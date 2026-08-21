@@ -62,6 +62,24 @@ mod tests {
     }
 
     #[test]
+    fn set_content_rejects_signed_malformed_file_metadata() {
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let (address, content_bytes) =
+            signed_content(priv_hex, json!({ "gate.bin": {} }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(
+            Address::parse(address).unwrap(),
+            XiteStorage::new(dir.path()),
+        );
+        let error = xite.set_content(&content_bytes).unwrap_err();
+
+        assert!(error.to_string().contains("size must be a nonnegative integer"));
+        assert!(xite.content.is_none(), "invalid content must not be adopted");
+        assert!(!xite.storage.exists("content.json"), "invalid content must not be committed");
+    }
+
+    #[test]
     fn stage_content_adopts_in_memory_without_touching_disk() {
         let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
         let a = XiteStorage::hash_bytes(b"hello");

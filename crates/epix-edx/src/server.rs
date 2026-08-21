@@ -7,19 +7,21 @@
 //! blocking_send) — a multi-GB range never materializes in memory, and a
 //! peer Cancel aborts the encode between frames.
 //!
-//! Control-plane limits enforced here, per connection: a Hello gate
-//! (nothing else is answered first; wrong net or bad channel binding
-//! kills the connection), a concurrent-serve semaphore, and per-request
-//! caps on range count/bytes and GetMany item count/size. Cross-peer
-//! fairness (choking) sits a layer above and only shapes BULK data;
-//! these caps are the hard backstop.
+//! Control-plane limits enforced here, per connection: a Hello gate for
+//! accepted links (nothing else is answered first; wrong net or bad channel
+//! binding kills the connection), a concurrent-serve semaphore, and
+//! per-request caps on range count/bytes and GetMany item count/size. A dialer
+//! that already authenticated its peer with [`client_hello`] enters the same
+//! request loop through [`serve_authenticated`]. Cross-peer fairness (choking)
+//! sits a layer above and only shapes BULK data; these caps are the hard
+//! backstop.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use epix_blob::store::Store;
 use epix_blob::ObjId;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::choke::{Choker, Reach, ServeDecision};
 use crate::conn::{Conn, Incoming};
@@ -33,8 +35,14 @@ pub const MAX_RANGES_PER_REQ: usize = 64;
 pub const MAX_BYTES_PER_REQ: u64 = 64 << 20;
 pub const MAX_MANY_ITEMS: usize = 256;
 pub const MAX_MANY_ITEM_BYTES: u64 = 64 * 1024;
-/// Concurrent serve tasks per connection.
+/// Concurrent non-Update serve tasks per connection.
 pub const MAX_CONCURRENT_SERVES: usize = 8;
+/// Concurrent Update applications per connection. Updates have their own
+/// admission lane because an application may synchronously request signed or
+/// content-addressed data back over the same duplex session. Sharing every
+/// permit with those dependency requests creates a circular wait when both
+/// endpoints receive a full Update batch at once.
+pub const MAX_CONCURRENT_UPDATES: usize = 8;
 /// Concurrent range-encode threads across the WHOLE process. The encode
 /// runs on tokio's blocking pool, which the node shares with store and
 /// database IO, and each thread can sit on the connection's send stall
@@ -44,12 +52,12 @@ pub const MAX_CONCURRENT_SERVES: usize = 8;
 pub const MAX_ENCODE_THREADS: usize = 32;
 /// Global bound on serves ADMITTED to the encode stage: the running
 /// [`MAX_ENCODE_THREADS`] plus a bounded queue behind them. Per
-/// connection [`MAX_CONCURRENT_SERVES`] caps concurrency, but connections
-/// are many, and every one of them parking its serves on the encode
-/// semaphore was an unbounded process-wide queue. Past this bound the
-/// request waits out one short drain window ([`ENCODE_QUEUE_WAIT`]) and
-/// is then refused with a typed retry-after instead of waiting silently
-/// for an unbounded time.
+/// connection [`MAX_CONCURRENT_SERVES`] caps data/control concurrency and
+/// [`MAX_CONCURRENT_UPDATES`] caps update application, but connections are
+/// many, and every one of them parking its serves on the encode semaphore was
+/// an unbounded process-wide queue. Past this bound the request waits out one
+/// short drain window ([`ENCODE_QUEUE_WAIT`]) and is then refused with a typed
+/// retry-after instead of waiting silently for an unbounded time.
 pub const MAX_ENCODE_QUEUE: usize = MAX_ENCODE_THREADS * 3;
 /// How long a serve may wait for queue admission before it is refused.
 /// Refusing instantly regressed legacy clients: they parked here without
@@ -111,8 +119,12 @@ pub trait SignedProvider: Send + Sync + 'static {
     /// body; `inline` are small whole objects that ride along; `modified` is
     /// the version; `diffs` are per-file encoded action lists (the provider
     /// decodes them) so data files patch in place; `sender_peers` are the
-    /// publisher's dial-back addresses. Ok(true) = accepted and new,
-    /// Ok(false) = stale/known.
+    /// publisher's dial-back addresses. `source` identifies the authenticated
+    /// connection that delivered the update, so the provider can pull missing
+    /// signed content back over the same NAT-safe session and account for the
+    /// peer and transport class. Ok(true) = accepted and new, Ok(false) =
+    /// stale/known.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_update(
         &self,
         xite: &str,
@@ -122,6 +134,7 @@ pub trait SignedProvider: Send + Sync + 'static {
         modified: f64,
         diffs: &[(String, Vec<u8>)],
         sender_peers: &[String],
+        source: UpdateSource,
     ) -> Result<bool, String>;
 }
 
@@ -200,6 +213,20 @@ pub struct PeerIdentity {
     /// The peer's self-reported release version (empty if it sent none).
     /// Reporting only - nothing is gated on it.
     pub version: String,
+}
+
+/// Authenticated origin of a pushed update.
+///
+/// The connection is the live session that carried `Req::Update`. Providers
+/// should prefer it over opening a reverse connection to a self-declared
+/// address. `identity` and `reach` come from the same completed Hello exchange
+/// and let callers label, tune, and account for a same-session pull without
+/// trusting update payload fields.
+#[derive(Clone)]
+pub struct UpdateSource {
+    pub conn: Conn,
+    pub identity: PeerIdentity,
+    pub reach: Reach,
 }
 
 fn now_unix() -> u64 {
@@ -418,16 +445,115 @@ pub async fn serve(
     handshake_hash: Option<[u8; 32]>,
 ) -> Option<PeerIdentity> {
     let identity = hello_gate(&conn, &mut incoming, &ctx, handshake_hash.as_ref()).await?;
+    let reach = if handshake_hash.is_some() { Reach::Clearnet } else { Reach::Overlay };
+    Some(serve_requests(conn, incoming, ctx, identity, reach, true, None).await)
+}
+
+/// Notification that a request served on an authenticated outbound link has
+/// completed. A connection pool uses this to renew the reverse-serving lease
+/// after a long range response, without exposing pool state to this crate.
+pub type ServeActivityHook = Arc<dyn Fn() + Send + Sync>;
+
+/// Serve reverse requests on a link whose peer was already authenticated by
+/// [`client_hello`]. No second `Hello` is expected or accepted.
+///
+/// `identity` must be the value returned by `client_hello` for this exact
+/// connection. `reach` must describe the same link, just as [`serve`] derives it
+/// from the presence of a Noise handshake hash. The request path is otherwise
+/// identical to `serve`: governor accounting, concurrent-serve admission, Busy
+/// replies, and every per-request cap are shared.
+///
+/// Unlike an accepted socket, an outbound pooled link does not consume an
+/// inbound accept slot. This loop therefore remains available until `incoming`
+/// closes instead of applying [`IDLE_TIMEOUT`]. The connection pool owns that
+/// link's idle lifetime.
+pub async fn serve_authenticated(
+    conn: Conn,
+    incoming: mpsc::Receiver<Incoming>,
+    ctx: Arc<ServeCtx>,
+    identity: PeerIdentity,
+    reach: Reach,
+) -> PeerIdentity {
+    serve_requests(conn, incoming, ctx, identity, reach, false, None).await
+}
+
+/// [`serve_authenticated`] with a completion hook for connection-pool lease
+/// tracking. The hook fires after each request handler finishes and before its
+/// connection handle and admission permit are released.
+pub async fn serve_authenticated_tracked(
+    conn: Conn,
+    incoming: mpsc::Receiver<Incoming>,
+    ctx: Arc<ServeCtx>,
+    identity: PeerIdentity,
+    reach: Reach,
+    on_activity: ServeActivityHook,
+) -> PeerIdentity {
+    serve_requests(conn, incoming, ctx, identity, reach, false, Some(on_activity)).await
+}
+
+/// Result of assigning one established request to its bounded handler lane.
+enum RequestAdmission {
+    Admitted(OwnedSemaphorePermit),
+    Busy(&'static str),
+    Closed,
+}
+
+/// Receive one request, applying the idle timeout only to accepted links.
+async fn next_request(
+    incoming: &mut mpsc::Receiver<Incoming>,
+    reap_idle: bool,
+) -> Option<Incoming> {
+    if reap_idle {
+        tokio::time::timeout(IDLE_TIMEOUT, incoming.recv()).await.ok().flatten()
+    } else {
+        incoming.recv().await
+    }
+}
+
+/// Assign Updates and dependency serves to their independent bounded lanes.
+async fn admit_request(
+    req: &Req,
+    serves: &Arc<Semaphore>,
+    updates: &Arc<Semaphore>,
+) -> RequestAdmission {
+    if matches!(req, Req::Update { .. }) {
+        // Do not let a ninth Update park the dispatcher ahead of a nested
+        // dependency request. The admitted Updates keep running and the
+        // excess one gets the ordinary bounded-retry response.
+        return match updates.clone().try_acquire_owned() {
+            Ok(permit) => RequestAdmission::Admitted(permit),
+            Err(_) => RequestAdmission::Busy("update slots busy"),
+        };
+    }
+
+    // A bounded wait keeps a full serve lane from parking the dispatcher
+    // forever. A timeout means BUSY, while semaphore closure ends the loop.
+    match tokio::time::timeout(IDLE_TIMEOUT, serves.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => RequestAdmission::Admitted(permit),
+        Ok(Err(_)) => RequestAdmission::Closed,
+        Err(_) => RequestAdmission::Busy("serve slots busy"),
+    }
+}
+
+/// The established-request loop shared by accepted and outbound links.
+async fn serve_requests(
+    conn: Conn,
+    mut incoming: mpsc::Receiver<Incoming>,
+    ctx: Arc<ServeCtx>,
+    identity: PeerIdentity,
+    reach: Reach,
+    reap_idle: bool,
+    on_activity: Option<ServeActivityHook>,
+) -> PeerIdentity {
 
     // Register the connection with the governor (reachability from the
-    // link type: overlay links have no handshake hash). Unchoke slots are
+    // authenticated link type). Unchoke slots are
     // ranked over CONNECTED peers, so this is what admits the peer to the
     // competition; the matching note_disconnected runs from a drop guard,
     // so it also fires if this future is cancelled mid-serve (an accept
     // loop aborting per-conn tasks) - an unpaired note_connected would
     // leave a phantom conns>0 account squatting the connected set and
     // immune to table eviction forever.
-    let reach = if handshake_hash.is_some() { Reach::Clearnet } else { Reach::Overlay };
     struct Connected {
         ctx: Arc<ServeCtx>,
         node_pk: Vec<u8>,
@@ -445,49 +571,59 @@ pub async fn serve(
     });
     let identity = Arc::new(identity);
 
-    // Idle reaper: drop a connection that goes quiet, releasing its
-    // inbound slot. Long-lived links stay up as long as they keep making
-    // requests; a live-but-silent peer reconnects when it needs us.
+    // Accepted links reap idle peers to release their inbound slot. An
+    // authenticated outbound link follows its pool's lifetime instead and
+    // keeps reverse serving until the incoming channel closes.
     let serves = Arc::new(Semaphore::new(MAX_CONCURRENT_SERVES));
-    while let Ok(Some(inc)) = tokio::time::timeout(IDLE_TIMEOUT, incoming.recv()).await {
-        // Bounded too: with all MAX_CONCURRENT_SERVES permits held by slow
-        // serves, an unbounded wait here parks the loop off the timeout
-        // above, so the idle reaper could never fire for this connection.
-        // Running out of permits means the connection is BUSY, not idle, so
-        // the request is answered and the loop goes on: breaking here would
-        // shed the busiest connection and, worse, drop this request with no
-        // reply while `incoming` goes away under the in-flight serves, which
-        // black-holes everything the peer sends after it.
-        let slot = tokio::time::timeout(IDLE_TIMEOUT, serves.clone().acquire_owned()).await;
-        let permit = match slot {
-            Ok(Ok(p)) => p,
-            // The semaphore is ours and never closed; treat it as fatal.
-            Ok(Err(_)) => break,
-            Err(_) => {
+    let updates = Arc::new(Semaphore::new(MAX_CONCURRENT_UPDATES));
+    loop {
+        let Some(inc) = next_request(&mut incoming, reap_idle).await else {
+            break;
+        };
+        // Updates and the requests they may synchronously issue back over this
+        // same duplex link need independent bounded lanes. If eight Updates on
+        // each endpoint occupied the one shared semaphore, all sixteen could
+        // wait for GetSigned/GetBitfield/GetRange requests that neither request
+        // loop had a permit left to dispatch.
+        let permit = match admit_request(&inc.req, &serves, &updates).await {
+            RequestAdmission::Admitted(permit) => permit,
+            RequestAdmission::Busy(message) => {
                 let _ = conn
                     .respond(
                         inc.stream,
-                        busy_resp(&identity, SERVE_SLOTS_RETRY_SECS, "serve slots busy"),
+                        busy_resp(&identity, SERVE_SLOTS_RETRY_SECS, message),
                     )
                     .await;
                 continue;
             }
+            // The semaphore is ours and never closed; treat closure as fatal.
+            RequestAdmission::Closed => break,
         };
         let conn = conn.clone();
         let ctx = ctx.clone();
         let identity = identity.clone();
+        let on_activity = on_activity.clone();
         tokio::spawn(async move {
-            handle(conn, ctx, identity, inc).await;
+            handle(conn, ctx, identity, reach, inc).await;
+            if let Some(on_activity) = on_activity {
+                on_activity();
+            }
             drop(permit);
         });
     }
     // The connection is gone: `_connected`'s drop tells the governor, so
     // the peer stops competing for unchoke slots (the account and its
     // credit stay for when the peer returns).
-    Some((*identity).clone())
+    (*identity).clone()
 }
 
-async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc: Incoming) {
+async fn handle(
+    conn: Conn,
+    ctx: Arc<ServeCtx>,
+    identity: Arc<PeerIdentity>,
+    reach: Reach,
+    inc: Incoming,
+) {
     let stream = inc.stream;
     match inc.req {
         Req::Hello(_) => {
@@ -524,11 +660,27 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
         Req::Update { xite, inner_path, signed, inline, modified, diffs, sender_peers } => {
             let resp = match ctx
                 .provider
-                .apply_update(&xite, &inner_path, &signed, &inline, modified, &diffs, &sender_peers)
+                .apply_update(
+                    &xite,
+                    &inner_path,
+                    &signed,
+                    &inline,
+                    modified,
+                    &diffs,
+                    &sender_peers,
+                    UpdateSource {
+                        conn: conn.clone(),
+                        identity: (*identity).clone(),
+                        reach,
+                    },
+                )
                 .await
             {
                 Ok(_) => Resp::Ok,
-                Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
+                Err(e) => match e.strip_prefix(RETRYABLE_UPDATE_PREFIX) {
+                    Some(why) => busy_resp(&identity, UPDATE_RETRY_SECS, why),
+                    None => Resp::Err { code: err::BAD_REQUEST, msg: e },
+                },
             };
             let _ = conn.respond(stream, resp).await;
         }
@@ -557,6 +709,17 @@ async fn handle(conn: Conn, ctx: Arc<ServeCtx>, identity: Arc<PeerIdentity>, inc
 fn unsupported() -> Resp {
     Resp::Err { code: err::UNSUPPORTED, msg: "control plane not served".into() }
 }
+
+/// Prefix a provider may put on an `apply_update` error to mean "valid
+/// request, cannot take it this instant — come back shortly" (for example
+/// the same version is already mid-apply from another peer). Answered as
+/// the bounded-retry BUSY instead of a hard error, so the sender scores the
+/// peer alive-and-busy rather than refusing.
+pub const RETRYABLE_UPDATE_PREFIX: &str = "retry-later: ";
+
+/// The comeback hint for a retryable Update refusal: long enough for the
+/// racing apply to finish, short enough that a real retry is still "live".
+const UPDATE_RETRY_SECS: u64 = 2;
 
 /// The refusal reply: a typed `Busy` carrying the comeback hint for a
 /// peer that advertised [`caps::RETRY_AFTER`] in its Hello, the legacy
@@ -1333,7 +1496,96 @@ mod tests {
             _modified: f64,
             _diffs: &[(String, Vec<u8>)],
             _sender_peers: &[String],
+            _source: UpdateSource,
         ) -> Result<bool, String> {
+            Ok(true)
+        }
+    }
+
+    type PulledUpdate = (Vec<u8>, String, Reach);
+
+    struct PullingFixture {
+        pulled: Arc<Mutex<Option<PulledUpdate>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl SignedProvider for PullingFixture {
+        async fn get_signed(&self, _xite: &str, _inner_path: &str) -> Option<Vec<u8>> {
+            None
+        }
+
+        async fn list_signed(&self, _xite: &str, _since: u64) -> Vec<(String, u64, u64)> {
+            Vec::new()
+        }
+
+        async fn xite_summary(&self, _xite: &str) -> Option<(u64, u64, u64)> {
+            None
+        }
+
+        async fn apply_update(
+            &self,
+            xite: &str,
+            _inner_path: &str,
+            _signed: &[u8],
+            _inline: &[(ObjId, Vec<u8>)],
+            _modified: f64,
+            _diffs: &[(String, Vec<u8>)],
+            _sender_peers: &[String],
+            source: UpdateSource,
+        ) -> Result<bool, String> {
+            let bytes = crate::fetch::fetch_signed(
+                &source.conn,
+                xite,
+                "data/users/alice/posts.json",
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+            *self.pulled.lock().unwrap() =
+                Some((bytes, source.identity.address, source.reach));
+            Ok(true)
+        }
+    }
+
+    /// Both endpoints use this provider in the circular admission regression.
+    /// Every Update waits until all sixteen handlers are active, then pulls a
+    /// signed dependency back through the same session that delivered it.
+    struct CircularPullingFixture {
+        barrier: Arc<tokio::sync::Barrier>,
+        body: Vec<u8>,
+    }
+
+    #[async_trait::async_trait]
+    impl SignedProvider for CircularPullingFixture {
+        async fn get_signed(&self, _xite: &str, _inner_path: &str) -> Option<Vec<u8>> {
+            Some(self.body.clone())
+        }
+
+        async fn list_signed(&self, _xite: &str, _since: u64) -> Vec<(String, u64, u64)> {
+            Vec::new()
+        }
+
+        async fn xite_summary(&self, _xite: &str) -> Option<(u64, u64, u64)> {
+            None
+        }
+
+        async fn apply_update(
+            &self,
+            xite: &str,
+            _inner_path: &str,
+            _signed: &[u8],
+            _inline: &[(ObjId, Vec<u8>)],
+            _modified: f64,
+            _diffs: &[(String, Vec<u8>)],
+            _sender_peers: &[String],
+            source: UpdateSource,
+        ) -> Result<bool, String> {
+            self.barrier.wait().await;
+            let got = crate::fetch::fetch_signed(&source.conn, xite, "dependency.json")
+                .await
+                .map_err(|e| e.to_string())?;
+            if got != self.body {
+                return Err("same-session dependency body mismatch".into());
+            }
             Ok(true)
         }
     }
@@ -1369,6 +1621,209 @@ mod tests {
             .await
             .expect("a reply frame must arrive")
             .expect("the reply frame decodes")
+    }
+
+    /// A receiver can pull a merge file back through the connection carrying
+    /// Update while the publisher is still waiting for that Update's response.
+    /// This is the NAT-safe publish path and also proves the reverse serve loop
+    /// starts after client_hello without requiring another Hello.
+    #[tokio::test]
+    async fn an_update_source_supports_same_session_pull() {
+        const PUBLISHER_KEY: &str =
+            "2222222222222222222222222222222222222222222222222222222222222222";
+        let merge = br#"{"record_format":"epix-orset-1","post":[{"post_id":7}]}"#.to_vec();
+        let (publisher_io, receiver_io) = tokio::io::duplex(1 << 20);
+        let (publisher, publisher_incoming) = Conn::start(publisher_io, true);
+        let (receiver, receiver_incoming) = Conn::start(receiver_io, false);
+
+        let publisher_dir = tempfile::tempdir().unwrap();
+        let publisher_ctx = Arc::new(ServeCtx {
+            now: || 0,
+            ..ServeCtx::new(
+                store_in(&publisher_dir),
+                Arc::new(Fixture { signed: Some(merge.clone()), block: false }),
+                PUBLISHER_KEY.into(),
+            )
+        });
+
+        let pulled = Arc::new(Mutex::new(None));
+        let receiver_dir = tempfile::tempdir().unwrap();
+        let receiver_ctx = Arc::new(ServeCtx {
+            now: || 0,
+            ..ServeCtx::new(
+                store_in(&receiver_dir),
+                Arc::new(PullingFixture { pulled: pulled.clone() }),
+                TEST_KEY.into(),
+            )
+        });
+        tokio::spawn(serve(receiver, receiver_incoming, receiver_ctx, None));
+
+        let receiver_identity = client_hello(&publisher, &publisher_ctx, vec![], None)
+            .await
+            .expect("receiver authenticates");
+        tokio::spawn(serve_authenticated(
+            publisher.clone(),
+            publisher_incoming,
+            publisher_ctx,
+            receiver_identity,
+            Reach::Overlay,
+        ));
+
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            crate::fetch::push_update(
+                &publisher,
+                "1Forum",
+                "data/users/alice/content.json",
+                br#"{"modified":2000}"#,
+                2000.0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            ),
+        )
+        .await
+        .expect("same-session pull must not stall")
+        .expect("receiver accepts the update");
+
+        let got = pulled.lock().unwrap().clone().expect("provider pulled the merge file");
+        assert_eq!(got.0, merge);
+        assert_eq!(got.1, epix_crypt::privatekey_to_address(PUBLISHER_KEY).unwrap());
+        assert_eq!(got.2, Reach::Overlay);
+        publisher.shutdown();
+    }
+
+    /// Eight Updates in each direction used to consume every shared serve
+    /// permit. Once all handlers tried to pull a dependency through the same
+    /// sessions, neither endpoint could admit the requests needed to finish
+    /// those Updates. Dependency traffic has its own bounded admission lane.
+    #[tokio::test]
+    async fn circular_updates_do_not_block_same_session_pull() {
+        let body = br#"{"record_format":"epix-orset-1"}"#.to_vec();
+        let barrier = Arc::new(tokio::sync::Barrier::new(MAX_CONCURRENT_UPDATES * 2));
+        let (a_io, b_io) = tokio::io::duplex(1 << 20);
+        let (a, a_incoming) = Conn::start(a_io, true);
+        let (b, b_incoming) = Conn::start(b_io, false);
+
+        let a_dir = tempfile::tempdir().unwrap();
+        let a_ctx = Arc::new(ServeCtx {
+            now: || 0,
+            ..ServeCtx::new(
+                store_in(&a_dir),
+                Arc::new(CircularPullingFixture {
+                    barrier: barrier.clone(),
+                    body: body.clone(),
+                }),
+                TEST_KEY.into(),
+            )
+        });
+        let b_dir = tempfile::tempdir().unwrap();
+        let b_ctx = Arc::new(ServeCtx {
+            now: || 0,
+            ..ServeCtx::new(
+                store_in(&b_dir),
+                Arc::new(CircularPullingFixture { barrier, body }),
+                TEST_KEY.into(),
+            )
+        });
+
+        tokio::spawn(serve_authenticated(
+            a.clone(),
+            a_incoming,
+            a_ctx,
+            (*peer()).clone(),
+            Reach::Overlay,
+        ));
+        tokio::spawn(serve_authenticated(
+            b.clone(),
+            b_incoming,
+            b_ctx,
+            (*peer()).clone(),
+            Reach::Overlay,
+        ));
+
+        let mut pushes = tokio::task::JoinSet::new();
+        for _ in 0..MAX_CONCURRENT_UPDATES {
+            let conn = a.clone();
+            pushes.spawn(async move {
+                crate::fetch::push_update(
+                    &conn,
+                    "1Forum",
+                    "content.json",
+                    br#"{"modified":2000}"#,
+                    2000.0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+            });
+            let conn = b.clone();
+            pushes.spawn(async move {
+                crate::fetch::push_update(
+                    &conn,
+                    "1Forum",
+                    "content.json",
+                    br#"{"modified":2000}"#,
+                    2000.0,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                )
+                .await
+            });
+        }
+
+        tokio::time::timeout(Duration::from_secs(5), async move {
+            while let Some(result) = pushes.join_next().await {
+                result.expect("push task completes").expect("peer accepts the Update");
+            }
+        })
+        .await
+        .expect("circular same-session pulls must not stall");
+
+        a.shutdown();
+        b.shutdown();
+    }
+
+    #[tokio::test]
+    async fn tracked_authenticated_serve_reports_completed_requests() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let (client, _client_incoming) = Conn::start(client_io, true);
+        let (server, server_incoming) = Conn::start(server_io, false);
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ctx_for(
+            store_in(&dir),
+            Fixture { signed: Some(b"tracked".to_vec()), block: false },
+        ));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let hook_count = completed.clone();
+        tokio::spawn(serve_authenticated_tracked(
+            server,
+            server_incoming,
+            ctx,
+            (*peer()).clone(),
+            Reach::Overlay,
+            Arc::new(move || {
+                hook_count.fetch_add(1, Ordering::Relaxed);
+            }),
+        ));
+
+        let got = crate::fetch::fetch_signed(&client, "1Forum", "content.json")
+            .await
+            .expect("signed response succeeds");
+        assert_eq!(got, b"tracked");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while completed.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion hook fires");
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
+        client.shutdown();
     }
 
     /// A full 256-item batch of near-budget blobs must stay inside the
@@ -1602,7 +2057,7 @@ mod tests {
             req: Req::GetSigned { xite: "1Abc".into(), inner_path: "content.json".into() },
             _budget: None,
         };
-        tokio::spawn(handle(conn, ctx, peer(), inc));
+        tokio::spawn(handle(conn, ctx, peer(), Reach::Clearnet, inc));
 
         let mut got: Vec<u8> = Vec::new();
         let mut frames = 0usize;

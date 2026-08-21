@@ -371,11 +371,11 @@ impl Xite {
         self.content.as_ref().map(Self::includes_in).unwrap_or_default()
     }
 
-    /// Verify + store a non-root content.json (an include or a user
-    /// content.json) whose PARENT content.json is already on disk, then return
-    /// the files it declares (`files` + `files_optional`). `inner_path` is the
-    /// child's path, e.g. `data/users/1abc/content.json`.
-    pub fn add_content(
+    /// Verify a non-root content.json without writing it or applying archive
+    /// directives. Update receivers use this to stage a child until every
+    /// required file is present, so an incomplete manifest has no destructive
+    /// or externally visible side effects.
+    pub fn verify_child_content(
         &self,
         inner_path: &str,
         bytes: &[u8],
@@ -390,6 +390,21 @@ impl Xite {
         };
         epix_content::verify_content_file(inner_path, &json, bytes.len() as i64, &ctx)
             .map_err(|e| Error::Crypt(e.to_string()))?;
+        Ok(Self::child_file_entries(inner_path, &json))
+    }
+
+    /// Verify + store a non-root content.json (an include or a user
+    /// content.json) whose PARENT content.json is already on disk, then return
+    /// the files it declares (`files` + `files_optional`). `inner_path` is the
+    /// child's path, e.g. `data/users/1abc/content.json`.
+    pub fn add_content(
+        &self,
+        inner_path: &str,
+        bytes: &[u8],
+        xid_map: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Result<Vec<FileEntry>> {
+        let files = self.verify_child_content(inner_path, bytes, xid_map)?;
+        let json: Value = serde_json::from_slice(bytes)?;
         // A user_contents parent (e.g. data/users/content.json) may archive
         // user directories; compare with the copy being replaced and delete
         // newly archived children (EpixNet's revocation path).
@@ -400,6 +415,10 @@ impl Xite {
             .and_then(|b| serde_json::from_slice(&b).ok());
         self.storage.write(inner_path, bytes)?;
         self.apply_archived(inner_path, old.as_ref(), &json);
+        Ok(files)
+    }
+
+    fn child_file_entries(inner_path: &str, json: &Value) -> Vec<FileEntry> {
         // The child's declared files are relative to its own directory.
         let dir = match inner_path.rsplit_once('/') {
             Some((d, _)) => d.to_string(),
@@ -423,7 +442,23 @@ impl Xite {
                 }
             }
         }
-        Ok(out)
+        out
+    }
+
+    /// Apply a VERIFIED child manifest's archive/revocation directives without
+    /// committing the manifest itself. The staged-commit path holds a new
+    /// users/content.json off disk until its required files verify; a signed
+    /// revocation must not wait on unrelated file availability (nor risk the
+    /// pending-relay caps evicting it), so the deletions run at stage time.
+    /// Committing the same manifest later re-applies them as a no-op (only
+    /// entries that changed against the stored copy are acted on).
+    pub fn apply_archived_directives(&self, inner_path: &str, new: &Value) {
+        let old: Option<Value> = self
+            .storage
+            .read(inner_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        self.apply_archived(inner_path, old.as_ref(), new);
     }
 
     /// EpixNet's archive semantics: when a user_contents parent (e.g.
@@ -637,13 +672,26 @@ impl Xite {
         let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
             return Vec::new();
         };
+        self.valid_signers_for_content(content_inner_path, &content, xid_map)
+    }
+
+    /// The authorized signer set for an already verified, possibly staged,
+    /// content.json value. Unlike [`Self::valid_signers_for`], this does not
+    /// read storage, so callers do not need to publish a child manifest merely
+    /// to derive the merge-record signer set it authorizes.
+    pub fn valid_signers_for_content(
+        &self,
+        content_inner_path: &str,
+        content: &Value,
+        xid_map: &std::collections::HashMap<String, Vec<String>>,
+    ) -> Vec<String> {
         let ctx = ChildCtx {
             address: self.address.as_str().to_string(),
             storage: &self.storage,
             root: self.content.as_ref(),
             xid_map,
         };
-        epix_content::verify::valid_signers(content_inner_path, &content, &ctx)
+        epix_content::verify::valid_signers(content_inner_path, content, &ctx)
     }
 
     /// Build the `files` and `files_optional` maps for the content.json unit

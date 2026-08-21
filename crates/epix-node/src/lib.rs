@@ -1037,6 +1037,16 @@ async fn clone_xite_with_progress(
         }
         empty_waits = 0;
         let staged = xite.content.clone();
+        // content.json is staged in memory until the core set lands, so the
+        // wants must carry the staged authority: without it, materialization
+        // re-reads the governing content.json from disk — which does not exist
+        // yet — and rejects every fetched file as undeclared.
+        let canonical = staged
+            .as_ref()
+            .and_then(|c| c.get("address"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(address)
+            .to_string();
         let edx_progress = emit_done.clone().map(|emit| {
             Arc::new(move |inner: &str, _bytes: u64, serving: usize| emit(inner, serving))
                 as epix_ui::state::EdxBatchProgress
@@ -1050,7 +1060,14 @@ async fn clone_xite_with_progress(
         const CLONE_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         let _ = tokio::time::timeout(
             CLONE_PASS_BUDGET,
-            state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress),
+            state.edx_first(
+                address,
+                before.clone(),
+                peers,
+                staged.as_ref(),
+                Some((&canonical, "content.json")),
+                edx_progress,
+            ),
         )
         .await;
         let after = xite.files_needed().len();
@@ -1570,7 +1587,9 @@ async fn sync_included_content(
             });
         // `on_file` is moved in and dropped when the pass returns, which closes
         // the channel and ends the consumer.
-        let missed = state.edx_first(address, needed, peers.to_vec(), None, Some(on_file)).await;
+        let missed = state
+            .edx_first(address, needed, peers.to_vec(), None, None, Some(on_file))
+            .await;
         let ingested = ingesting.await.unwrap_or_default();
         let still: std::collections::HashSet<&String> =
             missed.iter().map(|f| &f.inner_path).collect();
