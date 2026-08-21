@@ -285,6 +285,51 @@ struct DecodedInlineMerges {
     objects: HashMap<String, EdxObjectRef>,
 }
 
+impl DecodedInlineMerges {
+    fn insert(
+        &mut self,
+        delta: InlineMergeDelta,
+        total_delta_bytes: &mut u64,
+    ) -> Result<(), String> {
+        let InlineMergeDelta { path, body } = delta;
+        if self.deltas.contains_key(&path) || self.objects.contains_key(&path) {
+            return Err(format!("duplicate inline merge path: {path}"));
+        }
+        match body {
+            InlineMergeBody::Records(records) => {
+                if records.is_empty() || records.len() > MAX_INLINE_MERGE_BYTES {
+                    return Err(format!(
+                        "inline merge delta for {path} has an invalid byte length"
+                    ));
+                }
+                add_merge_payload_bytes(
+                    total_delta_bytes,
+                    records.len() as u64,
+                    "aggregate inline merge size overflow",
+                )?;
+                self.deltas.insert(path, records);
+            }
+            InlineMergeBody::Object { id, size } => {
+                if size == 0 || size > MAX_MERGE_DELTA_OBJECT_BYTES {
+                    return Err(format!(
+                        "merge delta object for {path} has an invalid byte length"
+                    ));
+                }
+                add_merge_payload_bytes(
+                    total_delta_bytes,
+                    size,
+                    "aggregate merge object size overflow",
+                )?;
+                self.objects.insert(path, EdxObjectRef { id, size });
+            }
+            InlineMergeBody::LegacyPull => {
+                self.deltas.insert(path, Vec::new());
+            }
+        }
+        Ok(())
+    }
+}
+
 type InlineMergeWire = Vec<(ObjId, Vec<u8>)>;
 type InlineMergeEntries<'a> = Vec<(&'a str, &'a [u8])>;
 
@@ -402,12 +447,56 @@ fn encode_inline_merge_objects(
     Ok(markers)
 }
 
+fn select_update_merge_wire(
+    supports_inline: bool,
+    candidate_inline: Option<InlineMergeWire>,
+    merges: &HashMap<String, Vec<u8>>,
+    objects: &HashMap<String, EdxObjectRef>,
+) -> Result<InlineMergeWire, String> {
+    if !supports_inline {
+        return Ok(Vec::new());
+    }
+    match candidate_inline {
+        Some(inline) => Ok(inline),
+        None => encode_inline_merge_objects(merges, objects),
+    }
+}
+
+fn decode_inline_merge_envelope(id: ObjId, bytes: &[u8]) -> Result<InlineMergeDelta, String> {
+    if ObjId::of(bytes) != id {
+        return Err("inline merge object hash mismatch".into());
+    }
+    if !bytes.starts_with(INLINE_MERGE_MAGIC) {
+        return Err("unsupported inline object on merge-capable Update".into());
+    }
+    let delta = postcard::from_bytes::<InlineMergeDelta>(&bytes[INLINE_MERGE_MAGIC.len()..])
+        .map_err(|e| format!("malformed inline merge envelope: {e}"))?;
+    if !safe_inner_path(&delta.path) {
+        return Err(format!("unsafe inline merge path: {}", delta.path));
+    }
+    Ok(delta)
+}
+
+fn add_merge_payload_bytes(
+    total: &mut u64,
+    size: u64,
+    overflow_message: &'static str,
+) -> Result<(), String> {
+    *total = total
+        .checked_add(size)
+        .ok_or_else(|| overflow_message.to_string())?;
+    if *total > MAX_MERGE_DELTA_OBJECT_BYTES {
+        return Err(format!(
+            "aggregate merge payload exceeds {MAX_MERGE_DELTA_OBJECT_BYTES} bytes"
+        ));
+    }
+    Ok(())
+}
+
 /// Decode only runtime-owned merge envelopes. Other inline object types are
 /// rejected for a capability-gated Update. Hash mismatch, malformed postcard,
 /// unsafe path, and duplicate path all fail closed before application checks.
-fn decode_inline_merges(
-    inline: &[(ObjId, Vec<u8>)],
-) -> Result<DecodedInlineMerges, String> {
+fn decode_inline_merges(inline: &[(ObjId, Vec<u8>)]) -> Result<DecodedInlineMerges, String> {
     if inline.len() > MAX_INLINE_MERGES {
         return Err(format!(
             "update has {} inline merge objects, maximum is {MAX_INLINE_MERGES}",
@@ -417,55 +506,8 @@ fn decode_inline_merges(
     let mut out = DecodedInlineMerges::default();
     let mut total_delta_bytes = 0u64;
     for (id, bytes) in inline {
-        if ObjId::of(bytes) != *id {
-            return Err("inline merge object hash mismatch".into());
-        }
-        if !bytes.starts_with(INLINE_MERGE_MAGIC) {
-            return Err("unsupported inline object on merge-capable Update".into());
-        }
-        let delta =
-            postcard::from_bytes::<InlineMergeDelta>(&bytes[INLINE_MERGE_MAGIC.len()..])
-                .map_err(|e| format!("malformed inline merge envelope: {e}"))?;
-        if !safe_inner_path(&delta.path) {
-            return Err(format!("unsafe inline merge path: {}", delta.path));
-        }
-        if out.deltas.contains_key(&delta.path) || out.objects.contains_key(&delta.path) {
-            return Err(format!("duplicate inline merge path: {}", delta.path));
-        }
-        match delta.body {
-            InlineMergeBody::Records(records) => {
-                if records.is_empty() || records.len() > MAX_INLINE_MERGE_BYTES {
-                    return Err(format!(
-                        "inline merge delta for {} has an invalid byte length",
-                        delta.path
-                    ));
-                }
-                total_delta_bytes = total_delta_bytes
-                    .checked_add(records.len() as u64)
-                    .ok_or_else(|| "aggregate inline merge size overflow".to_string())?;
-                out.deltas.insert(delta.path, records);
-            }
-            InlineMergeBody::Object { id, size } => {
-                if size == 0 || size > MAX_MERGE_DELTA_OBJECT_BYTES {
-                    return Err(format!(
-                        "merge delta object for {} has an invalid byte length",
-                        delta.path
-                    ));
-                }
-                total_delta_bytes = total_delta_bytes
-                    .checked_add(size)
-                    .ok_or_else(|| "aggregate merge object size overflow".to_string())?;
-                out.objects.insert(delta.path, EdxObjectRef { id, size });
-            }
-            InlineMergeBody::LegacyPull => {
-                out.deltas.insert(delta.path, Vec::new());
-            }
-        }
-        if total_delta_bytes > MAX_MERGE_DELTA_OBJECT_BYTES {
-            return Err(format!(
-                "aggregate merge payload exceeds {MAX_MERGE_DELTA_OBJECT_BYTES} bytes"
-            ));
-        }
+        let delta = decode_inline_merge_envelope(*id, bytes)?;
+        out.insert(delta, &mut total_delta_bytes)?;
     }
     Ok(out)
 }
@@ -528,6 +570,12 @@ fn drop_if_unfilled(store: &Store, id: ObjId, fresh: bool) {
 type ObjClaims = Arc<Mutex<HashMap<ObjId, (usize, bool)>>>;
 type MergePrepareGate = Arc<tokio::sync::OnceCell<Result<(), String>>>;
 type MergePrepareGates = Arc<Mutex<HashMap<ObjId, MergePrepareGate>>>;
+
+struct PreparedMergeObjects<'a> {
+    _preparations: Vec<MergePrepareGate>,
+    _holds: Vec<epix_blob::store::EvictionHold<'a>>,
+    objects: HashMap<String, EdxObjectRef>,
+}
 
 /// Fetch guards shared by every runtime adapter that writes into one Store.
 /// Same-session Update sources construct a short-lived fetcher, while ordinary
@@ -1525,16 +1573,8 @@ impl LinkPool {
         Some((link.conn.clone(), link.identity.clone(), link.reg.clone()))
     }
 
-    fn store(
-        &self,
-        peer: PeerAddr,
-        lane: u8,
-        conn: Conn,
-        identity: PeerIdentity,
-        reg: Arc<ConnHandle>,
-        reverse_serve: Option<tokio::task::AbortHandle>,
-        activity: LinkActivity,
-    ) {
+    fn store(&self, peer: PeerAddr, lane: u8, opened: OpenedLink) {
+        let (conn, identity, reg, reverse_serve, activity) = opened;
         self.conns.lock().expect("link pool").insert(
             (peer, lane),
             PooledLink {
@@ -1582,17 +1622,10 @@ impl LinkPool {
         if let Some(hit) = self.live(peer, lane) {
             return Ok(hit);
         }
-        let (conn, identity, reg, reverse_serve, activity) = dial().await?;
-        self.store(
-            peer.clone(),
-            lane,
-            conn.clone(),
-            identity.clone(),
-            reg.clone(),
-            reverse_serve,
-            activity,
-        );
-        Ok((conn, identity, reg))
+        let opened = dial().await?;
+        let link = (opened.0.clone(), opened.1.clone(), opened.2.clone());
+        self.store(peer.clone(), lane, opened);
+        Ok(link)
     }
 
     /// This peer+lane's dial gate, created on first use. Gates nobody is
@@ -1640,6 +1673,11 @@ struct RuntimeEdxFetcher {
     /// Arc-shared for the same reason as the rest: a serve, its read-ahead and
     /// the scheduler all report into one picture of the same file.
     xfer: Arc<crate::xfer::Xfer>,
+}
+
+struct MaterializeOptions<'a> {
+    on_fetched: Option<&'a epix_ui::state::EdxFetchedHook>,
+    authority: Option<&'a EdxMaterializeAuthority>,
 }
 
 /// Concurrent materialize copies a bulk worker pool may run at once. The
@@ -1784,6 +1822,50 @@ fn clone_handle(h: &PeerHandle) -> PeerHandle {
 const PREFIX_HEAD_ATTEMPTS: u32 = 3;
 const PREFIX_HEAD_WAIT: std::time::Duration = std::time::Duration::from_millis(700);
 
+fn merge_delta_object_ready(store: &Store, object: &EdxObjectRef) -> Result<bool, String> {
+    match store.info(object.id).map_err(|e| e.to_string())? {
+        Some((size, true)) if size == object.size => Ok(true),
+        Some((_, true)) => Err("stored merge delta object has the wrong size".into()),
+        _ => Ok(false),
+    }
+}
+
+async fn prepare_merge_delta_object_once(
+    store: Arc<Store>,
+    payload: Arc<UpdatePayload>,
+    path: String,
+    object: EdxObjectRef,
+) -> Result<(), String> {
+    if object.size == 0 || object.size > MAX_MERGE_DELTA_OBJECT_BYTES {
+        return Err("merge delta object size is outside the allowed range".into());
+    }
+    if merge_delta_object_ready(&store, &object)? {
+        return Ok(());
+    }
+    let insert_store = store.clone();
+    let object_id = object.id;
+    let object_size = object.size;
+    tokio::task::spawn_blocking(move || {
+        let records = payload
+            .merge_deltas
+            .get(&path)
+            .ok_or_else(|| "merge delta disappeared before Store insertion".to_string())?;
+        if records.len() as u64 != object_size || ObjId::of(records) != object_id {
+            return Err("merge delta changed before Store insertion".to_string());
+        }
+        insert_store
+            .insert_bytes(object_id, Ns::Plain, records, now_secs())
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })
+    .await
+    .map_err(|e| e.to_string())??;
+    match store.info(object.id).map_err(|e| e.to_string())? {
+        Some((size, true)) if size == object.size => Ok(()),
+        _ => Err("merge delta object preparation did not complete".into()),
+    }
+}
+
 impl RuntimeEdxFetcher {
     /// Attempts at the group blocking a window's prefix before the serve gives
     /// up, and how long to wait between them.
@@ -1866,44 +1948,46 @@ impl RuntimeEdxFetcher {
     ) -> Result<MergePrepareGate, String> {
         let gate = self.merge_prepare_gate(object.id);
         let prepared = gate
-            .get_or_init(|| async move {
-                if object.size == 0 || object.size > MAX_MERGE_DELTA_OBJECT_BYTES {
-                    return Err("merge delta object size is outside the allowed range".into());
-                }
-                if let Some((size, complete)) =
-                    store.info(object.id).map_err(|e| e.to_string())?
-                {
-                    if complete && size == object.size {
-                        return Ok(());
-                    }
-                    if complete {
-                        return Err("stored merge delta object has the wrong size".into());
-                    }
-                }
-                let insert_store = store.clone();
-                tokio::task::spawn_blocking(move || {
-                    let records = payload.merge_deltas.get(&path).ok_or_else(|| {
-                        "merge delta disappeared before Store insertion".to_string()
-                    })?;
-                    if records.len() as u64 != object.size || ObjId::of(records) != object.id {
-                        return Err("merge delta changed before Store insertion".to_string());
-                    }
-                    insert_store
-                        .insert_bytes(object.id, Ns::Plain, records, now_secs())
-                        .map_err(|e| e.to_string())?;
-                    Ok(())
-                })
-                .await
-                .map_err(|e| e.to_string())??;
-                match store.info(object.id).map_err(|e| e.to_string())? {
-                    Some((size, true)) if size == object.size => Ok(()),
-                    _ => Err("merge delta object preparation did not complete".into()),
-                }
-            })
+            .get_or_init(|| prepare_merge_delta_object_once(store, payload, path, object))
             .await
             .clone();
         prepared?;
         Ok(gate)
+    }
+
+    async fn prepare_merge_delta_objects<'a>(
+        &self,
+        store: &'a Arc<Store>,
+        payload: Arc<UpdatePayload>,
+    ) -> Result<PreparedMergeObjects<'a>, String> {
+        let mut holds = Vec::new();
+        let mut preparations = Vec::new();
+        let mut objects = HashMap::new();
+        for (path, records) in sorted_inline_merge_entries(&payload.merge_deltas)? {
+            if records.is_empty() {
+                continue;
+            }
+            let object = EdxObjectRef {
+                id: ObjId::of(records),
+                size: records.len() as u64,
+            };
+            holds.push(store.hold_eviction(object.id));
+            preparations.push(
+                self.prepare_merge_delta_object(
+                    store.clone(),
+                    payload.clone(),
+                    path.to_string(),
+                    object,
+                )
+                .await?,
+            );
+            objects.insert(path.to_string(), object);
+        }
+        Ok(PreparedMergeObjects {
+            _holds: holds,
+            _preparations: preparations,
+            objects,
+        })
     }
 
     /// Claim `id` for the duration of this fetch and make sure its sparse
@@ -3839,8 +3923,10 @@ impl RuntimeEdxFetcher {
                 id,
                 size,
                 &store,
-                on_fetched.as_ref(),
-                None,
+                MaterializeOptions {
+                    on_fetched: on_fetched.as_ref(),
+                    authority: None,
+                },
             )
             .await?;
             return Ok(true);
@@ -3902,8 +3988,10 @@ impl RuntimeEdxFetcher {
             id,
             size,
             &store,
-            on_fetched.as_ref(),
-            None,
+            MaterializeOptions {
+                on_fetched: on_fetched.as_ref(),
+                authority: None,
+            },
         )
         .await?;
         // Cached content grows the store; keep it under quota (own content is
@@ -3932,12 +4020,11 @@ impl RuntimeEdxFetcher {
         id: ObjId,
         size: u64,
         store: &Arc<Store>,
-        on_fetched: Option<&epix_ui::state::EdxFetchedHook>,
-        authority: Option<&EdxMaterializeAuthority>,
+        options: MaterializeOptions<'_>,
     ) -> Result<(), String> {
         let _hold = store.hold_eviction(id);
         let shared = store_fetch_shared(store);
-        let _permit = match on_fetched {
+        let _permit = match options.on_fetched {
             Some(fetched) => {
                 // Hold taken first: the freed slot's next file can complete
                 // and run enforce_quota before our copy starts.
@@ -3954,7 +4041,8 @@ impl RuntimeEdxFetcher {
             // file, so never queue it behind bulk copies.
             None => None,
         };
-        self.materialize(address, inner_path, id, size, store, authority).await
+        self.materialize(address, inner_path, id, size, store, options.authority)
+            .await
     }
 
     /// Turn a completed object into the xite's file on disk.
@@ -4916,41 +5004,25 @@ impl EdxFetcher for RuntimeEdxFetcher {
         } else {
             None
         };
-        let mut delta_holds = Vec::new();
-        let mut delta_preparations = Vec::new();
-        let mut delta_objects = HashMap::new();
-        if let Some(store) = delta_store.as_ref() {
-            for (path, records) in sorted_inline_merge_entries(&payload.merge_deltas)
-                .map_err(EdxPushError::Refused)?
-            {
-                if records.is_empty() {
-                    continue;
-                }
-                let id = ObjId::of(records);
-                let size = records.len() as u64;
-                let object = EdxObjectRef { id, size };
-                delta_holds.push(store.hold_eviction(id));
-                delta_preparations.push(
-                    self.prepare_merge_delta_object(
-                        store.clone(),
-                        payload.clone(),
-                        path.to_string(),
-                        object,
-                    )
+        let prepared = match delta_store.as_ref() {
+            Some(store) => Some(
+                self.prepare_merge_delta_objects(store, payload.clone())
                     .await
                     .map_err(EdxPushError::Refused)?,
-                );
-                delta_objects.insert(path.to_string(), object);
-            }
-        }
-        let wire_inline = if !supports_inline {
-            Vec::new()
-        } else if let Some(inline) = candidate_inline {
-            inline
-        } else {
-            encode_inline_merge_objects(&payload.merge_deltas, &delta_objects)
-                .map_err(EdxPushError::Refused)?
+            ),
+            None => None,
         };
+        let empty_objects = HashMap::new();
+        let delta_objects = prepared
+            .as_ref()
+            .map_or(&empty_objects, |prepared| &prepared.objects);
+        let wire_inline = select_update_merge_wire(
+            supports_inline,
+            candidate_inline,
+            &payload.merge_deltas,
+            delta_objects,
+        )
+        .map_err(EdxPushError::Refused)?;
         let inline_len = inline_merge_wire_len(&wire_inline);
 
         let candidate_diffs = encode_edx_diffs(&payload.diffs);
@@ -4981,8 +5053,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         )
         .await
         .map_err(|e| EdxPushError::Refused(e.to_string()));
-        drop(delta_preparations);
-        drop(delta_holds);
+        drop(prepared);
         if let Some(store) = delta_store.as_ref() {
             let _ = store.enforce_quota(store_quota());
         }
@@ -8662,7 +8733,11 @@ mod tests {
         let (conn, _incoming) = epix_edx::conn::Conn::start(stream, true);
 
         let pool = LinkPool::default();
-        pool.store(peer.clone(), 0, conn, test_identity(), reg, None, test_link_activity());
+        pool.store(
+            peer.clone(),
+            0,
+            (conn, test_identity(), reg, None, test_link_activity()),
+        );
         assert!(pool.live(&peer, 0).is_some(), "a fresh pooled link is reused");
 
         // Still fresh: a sweep must not cut a link that is being used.
@@ -8700,11 +8775,13 @@ mod tests {
         pool.store(
             peer.clone(),
             0,
-            conn,
-            test_identity(),
-            reg,
-            Some(reverse.abort_handle()),
-            activity.clone(),
+            (
+                conn,
+                test_identity(),
+                reg,
+                Some(reverse.abort_handle()),
+                activity.clone(),
+            ),
         );
         tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
         *activity.lock().expect("link activity") = tokio::time::Instant::now();
@@ -8736,11 +8813,13 @@ mod tests {
         pool.store(
             peer.clone(),
             0,
-            conn,
-            test_identity(),
-            reg,
-            Some(reverse.abort_handle()),
-            test_link_activity(),
+            (
+                conn,
+                test_identity(),
+                reg,
+                Some(reverse.abort_handle()),
+                test_link_activity(),
+            ),
         );
         tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
         assert!(pool.live(&peer, 0).is_none(), "the reverse task does not pin an idle link");
@@ -8815,11 +8894,7 @@ mod tests {
         pool.store(
             peer.clone(),
             0,
-            conn.clone(),
-            test_identity(),
-            reg,
-            None,
-            test_link_activity(),
+            (conn.clone(), test_identity(), reg, None, test_link_activity()),
         );
         // `conn` here stands in for the session's handle: the pool is not the
         // only holder.
@@ -8884,11 +8959,7 @@ mod tests {
             pool.store(
                 peer.clone(),
                 lane,
-                conn,
-                test_identity(),
-                reg,
-                None,
-                test_link_activity(),
+                (conn, test_identity(), reg, None, test_link_activity()),
             );
         }
         assert_eq!(pool.conns.lock().expect("link pool").len(), 3);

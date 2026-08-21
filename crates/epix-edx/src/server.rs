@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use epix_blob::store::Store;
 use epix_blob::ObjId;
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 
 use crate::choke::{Choker, Reach, ServeDecision};
 use crate::conn::{Conn, Incoming};
@@ -491,6 +491,50 @@ pub async fn serve_authenticated_tracked(
     serve_requests(conn, incoming, ctx, identity, reach, false, Some(on_activity)).await
 }
 
+/// Result of assigning one established request to its bounded handler lane.
+enum RequestAdmission {
+    Admitted(OwnedSemaphorePermit),
+    Busy(&'static str),
+    Closed,
+}
+
+/// Receive one request, applying the idle timeout only to accepted links.
+async fn next_request(
+    incoming: &mut mpsc::Receiver<Incoming>,
+    reap_idle: bool,
+) -> Option<Incoming> {
+    if reap_idle {
+        tokio::time::timeout(IDLE_TIMEOUT, incoming.recv()).await.ok().flatten()
+    } else {
+        incoming.recv().await
+    }
+}
+
+/// Assign Updates and dependency serves to their independent bounded lanes.
+async fn admit_request(
+    req: &Req,
+    serves: &Arc<Semaphore>,
+    updates: &Arc<Semaphore>,
+) -> RequestAdmission {
+    if matches!(req, Req::Update { .. }) {
+        // Do not let a ninth Update park the dispatcher ahead of a nested
+        // dependency request. The admitted Updates keep running and the
+        // excess one gets the ordinary bounded-retry response.
+        return match updates.clone().try_acquire_owned() {
+            Ok(permit) => RequestAdmission::Admitted(permit),
+            Err(_) => RequestAdmission::Busy("update slots busy"),
+        };
+    }
+
+    // A bounded wait keeps a full serve lane from parking the dispatcher
+    // forever. A timeout means BUSY, while semaphore closure ends the loop.
+    match tokio::time::timeout(IDLE_TIMEOUT, serves.clone().acquire_owned()).await {
+        Ok(Ok(permit)) => RequestAdmission::Admitted(permit),
+        Ok(Err(_)) => RequestAdmission::Closed,
+        Err(_) => RequestAdmission::Busy("serve slots busy"),
+    }
+}
+
 /// The established-request loop shared by accepted and outbound links.
 async fn serve_requests(
     conn: Conn,
@@ -533,62 +577,27 @@ async fn serve_requests(
     let serves = Arc::new(Semaphore::new(MAX_CONCURRENT_SERVES));
     let updates = Arc::new(Semaphore::new(MAX_CONCURRENT_UPDATES));
     loop {
-        let inc = if reap_idle {
-            match tokio::time::timeout(IDLE_TIMEOUT, incoming.recv()).await {
-                Ok(Some(inc)) => inc,
-                Ok(None) | Err(_) => break,
-            }
-        } else {
-            match incoming.recv().await {
-                Some(inc) => inc,
-                None => break,
-            }
+        let Some(inc) = next_request(&mut incoming, reap_idle).await else {
+            break;
         };
         // Updates and the requests they may synchronously issue back over this
         // same duplex link need independent bounded lanes. If eight Updates on
         // each endpoint occupied the one shared semaphore, all sixteen could
         // wait for GetSigned/GetBitfield/GetRange requests that neither request
         // loop had a permit left to dispatch.
-        let permit = if matches!(&inc.req, Req::Update { .. }) {
-            // Do not let a ninth Update park the dispatcher ahead of a nested
-            // dependency request. The eight admitted Updates keep running and
-            // the excess one gets the ordinary bounded-retry response.
-            match updates.clone().try_acquire_owned() {
-                Ok(p) => p,
-                Err(_) => {
-                    let _ = conn
-                        .respond(
-                            inc.stream,
-                            busy_resp(&identity, SERVE_SLOTS_RETRY_SECS, "update slots busy"),
-                        )
-                        .await;
-                    continue;
-                }
+        let permit = match admit_request(&inc.req, &serves, &updates).await {
+            RequestAdmission::Admitted(permit) => permit,
+            RequestAdmission::Busy(message) => {
+                let _ = conn
+                    .respond(
+                        inc.stream,
+                        busy_resp(&identity, SERVE_SLOTS_RETRY_SECS, message),
+                    )
+                    .await;
+                continue;
             }
-        } else {
-            // Bounded too: with all MAX_CONCURRENT_SERVES permits held by slow
-            // serves, an unbounded wait here parks the loop off the timeout
-            // above, so the idle reaper could never fire for this connection.
-            // Running out of permits means the connection is BUSY, not idle, so
-            // the request is answered and the loop goes on: breaking here would
-            // shed the busiest connection and, worse, drop this request with no
-            // reply while `incoming` goes away under the in-flight serves, which
-            // black-holes everything the peer sends after it.
-            let slot = tokio::time::timeout(IDLE_TIMEOUT, serves.clone().acquire_owned()).await;
-            match slot {
-                Ok(Ok(p)) => p,
-                // The semaphore is ours and never closed; treat it as fatal.
-                Ok(Err(_)) => break,
-                Err(_) => {
-                    let _ = conn
-                        .respond(
-                            inc.stream,
-                            busy_resp(&identity, SERVE_SLOTS_RETRY_SECS, "serve slots busy"),
-                        )
-                        .await;
-                    continue;
-                }
-            }
+            // The semaphore is ours and never closed; treat closure as fatal.
+            RequestAdmission::Closed => break,
         };
         let conn = conn.clone();
         let ctx = ctx.clone();

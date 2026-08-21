@@ -858,6 +858,112 @@ struct PendingChildRelay {
     merge_pending: bool,
 }
 
+struct ChildMergeStage<'a> {
+    address: &'a str,
+    canonical: &'a str,
+    inner_path: &'a str,
+    view: &'a Xite,
+    content: &'a Value,
+    xid_map: &'a HashMap<String, Vec<String>>,
+    source: Option<&'a Arc<dyn InboundEdxSource>>,
+    sender: Option<&'a PeerAddr>,
+    sender_peers: &'a [PeerAddr],
+}
+
+pub struct MergeFetchRequest<'a> {
+    pub address: &'a str,
+    pub inner_path: &'a str,
+    pub signers: &'a [String],
+    pub max_size: Option<u64>,
+    pub sender: Option<&'a PeerAddr>,
+    pub sender_peers: &'a [PeerAddr],
+    pub union_from: usize,
+}
+
+struct InboundFinish {
+    keys: Vec<String>,
+    xite: Xite,
+    sender: Option<PeerAddr>,
+    sender_peers: Vec<PeerAddr>,
+    inner_path: String,
+    uri: String,
+    payload: UpdatePayload,
+    source: Option<Arc<dyn InboundEdxSource>>,
+    child_files: Option<Vec<epix_xite::FileEntry>>,
+    child_bytes: Option<Vec<u8>>,
+    root_bytes: Option<Vec<u8>>,
+    expected_modified: f64,
+    _update_guard: tokio::sync::OwnedMutexGuard<()>,
+}
+
+struct InboundFinishOutcome {
+    committed: bool,
+    relay_ready: bool,
+    merge_failed: bool,
+    missing_child: Vec<String>,
+}
+
+struct CurrentMergeRequest<'a> {
+    key: &'a str,
+    canonical: &'a str,
+    inner_path: &'a str,
+    payload: UpdatePayload,
+    source: Option<Arc<dyn InboundEdxSource>>,
+    sender: Option<&'a PeerAddr>,
+    sender_peers: &'a [PeerAddr],
+}
+
+struct CurrentMergeContext<'a> {
+    key: &'a str,
+    canonical: &'a str,
+    inner_path: &'a str,
+    view: &'a Xite,
+    content: &'a Value,
+    xid_map: &'a HashMap<String, Vec<String>>,
+    signers: &'a [String],
+    source: Option<&'a Arc<dyn InboundEdxSource>>,
+    sender: Option<&'a PeerAddr>,
+    sender_peers: &'a [PeerAddr],
+    require_delivery: bool,
+}
+
+impl CurrentMergeContext<'_> {
+    fn full_path(&self, relative: &str) -> String {
+        let dir = self
+            .inner_path
+            .strip_suffix("content.json")
+            .unwrap_or("")
+            .trim_end_matches('/');
+        if dir.is_empty() {
+            relative.to_string()
+        } else {
+            format!("{dir}/{relative}")
+        }
+    }
+}
+
+enum CurrentMergeItem {
+    None,
+    Pull,
+    Inline(Vec<u8>),
+    Object(EdxObjectRef),
+}
+
+#[derive(Default)]
+struct CurrentMergeAttempt {
+    handled: bool,
+    legacy_pull: bool,
+    novel_delta: Option<Vec<u8>>,
+}
+
+#[derive(Default)]
+struct CurrentMergeProgress {
+    relay_deltas: HashMap<String, Vec<u8>>,
+    changed: bool,
+    missing_merge: Vec<String>,
+    missing_files: Vec<epix_xite::FileEntry>,
+}
+
 impl PendingChildRelay {
     /// Conservatively account for peer-controlled memory retained while this
     /// relay waits. Include the staged manifest, duplicated file metadata,
@@ -1346,6 +1452,33 @@ struct PublishRun {
     requires_payload_ack: bool,
     done: usize,
     attempted: usize,
+}
+
+impl PublishRun {
+    fn delivered(&self) -> bool {
+        if self.requires_payload_ack {
+            self.payload_aware > 0
+        } else {
+            self.published > 0
+        }
+    }
+}
+
+struct PublishOptions {
+    limit: usize,
+    exhaustive: bool,
+    expected_modified: Option<f64>,
+    progress: Option<Option<u64>>,
+}
+
+struct PublishJob {
+    address: String,
+    inner_path: String,
+    body: Arc<Vec<u8>>,
+    modified: f64,
+    payload: Arc<UpdatePayload>,
+    sender_peers: Arc<Vec<String>>,
+    edx: Arc<dyn EdxFetcher>,
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -5707,32 +5840,19 @@ impl AppState {
     /// repair entries may already be stored but still lack required objects.
     async fn defer_child_relay(
         &self,
-        keys: &[String],
-        inner_path: &str,
-        modified: f64,
-        files: &[epix_xite::FileEntry],
-        payload: &UpdatePayload,
-        staged_bytes: Option<&[u8]>,
+        relay: PendingChildRelay,
         missing: &[String],
-        merge_pending: bool,
     ) {
-        let key = Self::pending_child_key(&keys[0], inner_path);
+        let key = Self::pending_child_key(&relay.keys[0], &relay.inner_path);
+        let keys = relay.keys.clone();
+        let inner_path = relay.inner_path.clone();
+        let modified = relay.modified;
+        let merge_pending = relay.merge_pending;
         {
             let mut pending = self.pending_child_relays.lock().unwrap();
             let replace = pending.get(&key).is_none_or(|old| old.modified <= modified);
             if replace {
-                pending.insert(
-                    key,
-                    PendingChildRelay {
-                        keys: keys.to_vec(),
-                        inner_path: inner_path.to_string(),
-                        modified,
-                        files: files.to_vec(),
-                        payload: payload.clone(),
-                        staged_bytes: staged_bytes.map(<[u8]>::to_vec),
-                        merge_pending,
-                    },
-                );
+                pending.insert(key, relay);
             }
             let mut retained_bytes = pending.values().fold(0usize, |total, relay| {
                 total.saturating_add(relay.retained_bytes())
@@ -5754,7 +5874,7 @@ impl AppState {
         }
         {
             let mut xites = self.xites.write().await;
-            for key in keys {
+            for key in &keys {
                 if let Some(xite) = xites.get_mut(key) {
                     for path in missing {
                         *xite.settings.cache.bad_files.entry(path.clone()).or_insert(0) += 1;
@@ -5768,6 +5888,175 @@ impl AppState {
                 "Child update {inner_path} is verified but incomplete ({} hashed file(s), merge pending: {merge_pending}); deferring hint and re-gossip",
                 missing.len(),
             ),
+        )
+        .await;
+    }
+
+    fn pending_child_is_stale(storage: &XiteStorage, pending: &PendingChildRelay) -> bool {
+        let current_modified = storage
+            .read(&pending.inner_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .and_then(|content| content.get("modified").and_then(Value::as_f64))
+            .unwrap_or(0.0);
+        if pending.staged_bytes.is_some() {
+            current_modified >= pending.modified
+        } else {
+            current_modified != pending.modified
+        }
+    }
+
+    async fn complete_pending_child_files(
+        self: &Arc<Self>,
+        pending: &PendingChildRelay,
+        storage: &XiteStorage,
+        canonical: &str,
+    ) -> bool {
+        let missing = Self::missing_child_files(storage, &pending.files);
+        if missing.is_empty() {
+            return true;
+        }
+        if self.transport.read().await.is_none() {
+            return false;
+        }
+        let peers = self.connectable_peers(&pending.keys[0], 10).await;
+        if peers.is_empty() {
+            return false;
+        }
+        let needed: Vec<epix_xite::FileEntry> = pending
+            .files
+            .iter()
+            .filter(|file| missing.contains(&file.inner_path))
+            .cloned()
+            .collect();
+        let staged_content = pending
+            .staged_bytes
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .or_else(|| {
+                storage
+                    .read(&pending.inner_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            });
+        let staged = staged_content
+            .map(|content| Self::staged_child_edx_content(&pending.inner_path, &content));
+        let _ = self
+            .edx_first(
+                &pending.keys[0],
+                needed,
+                peers,
+                staged.as_ref(),
+                Some((canonical, &pending.inner_path)),
+                None,
+            )
+            .await;
+        Self::missing_child_files(storage, &pending.files).is_empty()
+    }
+
+    fn mark_pending_child_merge_failed(
+        &self,
+        pending_key: &str,
+        relay_payload: UpdatePayload,
+    ) {
+        let mut relays = self.pending_child_relays.lock().unwrap();
+        let Some(live) = relays.get_mut(pending_key) else {
+            return;
+        };
+        live.staged_bytes = None;
+        live.merge_pending = true;
+        live.payload = relay_payload;
+    }
+
+    async fn commit_pending_child(
+        &self,
+        pending_key: &str,
+        pending: &PendingChildRelay,
+        storage: &XiteStorage,
+    ) -> Option<UpdatePayload> {
+        let mut relay_payload = pending.payload.clone();
+        let Some(bytes) = pending.staged_bytes.as_ref() else {
+            return Some(relay_payload);
+        };
+        let xite = self.xite_view(&pending.keys[0]).await.ok()?;
+        let xid_map = Self::resolve_xid_map(storage, &pending.inner_path).await;
+        if xite.add_content(&pending.inner_path, bytes, &xid_map).is_err() {
+            return None;
+        }
+        let content = serde_json::from_slice::<Value>(bytes).ok()?;
+        if let Err(error) = self
+            .apply_staged_child_merge_payload(
+                &pending.keys[0],
+                &pending.inner_path,
+                &xite,
+                &content,
+                &xid_map,
+                &mut relay_payload,
+            )
+            .await
+        {
+            self.log("WARN", error).await;
+            self.mark_pending_child_merge_failed(pending_key, relay_payload);
+            return None;
+        }
+        self.ingest_file_from(&pending.keys[0], &pending.inner_path, None).await;
+        for file in &pending.files {
+            self.ingest_file_from(&pending.keys[0], &file.inner_path, None).await;
+        }
+        Some(relay_payload)
+    }
+
+    async fn clear_pending_child_state(&self, pending_key: &str, pending: &PendingChildRelay) {
+        {
+            let mut relays = self.pending_child_relays.lock().unwrap();
+            if relays.get(pending_key).is_some_and(|live| live.modified == pending.modified) {
+                relays.remove(pending_key);
+            }
+        }
+        let paths: std::collections::HashSet<&str> =
+            pending.files.iter().map(|file| file.inner_path.as_str()).collect();
+        let mut xites = self.xites.write().await;
+        for key in &pending.keys {
+            if let Some(xite) = xites.get_mut(key) {
+                xite.settings.cache.bad_files.retain(|path, _| !paths.contains(path.as_str()));
+            }
+        }
+    }
+
+    async fn announce_promoted_child(
+        self: &Arc<Self>,
+        canonical: &str,
+        pending: &PendingChildRelay,
+        mut relay: UpdatePayload,
+    ) {
+        let can_republish = self.transport.read().await.is_some();
+        if can_republish {
+            relay.require_merge_delivery = false;
+            relay.merge_objects.clear();
+            let _ = self
+                .publish_to(
+                    &pending.keys[0],
+                    &pending.inner_path,
+                    relay,
+                    PublishOptions {
+                        limit: 3,
+                        exhaustive: false,
+                        expected_modified: Some(pending.modified),
+                        progress: None,
+                    },
+                )
+                .await;
+        } else {
+            self.record_update_hint(canonical, pending.modified as i64).await;
+        }
+        self.mark_optional_dirty(&pending.keys[0]);
+        self.refresh_optional_owed(&pending.keys[0]).await;
+        for key in &pending.keys {
+            self.push_xite_info_event(key, "updated").await;
+        }
+        self.log(
+            "INFO",
+            format!("Deferred child update {} is now relay-ready", pending.inner_path),
         )
         .await;
     }
@@ -5806,150 +6095,25 @@ impl AppState {
         else {
             return false;
         };
-        let current_modified = storage
-            .read(&pending.inner_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .and_then(|content| content.get("modified").and_then(Value::as_f64))
-            .unwrap_or(0.0);
-        let stale = if pending.staged_bytes.is_some() {
-            current_modified >= pending.modified
-        } else {
-            current_modified != pending.modified
-        };
-        if stale {
+        if Self::pending_child_is_stale(&storage, &pending) {
             self.pending_child_relays.lock().unwrap().remove(pending_key);
             return false;
         }
         if pending.merge_pending {
             return false;
         }
-        let mut missing = Self::missing_child_files(&storage, &pending.files);
-        if !missing.is_empty() && self.transport.read().await.is_some() {
-            let peers = self.connectable_peers(&pending.keys[0], 10).await;
-            if !peers.is_empty() {
-                let needed: Vec<epix_xite::FileEntry> = pending
-                    .files
-                    .iter()
-                    .filter(|file| missing.contains(&file.inner_path))
-                    .cloned()
-                    .collect();
-                let staged_content = pending
-                    .staged_bytes
-                    .as_ref()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-                    .or_else(|| {
-                        storage
-                            .read(&pending.inner_path)
-                            .ok()
-                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                    });
-                let staged = staged_content
-                    .map(|content| Self::staged_child_edx_content(&pending.inner_path, &content));
-                let _ = self
-                    .edx_first(
-                        &pending.keys[0],
-                        needed,
-                        peers,
-                        staged.as_ref(),
-                        Some((&canonical, &pending.inner_path)),
-                        None,
-                    )
-                    .await;
-                missing = Self::missing_child_files(&storage, &pending.files);
-            }
-        }
-        if !missing.is_empty() {
+        if !self
+            .complete_pending_child_files(&pending, &storage, &canonical)
+            .await
+        {
             return false;
         }
-        let mut relay_payload = pending.payload.clone();
-        if let Some(bytes) = pending.staged_bytes.as_ref() {
-            let Ok(xite) = self.xite_view(&pending.keys[0]).await else {
-                return false;
-            };
-            let xid_map = Self::resolve_xid_map(&storage, &pending.inner_path).await;
-            if xite.add_content(&pending.inner_path, bytes, &xid_map).is_err() {
-                return false;
-            }
-            let Some(content) = serde_json::from_slice::<Value>(bytes).ok() else {
-                return false;
-            };
-            if let Err(error) = self
-                .apply_staged_child_merge_payload(
-                    &pending.keys[0],
-                    &pending.inner_path,
-                    &xite,
-                    &content,
-                    &xid_map,
-                    &mut relay_payload,
-                )
-                .await
-            {
-                self.log("WARN", error).await;
-                if let Some(live) = self
-                    .pending_child_relays
-                    .lock()
-                    .unwrap()
-                    .get_mut(pending_key)
-                {
-                    live.staged_bytes = None;
-                    live.merge_pending = true;
-                    live.payload = relay_payload;
-                }
-                return false;
-            }
-            self.ingest_file_from(&pending.keys[0], &pending.inner_path, None).await;
-            for file in &pending.files {
-                self.ingest_file_from(&pending.keys[0], &file.inner_path, None).await;
-            }
-        }
-        // A newer deferred version may have replaced the one we cloned.
-        {
-            let mut relays = self.pending_child_relays.lock().unwrap();
-            if relays.get(pending_key).is_some_and(|live| live.modified == pending.modified) {
-                relays.remove(pending_key);
-            }
-        }
-        {
-            let paths: std::collections::HashSet<&str> =
-                pending.files.iter().map(|file| file.inner_path.as_str()).collect();
-            let mut xites = self.xites.write().await;
-            for key in &pending.keys {
-                if let Some(xite) = xites.get_mut(key) {
-                    xite.settings.cache.bad_files.retain(|path, _| !paths.contains(path.as_str()));
-                }
-            }
-        }
-        let can_republish = self.transport.read().await.is_some();
-        if !can_republish {
-            self.record_update_hint(&canonical, pending.modified as i64).await;
-        }
-        if can_republish {
-            let mut relay = relay_payload;
-            relay.require_merge_delivery = false;
-            relay.merge_objects.clear();
-            let _ = self
-                .publish_to(
-                    &pending.keys[0],
-                    &pending.inner_path,
-                    3,
-                    false,
-                    relay,
-                    Some(pending.modified),
-                    None,
-                )
-                .await;
-        }
-        self.mark_optional_dirty(&pending.keys[0]);
-        self.refresh_optional_owed(&pending.keys[0]).await;
-        for key in &pending.keys {
-            self.push_xite_info_event(key, "updated").await;
-        }
-        self.log(
-            "INFO",
-            format!("Deferred child update {} is now relay-ready", pending.inner_path),
-        )
-        .await;
+        let Some(relay_payload) = self.commit_pending_child(pending_key, &pending, &storage).await
+        else {
+            return false;
+        };
+        self.clear_pending_child_state(pending_key, &pending).await;
+        self.announce_promoted_child(&canonical, &pending, relay_payload).await;
         true
     }
 
@@ -11467,25 +11631,10 @@ impl AppState {
         serde_json::to_vec(&verified).map(Some).map_err(|e| e.to_string())
     }
 
-    /// Resolve all merge work named by a newly verified child while keeping it
-    /// off disk. Negotiated peers only trigger work for explicit envelope
-    /// entries. Capless peers preserve the legacy bump behavior and pull every
-    /// declared merge file from the exact live source, then known addresses.
-    #[allow(clippy::too_many_arguments)]
-    async fn stage_child_merge_payload(
-        &self,
-        address: &str,
-        canonical: &str,
-        inner_path: &str,
-        view: &Xite,
-        content: &Value,
-        xid_map: &HashMap<String, Vec<String>>,
-        payload: &mut UpdatePayload,
-        source: Option<&Arc<dyn InboundEdxSource>>,
-        sender: Option<&PeerAddr>,
-        sender_peers: &[PeerAddr],
+    fn validate_child_merge_paths(
+        merge_paths: &[String],
+        payload: &UpdatePayload,
     ) -> Result<(), String> {
-        let merge_paths = epix_content::declared_merge_files(content);
         if payload
             .merge_deltas
             .keys()
@@ -11501,103 +11650,153 @@ impl AppState {
         {
             return Err("Merge payload names an undeclared path".into());
         }
+        Ok(())
+    }
 
-        let require_delivery = payload.require_merge_delivery;
-        let signers = view.valid_signers_for_content(inner_path, content, xid_map);
+    fn child_merge_full_path(inner_path: &str, relative: &str) -> String {
         let dir = inner_path
             .strip_suffix("content.json")
             .unwrap_or("")
             .trim_end_matches('/');
-        let mut staged = HashMap::new();
+        if dir.is_empty() {
+            relative.to_string()
+        } else {
+            format!("{dir}/{relative}")
+        }
+    }
+
+    async fn fetch_staged_merge_object(
+        source: Option<&Arc<dyn InboundEdxSource>>,
+        object: EdxObjectRef,
+        full: &str,
+    ) -> Result<Vec<u8>, String> {
+        let live = source
+            .ok_or_else(|| format!("Merge delta object for {full} has no live source"))?;
+        if object.size == 0 || object.size > MAX_MERGE_DELTA_OBJECT_BYTES {
+            return Err(format!(
+                "Merge delta object for {full} has invalid size {}",
+                object.size
+            ));
+        }
+        let bytes = live
+            .fetch_object(object.id, object.size)
+            .await
+            .map_err(|e| format!("Merge delta object fetch for {full} failed: {e}"))?
+            .ok_or_else(|| format!("Merge delta object for {full} was unavailable"))?;
+        if bytes.len() as u64 != object.size || epix_blob::ObjId::of(&bytes) != object.id {
+            return Err(format!(
+                "Merge delta object for {full} failed size or hash verification"
+            ));
+        }
+        Ok(bytes)
+    }
+
+    async fn fetch_staged_merge_fallback(
+        &self,
+        stage: &ChildMergeStage<'_>,
+        full: &str,
+        signers: &[String],
+    ) -> Option<Vec<u8>> {
+        if self.transport.read().await.is_none() {
+            return None;
+        }
+        let mut peers = Vec::new();
+        if let Some(peer) = stage.sender {
+            peers.push(peer.clone());
+        }
+        for peer in stage.sender_peers {
+            if !peers.contains(peer) {
+                peers.push(peer.clone());
+            }
+        }
+        let (fetched, served, outcomes) = self
+            .union_merge_copies(
+                stage.canonical,
+                full,
+                signers,
+                &peers,
+                1,
+                epix_content::make_container(Vec::new()),
+            )
+            .await;
+        if !outcomes.is_empty() {
+            self.apply_peer_outcomes(stage.address, outcomes).await;
+        }
+        if served == 0 {
+            return None;
+        }
+        serde_json::to_vec(&fetched).ok()
+    }
+
+    async fn take_staged_merge_candidate(
+        &self,
+        stage: &ChildMergeStage<'_>,
+        payload: &mut UpdatePayload,
+        relative: &str,
+        full: &str,
+        signers: &[String],
+    ) -> Result<Option<Vec<u8>>, String> {
+        if let Some(delta) = payload.merge_deltas.remove(relative).filter(|delta| !delta.is_empty()) {
+            return Ok(Some(delta));
+        }
+        if let Some(object) = payload.merge_objects.remove(relative) {
+            return Self::fetch_staged_merge_object(stage.source, object, full)
+                .await
+                .map(Some);
+        }
+        if let Some(live) = stage.source {
+            if let Ok(Some(bytes)) = live.fetch_signed(stage.canonical, full).await {
+                return Ok(Some(bytes));
+            }
+        }
+        Ok(self
+            .fetch_staged_merge_fallback(stage, full, signers)
+            .await)
+    }
+
+    /// Resolve all merge work named by a newly verified child while keeping it
+    /// off disk. Negotiated peers only trigger work for explicit envelope
+    /// entries. Capless peers preserve the legacy bump behavior and pull every
+    /// declared merge file from the exact live source, then known addresses.
+    async fn stage_child_merge_payload(
+        &self,
+        stage: ChildMergeStage<'_>,
+        payload: &mut UpdatePayload,
+    ) -> Result<(), String> {
+        let merge_paths = epix_content::declared_merge_files(stage.content);
+        Self::validate_child_merge_paths(&merge_paths, payload)?;
+
+        let require_delivery = payload.require_merge_delivery;
+        let signers = stage
+            .view
+            .valid_signers_for_content(stage.inner_path, stage.content, stage.xid_map);
+        let mut staged_deltas = HashMap::new();
         for rel in merge_paths {
             let explicit = payload.merge_deltas.contains_key(&rel)
                 || payload.merge_objects.contains_key(&rel);
             if require_delivery && !explicit {
                 continue;
             }
-            let full = if dir.is_empty() {
-                rel.clone()
-            } else {
-                format!("{dir}/{rel}")
-            };
-            let max_size =
-                Self::merge_file_max_size(view, inner_path, content, xid_map, &rel);
-            let mut candidate = payload.merge_deltas.remove(&rel);
-            if candidate.as_ref().is_some_and(Vec::is_empty) {
-                candidate = None;
-            }
-            if candidate.is_none() {
-                if let Some(object) = payload.merge_objects.remove(&rel) {
-                    let live = source.ok_or_else(|| {
-                        format!("Merge delta object for {full} has no live source")
-                    })?;
-                    if object.size == 0 || object.size > MAX_MERGE_DELTA_OBJECT_BYTES {
-                        return Err(format!(
-                            "Merge delta object for {full} has invalid size {}",
-                            object.size
-                        ));
-                    }
-                    let bytes = live
-                        .fetch_object(object.id, object.size)
-                        .await
-                        .map_err(|e| format!("Merge delta object fetch for {full} failed: {e}"))?
-                        .ok_or_else(|| format!("Merge delta object for {full} was unavailable"))?;
-                    if bytes.len() as u64 != object.size
-                        || epix_blob::ObjId::of(&bytes) != object.id
-                    {
-                        return Err(format!(
-                            "Merge delta object for {full} failed size or hash verification"
-                        ));
-                    }
-                    candidate = Some(bytes);
-                }
-            }
-            // Empty pull markers and capless bumps first reuse the exact
-            // authenticated session that carried this child manifest.
-            if candidate.is_none() {
-                if let Some(live) = source {
-                    candidate = live.fetch_signed(canonical, &full).await.ok().flatten();
-                }
-            }
-            // Preserve the established reverse-dial fallback for old peers or
-            // a live source that cannot serve the path.
-            if candidate.is_none() && self.transport.read().await.is_some() {
-                let mut peers = Vec::new();
-                if let Some(peer) = sender {
-                    peers.push(peer.clone());
-                }
-                for peer in sender_peers {
-                    if !peers.contains(peer) {
-                        peers.push(peer.clone());
-                    }
-                }
-                let (fetched, served, outcomes) = self
-                    .union_merge_copies(
-                        canonical,
-                        &full,
-                        &signers,
-                        &peers,
-                        1,
-                        epix_content::make_container(Vec::new()),
-                    )
-                    .await;
-                if !outcomes.is_empty() {
-                    self.apply_peer_outcomes(address, outcomes).await;
-                }
-                if served > 0 {
-                    candidate = serde_json::to_vec(&fetched).ok();
-                }
-            }
-
+            let full = Self::child_merge_full_path(stage.inner_path, &rel);
+            let max_size = Self::merge_file_max_size(
+                stage.view,
+                stage.inner_path,
+                stage.content,
+                stage.xid_map,
+                &rel,
+            );
+            let candidate = self
+                .take_staged_merge_candidate(&stage, payload, &rel, &full, &signers)
+                .await?;
             let verified = match candidate {
                 Some(bytes) => self
-                    .stage_merge_records(address, &full, &signers, &bytes, max_size)
+                    .stage_merge_records(stage.address, &full, &signers, &bytes, max_size)
                     .await?,
                 None => None,
             };
             match verified {
                 Some(bytes) => {
-                    staged.insert(rel, bytes);
+                    staged_deltas.insert(rel, bytes);
                 }
                 None if require_delivery => {
                     return Err(format!("Merge delivery incomplete for {full}"));
@@ -11605,7 +11804,7 @@ impl AppState {
                 None => {}
             }
         }
-        payload.merge_deltas = staged;
+        payload.merge_deltas = staged_deltas;
         payload.merge_objects.clear();
         Ok(())
     }
@@ -11659,6 +11858,57 @@ impl AppState {
     /// and rises in selection. Without this the merge fetch was outcome-blind,
     /// so dead peers kept their slots and a good seed never gained the
     /// reputation to be picked. `EPIX_MERGE_TRACE=1` logs every answer.
+    fn verify_merge_copy(bytes: &[u8], signers: &[String]) -> Result<(Value, usize), String> {
+        let incoming: Value = serde_json::from_slice(bytes)
+            .map_err(|_| "served unparsable bytes".to_string())?;
+        let incoming_count = epix_content::records_of(&incoming).len();
+        let verified = epix_content::merge_orset(
+            &epix_content::make_container(Vec::new()),
+            &incoming,
+            signers,
+            epix_core::now_ms(),
+        );
+        let verified_count = epix_content::records_of(&verified).len();
+        let canonical_empty = incoming_count == 0
+            && incoming.get("record_format").and_then(Value::as_str)
+                == Some(epix_content::RECORD_FORMAT)
+            && incoming.get("post").is_some_and(Value::is_array);
+        if verified_count > 0 || canonical_empty {
+            Ok((verified, verified_count))
+        } else {
+            Err(format!("served {incoming_count} record(s), none valid"))
+        }
+    }
+
+    async fn fetch_one_merge_copy(
+        &self,
+        peer: &PeerAddr,
+        canonical: &str,
+        inner_path: &str,
+        signers: &[String],
+    ) -> (epix_worker::PeerOutcome, String, Option<Value>) {
+        match self.edx_fetch_signed(peer.clone(), canonical, inner_path).await {
+            Some(Ok(Some(bytes))) => match Self::verify_merge_copy(&bytes, signers) {
+                Ok((verified, count)) => (
+                    epix_worker::PeerOutcome::FileOk,
+                    format!("served {count} verified record(s)"),
+                    Some(verified),
+                ),
+                Err(answer) => (epix_worker::PeerOutcome::FileOk, answer, None),
+            },
+            Some(Ok(None)) => (
+                epix_worker::PeerOutcome::FileFail,
+                "refused".to_string(),
+                None,
+            ),
+            Some(Err(_)) | None => (
+                epix_worker::PeerOutcome::ConnectFail,
+                "dial failed".to_string(),
+                None,
+            ),
+        }
+    }
+
     async fn union_merge_copies(
         &self,
         canonical: &str,
@@ -11676,61 +11926,17 @@ impl AppState {
             if served >= union_from {
                 break;
             }
-            // EDX GetSigned fetches the raw bytes of `inner_path` over an EDX
-            // link; we verify them against the merge rules. A peer that serves
-            // unparsable bytes counts as answering (FileOk for the registry)
-            // but not as a served copy.
-            let answer;
-            match self.edx_fetch_signed(p.clone(), canonical, inner_path).await {
-                Some(Ok(Some(bytes))) => {
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileOk));
-                    match serde_json::from_slice::<Value>(&bytes) {
-                        Ok(incoming) => {
-                            let incoming_count = epix_content::records_of(&incoming).len();
-                            let verified = epix_content::merge_orset(
-                                &epix_content::make_container(Vec::new()),
-                                &incoming,
-                                signers,
-                                epix_core::now_ms(),
-                            );
-                            let verified_count = epix_content::records_of(&verified).len();
-                            // A canonical empty container is valid. A
-                            // non-empty answer whose every record failed
-                            // authorization is not a served merge copy and
-                            // must not satisfy a capable publisher's receipt.
-                            let canonical_empty = incoming_count == 0
-                                && incoming.get("record_format").and_then(Value::as_str)
-                                    == Some(epix_content::RECORD_FORMAT)
-                                && incoming.get("post").is_some_and(Value::is_array);
-                            if verified_count > 0 || canonical_empty {
-                                answer = format!("served {verified_count} verified record(s)");
-                                merged = epix_content::merge_orset(
-                                    &merged,
-                                    &verified,
-                                    signers,
-                                    epix_core::now_ms(),
-                                );
-                                served += 1;
-                            } else {
-                                answer = format!(
-                                    "served {incoming_count} record(s), none valid"
-                                );
-                            }
-                        }
-                        Err(_) => answer = "served unparsable bytes".to_string(),
-                    }
-                }
-                // Dialed fine but couldn't serve this file: dock reputation only
-                // (it may still serve others), don't back it off.
-                Some(Ok(None)) => {
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::FileFail));
-                    answer = "refused".to_string();
-                }
-                // Dial/link failed, or no fetcher: back it off.
-                Some(Err(_)) | None => {
-                    outcomes.push((p.clone(), epix_worker::PeerOutcome::ConnectFail));
-                    answer = "dial failed".to_string();
-                }
+            let (outcome, answer, verified) =
+                self.fetch_one_merge_copy(p, canonical, inner_path, signers).await;
+            outcomes.push((p.clone(), outcome));
+            if let Some(verified) = verified {
+                merged = epix_content::merge_orset(
+                    &merged,
+                    &verified,
+                    signers,
+                    epix_core::now_ms(),
+                );
+                served += 1;
             }
             if trace {
                 self.log("INFO", format!("[merge-trace] {inner_path} <- {p}: {answer}")).await;
@@ -11909,14 +12115,17 @@ impl AppState {
     /// otherwise silent, and "Updated!" with stale data is undebuggable.
     pub async fn fetch_and_merge_records(
         &self,
-        address: &str,
-        inner_path: &str,
-        signers: &[String],
-        max_size: Option<u64>,
-        sender: Option<&PeerAddr>,
-        sender_peers: &[PeerAddr],
-        union_from: usize,
+        request: MergeFetchRequest<'_>,
     ) -> MergeFetchOutcome {
+        let MergeFetchRequest {
+            address,
+            inner_path,
+            signers,
+            max_size,
+            sender,
+            sender_peers,
+            union_from,
+        } = request;
         if self.transport.read().await.is_none() {
             return MergeFetchOutcome::default(); // offline
         }
@@ -12105,13 +12314,15 @@ impl AppState {
                 Self::merge_file_max_size(view, content_path, &content, &xid_map, &rel);
             let outcome = self
                 .fetch_and_merge_records(
-                    address,
-                    &mpath,
-                    &signers,
-                    max_size,
-                    None,
-                    peers,
-                    MERGE_SWEEP_UNION,
+                    MergeFetchRequest {
+                        address,
+                        inner_path: &mpath,
+                        signers: &signers,
+                        max_size,
+                        sender: None,
+                        sender_peers: peers,
+                        union_from: MERGE_SWEEP_UNION,
+                    },
                 )
                 .await;
             files += 1;
@@ -12863,7 +13074,17 @@ impl AppState {
             require_merge_delivery: false,
         };
         let result = self
-            .publish_to(address, inner_path, 20, exhaustive, payload, None, Some(origin))
+            .publish_to(
+                address,
+                inner_path,
+                payload,
+                PublishOptions {
+                    limit: 20,
+                    exhaustive,
+                    expected_modified: None,
+                    progress: Some(origin),
+                },
+            )
             .await?;
         if result.payload_aware > 0 {
             self.acknowledge_merge_snapshots(address, merge_receipts).await;
@@ -12890,11 +13111,8 @@ impl AppState {
         self: &Arc<Self>,
         address: &str,
         inner_path: &str,
-        limit: usize,
-        exhaustive: bool,
         payload: UpdatePayload,
-        expected_modified: Option<f64>,
-        progress: Option<Option<u64>>,
+        options: PublishOptions,
     ) -> Result<PublishResult, String> {
         /// Upper bound on dial attempts for an exhaustive publish: batches of
         /// `limit` are bounded by one connect_timeout each, so this caps the
@@ -12915,7 +13133,7 @@ impl AppState {
             .ok()
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
-        if expected_modified.is_some_and(|expected| expected != modified) {
+        if options.expected_modified.is_some_and(|expected| expected != modified) {
             return Ok(PublishResult::default());
         }
         // The publisher is itself the best store-and-forward source for this
@@ -12931,20 +13149,18 @@ impl AppState {
             .await
             .clone()
             .ok_or("publishing requires EDX (it is disabled)")?;
-        let pool =
-            self.connectable_peers(address, if exhaustive { MAX_PUBLISH_DIALS } else { limit }).await;
-        let total = pool.len();
-        if exhaustive {
-            let overlay = pool.iter().filter(|p| p.is_overlay()).count();
-            self.log(
-                "DEBUG",
-                format!(
-                    "publish {address}: {total} candidate(s) ({} clearnet, {overlay} overlay), batch size {limit}",
-                    total - overlay
-                ),
+        let pool = self
+            .connectable_peers(
+                address,
+                if options.exhaustive {
+                    MAX_PUBLISH_DIALS
+                } else {
+                    options.limit
+                },
             )
             .await;
-        }
+        let total = pool.len();
+        self.log_publish_pool(address, &pool, &options).await;
         let requires_payload_ack = !payload.merge_deltas.is_empty();
         // Keep the payload transport-neutral (the EDX edge lowers diffs and
         // inline merge deltas to their wire forms); Arc so up to 100 spawned
@@ -12960,15 +13176,60 @@ impl AppState {
         // port is closed.
         let sender_peers = Arc::new(self.own_dialable_addresses().await);
         let mut run = PublishRun {
-            origin: progress,
+            origin: options.progress,
             published: 0,
             payload_aware: 0,
             requires_payload_ack,
             done: 0,
             attempted: 0,
         };
-        self.publish_progress(address, &run, total.min(limit.max(1)));
-        for (batch_no, batch) in pool.chunks(limit.max(1)).enumerate() {
+        let job = PublishJob {
+            address: address.to_string(),
+            inner_path: inner_path.to_string(),
+            body,
+            modified,
+            payload,
+            sender_peers,
+            edx,
+        };
+        self.publish_progress(address, &run, total.min(options.limit.max(1)));
+        self.run_publish_pool(&job, &pool, &options, &mut run).await;
+        // Close the bar against what was actually attempted (idempotent when
+        // the loop already emitted this exact event on its last candidate).
+        self.publish_progress(address, &run, run.done);
+        Ok(PublishResult { published: run.published, payload_aware: run.payload_aware })
+    }
+
+    async fn log_publish_pool(
+        &self,
+        address: &str,
+        pool: &[PeerAddr],
+        options: &PublishOptions,
+    ) {
+        if !options.exhaustive {
+            return;
+        }
+        let overlay = pool.iter().filter(|peer| peer.is_overlay()).count();
+        self.log(
+            "DEBUG",
+            format!(
+                "publish {address}: {} candidate(s) ({} clearnet, {overlay} overlay), batch size {}",
+                pool.len(),
+                pool.len() - overlay,
+                options.limit,
+            ),
+        )
+        .await;
+    }
+
+    async fn run_publish_pool(
+        self: &Arc<Self>,
+        job: &PublishJob,
+        pool: &[PeerAddr],
+        options: &PublishOptions,
+        run: &mut PublishRun,
+    ) {
+        for (batch_no, batch) in pool.chunks(options.limit.max(1)).enumerate() {
             // The pool was selected once up front; a concurrent sync pass may
             // have backed off (or evicted) peers in later batches since. Skip
             // candidates the registry now says to leave alone rather than
@@ -12976,30 +13237,20 @@ impl AppState {
             let batch = if batch_no == 0 {
                 batch.to_vec()
             } else {
-                self.still_dialable(address, batch).await
+                self.still_dialable(&job.address, batch).await
             };
             if batch.is_empty() {
                 continue;
             }
             run.attempted += batch.len();
-            self.push_batch(address, inner_path, batch, &body, modified, &payload, &sender_peers, &edx, &mut run)
-                .await;
+            self.push_batch(job, batch, run).await;
             // Metadata-only updates stop at any acceptor. A merge publish keeps
             // walking until one peer explicitly handled the inline payload;
             // an old peer's manifest ACK does not prove the post landed.
-            let delivered = if requires_payload_ack {
-                run.payload_aware > 0
-            } else {
-                run.published > 0
-            };
-            if delivered || !exhaustive {
+            if run.delivered() || !options.exhaustive {
                 break;
             }
         }
-        // Close the bar against what was actually attempted (idempotent when
-        // the loop already emitted this exact event on its last candidate).
-        self.publish_progress(address, &run, run.done);
-        Ok(PublishResult { published: run.published, payload_aware: run.payload_aware })
     }
 
     /// The subset of `batch` the registry still allows dialing - not backed
@@ -13028,12 +13279,7 @@ impl AppState {
         // not progress the author cares about. One acceptance means the
         // network has the update (acceptors that commit re-gossip it), so
         // the message flips to done at the first success.
-        let delivered = if run.requires_payload_ack {
-            run.payload_aware > 0
-        } else {
-            run.published > 0
-        };
-        let message = if delivered {
+        let message = if run.delivered() {
             "Changes published to the network."
         } else {
             "Publishing changes to the network..."
@@ -13054,30 +13300,23 @@ impl AppState {
     /// of them (an exhaustive walk still pays one bounded timeout per
     /// all-failed batch). Every outcome is fed into the peer registry, and
     /// progress streams per completion.
-    #[allow(clippy::too_many_arguments)]
     async fn push_batch(
         self: &Arc<Self>,
-        address: &str,
-        inner_path: &str,
+        job: &PublishJob,
         batch: Vec<PeerAddr>,
-        body: &Arc<Vec<u8>>,
-        modified: f64,
-        payload: &Arc<UpdatePayload>,
-        sender_peers: &Arc<Vec<String>>,
-        edx: &Arc<dyn EdxFetcher>,
         run: &mut PublishRun,
     ) {
         let mut set = tokio::task::JoinSet::new();
         for peer in batch {
             set.spawn(push_update_to_peer(
-                edx.clone(),
+                job.edx.clone(),
                 peer,
-                address.to_string(),
-                inner_path.to_string(),
-                body.clone(),
-                modified,
-                payload.clone(),
-                sender_peers.clone(),
+                job.address.clone(),
+                job.inner_path.clone(),
+                job.body.clone(),
+                job.modified,
+                job.payload.clone(),
+                job.sender_peers.clone(),
             ));
         }
         let mut outcomes = Vec::new();
@@ -13088,27 +13327,28 @@ impl AppState {
             if let Ok(outcome) = res {
                 record_push_outcome(outcome, run, &mut outcomes, &mut accepted, &mut failed);
             }
-            self.publish_progress(address, run, run.attempted);
+            self.publish_progress(&job.address, run, run.attempted);
             // For a regular update one acceptance is enough. A merge update
             // needs an explicit payload-aware acceptance before the remaining
             // dials can leave the author's critical path.
-            let delivered = if run.requires_payload_ack {
-                run.payload_aware > 0
-            } else {
-                run.published > 0
-            };
-            if delivered && !set.is_empty() {
-                self.drain_pushes_in_background(address, set);
+            if run.delivered() && !set.is_empty() {
+                self.drain_pushes_in_background(&job.address, set);
                 break;
             }
         }
-        self.apply_peer_outcomes(address, outcomes).await;
+        self.apply_peer_outcomes(&job.address, outcomes).await;
         if !accepted.is_empty() {
-            self.log("DEBUG", format!("publish {address}: accepted by: {}", accepted.join(", ")))
+            self.log(
+                "DEBUG",
+                format!("publish {}: accepted by: {}", job.address, accepted.join(", ")),
+            )
                 .await;
         }
         if !failed.is_empty() {
-            self.log("DEBUG", format!("publish {address}: failed candidates: {}", failed.join(", ")))
+            self.log(
+                "DEBUG",
+                format!("publish {}: failed candidates: {}", job.address, failed.join(", ")),
+            )
                 .await;
         }
     }
@@ -13155,47 +13395,10 @@ impl AppState {
         }
     }
 
-    /// Apply merge records carried by another push of the content version we
-    /// already store. Metadata and record delivery are intentionally separate:
-    /// an older relay may have delivered content.json without its post, so a
-    /// later payload-bearing relay must not be discarded as a duplicate.
-    #[allow(clippy::too_many_arguments)]
-    async fn apply_current_merge_payload(
-        self: &Arc<Self>,
-        key: &str,
-        canonical: &str,
-        inner_path: &str,
-        mut payload: UpdatePayload,
-        source: Option<Arc<dyn InboundEdxSource>>,
-        sender: Option<&PeerAddr>,
-        sender_peers: &[PeerAddr],
-    ) -> Result<InboundUpdate, String> {
-        if inner_path == "content.json" {
-            return Ok(InboundUpdate::NotChanged);
-        }
-        let view = self.xite_view(key).await?;
-        let bytes = view.storage.read(inner_path).map_err(|e| e.to_string())?;
-        let content: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| "Stored content is invalid JSON".to_string())?;
-        let modified_version = content.get("modified").and_then(Value::as_f64).unwrap_or(0.0);
-        let require_merge_delivery = payload.require_merge_delivery;
-        let pending_payload = payload.clone();
-        let merge_paths = epix_content::declared_merge_files(&content);
-        let xid_map = Self::resolve_xid_map(&view.storage, inner_path).await;
-        // The manifest was verified before it was stored. Recover its required
-        // hashed-file list so a retry can complete objects that the first live
-        // session missed without rewriting or weakening the manifest gate.
-        let child_files = Self::required_child_files(inner_path, &content);
-        let staged_current = Self::staged_child_edx_content(inner_path, &content);
-        let signers = view.valid_signers_for(inner_path, &xid_map);
-        let dir = inner_path
-            .strip_suffix("content.json")
-            .unwrap_or("")
-            .trim_end_matches('/');
-        let mut relay_deltas = HashMap::new();
-        let mut changed = false;
-        let mut missing_merge = Vec::new();
-
+    fn validate_current_merge_payload(
+        payload: &UpdatePayload,
+        declared: &[String],
+    ) -> Result<(), String> {
         if payload
             .merge_deltas
             .keys()
@@ -13207,290 +13410,509 @@ impl AppState {
             .merge_deltas
             .keys()
             .chain(payload.merge_objects.keys())
-            .any(|path| !merge_paths.iter().any(|declared| declared == path))
+            .any(|path| !declared.iter().any(|candidate| candidate == path))
         {
             return Err("Merge payload names an undeclared path".into());
         }
+        Ok(())
+    }
 
-        for rel in merge_paths {
-            // Capability only means this session can serve merge payloads. It
-            // does not mean every declared merge file changed. Only an
-            // explicit entry is work, with empty bytes as the pull marker.
-            if !payload.merge_deltas.contains_key(&rel)
-                && !payload.merge_objects.contains_key(&rel)
-            {
-                continue;
-            }
-            let full = if dir.is_empty() {
-                rel.clone()
+    fn current_merge_work(payload: &UpdatePayload, declared: &[String]) -> Vec<String> {
+        declared
+            .iter()
+            .filter(|path| {
+                payload.merge_deltas.contains_key(*path)
+                    || payload.merge_objects.contains_key(*path)
+            })
+            .cloned()
+            .collect()
+    }
+
+    fn take_current_merge_item(payload: &mut UpdatePayload, relative: &str) -> CurrentMergeItem {
+        if let Some(delta) = payload.merge_deltas.remove(relative) {
+            return if delta.is_empty() {
+                CurrentMergeItem::Pull
             } else {
-                format!("{dir}/{rel}")
+                CurrentMergeItem::Inline(delta)
             };
-            let max_size =
-                Self::merge_file_max_size(&view, inner_path, &content, &xid_map, &rel);
-            let mut handled = false;
-            let mut legacy_pull = false;
-            if let Some(delta) = payload.merge_deltas.remove(&rel) {
-                legacy_pull = delta.is_empty();
-                if !legacy_pull {
-                    if let Some(merged) = self
-                        .merge_inline_records(key, &full, &signers, &delta, max_size)
-                        .await?
-                    {
-                        if let Some(novel) = merged.novel_delta {
-                            relay_deltas.insert(rel.clone(), novel);
-                            changed = true;
-                        }
-                        handled = true;
-                    } else if require_merge_delivery {
-                        return Err(format!(
-                            "Inline merge delta for {full} contains no valid records"
-                        ));
-                    }
-                }
-            } else if let Some(object) = payload.merge_objects.remove(&rel) {
+        }
+        payload
+            .merge_objects
+            .remove(relative)
+            .map(CurrentMergeItem::Object)
+            .unwrap_or(CurrentMergeItem::None)
+    }
+
+    async fn apply_current_merge_item(
+        &self,
+        context: &CurrentMergeContext<'_>,
+        full_path: &str,
+        max_size: Option<u64>,
+        item: CurrentMergeItem,
+    ) -> Result<CurrentMergeAttempt, String> {
+        match item {
+            CurrentMergeItem::None => Ok(CurrentMergeAttempt::default()),
+            CurrentMergeItem::Pull => Ok(CurrentMergeAttempt {
+                legacy_pull: true,
+                ..CurrentMergeAttempt::default()
+            }),
+            CurrentMergeItem::Inline(delta) => {
                 let merged = self
-                    .merge_object_records(
-                        key,
-                        &full,
-                        &signers,
+                    .merge_inline_records(
+                        context.key,
+                        full_path,
+                        context.signers,
+                        &delta,
                         max_size,
-                        object,
-                        source.as_ref(),
                     )
                     .await?;
-                if let Some(novel) = merged.novel_delta {
-                    relay_deltas.insert(rel.clone(), novel);
-                    changed = true;
-                }
-                handled = true;
-            }
-            // Prefer the authenticated duplex session that delivered this
-            // update. It works even when the publisher has no dial-back route.
-            if !handled && legacy_pull && require_merge_delivery {
-                if let Some(source) = source.as_ref() {
-                    if let Ok(Some(records)) = source.fetch_signed(canonical, &full).await {
-                        if let Some(merged) = self
-                            .merge_inline_records(key, &full, &signers, &records, max_size)
-                            .await?
-                        {
-                            if let Some(novel) = merged.novel_delta {
-                                relay_deltas.insert(rel.clone(), novel);
-                                changed = true;
-                            }
-                            handled = true;
-                        }
+                let Some(merged) = merged else {
+                    if context.require_delivery {
+                        return Err(format!(
+                            "Inline merge delta for {full_path} contains no valid records"
+                        ));
                     }
-                }
+                    return Ok(CurrentMergeAttempt::default());
+                };
+                Ok(CurrentMergeAttempt {
+                    handled: true,
+                    novel_delta: merged.novel_delta,
+                    ..CurrentMergeAttempt::default()
+                })
             }
-            // Mixed-version or broken live sessions retain the established
-            // advertised-peer pull path.
-            if !handled && (legacy_pull || !require_merge_delivery) {
-                let outcome = self
-                    .fetch_and_merge_records(
-                        key,
-                        &full,
-                        &signers,
+            CurrentMergeItem::Object(object) => {
+                let merged = self
+                    .merge_object_records(
+                        context.key,
+                        full_path,
+                        context.signers,
                         max_size,
-                        sender,
-                        sender_peers,
-                        1,
+                        object,
+                        context.source,
                     )
-                    .await;
-                changed |= outcome.changed;
-                if outcome.changed {
-                    // We verified and merged a full fallback copy, but cannot
-                    // reconstruct its exact novel subset here. Re-gossip a
-                    // pull marker so downstream delivery still requires a
-                    // capable peer to fetch the full signed merge file.
-                    relay_deltas.entry(rel.clone()).or_default();
-                }
-                handled = outcome.served > 0;
-            }
-            if !handled {
-                missing_merge.push(rel);
+                    .await?;
+                Ok(CurrentMergeAttempt {
+                    handled: true,
+                    novel_delta: merged.novel_delta,
+                    ..CurrentMergeAttempt::default()
+                })
             }
         }
+    }
 
-        // A same-version retry also completes the child manifest's ordinary
-        // hashed files. Prefer the live duplex source. Its implementation
-        // materializes and verifies every successful object before returning.
-        let mut missing_files: Vec<epix_xite::FileEntry> = child_files
-            .iter()
-            .filter(|file| !view.storage.verify(&file.inner_path, &file.sha512))
-            .cloned()
-            .collect();
-        if !missing_files.is_empty() && require_merge_delivery {
-            if let Some(source) = source.as_ref() {
-                let want = missing_files
-                    .iter()
-                    .map(|file| {
-                        let (id, size) = edx_want_from_staged(
-                            &staged_current,
-                            &file.inner_path,
-                        )
-                        .unzip();
-                        let authority_id = id.or_else(|| {
-                            edx_shard_descriptor_id(&staged_current, &file.inner_path)
-                        });
-                        let authority = authority_id.map(|authority_id| {
-                            EdxMaterializeAuthority::staged(
-                                canonical,
-                                inner_path,
-                                &file.inner_path,
-                                authority_id,
-                            )
-                        });
-                        EdxWant {
-                            inner_path: file.inner_path.clone(),
-                            id,
-                            size,
-                            authority,
-                        }
-                    })
-                    .collect();
-                let batch = source
-                    .fetch_files(key, want, Some(staged_current.clone()), None)
-                    .await;
-                if batch.bytes > 0 {
-                    self.add_transfer(key, batch.bytes, 0).await;
-                }
-                for path in batch.done {
-                    if view.storage.exists(&path) {
-                        self.ingest_file_from(key, &path, None).await;
-                        changed = true;
-                    }
-                }
-            }
-            missing_files.retain(|file| !view.storage.verify(&file.inner_path, &file.sha512));
+    async fn pull_current_merge_live(
+        &self,
+        context: &CurrentMergeContext<'_>,
+        full_path: &str,
+        max_size: Option<u64>,
+        mut attempt: CurrentMergeAttempt,
+    ) -> Result<CurrentMergeAttempt, String> {
+        if attempt.handled || !attempt.legacy_pull || !context.require_delivery {
+            return Ok(attempt);
         }
-        // Preserve the advertised-peer fallback when the live source misses.
-        if !missing_files.is_empty() && self.transport.read().await.is_some() {
-            let mut peers = self.connectable_peers(key, 10).await;
-            let nets = self.dialable_networks().await;
-            if let Some(sender) = sender {
-                if nets.can_dial(sender)
-                    && epix_peer::Peer::new(sender.clone(), 0).is_connectable()
-                    && !self.is_own_peer(sender).await
-                    && !peers.contains(sender)
-                {
-                    peers.insert(0, sender.clone());
-                }
-            }
-            for peer in sender_peers.iter().rev() {
-                if nets.can_dial(peer)
-                    && epix_peer::Peer::new(peer.clone(), 0).is_connectable()
-                    && !self.is_own_peer(peer).await
-                    && !peers.contains(peer)
-                {
-                    peers.insert(0, peer.clone());
-                }
-            }
-            if !peers.is_empty() {
-                let _ = self
-                    .edx_first(
-                        key,
-                        missing_files.clone(),
-                        peers,
-                        Some(&staged_current),
-                        Some((canonical, inner_path)),
-                        None,
-                    )
-                    .await;
-                missing_files
-                    .retain(|file| !view.storage.verify(&file.inner_path, &file.sha512));
-            }
-        }
+        let Some(source) = context.source else {
+            return Ok(attempt);
+        };
+        let Ok(Some(records)) = source.fetch_signed(context.canonical, full_path).await else {
+            return Ok(attempt);
+        };
+        let Some(merged) = self
+            .merge_inline_records(
+                context.key,
+                full_path,
+                context.signers,
+                &records,
+                max_size,
+            )
+            .await?
+        else {
+            return Ok(attempt);
+        };
+        attempt.handled = true;
+        attempt.novel_delta = merged.novel_delta;
+        Ok(attempt)
+    }
 
-        if let Some(sender) = sender {
-            self.add_peers(key, [sender.clone()]).await;
+    async fn pull_current_merge_fallback(
+        &self,
+        context: &CurrentMergeContext<'_>,
+        full_path: &str,
+        max_size: Option<u64>,
+        mut attempt: CurrentMergeAttempt,
+    ) -> CurrentMergeAttempt {
+        if attempt.handled {
+            return attempt;
         }
-        if !sender_peers.is_empty() {
-            self.add_peers(key, sender_peers.iter().cloned()).await;
+        if !attempt.legacy_pull && context.require_delivery {
+            return attempt;
         }
-        let keys = self.alias_keys(canonical, key).await;
-        if !missing_merge.is_empty() || !missing_files.is_empty() {
-            let missing_hashed: Vec<String> = missing_files
+        let outcome = self
+            .fetch_and_merge_records(MergeFetchRequest {
+                address: context.key,
+                inner_path: full_path,
+                signers: context.signers,
+                max_size,
+                sender: context.sender,
+                sender_peers: context.sender_peers,
+                union_from: 1,
+            })
+            .await;
+        if outcome.changed {
+            attempt.novel_delta = Some(Vec::new());
+        }
+        attempt.handled = outcome.served > 0;
+        attempt
+    }
+
+    fn record_current_merge_attempt(
+        relative: String,
+        attempt: CurrentMergeAttempt,
+        progress: &mut CurrentMergeProgress,
+    ) {
+        if let Some(delta) = attempt.novel_delta {
+            progress.relay_deltas.insert(relative.clone(), delta);
+            progress.changed = true;
+        }
+        if !attempt.handled {
+            progress.missing_merge.push(relative);
+        }
+    }
+
+    async fn apply_current_merge_path(
+        &self,
+        context: &CurrentMergeContext<'_>,
+        payload: &mut UpdatePayload,
+        relative: String,
+        progress: &mut CurrentMergeProgress,
+    ) -> Result<(), String> {
+        let full_path = context.full_path(&relative);
+        let max_size = Self::merge_file_max_size(
+            context.view,
+            context.inner_path,
+            context.content,
+            context.xid_map,
+            &relative,
+        );
+        let item = Self::take_current_merge_item(payload, &relative);
+        let attempt = self
+            .apply_current_merge_item(context, &full_path, max_size, item)
+            .await?;
+        let attempt = self
+            .pull_current_merge_live(context, &full_path, max_size, attempt)
+            .await?;
+        let attempt = self
+            .pull_current_merge_fallback(context, &full_path, max_size, attempt)
+            .await;
+        Self::record_current_merge_attempt(relative, attempt, progress);
+        Ok(())
+    }
+
+    async fn fetch_current_live_files(
+        &self,
+        context: &CurrentMergeContext<'_>,
+        staged: &Value,
+        progress: &mut CurrentMergeProgress,
+    ) {
+        if progress.missing_files.is_empty() || !context.require_delivery {
+            return;
+        }
+        if let Some(source) = context.source {
+            let wants = progress
+                .missing_files
                 .iter()
-                .map(|file| file.inner_path.clone())
+                .map(|file| {
+                    Self::inbound_edx_want(
+                        context.canonical,
+                        context.inner_path,
+                        Some(staged),
+                        file,
+                    )
+                })
                 .collect();
-            let mut deferred_payload = pending_payload;
-            deferred_payload.merge_deltas = relay_deltas.clone();
-            deferred_payload.merge_objects.clear();
-            self.defer_child_relay(
-                &keys,
-                inner_path,
-                modified_version,
-                &child_files,
-                &deferred_payload,
+            let batch = source
+                .fetch_files(context.key, wants, Some(staged.clone()), None)
+                .await;
+            if batch.bytes > 0 {
+                self.add_transfer(context.key, batch.bytes, 0).await;
+            }
+            for path in batch.done {
+                if context.view.storage.exists(&path) {
+                    self.ingest_file_from(context.key, &path, None).await;
+                    progress.changed = true;
+                }
+            }
+        }
+        progress.missing_files.retain(|file| {
+            !context.view.storage.verify(&file.inner_path, &file.sha512)
+        });
+    }
+
+    async fn preferred_update_peers(
+        &self,
+        key: &str,
+        sender: Option<&PeerAddr>,
+        sender_peers: &[PeerAddr],
+    ) -> Vec<PeerAddr> {
+        let mut peers = self.connectable_peers(key, 10).await;
+        let networks = self.dialable_networks().await;
+        let candidates = sender.into_iter().chain(sender_peers.iter().rev());
+        for candidate in candidates {
+            if !networks.can_dial(candidate) {
+                continue;
+            }
+            if !epix_peer::Peer::new(candidate.clone(), 0).is_connectable() {
+                continue;
+            }
+            if self.is_own_peer(candidate).await {
+                continue;
+            }
+            if peers.contains(candidate) {
+                continue;
+            }
+            peers.insert(0, candidate.clone());
+        }
+        peers
+    }
+
+    async fn fetch_current_fallback_files(
+        &self,
+        context: &CurrentMergeContext<'_>,
+        staged: &Value,
+        progress: &mut CurrentMergeProgress,
+    ) {
+        if progress.missing_files.is_empty() {
+            return;
+        }
+        if self.transport.read().await.is_none() {
+            return;
+        }
+        let peers = self
+            .preferred_update_peers(context.key, context.sender, context.sender_peers)
+            .await;
+        if peers.is_empty() {
+            return;
+        }
+        let _ = self
+            .edx_first(
+                context.key,
+                progress.missing_files.clone(),
+                peers,
+                Some(staged),
+                Some((context.canonical, context.inner_path)),
                 None,
-                &missing_hashed,
-                !missing_merge.is_empty(),
             )
             .await;
-            if require_merge_delivery {
-                return Err(format!(
-                    "Merge delivery incomplete for {inner_path}: {} path(s) unavailable",
-                    missing_merge.len() + missing_files.len()
-                ));
-            }
-            return Ok(InboundUpdate::NotChanged);
-        }
+        progress.missing_files.retain(|file| {
+            !context.view.storage.verify(&file.inner_path, &file.sha512)
+        });
+    }
 
-        // If this was the retry for a previously incomplete child, consume its
-        // stored relay payload now that every required file verifies.
+    async fn register_current_senders(&self, context: &CurrentMergeContext<'_>) {
+        if let Some(sender) = context.sender {
+            self.add_peers(context.key, [sender.clone()]).await;
+        }
+        if !context.sender_peers.is_empty() {
+            self.add_peers(context.key, context.sender_peers.iter().cloned()).await;
+        }
+    }
+
+    async fn defer_incomplete_current_merge(
+        &self,
+        context: &CurrentMergeContext<'_>,
+        mut pending_payload: UpdatePayload,
+        child_files: &[epix_xite::FileEntry],
+        keys: &[String],
+        modified: f64,
+        progress: &CurrentMergeProgress,
+    ) -> Option<Result<InboundUpdate, String>> {
+        if progress.missing_merge.is_empty() && progress.missing_files.is_empty() {
+            return None;
+        }
+        let missing_hashed = progress
+            .missing_files
+            .iter()
+            .map(|file| file.inner_path.clone())
+            .collect::<Vec<_>>();
+        pending_payload.merge_deltas = progress.relay_deltas.clone();
+        pending_payload.merge_objects.clear();
+        self.defer_child_relay(
+            PendingChildRelay {
+                keys: keys.to_vec(),
+                inner_path: context.inner_path.to_string(),
+                modified,
+                files: child_files.to_vec(),
+                payload: pending_payload,
+                staged_bytes: None,
+                merge_pending: !progress.missing_merge.is_empty(),
+            },
+            &missing_hashed,
+        )
+        .await;
+        if context.require_delivery {
+            return Some(Err(format!(
+                "Merge delivery incomplete for {}: {} path(s) unavailable",
+                context.inner_path,
+                progress.missing_merge.len() + progress.missing_files.len()
+            )));
+        }
+        Some(Ok(InboundUpdate::NotChanged))
+    }
+
+    fn take_completed_child_relay(
+        &self,
+        key: &str,
+        inner_path: &str,
+        modified: f64,
+    ) -> Option<PendingChildRelay> {
         let pending_key = Self::pending_child_key(key, inner_path);
-        let pending = {
-            let mut pending = self.pending_child_relays.lock().unwrap();
-            if pending
-                .get(&pending_key)
-                .is_some_and(|relay| relay.modified == modified_version && relay.staged_bytes.is_none())
-            {
-                pending.remove(&pending_key)
-            } else {
-                None
-            }
-        };
-        if let Some(pending) = &pending {
-            let paths: std::collections::HashSet<&str> =
-                pending.files.iter().map(|file| file.inner_path.as_str()).collect();
-            let mut xites = self.xites.write().await;
-            for alias in &pending.keys {
-                if let Some(xite) = xites.get_mut(alias) {
-                    xite.settings.cache.bad_files.retain(|path, _| !paths.contains(path.as_str()));
-                }
+        let mut pending = self.pending_child_relays.lock().unwrap();
+        if pending.get(&pending_key).is_some_and(|relay| {
+            relay.modified == modified && relay.staged_bytes.is_none()
+        }) {
+            pending.remove(&pending_key)
+        } else {
+            None
+        }
+    }
+
+    async fn clear_completed_child_bad_files(&self, pending: &PendingChildRelay) {
+        let paths: std::collections::HashSet<&str> =
+            pending.files.iter().map(|file| file.inner_path.as_str()).collect();
+        let mut xites = self.xites.write().await;
+        for alias in &pending.keys {
+            if let Some(xite) = xites.get_mut(alias) {
+                xite.settings.cache.bad_files.retain(|path, _| !paths.contains(path.as_str()));
             }
         }
-        let promoted = pending.is_some();
-        if !changed && !promoted {
-            return Ok(InboundUpdate::NotChanged);
+    }
+
+    fn relay_completed_current_merge(
+        self: &Arc<Self>,
+        key: &str,
+        inner_path: &str,
+        modified: f64,
+        pending: Option<PendingChildRelay>,
+        progress: CurrentMergeProgress,
+    ) -> InboundUpdate {
+        if !progress.changed && pending.is_none() {
+            return InboundUpdate::NotChanged;
         }
-        // Re-gossip only records that passed the stored manifest's signer rules
-        // and were new here. A fallback pull may have changed the file without
-        // producing a compact delta; the metadata push still tells peers to pull.
         let state = self.clone();
         let key = key.to_string();
         let inner_path = inner_path.to_string();
-        let mut relay = pending.map(|pending| pending.payload).unwrap_or_default();
+        let mut relay = pending.map(|relay| relay.payload).unwrap_or_default();
         relay.require_merge_delivery = false;
         relay.merge_objects.clear();
-        if !relay_deltas.is_empty() {
-            relay.merge_deltas = relay_deltas;
+        if !progress.relay_deltas.is_empty() {
+            relay.merge_deltas = progress.relay_deltas;
         }
         tokio::spawn(async move {
             let _ = state
                 .publish_to(
                     &key,
                     &inner_path,
-                    3,
-                    false,
                     relay,
-                    Some(modified_version),
-                    None,
+                    PublishOptions {
+                        limit: 3,
+                        exhaustive: false,
+                        expected_modified: Some(modified),
+                        progress: None,
+                    },
                 )
                 .await;
         });
-        Ok(InboundUpdate::Applied)
+        InboundUpdate::Applied
+    }
+
+    /// Apply merge records carried by another push of the content version we
+    /// already store. Metadata and record delivery are intentionally separate:
+    /// an older relay may have delivered content.json without its post, so a
+    /// later payload-bearing relay must not be discarded as a duplicate.
+    async fn apply_current_merge_payload(
+        self: &Arc<Self>,
+        request: CurrentMergeRequest<'_>,
+    ) -> Result<InboundUpdate, String> {
+        let CurrentMergeRequest {
+            key,
+            canonical,
+            inner_path,
+            mut payload,
+            source,
+            sender,
+            sender_peers,
+        } = request;
+        if inner_path == "content.json" {
+            return Ok(InboundUpdate::NotChanged);
+        }
+        let view = self.xite_view(key).await?;
+        let bytes = view.storage.read(inner_path).map_err(|error| error.to_string())?;
+        let content: Value = serde_json::from_slice(&bytes)
+            .map_err(|_| "Stored content is invalid JSON".to_string())?;
+        let modified = content.get("modified").and_then(Value::as_f64).unwrap_or(0.0);
+        let pending_payload = payload.clone();
+        let merge_paths = epix_content::declared_merge_files(&content);
+        Self::validate_current_merge_payload(&payload, &merge_paths)?;
+        let work = Self::current_merge_work(&payload, &merge_paths);
+        let xid_map = Self::resolve_xid_map(&view.storage, inner_path).await;
+        let child_files = Self::required_child_files(inner_path, &content);
+        let staged = Self::staged_child_edx_content(inner_path, &content);
+        let signers = view.valid_signers_for(inner_path, &xid_map);
+        let context = CurrentMergeContext {
+            key,
+            canonical,
+            inner_path,
+            view: &view,
+            content: &content,
+            xid_map: &xid_map,
+            signers: &signers,
+            source: source.as_ref(),
+            sender,
+            sender_peers,
+            require_delivery: payload.require_merge_delivery,
+        };
+        let mut progress = CurrentMergeProgress::default();
+        for relative in work {
+            self.apply_current_merge_path(
+                &context,
+                &mut payload,
+                relative,
+                &mut progress,
+            )
+            .await?;
+        }
+        progress.missing_files = child_files
+            .iter()
+            .filter(|file| !view.storage.verify(&file.inner_path, &file.sha512))
+            .cloned()
+            .collect();
+        self.fetch_current_live_files(&context, &staged, &mut progress).await;
+        self.fetch_current_fallback_files(&context, &staged, &mut progress).await;
+        self.register_current_senders(&context).await;
+        let keys = self.alias_keys(canonical, key).await;
+        if let Some(result) = self
+            .defer_incomplete_current_merge(
+                &context,
+                pending_payload,
+                &child_files,
+                &keys,
+                modified,
+                &progress,
+            )
+            .await
+        {
+            return result;
+        }
+        let pending = self.take_completed_child_relay(key, inner_path, modified);
+        if let Some(completed) = pending.as_ref() {
+            self.clear_completed_child_bad_files(completed).await;
+        }
+        Ok(self.relay_completed_current_merge(
+            key,
+            inner_path,
+            modified,
+            pending,
+            progress,
+        ))
     }
 
     /// Handle a peer pushing us a new `content.json` (the inbound `update` wire
@@ -13623,15 +14045,15 @@ impl AppState {
                 && (!payload.merge_deltas.is_empty() || !payload.merge_objects.is_empty())
             {
                 return self
-                    .apply_current_merge_payload(
-                        &key,
-                        &lock_address,
+                    .apply_current_merge_payload(CurrentMergeRequest {
+                        key: &key,
+                        canonical: &lock_address,
                         inner_path,
                         payload,
                         source,
-                        sender.as_ref(),
-                        &sender_peers,
-                    )
+                        sender: sender.as_ref(),
+                        sender_peers: &sender_peers,
+                    })
                     .await;
             }
             if hint <= current_modified {
@@ -13697,15 +14119,15 @@ impl AppState {
             && (!payload.merge_deltas.is_empty() || !payload.merge_objects.is_empty())
         {
             return self
-                .apply_current_merge_payload(
-                    &key,
-                    &lock_address,
+                .apply_current_merge_payload(CurrentMergeRequest {
+                    key: &key,
+                    canonical: &lock_address,
                     inner_path,
                     payload,
                     source,
-                    sender.as_ref(),
-                    &sender_peers,
-                )
+                    sender: sender.as_ref(),
+                    sender_peers: &sender_peers,
+                })
                 .await;
         }
         if new_modified <= current_modified {
@@ -13786,16 +14208,18 @@ impl AppState {
                     // staged post prematurely.
                     if let Err(e) = self
                         .stage_child_merge_payload(
-                            &key,
-                            &lock_address,
-                            inner_path,
-                            &xite,
-                            &new,
-                            &xid_map,
+                            ChildMergeStage {
+                                address: &key,
+                                canonical: &lock_address,
+                                inner_path,
+                                view: &xite,
+                                content: &new,
+                                xid_map: &xid_map,
+                                source: source.as_ref(),
+                                sender: sender.as_ref(),
+                                sender_peers: &sender_peers,
+                            },
                             &mut payload,
-                            source.as_ref(),
-                            sender.as_ref(),
-                            &sender_peers,
                         )
                         .await
                     {
@@ -13825,24 +14249,24 @@ impl AppState {
         // to serve and relay. Root updates retain the background path.
         let inner = inner_path.to_string();
         let root_bytes = if is_root && !committed_inline { Some(bytes) } else { None };
-        if child_files.is_some() {
-            let ready = self
-                .finish_inbound_update(
-                    keys,
-                    xite,
-                    sender,
-                    sender_peers,
-                    inner,
-                    uri,
-                    payload,
-                    source,
-                    child_files,
-                    child_bytes,
-                    root_bytes,
-                    new_modified,
-                    update_guard,
-                )
-                .await;
+        let is_child = child_files.is_some();
+        let finish = InboundFinish {
+            keys,
+            xite,
+            sender,
+            sender_peers,
+            inner_path: inner,
+            uri,
+            payload,
+            source,
+            child_files,
+            child_bytes,
+            root_bytes,
+            expected_modified: new_modified,
+            _update_guard: update_guard,
+        };
+        if is_child {
+            let ready = self.finish_inbound_update(finish).await;
             return if ready {
                 Ok(InboundUpdate::Applied)
             } else {
@@ -13853,23 +14277,7 @@ impl AppState {
         }
         let state = self.clone();
         tokio::spawn(async move {
-            let _ = state
-                .finish_inbound_update(
-                    keys,
-                    xite,
-                    sender,
-                    sender_peers,
-                    inner,
-                    uri,
-                    payload,
-                    source,
-                    child_files,
-                    child_bytes,
-                    root_bytes,
-                    new_modified,
-                    update_guard,
-                )
-                .await;
+            let _ = state.finish_inbound_update(finish).await;
         });
         Ok(InboundUpdate::Applied)
     }
@@ -13900,314 +14308,418 @@ impl AppState {
         xid_map
     }
 
-    /// The deferred half of [`Self::apply_inbound_update`]: apply any diffs the
-    /// publisher sent (patching our old file copies to skip downloads), sync the
-    /// files still needed (preferring the sender), then - for a root push -
-    /// commit the staged content.json only if every declared file is present
-    /// (else defer it for retry and keep serving the previous version), and
-    /// re-publish to a few peers so the update spreads.
-    async fn finish_inbound_update(
-        self: &Arc<Self>,
-        keys: Vec<String>,
-        xite: Xite,
-        sender: Option<PeerAddr>,
-        sender_peers: Vec<PeerAddr>,
-        inner_path: String,
-        uri: String,
-        mut payload: UpdatePayload,
-        source: Option<Arc<dyn InboundEdxSource>>,
-        child_files: Option<Vec<epix_xite::FileEntry>>,
-        child_bytes: Option<Vec<u8>>,
-        root_bytes: Option<Vec<u8>>,
-        expected_modified: f64,
-        _update_guard: tokio::sync::OwnedMutexGuard<()>,
-    ) -> bool {
-        let key = keys[0].clone();
-        let transaction_canonical = canonical_address(xite.content.as_ref(), &key);
-        let staged_child = child_bytes
+    fn inbound_staged_content(finish: &InboundFinish) -> (Option<Value>, Option<Value>) {
+        let child = finish
+            .child_bytes
             .as_ref()
             .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok());
-        let staged_for_fetch = match staged_child.as_ref() {
-            Some(content) => Some(Self::staged_child_edx_content(&inner_path, content)),
-            None if child_files.is_none() => xite.content.clone(),
+        let fetch = match child.as_ref() {
+            Some(content) => {
+                Some(Self::staged_child_edx_content(&finish.inner_path, content))
+            }
+            None if finish.child_files.is_none() => finish.xite.content.clone(),
             None => None,
         };
-        // Diff keys are relative to the pushed content.json's directory (the
-        // root for a root push, the user/include dir for a child push).
-        let diff_dir =
-            inner_path.rsplit_once('/').map(|(d, _)| format!("{d}/")).unwrap_or_default();
-        // Apply diffs first: patch our old copy of each changed file and keep it
-        // only if the result matches the new content.json's declared hash. A
-        // bad/mismatched diff is ignored - the file just gets downloaded below.
-        // `arrived` collects every file this update landed (patched here,
-        // downloaded below) for the db ingest at the end.
-        let mut arrived: Vec<String> = Vec::new();
-        if !payload.diffs.is_empty() {
-            for (file_path, actions) in &payload.diffs {
-                let full = format!("{diff_dir}{file_path}");
-                let info = match &child_files {
-                    Some(list) => list.iter().find(|f| f.inner_path == full).cloned(),
-                    None => xite.file_info(&full),
-                };
-                let Some(info) = info else { continue };
-                if xite.storage.verify(&full, &info.sha512) {
-                    continue; // already current
-                }
-                let Ok(old) = xite.storage.read(&full) else { continue };
-                let Ok(new) = epix_content::patch(&old, actions) else { continue };
-                if XiteStorage::hash_bytes(&new) == info.sha512
-                    && xite.storage.write(&full, &new).is_ok()
-                {
-                    arrived.push(full);
-                }
-            }
-            if !arrived.is_empty() {
-                self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
+        (child, fetch)
+    }
+
+    fn apply_one_inbound_diff(
+        finish: &InboundFinish,
+        diff_dir: &str,
+        file_path: &str,
+        actions: &[epix_content::DiffAction],
+    ) -> Option<String> {
+        let full = format!("{diff_dir}{file_path}");
+        let info = match &finish.child_files {
+            Some(files) => files.iter().find(|file| file.inner_path == full).cloned(),
+            None => finish.xite.file_info(&full),
+        }?;
+        if finish.xite.storage.verify(&full, &info.sha512) {
+            return None;
+        }
+        let old = finish.xite.storage.read(&full).ok()?;
+        let new = epix_content::patch(&old, actions).ok()?;
+        if XiteStorage::hash_bytes(&new) != info.sha512 {
+            return None;
+        }
+        finish.xite.storage.write(&full, &new).ok().map(|_| full)
+    }
+
+    async fn apply_inbound_diffs(&self, finish: &InboundFinish, key: &str) -> Vec<String> {
+        let diff_dir = finish
+            .inner_path
+            .rsplit_once('/')
+            .map(|(dir, _)| format!("{dir}/"))
+            .unwrap_or_default();
+        let mut arrived = Vec::new();
+        for (file_path, actions) in &finish.payload.diffs {
+            if let Some(full) = Self::apply_one_inbound_diff(finish, &diff_dir, file_path, actions) {
+                arrived.push(full);
             }
         }
-        // The files to fetch: for a root push, whatever the staged root
-        // declares and we lack; for a child push, the child's declared files
-        // that are missing or stale.
-        let mut needed: Vec<epix_xite::FileEntry> = match &child_files {
-            Some(list) => list
+        if !arrived.is_empty() {
+            self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
+        }
+        arrived
+    }
+
+    fn inbound_files_needed(finish: &InboundFinish) -> Vec<epix_xite::FileEntry> {
+        match &finish.child_files {
+            Some(files) => files
                 .iter()
-                .filter(|f| !xite.storage.verify(&f.inner_path, &f.sha512))
+                .filter(|file| {
+                    !finish.xite.storage.verify(&file.inner_path, &file.sha512)
+                })
                 .cloned()
                 .collect(),
-            None => xite.files_needed(),
+            None => finish.xite.files_needed(),
+        }
+    }
+
+    fn inbound_edx_want(
+        canonical: &str,
+        content_inner_path: &str,
+        staged: Option<&Value>,
+        file: &epix_xite::FileEntry,
+    ) -> EdxWant {
+        let (id, size) = staged
+            .and_then(|content| edx_want_from_staged(content, &file.inner_path))
+            .unzip();
+        let authority_id = id.or_else(|| {
+            staged.and_then(|content| edx_shard_descriptor_id(content, &file.inner_path))
+        });
+        let authority = authority_id.map(|authority_id| {
+            EdxMaterializeAuthority::staged(
+                canonical,
+                content_inner_path,
+                &file.inner_path,
+                authority_id,
+            )
+        });
+        EdxWant { inner_path: file.inner_path.clone(), id, size, authority }
+    }
+
+    async fn fetch_inbound_live_source(
+        &self,
+        finish: &InboundFinish,
+        canonical: &str,
+        staged: Option<&Value>,
+        needed: &mut Vec<epix_xite::FileEntry>,
+        arrived: &mut Vec<String>,
+    ) {
+        if needed.is_empty() || !finish.payload.require_merge_delivery {
+            return;
+        }
+        let Some(source) = finish.source.as_ref() else {
+            return;
         };
-
-        // First use the authenticated session that delivered the manifest. A
-        // portless publisher can serve here even though no reverse address is
-        // available. Both root and child objects resolve against the verified
-        // staged manifest, which is still hidden from normal serving.
-        if !needed.is_empty() && payload.require_merge_delivery {
-            if let Some(source) = source.as_ref() {
-                let want: Vec<EdxWant> = needed
-                    .iter()
-                    .map(|file| {
-                        let (id, size) = staged_for_fetch
-                            .as_ref()
-                            .and_then(|content| edx_want_from_staged(content, &file.inner_path))
-                            .unzip();
-                        let authority_id = id.or_else(|| {
-                            staged_for_fetch.as_ref().and_then(|content| {
-                                edx_shard_descriptor_id(content, &file.inner_path)
-                            })
-                        });
-                        let authority = authority_id.map(|authority_id| {
-                            EdxMaterializeAuthority::staged(
-                                &transaction_canonical,
-                                &inner_path,
-                                &file.inner_path,
-                                authority_id,
-                            )
-                        });
-                        EdxWant {
-                            inner_path: file.inner_path.clone(),
-                            id,
-                            size,
-                            authority,
-                        }
-                    })
-                    .collect();
-                let batch = source
-                    .fetch_files(&key, want, staged_for_fetch.clone(), None)
-                    .await;
-                if batch.bytes > 0 {
-                    self.add_transfer(&key, batch.bytes, 0).await;
-                }
-                let done: std::collections::HashSet<String> = batch.done.into_iter().collect();
-                arrived.extend(
-                    needed
-                        .iter()
-                        .filter(|file| done.contains(&file.inner_path))
-                        .map(|file| file.inner_path.clone()),
-                );
-                needed.retain(|file| !done.contains(&file.inner_path));
-            }
+        let wants = needed
+            .iter()
+            .map(|file| Self::inbound_edx_want(canonical, &finish.inner_path, staged, file))
+            .collect();
+        let batch = source
+            .fetch_files(&finish.keys[0], wants, staged.cloned(), None)
+            .await;
+        if batch.bytes > 0 {
+            self.add_transfer(&finish.keys[0], batch.bytes, 0).await;
         }
+        let done: std::collections::HashSet<String> = batch.done.into_iter().collect();
+        arrived.extend(
+            needed
+                .iter()
+                .filter(|file| done.contains(&file.inner_path))
+                .map(|file| file.inner_path.clone()),
+        );
+        needed.retain(|file| !done.contains(&file.inner_path));
+    }
 
-        // Same-session misses retain the established sender and advertised-peer
-        // fallback. This also covers peers too old to provide a live source.
-        if !needed.is_empty() && self.transport.read().await.is_some() {
-            let mut peers = self.connectable_peers(&key, 10).await;
-            let nets = self.dialable_networks().await;
-            // Prefer fetching from the sender - it definitely has the files
-            // it just announced - but only if its address is dialable (an
-            // inbound-only peer, e.g. `ip:0`, would just waste a worker).
-            // Screened the same way the advertised addresses below are: the
-            // sender is caller-supplied, so a peer that names our own address
-            // or an undialable network must not get a worker slot either.
-            if let Some(s) = sender.as_ref() {
-                if nets.can_dial(s)
-                    && epix_peer::Peer::new(s.clone(), 0).is_connectable()
-                    && !self.is_own_peer(s).await
-                    && !peers.contains(s)
-                {
-                    peers.insert(0, s.clone());
-                }
+    async fn inbound_fallback_peers(&self, finish: &InboundFinish) -> Vec<PeerAddr> {
+        let mut peers = self.connectable_peers(&finish.keys[0], 10).await;
+        let networks = self.dialable_networks().await;
+        let candidates = finish.sender.iter().chain(finish.sender_peers.iter().rev());
+        for candidate in candidates {
+            if !networks.can_dial(candidate) {
+                continue;
             }
-            // Even before the sender's wire address: the addresses the
-            // publisher SAYS it is dialable at (onion/i2p/open clearnet).
-            // For a NAT'd publisher these are the only routes to the new
-            // files. Own addresses are dropped (a lone seeder must not dial
-            // itself) and so are networks we cannot dial right now.
-            for sp in sender_peers.iter().rev() {
-                if nets.can_dial(sp)
-                    && epix_peer::Peer::new((*sp).clone(), 0).is_connectable()
-                    && !self.is_own_peer(sp).await
-                    && !peers.contains(sp)
-                {
-                    peers.insert(0, (*sp).clone());
-                }
+            if !epix_peer::Peer::new(candidate.clone(), 0).is_connectable() {
+                continue;
             }
-            if !peers.is_empty() {
-                let needed_paths: Vec<String> =
-                    needed.iter().map(|f| f.inner_path.clone()).collect();
-                // EDX-only over the reused session (staged content's b3 is
-                // authoritative pre-commit). A file with no `b3` does not
-                // arrive; only the files EDX landed are reported for db ingest.
-                let missed = self
-                    .edx_first(
-                        &key,
-                        needed,
-                        peers.clone(),
-                        staged_for_fetch.as_ref(),
-                        Some((&transaction_canonical, &inner_path)),
-                        None,
-                    )
-                    .await;
-                let missed: std::collections::HashSet<&String> =
-                    missed.iter().map(|f| &f.inner_path).collect();
-                arrived.extend(needed_paths.into_iter().filter(|p| !missed.contains(p)));
+            if self.is_own_peer(candidate).await {
+                continue;
             }
+            if peers.contains(candidate) {
+                continue;
+            }
+            peers.insert(0, candidate.clone());
         }
-        // Commit either kind of staged content.json only after every required
-        // object verifies. Until this point listModified/GetSigned keep seeing
-        // the prior complete child or root version.
-        let missing_child = child_files
-            .as_ref()
-            .map(|files| Self::missing_child_files(&xite.storage, files))
-            .unwrap_or_default();
-        let committed = match (&child_files, &child_bytes, &root_bytes) {
+        peers
+    }
+
+    async fn fetch_inbound_fallback(
+        &self,
+        finish: &InboundFinish,
+        canonical: &str,
+        staged: Option<&Value>,
+        needed: &mut Vec<epix_xite::FileEntry>,
+        arrived: &mut Vec<String>,
+    ) {
+        if needed.is_empty() {
+            return;
+        }
+        if self.transport.read().await.is_none() {
+            return;
+        }
+        let peers = self.inbound_fallback_peers(finish).await;
+        if peers.is_empty() {
+            return;
+        }
+        let needed_paths: Vec<String> =
+            needed.iter().map(|file| file.inner_path.clone()).collect();
+        let missed = self
+            .edx_first(
+                &finish.keys[0],
+                std::mem::take(needed),
+                peers,
+                staged,
+                Some((canonical, &finish.inner_path)),
+                None,
+            )
+            .await;
+        let missed_paths: std::collections::HashSet<&String> =
+            missed.iter().map(|file| &file.inner_path).collect();
+        arrived.extend(needed_paths.into_iter().filter(|path| !missed_paths.contains(path)));
+        *needed = missed;
+    }
+
+    async fn commit_inbound_manifest(
+        &self,
+        finish: &InboundFinish,
+        missing_child: &[String],
+    ) -> bool {
+        match (&finish.child_files, &finish.child_bytes, &finish.root_bytes) {
             (None, _, Some(bytes)) => {
-                let canonical = canonical_address(xite.content.as_ref(), &key);
-                let failed: Vec<String> =
-                    xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
-                let content = xite.content.clone().unwrap_or(Value::Null);
-                self.finalize_root_update(&keys, &canonical, &xite.storage, content, bytes, &failed)
-                    .await
+                let key = &finish.keys[0];
+                let canonical = canonical_address(finish.xite.content.as_ref(), key);
+                let failed = finish
+                    .xite
+                    .files_needed()
+                    .iter()
+                    .map(|file| file.inner_path.clone())
+                    .collect::<Vec<_>>();
+                let content = finish.xite.content.clone().unwrap_or(Value::Null);
+                self.finalize_root_update(
+                    &finish.keys,
+                    &canonical,
+                    &finish.xite.storage,
+                    content,
+                    bytes,
+                    &failed,
+                )
+                .await
             }
             (Some(_), Some(bytes), _) if missing_child.is_empty() => {
-                let xid_map = Self::resolve_xid_map(&xite.storage, &inner_path).await;
-                xite.add_content(&inner_path, bytes, &xid_map).is_ok()
+                let xid_map =
+                    Self::resolve_xid_map(&finish.xite.storage, &finish.inner_path).await;
+                finish.xite.add_content(&finish.inner_path, bytes, &xid_map).is_ok()
             }
             (Some(_), _, _) => false,
-            // Root was committed inline before this deferred half ran.
             (None, _, None) => true,
-        };
+        }
+    }
 
-        let mut relay_ready = committed;
-        let mut merge_failed = false;
-        if committed && child_files.is_some() {
-            if let Some(content) = staged_child.as_ref() {
-                let xid_map = Self::resolve_xid_map(&xite.storage, &inner_path).await;
-                if let Err(error) = self
-                    .apply_staged_child_merge_payload(
-                        &key,
-                        &inner_path,
-                        &xite,
-                        content,
-                        &xid_map,
-                        &mut payload,
-                    )
-                    .await
-                {
-                    self.log("WARN", error).await;
-                    relay_ready = false;
-                    merge_failed = true;
-                }
+    async fn apply_finished_child_merge(
+        &self,
+        finish: &mut InboundFinish,
+        staged_child: Option<&Value>,
+        committed: bool,
+    ) -> (bool, bool) {
+        if !committed {
+            return (false, false);
+        }
+        if finish.child_files.is_none() {
+            return (true, false);
+        }
+        let Some(content) = staged_child else {
+            return (true, false);
+        };
+        let xid_map = Self::resolve_xid_map(&finish.xite.storage, &finish.inner_path).await;
+        let result = self
+            .apply_staged_child_merge_payload(
+                &finish.keys[0],
+                &finish.inner_path,
+                &finish.xite,
+                content,
+                &xid_map,
+                &mut finish.payload,
+            )
+            .await;
+        if let Err(error) = result {
+            self.log("WARN", error).await;
+            return (false, true);
+        }
+        (true, false)
+    }
+
+    async fn ingest_finished_child(
+        &self,
+        finish: &InboundFinish,
+        arrived: &[String],
+        committed: bool,
+    ) {
+        if !committed || finish.child_files.is_none() {
+            return;
+        }
+        let key = &finish.keys[0];
+        self.ingest_file_from(key, &finish.inner_path, None).await;
+        for path in arrived {
+            if finish.xite.storage.exists(path) {
+                self.ingest_file_from(key, path, None).await;
             }
         }
+    }
 
-        if committed && child_files.is_some() {
-            // Commit and db visibility move together. A patched file does not
-            // enter the download list, so ingest both patched and fetched
-            // arrivals after the signed child itself becomes public.
-            self.ingest_file_from(&key, &inner_path, None).await;
-            for path in &arrived {
-                if xite.storage.exists(path) {
-                    self.ingest_file_from(&key, path, None).await;
-                }
-            }
+    fn inbound_modified(finish: &InboundFinish) -> i64 {
+        if finish.child_files.is_some() {
+            return finish.expected_modified as i64;
         }
+        finish
+            .xite
+            .content
+            .as_ref()
+            .and_then(|content| content.get("modified"))
+            .and_then(Value::as_f64)
+            .unwrap_or(0.0) as i64
+    }
 
-        let modified = if child_files.is_some() {
-            expected_modified as i64
-        } else {
-            xite.content
-                .as_ref()
-                .and_then(|content| content.get("modified"))
-                .and_then(Value::as_f64)
-                .unwrap_or(0.0) as i64
+    async fn retain_finished_update(
+        &self,
+        finish: &InboundFinish,
+        outcome: &InboundFinishOutcome,
+        canonical: &str,
+        modified: i64,
+        can_republish: bool,
+    ) {
+        if outcome.relay_ready {
+            if !can_republish {
+                self.record_update_hint(canonical, modified).await;
+            }
+            return;
+        }
+        let Some(files) = finish.child_files.as_ref() else {
+            return;
         };
-        let canonical = canonical_address(xite.content.as_ref(), &key);
+        self.defer_child_relay(
+            PendingChildRelay {
+                keys: finish.keys.clone(),
+                inner_path: finish.inner_path.clone(),
+                modified: finish.expected_modified,
+                files: files.clone(),
+                payload: finish.payload.clone(),
+                staged_bytes: if outcome.committed {
+                    None
+                } else {
+                    finish.child_bytes.clone()
+                },
+                merge_pending: outcome.merge_failed,
+            },
+            &outcome.missing_child,
+        )
+        .await;
+    }
+
+    async fn republish_finished_update(
+        self: &Arc<Self>,
+        finish: &InboundFinish,
+        outcome: &InboundFinishOutcome,
+        can_republish: bool,
+    ) {
+        if !outcome.relay_ready || !can_republish {
+            return;
+        }
+        let mut relay = finish.payload.clone();
+        relay.require_merge_delivery = false;
+        relay.merge_objects.clear();
+        let _ = self
+            .publish_to(
+                &finish.keys[0],
+                &finish.inner_path,
+                relay,
+                PublishOptions {
+                    limit: 3,
+                    exhaustive: false,
+                    expected_modified: Some(finish.expected_modified),
+                    progress: None,
+                },
+            )
+            .await;
+    }
+
+    async fn emit_finished_update(&self, finish: &InboundFinish, committed: bool) {
+        if !committed {
+            return;
+        }
+        let key = &finish.keys[0];
+        self.mark_optional_dirty(key);
+        self.refresh_optional_owed(key).await;
+        for served_key in &finish.keys {
+            self.push_xite_info_event(served_key, "updated").await;
+        }
+    }
+
+    /// Complete a staged update, then expose and relay it only when every
+    /// required object has verified.
+    async fn finish_inbound_update(self: &Arc<Self>, mut finish: InboundFinish) -> bool {
+        let key = finish.keys[0].clone();
+        let canonical = canonical_address(finish.xite.content.as_ref(), &key);
+        let (staged_child, staged_for_fetch) = Self::inbound_staged_content(&finish);
+        let mut arrived = self.apply_inbound_diffs(&finish, &key).await;
+        let mut needed = Self::inbound_files_needed(&finish);
+        self.fetch_inbound_live_source(
+            &finish,
+            &canonical,
+            staged_for_fetch.as_ref(),
+            &mut needed,
+            &mut arrived,
+        )
+        .await;
+        self.fetch_inbound_fallback(
+            &finish,
+            &canonical,
+            staged_for_fetch.as_ref(),
+            &mut needed,
+            &mut arrived,
+        )
+        .await;
+        let missing_child = finish
+            .child_files
+            .as_ref()
+            .map(|files| Self::missing_child_files(&finish.xite.storage, files))
+            .unwrap_or_default();
+        let committed = self.commit_inbound_manifest(&finish, &missing_child).await;
+        let (relay_ready, merge_failed) = self
+            .apply_finished_child_merge(&mut finish, staged_child.as_ref(), committed)
+            .await;
+        self.ingest_finished_child(&finish, &arrived, committed).await;
+        let outcome = InboundFinishOutcome {
+            committed,
+            relay_ready,
+            merge_failed,
+            missing_child,
+        };
+        let modified = Self::inbound_modified(&finish);
         let can_republish = self.transport.read().await.is_some();
-        if !relay_ready {
-            if let Some(files) = child_files.as_ref() {
-                self.defer_child_relay(
-                    &keys,
-                    &inner_path,
-                    expected_modified,
-                    files,
-                    &payload,
-                    if committed { None } else { child_bytes.as_deref() },
-                    &missing_child,
-                    merge_failed,
-                )
-                .await;
-            }
-        } else if !can_republish {
-            // This hint is an availability claim. Record it only after the
-            // signed update is authorized and every required object verifies.
-            // When re-gossip runs below, publish_to records the one hint.
-            self.record_update_hint(&canonical, modified).await;
-        }
-
-        // EpixNet re-publishes an accepted update to up to 3 more peers,
-        // forwarding the diffs it received so they spread with the push - but
-        // never a version we couldn't complete ourselves.
-        if relay_ready && can_republish {
-            let mut relay = payload;
-            relay.require_merge_delivery = false;
-            relay.merge_objects.clear();
-            let _ = self
-                .publish_to(
-                    &key,
-                    &inner_path,
-                    3,
-                    false,
-                    relay,
-                    Some(expected_modified),
-                    None,
-                )
-                .await;
-        }
-        self.updates_in_flight.lock().unwrap().remove(&uri);
-        // Flash the dashboard row: a peer pushed a new version and it landed.
-        if committed {
-            // The update may declare new optional files; wake the retry loop
-            // so a xite that promised to fetch them (autodownloadoptional /
-            // optionalHelp) picks them up on its next tick, and count them now
-            // so the row's countdown includes them from the first push.
-            self.mark_optional_dirty(&key);
-            self.refresh_optional_owed(&key).await;
-            for k in &keys {
-                self.push_xite_info_event(k, "updated").await;
-            }
-        }
-        relay_ready
+        self.retain_finished_update(
+            &finish,
+            &outcome,
+            &canonical_address(finish.xite.content.as_ref(), &key),
+            modified,
+            can_republish,
+        )
+        .await;
+        self.republish_finished_update(&finish, &outcome, can_republish).await;
+        self.updates_in_flight.lock().unwrap().remove(&finish.uri);
+        self.emit_finished_update(&finish, outcome.committed).await;
+        outcome.relay_ready
     }
 
     pub async fn has_xite(&self, address: &str) -> bool {
@@ -23336,14 +23848,16 @@ mod tests {
             let key = format!("epix1pending{i}");
             state
                 .defer_child_relay(
-                    &[key],
-                    "data/users/content.json",
-                    (i + 1) as f64,
+                    PendingChildRelay {
+                        keys: vec![key],
+                        inner_path: "data/users/content.json".to_string(),
+                        modified: (i + 1) as f64,
+                        files: Vec::new(),
+                        payload: payload.clone(),
+                        staged_bytes: Some(staged.clone()),
+                        merge_pending: true,
+                    },
                     &[],
-                    &payload,
-                    Some(&staged),
-                    &[],
-                    true,
                 )
                 .await;
         }
@@ -23375,14 +23889,16 @@ mod tests {
         for i in 0..80 {
             state
                 .defer_child_relay(
-                    &[format!("epix1metadata{i}")],
-                    "data/users/content.json",
-                    (i + 1) as f64,
-                    &files,
-                    &UpdatePayload::default(),
-                    None,
+                    PendingChildRelay {
+                        keys: vec![format!("epix1metadata{i}")],
+                        inner_path: "data/users/content.json".to_string(),
+                        modified: (i + 1) as f64,
+                        files: files.clone(),
+                        payload: UpdatePayload::default(),
+                        staged_bytes: None,
+                        merge_pending: false,
+                    },
                     &[],
-                    false,
                 )
                 .await;
         }
