@@ -119,7 +119,7 @@ async fn node_resolve(ui_port: u16, token: &str, name: &str) -> Result<String, S
     let url = format!("http://127.0.0.1:{ui_port}{}", epix_node::NMH_RESOLVE_PATH);
     let nonce = epix_node::new_nmh_nonce()?;
     let request_mac = epix_node::nmh_request_mac(token, &nonce, name)?;
-    let response = reqwest::Client::new()
+    let mut response = reqwest::Client::new()
         .post(url)
         .json(&json!({
             "name": name,
@@ -131,12 +131,28 @@ async fn node_resolve(ui_port: u16, token: &str, name: &str) -> Result<String, S
         .await
         .map_err(|e| format!("node resolve endpoint unavailable: {e}"))?;
     let status = response.status();
-    let bytes = response
-        .bytes()
-        .await
-        .map_err(|e| format!("invalid node resolve response: {e}"))?;
-    if bytes.len() > 16 * 1024 {
+    // Enforce the size cap DURING the read, not after: a stale or hostile
+    // process squatting the loopback UI port could otherwise stream an
+    // unbounded body that `bytes()` buffers entirely into memory before any
+    // check. Reject an oversized Content-Length up front, then accumulate
+    // chunk-by-chunk and bail the instant the running total exceeds the cap.
+    const MAX_BODY: usize = 16 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_BODY as u64)
+    {
         return Err("invalid node resolve response: body is too large".to_string());
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("invalid node resolve response: {e}"))?
+    {
+        if bytes.len() + chunk.len() > MAX_BODY {
+            return Err("invalid node resolve response: body is too large".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
     }
     let body: Value = serde_json::from_slice(&bytes)
         .map_err(|e| format!("invalid node resolve response: {e}"))?;

@@ -842,12 +842,21 @@ pub mod xid_identity {
     fn cached(key: &str) -> Option<Option<XidInfo>> {
         let guard = CACHE.read().ok()?;
         let entry = guard.as_ref()?.get(key)?;
-        let checkpoint_current = super::xid_cache_binding_current(
-            entry.finality_binding.as_ref(),
-            super::verify_finality_enabled(),
-        );
-        (entry.at.elapsed() < ttl_for(key, &entry.info) && checkpoint_current)
-            .then(|| entry.info.clone())
+        // A POSITIVE answer must stay bound to a finalized checkpoint, so it is
+        // dropped the moment its binding is no longer current. A NEGATIVE answer
+        // ("address not linked" / "not in the verified domain") carries no
+        // binding by construction; gating it on `checkpoint_current` (which is
+        // false for a `None` binding under verification) would store it but never
+        // serve it, re-issuing the RPC on every call. Serve negatives on their
+        // TTL alone so they dedup under verification exactly as in legacy mode -
+        // a stale negative can never forge a positive, and NEGATIVE_TTL already
+        // bounds how long a freshly-linked identity stays hidden.
+        let binding_ok = entry.info.is_none()
+            || super::xid_cache_binding_current(
+                entry.finality_binding.as_ref(),
+                super::verify_finality_enabled(),
+            );
+        (entry.at.elapsed() < ttl_for(key, &entry.info) && binding_ok).then(|| entry.info.clone())
     }
 
     fn store(key: String, info: Option<XidInfo>, finality_binding: Option<(u64, String)>) {
