@@ -677,7 +677,10 @@ async fn handle(
                 .await
             {
                 Ok(_) => Resp::Ok,
-                Err(e) => Resp::Err { code: err::BAD_REQUEST, msg: e },
+                Err(e) => match e.strip_prefix(RETRYABLE_UPDATE_PREFIX) {
+                    Some(why) => busy_resp(&identity, UPDATE_RETRY_SECS, why),
+                    None => Resp::Err { code: err::BAD_REQUEST, msg: e },
+                },
             };
             let _ = conn.respond(stream, resp).await;
         }
@@ -706,6 +709,17 @@ async fn handle(
 fn unsupported() -> Resp {
     Resp::Err { code: err::UNSUPPORTED, msg: "control plane not served".into() }
 }
+
+/// Prefix a provider may put on an `apply_update` error to mean "valid
+/// request, cannot take it this instant — come back shortly" (for example
+/// the same version is already mid-apply from another peer). Answered as
+/// the bounded-retry BUSY instead of a hard error, so the sender scores the
+/// peer alive-and-busy rather than refusing.
+pub const RETRYABLE_UPDATE_PREFIX: &str = "retry-later: ";
+
+/// The comeback hint for a retryable Update refusal: long enough for the
+/// racing apply to finish, short enough that a real retry is still "live".
+const UPDATE_RETRY_SECS: u64 = 2;
 
 /// The refusal reply: a typed `Busy` carrying the comeback hint for a
 /// peer that advertised [`caps::RETRY_AFTER`] in its Hello, the legacy

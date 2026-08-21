@@ -1037,6 +1037,16 @@ async fn clone_xite_with_progress(
         }
         empty_waits = 0;
         let staged = xite.content.clone();
+        // content.json is staged in memory until the core set lands, so the
+        // wants must carry the staged authority: without it, materialization
+        // re-reads the governing content.json from disk — which does not exist
+        // yet — and rejects every fetched file as undeclared.
+        let canonical = staged
+            .as_ref()
+            .and_then(|c| c.get("address"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(address)
+            .to_string();
         let edx_progress = emit_done.clone().map(|emit| {
             Arc::new(move |inner: &str, _bytes: u64, serving: usize| emit(inner, serving))
                 as epix_ui::state::EdxBatchProgress
@@ -1055,7 +1065,7 @@ async fn clone_xite_with_progress(
                 before.clone(),
                 peers,
                 staged.as_ref(),
-                None,
+                Some((&canonical, "content.json")),
                 edx_progress,
             ),
         )

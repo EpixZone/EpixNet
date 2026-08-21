@@ -339,12 +339,28 @@ const INLINE_MERGE_MAGIC: &[u8] = b"EPIX-MERGE-2\0";
 /// into every gossip hop.
 const MAX_INLINE_MERGE_BYTES: usize = 32 * 1024;
 const MAX_INLINE_MERGES: usize = 8;
-/// Leave room below EDX's 64 KiB frame cap for the Update fields outside the
-/// inline object list.
-const UPDATE_FRAME_BUDGET: usize = 56 * 1024;
+/// Headroom reserved below the protocol frame cap for the Update fields
+/// outside the inline object list: `xite` and `inner_path` (up to
+/// MAX_INNER_PATH_BYTES each), five dial-back addresses, per-file diffs'
+/// framing, and postcard's own envelope.
+const UPDATE_ENVELOPE_HEADROOM: usize = 8 * 1024;
+/// Derived from the protocol crate's exported frame cap so a change there
+/// moves this budget with it instead of silently drifting past it. Both the
+/// send-side fit check and the receive-side marker validation use this one
+/// constant.
+const UPDATE_FRAME_BUDGET: usize = epix_edx::MAX_FRAME_LEN - UPDATE_ENVELOPE_HEADROOM;
+
+/// Conservative wire cost of one inline entry: the 32-byte ObjId plus the
+/// byte payload, with headroom for postcard's length varints and the outer
+/// Vec framing. Deliberately an over-estimate — the budget check must never
+/// admit a set the frame encoder then rejects.
+const INLINE_MERGE_ENTRY_OVERHEAD: usize = 48;
 
 fn inline_merge_wire_len(inline: &InlineMergeWire) -> usize {
-    inline.iter().map(|(_, bytes)| bytes.len() + 48).sum()
+    inline
+        .iter()
+        .map(|(_, bytes)| bytes.len() + INLINE_MERGE_ENTRY_OVERHEAD)
+        .sum()
 }
 
 fn encode_inline_merge(path: &str, body: InlineMergeBody) -> Result<(ObjId, Vec<u8>), String> {
@@ -462,19 +478,29 @@ fn select_update_merge_wire(
     }
 }
 
-fn decode_inline_merge_envelope(id: ObjId, bytes: &[u8]) -> Result<InlineMergeDelta, String> {
+/// Decode one inline object that MAY be a merge envelope. `Ok(None)` means
+/// the object is validly carried (hash matches) but of a kind this build
+/// does not own — a future inline payload type. It is not ours to decode,
+/// and failing the whole Update over it (manifest bump included) would let
+/// one novel entry stall propagation, so unknown kinds are skipped. A
+/// corrupt hash, a malformed envelope BEHIND our magic, or an unsafe path
+/// still fails closed.
+fn decode_inline_merge_envelope(
+    id: ObjId,
+    bytes: &[u8],
+) -> Result<Option<InlineMergeDelta>, String> {
     if ObjId::of(bytes) != id {
         return Err("inline merge object hash mismatch".into());
     }
     if !bytes.starts_with(INLINE_MERGE_MAGIC) {
-        return Err("unsupported inline object on merge-capable Update".into());
+        return Ok(None);
     }
     let delta = postcard::from_bytes::<InlineMergeDelta>(&bytes[INLINE_MERGE_MAGIC.len()..])
         .map_err(|e| format!("malformed inline merge envelope: {e}"))?;
     if !safe_inner_path(&delta.path) {
         return Err(format!("unsafe inline merge path: {}", delta.path));
     }
-    Ok(delta)
+    Ok(Some(delta))
 }
 
 fn add_merge_payload_bytes(
@@ -506,7 +532,9 @@ fn decode_inline_merges(inline: &[(ObjId, Vec<u8>)]) -> Result<DecodedInlineMerg
     let mut out = DecodedInlineMerges::default();
     let mut total_delta_bytes = 0u64;
     for (id, bytes) in inline {
-        let delta = decode_inline_merge_envelope(*id, bytes)?;
+        let Some(delta) = decode_inline_merge_envelope(*id, bytes)? else {
+            continue;
+        };
         out.insert(delta, &mut total_delta_bytes)?;
     }
     Ok(out)
@@ -1048,10 +1076,19 @@ impl SignedProvider for AppStateProvider {
         };
         let sender_peers: Vec<PeerAddr> =
             sender_peers.iter().filter_map(|s| PeerAddr::parse(s).ok()).take(5).collect();
-        let source: Arc<dyn InboundEdxSource> = Arc::new(LiveUpdateSource {
-            state: self.state.clone(),
-            address: xite.to_string(),
-            source,
+        // Same-session pulls only work against a sender that serves the
+        // reverse direction of its dialed link. Legacy binaries drop that
+        // half and silently ignore our requests, so every live fetch would
+        // black-hole for the full fetch timeout, per path, inside this
+        // handler. INLINE_MERGE is only advertised by builds that also
+        // reverse-serve, so gate the live source on it and send capless
+        // senders' updates straight to the dial-out fallback.
+        let source: Option<Arc<dyn InboundEdxSource>> = require_merge_delivery.then(|| {
+            Arc::new(LiveUpdateSource {
+                state: self.state.clone(),
+                address: xite.to_string(),
+                source,
+            }) as Arc<dyn InboundEdxSource>
         });
         // No `sender` PeerAddr is needed. The authenticated `source` preserves
         // the exact live connection for the first pull, and self-declared
@@ -1068,7 +1105,7 @@ impl SignedProvider for AppStateProvider {
                 Some(signed.to_vec()),
                 Some(modified),
                 sender,
-                Some(source),
+                source,
                 payload,
                 sender_peers,
             )
@@ -1673,6 +1710,25 @@ struct RuntimeEdxFetcher {
     /// Arc-shared for the same reason as the rest: a serve, its read-ahead and
     /// the scheduler all report into one picture of the same file.
     xfer: Arc<crate::xfer::Xfer>,
+    /// One-slot memo of the inline wire encoding for the payload currently
+    /// fanning out: an exhaustive publish pushes the same Arc'd payload to up
+    /// to 100 peers, and sorting + postcard-encoding + BLAKE3-hashing the
+    /// identical delta set once beats doing it per dial. Keyed by payload
+    /// identity (Weak + ptr_eq), so a relay's different payload can never
+    /// reuse a stale encoding.
+    inline_wire_memo: Arc<
+        Mutex<
+            Option<(
+                std::sync::Weak<UpdatePayload>,
+                Arc<Result<Option<InlineMergeWire>, String>>,
+            )>,
+        >,
+    >,
+    /// When the per-push quota reconciliation last ran (unix millis). The
+    /// enforce pass scans the whole object table, so the up-to-100 dials of
+    /// one publish must not each pay it; the many insert-path enforcers keep
+    /// the store bounded regardless.
+    quota_enforced_at: Arc<std::sync::atomic::AtomicU64>,
 }
 
 struct MaterializeOptions<'a> {
@@ -1927,6 +1983,8 @@ impl RuntimeEdxFetcher {
             peer_cache: Arc::default(),
             merge_prepare: Arc::default(),
             xfer: Arc::default(),
+            inline_wire_memo: Arc::default(),
+            quota_enforced_at: Arc::default(),
         }
     }
 
@@ -4988,8 +5046,32 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // capable peer receives either every small delta or an immutable
         // object marker for every non-empty delta. A legacy empty value stays
         // an explicit full-file pull marker. No path is silently omitted.
-        let candidate_inline = encode_inline_merge_records(&payload.merge_deltas)
-            .map_err(EdxPushError::Refused)?;
+        // Encoded once per publish: every dial of the fan-out shares the same
+        // Arc'd payload, so the memo hands back the finished encoding and
+        // each peer only pays the copy its own frame needs.
+        let candidate_inline = {
+            let hit = self
+                .inline_wire_memo
+                .lock()
+                .expect("inline wire memo")
+                .clone()
+                .and_then(|(weak, wire)| {
+                    weak.upgrade()
+                        .filter(|live| Arc::ptr_eq(live, &payload))
+                        .map(|_| wire)
+                });
+            match hit {
+                Some(wire) => wire,
+                None => {
+                    let wire = Arc::new(encode_inline_merge_records(&payload.merge_deltas));
+                    *self.inline_wire_memo.lock().expect("inline wire memo") =
+                        Some((Arc::downgrade(&payload), wire.clone()));
+                    wire
+                }
+            }
+        };
+        let candidate_inline =
+            candidate_inline.as_ref().clone().map_err(EdxPushError::Refused)?;
         // Declared before the holds so reverse drop order always releases the
         // holds before their Store owner. A hold is taken before each blocking
         // insert, closing the quota-eviction race between registration and the
@@ -5052,10 +5134,37 @@ impl EdxFetcher for RuntimeEdxFetcher {
             wire_inline,
         )
         .await
-        .map_err(|e| EdxPushError::Refused(e.to_string()));
+        .map_err(|e| {
+            // A typed BUSY (or the legacy Err{BUSY}) rides a QuotaExceeded
+            // io::Error (see fetch::busy_err/remote_err): the peer is alive
+            // and asked us to come back, so keep it distinct from a refusal —
+            // Refused is scored as a file failure against the peer.
+            if e.kind() == std::io::ErrorKind::QuotaExceeded {
+                EdxPushError::Busy(e.to_string())
+            } else {
+                EdxPushError::Refused(e.to_string())
+            }
+        });
         drop(prepared);
         if let Some(store) = delta_store.as_ref() {
-            let _ = store.enforce_quota(store_quota());
+            // Reconcile the store once the eviction hold dropped — but not
+            // once per dialed peer: the enforce pass walks the whole object
+            // table, and one publish fans out to up to 100 candidates whose
+            // holds all cover the same freshly-inserted delta object. A
+            // short throttle keeps one reconciliation per wave; the insert
+            // paths enforce on their own regardless.
+            use std::sync::atomic::Ordering;
+            const QUOTA_ENFORCE_THROTTLE_MS: u64 = 5_000;
+            let now = epix_core::now_ms().max(0) as u64;
+            let last = self.quota_enforced_at.load(Ordering::Relaxed);
+            if now.saturating_sub(last) >= QUOTA_ENFORCE_THROTTLE_MS
+                && self
+                    .quota_enforced_at
+                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+                    .is_ok()
+            {
+                let _ = store.enforce_quota(store_quota());
+            }
         }
         pushed?;
         // A capable receiver answers only after inline records or the verified
@@ -7211,10 +7320,24 @@ mod tests {
             "the object id binds path and bytes"
         );
 
+        // An inline object of a kind this build does not own (no merge magic)
+        // is skipped, not fatal: one novel entry from a future build must not
+        // stall the whole Update. Its hash still has to bind the bytes.
         let foreign = b"not a runtime merge envelope".to_vec();
+        let skipped =
+            decode_inline_merges(&[(ObjId::of(&foreign), foreign.clone())]).unwrap();
+        assert!(skipped.deltas.is_empty() && skipped.objects.is_empty());
         assert!(
-            decode_inline_merges(&[(ObjId::of(&foreign), foreign)]).is_err(),
-            "a capability-gated Update rejects foreign inline objects"
+            decode_inline_merges(&[(ObjId::of(b"other"), foreign)]).is_err(),
+            "a corrupt hash fails closed even for a foreign inline object"
+        );
+
+        // Garbage BEHIND our magic is ours to judge - still fatal.
+        let mut ours = INLINE_MERGE_MAGIC.to_vec();
+        ours.extend_from_slice(&[0xFF; 8]);
+        assert!(
+            decode_inline_merges(&[(ObjId::of(&ours), ours)]).is_err(),
+            "a malformed envelope behind the merge magic fails closed"
         );
     }
 

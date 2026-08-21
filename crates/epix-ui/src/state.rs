@@ -136,12 +136,74 @@ pub struct EdxObjectRef {
 #[derive(Clone, Debug, Default)]
 pub struct UpdatePayload {
     pub diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+    /// Per merge path, ONE of three shapes (never two for the same path -
+    /// [`Self::validate_disjoint_paths`] is the shared enforcement):
+    /// a non-empty value here is an inline record container; an EMPTY value
+    /// is the legacy full-file pull marker ("fetch the whole file yourself");
+    /// a path present in `merge_objects` instead names an immutable object
+    /// to stream. Producing an empty value by accident silently means "pull",
+    /// so construction sites must never emit one for a real delta.
     pub merge_deltas: HashMap<String, Vec<u8>>,
     pub merge_objects: HashMap<String, EdxObjectRef>,
     /// The sending session advertised INLINE_MERGE, so an `Ok` reply is a
     /// delivery receipt, not merely a manifest receipt. Runtime-only. This is
     /// derived from the authenticated Hello and is never serialized itself.
     pub require_merge_delivery: bool,
+}
+
+impl UpdatePayload {
+    /// Whether an acceptance only counts as delivery once the receiver has
+    /// explicitly handled the payload. The single definition of the rule:
+    /// inline merge deltas need a payload-aware ACK before a merge snapshot
+    /// may be retired; everything else is delivered when the manifest lands.
+    fn requires_payload_ack(&self) -> bool {
+        !self.merge_deltas.is_empty()
+    }
+
+    /// Wire-shape rule shared by every inbound consumer: one path may ride as
+    /// EITHER an inline delta or an object marker, never both. The single
+    /// definition — the child-staging, current-version-merge, and inbound
+    /// entry paths all enforce the same rule through here.
+    fn validate_disjoint_paths(&self) -> Result<(), String> {
+        if self
+            .merge_deltas
+            .keys()
+            .any(|path| self.merge_objects.contains_key(path))
+        {
+            return Err("Merge payload repeats a path".into());
+        }
+        Ok(())
+    }
+
+    /// The payload a RELAY may forward, built so session-scoped state is
+    /// structurally unable to survive the hop: the connection-derived
+    /// require_merge_delivery flag is never carried, and object markers this
+    /// node cannot serve are dropped. Every re-broadcast builds its payload
+    /// through here instead of hand-clearing fields at each site.
+    fn relay_form(&self) -> UpdatePayload {
+        UpdatePayload {
+            diffs: self.diffs.clone(),
+            merge_deltas: self.merge_deltas.clone(),
+            merge_objects: HashMap::new(),
+            require_merge_delivery: false,
+        }
+    }
+
+    /// [`Self::validate_disjoint_paths`] plus the declared-path rule applied
+    /// once a governing manifest is at hand: every payload path must be a
+    /// merge file that manifest declares.
+    fn validate_against_declared(&self, declared: &[String]) -> Result<(), String> {
+        self.validate_disjoint_paths()?;
+        if self
+            .merge_deltas
+            .keys()
+            .chain(self.merge_objects.keys())
+            .any(|path| !declared.iter().any(|candidate| candidate == path))
+        {
+            return Err("Merge payload names an undeclared path".into());
+        }
+        Ok(())
+    }
 }
 
 /// Fetches a file's bytes over the EDX verified-streaming path (installed by
@@ -535,6 +597,10 @@ pub enum EdxPushError {
     Unreachable(String),
     /// The link came up but the peer refused the update (it is alive).
     Refused(String),
+    /// The peer answered BUSY (update lane full, or this exact version is
+    /// already mid-apply from another sender) and asked us to come back.
+    /// Alive and healthy — must not be scored as a file failure.
+    Busy(String),
 }
 
 /// One file's state during an on-demand clone (progressive serve).
@@ -929,16 +995,7 @@ struct CurrentMergeContext<'a> {
 
 impl CurrentMergeContext<'_> {
     fn full_path(&self, relative: &str) -> String {
-        let dir = self
-            .inner_path
-            .strip_suffix("content.json")
-            .unwrap_or("")
-            .trim_end_matches('/');
-        if dir.is_empty() {
-            relative.to_string()
-        } else {
-            format!("{dir}/{relative}")
-        }
+        AppState::child_merge_full_path(self.inner_path, relative)
     }
 }
 
@@ -1485,14 +1542,17 @@ struct PublishJob {
 struct PublishResult {
     published: usize,
     payload_aware: usize,
+    /// Stamped by `publish_to` from [`UpdatePayload::requires_payload_ack`]
+    /// so callers cannot recompute the delivery rule differently.
+    requires_payload_ack: bool,
 }
 
 impl PublishResult {
     /// The acceptance count the author can safely treat as delivery. A legacy
     /// peer accepting only the manifest is success for ordinary content, but
     /// is not delivery for an inline merge-record publish.
-    fn delivered(self, requires_payload_ack: bool) -> usize {
-        if requires_payload_ack {
+    fn delivered(self) -> usize {
+        if self.requires_payload_ack {
             self.payload_aware
         } else {
             self.published
@@ -1533,6 +1593,14 @@ enum PushOutcome {
     /// tiebreak prefers - promoting a useless peer above never-tried
     /// candidates and (via the connected flag) shielding it from eviction.
     Refused(PeerAddr, String),
+    /// Alive but could not take the update right now: its update lane was
+    /// full, this exact version was already mid-apply from another sender,
+    /// or it was still pulling our files when the push budget ran out.
+    /// Scored neutrally - no reward, no dock. The flood redundancy and the
+    /// periodic resync cover the miss, and docking a healthy peer that is
+    /// busy applying this very update was exactly the mis-signal this
+    /// variant removes.
+    Deferred(PeerAddr, String),
 }
 
 impl PushOutcome {
@@ -1544,16 +1612,22 @@ impl PushOutcome {
         matches!(self, PushOutcome::Accepted(_, true))
     }
 
-    /// The registry feedback for this outcome, plus the label it carries in
-    /// the DEBUG failed-candidates line (None = success).
-    fn feedback(self) -> (PeerAddr, epix_worker::PeerOutcome, Option<String>) {
+    /// The registry feedback for this outcome (None = score nothing), plus
+    /// the label it carries in the DEBUG failed-candidates line (None =
+    /// success).
+    fn feedback(self) -> (PeerAddr, Option<epix_worker::PeerOutcome>, Option<String>) {
         match self {
-            PushOutcome::Accepted(peer, _) => (peer, epix_worker::PeerOutcome::ConnectOk, None),
+            PushOutcome::Accepted(peer, _) => {
+                (peer, Some(epix_worker::PeerOutcome::ConnectOk), None)
+            }
             PushOutcome::Unreachable(peer) => {
-                (peer, epix_worker::PeerOutcome::ConnectFail, Some("unreachable".into()))
+                (peer, Some(epix_worker::PeerOutcome::ConnectFail), Some("unreachable".into()))
             }
             PushOutcome::Refused(peer, why) => {
-                (peer, epix_worker::PeerOutcome::FileFail, Some(format!("refused: {why}")))
+                (peer, Some(epix_worker::PeerOutcome::FileFail), Some(format!("refused: {why}")))
+            }
+            PushOutcome::Deferred(peer, why) => {
+                (peer, None, Some(format!("deferred: {why}")))
             }
         }
     }
@@ -1575,7 +1649,9 @@ fn record_push_outcome(
         Some(label) => failed.push(format!("{peer} ({label})")),
         None => accepted.push(peer.to_string()),
     }
-    outcomes.push((peer, score));
+    if let Some(score) = score {
+        outcomes.push((peer, score));
+    }
 }
 
 /// Push one update to a publish candidate over EDX, bounded by the peer's dial
@@ -1607,7 +1683,19 @@ async fn push_update_to_peer(
     payload: Arc<UpdatePayload>,
     sender_peers: Arc<Vec<String>>,
 ) -> PushOutcome {
-    let deadline = peer.connect_timeout().saturating_add(peer.file_timeout());
+    // A child ACK is an availability receipt: the receiver holds the Update
+    // open while it pulls required files over this same session, so a child
+    // or payload-bearing push gets a second file budget on top of the dial.
+    // Root pushes are ACKed after staging and keep the single-file bound.
+    let transfers = if inner_path != "content.json"
+        || !payload.merge_deltas.is_empty()
+        || !payload.merge_objects.is_empty()
+    {
+        2
+    } else {
+        1
+    };
+    let deadline = peer.connect_timeout().saturating_add(peer.file_timeout() * transfers);
     let timeout_peer = peer.clone();
     // Set by the fetcher once the EDX link is up, so a timeout that fires
     // after the handshake is scored Refused (alive), not a backoff.
@@ -1630,14 +1718,19 @@ async fn push_update_to_peer(
             {
                 Ok(payload_aware) => PushOutcome::Accepted(peer, payload_aware),
                 Err(EdxPushError::Refused(e)) => PushOutcome::Refused(peer, e),
+                Err(EdxPushError::Busy(e)) => PushOutcome::Deferred(peer, e),
                 Err(EdxPushError::Unreachable(_)) => PushOutcome::Unreachable(peer),
             }
         }
     };
     match tokio::time::timeout(deadline, push).await {
         Ok(outcome) => outcome,
+        // The link was up, so the peer is alive and most likely still pulling
+        // our files; it usually commits and re-relays after we hang up. Score
+        // it neutrally instead of docking a receiver for doing the transfer
+        // work we asked of it.
         Err(_) if progressed.load(Ordering::Relaxed) => {
-            PushOutcome::Refused(timeout_peer, "timed out after the link came up".into())
+            PushOutcome::Deferred(timeout_peer, "still transferring at the push deadline".into())
         }
         Err(_) => PushOutcome::Unreachable(timeout_peer),
     }
@@ -5519,6 +5612,11 @@ impl AppState {
     /// record the missing paths in `settings.cache.bad_files`, and hold the
     /// update as a [`PendingUpdate`] for [`Self::retry_pending_updates`].
     /// Returns whether the update committed.
+    ///
+    /// `manifest_guard` is the caller's held `merge_path_lock(canonical,
+    /// "content.json")` — demanded by type so an unguarded caller cannot
+    /// compile, which is the invariant that keeps a stale v2 from
+    /// materializing beside an already-committed v3.
     async fn finalize_root_update(
         &self,
         keys: &[String],
@@ -5527,9 +5625,11 @@ impl AppState {
         content: Value,
         bytes: &[u8],
         failed: &[String],
+        manifest_guard: &tokio::sync::OwnedMutexGuard<()>,
     ) -> bool {
         if failed.is_empty() {
-            self.commit_root_update(keys, canonical, storage, content, bytes).await
+            self.commit_root_update(keys, canonical, storage, content, bytes, manifest_guard)
+                .await
         } else {
             self.defer_root_update(keys, canonical, content, bytes, failed).await;
             false
@@ -5547,6 +5647,7 @@ impl AppState {
         storage: &XiteStorage,
         content: Value,
         bytes: &[u8],
+        _manifest_guard: &tokio::sync::OwnedMutexGuard<()>,
     ) -> bool {
         if let Err(e) = storage.write_atomic("content.json", bytes) {
             self.log("ERROR", format!("Committing content.json for {canonical} failed: {e}"))
@@ -5758,7 +5859,16 @@ impl AppState {
         }
         let failed: Vec<String> =
             xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
-        self.finalize_root_update(keys, canonical, &view.storage, content, bytes, &failed).await
+        self.finalize_root_update(
+            keys,
+            canonical,
+            &view.storage,
+            content,
+            bytes,
+            &failed,
+            &_update_guard,
+        )
+        .await
     }
 
     fn pending_child_key(key: &str, inner_path: &str) -> String {
@@ -5773,6 +5883,54 @@ impl AppState {
             .iter()
             .filter(|file| !storage.verify(&file.inner_path, &file.sha512))
             .map(|file| file.inner_path.clone())
+            .collect()
+    }
+
+    /// Declared hashed paths that can NEVER arrive over EDX: legacy entries
+    /// with no `b3` and no `files_shard` descriptor (the known pre-EDX signed
+    /// population; the cure is re-signing). Availability gating must not wait
+    /// on them - EDX is the only transfer path, so requiring one would turn
+    /// every push of such a manifest into a permanent refusal. They still
+    /// ride `child_files` for diff application and ingest.
+    fn unfetchable_child_paths(
+        inner_path: &str,
+        content: &Value,
+    ) -> std::collections::HashSet<String> {
+        let dir = inner_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        content
+            .get("files")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|files| files.iter())
+            .filter(|(path, info)| {
+                info.get("b3").and_then(Value::as_str).is_none()
+                    && content
+                        .get("files_shard")
+                        .and_then(|shards| shards.get(path.as_str()))
+                        .is_none()
+            })
+            .map(|(path, _)| {
+                if dir.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{dir}/{path}")
+                }
+            })
+            .collect()
+    }
+
+    /// [`Self::missing_child_files`] restricted to files a fetch can actually
+    /// land - the availability gate for receipts and promotion.
+    fn missing_fetchable_child_files(
+        storage: &XiteStorage,
+        files: &[epix_xite::FileEntry],
+        inner_path: &str,
+        content: &Value,
+    ) -> Vec<String> {
+        let unfetchable = Self::unfetchable_child_paths(inner_path, content);
+        Self::missing_child_files(storage, files)
+            .into_iter()
+            .filter(|path| !unfetchable.contains(path))
             .collect()
     }
 
@@ -5848,11 +6006,12 @@ impl AppState {
         let inner_path = relay.inner_path.clone();
         let modified = relay.modified;
         let merge_pending = relay.merge_pending;
-        {
+        let mut evicted: Vec<PendingChildRelay> = Vec::new();
+        let retained = {
             let mut pending = self.pending_child_relays.lock().unwrap();
             let replace = pending.get(&key).is_none_or(|old| old.modified <= modified);
             if replace {
-                pending.insert(key, relay);
+                pending.insert(key.clone(), relay);
             }
             let mut retained_bytes = pending.values().fold(0usize, |total, relay| {
                 total.saturating_add(relay.retained_bytes())
@@ -5869,10 +6028,21 @@ impl AppState {
                 };
                 if let Some(removed) = pending.remove(&oldest) {
                     retained_bytes = retained_bytes.saturating_sub(removed.retained_bytes());
+                    evicted.push(removed);
                 }
             }
+            replace && pending.get(&key).is_some_and(|live| live.modified == modified)
+        };
+        // A relay the caps just evicted will never complete, so its bad-file
+        // counters must go with it or the dashboard reads those paths as
+        // permanently bad until the next root commit's blanket clear.
+        for removed in &evicted {
+            self.clear_relay_bad_files(removed).await;
         }
-        {
+        // Same rule for a relay that was never stored (an older version racing
+        // a newer pending entry, or immediately evicted above): registering
+        // bad files for it would leak counters nothing ever clears.
+        if retained {
             let mut xites = self.xites.write().await;
             for key in &keys {
                 if let Some(xite) = xites.get_mut(key) {
@@ -5912,7 +6082,26 @@ impl AppState {
         storage: &XiteStorage,
         canonical: &str,
     ) -> bool {
-        let missing = Self::missing_child_files(storage, &pending.files);
+        let staged_content = pending
+            .staged_bytes
+            .as_ref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            .or_else(|| {
+                storage
+                    .read(&pending.inner_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            });
+        let gate_missing = |storage: &XiteStorage| match staged_content.as_ref() {
+            Some(content) => Self::missing_fetchable_child_files(
+                storage,
+                &pending.files,
+                &pending.inner_path,
+                content,
+            ),
+            None => Self::missing_child_files(storage, &pending.files),
+        };
+        let missing = gate_missing(storage);
         if missing.is_empty() {
             return true;
         }
@@ -5929,18 +6118,9 @@ impl AppState {
             .filter(|file| missing.contains(&file.inner_path))
             .cloned()
             .collect();
-        let staged_content = pending
-            .staged_bytes
-            .as_ref()
-            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
-            .or_else(|| {
-                storage
-                    .read(&pending.inner_path)
-                    .ok()
-                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            });
         let staged = staged_content
-            .map(|content| Self::staged_child_edx_content(&pending.inner_path, &content));
+            .as_ref()
+            .map(|content| Self::staged_child_edx_content(&pending.inner_path, content));
         let _ = self
             .edx_first(
                 &pending.keys[0],
@@ -5951,7 +6131,7 @@ impl AppState {
                 None,
             )
             .await;
-        Self::missing_child_files(storage, &pending.files).is_empty()
+        gate_missing(storage).is_empty()
     }
 
     fn mark_pending_child_merge_failed(
@@ -5997,6 +6177,15 @@ impl AppState {
         {
             self.log("WARN", error).await;
             self.mark_pending_child_merge_failed(pending_key, relay_payload);
+            // add_content above already committed the manifest and its hashed
+            // files verified, so keep the db in step with the disk even though
+            // the merge apply failed. The pending entry stays behind, waiting
+            // for a live payload push (or the periodic merge resync) to land
+            // the records themselves.
+            self.ingest_file_from(&pending.keys[0], &pending.inner_path, None).await;
+            for file in &pending.files {
+                self.ingest_file_from(&pending.keys[0], &file.inner_path, None).await;
+            }
             return None;
         }
         self.ingest_file_from(&pending.keys[0], &pending.inner_path, None).await;
@@ -6013,6 +6202,14 @@ impl AppState {
                 relays.remove(pending_key);
             }
         }
+        self.clear_relay_bad_files(pending).await;
+    }
+
+    /// Drop the bad-file counters a relay registered. Runs both when a relay
+    /// completes and when one is discarded (cap-evicted, dropped as a stale
+    /// duplicate, or removed by the staleness check): a discarded relay will
+    /// never complete, so its counters would otherwise read as permanently bad.
+    async fn clear_relay_bad_files(&self, pending: &PendingChildRelay) {
         let paths: std::collections::HashSet<&str> =
             pending.files.iter().map(|file| file.inner_path.as_str()).collect();
         let mut xites = self.xites.write().await;
@@ -6027,12 +6224,11 @@ impl AppState {
         self: &Arc<Self>,
         canonical: &str,
         pending: &PendingChildRelay,
-        mut relay: UpdatePayload,
+        relay: UpdatePayload,
     ) {
         let can_republish = self.transport.read().await.is_some();
         if can_republish {
-            relay.require_merge_delivery = false;
-            relay.merge_objects.clear();
+            let relay = relay.relay_form();
             let _ = self
                 .publish_to(
                     &pending.keys[0],
@@ -6097,6 +6293,7 @@ impl AppState {
         };
         if Self::pending_child_is_stale(&storage, &pending) {
             self.pending_child_relays.lock().unwrap().remove(pending_key);
+            self.clear_relay_bad_files(&pending).await;
             return false;
         }
         if pending.merge_pending {
@@ -6225,7 +6422,7 @@ impl AppState {
     ) -> Vec<epix_xite::FileEntry> {
         let want: Vec<EdxWant> = needed
             .iter()
-            .map(|f| {
+            .filter_map(|f| {
                 let (id, size) = staged
                     .and_then(|c| edx_want_from_staged(c, &f.inner_path))
                     .unzip();
@@ -6245,7 +6442,16 @@ impl AppState {
                     ),
                     _ => None,
                 };
-                EdxWant { inner_path: f.inner_path.clone(), id, size, authority }
+                // The caller holds this manifest's canonical merge lock. A
+                // want with no staged authority would resolve against the
+                // committed manifest and materialize through the ordinary
+                // locking path — awaiting the very lock the caller holds, a
+                // self-deadlock. Such a file cannot ride this batch; the
+                // periodic resync retries it without the lock held.
+                if held_manifest.is_some() && authority.is_none() {
+                    return None;
+                }
+                Some(EdxWant { inner_path: f.inner_path.clone(), id, size, authority })
             })
             .collect();
         let total = needed.len();
@@ -6541,7 +6747,15 @@ impl AppState {
             xite.files_needed().iter().map(|f| f.inner_path.clone()).collect();
         let Some(content) = xite.content else { return Ok(false) };
         let committed = self
-            .finalize_root_update(&keys, canonical, storage, content, &bytes, &failed)
+            .finalize_root_update(
+                &keys,
+                canonical,
+                storage,
+                content,
+                &bytes,
+                &failed,
+                &_update_guard,
+            )
             .await;
         if committed {
             // The new version may declare optional files the user has promised
@@ -10538,24 +10752,36 @@ impl AppState {
         Some((b3, size))
     }
 
-    fn declared_object_id_at(
+    /// Read the ON-DISK governing content.json and resolve `inner_path` to
+    /// the manifest-relative key its file sections use. The one resolver both
+    /// declared-entry lookups below share, so their rules cannot drift.
+    fn governing_content_and_rel(
         storage: &XiteStorage,
         governing: &str,
         inner_path: &str,
-    ) -> Option<epix_blob::ObjId> {
+    ) -> Option<(Value, String)> {
         let content: Value = serde_json::from_slice(&storage.read(governing).ok()?).ok()?;
         let dir = governing
             .strip_suffix("content.json")
             .unwrap_or("")
             .trim_end_matches('/');
         let rel = if dir.is_empty() {
-            inner_path
+            inner_path.to_string()
         } else {
-            inner_path.strip_prefix(&format!("{dir}/"))?
+            inner_path.strip_prefix(&format!("{dir}/"))?.to_string()
         };
+        Some((content, rel))
+    }
+
+    fn declared_object_id_at(
+        storage: &XiteStorage,
+        governing: &str,
+        inner_path: &str,
+    ) -> Option<epix_blob::ObjId> {
+        let (content, rel) = Self::governing_content_and_rel(storage, governing, inner_path)?;
         ["files", "files_optional"]
             .into_iter()
-            .find_map(|section| content.get(section).and_then(|files| files.get(rel)))
+            .find_map(|section| content.get(section).and_then(|files| files.get(&rel)))
             .and_then(|entry| entry.get("b3"))
             .and_then(Value::as_str)
             .and_then(epix_blob::ObjId::from_hex)
@@ -10566,17 +10792,8 @@ impl AppState {
         governing: &str,
         inner_path: &str,
     ) -> Option<Value> {
-        let content: Value = serde_json::from_slice(&storage.read(governing).ok()?).ok()?;
-        let dir = governing
-            .strip_suffix("content.json")
-            .unwrap_or("")
-            .trim_end_matches('/');
-        let rel = if dir.is_empty() {
-            inner_path
-        } else {
-            inner_path.strip_prefix(&format!("{dir}/"))?
-        };
-        content.get("files_shard")?.get(rel).cloned()
+        let (content, rel) = Self::governing_content_and_rel(storage, governing, inner_path)?;
+        content.get("files_shard")?.get(&rel).cloned()
     }
 
     /// Authorize one final-path materialization. Ordinary fetches lock the
@@ -10591,6 +10808,30 @@ impl AppState {
         id: epix_blob::ObjId,
         authority: Option<&EdxMaterializeAuthority>,
     ) -> Result<(XiteStorage, Option<tokio::sync::OwnedMutexGuard<()>>), String> {
+        self.edx_materialize_permit_with(address, inner_path, id, authority, |storage, governing| {
+            if Self::declared_object_id_at(storage, governing, inner_path) != Some(id) {
+                return Err(format!(
+                    "stale EDX object {id} is no longer declared for {inner_path}"
+                ));
+            }
+            Ok(())
+        })
+        .await
+    }
+
+    /// The one authority-or-lock transaction behind every final-path
+    /// materialization, parameterized by how the current declaration is
+    /// rechecked under the lock (hash files compare the declared `b3`;
+    /// encrypted files compare the exact `files_shard` descriptor). Any fix
+    /// to the lock protocol lands here once and covers both.
+    async fn edx_materialize_permit_with(
+        &self,
+        address: &str,
+        inner_path: &str,
+        authority_id: epix_blob::ObjId,
+        authority: Option<&EdxMaterializeAuthority>,
+        recheck_declaration: impl FnOnce(&XiteStorage, &str) -> Result<(), String>,
+    ) -> Result<(XiteStorage, Option<tokio::sync::OwnedMutexGuard<()>>), String> {
         let (storage, canonical) = {
             let xites = self.xites.read().await;
             let entry = xites.get(address).ok_or("unknown xite")?;
@@ -10601,7 +10842,7 @@ impl AppState {
         };
         if let Some(authority) = authority {
             if !authority.governing.ends_with("content.json")
-                || !authority.matches(&canonical, inner_path, id)
+                || !authority.matches(&canonical, inner_path, authority_id)
             {
                 return Err(format!(
                     "staged materialization authority does not match {canonical}/{inner_path}"
@@ -10620,11 +10861,7 @@ impl AppState {
         if self.content_inner_path(address, inner_path).await != governing {
             return Err(format!("stale EDX materialization for {canonical}/{inner_path}"));
         }
-        if Self::declared_object_id_at(&storage, &governing, inner_path) != Some(id) {
-            return Err(format!(
-                "stale EDX object {id} is no longer declared for {canonical}/{inner_path}"
-            ));
-        }
+        recheck_declaration(&storage, &governing)?;
         Ok((storage, Some(guard)))
     }
 
@@ -10705,47 +10942,29 @@ impl AppState {
         }
         let descriptor_id =
             epix_blob::ObjId::of(epix_content::dumps_sorted(expected_entry).as_bytes());
-        let (storage, canonical) = {
-            let xites = self.xites.read().await;
-            let entry = xites.get(address).ok_or("unknown xite")?;
-            (
-                entry.storage.clone(),
-                canonical_address(entry.content.as_ref(), address),
+        let (storage, _manifest_guard) = self
+            .edx_materialize_permit_with(
+                address,
+                inner_path,
+                descriptor_id,
+                authority,
+                |storage, governing| {
+                    let current =
+                        Self::declared_shard_entry_at(storage, governing, inner_path)
+                            .ok_or_else(|| {
+                                format!(
+                                    "encrypted file is no longer declared for {inner_path}"
+                                )
+                            })?;
+                    if current != *expected_entry {
+                        return Err(format!(
+                            "stale EDX shard descriptor for {inner_path}"
+                        ));
+                    }
+                    Ok(())
+                },
             )
-        };
-        let _manifest_guard = if let Some(authority) = authority {
-            if !authority.governing.ends_with("content.json")
-                || !authority.matches(&canonical, inner_path, descriptor_id)
-            {
-                return Err(format!(
-                    "staged shard authority does not match {canonical}/{inner_path}"
-                ));
-            }
-            None
-        } else {
-            let governing = self.content_inner_path(address, inner_path).await;
-            let guard = self
-                .merge_path_lock(&canonical, &governing)
-                .lock_owned()
-                .await;
-            if self.content_inner_path(address, inner_path).await != governing {
-                return Err(format!(
-                    "stale EDX shard materialization for {canonical}/{inner_path}"
-                ));
-            }
-            let current = Self::declared_shard_entry_at(&storage, &governing, inner_path)
-                .ok_or_else(|| {
-                    format!(
-                        "encrypted file is no longer declared for {canonical}/{inner_path}"
-                    )
-                })?;
-            if current != *expected_entry {
-                return Err(format!(
-                    "stale EDX shard descriptor for {canonical}/{inner_path}"
-                ));
-            }
-            Some(guard)
-        };
+            .await?;
         storage.write(inner_path, bytes).map_err(|e| e.to_string())?;
         self.note_materialized(address, inner_path).await;
         Ok(())
@@ -11593,23 +11812,9 @@ impl AppState {
         bytes: &[u8],
         max_size: Option<u64>,
     ) -> Result<Option<Vec<u8>>, String> {
-        let Ok(incoming) = serde_json::from_slice::<Value>(bytes) else {
+        let Ok((verified, _)) = Self::verify_merge_copy(bytes, signers) else {
             return Ok(None);
         };
-        let incoming_count = epix_content::records_of(&incoming).len();
-        let verified = epix_content::merge_orset(
-            &epix_content::make_container(Vec::new()),
-            &incoming,
-            signers,
-            epix_core::now_ms(),
-        );
-        let canonical_empty = incoming_count == 0
-            && incoming.get("record_format").and_then(Value::as_str)
-                == Some(epix_content::RECORD_FORMAT)
-            && incoming.get("post").is_some_and(Value::is_array);
-        if epix_content::records_of(&verified).is_empty() && !canonical_empty {
-            return Ok(None);
-        }
         let (storage, canonical) = {
             let xites = self.xites.read().await;
             let xite = xites.get(address).ok_or("unknown xite")?;
@@ -11631,28 +11836,9 @@ impl AppState {
         serde_json::to_vec(&verified).map(Some).map_err(|e| e.to_string())
     }
 
-    fn validate_child_merge_paths(
-        merge_paths: &[String],
-        payload: &UpdatePayload,
-    ) -> Result<(), String> {
-        if payload
-            .merge_deltas
-            .keys()
-            .any(|path| payload.merge_objects.contains_key(path))
-        {
-            return Err("Merge payload repeats a path".into());
-        }
-        if payload
-            .merge_deltas
-            .keys()
-            .chain(payload.merge_objects.keys())
-            .any(|path| !merge_paths.iter().any(|declared| declared == path))
-        {
-            return Err("Merge payload names an undeclared path".into());
-        }
-        Ok(())
-    }
-
+    /// The one governing-manifest-dir -> xite-relative join for merge paths.
+    /// Peer-supplied payload paths are resolved through here everywhere, so
+    /// any future normalization or traversal hardening lands once.
     fn child_merge_full_path(inner_path: &str, relative: &str) -> String {
         let dir = inner_path
             .strip_suffix("content.json")
@@ -11757,14 +11943,17 @@ impl AppState {
     /// Resolve all merge work named by a newly verified child while keeping it
     /// off disk. Negotiated peers only trigger work for explicit envelope
     /// entries. Capless peers preserve the legacy bump behavior and pull every
-    /// declared merge file from the exact live source, then known addresses.
+    /// declared merge file - from dial-out candidates only: legacy binaries
+    /// serve nothing on the reverse half of their own dialed link (the
+    /// runtime passes no live source for them), so a same-session pull would
+    /// black-hole for the full fetch timeout per path.
     async fn stage_child_merge_payload(
         &self,
         stage: ChildMergeStage<'_>,
         payload: &mut UpdatePayload,
     ) -> Result<(), String> {
         let merge_paths = epix_content::declared_merge_files(stage.content);
-        Self::validate_child_merge_paths(&merge_paths, payload)?;
+        payload.validate_against_declared(&merge_paths)?;
 
         let require_delivery = payload.require_merge_delivery;
         let signers = stage
@@ -11821,20 +12010,12 @@ impl AppState {
         payload: &mut UpdatePayload,
     ) -> Result<(), String> {
         let signers = view.valid_signers_for_content(inner_path, content, xid_map);
-        let dir = inner_path
-            .strip_suffix("content.json")
-            .unwrap_or("")
-            .trim_end_matches('/');
         let mut relay = HashMap::new();
         for rel in epix_content::declared_merge_files(content) {
             let Some(delta) = payload.merge_deltas.remove(&rel) else {
                 continue;
             };
-            let full = if dir.is_empty() {
-                rel.clone()
-            } else {
-                format!("{dir}/{rel}")
-            };
+            let full = Self::child_merge_full_path(inner_path, &rel);
             let max_size =
                 Self::merge_file_max_size(view, inner_path, content, xid_map, &rel);
             let merged = self
@@ -11858,6 +12039,12 @@ impl AppState {
     /// and rises in selection. Without this the merge fetch was outcome-blind,
     /// so dead peers kept their slots and a good seed never gained the
     /// reputation to be picked. `EPIX_MERGE_TRACE=1` logs every answer.
+    /// Parse and verify one serialized merge container against `signers`;
+    /// the returned container holds only authorized records. Err when nothing
+    /// verifies AND the container is not the canonical empty form (the valid
+    /// "nothing here yet" answer). THE single definition of the signed-CRDT
+    /// envelope rule: staging, inline apply, and the anti-entropy copies all
+    /// pass through here.
     fn verify_merge_copy(bytes: &[u8], signers: &[String]) -> Result<(Value, usize), String> {
         let incoming: Value = serde_json::from_slice(bytes)
             .map_err(|_| "served unparsable bytes".to_string())?;
@@ -11960,23 +12147,9 @@ impl AppState {
         bytes: &[u8],
         max_size: Option<u64>,
     ) -> Result<Option<MergeRecordsResult>, String> {
-        let Ok(incoming) = serde_json::from_slice::<Value>(bytes) else {
+        let Ok((verified, _)) = Self::verify_merge_copy(bytes, signers) else {
             return Ok(None);
         };
-        let incoming_count = epix_content::records_of(&incoming).len();
-        let verified = epix_content::merge_orset(
-            &epix_content::make_container(Vec::new()),
-            &incoming,
-            signers,
-            epix_core::now_ms(),
-        );
-        let canonical_empty = incoming_count == 0
-            && incoming.get("record_format").and_then(Value::as_str)
-                == Some(epix_content::RECORD_FORMAT)
-            && incoming.get("post").is_some_and(Value::is_array);
-        if epix_content::records_of(&verified).is_empty() && !canonical_empty {
-            return Ok(None);
-        }
         let (storage, canonical) = {
             let xites = self.xites.read().await;
             let xite = xites.get(address).ok_or("unknown xite")?;
@@ -11992,22 +12165,23 @@ impl AppState {
             .ok()
             .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
             .unwrap_or_else(|| epix_content::make_container(Vec::new()));
-        let normalized_existing = epix_content::merge_orset(
-            &epix_content::make_container(Vec::new()),
-            &existing,
-            signers,
-            epix_core::now_ms(),
-        );
-        let existing_signatures: std::collections::HashSet<String> =
-            epix_content::records_of(&normalized_existing)
-                .into_iter()
-                .filter_map(|record| {
-                    record
-                        .get("sign")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect();
+        // The novel-record set and the before count only need the signature
+        // strings already on disk — a plain read, no crypto. The final
+        // merge_orset below is the single verifying pass over `existing`;
+        // running another one here doubled the ECDSA work of every inbound
+        // delta against the whole stored record set while the merge lock was
+        // held.
+        let existing_records = epix_content::records_of(&existing);
+        let before = existing_records.len();
+        let existing_signatures: std::collections::HashSet<String> = existing_records
+            .into_iter()
+            .filter_map(|record| {
+                record
+                    .get("sign")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect();
         let novel: Vec<Value> = epix_content::records_of(&verified)
             .into_iter()
             .filter(|record| {
@@ -12017,7 +12191,6 @@ impl AppState {
                     .is_some_and(|sign| !existing_signatures.contains(sign))
             })
             .collect();
-        let before = epix_content::records_of(&normalized_existing).len();
         let merged = epix_content::merge_orset(&existing, &verified, signers, epix_core::now_ms());
         let after = epix_content::records_of(&merged).len();
         let changed = merged != existing;
@@ -12938,6 +13111,16 @@ impl AppState {
     ) -> Result<(HashMap<String, Vec<u8>>, Vec<MergeSnapshotReceipt>), String> {
         let mut out = HashMap::new();
         let mut receipts = Vec::new();
+        // Inline merge delivery is authorized by a governing CHILD manifest:
+        // every receiver's root branch drops payload envelopes on a root
+        // update without writing a record. Deriving deltas for a root publish
+        // would therefore hand out receipts no peer can honor — the sender
+        // would count the push payload-aware (the flag is capability-derived)
+        // and retire '-old' snapshots for records that were never delivered.
+        // Root-declared merge files stay on the anti-entropy path instead.
+        if content_inner_path == "content.json" {
+            return Ok((out, receipts));
+        }
         let Some((storage, canonical)) = ({
             let xites = self.xites.read().await;
             xites.get(address).map(|xite| {
@@ -13004,11 +13187,23 @@ impl AppState {
             let bytes = serde_json::to_vec(&epix_content::make_container(added))
                 .map_err(|e| format!("Could not encode merge delta for {full}: {e}"))?;
             if bytes.len() as u64 > MAX_MERGE_DELTA_OBJECT_BYTES {
-                return Err(format!(
-                    "Merge delta for {full} is {} bytes, above the {} byte live-delivery limit; publish aborted",
-                    bytes.len(),
-                    MAX_MERGE_DELTA_OBJECT_BYTES
-                ));
+                // Undeliverable live (aggregate object cap), and a legacy
+                // empty marker must not be emitted either (GetSigned has the
+                // same 8 MiB cap). Failing the whole publish here would also
+                // block unrelated manifest edits with no way forward, so ship
+                // everything else and leave this path's records pending: the
+                // snapshot is retained, and the immutable-snapshot descriptor
+                // follow-up is the real transfer for oversize merge files.
+                self.log(
+                    "WARN",
+                    format!(
+                        "Merge delta for {full} is {} bytes, above the {} byte live-delivery limit; its records stay pending and ride no receipt",
+                        bytes.len(),
+                        MAX_MERGE_DELTA_OBJECT_BYTES
+                    ),
+                )
+                .await;
+                continue;
             }
             out.insert(rel, bytes);
             receipts.push(MergeSnapshotReceipt {
@@ -13066,7 +13261,6 @@ impl AppState {
         exhaustive: bool,
     ) -> Result<usize, String> {
         let (merge_deltas, merge_receipts) = self.merge_deltas(address, inner_path).await?;
-        let requires_payload_ack = !merge_deltas.is_empty();
         let payload = UpdatePayload {
             diffs: self.take_diffs(address, inner_path).await,
             merge_deltas,
@@ -13089,7 +13283,7 @@ impl AppState {
         if result.payload_aware > 0 {
             self.acknowledge_merge_snapshots(address, merge_receipts).await;
         }
-        Ok(result.delivered(requires_payload_ack))
+        Ok(result.delivered())
     }
 
     /// Publish to at most `limit` connectable peers per batch. The
@@ -13138,8 +13332,18 @@ impl AppState {
         }
         // The publisher is itself the best store-and-forward source for this
         // update. Pollers connected to us should learn about it even if every
-        // direct push target is temporarily unreachable.
-        self.record_update_hint(address, modified as i64).await;
+        // direct push target is temporarily unreachable. Key the hint by the
+        // canonical address: `address` can be a .epix serving alias, and
+        // UpdatesSince pollers match hints by exact string against the
+        // canonical key, so an alias-keyed hint reaches almost nobody.
+        let hint_key = {
+            let xites = self.xites.read().await;
+            xites
+                .get(address)
+                .map(|x| canonical_address(x.content.as_ref(), address))
+                .unwrap_or_else(|| address.to_string())
+        };
+        self.record_update_hint(&hint_key, modified as i64).await;
         // EDX is the sole propagation transport now; without it there is no
         // push path (the msgpack update was retired). EPIX_EDX=0 therefore
         // disables publishing, which is the intended clean-cut behavior.
@@ -13161,7 +13365,7 @@ impl AppState {
             .await;
         let total = pool.len();
         self.log_publish_pool(address, &pool, &options).await;
-        let requires_payload_ack = !payload.merge_deltas.is_empty();
+        let requires_payload_ack = payload.requires_payload_ack();
         // Keep the payload transport-neutral (the EDX edge lowers diffs and
         // inline merge deltas to their wire forms); Arc so up to 100 spawned
         // pushes share one copy.
@@ -13197,7 +13401,11 @@ impl AppState {
         // Close the bar against what was actually attempted (idempotent when
         // the loop already emitted this exact event on its last candidate).
         self.publish_progress(address, &run, run.done);
-        Ok(PublishResult { published: run.published, payload_aware: run.payload_aware })
+        Ok(PublishResult {
+            published: run.published,
+            payload_aware: run.payload_aware,
+            requires_payload_ack,
+        })
     }
 
     async fn log_publish_pool(
@@ -13367,7 +13575,9 @@ impl AppState {
             while let Some(res) = set.join_next().await {
                 if let Ok(outcome) = res {
                     let (peer, score, _) = outcome.feedback();
-                    outcomes.push((peer, score));
+                    if let Some(score) = score {
+                        outcomes.push((peer, score));
+                    }
                 }
             }
             state.apply_peer_outcomes(&addr, outcomes).await;
@@ -13393,28 +13603,6 @@ impl AppState {
             Ok(Some(Ok(Some(bytes)))) => Some(bytes),
             _ => None,
         }
-    }
-
-    fn validate_current_merge_payload(
-        payload: &UpdatePayload,
-        declared: &[String],
-    ) -> Result<(), String> {
-        if payload
-            .merge_deltas
-            .keys()
-            .any(|path| payload.merge_objects.contains_key(path))
-        {
-            return Err("Merge payload repeats a path".into());
-        }
-        if payload
-            .merge_deltas
-            .keys()
-            .chain(payload.merge_objects.keys())
-            .any(|path| !declared.iter().any(|candidate| candidate == path))
-        {
-            return Err("Merge payload names an undeclared path".into());
-        }
-        Ok(())
     }
 
     fn current_merge_work(payload: &UpdatePayload, declared: &[String]) -> Vec<String> {
@@ -13647,6 +13835,11 @@ impl AppState {
         });
     }
 
+    /// The ONE candidate screen for update-driven fetches (used by both the
+    /// current-merge and the inbound-finish paths): known connectable peers
+    /// first, then the sender and its self-declared addresses - each gated by
+    /// dialable-network, connectability, and the is-own-peer filter so a peer
+    /// naming our own address can never make us dial ourselves.
     async fn preferred_update_peers(
         &self,
         key: &str,
@@ -13800,9 +13993,8 @@ impl AppState {
         let state = self.clone();
         let key = key.to_string();
         let inner_path = inner_path.to_string();
-        let mut relay = pending.map(|relay| relay.payload).unwrap_or_default();
-        relay.require_merge_delivery = false;
-        relay.merge_objects.clear();
+        let mut relay =
+            pending.map(|relay| relay.payload.relay_form()).unwrap_or_default();
         if !progress.relay_deltas.is_empty() {
             relay.merge_deltas = progress.relay_deltas;
         }
@@ -13851,7 +14043,7 @@ impl AppState {
         let modified = content.get("modified").and_then(Value::as_f64).unwrap_or(0.0);
         let pending_payload = payload.clone();
         let merge_paths = epix_content::declared_merge_files(&content);
-        Self::validate_current_merge_payload(&payload, &merge_paths)?;
+        payload.validate_against_declared(&merge_paths)?;
         let work = Self::current_merge_work(&payload, &merge_paths);
         let xid_map = Self::resolve_xid_map(&view.storage, inner_path).await;
         let child_files = Self::required_child_files(inner_path, &content);
@@ -13880,9 +14072,21 @@ impl AppState {
             )
             .await?;
         }
+        // Same-version pushes are the duplicate-gossip hot path: one arrives
+        // per relaying peer, so a full read+SHA-512 of every declared file per
+        // push turned redundant floods into disk storms. The stat gate is
+        // enough to spot MISSING files here; a wrong-content file at the
+        // declared size is caught by the sha512-verifying promotion gate
+        // (missing_child_files) and the periodic resync. Legacy no-b3 entries
+        // can never arrive and must not hold the payload hostage either.
+        let unfetchable = Self::unfetchable_child_paths(inner_path, &content);
         progress.missing_files = child_files
             .iter()
-            .filter(|file| !view.storage.verify(&file.inner_path, &file.sha512))
+            .filter(|file| {
+                !(file.size >= 0
+                    && view.storage.present_at_size(&file.inner_path, file.size as u64))
+                    && !unfetchable.contains(&file.inner_path)
+            })
             .cloned()
             .collect();
         self.fetch_current_live_files(&context, &staged, &mut progress).await;
@@ -14002,13 +14206,7 @@ impl AppState {
         if !downloaded {
             return Err("Xite not yet downloaded".into());
         }
-        if payload
-            .merge_deltas
-            .keys()
-            .any(|path| payload.merge_objects.contains_key(path))
-        {
-            return Err("Merge payload repeats a path".into());
-        }
+        payload.validate_disjoint_paths()?;
         if !payload.merge_objects.is_empty() && !payload.require_merge_delivery {
             return Err("Merge objects require a negotiated live delivery source".into());
         }
@@ -14144,7 +14342,17 @@ impl AppState {
         let uri = format!("{xite}/{inner_path}:{new_modified}");
         if !self.updates_in_flight.lock().unwrap().insert(uri.clone()) {
             if payload.require_merge_delivery {
-                return Err("Update for this version is already being applied".into());
+                // A capable sender must not get a plain Ok (it would count the
+                // push payload-aware and retire its merge snapshot on an apply
+                // that may still fail), but a hard error docks a peer that is
+                // actively applying this very version — a routine flood race
+                // now that applies span same-session transfers. The prefix
+                // makes the EDX server answer the bounded-retry BUSY, which
+                // senders score alive-and-busy.
+                return Err(format!(
+                    "{}Update for this version is already being applied",
+                    epix_edx::server::RETRYABLE_UPDATE_PREFIX
+                ));
             }
             return Ok(InboundUpdate::NotChanged);
         }
@@ -14182,7 +14390,15 @@ impl AppState {
                 let canonical = canonical_address(xite.content.as_ref(), &key);
                 let content = xite.content.clone().unwrap_or(Value::Null);
                 committed_inline = self
-                    .finalize_root_update(&keys, &canonical, &xite.storage, content, &bytes, &[])
+                    .finalize_root_update(
+                        &keys,
+                        &canonical,
+                        &xite.storage,
+                        content,
+                        &bytes,
+                        &[],
+                        &update_guard,
+                    )
                     .await;
             }
         } else {
@@ -14434,25 +14650,15 @@ impl AppState {
     }
 
     async fn inbound_fallback_peers(&self, finish: &InboundFinish) -> Vec<PeerAddr> {
-        let mut peers = self.connectable_peers(&finish.keys[0], 10).await;
-        let networks = self.dialable_networks().await;
-        let candidates = finish.sender.iter().chain(finish.sender_peers.iter().rev());
-        for candidate in candidates {
-            if !networks.can_dial(candidate) {
-                continue;
-            }
-            if !epix_peer::Peer::new(candidate.clone(), 0).is_connectable() {
-                continue;
-            }
-            if self.is_own_peer(candidate).await {
-                continue;
-            }
-            if peers.contains(candidate) {
-                continue;
-            }
-            peers.insert(0, candidate.clone());
-        }
-        peers
+        // One screening rule with the current-merge path: any fix to the
+        // dial filters (own-address, dialability, connectability) must land
+        // in preferred_update_peers once and cover both.
+        self.preferred_update_peers(
+            &finish.keys[0],
+            finish.sender.as_ref(),
+            &finish.sender_peers,
+        )
+        .await
     }
 
     async fn fetch_inbound_fallback(
@@ -14514,6 +14720,7 @@ impl AppState {
                     content,
                     bytes,
                     &failed,
+                    &finish._update_guard,
                 )
                 .await
             }
@@ -14608,6 +14815,20 @@ impl AppState {
         let Some(files) = finish.child_files.as_ref() else {
             return;
         };
+        // A signed revocation must not wait on unrelated file availability
+        // (nor risk the pending-relay caps evicting it): apply the verified
+        // staged manifest's archive directives now, while the manifest itself
+        // stays hidden until its required files verify. The eventual commit
+        // re-applies them as a no-op.
+        if !outcome.committed {
+            if let Some(staged) = finish
+                .child_bytes
+                .as_ref()
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            {
+                finish.xite.apply_archived_directives(&finish.inner_path, &staged);
+            }
+        }
         self.defer_child_relay(
             PendingChildRelay {
                 keys: finish.keys.clone(),
@@ -14636,9 +14857,7 @@ impl AppState {
         if !outcome.relay_ready || !can_republish {
             return;
         }
-        let mut relay = finish.payload.clone();
-        relay.require_merge_delivery = false;
-        relay.merge_objects.clear();
+        let relay = finish.payload.relay_form();
         let _ = self
             .publish_to(
                 &finish.keys[0],
@@ -14693,7 +14912,15 @@ impl AppState {
         let missing_child = finish
             .child_files
             .as_ref()
-            .map(|files| Self::missing_child_files(&finish.xite.storage, files))
+            .map(|files| match staged_child.as_ref() {
+                Some(content) => Self::missing_fetchable_child_files(
+                    &finish.xite.storage,
+                    files,
+                    &finish.inner_path,
+                    content,
+                ),
+                None => Self::missing_child_files(&finish.xite.storage, files),
+            })
             .unwrap_or_default();
         let committed = self.commit_inbound_manifest(&finish, &missing_child).await;
         let (relay_ready, merge_failed) = self
@@ -18836,6 +19063,7 @@ mod tests {
         });
         let v2 = serde_json::to_vec(&v2_content).unwrap();
         let keys = vec![addr.to_string(), "dash.epix".to_string()];
+        let guard = state.merge_path_lock(addr, "content.json").lock_owned().await;
         let committed = state
             .finalize_root_update(
                 &keys,
@@ -18844,6 +19072,7 @@ mod tests {
                 v2_content.clone(),
                 &v2,
                 &["js/app.js".to_string()],
+                &guard,
             )
             .await;
         assert!(!committed);
@@ -18853,8 +19082,9 @@ mod tests {
 
         // The files land later (any path): the same finalize now commits the
         // exact signed bytes and swaps the live state.
-        let committed =
-            state.finalize_root_update(&keys, addr, &storage, v2_content, &v2, &[]).await;
+        let committed = state
+            .finalize_root_update(&keys, addr, &storage, v2_content, &v2, &[], &guard)
+            .await;
         assert!(committed);
         assert_eq!(storage.read("content.json").unwrap(), v2, "exact bytes committed");
         assert_eq!(state.xite_info(addr).await["content"]["title"], "V2");
@@ -18896,11 +19126,21 @@ mod tests {
         });
         let v2 = serde_json::to_vec(&v2_content).unwrap();
         let keys = vec![addr.to_string()];
+        let guard = state.merge_path_lock(addr, "content.json").lock_owned().await;
         assert!(
             !state
-                .finalize_root_update(&keys, addr, &storage, v2_content, &v2, &["a.txt".into()])
+                .finalize_root_update(
+                    &keys,
+                    addr,
+                    &storage,
+                    v2_content,
+                    &v2,
+                    &["a.txt".into()],
+                    &guard,
+                )
                 .await
         );
+        drop(guard);
         assert_eq!(storage.read("content.json").unwrap(), v1);
 
         // Nothing on disk yet: the retry can't fetch (no transport) and the
@@ -18943,18 +19183,22 @@ mod tests {
         let keys = vec![addr.to_string()];
         let v2_content = json!({ "address": addr, "modified": 200.0, "files": {} });
         let v2 = serde_json::to_vec(&v2_content).unwrap();
-        assert!(
-            !state
-                .finalize_root_update(
-                    &keys,
-                    addr,
-                    &storage,
-                    v2_content.clone(),
-                    &v2,
-                    &["missing.bin".to_string()],
-                )
-                .await
-        );
+        {
+            let guard = state.merge_path_lock(addr, "content.json").lock_owned().await;
+            assert!(
+                !state
+                    .finalize_root_update(
+                        &keys,
+                        addr,
+                        &storage,
+                        v2_content.clone(),
+                        &v2,
+                        &["missing.bin".to_string()],
+                        &guard,
+                    )
+                    .await
+            );
+        }
 
         // Model a retry clone taken before a live v3 transaction. It must wait
         // on the same canonical guard rather than materializing v2 alongside
@@ -18982,7 +19226,7 @@ mod tests {
         let v3 = serde_json::to_vec(&v3_content).unwrap();
         assert!(
             state
-                .commit_root_update(&keys, addr, &storage, v3_content, &v3)
+                .commit_root_update(&keys, addr, &storage, v3_content, &v3, &guard)
                 .await
         );
         drop(guard);
@@ -19069,6 +19313,7 @@ mod tests {
                     &storage,
                     v3_content,
                     &v3,
+                    &guard,
                 )
                 .await
         );
@@ -19539,8 +19784,10 @@ mod tests {
         // The receiver may pull a required file before its ACK. Thirty seconds
         // exceeds clearnet's 15-second dial budget but fits dial + transfer.
         assert!(matches!(run(4, peer.clone()).await, PushOutcome::Accepted(_, true)));
-        // Came up then timed out -> Refused (alive), NOT Unreachable.
-        assert!(matches!(run(3, peer.clone()).await, PushOutcome::Refused(..)));
+        // Came up then timed out -> Deferred (alive, probably still pulling
+        // the files we asked it to take), NOT Unreachable and NOT a
+        // reputation-docking Refused.
+        assert!(matches!(run(3, peer.clone()).await, PushOutcome::Deferred(..)));
     }
 
     /// A body-less push (the publisher dropped a >1 MB content.json) with no
@@ -19936,8 +20183,9 @@ mod tests {
                 "b3": b3.to_string() } },
         });
         let bytes = serde_json::to_vec(&edx).unwrap();
+        let guard = state.merge_path_lock(addr, "content.json").lock_owned().await;
         state
-            .commit_root_update(&[addr.to_string()], addr, &storage, edx, &bytes)
+            .commit_root_update(&[addr.to_string()], addr, &storage, edx, &bytes, &guard)
             .await;
 
         // Servable now, with no restart - and adopted in place, so the bytes
@@ -19991,8 +20239,9 @@ mod tests {
 
         // Landing the same manifest again is a no-op, and must not disturb it.
         let bytes = serde_json::to_vec(&content).unwrap();
+        let guard = state.merge_path_lock(addr, "content.json").lock_owned().await;
         state
-            .commit_root_update(&[addr.to_string()], addr, &storage, content, &bytes)
+            .commit_root_update(&[addr.to_string()], addr, &storage, content, &bytes, &guard)
             .await;
         assert!(store.is_extern(b3).unwrap(), "still extern, untouched");
     }
@@ -23928,6 +24177,7 @@ mod tests {
                 "large.bin": {
                     "size": large.len(),
                     "sha512": XiteStorage::hash_bytes(&large),
+                    "b3": epix_blob::ObjId::of(&large).to_string(),
                 }
             },
             "files_merged": {
@@ -23977,7 +24227,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn staged_archive_directive_has_no_effect_until_required_files_verify() {
+    async fn staged_child_stays_hidden_when_required_file_exists_with_wrong_content() {
+        let (_dir, state, xite, storage, child, _posts, author_key) =
+            inline_merge_fixture().await;
+        let previous = storage.read(&child).unwrap();
+        let large = vec![0x6b; 64 * 1024];
+        let file_path = child
+            .strip_suffix("content.json")
+            .map(|dir| format!("{dir}large.bin"))
+            .unwrap();
+        let mut next = json!({
+            "address": xite.clone(),
+            "inner_path": child.clone(),
+            "modified": 43.0,
+            "files": {
+                "large.bin": {
+                    "size": large.len(),
+                    "sha512": XiteStorage::hash_bytes(&large),
+                    "b3": epix_blob::ObjId::of(&large).to_string(),
+                }
+            },
+        });
+        epix_content::sign(&mut next, &author_key).unwrap();
+        let next_bytes = serde_json::to_vec(&next).unwrap();
+
+        // An imposter already sits at the declared path AND size - only its
+        // bytes are wrong. An existence or size check would promote it; the
+        // gate must verify content.
+        let imposter = vec![0x00; 64 * 1024];
+        storage.write(&file_path, &imposter).unwrap();
+
+        let result = state
+            .apply_inbound_update(
+                &xite,
+                &child,
+                Some(next_bytes.clone()),
+                Some(43.0),
+                None,
+                None,
+                UpdatePayload {
+                    diffs: HashMap::new(),
+                    merge_deltas: HashMap::new(),
+                    merge_objects: HashMap::new(),
+                    require_merge_delivery: true,
+                },
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            result.is_err(),
+            "availability receipt escaped for a file present at size with wrong content"
+        );
+        assert_eq!(storage.read(&child).unwrap(), previous, "staged child leaked");
+
+        state.retry_pending_child_relays().await;
+        assert!(
+            !state.pending_child_relays.lock().unwrap().is_empty(),
+            "a wrong-content file must not satisfy promotion"
+        );
+        assert_eq!(storage.read(&child).unwrap(), previous);
+
+        // The correct bytes land - now, and only now, it promotes.
+        storage.write(&file_path, &large).unwrap();
+        state.retry_pending_child_relays().await;
+        assert!(state.pending_child_relays.lock().unwrap().is_empty());
+        assert_eq!(storage.read(&child).unwrap(), next_bytes);
+    }
+
+    #[tokio::test]
+    async fn staged_archive_directive_applies_at_stage_time_while_manifest_stays_hidden() {
         let xite_key = epix_crypt::new_seed();
         let xite = epix_crypt::privatekey_to_address(&xite_key).unwrap();
         let user_key = epix_crypt::new_seed();
@@ -24032,6 +24350,7 @@ mod tests {
                 "gate.bin": {
                     "size": gate.len(),
                     "sha512": XiteStorage::hash_bytes(&gate),
+                    "b3": epix_blob::ObjId::of(&gate).to_string(),
                 }
             },
             "user_contents": {
@@ -24074,8 +24393,11 @@ mod tests {
             parent_v1_bytes,
             "staged archive parent became publicly visible"
         );
-        assert!(storage.exists(&user_content), "staging deleted the archived child");
-        assert!(storage.exists(&user_data), "staging deleted the archived child's file");
+        // A signed revocation acts the moment the manifest verifies: waiting
+        // for unrelated required files would keep serving the revoked content
+        // (and cap eviction could drop the revocation entirely).
+        assert!(!storage.exists(&user_content), "staging left the revoked child in place");
+        assert!(!storage.exists(&user_data), "staging left the revoked child's file in place");
 
         storage.write("data/users/gate.bin", &gate).unwrap();
         state.retry_pending_child_relays().await;
@@ -24146,6 +24468,7 @@ mod tests {
             "large.bin": {
                 "size": large.len(),
                 "sha512": XiteStorage::hash_bytes(&large),
+                "b3": epix_blob::ObjId::of(&large).to_string(),
             }
         });
         storage
@@ -24280,7 +24603,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merge_delta_over_object_cap_fails_publish_instead_of_emitting_legacy_pull() {
+    async fn merge_delta_over_object_cap_skips_the_path_but_not_the_publish() {
         let (_dir, state, xite, storage, child, posts, _author_key) =
             inline_merge_fixture().await;
         let oversized = epix_content::make_container(vec![json!({
@@ -24292,34 +24615,45 @@ mod tests {
         storage.write(&posts, &oversized).unwrap();
         assert!(!storage.exists(&format!("{posts}-old")));
 
-        let error = state
-            .publish(&xite, &child, None, false)
-            .await
-            .expect_err("an undeliverable merge delta must fail locally");
-        assert!(error.contains("live-delivery limit"), "{error}");
-        assert!(error.contains(&posts), "{error}");
+        // Undeliverable live, and a legacy empty marker cannot serve it
+        // either (GetSigned shares the 8 MiB cap) - but blocking the WHOLE
+        // publish would also block unrelated manifest edits. The path is
+        // skipped: no delta, no marker, no receipt, snapshot state untouched,
+        // and the publish itself proceeds.
+        let (deltas, receipts) = state.merge_deltas(&xite, &child).await.unwrap();
+        assert!(
+            deltas.is_empty(),
+            "no delta and no legacy pull marker may ride for an oversize path"
+        );
+        assert!(receipts.is_empty(), "an undelivered path must not create a receipt");
         assert!(
             !storage.exists(&format!("{posts}-old")),
-            "failed publish must leave snapshot state unchanged"
+            "a skipped path must leave snapshot state unchanged"
         );
     }
 
     #[test]
     fn merge_publish_delivery_requires_a_payload_aware_ack() {
-        let result = PublishResult {
-            published: 3,
-            payload_aware: 0,
-        };
-        assert_eq!(result.delivered(false), 3);
-        assert_eq!(result.delivered(true), 0);
         assert_eq!(
-            PublishResult {
-                published: 3,
-                payload_aware: 1
-            }
-            .delivered(true),
+            PublishResult { published: 3, payload_aware: 0, requires_payload_ack: false }
+                .delivered(),
+            3
+        );
+        assert_eq!(
+            PublishResult { published: 3, payload_aware: 0, requires_payload_ack: true }
+                .delivered(),
+            0
+        );
+        assert_eq!(
+            PublishResult { published: 3, payload_aware: 1, requires_payload_ack: true }
+                .delivered(),
             1
         );
+        // The flag itself has exactly one source: the payload.
+        let mut payload = UpdatePayload::default();
+        assert!(!payload.requires_payload_ack());
+        payload.merge_deltas.insert("posts.json".into(), vec![1]);
+        assert!(payload.requires_payload_ack());
     }
 
     #[tokio::test]
@@ -25069,6 +25403,167 @@ mod tests {
     /// optional pass must batch and re-check the user's mandate between batches
     /// - otherwise toggling a 200 GB xite off keeps pulling to the end of the
     /// list.
+    /// A pass that already owns the manifest transaction (a fresh clone whose
+    /// content.json is staged in memory, a guarded update) must stamp staged
+    /// authority onto every want: materialization would otherwise re-read the
+    /// governing content.json from disk - absent during a clone - and reject
+    /// every fetched file as undeclared. A want that CANNOT carry authority
+    /// is not submitted at all: its materialize path would await the very
+    /// merge lock the caller holds.
+    #[tokio::test]
+    async fn edx_first_with_a_held_manifest_stamps_authority_and_drops_bare_wants() {
+        struct CaptureFetcher {
+            wants: Arc<std::sync::Mutex<Vec<(String, bool)>>>,
+        }
+        #[async_trait::async_trait]
+        impl EdxFetcher for CaptureFetcher {
+            async fn fetch_files(
+                &self,
+                _: &str,
+                want: Vec<EdxWant>,
+                _: Vec<PeerAddr>,
+                _: Option<Value>,
+                _: Option<EdxBatchProgress>,
+            ) -> EdxBatch {
+                let missed = want.iter().map(|w| w.inner_path.clone()).collect();
+                self.wants.lock().unwrap().extend(
+                    want.into_iter().map(|w| (w.inner_path, w.authority.is_some())),
+                );
+                EdxBatch { done: Vec::new(), missed, bytes: 0 }
+            }
+            async fn fetch_file(&self, _: &str, _: &str) -> Result<bool, String> {
+                unreachable!()
+            }
+            async fn fetch_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn fetch_signed_many(
+                &self,
+                _: &str,
+                _: Vec<String>,
+                _: Vec<PeerAddr>,
+                _: Option<EdxSignedProgress>,
+            ) -> HashMap<String, Vec<u8>> {
+                unreachable!()
+            }
+            async fn fetch_range(
+                &self,
+                _: &str,
+                _: &str,
+                _: u64,
+                _: u64,
+            ) -> Result<Option<Vec<u8>>, String> {
+                unreachable!()
+            }
+            async fn push_update(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: &str,
+                _: Arc<Vec<u8>>,
+                _: f64,
+                _: Arc<UpdatePayload>,
+                _: Arc<Vec<String>>,
+                _: Arc<AtomicBool>,
+            ) -> Result<bool, EdxPushError> {
+                unreachable!()
+            }
+            async fn list_signed(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u64,
+            ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
+                unreachable!()
+            }
+            async fn pex(
+                &self,
+                _: PeerAddr,
+                _: &str,
+                _: u32,
+                _: Vec<PeerAddr>,
+            ) -> Result<Vec<PeerAddr>, String> {
+                unreachable!()
+            }
+            async fn get_trackers(&self, _: PeerAddr) -> Result<Vec<String>, String> {
+                unreachable!()
+            }
+            async fn kad(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn announce(&self, _: PeerAddr, _: Vec<u8>) -> Result<Vec<u8>, String> {
+                unreachable!()
+            }
+            async fn updates_since(
+                &self,
+                _: PeerAddr,
+                _: u64,
+            ) -> Result<(Vec<(String, i64)>, u64), String> {
+                unreachable!()
+            }
+        }
+
+        let addr = "epix1cloneauthority";
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        // The staged (in-memory-only) manifest: one EDX file, one legacy
+        // no-b3 file. NOTHING is on disk - the clone case.
+        let with_b3 = epix_blob::ObjId::of(b"payload").to_string();
+        let staged = json!({
+            "address": addr,
+            "modified": 1.0,
+            "files": {
+                "app.js": { "size": 7, "sha512": "a".repeat(64), "b3": with_b3 },
+                "legacy.bin": { "size": 7, "sha512": "b".repeat(64) },
+            },
+        });
+        state
+            .add_xite(addr, XiteEntry {
+                storage: XiteStorage::new(dir.path()),
+                content: Some(staged.clone()),
+            })
+            .await;
+        let wants = Arc::new(std::sync::Mutex::new(Vec::new()));
+        state
+            .set_edx_fetcher(Arc::new(CaptureFetcher { wants: wants.clone() }))
+            .await;
+
+        let needed = vec![
+            epix_xite::FileEntry {
+                inner_path: "app.js".into(),
+                size: 7,
+                sha512: "a".repeat(64),
+            },
+            epix_xite::FileEntry {
+                inner_path: "legacy.bin".into(),
+                size: 7,
+                sha512: "b".repeat(64),
+            },
+        ];
+        let _ = state
+            .edx_first(
+                addr,
+                needed,
+                vec![PeerAddr::parse("1.2.3.4:1234").unwrap()],
+                Some(&staged),
+                Some((addr, "content.json")),
+                None,
+            )
+            .await;
+
+        let seen = wants.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![("app.js".to_string(), true)],
+            "the declared want carries staged authority; the bare want is dropped"
+        );
+    }
+
     #[tokio::test]
     async fn the_edx_bulk_optional_pass_batches_and_stops_when_the_mandate_drops() {
         /// Records the size of every batch it is handed; on the first one it

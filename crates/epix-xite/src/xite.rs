@@ -445,6 +445,22 @@ impl Xite {
         out
     }
 
+    /// Apply a VERIFIED child manifest's archive/revocation directives without
+    /// committing the manifest itself. The staged-commit path holds a new
+    /// users/content.json off disk until its required files verify; a signed
+    /// revocation must not wait on unrelated file availability (nor risk the
+    /// pending-relay caps evicting it), so the deletions run at stage time.
+    /// Committing the same manifest later re-applies them as a no-op (only
+    /// entries that changed against the stored copy are acted on).
+    pub fn apply_archived_directives(&self, inner_path: &str, new: &Value) {
+        let old: Option<Value> = self
+            .storage
+            .read(inner_path)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok());
+        self.apply_archived(inner_path, old.as_ref(), new);
+    }
+
     /// EpixNet's archive semantics: when a user_contents parent (e.g.
     /// `data/users/content.json`) is replaced, a user directory named in
     /// `user_contents.archived` (or older than `user_contents.archived_before`)

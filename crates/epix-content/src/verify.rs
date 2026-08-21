@@ -512,11 +512,23 @@ fn verify_file_metadata(content: &Value) -> Result<(), VerifyError> {
             let Some(metadata) = value.as_object() else {
                 return err(format!("Invalid {node} entry {path}: expected an object"));
             };
-            if !metadata
-                .get("size")
-                .and_then(Value::as_i64)
-                .is_some_and(|size| size >= 0)
-            {
+            // JSON number representation is signer-dependent: an integral
+            // float (10.0) from an older or foreign signer is the same
+            // declared size, and rejecting it would retroactively invalidate
+            // an already-signed manifest. Anything non-integral or negative
+            // is still refused.
+            let size_ok = metadata.get("size").is_some_and(|value| {
+                value
+                    .as_i64()
+                    .or_else(|| {
+                        value
+                            .as_f64()
+                            .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= i64::MAX as f64)
+                            .map(|f| f as i64)
+                    })
+                    .is_some_and(|size| size >= 0)
+            });
+            if !size_ok {
                 return err(format!(
                     "Invalid {node} entry {path}: size must be a nonnegative integer"
                 ));
