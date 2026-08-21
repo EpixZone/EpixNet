@@ -6021,7 +6021,11 @@ impl AppState {
             }
         }
         let db = db.ok_or_else(|| "xite has no database".to_string())?;
-        db.query_value(query, params).map_err(|e| e.to_string())
+        // `query` is page-supplied (the `dbQuery` WS command passes it verbatim),
+        // so run it read-only: the authorizer refuses writes, DDL, and ATTACH.
+        // dbQuery is not admin- or owner-gated, so on the public gateway this is
+        // the boundary that stops a visitor from writing files via ATTACH.
+        db.query_untrusted(query, params).map_err(|e| e.to_string())
     }
 
     /// Every served xite's dbschema-declared feeds, with the xite's title:
