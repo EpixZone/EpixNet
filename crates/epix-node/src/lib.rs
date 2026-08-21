@@ -1050,7 +1050,14 @@ async fn clone_xite_with_progress(
         const CLONE_PASS_BUDGET: std::time::Duration = std::time::Duration::from_secs(120);
         let _ = tokio::time::timeout(
             CLONE_PASS_BUDGET,
-            state.edx_first(address, before.clone(), peers, staged.as_ref(), edx_progress),
+            state.edx_first(
+                address,
+                before.clone(),
+                peers,
+                staged.as_ref(),
+                None,
+                edx_progress,
+            ),
         )
         .await;
         let after = xite.files_needed().len();
@@ -1570,7 +1577,9 @@ async fn sync_included_content(
             });
         // `on_file` is moved in and dropped when the pass returns, which closes
         // the channel and ends the consumer.
-        let missed = state.edx_first(address, needed, peers.to_vec(), None, Some(on_file)).await;
+        let missed = state
+            .edx_first(address, needed, peers.to_vec(), None, None, Some(on_file))
+            .await;
         let ingested = ingesting.await.unwrap_or_default();
         let still: std::collections::HashSet<&String> =
             missed.iter().map(|f| &f.inner_path).collect();

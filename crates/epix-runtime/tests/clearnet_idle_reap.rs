@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use epix_blob::store::Store;
 use epix_core::PeerAddr;
-use epix_edx::server::{client_hello, ServeCtx, SignedProvider};
+use epix_edx::server::{client_hello, ServeCtx, SignedProvider, UpdateSource};
 use epix_runtime::edx::{edx_hook, ControlHandles};
 use epix_transport::{TcpTransport, Transport};
 use epix_ui::AppState;
@@ -41,6 +41,7 @@ impl SignedProvider for NoProvider {
         _m: f64,
         _d: &[(String, Vec<u8>)],
         _sp: &[String],
+        _source: UpdateSource,
     ) -> Result<bool, String> {
         Ok(true)
     }

@@ -8,9 +8,10 @@
 //! - **Certs** (`user_contents`): a user file under a `user_contents` node must
 //!   carry a `cert_user_id`/`cert_sign` issued by an accepted `cert_signers`
 //!   provider, verified against the user's address.
-//! - **Content rules**: address + inner_path match, valid relative paths,
-//!   size-limit enforcement, and per-include `max_size` / `max_size_optional` /
-//!   `files_allowed` / `files_allowed_optional` / `includes_allowed`.
+//! - **Content rules**: address + inner_path match, valid relative paths and
+//!   file metadata, size-limit enforcement, and per-include `max_size` /
+//!   `max_size_optional` / `files_allowed` / `files_allowed_optional` /
+//!   `includes_allowed`.
 //!
 //! Signature/cert checks are the security gates; the size/quota checks bound
 //! abuse. Ported from `EpixNet/src/Content/ContentManager.py`
@@ -385,6 +386,7 @@ fn verify_content_rules(
             return err(format!("Wrong inner_path: {ip}"));
         }
     }
+    verify_file_metadata(content)?;
     // Valid relative filenames.
     for node in ["files", "files_optional", "files_merged"] {
         if let Some(files) = content.get(node).and_then(|v| v.as_object()) {
@@ -424,8 +426,10 @@ fn verify_content_rules(
     let Some(rules) = get_rules(inner_path, content, ctx) else {
         return err("No rules");
     };
-    let content_size = raw_len + sum_file_sizes(content, "files");
-    let content_size_optional = sum_file_sizes(content, "files_optional");
+    let content_size = raw_len
+        .checked_add(sum_file_sizes(content, "files")?)
+        .ok_or_else(|| VerifyError("files size total overflow".to_string()))?;
+    let content_size_optional = sum_file_sizes(content, "files_optional")?;
     if let Some(max) = rules.get("max_size").and_then(|v| v.as_i64()) {
         if content_size > max {
             return err(format!("Include too large {content_size}B > {max}B"));
@@ -492,6 +496,59 @@ fn verify_content_rules(
         return err("Includes not allowed");
     }
     Ok(())
+}
+
+/// Validate hashed file declarations before any caller enumerates them.
+/// Epix hashes are the first 32 bytes of SHA-512, encoded as 64 hex
+/// characters. BLAKE3 object IDs use the same encoded length. File consumers
+/// use signed `i64` sizes, so values outside that range are not valid metadata.
+fn verify_file_metadata(content: &Value) -> Result<(), VerifyError> {
+    for node in ["files", "files_optional"] {
+        let Some(value) = content.get(node) else { continue };
+        let Some(files) = value.as_object() else {
+            return err(format!("Invalid {node}: expected an object"));
+        };
+        for (path, value) in files {
+            let Some(metadata) = value.as_object() else {
+                return err(format!("Invalid {node} entry {path}: expected an object"));
+            };
+            if !metadata
+                .get("size")
+                .and_then(Value::as_i64)
+                .is_some_and(|size| size >= 0)
+            {
+                return err(format!(
+                    "Invalid {node} entry {path}: size must be a nonnegative integer"
+                ));
+            }
+            if !metadata.get("sha512").is_some_and(is_lower_hash_hex) {
+                return err(format!(
+                    "Invalid {node} entry {path}: sha512 must be 64 lowercase hexadecimal characters"
+                ));
+            }
+            if metadata.get("b3").is_some_and(|value| !is_hash_hex(value)) {
+                return err(format!(
+                    "Invalid {node} entry {path}: b3 must be 64 hexadecimal characters"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn is_hash_hex(value: &Value) -> bool {
+    value
+        .as_str()
+        .is_some_and(|hash| hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()))
+}
+
+fn is_lower_hash_hex(value: &Value) -> bool {
+    value.as_str().is_some_and(|hash| {
+        hash.len() == 64
+            && hash
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    })
 }
 
 /// Full verification of a content.json file (`verifyFile` for content.json):
@@ -581,18 +638,21 @@ fn is_archived(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> bo
     modified <= before || modified <= dir_archived
 }
 
-fn sum_file_sizes(content: &Value, node: &str) -> i64 {
-    content
-        .get(node)
-        .and_then(|v| v.as_object())
-        .map(|files| {
-            files
-                .values()
-                .filter_map(|f| f.get("size").and_then(|s| s.as_i64()))
-                .filter(|&s| s >= 0)
-                .sum()
-        })
-        .unwrap_or(0)
+fn sum_file_sizes(content: &Value, node: &str) -> Result<i64, VerifyError> {
+    let Some(files) = content.get(node).and_then(Value::as_object) else {
+        return Ok(0);
+    };
+    let mut total = 0i64;
+    for size in files
+        .values()
+        .filter_map(|file| file.get("size").and_then(Value::as_i64))
+        .filter(|size| *size >= 0)
+    {
+        total = total
+            .checked_add(size)
+            .ok_or_else(|| VerifyError(format!("{node} size total overflow")))?;
+    }
+    Ok(total)
 }
 
 /// EpixNet's `isValidRelativePath`: no `..` traversal, no leading slash, no
@@ -748,6 +808,126 @@ mod tests {
     }
 
     #[test]
+    fn root_file_metadata_requires_sizes_and_64_character_hashes() {
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let ctx = Ctx { address: addr.clone(), loaded: Default::default(), limit: i64::MAX };
+
+        let (valid, bytes) = sign_content(
+            json!({
+                "address": addr,
+                "inner_path": "content.json",
+                "modified": 1,
+                "files": {
+                    "required.bin": {
+                        "size": 0,
+                        "sha512": "a".repeat(64),
+                        "b3": "B".repeat(64),
+                    },
+                },
+                "files_optional": {
+                    "optional.bin": { "size": 1, "sha512": "0".repeat(64) },
+                },
+            }),
+            &pk,
+        );
+        assert!(
+            verify_content_file("content.json", &valid, bytes.len() as i64, &ctx).is_ok()
+        );
+
+        for node in ["files", "files_optional"] {
+            let mut content = json!({
+                "address": ctx.address,
+                "inner_path": "content.json",
+                "modified": 1,
+                "files": {},
+                "files_optional": {},
+            });
+            content[node] = json!([]);
+            let (content, bytes) = sign_content(content, &pk);
+            let error =
+                verify_content_file("content.json", &content, bytes.len() as i64, &ctx).unwrap_err();
+            assert!(error.0.contains("expected an object"), "{node}: {}", error.0);
+        }
+
+        let malformed = [
+            ("non-object entry", json!(null), "expected an object"),
+            ("empty entry", json!({}), "size must be a nonnegative integer"),
+            (
+                "string size",
+                json!({ "size": "1", "sha512": "a".repeat(64) }),
+                "size must be a nonnegative integer",
+            ),
+            (
+                "negative size",
+                json!({ "size": -1, "sha512": "a".repeat(64) }),
+                "size must be a nonnegative integer",
+            ),
+            (
+                "fractional size",
+                json!({ "size": 1.5, "sha512": "a".repeat(64) }),
+                "size must be a nonnegative integer",
+            ),
+            ("missing sha512", json!({ "size": 1 }), "sha512 must be 64"),
+            (
+                "short sha512",
+                json!({ "size": 1, "sha512": "ab" }),
+                "sha512 must be 64",
+            ),
+            (
+                "non-hex sha512",
+                json!({ "size": 1, "sha512": "z".repeat(64) }),
+                "sha512 must be 64",
+            ),
+            (
+                "uppercase sha512",
+                json!({ "size": 1, "sha512": "A".repeat(64) }),
+                "sha512 must be 64 lowercase",
+            ),
+            (
+                "non-string b3",
+                json!({ "size": 1, "sha512": "a".repeat(64), "b3": 1 }),
+                "b3 must be 64",
+            ),
+            (
+                "short b3",
+                json!({ "size": 1, "sha512": "a".repeat(64), "b3": "ab" }),
+                "b3 must be 64",
+            ),
+            (
+                "non-hex b3",
+                json!({ "size": 1, "sha512": "a".repeat(64), "b3": "z".repeat(64) }),
+                "b3 must be 64",
+            ),
+        ];
+        for node in ["files", "files_optional"] {
+            for (case, metadata, expected) in &malformed {
+                let mut content = json!({
+                    "address": ctx.address,
+                    "inner_path": "content.json",
+                    "modified": 1,
+                    "files": {},
+                    "files_optional": {},
+                });
+                content[node]["gate.bin"] = metadata.clone();
+                let (content, bytes) = sign_content(content, &pk);
+                let error = verify_content_file(
+                    "content.json",
+                    &content,
+                    bytes.len() as i64,
+                    &ctx,
+                )
+                .unwrap_err();
+                assert!(
+                    error.0.contains(expected),
+                    "{node} {case}: {}",
+                    error.0
+                );
+            }
+        }
+    }
+
+    #[test]
     fn permission_rules_grant_moderator_signing_over_user_dirs() {
         // EpixTalk's moderation model: data/users/content.json lists the xite
         // admins as extra `signers` under a permission_rules catch-all, so an
@@ -776,7 +956,7 @@ mod tests {
             sign_content(
                 json!({
                     "address": "epix1site", "inner_path": inner, "modified": 2,
-                    "files": { "data.json": { "size": 10, "sha512": "ab" } },
+                    "files": { "data.json": { "size": 10, "sha512": "a".repeat(64) } },
                 }),
                 pk,
             )
@@ -852,7 +1032,7 @@ mod tests {
         // rejected (would re-arm last-writer-wins).
         let (c, b) = make(
             json!({ "posts.json": { "class": "epix-orset-1" } }),
-            json!({ "posts.json": { "size": 2, "sha512": "ab" } }),
+            json!({ "posts.json": { "size": 2, "sha512": "a".repeat(64) } }),
         );
         let e = verify_content_file(&inner, &c, b.len() as i64, &ctx).unwrap_err();
         assert!(format!("{e:?}").contains("also declared as a hashed file"), "{e:?}");
@@ -1017,6 +1197,53 @@ mod tests {
     }
 
     #[test]
+    fn child_file_metadata_is_verified_before_commit_enumeration() {
+        let (inner, content, bytes, loaded) = user_content_fixture(
+            json!({}),
+            json!({ "files": { "gate.bin": {} } }),
+        );
+        let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+
+        let error = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+        assert!(error.0.contains("size must be a nonnegative integer"), "{}", error.0);
+    }
+
+    #[test]
+    fn child_file_size_totals_reject_integer_overflow() {
+        for node in ["files", "files_optional"] {
+            let mut extra = json!({ "files": {}, "files_optional": {} });
+            extra[node] = json!({
+                "one.bin": { "size": i64::MAX, "sha512": "a".repeat(64) },
+                "two.bin": { "size": i64::MAX, "sha512": "b".repeat(64) },
+            });
+            let (inner, content, bytes, loaded) = user_content_fixture(json!({}), extra);
+            let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+
+            let error =
+                verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+            assert!(
+                error.0.contains(&format!("{node} size total overflow")),
+                "{node}: {}",
+                error.0
+            );
+        }
+
+        // The required-file sum itself can fit while adding content.json's
+        // signed byte length still exceeds the supported total.
+        let (inner, content, bytes, loaded) = user_content_fixture(
+            json!({}),
+            json!({
+                "files": {
+                    "one.bin": { "size": i64::MAX, "sha512": "a".repeat(64) },
+                },
+            }),
+        );
+        let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+        let error = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+        assert!(error.0.contains("files size total overflow"), "{}", error.0);
+    }
+
+    #[test]
     fn archived_user_directory_is_revoked() {
         // The parent archives this user dir at t=500: content modified at or
         // before that is rejected; newer content is accepted again.
@@ -1068,7 +1295,7 @@ mod tests {
         // comments is rejected, 2 pass.
         let (inner, content, bytes, loaded) = user_content_fixture(
             json!({ "permission_rules": { ".*": { "max_items": { "comment": 2 } } } }),
-            json!({ "files": { "data.json": { "size": 1, "sha512": "00" } } }),
+            json!({ "files": { "data.json": { "size": 1, "sha512": "0".repeat(64) } } }),
         );
         let dir = inner.rsplit_once('/').unwrap().0;
         let base = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };

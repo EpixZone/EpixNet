@@ -9,7 +9,8 @@ use std::sync::Arc;
 
 use epix_core::PeerAddr;
 use epix_ui::state::{
-    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, XiteEntry,
+    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, UpdatePayload,
+    XiteEntry,
 };
 use epix_ui::UiServer;
 use epix_xite::XiteStorage;
@@ -68,10 +69,10 @@ impl EdxFetcher for RangeFetcher {
         _: &str,
         _: Arc<Vec<u8>>,
         _: f64,
-        _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+        _: Arc<UpdatePayload>,
         _: Arc<Vec<String>>,
         _: Arc<AtomicBool>,
-    ) -> Result<(), EdxPushError> {
+    ) -> Result<bool, EdxPushError> {
         unreachable!()
     }
     async fn fetch_files(

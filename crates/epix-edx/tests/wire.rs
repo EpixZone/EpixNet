@@ -9,7 +9,7 @@ use epix_blob::verified::{encode_slice, OutboardBytes};
 use epix_blob::{Ns, ObjId};
 use epix_edx::conn::Conn;
 use epix_edx::msg::{caps, NET_ID};
-use epix_edx::server::{serve, ServeCtx, SignedProvider};
+use epix_edx::server::{serve, ServeCtx, SignedProvider, UpdateSource};
 use epix_edx::{fetch, sim};
 use epix_core::PeerAddr;
 use std::net::SocketAddr;
@@ -55,6 +55,7 @@ impl SignedProvider for FixtureProvider {
         _modified: f64,
         _diffs: &[(String, Vec<u8>)],
         _sender_peers: &[String],
+        _source: UpdateSource,
     ) -> Result<bool, String> {
         Ok(true)
     }
@@ -105,6 +106,44 @@ async fn connect(
     let _ = NET_ID;
     assert_eq!(id.address, epix_crypt::privatekey_to_address(SERVER_KEY).unwrap());
     conn
+}
+
+#[tokio::test]
+async fn hello_round_trip_preserves_the_inline_merge_capability() {
+    let net = sim::SimNet::new();
+    let (server_store, _sg) = temp_store();
+    let provider = Arc::new(FixtureProvider { signed: Default::default() });
+    let mut server_ctx = ServeCtx::new(server_store, provider, SERVER_KEY.into());
+    server_ctx.caps |= caps::INLINE_MERGE;
+    let server_ctx = Arc::new(server_ctx);
+
+    let server_addr = ip(41);
+    let mut inbox = net.listen(server_addr.clone());
+    tokio::spawn(async move {
+        while let Some((_from, stream)) = inbox.recv().await {
+            let (conn, incoming) = Conn::start(stream, false);
+            let ctx = server_ctx.clone();
+            tokio::spawn(async move {
+                serve(conn, incoming, ctx, None).await;
+            });
+        }
+    });
+
+    let transport = sim::SimTransport { net, local: ip(204) };
+    let stream = {
+        use epix_transport::Transport;
+        transport.dial(&server_addr).await.unwrap()
+    };
+    let (conn, _incoming) = Conn::start(stream, true);
+    let (client_store, _cg) = temp_store();
+    let client_ctx = ServeCtx::new(
+        client_store,
+        Arc::new(FixtureProvider { signed: Default::default() }),
+        CLIENT_KEY.into(),
+    );
+
+    let identity = epix_edx::server::client_hello(&conn, &client_ctx, vec![], None).await.unwrap();
+    assert!(caps::supports(identity.caps, caps::INLINE_MERGE));
 }
 
 #[tokio::test]
@@ -589,6 +628,7 @@ impl SignedProvider for CapturingProvider {
         modified: f64,
         diffs: &[(String, Vec<u8>)],
         sender_peers: &[String],
+        _source: UpdateSource,
     ) -> Result<bool, String> {
         *self.seen.lock().unwrap() = Some(Captured {
             xite: xite.into(),
@@ -604,7 +644,7 @@ impl SignedProvider for CapturingProvider {
 }
 
 #[tokio::test]
-async fn push_update_delivers_every_field_to_the_provider() {
+async fn push_update_delivers_a_nonempty_inline_envelope_and_every_field() {
     let net = sim::SimNet::new();
     let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
     let provider = Arc::new(CapturingProvider { seen: seen.clone() });
@@ -637,7 +677,8 @@ async fn push_update_delivers_every_field_to_the_provider() {
 
     // Push a fully-populated update (a forum post with a data.json diff).
     let signed = br#"{"address":"1Forum","modified":2000}"#.to_vec();
-    let inline = vec![(ObjId([3; 32]), vec![10, 20, 30])];
+    let merge_envelope = b"EPIX-MERGE-1\0opaque-versioned-record-delta".to_vec();
+    let inline = vec![(ObjId::of(&merge_envelope), merge_envelope)];
     let diffs = vec![("data.json".to_string(), br#"[["=",42],["+",["new"]]]"#.to_vec())];
     let sender_peers = vec!["abc.onion:15441".to_string(), "1.2.3.4:15441".to_string()];
     epix_edx::fetch::push_update(
@@ -728,6 +769,7 @@ async fn a_signed_list_larger_than_one_frame_survives() {
             _m: f64,
             _d: &[(String, Vec<u8>)],
             _sp: &[String],
+            _source: UpdateSource,
         ) -> Result<bool, String> {
             Ok(true)
         }
