@@ -4,7 +4,7 @@
 //! Phase 3 publish checkpoint (two Rust nodes propagating an update by push,
 //! no polling).
 
-use epix_ui::state::{AppState, XiteEntry};
+use epix_ui::state::{AppState, InboundSource, XiteEntry};
 use epix_xite::XiteStorage;
 use serde_json::json;
 
@@ -35,7 +35,13 @@ async fn far_future_modified_is_rejected() {
         .as_secs() as i64;
     let (_far, far_bytes) = signed_content(&address, &privkey, now + 100 * 24 * 60 * 60);
     let err = state
-        .apply_inbound_update(&address, "content.json", Some(far_bytes), None, None, Default::default(), Vec::new())
+        .apply_inbound_update(
+            &address,
+            "content.json",
+            Some(far_bytes),
+            None,
+            InboundSource { sender: None, diffs: Default::default(), sender_peers: Vec::new() },
+        )
         .await
         .unwrap_err();
     assert!(err.contains("far future"), "unexpected error: {err}");

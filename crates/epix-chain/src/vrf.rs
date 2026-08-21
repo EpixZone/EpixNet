@@ -68,7 +68,7 @@ pub fn combine_beacons<S: AsRef<str>>(beacons: &[S]) -> String {
 pub struct Vrf {
     /// HTTP client + the SOCKS generation it was built for (rebuilt on change,
     /// so a direct client from before Tor came up doesn't keep sending direct).
-    client: RwLock<(u64, reqwest::Client)>,
+    client: RwLock<Option<(u64, reqwest::Client)>>,
     rpc_url: String,
     beacons: RwLock<HashMap<u64, (Beacon, Instant)>>,
     latest: RwLock<Option<(Beacon, Instant)>>,
@@ -76,10 +76,9 @@ pub struct Vrf {
 
 impl Vrf {
     pub fn new(rpc_url: impl Into<String>) -> Self {
-        let gen = crate::socks_generation();
-        let client = crate::http_client(Duration::from_secs(15));
+        let client = crate::http_client(Duration::from_secs(15)).ok();
         Self {
-            client: RwLock::new((gen, client)),
+            client: RwLock::new(client),
             rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
             beacons: RwLock::new(HashMap::new()),
             latest: RwLock::new(None),
@@ -87,17 +86,19 @@ impl Vrf {
     }
 
     /// The HTTP client for the current SOCKS setting, rebuilding on change.
-    async fn client(&self) -> reqwest::Client {
-        let gen = crate::socks_generation();
+    async fn client(&self) -> Result<reqwest::Client> {
+        let generation = crate::chain_route_snapshot()?.generation;
         {
             let cur = self.client.read().await;
-            if cur.0 == gen {
-                return cur.1.clone();
+            if let Some((cached_generation, client)) = cur.as_ref() {
+                if *cached_generation == generation {
+                    return Ok(client.clone());
             }
         }
-        let client = crate::http_client(Duration::from_secs(15));
-        *self.client.write().await = (gen, client.clone());
-        client
+        }
+        let (generation, client) = crate::http_client(Duration::from_secs(15))?;
+        *self.client.write().await = Some((generation, client.clone()));
+        Ok(client)
     }
 
     /// The random beacon at `height` (immutable once produced; cached 5 min).
@@ -180,7 +181,7 @@ impl Vrf {
         // Refuse to egress over clearnet before Tor is ready in Always mode.
         crate::chain_egress_ok()?;
         self.client()
-            .await
+            .await?
             .get(url)
             .send()
             .await

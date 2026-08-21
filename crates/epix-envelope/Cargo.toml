@@ -1,0 +1,19 @@
+[package]
+name = "epix-envelope"
+version = "0.1.0"
+edition = "2021"
+description = "Generic sealed-envelope messaging over the anonymous pool: the crypto Engine trait, a trial-decrypt indexer parameterized over a private store, and detection primitives. Mail is one consumer; an encrypted forum or DM app would be another."
+
+[dependencies]
+epix-core = { path = "../epix-core" }
+epix-crypt = { path = "../epix-crypt" }
+epix-content = { path = "../epix-content" }
+serde_json = "1"
+blake3 = "1"
+base64 = "0.23"
+hex = "0.4"
+chacha20poly1305 = "0.10"
+zeroize = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }

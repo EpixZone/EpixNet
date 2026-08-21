@@ -37,7 +37,9 @@ epix-chain = { path = "../epix-chain" }
 epix-bt = { path = "../epix-bt", optional = true }
 base64 = "0.23"
 sha2 = "0.11"
+hmac = "0.13"
 hex = "0.4"
+blake3 = "1"
 axum = { version = "0.8", features = ["ws", "multipart"] }
 tower = { version = "0.5", features = ["util", "make"] }
 tokio = { version = "1", features = ["rt-multi-thread", "net", "sync", "macros"] }

@@ -25,7 +25,10 @@ use epix_protocol::server::{EdxHook, InboundHook};
 use epix_protocol::HandshakeInfo;
 use epix_transport::Transport;
 use epix_ui::conn_pool::{LinkOpener, PeerLink};
-use epix_ui::state::{EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, InboundUpdate};
+use epix_ui::state::{
+    EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, InboundSource, InboundUpdate,
+    PushJob,
+};
 use epix_ui::AppState;
 
 /// The peer's EDX Hello, in the shape the diagnostics Stats page renders. Only
@@ -601,6 +604,13 @@ impl SignedProvider for AppStateProvider {
         if !safe_inner_path(inner_path) {
             return None;
         }
+        let is_pool_shard = self.state.is_pool_shard(xite, inner_path).await;
+        if is_pool_shard {
+            return self
+                .state
+                .pool_shard_bytes_for_serve(xite, inner_path)
+                .await;
+        }
         if !is_content_json(inner_path)
             && !self.state.is_declared_merge_file(xite, inner_path).await
         {
@@ -662,6 +672,13 @@ impl SignedProvider for AppStateProvider {
         // others - the store-and-forward reach a publish flood needs.
         self.state.record_update_hint(xite, modified as i64).await;
 
+        // Anonymous envelope pool shards are not content.json and self-verify
+        // per-record (PoW + self-signature); route them to the pool merge path,
+        // which unions grow-only and never touches the content.json apply gate.
+        if self.state.is_pool_shard(xite, inner_path).await {
+            return self.state.apply_inbound_pool_update(xite, inner_path, signed).await;
+        }
+
         // `inline` is not consumed: nothing sends it yet, and inserting pushed
         // objects into the store before apply_inbound_update authorizes the
         // update would let any peer fill our disk. Files land through the
@@ -691,9 +708,7 @@ impl SignedProvider for AppStateProvider {
                 inner_path,
                 Some(signed.to_vec()),
                 Some(modified),
-                sender,
-                diffs,
-                sender_peers,
+                InboundSource { sender, diffs, sender_peers },
             )
             .await
         {
@@ -4025,8 +4040,11 @@ impl EdxFetcher for RuntimeEdxFetcher {
             &work.served,
         )
         .await;
-        let served = std::mem::take(&mut *work.served.lock().expect("signed queue"));
-        served
+        // Bind the guard so it drops before `work` does; taking straight from
+        // `work.served.lock()` in the tail position would hold that borrow of
+        // `work` past the end of the function, where `work` is already dropped.
+        let mut served = work.served.lock().expect("signed queue");
+        std::mem::take(&mut *served)
     }
 
     async fn fetch_range(
@@ -4158,14 +4176,10 @@ impl EdxFetcher for RuntimeEdxFetcher {
     async fn push_update(
         &self,
         peer: PeerAddr,
-        address: &str,
-        inner_path: &str,
-        signed: Arc<Vec<u8>>,
-        modified: f64,
-        diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-        sender_peers: Arc<Vec<String>>,
+        job: PushJob<'_>,
         progressed: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<(), EdxPushError> {
+        let PushJob { address, inner_path, signed, modified, diffs, sender_peers } = job;
         // Dial the peer as an EDX link and push the update. A dial/handshake
         // failure means the peer looks unreachable (back it off); a failure
         // after the link is up means it answered but refused (alive).
@@ -4600,8 +4614,40 @@ mod tests {
     use epix_edx::msg::{caps, Req, Resp};
     use epix_edx::server::client_hello;
     use epix_transport::{TcpTransport, Transport};
+    use epix_ui::pool::{
+        PoolAdmission, PoolAdmissionBatch, PoolAdmissionRecord, PoolAdmissionRefresh,
+    };
     use epix_ui::state::XiteEntry;
     use epix_xite::{Xite, XiteStorage};
+
+    struct RejectPoolRescan;
+
+    impl PoolAdmission for RejectPoolRescan {
+        fn refresh_address(
+            &self,
+            _address: &str,
+            _content: Option<&serde_json::Value>,
+            _retained: &mut dyn FnMut() -> Result<Vec<PoolAdmissionRecord>, String>,
+        ) -> PoolAdmissionRefresh {
+            PoolAdmissionRefresh::default()
+        }
+
+        fn admit_records(
+            &self,
+            _address: &str,
+            _records: &[PoolAdmissionRecord],
+        ) -> PoolAdmissionBatch {
+            PoolAdmissionBatch::default()
+        }
+
+        fn allow_rescan_records(
+            &self,
+            _address: &str,
+            records: &[PoolAdmissionRecord],
+        ) -> Vec<bool> {
+            vec![false; records.len()]
+        }
+    }
 
     /// The foreground guards drive the process-wide LEDBAT flag: any live
     /// guard holds it up, and the last drop clears it. Asserted relatively
@@ -4697,6 +4743,74 @@ mod tests {
         assert!(
             p.get_signed(address, "evilcontent.json").await.is_none(),
             "a file that merely ENDS in content.json is not signed content"
+        );
+    }
+
+    #[tokio::test]
+    async fn get_signed_never_serves_a_poisoned_pool_survivor() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let address = "1PoisonedPoolServeTest";
+        let content = serde_json::json!({
+            "address": address,
+            "pool": { "channels": {
+                "dir": "pool", "class": "epix-pool-1", "since_week": 0,
+                "fanout": 1, "pow_bits": 0, "pad_buckets": [64],
+                "max_record_bytes": 4096, "max_shard_bytes": 1_000_000,
+                "rln_required": true
+            }}
+        });
+        let rule = epix_content::pool::PoolRule::parse(&content["pool"]["channels"]).unwrap();
+        let epoch = epix_content::pool::epoch_now(epix_core::time::now_ms());
+        let tag = [4u8; 32];
+        let key = epix_crypt::new_seed();
+        let mut record = serde_json::json!({
+            "v": 1,
+            "epoch": epoch,
+            "tag": base64::engine::general_purpose::STANDARD.encode(tag),
+            "ct": base64::engine::general_purpose::STANDARD.encode([5u8; 64]),
+            "pow": 0,
+            "rln": base64::engine::general_purpose::STANDARD.encode([6u8]),
+            "author": epix_crypt::privatekey_to_address(&key).unwrap(),
+        });
+        record["sign"] =
+            serde_json::json!(
+                epix_crypt::sign(&epix_content::record_signed_data(&record), &key).unwrap()
+            );
+        let shard = epix_content::pool::shard_path(&rule, epoch, &tag);
+        storage
+            .write(
+                &shard,
+                &serde_json::to_vec(&epix_content::pool::make_pool_container(vec![record]))
+                    .unwrap(),
+            )
+            .unwrap();
+
+        let state = AppState::new("provider");
+        state
+            .add_xite(
+                address,
+                XiteEntry {
+                    storage: XiteStorage::new(dir.path()),
+                    content: Some(content),
+                },
+            )
+            .await;
+        state.set_pool_admission(Arc::new(RejectPoolRescan)).await;
+        let served = AppStateProvider { state }
+            .get_signed(address, &shard)
+            .await
+            .expect("the shard is served as a sanitized empty container");
+        let served: serde_json::Value = serde_json::from_slice(&served).unwrap();
+        assert!(epix_content::pool::pool_records_of(&served).is_empty());
+        let raw: serde_json::Value =
+            serde_json::from_slice(&storage.read(&shard).unwrap()).unwrap();
+        assert_eq!(
+            epix_content::pool::pool_records_of(&raw).len(),
+            1,
+            "the regression models a failed cleanup write leaving poison on disk"
         );
     }
 
@@ -6407,12 +6521,14 @@ mod tests {
         let pushed = fetcher
             .push_update(
                 epix_core::PeerAddr::Ip(addr),
-                &xite_addr,
-                &format!("{user_dir}/content.json"),
-                Arc::new(serde_json::to_vec(&c2).unwrap()),
-                2000.0,
-                Arc::new(diffs),
-                Arc::new(Vec::new()),
+                PushJob {
+                    address: &xite_addr,
+                    inner_path: &format!("{user_dir}/content.json"),
+                    signed: Arc::new(serde_json::to_vec(&c2).unwrap()),
+                    modified: 2000.0,
+                    diffs: Arc::new(diffs),
+                    sender_peers: Arc::new(Vec::new()),
+                },
                 progressed.clone(),
             )
             .await;

@@ -126,24 +126,14 @@ impl EpixNode {
             version: config.version,
             rev: env!("EPIX_GIT_REV").to_string(),
         };
-        // Boot synchronously so the shell knows serving is ready (and can point
-        // its web view at ui_url) before returning; then drive the server on a
-        // background task for the process lifetime. The listener is bound HERE,
-        // not inside the spawned task: on a first launch the runtime workers are
-        // busy with Tor bootstrap, so a spawned bind can lose the race against
-        // the shell's first page load - the web view got connection-refused and
-        // rendered a blank page (the Android "blank screen on fresh install").
+        // Boot synchronously so the shell knows the UI listener is already
+        // owned before it points a web view at ui_url. Boot retains that
+        // listener inside UiServer; the background task only starts accepting.
         let booted: Result<RunningNode, String> = self.rt.block_on(async {
-            let (server, mut running) = boot(opts).await?;
-            let listener = tokio::net::TcpListener::bind(running.ui_addr)
-                .await
-                .map_err(|e| format!("bind UI on {}: {e}", running.ui_addr))?;
-            // The bound address is authoritative (a port-0 request resolves here).
-            running.ui_addr = listener
-                .local_addr()
-                .map_err(|e| format!("UI listener address: {e}"))?;
+            let (server, running) = boot(opts).await?;
+            let ui_addr = running.ui_addr;
             tokio::spawn(async move {
-                let _ = server.serve_on(listener).await;
+                let _ = server.serve(ui_addr).await;
             });
             Ok(running)
         });
@@ -227,19 +217,17 @@ impl EpixNode {
             }
             epix_core::LabelClass::Name => {}
         }
-        let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
-        let label = label.to_string();
-        let tld = tld.to_string();
-        self.rt.block_on(async move {
-            let domain = resolver
-                .resolve(&label, &tld)
-                .await
-                .map_err(|e| EpixError::msg(format!("resolve {label}.{tld}: {e}")))?;
-            domain
-                .xite_address()
-                .map(|a| a.to_string())
-                .ok_or_else(|| EpixError::msg(format!("{label}.{tld} has no xite address")))
-        })
+        let node = self
+            .inner
+            .lock()
+            .unwrap()
+            .node
+            .clone()
+            .ok_or_else(|| EpixError::msg("start the node before resolving an xID name"))?;
+        let full = format!("{label}.{tld}");
+        self.rt
+            .block_on(node.resolve_on_demand(&full))
+            .ok_or_else(|| EpixError::msg(format!("could not resolve {full}")))
     }
 }
 
@@ -250,3 +238,14 @@ pub struct TorStatus {
     pub status: String,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xid_names_cannot_resolve_before_node_finality_initializes() {
+        let node = EpixNode::new();
+        let error = node.resolve("talk.epix".to_string()).unwrap_err();
+        assert!(error.to_string().contains("start the node"));
+    }
+}

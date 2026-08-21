@@ -114,6 +114,42 @@ pub trait ContentSyncer: Send + Sync {
     async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>);
 }
 
+/// The update payload for [`EdxFetcher::push_update`], grouped so the call stays
+/// under the argument-count limit; `peer` and `progressed` stay separate as the
+/// routing target and the liveness flag.
+pub struct PushJob<'a> {
+    pub address: &'a str,
+    pub inner_path: &'a str,
+    pub signed: Arc<Vec<u8>>,
+    pub modified: f64,
+    pub diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+    pub sender_peers: Arc<Vec<String>>,
+}
+
+/// Where an inbound update came from: the sender's address (if any), the diffs
+/// it carried, and the peer list it advertised. Grouped for
+/// [`AppState::apply_inbound_update`].
+pub struct InboundSource {
+    pub sender: Option<PeerAddr>,
+    pub diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+    pub sender_peers: Vec<PeerAddr>,
+}
+
+/// The verified-and-applied inbound update handed to `finish_inbound_update`
+/// for the post-commit sync/publish. Grouped so the (internal) call stays under
+/// the argument-count limit.
+struct FinishInbound {
+    keys: Vec<String>,
+    xite: Xite,
+    sender: Option<PeerAddr>,
+    sender_peers: Vec<PeerAddr>,
+    inner_path: String,
+    uri: String,
+    diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+    child_files: Option<Vec<epix_xite::FileEntry>>,
+    root_bytes: Option<Vec<u8>>,
+}
+
 /// Fetches a file's bytes over the EDX verified-streaming path (installed by
 /// the node, which owns the EDX client stack). Kept behind a trait so the UI
 /// crate stays free of the transport/swarm dependency, like the resolvers.
@@ -211,12 +247,7 @@ pub trait EdxFetcher: Send + Sync {
     async fn push_update(
         &self,
         peer: PeerAddr,
-        address: &str,
-        inner_path: &str,
-        signed: Arc<Vec<u8>>,
-        modified: f64,
-        diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-        sender_peers: Arc<Vec<String>>,
+        job: PushJob<'_>,
         progressed: Arc<AtomicBool>,
     ) -> Result<(), EdxPushError>;
 
@@ -794,6 +825,36 @@ pub struct AppState {
     /// EDX verified-streaming fetcher, installed by the node when EDX is
     /// enabled. When absent, downloads use the legacy sha512/piecemap path.
     edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
+    /// Per-xite cached anonymous-envelope-pool descriptors, parsed from the root
+    /// content.json and rebuilt when it changes. A derived read cache, like
+    /// `feed_cache`. GENERIC — any xite may declare a `pool` (see `crate::pool`).
+    pub(crate) pool_rules: RwLock<HashMap<String, Vec<epix_content::PoolRule>>>,
+    /// Per-shard locks serializing the read-merge-write cycle for one pool shard,
+    /// keyed by "address\0inner_path". A local append and a concurrent inbound
+    /// merge on the SAME shard would otherwise lose-update each other (the
+    /// content.json path is guarded by `updates_in_flight`; pool shards need their
+    /// own guard because they bypass that gate).
+    pub(crate) pool_shard_locks:
+        std::sync::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    /// Broadcast bus of newly-landed pool records `(address, records)`. GENERIC:
+    /// any consumer (the mail indexer, or another xite's handler) subscribes via
+    /// [`Self::subscribe_pool_deltas`] and filters by address. Decoupled so the
+    /// pool machinery has no knowledge of its consumers.
+    pub(crate) pool_events: tokio::sync::broadcast::Sender<crate::pool::PoolDelta>,
+    /// Optional RLN admission hook for `rln_required` pools, installed by the
+    /// node at startup. Kept as a trait object so the arkworks proving stack
+    /// stays out of this crate (see [`crate::pool::PoolAdmission`]).
+    pub(crate) pool_admission: RwLock<Option<Arc<dyn crate::pool::PoolAdmission>>>,
+    /// Generic typed capability registry: a plugin installs its own state (e.g.
+    /// the mail plugin's private index + engine) under a string key so its WS
+    /// commands can retrieve it from the bound `AppState`, keeping the core free
+    /// of any per-feature fields. See [`Self::install_capability`].
+    capabilities: std::sync::RwLock<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Generic local (never-shared) feed/notification sources contributed by
+    /// plugins. `feedQuery`/`notification_query` fold these in after the shared
+    /// queries so private data (like decrypted mail) reaches the dashboard and
+    /// badge without any shared-DB footprint. See [`crate::local_feed`].
+    local_sources: RwLock<Vec<Arc<dyn crate::local_feed::LocalFeedSource>>>,
     /// Opens the warm pool's EDX links, installed by the node alongside the
     /// fetcher. Separate from `edx_fetcher` because the pool needs only a
     /// ping, and a mock of one should not have to mock the other.
@@ -995,6 +1056,9 @@ pub struct AppState {
     /// re-submitted repeatedly, and rotating per render would break the back
     /// button. Regenerated each run, so it does not persist to disk.
     ui_csrf: std::sync::OnceLock<String>,
+    /// Per-run secret used only by the native-messaging host. Unlike the UI
+    /// CSRF token, this is never rendered into a page served to xite content.
+    nmh_token: std::sync::OnceLock<String>,
     /// Hosts allowed as WebSocket `Origin`s (a wrapper's Host is added when
     /// served), so a cross-origin page can't drive the local WS API.
     allowed_ws_origins: std::sync::Mutex<std::collections::HashSet<String>>,
@@ -1110,6 +1174,11 @@ struct PublishRun {
     published: usize,
     done: usize,
     attempted: usize,
+    /// Reasons returned by reachable peers that rejected the update. Keep
+    /// these separate from transport failures so a durable sender can react
+    /// to a deterministic refusal such as pool capacity instead of retrying
+    /// the exact same representation forever.
+    refusals: Vec<String>,
 }
 
 /// One publish candidate's fate, fed back into the peer registry: an
@@ -1162,12 +1231,30 @@ fn record_push_outcome(
     failed: &mut Vec<String>,
 ) {
     run.published += outcome.accepted() as usize;
+    if let PushOutcome::Refused(_, why) = &outcome {
+        // A bounded publish attempts at most MAX_PUBLISH_DIALS peers. Retain a
+        // few distinct reasons for the caller without allowing an aggregate
+        // error string to grow with the peer set.
+        if run.refusals.len() < 4 && !run.refusals.contains(why) {
+            run.refusals.push(why.clone());
+        }
+    }
     let (peer, score, fail_label) = outcome.feedback();
     match fail_label {
         Some(label) => failed.push(format!("{peer} ({label})")),
         None => accepted.push(peer.to_string()),
     }
     outcomes.push((peer, score));
+}
+
+fn publish_run_result(run: &PublishRun) -> Result<usize, String> {
+    if run.published == 0 && !run.refusals.is_empty() {
+        return Err(format!(
+            "all reachable peers refused publication: {}",
+            run.refusals.join("; ")
+        ));
+    }
+    Ok(run.published)
 }
 
 /// Push one update to a publish candidate over EDX, bounded by the peer's
@@ -1209,12 +1296,14 @@ async fn push_update_to_peer(
             match edx
                 .push_update(
                     peer.clone(),
-                    &address,
-                    &inner_path,
-                    body,
-                    modified,
-                    diffs,
-                    sender_peers,
+                    PushJob {
+                        address: &address,
+                        inner_path: &inner_path,
+                        signed: body,
+                        modified,
+                        diffs,
+                        sender_peers,
+                    },
                     progressed,
                 )
                 .await
@@ -1331,10 +1420,20 @@ fn sql_quote(v: &Value) -> String {
     }
 }
 
-fn random_hex(bytes: usize) -> String {
+fn random_hex_with(
+    bytes: usize,
+    fill: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+) -> Result<String, String> {
     let mut buf = vec![0u8; bytes];
-    let _ = getrandom::fill(&mut buf);
-    buf.iter().map(|b| format!("{b:02x}")).collect()
+    fill(&mut buf)?;
+    Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+fn random_hex(bytes: usize) -> String {
+    random_hex_with(bytes, &mut |buf| {
+        getrandom::fill(buf).map_err(|error| format!("operating-system randomness failed: {error}"))
+    })
+    .expect("security token generation requires operating-system randomness")
 }
 
 /// The running executable's canonical path, for building a self-relaunch
@@ -1357,7 +1456,7 @@ pub fn self_exe() -> Option<String> {
 /// fallback, so a node whose shell cannot relaunch (the mobile apps) plainly
 /// shuts down instead.
 fn spawn_relauncher(argv: &[String]) {
-    if argv.first().map(|s| s.is_empty()).unwrap_or(true) {
+    if argv.first().map(String::is_empty).unwrap_or(true) {
         return;
     }
     let pid = std::process::id();
@@ -1484,6 +1583,12 @@ impl AppState {
             edx_store: RwLock::new(None),
             edx_paths: std::sync::RwLock::new(HashMap::new()),
             edx_fetcher: RwLock::new(None),
+            pool_rules: RwLock::new(HashMap::new()),
+            pool_shard_locks: std::sync::Mutex::new(HashMap::new()),
+            pool_events: tokio::sync::broadcast::channel(1024).0,
+            pool_admission: RwLock::new(None),
+            capabilities: std::sync::RwLock::new(HashMap::new()),
+            local_sources: RwLock::new(Vec::new()),
             link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
             tracker_stats: RwLock::new(HashMap::new()),
@@ -1534,6 +1639,7 @@ impl AppState {
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             ui_csrf: std::sync::OnceLock::new(),
+            nmh_token: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
             data_root: persist.data_root,
@@ -1892,7 +1998,7 @@ impl AppState {
             push(t.to_string());
         }
         let shared = self.shared_trackers().await;
-        let cutoff = now_secs() as i64 - TRACKER_WORKING_SECS;
+        let cutoff = now_secs() - TRACKER_WORKING_SECS;
         let stats = self.tracker_stats.read().await;
         for t in shared {
             let recent = stats
@@ -2005,7 +2111,7 @@ impl AppState {
             let stats = self.tracker_stats.read().await;
             let Some(entry) = stats.get(&key) else { return };
             let get = |k: &str| entry.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-            let now = now_secs() as i64;
+            let now = now_secs();
             get("num_error") >= SHARED_TRACKER_ERROR_LIMIT
                 && now - get("time_success") > SHARED_TRACKER_DEAD_SECS
                 && now - get("time_first_request") > SHARED_TRACKER_DEAD_SECS
@@ -2226,6 +2332,13 @@ impl AppState {
                 }
                 results.push(entry);
             }
+        }
+        // Fold in generic local (never-shared) sources — e.g. the decrypted
+        // mail badge — so private data reaches the badge with no shared footprint.
+        let mut xite_count = xite_count;
+        for entry in self.local_notification_entries().await {
+            results.push(entry);
+            xite_count += 1;
         }
         json!({ "results": results, "num": results.len(), "sites": xite_count, "muted": false })
     }
@@ -2737,10 +2850,19 @@ impl AppState {
     /// node on every chain resolution - so a name maps as soon as it resolves,
     /// even while its clone is still downloading). `None` for unknown names.
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
-        {
+        let served = {
             let xites = self.xites.read().await;
-            if let Some((k, _)) = xites.iter().find(|(_, x)| x.display.as_deref() == Some(name)) {
-                return Some(k.clone());
+            xites
+                .iter()
+                .find(|(_, x)| x.display.as_deref() == Some(name))
+                .map(|(address, _)| address.clone())
+        };
+        // Before the finality cutover, keep the historical display-name fast
+        // path. In finality mode, a persisted display is trusted only through
+        // the exact bound resolve-cache entry checked below.
+        if !epix_chain::verify_finality_enabled() {
+            if served.is_some() {
+                return served;
             }
         }
         // Entries are `{"address": …, "resolved_at": …}` or a legacy string.
@@ -2750,10 +2872,54 @@ impl AppState {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())?;
         let entry = cache.get(name)?;
-        entry
+        if epix_chain::verify_finality_enabled() {
+            let height = entry.get("finality_height")?.as_u64()?;
+            let digest = entry.get("finality_digest")?.as_str()?;
+            if !epix_chain::finality_checkpoint_matches(height, digest) {
+                return None;
+            }
+        }
+        let address = entry
             .as_str()
             .or_else(|| entry.get("address").and_then(Value::as_str))
-            .map(str::to_string)
+            .map(str::to_string)?;
+        // In finality mode the chain-bound cache wins over stale sites.json
+        // display data, including a mapping to a different address.
+        Some(address)
+    }
+
+    /// Whether an xID name currently has an active (non-revoked) linked identity
+    /// on chain, Merkle-verified. `Some(true)`/`Some(false)` are definite;
+    /// `None` = indeterminate (unregistered / chain unreachable) → callers
+    /// enforcing revocation should fail OPEN. Used to cut a revoked identity off
+    /// from channel mail (see the channel plugin's bundle gate).
+    pub async fn xid_name_active(&self, fqdn: &str) -> Option<bool> {
+        epix_chain::xid_identity::name_has_active_identity(fqdn).await
+    }
+
+    /// The chain-attested set of ACTIVE, non-revoked linked-identity addresses
+    /// for `fqdn` (each an `epix1…` device/key the name currently authorizes).
+    /// Empty means either "chain unreachable/unregistered" or "all revoked" —
+    /// callers must NOT treat empty as "definitely revoked"; use
+    /// [`Self::xid_name_active`] for that three-valued question and reserve this
+    /// for the finer per-device refinement (drop a bundle only when its `auth`
+    /// is positively absent from a NON-empty set).
+    pub async fn xid_active_addrs(&self, fqdn: &str) -> Vec<String> {
+        let Some((name, tld)) = fqdn.rsplit_once('.') else { return Vec::new() };
+        if name.is_empty() || tld.is_empty() {
+            return Vec::new();
+        }
+        epix_chain::xid_signers::resolve(name, tld).await
+    }
+
+    /// One fresh, chain-proven view of every identity status for an xID name.
+    /// `Ok(None)` is finalized NotFound. Transport, proof, and finality faults
+    /// stay `Err`, and an auth absent from the returned snapshot is unknown.
+    pub async fn xid_identity_snapshot(
+        &self,
+        fqdn: &str,
+    ) -> epix_chain::Result<Option<epix_chain::XidIdentitySnapshot>> {
+        epix_chain::resolve_xid_identity_snapshot(fqdn).await
     }
 
     /// Clear every xID resolution cache, so the next visit to any `.epix` name
@@ -3846,7 +4012,7 @@ impl AppState {
             return false;
         }
         let wait = 60 * num_error.min(30);
-        now_secs() as i64 - time_request < wait
+        now_secs() - time_request < wait
     }
 
     /// Per-tracker announce stats for the dashboard. `announcerStats`.
@@ -5103,7 +5269,7 @@ impl AppState {
     /// update as a [`PendingUpdate`] for [`Self::retry_pending_updates`].
     /// Returns whether the update committed.
     async fn finalize_root_update(
-        &self,
+        self: &Arc<Self>,
         keys: &[String],
         canonical: &str,
         storage: &XiteStorage,
@@ -5124,13 +5290,23 @@ impl AppState {
     /// record, clear the bad-file counters, and adopt the new content under
     /// every alias key.
     async fn commit_root_update(
-        &self,
+        self: &Arc<Self>,
         keys: &[String],
         canonical: &str,
         storage: &XiteStorage,
         content: Value,
         bytes: &[u8],
     ) -> bool {
+        // Root content owns both routing and RLN membership. Exclude every pool
+        // reader/writer for each served alias until the exact signed bytes,
+        // adopted content, cached rules, and candidate admission gate all agree.
+        let mut transition_keys = keys.to_vec();
+        transition_keys.sort();
+        transition_keys.dedup();
+        let mut transitions = Vec::with_capacity(transition_keys.len());
+        for key in &transition_keys {
+            transitions.push(self.pool_rule_transaction(key).await);
+        }
         if let Err(e) = storage.write_atomic("content.json", bytes) {
             self.log("ERROR", format!("Committing content.json for {canonical} failed: {e}"))
                 .await;
@@ -5148,7 +5324,12 @@ impl AppState {
         for k in keys {
             self.update_content(k, Some(content.clone())).await;
         }
-        self.register_new_manifest_objects(canonical, &content).await;
+        for transition in &transitions {
+            transition.refresh_rules().await;
+        }
+        drop(transitions);
+        self.register_new_manifest_objects(canonical, &content)
+            .await;
         true
     }
 
@@ -6096,6 +6277,17 @@ impl AppState {
         self.user.write().await.xite_data(address).map(|d| d.auth_privatekey.clone())
     }
 
+    /// The cert-aware auth key that signs this user's content unit. Channel v3
+    /// bundles use it to bind their device IK/SPK tuple to the linked identity.
+    pub async fn user_cert_auth_privatekey(&self, address: &str) -> Result<String, String> {
+        let key = {
+            let mut user = self.user.write().await;
+            user.auth_privatekey(address)?
+        };
+        self.save_user().await;
+        Ok(key)
+    }
+
     /// The user's auth (identity) address for a xite.
     pub async fn user_auth_address(&self, address: &str) -> Result<String, String> {
         self.user.write().await.auth_address(address)
@@ -6174,7 +6366,7 @@ impl AppState {
     /// The Epix chain's xID auth/linking xite - where "New" and the
     /// not-yet-linked redirect send the user to link an identity address to
     /// their xID name. EpixNet's `xid_xite`.
-    const XID_XITE: &'static str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
+    const XID_XITE: &str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
 
     /// Show the xID cert-selection dialog and act on the choice (EpixNet's
     /// `actionCertXid`). Discovers which of the user's addresses already map
@@ -8198,6 +8390,102 @@ impl AppState {
         self.events.subscribe()
     }
 
+    /// Subscribe to the generic anonymous-envelope-pool delta bus: every newly
+    /// landed pool record (from a local append or an inbound merge) is broadcast
+    /// as `(address, records)`. Consumers filter by address. See `crate::pool`.
+    pub fn subscribe_pool_deltas(&self) -> tokio::sync::broadcast::Receiver<crate::pool::PoolDelta> {
+        self.pool_events.subscribe()
+    }
+
+    /// The xite storage handle for `address`, if served (a cheap `Arc` clone).
+    /// A `pub(crate)` accessor so the generic pool and mail modules can read and
+    /// write shard files without reaching the private `xites` field directly.
+    pub(crate) async fn xite_storage(&self, address: &str) -> Option<XiteStorage> {
+        self.xites.read().await.get(address).map(|x| x.storage.clone())
+    }
+
+    /// The node master seed (hex), for deriving per-consumer identity seeds.
+    pub(crate) async fn master_seed(&self) -> String {
+        self.user.read().await.master_seed.clone()
+    }
+
+    // --- generic plugin capability registry -------------------------------
+
+    /// Install typed plugin state under `key`. A plugin's WS commands can later
+    /// retrieve it from the bound `AppState` via [`Self::capability`], so the
+    /// core needs no per-feature fields. Overwrites any prior value for `key`.
+    pub fn install_capability(&self, key: &str, cap: Arc<dyn std::any::Any + Send + Sync>) {
+        if let Ok(mut caps) = self.capabilities.write() {
+            caps.insert(key.to_string(), cap);
+        }
+    }
+
+    /// Retrieve typed plugin state installed under `key`, if present and of type
+    /// `T`. Returns `None` before the owning plugin's `start()` has installed it.
+    pub fn capability<T: std::any::Any + Send + Sync>(&self, key: &str) -> Option<Arc<T>> {
+        let caps = self.capabilities.read().ok()?;
+        caps.get(key)?.clone().downcast::<T>().ok()
+    }
+
+    pub(crate) async fn local_sources_mut(
+        &self,
+    ) -> tokio::sync::RwLockWriteGuard<'_, Vec<Arc<dyn crate::local_feed::LocalFeedSource>>> {
+        self.local_sources.write().await
+    }
+
+    pub(crate) async fn local_sources_snapshot(
+        &self,
+    ) -> Vec<Arc<dyn crate::local_feed::LocalFeedSource>> {
+        self.local_sources.read().await.clone()
+    }
+
+    /// Derive a stable, secret 32-byte per-consumer seed from the node master
+    /// seed, domain-separated by `domain` and `key` (e.g. an auth address). Lets
+    /// a plugin get key material bound to the node identity WITHOUT the master
+    /// seed ever leaving the node. Recomputable across restarts / restore-from-seed.
+    pub async fn derive_consumer_seed(&self, domain: &str, key: &str) -> [u8; 32] {
+        let seed = self.master_seed().await;
+        let mut material = hex::decode(&seed).unwrap_or_else(|_| seed.into_bytes());
+        material.extend_from_slice(domain.as_bytes());
+        material.push(0);
+        material.extend_from_slice(key.as_bytes());
+        blake3::derive_key("epix/consumer-seed/v1", &material)
+    }
+
+    /// Read one file from a served xite's storage (generic; used by plugins that
+    /// need a xite's published data, e.g. a recipient's mail key bundle).
+    pub async fn read_xite_file(&self, address: &str, inner_path: &str) -> Option<Vec<u8>> {
+        self.xite_storage(address).await?.read(inner_path).ok()
+    }
+
+    /// Every file currently on disk under a served xite's root, as relative
+    /// inner paths. Generic; a plugin uses it to enumerate published data (e.g.
+    /// every user's legacy `messages.json` for a one-shot migration).
+    pub async fn list_xite_files(&self, address: &str) -> Vec<String> {
+        match self.xite_storage(address).await {
+            Some(storage) => storage.list_files(),
+            None => Vec::new(),
+        }
+    }
+
+    /// The node's own auth address for a xite (ensuring the per-xite identity
+    /// entry exists). Generic; a plugin uses it to name its per-xite identity.
+    pub async fn xite_auth_address(&self, address: &str) -> Option<String> {
+        let mut user = self.user.write().await;
+        user.xite_data(address).ok()?;
+        user.xites.get(address).map(|x| x.auth_address.clone())
+    }
+
+    /// Push an unsolicited `{cmd, params}` event to a xite's bound page(s),
+    /// gated to the `siteChanged` channel. Generic wrapper a plugin can call
+    /// (the routed primitive is crate-private).
+    pub fn push_site_event(&self, xite: &str, cmd: &str, params: Value) {
+        if xite.is_empty() {
+            return;
+        }
+        self.push_event_routed(cmd, params, Some("siteChanged"), Some(xite.to_string()), None, None);
+    }
+
     /// Push an unsolicited `{cmd, params}` event. `channel` gates by
     /// subscription (`None` = ungated); `target` gates by xite (`None` = any).
     /// No-op if nothing is listening.
@@ -8207,7 +8495,7 @@ impl AppState {
 
     /// [`Self::push_event`] with per-connection routing: `exclude` skips the
     /// originating connection, `only` delivers to a single one.
-    fn push_event_routed(
+    pub(crate) fn push_event_routed(
         &self,
         cmd: &str,
         params: Value,
@@ -9381,6 +9669,14 @@ impl AppState {
         *self.on_demand.write().await = Some(resolver);
     }
 
+    /// Resolve through the node-owned resolver without cloning. This is used
+    /// by the authenticated native-messaging endpoint so the browser helper
+    /// cannot create its own unconfigured chain resolver.
+    pub async fn resolve_on_demand(&self, host: &str) -> Option<String> {
+        let resolver = self.on_demand.read().await.clone()?;
+        resolver.resolve(host).await
+    }
+
     /// Install the DHT-backed peer lookup (set by the runtime).
     pub async fn set_peer_finder(&self, finder: Arc<dyn PeerFinder>) {
         *self.peer_finder.write().await = Some(finder);
@@ -9740,7 +10036,7 @@ impl AppState {
                     x.settings.cache.optional_stats.entry(inner_path.to_string()).or_default();
                 let first = stat.time_downloaded == 0;
                 if first {
-                    stat.time_downloaded = now_secs() as i64;
+                    stat.time_downloaded = now_secs();
                 }
                 first
             };
@@ -9901,6 +10197,15 @@ impl AppState {
             .and_then(|c| c.get("modified").and_then(|v| v.as_f64()))
             .unwrap_or(0.0);
             self.bump_modified(address, modified).await;
+            // The ROOT content.json owns the pool descriptors, so refresh the
+            // cached pool rules when it changes — otherwise an owner adding a pool
+            // or changing fanout / retention / rln_required is ignored until the
+            // node restarts (the EDX serve gate and inbound routing read this
+            // cache, and a stale rln_required=false would keep a pool on PoW-only
+            // admission).
+            if inner_path == "content.json" {
+                self.refresh_pool_rules(address).await;
+            }
         }
         // A changed dbschema.json obsoletes the built db: its maps and tables
         // no longer match what pages query, and the map ingest below cannot
@@ -11332,12 +11637,6 @@ impl AppState {
         diffs: HashMap<String, Vec<epix_content::DiffAction>>,
         progress: Option<Option<u64>>,
     ) -> Result<usize, String> {
-        /// Upper bound on dial attempts for an exhaustive publish: batches of
-        /// `limit` are bounded by one connect_timeout each, so this caps the
-        /// worst case (a fully dead registry) at a few minutes while still
-        /// walking deep enough to reach the first live peer of a junk-heavy
-        /// pool. Sync keeps spreading the content afterwards regardless.
-        const MAX_PUBLISH_DIALS: usize = 100;
         let body = self
             .xites
             .read()
@@ -11345,6 +11644,28 @@ impl AppState {
             .get(address)
             .and_then(|x| x.storage.read(inner_path).ok())
             .ok_or("nothing to publish")?;
+        self.publish_bytes_to(
+            address, inner_path, body, limit, exhaustive, diffs, progress,
+        )
+        .await
+    }
+
+    /// Publish an immutable caller-captured file snapshot. Pool outbox delivery
+    /// uses this after releasing its shard and descriptor locks, so a concurrent
+    /// merge cannot change what peers acknowledge.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn publish_bytes_to(
+        self: &Arc<Self>,
+        address: &str,
+        inner_path: &str,
+        body: Vec<u8>,
+        limit: usize,
+        exhaustive: bool,
+        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
+        progress: Option<Option<u64>>,
+    ) -> Result<usize, String> {
+        /// Upper bound on dial attempts for an exhaustive publish.
+        const MAX_PUBLISH_DIALS: usize = 100;
         // The version we're publishing: sent with the update so receivers can
         // short-circuit, and used for the offline-peer propagation hint.
         let modified = serde_json::from_slice::<Value>(&body)
@@ -11386,7 +11707,13 @@ impl AppState {
         // fetch the new files from us over onion/i2p even when our clearnet
         // port is closed.
         let sender_peers = Arc::new(self.own_dialable_addresses().await);
-        let mut run = PublishRun { origin: progress, published: 0, done: 0, attempted: 0 };
+        let mut run = PublishRun {
+            origin: progress,
+            published: 0,
+            done: 0,
+            attempted: 0,
+            refusals: Vec::new(),
+        };
         self.publish_progress(address, &run, total.min(limit.max(1)));
 
         for (batch_no, batch) in pool.chunks(limit.max(1)).enumerate() {
@@ -11416,7 +11743,7 @@ impl AppState {
         // Close the bar against what was actually attempted (idempotent when
         // the loop already emitted this exact event on its last candidate).
         self.publish_progress(address, &run, run.done);
-        Ok(run.published)
+        publish_run_result(&run)
     }
 
     /// The subset of `batch` the registry still allows dialing - not backed
@@ -11547,7 +11874,7 @@ impl AppState {
     /// bounded by that peer's dial deadline (an onion/i2p peer needs far more
     /// than a flat clearnet one). `None` on any failure, so callers can just
     /// try the next address.
-    async fn fetch_signed_from(
+    pub(crate) async fn fetch_signed_from(
         &self,
         peer: &PeerAddr,
         address: &str,
@@ -11582,10 +11909,9 @@ impl AppState {
         inner_path: &str,
         body: Option<Vec<u8>>,
         modified_hint: Option<f64>,
-        sender: Option<PeerAddr>,
-        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
-        sender_peers: Vec<PeerAddr>,
+        src: InboundSource,
     ) -> Result<InboundUpdate, String> {
+        let InboundSource { sender, diffs, sender_peers } = src;
         // A xite may be served under aliases (raw address + `.epix` name); an
         // update applies to every key sharing the pushed canonical address.
         let keys: Vec<String> = {
@@ -11814,17 +12140,17 @@ impl AppState {
         let root_bytes = if is_root && !committed_inline { Some(bytes) } else { None };
         tokio::spawn(async move {
             state
-                .finish_inbound_update(
+                .finish_inbound_update(FinishInbound {
                     keys,
                     xite,
                     sender,
                     sender_peers,
-                    inner,
+                    inner_path: inner,
                     uri,
                     diffs,
                     child_files,
                     root_bytes,
-                )
+                })
                 .await;
         });
         Ok(InboundUpdate::Applied)
@@ -11862,18 +12188,18 @@ impl AppState {
     /// commit the staged content.json only if every declared file is present
     /// (else defer it for retry and keep serving the previous version), and
     /// re-publish to a few peers so the update spreads.
-    async fn finish_inbound_update(
-        self: &Arc<Self>,
-        keys: Vec<String>,
-        xite: Xite,
-        sender: Option<PeerAddr>,
-        sender_peers: Vec<PeerAddr>,
-        inner_path: String,
-        uri: String,
-        diffs: HashMap<String, Vec<epix_content::DiffAction>>,
-        child_files: Option<Vec<epix_xite::FileEntry>>,
-        root_bytes: Option<Vec<u8>>,
-    ) {
+    async fn finish_inbound_update(self: &Arc<Self>, f: FinishInbound) {
+        let FinishInbound {
+            keys,
+            xite,
+            sender,
+            sender_peers,
+            inner_path,
+            uri,
+            diffs,
+            child_files,
+            root_bytes,
+        } = f;
         let key = keys[0].clone();
         // Diff keys are relative to the pushed content.json's directory (the
         // root for a root push, the user/include dir for a child push).
@@ -11884,98 +12210,11 @@ impl AppState {
         // bad/mismatched diff is ignored - the file just gets downloaded below.
         // `arrived` collects every file this update landed (patched here,
         // downloaded below) for the db ingest at the end.
-        let mut arrived: Vec<String> = Vec::new();
-        if !diffs.is_empty() {
-            for (file_path, actions) in &diffs {
-                let full = format!("{diff_dir}{file_path}");
-                let info = match &child_files {
-                    Some(list) => list.iter().find(|f| f.inner_path == full).cloned(),
-                    None => xite.file_info(&full),
-                };
-                let Some(info) = info else { continue };
-                if xite.storage.verify(&full, &info.sha512) {
-                    continue; // already current
-                }
-                let Ok(old) = xite.storage.read(&full) else { continue };
-                let Ok(new) = epix_content::patch(&old, actions) else { continue };
-                if XiteStorage::hash_bytes(&new) == info.sha512
-                    && xite.storage.write(&full, &new).is_ok()
-                {
-                    arrived.push(full);
-                }
-            }
-            if !arrived.is_empty() {
-                self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
-            }
-        }
-        if self.transport.read().await.is_some() {
-            let mut peers = self.connectable_peers(&key, 10).await;
-            let nets = self.dialable_networks().await;
-            // Prefer fetching from the sender - it definitely has the files
-            // it just announced - but only if its address is dialable (an
-            // inbound-only peer, e.g. `ip:0`, would just waste a worker).
-            // Screened the same way the advertised addresses below are: the
-            // sender is caller-supplied, so a peer that names our own address
-            // or an undialable network must not get a worker slot either.
-            if let Some(s) = sender {
-                if nets.can_dial(&s)
-                    && epix_peer::Peer::new(s.clone(), 0).is_connectable()
-                    && !self.is_own_peer(&s).await
-                    && !peers.contains(&s)
-                {
-                    peers.insert(0, s);
-                }
-            }
-            // Even before the sender's wire address: the addresses the
-            // publisher SAYS it is dialable at (onion/i2p/open clearnet).
-            // For a NAT'd publisher these are the only routes to the new
-            // files. Own addresses are dropped (a lone seeder must not dial
-            // itself) and so are networks we cannot dial right now.
-            for sp in sender_peers.into_iter().rev() {
-                if nets.can_dial(&sp)
-                    && epix_peer::Peer::new(sp.clone(), 0).is_connectable()
-                    && !self.is_own_peer(&sp).await
-                    && !peers.contains(&sp)
-                {
-                    peers.insert(0, sp);
-                }
-            }
-            // The files to fetch: for a root push, whatever the new root
-            // declares and we lack; for a child push, the child's declared
-            // files that are missing or stale.
-            let needed: Vec<epix_xite::FileEntry> = match &child_files {
-                Some(list) => list
-                    .iter()
-                    .filter(|f| !xite.storage.verify(&f.inner_path, &f.sha512))
-                    .cloned()
-                    .collect(),
-                None => xite.files_needed(),
-            };
-            if !needed.is_empty() && !peers.is_empty() {
-                let needed_paths: Vec<String> =
-                    needed.iter().map(|f| f.inner_path.clone()).collect();
-                // EDX-only over the reused session (staged content's b3 is
-                // authoritative pre-commit). A file with no `b3` does not
-                // arrive; only the files EDX landed are reported for db ingest.
-                let missed =
-                    self.edx_first(&key, needed, peers.clone(), xite.content.as_ref(), None).await;
-                let missed: std::collections::HashSet<&String> =
-                    missed.iter().map(|f| &f.inner_path).collect();
-                arrived.extend(needed_paths.into_iter().filter(|p| !missed.contains(p)));
-            }
-        }
+        let mut arrived =
+            self.apply_inbound_diffs(&xite, &child_files, &diff_dir, &diffs, &key).await;
+        self.fetch_pushed_files(&key, &xite, sender, sender_peers, &child_files, &mut arrived).await;
         if child_files.is_some() {
-            // Child data files (user posts) feed the db per file, so open
-            // pages see them without a full rebuild - the downloaded files
-            // AND the diff-patched ones. A patched file never enters the
-            // download list (it already verifies against the new hash), so
-            // ingesting only downloads left a pushed post on disk but
-            // invisible to queries until a restart rebuilt the db.
-            for path in &arrived {
-                if xite.storage.exists(path) {
-                    self.ingest_file_from(&key, path, None).await;
-                }
-            }
+            self.ingest_arrived_child_files(&key, &xite, &arrived).await;
         }
 
         // Root push: commit the staged content.json (write to disk + adopt for
@@ -12017,6 +12256,144 @@ impl AppState {
         }
     }
 
+    /// Patch our old copy of each diffed file and keep it only if the result
+    /// matches the new content.json's declared hash. A bad/mismatched diff is
+    /// ignored - the file just gets downloaded by [`Self::fetch_pushed_files`].
+    /// Returns the files this step landed (for the db ingest at the end).
+    async fn apply_inbound_diffs(
+        self: &Arc<Self>,
+        xite: &Xite,
+        child_files: &Option<Vec<epix_xite::FileEntry>>,
+        diff_dir: &str,
+        diffs: &HashMap<String, Vec<epix_content::DiffAction>>,
+        key: &str,
+    ) -> Vec<String> {
+        let mut arrived: Vec<String> = Vec::new();
+        if diffs.is_empty() {
+            return arrived;
+        }
+        for (file_path, actions) in diffs {
+            let full = format!("{diff_dir}{file_path}");
+            let info = match child_files {
+                Some(list) => list.iter().find(|f| f.inner_path == full).cloned(),
+                None => xite.file_info(&full),
+            };
+            let Some(info) = info else { continue };
+            if Self::patch_file_to_new_hash(xite, &full, &info.sha512, actions) {
+                arrived.push(full);
+            }
+        }
+        if !arrived.is_empty() {
+            self.log("INFO", format!("Applied {} diff(s) for {key}", arrived.len())).await;
+        }
+        arrived
+    }
+
+    /// Patch our stored `full` from `actions` and keep it only if the result
+    /// matches `expected`. Returns whether the patched file landed - a file that
+    /// already verifies, or any bad/mismatched diff, is a no-op (`false`).
+    fn patch_file_to_new_hash(
+        xite: &Xite,
+        full: &str,
+        expected: &str,
+        actions: &[epix_content::DiffAction],
+    ) -> bool {
+        if xite.storage.verify(full, expected) {
+            return false; // already current
+        }
+        let Ok(old) = xite.storage.read(full) else { return false };
+        let Ok(new) = epix_content::patch(&old, actions) else { return false };
+        XiteStorage::hash_bytes(&new) == expected && xite.storage.write(full, &new).is_ok()
+    }
+
+    /// Fetch the files a push declared that we still lack, over the reused EDX
+    /// session, preferring the sender and the addresses it advertised. Extends
+    /// `arrived` with the files that landed. No-op without a transport.
+    async fn fetch_pushed_files(
+        self: &Arc<Self>,
+        key: &str,
+        xite: &Xite,
+        sender: Option<PeerAddr>,
+        sender_peers: Vec<PeerAddr>,
+        child_files: &Option<Vec<epix_xite::FileEntry>>,
+        arrived: &mut Vec<String>,
+    ) {
+        if self.transport.read().await.is_none() {
+            return;
+        }
+        let mut peers = self.connectable_peers(key, 10).await;
+        let nets = self.dialable_networks().await;
+        // Prefer fetching from the sender - it definitely has the files it just
+        // announced - but only if its address is dialable (an inbound-only peer,
+        // e.g. `ip:0`, would just waste a worker). The sender is caller-supplied,
+        // so it is screened exactly like the advertised addresses below.
+        if let Some(s) = sender {
+            if self.dialable_fresh_peer(&s, &nets, &peers).await {
+                peers.insert(0, s);
+            }
+        }
+        // Even before the sender's wire address: the addresses the publisher
+        // SAYS it is dialable at (onion/i2p/open clearnet). For a NAT'd
+        // publisher these are the only routes to the new files. Own addresses
+        // are dropped (a lone seeder must not dial itself) and so are networks
+        // we cannot dial right now.
+        for sp in sender_peers.into_iter().rev() {
+            if self.dialable_fresh_peer(&sp, &nets, &peers).await {
+                peers.insert(0, sp);
+            }
+        }
+        // The files to fetch: for a root push, whatever the new root declares
+        // and we lack; for a child push, the child's declared files that are
+        // missing or stale.
+        let needed: Vec<epix_xite::FileEntry> = match child_files {
+            Some(list) => list
+                .iter()
+                .filter(|f| !xite.storage.verify(&f.inner_path, &f.sha512))
+                .cloned()
+                .collect(),
+            None => xite.files_needed(),
+        };
+        if needed.is_empty() || peers.is_empty() {
+            return;
+        }
+        let needed_paths: Vec<String> = needed.iter().map(|f| f.inner_path.clone()).collect();
+        // EDX-only over the reused session (staged content's b3 is authoritative
+        // pre-commit). A file with no `b3` does not arrive; only the files EDX
+        // landed are reported for db ingest.
+        let missed = self.edx_first(key, needed, peers.clone(), xite.content.as_ref(), None).await;
+        let missed: std::collections::HashSet<&String> =
+            missed.iter().map(|f| &f.inner_path).collect();
+        arrived.extend(needed_paths.into_iter().filter(|p| !missed.contains(p)));
+    }
+
+    /// Feed each landed child file (downloaded or diff-patched) into the db so
+    /// open pages see it without a full rebuild. A patched file never enters the
+    /// download list (it already verifies against the new hash), so ingesting
+    /// only downloads would leave a pushed post on disk but invisible to queries
+    /// until a restart rebuilt the db.
+    async fn ingest_arrived_child_files(
+        self: &Arc<Self>,
+        key: &str,
+        xite: &Xite,
+        arrived: &[String],
+    ) {
+        for path in arrived {
+            if xite.storage.exists(path) {
+                self.ingest_file_from(key, path, None).await;
+            }
+        }
+    }
+
+    /// Whether `p` is worth a worker slot for a push fetch: on a dialable
+    /// network, connectable, not one of our own addresses, and not already in
+    /// `peers`. Screens both the sender and its advertised addresses.
+    async fn dialable_fresh_peer(&self, p: &PeerAddr, nets: &DialableNets, peers: &[PeerAddr]) -> bool {
+        nets.can_dial(p)
+            && epix_peer::Peer::new(p.clone(), 0).is_connectable()
+            && !self.is_own_peer(p).await
+            && !peers.contains(p)
+    }
+
     pub async fn has_xite(&self, address: &str) -> bool {
         self.xites.read().await.contains_key(address)
     }
@@ -12055,8 +12432,8 @@ impl AppState {
             let Ok(entry) = entry else { continue };
             let name = entry.file_name().to_string_lossy().into_owned();
             let meta = entry.metadata().ok();
-            let is_dir = meta.as_ref().map(|m| m.is_dir()).unwrap_or(false);
-            let size = meta.as_ref().map(|m| m.len()).unwrap_or(0);
+            let is_dir = meta.as_ref().map(std::fs::Metadata::is_dir).unwrap_or(false);
+            let size = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
             entries.push(json!({ "name": name, "is_dir": is_dir, "size": size }));
         }
         entries.sort_by(|a, b| {
@@ -12958,7 +13335,7 @@ impl AppState {
         schedule: &mut HashMap<String, (u32, i64)>,
     ) {
         let (fails, next_at) = schedule.get(addr).copied().unwrap_or((0, 0));
-        if next_at > now_secs() as i64 {
+        if next_at > now_secs() {
             return;
         }
         if self.optional_pass_in_flight(addr) {
@@ -12970,14 +13347,14 @@ impl AppState {
         self.set_optional_owed(addr, owed).await;
         if owed == 0 {
             // Complete: park it on the slow re-verify interval.
-            schedule.insert(addr.to_string(), (0, now_secs() as i64 + 600));
+            schedule.insert(addr.to_string(), (0, now_secs() + 600));
             return;
         }
         if fails == 0 {
             self.log("INFO", format!("Resuming optional download for {addr}")).await;
         }
         let delay = (60i64 * (1i64 << fails.min(4))).min(600);
-        schedule.insert(addr.to_string(), (fails + 1, now_secs() as i64 + delay));
+        schedule.insert(addr.to_string(), (fails + 1, now_secs() + delay));
         self.spawn_retry_pass(addr.to_string(), dirs.clone());
     }
 
@@ -13042,12 +13419,12 @@ impl AppState {
     ) {
         let key = format!("core:{addr}");
         let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
-        if next_at > now_secs() as i64 {
+        if next_at > now_secs() {
             return;
         }
         if self.xite_core_complete(addr).await {
             // Whole core on disk: park on the slow re-verify.
-            schedule.insert(key, (0, now_secs() as i64 + 600));
+            schedule.insert(key, (0, now_secs() + 600));
             return;
         }
         self.log("INFO", format!("Resuming interrupted download of {addr}")).await;
@@ -13060,7 +13437,7 @@ impl AppState {
         // long after a retry would have worked. 20s doubling to 90s keeps a
         // dead xite cheap while catching a peer that just came up.
         let delay = (20i64 * (1i64 << fails.min(3))).min(90);
-        schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
+        schedule.insert(key, (fails + 1, now_secs() + delay));
         let state = self.clone();
         let addr = addr.to_string();
         tokio::spawn(async move {
@@ -13600,7 +13977,7 @@ impl AppState {
                 self.add_transfer(address, batch.bytes, 0).await;
             }
             let done: std::collections::HashSet<&str> =
-                batch.done.iter().map(|s| s.as_str()).collect();
+                batch.done.iter().map(String::as_str).collect();
             if done.is_empty() {
                 continue;
             }
@@ -14280,6 +14657,59 @@ impl AppState {
         expected.iter().zip(got).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0
     }
 
+    /// Generate both HTTP security tokens before the server starts. Entropy
+    /// failure is returned to the node so startup fails closed.
+    pub fn initialize_security_tokens(&self) -> Result<(), String> {
+        self.initialize_security_tokens_with(&mut |buf| {
+            getrandom::fill(buf)
+                .map_err(|error| format!("operating-system randomness failed: {error}"))
+        })
+    }
+
+    fn initialize_security_tokens_with(
+        &self,
+        fill: &mut impl FnMut(&mut [u8]) -> Result<(), String>,
+    ) -> Result<(), String> {
+        let ui_csrf = self
+            .ui_csrf
+            .get()
+            .is_none()
+            .then(|| random_hex_with(32, fill))
+            .transpose()?;
+        let nmh_token = self
+            .nmh_token
+            .get()
+            .is_none()
+            .then(|| random_hex_with(32, fill))
+            .transpose()?;
+        if let Some(token) = ui_csrf {
+            let _ = self.ui_csrf.set(token);
+        }
+        if let Some(token) = nmh_token {
+            let _ = self.nmh_token.set(token);
+        }
+        Ok(())
+    }
+
+    /// This run's private native-messaging authentication token.
+    pub fn nmh_token(&self) -> &str {
+        self.nmh_token.get_or_init(|| random_hex(32))
+    }
+
+    /// Compare a supplied native-messaging token in constant time.
+    pub fn nmh_token_valid(&self, token: &str) -> bool {
+        let expected = self.nmh_token().as_bytes();
+        let got = token.as_bytes();
+        if expected.len() != got.len() {
+            return false;
+        }
+        expected
+            .iter()
+            .zip(got)
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+
     /// Record a wrapper's Host as an allowed WebSocket origin (EpixNet adds
     /// `HTTP_HOST` to `allowed_ws_origins` when it serves the wrapper).
     pub fn allow_ws_origin(&self, host: &str) {
@@ -14564,7 +14994,7 @@ fn walk_content_json(root: &std::path::Path) -> Vec<String> {
             let path = entry.path();
             if path.is_dir() {
                 stack.push(path);
-            } else if path.file_name().and_then(|n| n.to_str()) == Some("content.json") {
+            } else if path.file_name().and_then(std::ffi::OsStr::to_str) == Some("content.json") {
                 if let Ok(rel) = path.strip_prefix(root) {
                     out.push(rel.to_string_lossy().replace('\\', "/"));
                 }
@@ -14682,7 +15112,7 @@ fn free_space(path: Option<&std::path::Path>) -> i64 {
     #[cfg(unix)]
     {
         use std::os::unix::ffi::OsStrExt;
-        let dir = path.and_then(|p| p.parent()).unwrap_or_else(|| std::path::Path::new("."));
+        let dir = path.and_then(std::path::Path::parent).unwrap_or_else(|| std::path::Path::new("."));
         let Ok(c) = std::ffi::CString::new(dir.as_os_str().as_bytes()) else { return 0 };
         // SAFETY: statvfs writes into the zeroed struct; we read it only on success.
         unsafe {
@@ -15097,6 +15527,60 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    #[test]
+    fn security_token_entropy_failure_is_atomic_and_fail_closed() {
+        let state = AppState::new("test");
+        let mut calls = 0usize;
+        let error = state
+            .initialize_security_tokens_with(&mut |buf| {
+                calls += 1;
+                if calls == 2 {
+                    return Err("injected entropy failure".to_string());
+                }
+                buf.fill(0x11);
+                Ok(())
+            })
+            .unwrap_err();
+        assert!(error.contains("injected entropy failure"));
+        assert!(state.ui_csrf.get().is_none());
+        assert!(state.nmh_token.get().is_none());
+
+        state
+            .initialize_security_tokens_with(&mut |buf| {
+                buf.fill(0x22);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(state.ui_csrf_token(), "22".repeat(32));
+        assert_eq!(state.nmh_token(), "22".repeat(32));
+    }
+
+    #[tokio::test]
+    async fn cert_aware_auth_address_and_private_key_stay_paired_for_linked_override() {
+        let state = AppState::new("test");
+        let xite_key = epix_crypt::new_seed();
+        let xite = epix_crypt::privatekey_to_address(&xite_key).unwrap();
+        let (raw_auth, linked_auth) = {
+            let mut user = state.user.write().await;
+            let raw_auth = user.auth_address(&xite).unwrap();
+            let (linked_auth, _) = user.generate_new_identity_address().unwrap();
+            user.add_cert(&linked_auth, "xid.epix", "xid", "alice", "test-cert")
+                .unwrap();
+            user.set_cert_global(Some("xid.epix"));
+            (raw_auth, linked_auth)
+        };
+        assert_ne!(
+            raw_auth, linked_auth,
+            "the regression requires a true override"
+        );
+        assert_eq!(state.user_auth_address(&xite).await.unwrap(), linked_auth);
+        let key = state.user_cert_auth_privatekey(&xite).await.unwrap();
+        assert_eq!(
+            epix_crypt::privatekey_to_address(&key).unwrap(),
+            linked_auth
+        );
+    }
 
     #[test]
     fn shuffle_peers_permutes_without_losing_anyone() {
@@ -16577,12 +17061,7 @@ mod tests {
             async fn push_update(
                 &self,
                 _peer: PeerAddr,
-                _address: &str,
-                _inner_path: &str,
-                _signed: Arc<Vec<u8>>,
-                _modified: f64,
-                _diffs: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-                _sender_peers: Arc<Vec<String>>,
+                _job: PushJob<'_>,
                 progressed: Arc<AtomicBool>,
             ) -> Result<(), EdxPushError> {
                 match self.mode {
@@ -16664,6 +17143,44 @@ mod tests {
         assert!(matches!(run(3, peer.clone()).await, PushOutcome::Refused(..)));
     }
 
+    #[test]
+    fn publish_result_preserves_refusal_but_not_unreachable_as_an_error() {
+        fn empty_run() -> PublishRun {
+            PublishRun {
+                origin: None,
+                published: 0,
+                done: 0,
+                attempted: 1,
+                refusals: Vec::new(),
+            }
+        }
+
+        let peer = PeerAddr::Ip("1.2.3.4:15441".parse().unwrap());
+        let mut refused = empty_run();
+        record_push_outcome(
+            PushOutcome::Refused(
+                peer.clone(),
+                "peer pool update was dropped by shard capacity".into(),
+            ),
+            &mut refused,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        let error = publish_run_result(&refused).unwrap_err();
+        assert!(error.contains("capacity"));
+
+        let mut unreachable = empty_run();
+        record_push_outcome(
+            PushOutcome::Unreachable(peer),
+            &mut unreachable,
+            &mut Vec::new(),
+            &mut Vec::new(),
+            &mut Vec::new(),
+        );
+        assert_eq!(publish_run_result(&unreachable), Ok(0));
+    }
+
     /// A body-less push (the publisher dropped a >1 MB content.json) with no
     /// usable sender wire address must still be fetched back: the push carries
     /// the publisher's own dialable addresses, and the first one that answers
@@ -16714,12 +17231,7 @@ mod tests {
             async fn push_update(
                 &self,
                 _: PeerAddr,
-                _: &str,
-                _: &str,
-                _: Arc<Vec<u8>>,
-                _: f64,
-                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-                _: Arc<Vec<String>>,
+                _: PushJob<'_>,
                 _: Arc<AtomicBool>,
             ) -> Result<(), EdxPushError> {
                 unreachable!()
@@ -16800,9 +17312,11 @@ mod tests {
                 "content.json",
                 None,
                 None,
-                None,
-                Default::default(),
-                vec![dead.clone(), good.clone()],
+                InboundSource {
+                    sender: None,
+                    diffs: Default::default(),
+                    sender_peers: vec![dead.clone(), good.clone()],
+                },
             )
             .await
             .unwrap();
@@ -16895,9 +17409,7 @@ mod tests {
                 &format!("{user_dir}/content.json"),
                 Some(serde_json::to_vec(&c2).unwrap()),
                 None,
-                None,
-                diffs,
-                Vec::new(),
+                InboundSource { sender: None, diffs, sender_peers: Vec::new() },
             )
             .await
             .unwrap();
@@ -17062,6 +17574,85 @@ mod tests {
             !store_dir.path().join("sparse").join(b3.to_string()).exists(),
             "no second copy of the bytes"
         );
+    }
+
+    #[tokio::test]
+    async fn inbound_root_commit_refreshes_pool_rule_and_admission_gate_together() {
+        use crate::pool::{
+            PoolAdmission, PoolAdmissionBatch, PoolAdmissionRecord, PoolAdmissionRefresh,
+        };
+
+        struct ObservedRefresh(std::sync::atomic::AtomicBool);
+
+        impl PoolAdmission for ObservedRefresh {
+            fn refresh_address(
+                &self,
+                _: &str,
+                content: Option<&Value>,
+                retained: &mut dyn FnMut() -> Result<Vec<PoolAdmissionRecord>, String>,
+            ) -> PoolAdmissionRefresh {
+                assert!(retained().unwrap().is_empty());
+                self.0.store(
+                    content
+                        .and_then(|root| root.pointer("/pool/channels/rln_required"))
+                        .and_then(Value::as_bool)
+                        == Some(true),
+                    Ordering::Release,
+                );
+                PoolAdmissionRefresh::default()
+            }
+
+            fn admit_records(&self, _: &str, _: &[PoolAdmissionRecord]) -> PoolAdmissionBatch {
+                PoolAdmissionBatch::default()
+            }
+
+            fn allow_rescan_records(&self, _: &str, records: &[PoolAdmissionRecord]) -> Vec<bool> {
+                vec![true; records.len()]
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let descriptor = |rln_required| {
+            json!({
+                "address": addr,
+                "files": {},
+                "pool": { "channels": {
+                    "dir": "pool", "class": "epix-pool-1", "since_week": 0,
+                    "fanout": 2, "pow_bits": 0, "pad_buckets": [64],
+                    "max_record_bytes": 4096, "max_shard_bytes": 1_000_000,
+                    "rln_required": rln_required
+                }}
+            })
+        };
+        let old = descriptor(false);
+        storage
+            .write("content.json", &serde_json::to_vec(&old).unwrap())
+            .unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                &addr,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(old),
+                },
+            )
+            .await;
+        assert!(!state.pool_rules_for(&addr).await[0].rln_required);
+        let observed = Arc::new(ObservedRefresh(std::sync::atomic::AtomicBool::new(false)));
+        state.set_pool_admission(observed.clone()).await;
+
+        let inbound = descriptor(true);
+        let bytes = serde_json::to_vec(&inbound).unwrap();
+        assert!(
+            state
+                .finalize_root_update(&[addr.clone()], &addr, &storage, inbound, &bytes, &[],)
+                .await
+        );
+        assert!(state.pool_rules_for(&addr).await[0].rln_required);
+        assert!(observed.0.load(Ordering::Acquire));
     }
 
     /// The gate is cheap and quiet: an ordinary update that declares nothing
@@ -19156,8 +19747,11 @@ mod tests {
         let dir = tempdir().unwrap();
         let master = {
             let s = AppState::with_data_dir("test", dir.path());
-            let master = s.user.read().await.master_address.clone();
-            master
+            // Bind the guard so it drops before `s`; the clone is the block's
+            // value. Cloning straight off `s.user.read().await` in the tail
+            // position would hold the read borrow of `s` past its drop.
+            let user = s.user.read().await;
+            user.master_address.clone()
         };
         assert!(dir.path().join("private/users.json").exists());
         assert!(!dir.path().join("users.json").exists(), "no node files at the root");
@@ -20707,12 +21301,7 @@ mod tests {
             async fn push_update(
                 &self,
                 _: PeerAddr,
-                _: &str,
-                _: &str,
-                _: Arc<Vec<u8>>,
-                _: f64,
-                _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-                _: Arc<Vec<String>>,
+                _: PushJob<'_>,
                 _: Arc<AtomicBool>,
             ) -> Result<(), EdxPushError> {
                 unreachable!()
@@ -20894,12 +21483,7 @@ mod tests {
         async fn push_update(
             &self,
             _: PeerAddr,
-            _: &str,
-            _: &str,
-            _: Arc<Vec<u8>>,
-            _: f64,
-            _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-            _: Arc<Vec<String>>,
+            _: PushJob<'_>,
             _: Arc<AtomicBool>,
         ) -> Result<(), EdxPushError> {
             unreachable!()

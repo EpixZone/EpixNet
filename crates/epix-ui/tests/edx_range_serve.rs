@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use epix_core::PeerAddr;
 use epix_ui::state::{
-    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, XiteEntry,
+    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, PushJob, XiteEntry,
 };
 use epix_ui::UiServer;
 use epix_xite::XiteStorage;
@@ -64,12 +64,7 @@ impl EdxFetcher for RangeFetcher {
     async fn push_update(
         &self,
         _: PeerAddr,
-        _: &str,
-        _: &str,
-        _: Arc<Vec<u8>>,
-        _: f64,
-        _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
-        _: Arc<Vec<String>>,
+        _: PushJob<'_>,
         _: Arc<AtomicBool>,
     ) -> Result<(), EdxPushError> {
         unreachable!()

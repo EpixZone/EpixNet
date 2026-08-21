@@ -11,6 +11,39 @@ pub struct XiteStorage {
     root: PathBuf,
 }
 
+#[cfg(not(windows))]
+fn persist_durable_temp(
+    temp: tempfile::NamedTempFile,
+    path: &Path,
+) -> std::io::Result<std::fs::File> {
+    temp.persist(path).map_err(|error| error.error)
+}
+
+#[cfg(windows)]
+fn persist_durable_temp(
+    temp: tempfile::NamedTempFile,
+    path: &Path,
+) -> std::io::Result<std::fs::File> {
+    use std::os::windows::ffi::OsStrExt as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    let (file, temp_path) = temp.keep().map_err(|error| error.error)?;
+    let source: Vec<u16> = temp_path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let destination: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    let flags = MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH;
+    // SAFETY: both buffers are NUL-terminated UTF-16 and remain alive for the
+    // call. NamedTempFile's handle permits rename sharing on Windows.
+    if unsafe { MoveFileExW(source.as_ptr(), destination.as_ptr(), flags) } == 0 {
+        let error = std::io::Error::last_os_error();
+        drop(file);
+        let _ = std::fs::remove_file(temp_path);
+        return Err(error);
+    }
+    Ok(file)
+}
+
 impl XiteStorage {
     pub fn new(root: impl Into<PathBuf>) -> Self {
         Self { root: root.into() }
@@ -60,7 +93,10 @@ impl XiteStorage {
         let parent =
             p.parent().ok_or_else(|| Error::Other(format!("no parent dir: {inner_path}")))?;
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("content.json");
+        let name = p
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .unwrap_or("content.json");
         let tmp = parent.join(format!("{name}.epixtmp"));
         {
             let mut f = std::fs::File::create(&tmp).map_err(Error::Io)?;
@@ -110,6 +146,41 @@ impl XiteStorage {
             }
             Err(_) => Err(Error::Io(rename_err.expect("rename ran at least once"))),
         }
+    }
+
+    /// Crash-durable atomic replacement with no in-place fallback.
+    ///
+    /// Unlike [`Self::write_atomic`], a failed rename never truncates the live
+    /// target. Callers whose transaction acknowledgement depends on the file
+    /// surviving a crash, such as the anonymous channel outbox, use this seam.
+    /// A transient rename failure is returned so the caller can retain and
+    /// retry its durable source record.
+    pub fn write_atomic_durable(&self, inner_path: &str, bytes: &[u8]) -> Result<()> {
+        use std::io::Write;
+
+        let p = self.path(inner_path)?;
+        let parent = p
+            .parent()
+            .ok_or_else(|| Error::Other(format!("no parent dir: {inner_path}")))?;
+        std::fs::create_dir_all(parent).map_err(Error::Io)?;
+        let mut tmp = tempfile::NamedTempFile::new_in(parent).map_err(Error::Io)?;
+        tmp.write_all(bytes).map_err(Error::Io)?;
+        tmp.as_file().sync_all().map_err(Error::Io)?;
+        // Windows uses MOVEFILE_WRITE_THROUGH in addition to atomic replace.
+        // Unix persists with rename and fsyncs the containing directory below.
+        let persisted = persist_durable_temp(tmp, &p).map_err(Error::Io)?;
+        // Sync the live handle again after replacement. On Windows this does
+        // not make the containing directory durable, but it does flush the
+        // renamed file through the platform file handle before acknowledgement.
+        persisted.sync_all().map_err(Error::Io)?;
+
+        // Persist the directory entry on Unix. The Windows replacement above
+        // requests MOVEFILE_WRITE_THROUGH for the equivalent durability contract.
+        #[cfg(unix)]
+        std::fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(Error::Io)?;
+        Ok(())
     }
 
     /// Delete a stored file, pruning any directories the removal left empty.
@@ -229,5 +300,19 @@ mod tests {
             .filter(|f| f.ends_with(".epixtmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn durable_atomic_write_replaces_and_syncs_pool_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = XiteStorage::new(dir.path());
+        s.write_atomic_durable("pool/w1/00.json", b"first").unwrap();
+        s.write_atomic_durable("pool/w1/00.json", b"second-complete")
+            .unwrap();
+        assert_eq!(s.read("pool/w1/00.json").unwrap(), b"second-complete");
+        assert!(
+            s.list_files().iter().all(|path| !path.contains(".tmp")),
+            "the rename leaves no temporary shard"
+        );
     }
 }
