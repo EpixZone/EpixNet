@@ -363,14 +363,58 @@ struct PublishedBundles {
     revoked_devices: std::collections::HashSet<(String, String)>,
 }
 
+type PublishedBundleMap = std::collections::HashMap<String, Vec<Value>>;
+type SessionPeerMap =
+    std::collections::HashMap<String, Vec<epix_channel::SessionPeer>>;
+
+struct PublishedBundleSources<'a> {
+    state: &'a Arc<AppState>,
+    engine: &'a dyn Engine,
+    db: &'a ChannelDb,
+    sessions_by_name: &'a SessionPeerMap,
+}
+
 async fn load_published_bundles(
     state: &Arc<AppState>,
     xite: &str,
     engine: &dyn Engine,
     db: &ChannelDb,
 ) -> Result<PublishedBundles, String> {
-    let mut by_name: std::collections::HashMap<String, Vec<Value>> =
-        std::collections::HashMap::new();
+    let mut by_name = read_published_bundle_files(state, xite, engine).await;
+    db.backfill_session_peer_auth(&published_auth_bindings(engine, &by_name))
+        .map_err(|error| error.to_string())?;
+    let sessions_by_name = session_peers_by_name(db, &mut by_name)?;
+    include_local_identity_names(db, &mut by_name)?;
+
+    let mut out = PublishedBundles::default();
+    let mut newly_revoked = Vec::<RevokedDevice>::new();
+    let sources = PublishedBundleSources {
+        state,
+        engine,
+        db,
+        sessions_by_name: &sessions_by_name,
+    };
+    for (name, devs) in by_name {
+        classify_published_name(
+            &sources,
+            name,
+            devs,
+            &mut out,
+            &mut newly_revoked,
+        )
+        .await?;
+    }
+    db.remember_revoked_devices(&newly_revoked, now_ms())
+        .map_err(|error| error.to_string())?;
+    Ok(out)
+}
+
+async fn read_published_bundle_files(
+    state: &Arc<AppState>,
+    xite: &str,
+    engine: &dyn Engine,
+) -> PublishedBundleMap {
+    let mut by_name = PublishedBundleMap::new();
     for path in state.list_xite_files(xite).await {
         let Some((dir, file)) = bundle_path_parts(&path) else {
             continue;
@@ -381,38 +425,43 @@ async fn load_published_bundles(
         let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
             continue;
         };
-        // Attribute the bundle to the cert-gated directory it lives in, 
-        // NOT to its self-declared `xid` field.
-        // Only the owner of `data/users/<name>.epix/` can write there, so the
-        // directory IS the authenticated identity (publish stamps the same value
-        // into the field). Keying by the JSON field would let anyone drop a bundle
-        // carrying THEIR own `ik` under a VICTIM's name, so the transcript-bound
-        // `ik_a` check in the indexer would then match and the forgery would index
-        // as "from victim". Drop any bundle whose declared `xid` disagrees.
+        // Attribute the bundle to the cert-gated directory it lives in. Drop a
+        // bundle whose declared xID disagrees with that authenticated directory.
         let key = norm_xid(dir);
         if !bundle_xid_matches_directory(&v, &key) {
-                continue;
-            }
+            continue;
+        }
         if !engine.verify_bundle(&v) || !bundle_filename_matches_auth(file, &v) {
             continue;
         }
         by_name.entry(key).or_default().push(v);
     }
-    let mut peer_auth_bindings = Vec::new();
-    for (name, bundles) in &by_name {
+    by_name
+}
+
+fn published_auth_bindings(
+    engine: &dyn Engine,
+    by_name: &PublishedBundleMap,
+) -> Vec<(String, String, String)> {
+    let mut bindings = Vec::new();
+    for (name, bundles) in by_name {
         for bundle in bundles {
             if let (Some(ik), Some(auth)) = (
                 engine.sender_ik(bundle),
                 bundle.get("auth").and_then(Value::as_str),
             ) {
-                peer_auth_bindings.push((name.clone(), hex::encode(ik), auth.to_string()));
+                bindings.push((name.clone(), hex::encode(ik), auth.to_string()));
             }
         }
     }
-    db.backfill_session_peer_auth(&peer_auth_bindings)
-        .map_err(|e| e.to_string())?;
-    let mut sessions_by_name: std::collections::HashMap<String, Vec<epix_channel::SessionPeer>> =
-        std::collections::HashMap::new();
+    bindings
+}
+
+fn session_peers_by_name(
+    db: &ChannelDb,
+    by_name: &mut PublishedBundleMap,
+) -> Result<SessionPeerMap, String> {
+    let mut sessions_by_name = SessionPeerMap::new();
     for peer in db.session_peers().map_err(|e| e.to_string())? {
         let name = norm_xid(&peer.xid);
         sessions_by_name.entry(name.clone()).or_default().push(peer);
@@ -420,149 +469,213 @@ async fn load_published_bundles(
         // was removed or has not synced on this node.
         by_name.entry(name).or_default();
     }
-    let local_identities = db.identities().map_err(|e| e.to_string())?;
-    for identity in &local_identities {
+    Ok(sessions_by_name)
+}
+
+fn include_local_identity_names(
+    db: &ChannelDb,
+    by_name: &mut PublishedBundleMap,
+) -> Result<(), String> {
+    for identity in db.identities().map_err(|error| error.to_string())? {
         by_name.entry(norm_xid(&identity.xid)).or_default();
     }
+    Ok(())
+}
 
-    let mut out = PublishedBundles::default();
-    let mut newly_revoked = Vec::<RevokedDevice>::new();
-    for (name, devs) in by_name {
-        let snapshot = match state.xid_identity_snapshot(&name).await {
-            Ok(Some(snapshot)) if norm_xid(&snapshot.canonical_name) == name => Some(snapshot),
-            Ok(Some(_)) => {
-                state
-                    .log(
-                        "WARN",
-                        &format!("ignoring mismatched xID identity snapshot for {name}"),
-                    )
-                    .await;
-                None
+async fn published_identity_snapshot(
+    state: &Arc<AppState>,
+    name: &str,
+) -> Option<epix_chain::XidIdentitySnapshot> {
+    match state.xid_identity_snapshot(name).await {
+        Ok(Some(snapshot)) if norm_xid(&snapshot.canonical_name) == name => Some(snapshot),
+        Ok(Some(_)) => {
+            state
+                .log(
+                    "WARN",
+                    &format!("ignoring mismatched xID identity snapshot for {name}"),
+                )
+                .await;
+            None
         }
-            Ok(None) => None,
-            Err(error) => {
-                // The documented policy is offline fail-open. A resolver or
-                // finality failure must not erase an already persisted tombstone,
-                // and it must not invent a new one either.
-                state
-                    .log(
-                        "WARN",
-                        &format!("xID identity snapshot unavailable for {name}: {error}"),
-                    )
-                    .await;
-                None
-            }
+        Ok(None) => None,
+        Err(error) => {
+            state
+                .log(
+                    "WARN",
+                    &format!("xID identity snapshot unavailable for {name}: {error}"),
+                )
+                .await;
+            None
+        }
+    }
+}
+
+fn record_snapshot_revocations(
+    name: &str,
+    snapshot: Option<&epix_chain::XidIdentitySnapshot>,
+    out: &mut PublishedBundles,
+    newly_revoked: &mut Vec<RevokedDevice>,
+) {
+    let Some(snapshot) = snapshot else { return };
+    use epix_chain::XidIdentityStatus::{Active, Revoked};
+    if !snapshot
+        .identities
+        .iter()
+        .any(|identity| identity.status == Active)
+    {
+        out.revoked_names.insert(name.to_string());
+    }
+    for identity in snapshot
+        .identities
+        .iter()
+        .filter(|identity| identity.status == Revoked)
+    {
+        newly_revoked.push(RevokedDevice {
+            xid: name.to_string(),
+            auth_address: identity.auth_address.clone(),
+            peer_ik: String::new(),
+        });
+    }
+}
+
+fn classify_session_peer(
+    db: &ChannelDb,
+    name: &str,
+    snapshot: Option<&epix_chain::XidIdentitySnapshot>,
+    peer: &epix_channel::SessionPeer,
+    out: &mut PublishedBundles,
+    newly_revoked: &mut Vec<RevokedDevice>,
+) -> Result<(), String> {
+    let status_for = |auth: &str| snapshot.and_then(|value| value.status_for(auth));
+    let snapshot_has_revocation = snapshot.is_some_and(|value| {
+        value
+            .identities
+            .iter()
+            .any(|identity| identity.status == epix_chain::XidIdentityStatus::Revoked)
+    });
+    let unbound_legacy_leg = peer.peer_auth.is_none() && snapshot_has_revocation;
+    let transiently_blocked = peer.peer_auth.as_deref().is_some_and(|auth| {
+        snapshot.is_some() && status_for(auth) != Some(epix_chain::XidIdentityStatus::Active)
+    });
+    let explicitly_revoked = peer.peer_auth.as_deref().is_some_and(|auth| {
+        status_for(auth) == Some(epix_chain::XidIdentityStatus::Revoked)
+    });
+    if explicitly_revoked {
+        newly_revoked.push(RevokedDevice {
+            xid: name.to_string(),
+            auth_address: peer.peer_auth.clone().unwrap_or_default(),
+            peer_ik: peer.peer_ik.clone(),
+        });
+    }
+    if unbound_legacy_leg {
+        newly_revoked.push(RevokedDevice {
+            xid: name.to_string(),
+            auth_address: String::new(),
+            peer_ik: peer.peer_ik.clone(),
+        });
+    }
+    let should_block = if unbound_legacy_leg || transiently_blocked {
+        true
+    } else {
+        db.is_device_revoked(name, peer.peer_auth.as_deref(), &peer.peer_ik)
+            .map_err(|error| error.to_string())?
+    };
+    if should_block {
+        out.revoked_devices
+            .insert((name.to_string(), peer.peer_ik.clone()));
+    }
+    Ok(())
+}
+
+fn classify_session_peers(
+    db: &ChannelDb,
+    sessions_by_name: &SessionPeerMap,
+    name: &str,
+    snapshot: Option<&epix_chain::XidIdentitySnapshot>,
+    out: &mut PublishedBundles,
+    newly_revoked: &mut Vec<RevokedDevice>,
+) -> Result<(), String> {
+    for peer in sessions_by_name.get(name).into_iter().flatten() {
+        classify_session_peer(db, name, snapshot, peer, out, newly_revoked)?;
+    }
+    Ok(())
+}
+
+fn retain_active_bundles(
+    engine: &dyn Engine,
+    db: &ChannelDb,
+    name: &str,
+    devs: Vec<Value>,
+    snapshot: Option<&epix_chain::XidIdentitySnapshot>,
+    out: &mut PublishedBundles,
+    newly_revoked: &mut Vec<RevokedDevice>,
+) -> Result<Vec<Value>, String> {
+    let status_for = |auth: &str| snapshot.and_then(|value| value.status_for(auth));
+    let mut retained = Vec::new();
+    for bundle in refine_device_bundles(devs, &[]) {
+        let Some(auth) = bundle.get("auth").and_then(Value::as_str) else {
+            continue;
         };
-        let status_for = |auth: &str| snapshot.as_ref().and_then(|s| s.status_for(auth));
-
-        if let Some(snapshot) = &snapshot {
-            use epix_chain::XidIdentityStatus::{Active, Revoked};
-            let has_active = snapshot
-                .identities
-                .iter()
-                .any(|identity| identity.status == Active);
-            if !has_active {
-                // This is a transient name-wide block for this exact snapshot,
-                // not a permanent name tombstone. Future newly-linked auths work.
-                out.revoked_names.insert(name.clone());
-            }
-            for identity in snapshot
-                .identities
-                .iter()
-                .filter(|identity| identity.status == Revoked)
-            {
-                // Persist every chain-known revoked auth even if its stale bundle
-                // is absent today. A later outage cannot revive that device.
-                newly_revoked.push(RevokedDevice {
-                    xid: name.clone(),
-                    auth_address: identity.auth_address.clone(),
-                    peer_ik: String::new(),
-                });
+        let Some(peer_ik) = engine.sender_ik(&bundle).map(hex::encode) else {
+            continue;
+        };
+        let explicitly_revoked =
+            status_for(auth) == Some(epix_chain::XidIdentityStatus::Revoked);
+        if explicitly_revoked {
+            newly_revoked.push(RevokedDevice {
+                xid: name.to_string(),
+                auth_address: auth.to_string(),
+                peer_ik: peer_ik.clone(),
+            });
+            out.revoked_devices
+                .insert((name.to_string(), peer_ik.clone()));
+        }
+        let snapshot_allows = snapshot.is_none()
+            || status_for(auth) == Some(epix_chain::XidIdentityStatus::Active);
+        if snapshot_allows
+            && !out
+                .revoked_devices
+                .contains(&(name.to_string(), peer_ik.clone()))
+            && !db
+                .is_device_revoked(name, Some(auth), &peer_ik)
+                .map_err(|error| error.to_string())?
+        {
+            retained.push(bundle);
         }
     }
+    Ok(retained)
+}
 
-        for peer in sessions_by_name.get(&name).into_iter().flatten() {
-            let unbound_legacy_leg = peer.peer_auth.is_none()
-                && snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot
-                        .identities
-                        .iter()
-                        .any(|identity| identity.status == epix_chain::XidIdentityStatus::Revoked)
-                });
-            let transiently_blocked = peer.peer_auth.as_deref().is_some_and(|auth| {
-                snapshot.is_some()
-                    && status_for(auth) != Some(epix_chain::XidIdentityStatus::Active)
-            });
-            let explicitly_revoked = peer.peer_auth.as_deref().is_some_and(|auth| {
-                status_for(auth) == Some(epix_chain::XidIdentityStatus::Revoked)
-            });
-            if explicitly_revoked {
-                newly_revoked.push(RevokedDevice {
-                    xid: name.clone(),
-                    auth_address: peer.peer_auth.clone().unwrap_or_default(),
-                    peer_ik: peer.peer_ik.clone(),
-                });
-            }
-            if unbound_legacy_leg {
-                // A legacy leg without authenticated v3 ownership cannot be
-                // distinguished from the revoked sibling in a mixed snapshot.
-                // Close that exact old IK durably. A verified v3 re-handshake
-                // with a fresh IK remains available.
-                newly_revoked.push(RevokedDevice {
-                    xid: name.clone(),
-                    auth_address: String::new(),
-                    peer_ik: peer.peer_ik.clone(),
-                });
-            }
-            if unbound_legacy_leg
-                || transiently_blocked
-                || db
-                    .is_device_revoked(&name, peer.peer_auth.as_deref(), &peer.peer_ik)
-                    .map_err(|e| e.to_string())?
-            {
-                out.revoked_devices
-                    .insert((name.clone(), peer.peer_ik.clone()));
-            }
-        }
-
-        let mut retained = Vec::new();
-        for bundle in refine_device_bundles(devs, &[]) {
-            let Some(auth) = bundle.get("auth").and_then(Value::as_str) else {
-                continue;
-            };
-            let Some(peer_ik) = engine.sender_ik(&bundle).map(hex::encode) else {
-                continue;
-            };
-            let explicitly_revoked =
-                status_for(auth) == Some(epix_chain::XidIdentityStatus::Revoked);
-            if explicitly_revoked {
-                newly_revoked.push(RevokedDevice {
-                    xid: name.clone(),
-                    auth_address: auth.to_string(),
-                    peer_ik: peer_ik.clone(),
-                });
-                out.revoked_devices.insert((name.clone(), peer_ik.clone()));
-            }
-            let snapshot_allows = snapshot.is_none()
-                || status_for(auth) == Some(epix_chain::XidIdentityStatus::Active);
-            if snapshot_allows
-                && !out
-                    .revoked_devices
-                    .contains(&(name.clone(), peer_ik.clone()))
-                && !db
-                    .is_device_revoked(&name, Some(auth), &peer_ik)
-                    .map_err(|e| e.to_string())?
-            {
-                retained.push(bundle);
-            }
-        }
-        if !retained.is_empty() {
-            out.active.insert(name, retained);
-        }
+async fn classify_published_name(
+    sources: &PublishedBundleSources<'_>,
+    name: String,
+    devs: Vec<Value>,
+    out: &mut PublishedBundles,
+    newly_revoked: &mut Vec<RevokedDevice>,
+) -> Result<(), String> {
+    let snapshot = published_identity_snapshot(sources.state, &name).await;
+    record_snapshot_revocations(&name, snapshot.as_ref(), out, newly_revoked);
+    classify_session_peers(
+        sources.db,
+        sources.sessions_by_name,
+        &name,
+        snapshot.as_ref(),
+        out,
+        newly_revoked,
+    )?;
+    let retained = retain_active_bundles(
+        sources.engine,
+        sources.db,
+        &name,
+        devs,
+        snapshot.as_ref(),
+        out,
+        newly_revoked,
+    )?;
+    if !retained.is_empty() {
+        out.active.insert(name, retained);
     }
-    db.remember_revoked_devices(&newly_revoked, now_ms())
-        .map_err(|e| e.to_string())?;
-    Ok(out)
+    Ok(())
 }
 
 /// Filter one name's raw device bundles down to the usable, deduplicated set:
@@ -948,8 +1061,128 @@ impl Plugin for ChannelPlugin {
     }
 
     fn start(&self, state: &Arc<AppState>) {
-        let state = state.clone();
-        tokio::spawn(async move {
+        tokio::spawn(run_channel_plugin(state.clone()));
+    }
+}
+
+async fn initialize_local_channel_identity(
+    state: &Arc<AppState>,
+    xite: &str,
+    engine: &dyn Engine,
+    db: &ChannelDb,
+) -> Option<i64> {
+    let (auth, xid, bundle) = match local_channel_bundle(state, xite, engine).await {
+        Ok(bundle) => bundle,
+        Err(error) => {
+            state
+                .log(
+                    "ERROR",
+                    &format!("could not build authenticated channel bundle: {error}"),
+                )
+                .await;
+            return None;
+        }
+    };
+    match db.upsert_identity(&xid, &auth, 0, Some(&bundle.to_string())) {
+        Ok(identity_id) => Some(identity_id),
+        Err(error) => {
+            state
+                .log(
+                    "ERROR",
+                    &format!("could not persist channel identity: {error}"),
+                )
+                .await;
+            None
+        }
+    }
+}
+
+async fn install_channel_rln(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+    xite: &str,
+) {
+    let ledger = state
+        .data_root_path()
+        .map(|root| root.join("private").join("rln_usage.json"));
+    let rln = crate::rln::RlnAdmission::new(ledger);
+    if let Err(error) = reconcile_rln_usage(ms, &rln) {
+        state
+            .log(
+                "ERROR",
+                &format!("could not reconcile RLN outbox reservations: {error}"),
+            )
+            .await;
+    } else {
+        ms.rln_usage_ready
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    state.set_pool_admission(rln.clone()).await;
+    rln.refresh(state, xite).await;
+    state.install_capability(crate::rln::RLN_CAP, rln.clone());
+    tokio::spawn(monitor_rln_usage_reconciliation(
+        state.clone(),
+        ms.clone(),
+        rln,
+    ));
+}
+
+fn spawn_channel_outbox_worker(state: Arc<AppState>, ms: Arc<ChannelState>) {
+    tokio::spawn(async move {
+        loop {
+            if let Err(error) = deliver_due_outbox(&state, &ms).await {
+                state
+                    .log(
+                        "WARNING",
+                        &format!("channel outbox delivery failed: {error}"),
+                    )
+                    .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+    });
+}
+
+fn spawn_channel_backfill(state: Arc<AppState>, xite: String, weeks: u64) {
+    tokio::spawn(async move {
+        state.backfill_pool_shards(&xite, weeks).await;
+    });
+}
+
+fn spawn_channel_sweep(state: Arc<AppState>, xite: String) {
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(SWEEP_INTERVAL).await;
+            if !state.config_bool("channel_enabled", false).await {
+                continue;
+            }
+            state.resync_pool_shards_for(&xite).await;
+        }
+    });
+}
+
+async fn run_channel_indexer(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+    xite: &str,
+    mut rx: tokio::sync::broadcast::Receiver<epix_ui::pool::PoolDelta>,
+) {
+    loop {
+        match rx.recv().await {
+            Ok(delta) if delta.address == xite => {
+                index_records(state, ms, delta.records.as_ref().clone()).await;
+            }
+            Ok(_) => {}
+            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                let all = state.pool_all_records(xite).await;
+                index_records(state, ms, all).await;
+            }
+            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
+async fn run_channel_plugin(state: Arc<AppState>) {
             if !state.config_bool("channel_enabled", false).await {
                 return;
             }
@@ -968,30 +1201,15 @@ impl Plugin for ChannelPlugin {
                 return;
             };
 
-            // Ensure the node's channel identity row exists so inbound records can
-            // be trial-matched, and stash its published bundle.
-            let local_identity_id = match local_channel_bundle(&state, &xite, engine.as_ref()).await
-            {
-                Ok((auth, xid, bundle)) => {
-                    match db.upsert_identity(&xid, &auth, 0, Some(&bundle.to_string())) {
-                        Ok(identity_id) => identity_id,
-                        Err(e) => {
-                            state
-                                .log("ERROR", &format!("could not persist channel identity: {e}"))
-                                .await;
-                            return;
-            }
-                    }
-                }
-                Err(e) => {
-                    state
-                        .log(
-                            "ERROR",
-                            &format!("could not build authenticated channel bundle: {e}"),
-                        )
-                        .await;
-                    return;
-                }
+            let Some(local_identity_id) = initialize_local_channel_identity(
+                &state,
+                &xite,
+                engine.as_ref(),
+                &db,
+            )
+            .await
+            else {
+                return;
             };
 
             let ms = Arc::new(ChannelState {
@@ -1012,48 +1230,12 @@ impl Plugin for ChannelPlugin {
                 tokio::spawn(retry_index_records(s, m));
             }
 
-            // RLN anonymous rate-limiting: install the owner-signed admission hook
-            // and load this xite's member roster. Inert unless the pool rule sets
-            // rln_required and a roster is published, so it is safe to always wire.
-            {
-                let ledger = state.data_root_path().map(|r| r.join("private").join("rln_usage.json"));
-                let rln = crate::rln::RlnAdmission::new(ledger);
-                if let Err(error) = reconcile_rln_usage(&ms, &rln) {
-                    state
-                        .log(
-                            "ERROR",
-                            &format!("could not reconcile RLN outbox reservations: {error}"),
-                        )
-                        .await;
-                } else {
-                    ms.rln_usage_ready
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
-                state.set_pool_admission(rln.clone()).await;
-                rln.refresh(&state, &xite).await;
-                // Also stash it so the send path can prove with the same gates.
-                state.install_capability(crate::rln::RLN_CAP, rln.clone());
-                let retry_state = state.clone();
-                let retry_ms = ms.clone();
-                tokio::spawn(monitor_rln_usage_reconciliation(retry_state, retry_ms, rln));
-            }
+            install_channel_rln(&state, &ms, &xite).await;
 
             // Reconcile every provisional RLN range before any durable record
             // can publish or be acknowledged. The exact record and ratchet
             // advance already committed together, so retry remains idempotent.
-            {
-                let s = state.clone();
-                let m = ms.clone();
-                tokio::spawn(async move {
-                    loop {
-                        if let Err(e) = deliver_due_outbox(&s, &m).await {
-                            s.log("WARNING", &format!("channel outbox delivery failed: {e}"))
-                                .await;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    }
-                });
-            }
+            spawn_channel_outbox_worker(state.clone(), ms.clone());
 
             let snippets = state.config_bool("channel_feed_snippets", false).await;
             state
@@ -1066,7 +1248,7 @@ impl Plugin for ChannelPlugin {
 
             // Subscribe to the pool-delta bus BEFORE kicking off backfill, so no
             // backfilled record's delta is missed.
-            let mut rx = state.subscribe_pool_deltas();
+            let rx = state.subscribe_pool_deltas();
 
             // A shard can have committed durably just before a crash, after its
             // delta was emitted but before the private index consumed it. No new
@@ -1081,46 +1263,11 @@ impl Plugin for ChannelPlugin {
                 .await
                 .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
                 .unwrap_or(4);
-            {
-                let s = state.clone();
-                let x = xite.clone();
-                tokio::spawn(async move {
-                    s.backfill_pool_shards(&x, weeks).await;
-                });
-            }
+            spawn_channel_backfill(state.clone(), xite.clone(), weeks);
 
             // Periodic anti-entropy sweep of the current-week shards.
-            {
-                let s = state.clone();
-                let x = xite.clone();
-                tokio::spawn(async move {
-                    loop {
-                        tokio::time::sleep(SWEEP_INTERVAL).await;
-                        if !s.config_bool("channel_enabled", false).await {
-                            continue;
-                        }
-                        s.resync_pool_shards_for(&x).await;
-                    }
-                });
-            }
-
-            // The indexer loop.
-            loop {
-                match rx.recv().await {
-                    Ok(delta) if delta.address == xite => {
-                        index_records(&state, &ms, delta.records.as_ref().clone()).await;
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        // Missed some deltas under load: rescan from disk.
-                        let all = state.pool_all_records(&xite).await;
-                        index_records(&state, &ms, all).await;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        });
-    }
+            spawn_channel_sweep(state.clone(), xite.clone());
+            run_channel_indexer(&state, &ms, &xite, rx).await;
 }
 
 // ===========================================================================
@@ -1410,49 +1557,41 @@ async fn send_jitter_max_secs(state: &Arc<AppState>) -> u64 {
         .unwrap_or(0)
 }
 
-/// Rebuild the transport representation of one immutable queued ciphertext for
-/// the current pool rule. This may move the route, increase PoW after a capacity
-/// rejection, or replace an expired RLN proof while reusing the exact durable
-/// unit allocation. It never reseals the pairwise payload or advances a ratchet.
-async fn recover_outbound_representation(
+async fn validate_legacy_outbound(
     state: &Arc<AppState>,
     ms: &ChannelState,
     pending: &PendingOutbound,
-) -> Result<PendingOutbound, String> {
-    let rule = state
-        .pool_rules_for(&ms.xite)
-        .await
-        .into_iter()
-        .next()
-        .ok_or("this xite has no pool configured")?;
-    let mut record = pending.record.clone();
-    let original_work = epix_content::pool::record_work_bits(&record);
-    let mut recovery = pending.recovery.clone();
-    if recovery.author_private_key.is_empty() {
-        let shard_path = state.pool_shard_for_record(&ms.xite, &record).await?;
-        let epoch = record
-            .get("epoch")
-            .and_then(Value::as_i64)
-            .ok_or("queued channel record has no epoch")?;
-        epix_content::pool::verify_pool_record(
-            &record,
-            &rule,
-            epix_content::pool::week_of(epoch),
-            now_ms(),
+    record: &Value,
+    rule: &epix_content::pool::PoolRule,
+) -> Result<(), String> {
+    let shard_path = state.pool_shard_for_record(&ms.xite, record).await?;
+    let epoch = record
+        .get("epoch")
+        .and_then(Value::as_i64)
+        .ok_or("queued channel record has no epoch")?;
+    epix_content::pool::verify_pool_record(
+        record,
+        rule,
+        epix_content::pool::week_of(epoch),
+        now_ms(),
+    )
+    .map_err(|error| {
+        format!(
+            "legacy queued record needs unavailable recovery material under the current pool: {error:?}"
         )
-        .map_err(|error| {
-            format!(
-                "legacy queued record needs unavailable recovery material under the current pool: {error:?}"
-            )
-        })?;
-        if shard_path != pending.shard_path {
-            return Err(
-                "legacy queued record needs unavailable recovery material after a route change"
-                    .into(),
-            );
+    })?;
+    if shard_path != pending.shard_path {
+        return Err(
+            "legacy queued record needs unavailable recovery material after a route change".into(),
+        );
     }
-        return Ok(pending.clone());
-    }
+    Ok(())
+}
+
+fn recovered_record_material(
+    record: &Value,
+    recovery: &epix_envelope::OutboundRecovery,
+) -> Result<(i64, Vec<u8>), String> {
     let author = record
         .get("author")
         .and_then(Value::as_str)
@@ -1473,48 +1612,110 @@ async fn recover_outbound_representation(
     let ct = base64::engine::general_purpose::STANDARD
         .decode(ct_b64)
         .map_err(|_| "queued channel record has invalid ciphertext".to_string())?;
-
-    // Roster refresh and proof replacement share the same per-pool transaction
-    // as multi-chunk reservation. Release it before local admission, which takes
-    // the same permit. The gate retains a short grace root for a refresh in that
-    // narrow handoff window, and the next retry re-proves again if necessary.
-    let mut representation_changed = false;
-    if rule.rln_required {
-        let admission = state
-            .capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP)
-            .ok_or("this pool requires RLN but no admission gate is loaded")?;
-        let auth = state.user_auth_address(&ms.xite).await?;
-        let seed = state.derive_consumer_seed("rln", &auth).await;
-        let identity = epix_rln::RlnIdentity::from_seed(&seed);
-        let _transaction = admission.send_transaction(&ms.xite).await;
-        let current_root = admission.current_root(&ms.xite)?;
-        if let Some(reservation) = recovery.rln.as_mut() {
-            if reservation.root != Some(current_root) || record.get("rln").is_none() {
-                let proof =
-                    admission.reprove_reserved(&ms.xite, &identity, epoch, &ct, reservation)?;
-                record["rln"] = json!(base64::engine::general_purpose::STANDARD.encode(proof));
-                reservation.root = Some(current_root);
-                representation_changed = true;
-            }
-        } else {
-            // A delayed PoW-only row can outlive a descriptor change that turns
-            // RLN on. Reserve by the immutable ciphertext id. A crash before the
-            // SQLite representation update is safe because reserve_proof is
-            // named and idempotently returns this same durable range on retry.
-            let reserved = admission.reserve_proof(&ms.xite, &identity, epoch, &ct)?;
-            record["rln"] = json!(base64::engine::general_purpose::STANDARD.encode(reserved.proof));
-            recovery.rln = Some(reserved.reservation);
-            representation_changed = true;
-        }
-    } else if record
-        .as_object_mut()
-        .and_then(|object| object.remove("rln"))
-        .is_some()
-    {
-        // Retain the private reservation in case policy later returns to the old
-        // rail. Only the public proof is invalid under a PoW-only descriptor.
-        representation_changed = true;
+    Ok((epoch, ct))
 }
+
+async fn refresh_recovered_rln(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    rule: &epix_content::pool::PoolRule,
+    record: &mut Value,
+    recovery: &mut epix_envelope::OutboundRecovery,
+    epoch: i64,
+    ct: &[u8],
+) -> Result<bool, String> {
+    if !rule.rln_required {
+        return Ok(record
+            .as_object_mut()
+            .and_then(|object| object.remove("rln"))
+            .is_some());
+    }
+    let admission = state
+        .capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP)
+        .ok_or("this pool requires RLN but no admission gate is loaded")?;
+    let auth = state.user_auth_address(&ms.xite).await?;
+    let seed = state.derive_consumer_seed("rln", &auth).await;
+    let identity = epix_rln::RlnIdentity::from_seed(&seed);
+    let _transaction = admission.send_transaction(&ms.xite).await;
+    let current_root = admission.current_root(&ms.xite)?;
+    if let Some(reservation) = recovery.rln.as_mut() {
+        let proof_is_current = reservation.root == Some(current_root) && record.get("rln").is_some();
+        if proof_is_current {
+            return Ok(false);
+        }
+        let proof = admission.reprove_reserved(&ms.xite, &identity, epoch, ct, reservation)?;
+        record["rln"] = json!(base64::engine::general_purpose::STANDARD.encode(proof));
+        reservation.root = Some(current_root);
+        return Ok(true);
+    }
+    let reserved = admission.reserve_proof(&ms.xite, &identity, epoch, ct)?;
+    record["rln"] = json!(base64::engine::general_purpose::STANDARD.encode(reserved.proof));
+    recovery.rln = Some(reserved.reservation);
+    Ok(true)
+}
+
+async fn solve_recovered_record(
+    mut record: Value,
+    target_work: u32,
+    signing_key: String,
+) -> Result<Value, String> {
+    tokio::task::spawn_blocking(move || -> Result<Value, String> {
+        epix_content::pool::solve_pow(&mut record, target_work);
+        record["sign"] = json!(epix_crypt::sign(
+            &epix_content::record_signed_data(&record),
+            &signing_key,
+        )?);
+        Ok(record)
+    })
+    .await
+    .map_err(|error| format!("queued channel PoW task failed: {error}"))?
+}
+
+fn persist_recovered_representation(
+    ms: &ChannelState,
+    pending: &PendingOutbound,
+    record: &Value,
+    shard_path: &str,
+    recovery: &epix_envelope::OutboundRecovery,
+    representation_changed: bool,
+) -> Result<(), String> {
+    if representation_changed
+        || record != &pending.record
+        || shard_path != pending.shard_path
+        || pending.last_error.is_some()
+    {
+        ms.db
+            .replace_outbound_record(pending.outbox_id, record, shard_path, recovery)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(())
+}
+
+/// Rebuild the transport representation of one immutable queued ciphertext for
+/// the current pool rule. This may move the route, increase PoW after a capacity
+/// rejection, or replace an expired RLN proof while reusing the exact durable
+/// unit allocation. It never reseals the pairwise payload or advances a ratchet.
+async fn recover_outbound_representation(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    pending: &PendingOutbound,
+) -> Result<PendingOutbound, String> {
+    let rule = state
+        .pool_rules_for(&ms.xite)
+        .await
+        .into_iter()
+        .next()
+        .ok_or("this xite has no pool configured")?;
+    let mut record = pending.record.clone();
+    let original_work = epix_content::pool::record_work_bits(&record);
+    let mut recovery = pending.recovery.clone();
+    if recovery.author_private_key.is_empty() {
+        validate_legacy_outbound(state, ms, pending, &record, &rule).await?;
+        return Ok(pending.clone());
+    }
+    let (epoch, ct) = recovered_record_material(&record, &recovery)?;
+    let representation_changed =
+        refresh_recovered_rln(state, ms, &rule, &mut record, &mut recovery, epoch, &ct).await?;
 
     let capacity_retry = pending
         .last_error
@@ -1524,17 +1725,7 @@ async fn recover_outbound_representation(
     let target_work = rule
         .pow_bits
         .max(original_work.saturating_add(u32::from(strengthen)));
-    let signing_key = recovery.author_private_key.clone();
-    record = tokio::task::spawn_blocking(move || -> Result<Value, String> {
-        epix_content::pool::solve_pow(&mut record, target_work);
-        record["sign"] = json!(epix_crypt::sign(
-            &epix_content::record_signed_data(&record),
-            &signing_key,
-        )?);
-        Ok(record)
-    })
-    .await
-    .map_err(|error| format!("queued channel PoW task failed: {error}"))??;
+    record = solve_recovered_record(record, target_work, recovery.author_private_key.clone()).await?;
 
     epix_content::pool::verify_pool_record(
         &record,
@@ -1546,15 +1737,14 @@ async fn recover_outbound_representation(
         format!("queued channel record is incompatible with the current pool: {error:?}")
     })?;
     let shard_path = state.pool_shard_for_record(&ms.xite, &record).await?;
-    if representation_changed
-        || record != pending.record
-        || shard_path != pending.shard_path
-        || pending.last_error.is_some()
-    {
-        ms.db
-            .replace_outbound_record(pending.outbox_id, &record, &shard_path, &recovery)
-            .map_err(|error| error.to_string())?;
-    }
+    persist_recovered_representation(
+        ms,
+        pending,
+        &record,
+        &shard_path,
+        &recovery,
+        representation_changed,
+    )?;
 
     let mut recovered = pending.clone();
     recovered.record = record;
@@ -1658,6 +1848,62 @@ async fn deliver_due_outbox(state: &Arc<AppState>, ms: &ChannelState) -> Result<
     first_error.map_or(Ok(()), Err)
 }
 
+async fn pending_outbound_through_ready(
+    ms: &ChannelState,
+    outbox_id: i64,
+) -> Result<Vec<PendingOutbound>, String> {
+    let _staging_guard = ms.outbox_lock.lock().await;
+    if !ms
+        .rln_usage_ready
+        .load(std::sync::atomic::Ordering::Acquire)
+    {
+        return Err("RLN usage reconciliation is incomplete; channel outbox remains queued".into());
+    }
+    ms.db
+        .pending_outbound_through(outbox_id)
+        .map_err(|error| error.to_string())
+}
+
+async fn deliver_outbound_rows(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    rows: Vec<PendingOutbound>,
+    first_error: &mut Option<String>,
+) -> Result<(), String> {
+    for row in rows {
+        if let Err(error) = append_outbound(state, ms, &row).await {
+            let retry_at = now_ms() + OUTBOX_RETRY_INTERVAL.as_millis() as i64;
+            ms.db
+                .reschedule_outbound_error(row.outbox_id, retry_at, Some(&error))
+                .map_err(|db| format!("{error}; could not reschedule outbox row: {db}"))?;
+            if first_error.is_none() {
+                *first_error = Some(error);
+            }
+        }
+    }
+    Ok(())
+}
+
+fn first_delivery_result(
+    ms: &ChannelState,
+    pending: &PendingOutbound,
+    first_error: Option<String>,
+) -> Result<(), String> {
+    if ms
+        .db
+        .outbound_pending(pending.outbox_id)
+        .map_err(|error| error.to_string())?
+    {
+        return Err(first_error.unwrap_or_else(|| {
+            format!(
+                "channel send is queued behind an older dependency or future deadline for outbox row {}",
+                pending.outbox_id
+            )
+        }));
+    }
+    Ok(())
+}
+
 /// Preserve the historical no-origin-jitter behavior by surfacing the first
 /// append error to the command caller. The row remains durable on failure.
 async fn deliver_first_now(
@@ -1670,49 +1916,13 @@ async fn deliver_first_now(
     })?;
     let mut first_error = None;
     loop {
-        let rows = {
-            let _staging_guard = ms.outbox_lock.lock().await;
-            if !ms
-                .rln_usage_ready
-                .load(std::sync::atomic::Ordering::Acquire)
-            {
-                return Err(
-                    "RLN usage reconciliation is incomplete; channel outbox remains queued".into(),
-                );
-            }
-            ms.db
-                .pending_outbound_through(pending.outbox_id)
-                .map_err(|e| e.to_string())?
-        };
+        let rows = pending_outbound_through_ready(ms, pending.outbox_id).await?;
         if rows.is_empty() {
             break;
         }
-        for row in rows {
-            if let Err(e) = append_outbound(state, ms, &row).await {
-                let retry_at = now_ms() + OUTBOX_RETRY_INTERVAL.as_millis() as i64;
-                ms.db
-                    .reschedule_outbound_error(row.outbox_id, retry_at, Some(&e))
-                    .map_err(|db| format!("{e}; could not reschedule outbox row: {db}"))?;
-                if first_error.is_none() {
-                    first_error = Some(e);
-                }
-            }
-        }
+        deliver_outbound_rows(state, ms, rows, &mut first_error).await?;
     }
-    if ms
-        .db
-        .outbound_pending(pending.outbox_id)
-        .map_err(|error| error.to_string())?
-    {
-        Err(first_error.unwrap_or_else(|| {
-            format!(
-                "channel send is queued behind an older dependency or future deadline for outbox row {}",
-                pending.outbox_id
-            )
-        }))
-    } else {
-        Ok(())
-    }
+    first_delivery_result(ms, pending, first_error)
 }
 
 /// A send is already accepted once its batch committed to SQLite. Transport
@@ -1737,6 +1947,468 @@ async fn accepted_delivery_status(
     }
 }
 
+struct ChannelSendRequest {
+    recipients: Vec<String>,
+    subject: String,
+    body: String,
+    conv_hint: Option<[u8; 16]>,
+}
+
+struct LocalChannelSender {
+    identity_id: i64,
+    secret: IdentitySecret,
+    xid: String,
+}
+
+#[derive(Clone)]
+struct ChannelRlnSendContext {
+    admission: Arc<crate::rln::RlnAdmission>,
+    seed: Vec<u8>,
+    address: String,
+}
+
+#[derive(Clone)]
+struct ChannelSealContext {
+    db: Arc<ChannelDb>,
+    engine: Arc<dyn Engine>,
+    identity_id: i64,
+    secret: IdentitySecret,
+    sender_xid: String,
+    members: Vec<String>,
+    conv: [u8; 16],
+    subject: String,
+    body: String,
+    rule: epix_content::pool::PoolRule,
+    chunk_count: usize,
+    rln: Option<ChannelRlnSendContext>,
+    rln_batch: Option<crate::rln::RlnReservationBatch>,
+    rln_preflight_done: Arc<std::sync::atomic::AtomicBool>,
+}
+
+struct ChannelChunkSeal {
+    context: ChannelSealContext,
+    destinations: Vec<epix_envelope::Dest>,
+    record_own: bool,
+    now_ms: i64,
+    scheduled_ms: i64,
+}
+
+fn parse_channel_send_request(p: &Value) -> Result<ChannelSendRequest, String> {
+    let values = p
+        .as_array()
+        .ok_or("channelSend: [recipients, subject, body, conv_id?]")?;
+    let recipients = values
+        .first()
+        .and_then(Value::as_array)
+        .map(|items| normalized_recipients(items))
+        .unwrap_or_default();
+    if recipients.is_empty() {
+        return Err("channelSend: at least one recipient required".into());
+    }
+    let conv_hint = values
+        .get(3)
+        .and_then(Value::as_str)
+        .and_then(|value| hex::decode(value).ok())
+        .and_then(|bytes| bytes.try_into().ok());
+    Ok(ChannelSendRequest {
+        recipients,
+        subject: values.get(1).and_then(Value::as_str).unwrap_or("").to_string(),
+        body: values.get(2).and_then(Value::as_str).unwrap_or("").to_string(),
+        conv_hint,
+    })
+}
+
+async fn local_sender_snapshot(
+    state: &Arc<AppState>,
+    xid: &str,
+) -> Option<epix_chain::XidIdentitySnapshot> {
+    match state.xid_identity_snapshot(xid).await {
+        Ok(Some(snapshot)) if norm_xid(&snapshot.canonical_name) == norm_xid(xid) => Some(snapshot),
+        Ok(Some(_)) | Ok(None) => None,
+        Err(error) => {
+            state
+                .log(
+                    "WARN",
+                    &format!("local xID identity snapshot unavailable: {error}"),
+                )
+                .await;
+            None
+        }
+    }
+}
+
+async fn validated_local_sender(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+) -> Result<LocalChannelSender, String> {
+    let (identity_id, secret, xid, auth) = channel_identity(state, ms).await?;
+    let snapshot = local_sender_snapshot(state, &xid).await;
+    let active_addrs: Vec<String> = snapshot
+        .as_ref()
+        .map(|value| {
+            value
+                .identities
+                .iter()
+                .filter(|identity| identity.status == epix_chain::XidIdentityStatus::Active)
+                .map(|identity| identity.auth_address.clone())
+                .collect()
+        })
+        .unwrap_or_default();
+    let name_active = snapshot.as_ref().map(|_| !active_addrs.is_empty());
+    if snapshot.as_ref().is_some_and(|value| {
+        value.status_for(&auth) == Some(epix_chain::XidIdentityStatus::Revoked)
+    }) {
+        ms.db
+            .remember_revoked_device(&norm_xid(&xid), Some(&auth), "", now_ms())
+            .map_err(|error| error.to_string())?;
+    }
+    let tombstoned = ms
+        .db
+        .is_device_revoked(&norm_xid(&xid), Some(&auth), "")
+        .map_err(|error| error.to_string())?;
+    ensure_local_sender_active(&xid, &auth, tombstoned, name_active, &active_addrs)?;
+    Ok(LocalChannelSender {
+        identity_id,
+        secret,
+        xid,
+    })
+}
+
+fn channel_conversation_members(recipients: &[String], sender_xid: &str) -> Vec<String> {
+    let mut members = recipients.to_vec();
+    members.push(norm_xid(sender_xid));
+    members.sort();
+    members.dedup();
+    members
+}
+
+async fn channel_rln_send_context(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    rule: &epix_content::pool::PoolRule,
+) -> Result<Option<ChannelRlnSendContext>, String> {
+    if !rule.rln_required {
+        return Ok(None);
+    }
+    let admission = state.capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP);
+    let auth = state.user_auth_address(&ms.xite).await.ok();
+    let (Some(admission), Some(auth)) = (admission, auth) else {
+        return Err("this pool requires RLN but no membership is available".into());
+    };
+    let seed = state.derive_consumer_seed("rln", &auth).await.to_vec();
+    Ok(Some(ChannelRlnSendContext {
+        admission,
+        seed,
+        address: ms.xite.clone(),
+    }))
+}
+
+fn seal_channel_chunk_without_rln(
+    input: &ChannelChunkSeal,
+) -> Result<epix_envelope::PreparedSend, String> {
+    let context = &input.context;
+    epix_envelope::prepare_multi_scheduled(
+        context.db.as_ref(),
+        context.engine.as_ref(),
+        context.identity_id,
+        &context.secret,
+        &context.sender_xid,
+        &context.members,
+        &input.destinations,
+        context.conv,
+        &context.subject,
+        &context.body,
+        input.now_ms,
+        input.scheduled_ms,
+        &context.rule,
+        input.record_own,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn seal_channel_chunk_with_rln(
+    input: &ChannelChunkSeal,
+    rln: &ChannelRlnSendContext,
+    batch: &crate::rln::RlnReservationBatch,
+) -> Result<epix_envelope::PreparedSend, String> {
+    let context = &input.context;
+    let identity = epix_rln::RlnIdentity::from_seed(&rln.seed);
+    let prover = |ct: &[u8], epoch: i64| {
+        if !context
+            .rln_preflight_done
+            .swap(true, std::sync::atomic::Ordering::AcqRel)
+        {
+            let smallest = context.rule.pad_buckets.first().copied().unwrap_or(1);
+            let weight = epix_rln::bucket_weight(ct.len(), smallest);
+            let total = weight.saturating_mul(context.chunk_count as u32);
+            let (used, limit) = rln
+                .admission
+                .usage(&rln.address, epoch.max(0) as u64)
+                .ok_or("no RLN roster loaded for this pool")?;
+            if used.saturating_add(total) > limit {
+                return Err(format!(
+                    "epoch allowance exhausted: send needs {total} units, {used}/{limit} already spent"
+                ));
+            }
+        }
+        rln.admission
+            .reserve_proof_batched(batch, &rln.address, &identity, epoch, ct)
+            .map(|reserved| epix_envelope::RlnProofMaterial {
+                proof: reserved.proof,
+                reservation: Some(reserved.reservation),
+            })
+    };
+    epix_envelope::prepare_multi_with_rln_reserved_scheduled(
+        context.db.as_ref(),
+        context.engine.as_ref(),
+        context.identity_id,
+        &context.secret,
+        &context.sender_xid,
+        &context.members,
+        &input.destinations,
+        context.conv,
+        &context.subject,
+        &context.body,
+        input.now_ms,
+        input.scheduled_ms,
+        &context.rule,
+        input.record_own,
+        &prover,
+    )
+    .map_err(|error| error.to_string())
+}
+
+fn seal_channel_chunk_blocking(
+    input: ChannelChunkSeal,
+) -> Result<epix_envelope::PreparedSend, String> {
+    if let Some(rln) = &input.context.rln {
+        let batch = input
+            .context
+            .rln_batch
+            .as_ref()
+            .ok_or("missing RLN reservation batch")?;
+        seal_channel_chunk_with_rln(&input, rln, batch)
+    } else {
+        seal_channel_chunk_without_rln(&input)
+    }
+}
+
+async fn prepare_channel_chunk(
+    context: ChannelSealContext,
+    chunk: &[Value],
+    record_own: bool,
+    scheduled_ms: i64,
+) -> Result<epix_envelope::PreparedSend, String> {
+    let destinations = chunk
+        .iter()
+        .map(|bundle| epix_envelope::Dest {
+            bundle: bundle.clone(),
+        })
+        .collect();
+    let input = ChannelChunkSeal {
+        context,
+        destinations,
+        record_own,
+        now_ms: now_ms(),
+        scheduled_ms,
+    };
+    tokio::task::spawn_blocking(move || seal_channel_chunk_blocking(input))
+        .await
+        .map_err(|error| format!("channelSend seal task failed: {error}"))?
+}
+
+fn validate_prepared_record_sizes(
+    prepared: &[epix_envelope::PreparedSend],
+    max_shard_bytes: usize,
+) -> Result<(), String> {
+    for prepared_record in prepared {
+        let singleton = epix_content::pool::make_pool_container(vec![prepared_record
+            .commit
+            .record
+            .clone()]);
+        let encoded = serde_json::to_vec(&singleton)
+            .map_err(|error| format!("could not size channel pool record: {error}"))?;
+        if encoded.len() > max_shard_bytes {
+            return Err(format!(
+                "channel record cannot fit the pool shard limit ({} > {})",
+                encoded.len(),
+                max_shard_bytes
+            ));
+        }
+    }
+    Ok(())
+}
+
+async fn finalize_rln_send_batch(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    batch: Option<&crate::rln::RlnReservationBatch>,
+) {
+    let Some(batch) = batch else { return };
+    if let Err(error) = batch.commit() {
+        ms.rln_usage_ready
+            .store(false, std::sync::atomic::Ordering::Release);
+        state
+            .log(
+                "ERROR",
+                &format!("could not finalize RLN usage reservation: {error}"),
+            )
+            .await;
+    }
+}
+
+async fn stage_prepared_outbound(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    rule: &epix_content::pool::PoolRule,
+    prepared: Vec<epix_envelope::PreparedSend>,
+    rln_batch: Option<&crate::rln::RlnReservationBatch>,
+) -> Result<Vec<PendingOutbound>, String> {
+    validate_prepared_record_sizes(&prepared, rule.max_shard_bytes)?;
+    let commits: Vec<_> = prepared.iter().map(|value| value.commit.clone()).collect();
+    let staged = ms
+        .db
+        .commit_outbound_batch(&commits)
+        .map_err(|error| error.to_string())?;
+    finalize_rln_send_batch(state, ms, rln_batch).await;
+    Ok(prepared
+        .into_iter()
+        .zip(staged)
+        .map(|(prepared, (outbox_id, _msg_id))| PendingOutbound {
+            outbox_id,
+            record: prepared.commit.record,
+            shard_path: prepared.commit.shard_path,
+            created_ms: prepared.commit.created_ms,
+            next_attempt_ms: prepared.commit.next_attempt_ms,
+            recovery: prepared.commit.recovery,
+            last_error: None,
+        })
+        .collect())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn prepare_outbound_records(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    sender: LocalChannelSender,
+    request: &ChannelSendRequest,
+    members: Vec<String>,
+    destinations: &[Value],
+    conv: [u8; 16],
+    rule: epix_content::pool::PoolRule,
+    rln: Option<ChannelRlnSendContext>,
+    burst_jitter: u64,
+    mut next_attempt_ms: i64,
+) -> Result<Vec<PendingOutbound>, String> {
+    let _send_guard = ms.send_lock.lock().await;
+    let rln_batch = match &rln {
+        Some(context) => Some(context.admission.reservation_batch(&ms.xite).await),
+        None => None,
+    };
+    let context = ChannelSealContext {
+        db: ms.db.clone(),
+        engine: ms.engine.clone(),
+        identity_id: sender.identity_id,
+        secret: sender.secret,
+        sender_xid: sender.xid,
+        members,
+        conv,
+        subject: request.subject.clone(),
+        body: request.body.clone(),
+        rule: rule.clone(),
+        chunk_count: destinations.len().div_ceil(epix_envelope::SLOTS),
+        rln,
+        rln_batch: rln_batch.clone(),
+        rln_preflight_done: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    let mut prepared = Vec::new();
+    for (chunk_index, chunk) in destinations.chunks(epix_envelope::SLOTS).enumerate() {
+        if chunk_index > 0 {
+            next_attempt_ms += jitter_gap_secs(burst_jitter).saturating_mul(1000) as i64;
+        }
+        prepared.push(
+            prepare_channel_chunk(
+                context.clone(),
+                chunk,
+                chunk_index == 0,
+                next_attempt_ms,
+            )
+            .await?,
+        );
+    }
+    stage_prepared_outbound(state, ms, &rule, prepared, rln_batch.as_ref()).await
+}
+
+async fn immediate_channel_delivery(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    records: &[PendingOutbound],
+    send_jitter: u64,
+) -> &'static str {
+    if send_jitter != 0 {
+        return "queued";
+    }
+    match records.last() {
+        Some(last) => accepted_delivery_status(state, ms, last).await,
+        None => "queued",
+    }
+}
+
+async fn execute_channel_send(s: &WsSession, p: &Value) -> Result<Value, String> {
+    let ms = channel_state(s)?;
+    let request = parse_channel_send_request(p)?;
+    let sender = validated_local_sender(&s.state, &ms).await?;
+    let conv = request.conv_hint.unwrap_or_else(epix_envelope::new_conv_id);
+    let members = channel_conversation_members(&request.recipients, &sender.xid);
+    let published =
+        load_published_bundles(&s.state, &ms.xite, ms.engine.as_ref(), &ms.db).await?;
+    let destinations = resolve_destinations(&ms, &request.recipients, &published).await?;
+
+    let _staging_outbox_guard = channel_staging_guard(&ms).await?;
+    let _rule_transaction = s.state.pool_rule_transaction(&ms.xite).await;
+    let rule = s
+        .state
+        .pool_rules_for(&ms.xite)
+        .await
+        .into_iter()
+        .next()
+        .ok_or("this xite has no pool configured")?;
+    let rln = channel_rln_send_context(&s.state, &ms, &rule).await?;
+    let send_jitter = send_jitter_max_secs(&s.state).await;
+    let burst_jitter = burst_jitter_max_secs(&s.state).await;
+    let origin_delay = if send_jitter == 0 {
+        0
+    } else {
+        rand_u64_below(send_jitter + 1)
+    };
+    let next_attempt_ms = now_ms() + origin_delay.saturating_mul(1000) as i64;
+    let records = prepare_outbound_records(
+        &s.state,
+        &ms,
+        sender,
+        &request,
+        members,
+        &destinations,
+        conv,
+        rule,
+        rln,
+        burst_jitter,
+        next_attempt_ms,
+    )
+    .await?;
+    drop(_rule_transaction);
+    drop(_staging_outbox_guard);
+
+    let delivery = immediate_channel_delivery(&s.state, &ms, &records, send_jitter).await;
+    Ok(json!({
+        "ok": true,
+        "conv_id": hex::encode(conv),
+        "recipients": request.recipients.len(),
+        "envelopes": records.len(),
+        "delivery": delivery,
+    }))
+}
+
 struct ChannelSend;
 #[async_trait]
 impl WsCommand for ChannelSend {
@@ -1744,320 +2416,7 @@ impl WsCommand for ChannelSend {
         "channelSend"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let a = p.as_array().ok_or("channelSend: [recipients, subject, body, conv_id?]")?;
-        let recipients: Vec<String> = a
-            .first()
-            .and_then(|v| v.as_array())
-            .map(|arr| normalized_recipients(arr))
-            .unwrap_or_default();
-        if recipients.is_empty() {
-            return Err("channelSend: at least one recipient required".into());
-        }
-        let subject = a.get(1).and_then(|v| v.as_str()).unwrap_or("");
-        let body = a.get(2).and_then(|v| v.as_str()).unwrap_or("");
-        let conv_hint: Option<[u8; 16]> = a
-            .get(3)
-            .and_then(|v| v.as_str())
-            .and_then(|h| hex::decode(h).ok())
-            .and_then(|b| b.try_into().ok());
-
-        let (identity_id, secret, my_xid, my_auth) = channel_identity(&s.state, &ms).await?;
-        let snapshot = match s.state.xid_identity_snapshot(&my_xid).await {
-            Ok(Some(snapshot)) if norm_xid(&snapshot.canonical_name) == norm_xid(&my_xid) => {
-                Some(snapshot)
-            }
-            Ok(Some(_)) | Ok(None) => None,
-            Err(error) => {
-                s.state
-                    .log(
-                        "WARN",
-                        &format!("local xID identity snapshot unavailable: {error}"),
-                    )
-                    .await;
-                None
-            }
-        };
-        let active_addrs: Vec<String> = snapshot
-            .as_ref()
-            .map(|snapshot| {
-                snapshot
-                    .identities
-                    .iter()
-                    .filter(|identity| identity.status == epix_chain::XidIdentityStatus::Active)
-                    .map(|identity| identity.auth_address.clone())
-                    .collect()
-            })
-            .unwrap_or_default();
-        let name_active = snapshot.as_ref().map(|_| !active_addrs.is_empty());
-        if snapshot.as_ref().is_some_and(|snapshot| {
-            snapshot.status_for(&my_auth) == Some(epix_chain::XidIdentityStatus::Revoked)
-        }) {
-            ms.db
-                .remember_revoked_device(&norm_xid(&my_xid), Some(&my_auth), "", now_ms())
-                .map_err(|e| e.to_string())?;
-        }
-        let tombstoned = ms
-            .db
-            .is_device_revoked(&norm_xid(&my_xid), Some(&my_auth), "")
-            .map_err(|e| e.to_string())?;
-        ensure_local_sender_active(&my_xid, &my_auth, tombstoned, name_active, &active_addrs)?;
-        // ONE conversation id shared across the whole thread (a 1:1 or a group),
-        // and the full participant list (recipients + me) so every recipient can
-        // reply-all.
-        let conv = conv_hint.unwrap_or_else(epix_envelope::new_conv_id);
-        let mut members: Vec<String> = recipients.clone();
-        members.push(norm_xid(&my_xid));
-        members.sort();
-        members.dedup();
-
-        // Resolve every recipient's active device bundles, flattened to ONE list of
-        // destinations. Instead of one pool record per device (which would leak the
-        // recipient device+group count to a peer counting the burst), all
-        // destinations are packed into fixed-width `SLOTS`-slot records — so the
-        // observable record count is independent of how many devices/recipients the
-        // message actually reaches. Resolving touches no ratchet state, so it runs
-        // BEFORE the send lock. See `docs/channel-count-privacy.md`.
-        let published =
-            load_published_bundles(&s.state, &ms.xite, ms.engine.as_ref(), &ms.db).await?;
-        let dests = resolve_destinations(&ms, &recipients, &published).await?;
-
-        // Padding, routing, and RLN policy must remain the same from the rule
-        // read through the atomic ratchet/outbox commit. Otherwise a descriptor
-        // refresh can leave an immutable ciphertext that no current rule can
-        // admit after its ratchet has already advanced.
-        let _staging_outbox_guard = channel_staging_guard(&ms).await?;
-        let _rule_transaction = s.state.pool_rule_transaction(&ms.xite).await;
-        let rule = s
-            .state
-            .pool_rules_for(&ms.xite)
-            .await
-            .into_iter()
-            .next()
-            .ok_or("this xite has no pool configured")?;
-
-        // For an rln_required pool, the node attaches an RLN membership proof to
-        // every record it sends. Fetch the shared admission (the same gates the
-        // ingest path uses) and this node's RLN identity seed up front, so the
-        // per-chunk seal task can prove without touching async state.
-        let rln_ctx: Option<(Arc<crate::rln::RlnAdmission>, Vec<u8>, String)> = if rule.rln_required
-        {
-            let admission = s
-                .state
-                .capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP);
-            let auth = s.state.user_auth_address(&ms.xite).await.ok();
-            match (admission, auth) {
-                (Some(a), Some(auth)) => {
-                    let seed = s.state.derive_consumer_seed("rln", &auth).await.to_vec();
-                    Some((a, seed, ms.xite.clone()))
-                }
-                _ => return Err("this pool requires RLN but no membership is available".into()),
-            }
-        } else {
-            None
-        };
-
-        let send_jitter = send_jitter_max_secs(&s.state).await;
-        let burst_jitter = burst_jitter_max_secs(&s.state).await;
-        let origin_delay = if send_jitter == 0 {
-            0
-        } else {
-            rand_u64_below(send_jitter + 1)
-        };
-        let mut next_attempt_ms = now_ms() + origin_delay.saturating_mul(1000) as i64;
-        let chunk_count = dests.len().div_ceil(epix_envelope::SLOTS);
-        let rln_preflight_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Seal each chunk of up to SLOTS destinations into one fixed-width record
-        // (≤ SLOTS total devices is a single record; larger sends span the minimum
-        // number of records). The sender's own copy is recorded on the first chunk
-        // only. PoW runs on the blocking pool so it can't starve the runtime. The
-        // send lock serializes the seal→persist section: two concurrent sends must
-        // not read the same ratchet state (which would reuse an AEAD nonce and a
-        // detection tag). It is held ONLY across sealing — appends touch no ratchet
-        // state. Each exact signed record and its persisted jitter deadline land
-        // atomically with those advances in the durable SQLite outbox.
-        let records = {
-            let _send_guard = ms.send_lock.lock().await;
-            let rln_batch = match &rln_ctx {
-                Some((admission, _, _)) => Some(admission.reservation_batch(&ms.xite).await),
-                None => None,
-            };
-            let mut prepared: Vec<epix_envelope::PreparedSend> = Vec::new();
-            for (ci, chunk) in dests.chunks(epix_envelope::SLOTS).enumerate() {
-                if ci > 0 {
-                    next_attempt_ms += jitter_gap_secs(burst_jitter).saturating_mul(1000) as i64;
-                }
-                let db = ms.db.clone();
-                let engine = ms.engine.clone();
-                let secret = secret.clone();
-                let my_xid_c = my_xid.clone();
-                let members_c = members.clone();
-                let rule_c = rule.clone();
-                let subject_c = subject.to_string();
-                let body_c = body.to_string();
-                let record_own = ci == 0;
-                let now = now_ms();
-                let scheduled = next_attempt_ms;
-                let chunk_dests: Vec<epix_envelope::Dest> = chunk
-                    .iter()
-                    .map(|b| epix_envelope::Dest { bundle: b.clone() })
-                    .collect();
-                let rln_c = rln_ctx.clone();
-                let rln_batch_c = rln_batch.clone();
-                let preflight = rln_preflight_done.clone();
-                let res = tokio::task::spawn_blocking(move || {
-                    if let Some((admission, seed, addr)) = rln_c {
-                        let ident = epix_rln::RlnIdentity::from_seed(&seed);
-                        // The rail computes the record's unit cost from ct and
-                        // spends a fresh unit range, refusing past the allowance.
-                        let prover = |ct: &[u8], epoch: i64| {
-                            if !preflight.swap(true, std::sync::atomic::Ordering::AcqRel) {
-                                let smallest = rule_c.pad_buckets.first().copied().unwrap_or(1);
-                                let weight = epix_rln::bucket_weight(ct.len(), smallest);
-                                let total = weight.saturating_mul(chunk_count as u32);
-                                let (used, limit) = admission
-                                    .usage(&addr, epoch.max(0) as u64)
-                                    .ok_or("no RLN roster loaded for this pool")?;
-                                if used.saturating_add(total) > limit {
-                                    return Err(format!(
-                                        "epoch allowance exhausted: send needs {total} units, {used}/{limit} already spent"
-                                    ));
-                                }
-                            }
-                            admission
-                                .reserve_proof_batched(
-                                    rln_batch_c
-                                        .as_ref()
-                                        .ok_or("missing RLN reservation batch")?,
-                                    &addr,
-                                    &ident,
-                                    epoch,
-                                    ct,
-                                )
-                                .map(
-                                |reserved| epix_envelope::RlnProofMaterial {
-                                    proof: reserved.proof,
-                                    reservation: Some(reserved.reservation),
-                                },
-                            )
-                        };
-                        epix_envelope::prepare_multi_with_rln_reserved_scheduled(
-                            db.as_ref(),
-                            engine.as_ref(),
-                            identity_id,
-                            &secret,
-                            &my_xid_c,
-                            &members_c,
-                            &chunk_dests,
-                            conv,
-                            &subject_c,
-                            &body_c,
-                            now,
-                            scheduled,
-                            &rule_c,
-                            record_own,
-                            &prover,
-                        )
-                    } else {
-                        epix_envelope::prepare_multi_scheduled(
-                            db.as_ref(),
-                            engine.as_ref(),
-                            identity_id,
-                            &secret,
-                            &my_xid_c,
-                            &members_c,
-                            &chunk_dests,
-                            conv,
-                            &subject_c,
-                            &body_c,
-                            now,
-                            scheduled,
-                            &rule_c,
-                            record_own,
-                        )
-                    }
-                })
-                .await
-                .map_err(|e| format!("channelSend seal task failed: {e}"))?
-                .map_err(|e| e.to_string())?;
-                prepared.push(res);
-            }
-            for prepared_record in &prepared {
-                let singleton = epix_content::pool::make_pool_container(vec![prepared_record
-                    .commit
-                    .record
-                    .clone()]);
-                let encoded = serde_json::to_vec(&singleton)
-                    .map_err(|error| format!("could not size channel pool record: {error}"))?;
-                if encoded.len() > rule.max_shard_bytes {
-                    return Err(format!(
-                        "channel record cannot fit the pool shard limit ({} > {})",
-                        encoded.len(),
-                        rule.max_shard_bytes
-                    ));
-                }
-            }
-            let commits: Vec<_> = prepared.iter().map(|p| p.commit.clone()).collect();
-            let staged = ms
-                .db
-                .commit_outbound_batch(&commits)
-                .map_err(|e| e.to_string())?;
-            if let Some(batch) = &rln_batch {
-                if let Err(error) = batch.commit() {
-                    ms.rln_usage_ready
-                        .store(false, std::sync::atomic::Ordering::Release);
-                    // SQLite already accepted the logical send. Keep reporting
-                    // queued success, while the poisoned usage ledger blocks
-                    // later sends until restart reconciliation repairs it.
-                    s.state
-                        .log(
-                            "ERROR",
-                            &format!("could not finalize RLN usage reservation: {error}"),
-                        )
-                        .await;
-                }
-            }
-            prepared
-                .into_iter()
-                .zip(staged)
-                .map(|(prepared, (outbox_id, _msg_id))| PendingOutbound {
-                    outbox_id,
-                    record: prepared.commit.record,
-                    shard_path: prepared.commit.shard_path,
-                    created_ms: prepared.commit.created_ms,
-                    next_attempt_ms: prepared.commit.next_attempt_ms,
-                    recovery: prepared.commit.recovery,
-                    last_error: None,
-                })
-                .collect::<Vec<_>>()
-        };
-        drop(_rule_transaction);
-        drop(_staging_outbox_guard);
-
-        // With origin jitter disabled, preserve the synchronous first append and
-        // try it immediately. Once SQLite accepted the logical send, a transport
-        // failure is a queued success, not a failed command that invites the user
-        // to retry and duplicate the message. Every row remains durable.
-        // Delayed and tail records are picked up by the retry loop at their
-        // persisted deadlines, including after a restart.
-        let envelopes = records.len();
-        let mut delivery = "queued";
-        if send_jitter == 0 {
-            if let Some(last) = records.last() {
-                delivery = accepted_delivery_status(&s.state, &ms, last).await;
-            }
-        }
-
-        // `envelopes` is the record count — independent of the true recipient/device
-        // count (which is hidden inside each fixed-width record).
-        Ok(json!({
-            "ok": true,
-            "conv_id": hex::encode(conv),
-            "recipients": recipients.len(),
-            "envelopes": envelopes,
-            "delivery": delivery,
-        }))
+        execute_channel_send(s, p).await
     }
 }
 

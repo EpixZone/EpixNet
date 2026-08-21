@@ -303,6 +303,63 @@ pub fn write_frame<W: Write>(w: &mut W, v: &Value) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    fn http_request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_len = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        content_len.is_some_and(|len| request.len() >= header_end + 4 + len)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let read = std::io::Read::read(stream, &mut chunk).unwrap();
+            assert!(read != 0, "request ended before its body arrived");
+            request.extend_from_slice(&chunk[..read]);
+            if http_request_complete(&request) {
+                return request;
+            }
+        }
+    }
+
+    async fn assert_oversized_response_rejected_before_end(response: Vec<u8>) {
+        let token = "77".repeat(32);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            std::io::Write::write_all(&mut stream, &response).unwrap();
+            std::io::Write::flush(&mut stream).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node_resolve(port, &token, "talk.epix"),
+        )
+        .await;
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert_eq!(
+            result.expect("oversize must be rejected before the response ends"),
+            Err("invalid node resolve response: body is too large".to_string())
+        );
+    }
+
     #[test]
     fn frame_roundtrips() {
         let mut buf = Vec::new();
@@ -427,39 +484,14 @@ mod tests {
         let port = listener.local_addr().unwrap().port();
         let (request_tx, request_rx) = std::sync::mpsc::channel();
         let server = std::thread::spawn(move || {
-            use std::io::{Read as _, Write as _};
+            use std::io::Write as _;
 
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            let request = read_http_request(&mut stream);
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
                 .unwrap();
-            let mut request = Vec::new();
-            let mut end = None;
-            let mut content_len = None;
-            loop {
-                let mut chunk = [0u8; 4096];
-                let read = stream.read(&mut chunk).unwrap();
-                assert!(read != 0, "request ended before its body arrived");
-                request.extend_from_slice(&chunk[..read]);
-                if end.is_none() {
-                    end = request.windows(4).position(|window| window == b"\r\n\r\n");
-                    if let Some(header_end) = end {
-                        let headers = String::from_utf8_lossy(&request[..header_end]);
-                        content_len = headers.lines().find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().ok())
-                                .flatten()
-                        });
-                    }
-                }
-                if let (Some(header_end), Some(content_len)) = (end, content_len) {
-                    if request.len() >= header_end + 4 + content_len {
-                        break;
-                    }
-                }
-            }
-            let header_end = end.unwrap();
             let request_body = &request[header_end + 4..];
             let parsed: Value = serde_json::from_slice(request_body).unwrap();
             let nonce = parsed["nonce"].as_str().unwrap();
@@ -490,5 +522,21 @@ mod tests {
             "the raw native-messaging secret was sent to the stale listener"
         );
         server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_is_rejected_without_reading_the_body() {
+        assert_oversized_response_rejected_before_end(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16385\r\nconnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn chunked_response_is_rejected_as_soon_as_it_crosses_the_limit() {
+        let mut response = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n4000\r\n".to_vec();
+        response.extend(vec![b'x'; 16 * 1024]);
+        response.extend(b"\r\n1\r\ny\r\n");
+        assert_oversized_response_rejected_before_end(response).await;
     }
 }

@@ -2868,7 +2868,7 @@ fn resolve_cache_lock(path: &std::path::Path) -> Arc<std::sync::Mutex<()>> {
     let locks = LOCKS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
     let mut locks = locks
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(lock) = locks.get(&key).and_then(std::sync::Weak::upgrade) {
         return lock;
     }
@@ -2996,7 +2996,7 @@ fn create_resolve_cache_temp(
     })?;
     let name = destination
         .file_name()
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("resolve-cache.json");
     for _ in 0..128 {
         let id = RESOLVE_CACHE_TEMP_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -3164,7 +3164,9 @@ fn write_resolve_cache_bound_checked(
     }
 
     let lock = resolve_cache_lock(&path);
-    let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _guard = lock
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     // The Arc mutex serializes tasks in this process. The lock file extends the
     // same read-modify-write critical section across separate node processes
     // that share a data root.

@@ -1025,6 +1025,24 @@ pub mod xid_identity {
     mod tests {
         use super::*;
 
+        static CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+        struct VerifyFinalityReset(bool);
+
+        impl Drop for VerifyFinalityReset {
+            fn drop(&mut self) {
+                crate::set_verify_finality(self.0);
+            }
+        }
+
+        struct CacheReset;
+
+        impl Drop for CacheReset {
+            fn drop(&mut self) {
+                clear();
+            }
+        }
+
         fn info(active: bool) -> XidInfo {
             XidInfo {
                 name: "x".into(),
@@ -1055,6 +1073,11 @@ pub mod xid_identity {
         // maps through to the three-valued answer the channel gate relies on.
         #[tokio::test]
         async fn name_active_maps_cached_flag_without_network() {
+            let _finality_guard = crate::finality_state_test_guard().await;
+            let _cache_guard = CACHE_TEST_LOCK.lock().await;
+            let _verify_reset = VerifyFinalityReset(crate::verify_finality_enabled());
+            let _cache_reset = CacheReset;
+            crate::set_verify_finality(false);
             clear();
             store("active?:alice.epix".into(), Some(info(true)), None);
             assert_eq!(
@@ -1074,7 +1097,43 @@ pub mod xid_identity {
                 None,
                 "unknown → fail open"
             );
+        }
+
+        #[tokio::test]
+        async fn verified_mode_serves_negative_cache_and_expires_it() {
+            let _finality_guard = crate::finality_state_test_guard().await;
+            let _cache_guard = CACHE_TEST_LOCK.lock().await;
+            let _verify_reset = VerifyFinalityReset(crate::verify_finality_enabled());
+            let _cache_reset = CacheReset;
+            crate::set_verify_finality(true);
             clear();
+
+            let missing = "epix1missing";
+            store(missing.into(), None, None);
+            assert!(
+                matches!(cached(missing), Some(None)),
+                "a verified-mode negative must be served from cache"
+            );
+
+            let unbound = "unbound.epix";
+            store(unbound.into(), Some(info(true)), None);
+            assert!(
+                cached(unbound).is_none(),
+                "verified-mode positives must still require a current finality binding"
+            );
+
+            let mut guard = CACHE.write().unwrap();
+            guard
+                .as_mut()
+                .unwrap()
+                .get_mut(missing)
+                .unwrap()
+                .at = Instant::now() - NEGATIVE_TTL - Duration::from_millis(1);
+            drop(guard);
+            assert!(
+                cached(missing).is_none(),
+                "a negative must stop being served after its short TTL"
+            );
         }
     }
 }

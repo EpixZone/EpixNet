@@ -41,6 +41,7 @@ use crate::record::record_signed_data;
 use base64::Engine as _;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The container `record_format` marker for the pool class.
 pub const POOL_RECORD_FORMAT: &str = "epix-pool-1";
@@ -644,93 +645,125 @@ pub fn merge_pool(
     shard_sub: u16,
     now_ms: i64,
 ) -> (Value, Vec<Value>) {
-    use std::collections::BTreeMap;
+    let local_ids = verified_local_ids(local, rule, shard_week, shard_sub, now_ms);
 
-    let payload_id = |record: &Value| sha256d(logical_record_data(record).as_bytes());
-    let routed_here = |record: &Value| {
-        record
-            .get("tag")
-            .and_then(|t| t.as_str())
-            .and_then(|s| base64::engine::general_purpose::STANDARD.decode(s).ok())
-            .map(|t| crate::pool::shard_sub(&t, rule.fanout) == shard_sub)
-            .unwrap_or(false)
-    };
-    let local_ids: std::collections::BTreeSet<[u8; 32]> = pool_records_of(local)
-        .into_iter()
-        .filter(|record| {
-            routed_here(record) && verify_pool_record(record, rule, shard_week, now_ms).is_ok()
-        })
-        .map(|record| payload_id(&record))
+    // Bind the record to this shard's SUB-index too. `verify_pool_record`
+    // binds only the week; without this an attacker could copy valid records
+    // from OTHER subs (no fresh PoW needed) into one shard, inflate it past
+    // `max_shard_bytes`, and force eviction of the genuine records addressed
+    // to that sub. A record only ever belongs in `shard_sub(tag, fanout)`.
+    let mut records = collect_merge_records(local, inbound, rule, shard_week, shard_sub, now_ms);
+
+    // Deterministic overflow eviction (rare): keep the highest-work records.
+    evict_overflow(&mut records, rule.max_shard_bytes);
+
+    sort_records(&mut records);
+
+    let delta: Vec<Value> = records
+        .iter()
+        .filter(|record| !local_ids.contains(&pool_payload_id(record)))
+        .cloned()
         .collect();
 
+    (make_pool_container(records), delta)
+}
+
+fn pool_payload_id(record: &Value) -> [u8; 32] {
+    sha256d(logical_record_data(record).as_bytes())
+}
+
+fn record_routes_to_sub(record: &Value, rule: &PoolRule, shard_sub: u16) -> bool {
+    record
+        .get("tag")
+        .and_then(|tag| tag.as_str())
+        .and_then(|tag| base64::engine::general_purpose::STANDARD.decode(tag).ok())
+        .map(|tag| crate::pool::shard_sub(&tag, rule.fanout) == shard_sub)
+        .unwrap_or(false)
+}
+
+fn verified_local_ids(
+    local: &Value,
+    rule: &PoolRule,
+    shard_week: i64,
+    shard_sub: u16,
+    now_ms: i64,
+) -> BTreeSet<[u8; 32]> {
+    pool_records_of(local)
+        .into_iter()
+        .filter(|record| {
+            record_routes_to_sub(record, rule, shard_sub)
+                && verify_pool_record(record, rule, shard_week, now_ms).is_ok()
+        })
+        .map(|record| pool_payload_id(&record))
+        .collect()
+}
+
+fn is_merge_candidate(
+    record: &Value,
+    rule: &PoolRule,
+    shard_week: i64,
+    shard_sub: u16,
+    now_ms: i64,
+) -> bool {
+    verify_pool_record(record, rule, shard_week, now_ms).is_ok()
+        && record_routes_to_sub(record, rule, shard_sub)
+        && !sign_of(record).is_empty()
+}
+
+fn collect_merge_records(
+    local: &Value,
+    inbound: &Value,
+    rule: &PoolRule,
+    shard_week: i64,
+    shard_sub: u16,
+    now_ms: i64,
+) -> Vec<Value> {
     let mut by_payload: BTreeMap<[u8; 32], Value> = BTreeMap::new();
-    for r in pool_records_of(local)
+    let records = pool_records_of(local)
         .into_iter()
         .chain(pool_records_of(inbound))
-    {
-        if verify_pool_record(&r, rule, shard_week, now_ms).is_err() {
-            continue;
-        }
-        // Bind the record to this shard's SUB-index too. `verify_pool_record`
-        // binds only the week; without this an attacker could copy valid records
-        // from OTHER subs (no fresh PoW needed) into one shard, inflate it past
-        // `max_shard_bytes`, and force eviction of the genuine records addressed
-        // to that sub. A record only ever belongs in `shard_sub(tag, fanout)`.
-        if !routed_here(&r) {
-            continue;
-        }
-        if sign_of(&r).is_empty() {
-            continue;
-        }
+        .filter(|record| is_merge_candidate(record, rule, shard_week, shard_sub, now_ms));
+    for record in records {
         // A Bitcoin compact recovery header has an optional +4 compressed-key
         // flag. Both encodings recover the same author and cover the same
         // payload. Keying by raw signature would let an observer toggle that
         // unauthenticated flag and occupy a second shard entry. Keep one record
         // per signed payload and choose the lexicographically smaller signature
         // so partitions converge regardless of which encoding arrived first.
-        let id = payload_id(&r);
+        let id = pool_payload_id(&record);
         match by_payload.entry(id) {
             std::collections::btree_map::Entry::Vacant(slot) => {
-                slot.insert(r);
+                slot.insert(record);
             }
             std::collections::btree_map::Entry::Occupied(mut slot) => {
-                let candidate_work = sha256d(record_signed_data(&r).as_bytes());
+                let candidate_work = sha256d(record_signed_data(&record).as_bytes());
                 let retained_work = sha256d(record_signed_data(slot.get()).as_bytes());
                 if candidate_work < retained_work
-                    || (candidate_work == retained_work && sign_of(&r) < sign_of(slot.get()))
+                    || (candidate_work == retained_work && sign_of(&record) < sign_of(slot.get()))
                 {
-                    slot.insert(r);
+                    slot.insert(record);
                 }
             }
         }
     }
+    by_payload.into_values().collect()
+}
 
-    let mut records: Vec<Value> = by_payload.into_values().collect();
-
-    // Deterministic overflow eviction (rare): keep the highest-work records.
-    if container_len(&records) > rule.max_shard_bytes {
-        records.sort_by(|a, b| {
-            let ha = sha256d(record_signed_data(a).as_bytes());
-            let hb = sha256d(record_signed_data(b).as_bytes());
-            ha.cmp(&hb).then_with(|| sign_of(a).cmp(sign_of(b)))
-        });
-        // A singleton is not exempt from the byte cap. Retaining an oversized
-        // final record would let append report success while GetSigned refuses
-        // the shard, which is especially dangerous for a durable outbox.
-        while !records.is_empty() && container_len(&records) > rule.max_shard_bytes {
-            records.pop();
-        }
+fn evict_overflow(records: &mut Vec<Value>, max_shard_bytes: usize) {
+    if container_len(records) <= max_shard_bytes {
+        return;
     }
-
-    sort_records(&mut records);
-
-    let delta: Vec<Value> = records
-        .iter()
-        .filter(|r| !local_ids.contains(&payload_id(r)))
-        .cloned()
-        .collect();
-
-    (make_pool_container(records), delta)
+    records.sort_by(|a, b| {
+        let ha = sha256d(record_signed_data(a).as_bytes());
+        let hb = sha256d(record_signed_data(b).as_bytes());
+        ha.cmp(&hb).then_with(|| sign_of(a).cmp(sign_of(b)))
+    });
+    // A singleton is not exempt from the byte cap. Retaining an oversized
+    // final record would let append report success while GetSigned refuses
+    // the shard, which is especially dangerous for a durable outbox.
+    while !records.is_empty() && container_len(records) > max_shard_bytes {
+        records.pop();
+    }
 }
 
 #[cfg(test)]

@@ -174,6 +174,103 @@ struct FilteredRlnAdmission {
     permit: Option<tokio::sync::OwnedMutexGuard<()>>,
 }
 
+type PoolAdmissionCandidate = (PoolRecordId, Value, PoolAdmissionRecord);
+
+fn pool_admission_candidate(
+    record: Value,
+    rule: &PoolRule,
+    week: i64,
+    now: i64,
+    oldest_epoch: i64,
+) -> Option<PoolAdmissionCandidate> {
+    pool::verify_pool_record(&record, rule, week, now).ok()?;
+    let admission = admission_record(&record)?;
+    (admission.epoch >= oldest_epoch).then_some((admission.id, record, admission))
+}
+
+fn pool_admission_candidates(
+    records: Vec<Value>,
+    rule: &PoolRule,
+    week: i64,
+    now: i64,
+    oldest_epoch: i64,
+) -> Vec<PoolAdmissionCandidate> {
+    let mut candidates = Vec::new();
+    for record in records {
+        if let Some(candidate) = pool_admission_candidate(record, rule, week, now, oldest_epoch) {
+            candidates.push(candidate);
+        }
+    }
+    candidates.sort_by_key(|(id, _, _)| *id);
+    candidates
+}
+
+fn apply_pool_admission_decision(
+    candidate: (PoolRecordId, Value),
+    decision: PoolAdmissionDecision,
+    kept: &mut Vec<(PoolRecordId, Value)>,
+    evicted: &mut BTreeSet<PoolRecordId>,
+    suppress_delivery: &mut BTreeSet<PoolRecordId>,
+    offenders: &mut BTreeSet<String>,
+    errors: &mut Vec<String>,
+) {
+    let (id, record) = candidate;
+    evicted.extend(decision.evict);
+    offenders.extend(decision.offenders);
+    if let Some(error) = decision.error {
+        errors.push(error);
+    }
+    if !decision.admit {
+        return;
+    }
+    if !decision.deliver {
+        suppress_delivery.insert(id);
+    }
+    kept.push((id, record));
+}
+
+fn apply_pool_admission_batch(
+    admission: Arc<dyn PoolAdmission>,
+    address: String,
+    candidates: Vec<PoolAdmissionCandidate>,
+) -> FilteredRlnAdmission {
+    let admission_records: Vec<PoolAdmissionRecord> = candidates
+        .iter()
+        .map(|(_, _, record)| record.clone())
+        .collect();
+    let mut batch = admission.admit_records(&address, &admission_records);
+    let mut kept = Vec::new();
+    let mut evicted = BTreeSet::new();
+    let mut suppress_delivery = BTreeSet::new();
+    let mut offenders = BTreeSet::new();
+    let mut errors = Vec::new();
+    for ((id, record, _), decision) in
+        candidates.into_iter().zip(batch.decisions.drain(..))
+    {
+        apply_pool_admission_decision(
+            (id, record),
+            decision,
+            &mut kept,
+            &mut evicted,
+            &mut suppress_delivery,
+            &mut offenders,
+            &mut errors,
+        );
+    }
+    kept.retain(|(id, _)| !evicted.contains(id));
+    suppress_delivery.retain(|id| !evicted.contains(id));
+    FilteredRlnAdmission {
+        container: pool::make_pool_container(
+            kept.into_iter().map(|(_, record)| record).collect(),
+        ),
+        evicted: evicted.into_iter().collect(),
+        suppress_delivery: suppress_delivery.into_iter().collect(),
+        offenders: offenders.into_iter().collect(),
+        errors,
+        permit: batch.permit.take(),
+    }
+}
+
 enum PoolWriteOutcome {
     Committed {
         delta: Vec<Value>,
@@ -184,6 +281,273 @@ enum PoolWriteOutcome {
         snapshot: Vec<u8>,
     },
     CapacityRejected,
+}
+
+struct OutboundPoolRoute {
+    tag: Vec<u8>,
+    epoch: i64,
+    shard: String,
+    record_id: Option<PoolRecordId>,
+}
+
+struct InboundPoolMerge<'a> {
+    inner_path: &'a str,
+    rule: &'a PoolRule,
+    week: i64,
+    sub: u16,
+    incoming: &'a Value,
+    evicted: &'a [PoolRecordId],
+    offer_well_formed: bool,
+    offered_ids: &'a BTreeSet<PoolRecordId>,
+}
+
+fn outbound_pool_route(
+    rule: &PoolRule,
+    record: &Value,
+    expected_shard: Option<&str>,
+) -> Result<OutboundPoolRoute, String> {
+    let tag = record
+        .get("tag")
+        .and_then(Value::as_str)
+        .and_then(b64_decode)
+        .ok_or("pool record missing tag")?;
+    let epoch = record
+        .get("epoch")
+        .and_then(Value::as_i64)
+        .ok_or("pool record missing epoch")?;
+    let shard = pool::shard_path(rule, epoch, &tag);
+    if expected_shard.is_some_and(|expected| expected != shard) {
+        return Err(format!(
+            "staged pool route changed: expected {}, current rule routes to {shard}",
+            expected_shard.unwrap_or_default()
+        ));
+    }
+    Ok(OutboundPoolRoute {
+        tag,
+        epoch,
+        shard,
+        record_id: pool_record_id(record),
+    })
+}
+
+fn pool_record_ids(container: &Value) -> BTreeSet<PoolRecordId> {
+    pool::pool_records_of(container)
+        .iter()
+        .filter_map(pool_record_id)
+        .collect()
+}
+
+fn remove_evicted_pool_records(
+    existing: Value,
+    evicted: &[PoolRecordId],
+) -> (Value, bool) {
+    let evicted: BTreeSet<PoolRecordId> = evicted.iter().copied().collect();
+    let before = pool::pool_records_of(&existing);
+    let filtered: Vec<Value> = before
+        .iter()
+        .filter(|record| {
+            admission_record(record).is_none_or(|record| !evicted.contains(&record.id))
+        })
+        .cloned()
+        .collect();
+    let removed = filtered.len() != before.len();
+    if removed {
+        (pool::make_pool_container(filtered), true)
+    } else {
+        (existing, false)
+    }
+}
+
+fn merge_outbound_pool_shard(
+    storage: &epix_xite::XiteStorage,
+    rule: &PoolRule,
+    route: &OutboundPoolRoute,
+    incoming: &Value,
+    evicted: &[PoolRecordId],
+) -> Result<PoolWriteOutcome, String> {
+    let existing = read_pool_container(storage, &route.shard)?;
+    let already_present = route.record_id.is_some_and(|id| {
+        pool::pool_records_of(&existing)
+            .iter()
+            .any(|record| pool_record_id(record) == Some(id))
+    });
+    if rule.rln_required
+        && pool::pool_records_of(incoming).is_empty()
+        && evicted.is_empty()
+        && !already_present
+    {
+        return Err("local RLN record was rejected by admission".into());
+    }
+    let (existing, _) = remove_evicted_pool_records(existing, evicted);
+    let (merged, delta) = pool::merge_pool(
+        &existing,
+        incoming,
+        rule,
+        pool::week_of(route.epoch),
+        pool::shard_sub(&route.tag, rule.fanout),
+        now_ms(),
+    );
+    if !pool_record_ids(incoming).is_subset(&pool_record_ids(&merged)) {
+        return Ok(PoolWriteOutcome::CapacityRejected);
+    }
+    let snapshot = serde_json::to_vec(&merged).map_err(|error| error.to_string())?;
+    storage
+        .write_atomic_durable(&route.shard, &snapshot)
+        .map_err(|error| error.to_string())?;
+    Ok(PoolWriteOutcome::Committed {
+        delta,
+        accepted: true,
+        snapshot,
+    })
+}
+
+fn inbound_offer_is_well_formed(
+    incoming: &Value,
+    rule: &PoolRule,
+    week: i64,
+    sub: u16,
+    offered_ids: &BTreeSet<PoolRecordId>,
+) -> bool {
+    let offered = pool::pool_records_of(incoming);
+    incoming.get("record_format").and_then(Value::as_str) == Some(pool::POOL_RECORD_FORMAT)
+        && incoming
+            .get(pool::POOL_RECORDS_KEY)
+            .is_some_and(Value::is_array)
+        && offered.len() == offered_ids.len()
+        && offered.iter().all(|record| {
+            pool::verify_pool_record(record, rule, week, now_ms()).is_ok()
+                && record
+                    .get("tag")
+                    .and_then(Value::as_str)
+                    .and_then(b64_decode)
+                    .is_some_and(|tag| pool::shard_sub(&tag, rule.fanout) == sub)
+        })
+}
+
+fn merge_inbound_pool_shard(
+    storage: &epix_xite::XiteStorage,
+    merge: &InboundPoolMerge<'_>,
+) -> Result<PoolWriteOutcome, String> {
+    let existing = read_pool_container(storage, merge.inner_path)?;
+    let (existing, removed_here) = remove_evicted_pool_records(existing, merge.evicted);
+    let (merged, delta) = pool::merge_pool(
+        &existing,
+        merge.incoming,
+        merge.rule,
+        merge.week,
+        merge.sub,
+        now_ms(),
+    );
+    let survived = pool_record_ids(&merged);
+    if !pool_record_ids(merge.incoming).is_subset(&survived) {
+        return Ok(PoolWriteOutcome::CapacityRejected);
+    }
+    let snapshot = serde_json::to_vec(&merged).map_err(|error| error.to_string())?;
+    let unchanged = !removed_here && merged == existing;
+    if !unchanged {
+        storage
+            .write_atomic_durable(merge.inner_path, &snapshot)
+            .map_err(|error| error.to_string())?;
+    }
+    Ok(PoolWriteOutcome::Committed {
+        delta: if unchanged { Vec::new() } else { delta },
+        accepted: merge.offer_well_formed && merge.offered_ids.is_subset(&survived),
+        snapshot,
+    })
+}
+
+fn deliverable_pool_records(
+    records: impl IntoIterator<Item = Value>,
+    suppressed: Vec<PoolRecordId>,
+) -> Vec<Value> {
+    let suppressed: BTreeSet<PoolRecordId> = suppressed.into_iter().collect();
+    records
+        .into_iter()
+        .filter(|record| pool_record_id(record).is_none_or(|id| !suppressed.contains(&id)))
+        .collect()
+}
+
+enum ScannedPoolRecord {
+    Plain(Value),
+    Rln(Value, PoolAdmissionRecord),
+}
+
+fn scan_pool_record(
+    record: Value,
+    rule: &PoolRule,
+    week: i64,
+    sub: u16,
+    now: i64,
+    oldest_rln_epoch: i64,
+) -> Option<ScannedPoolRecord> {
+    pool::verify_pool_record(&record, rule, week, now).ok()?;
+    let tag = record
+        .get("tag")
+        .and_then(Value::as_str)
+        .and_then(b64_decode)?;
+    if pool::shard_sub(&tag, rule.fanout) != sub {
+        return None;
+    }
+    if !rule.rln_required {
+        return Some(ScannedPoolRecord::Plain(record));
+    }
+    let admission = admission_record(&record)?;
+    (admission.epoch >= oldest_rln_epoch).then_some(ScannedPoolRecord::Rln(record, admission))
+}
+
+fn scan_pool_shard(
+    storage: &epix_xite::XiteStorage,
+    rule: &PoolRule,
+    path: &str,
+    now: i64,
+    oldest_rln_epoch: i64,
+    records: &mut Vec<Value>,
+    rln_records: &mut Vec<(Value, PoolAdmissionRecord)>,
+) {
+    let Some((week, sub)) = pool::parse_shard_path(rule, path) else {
+        return;
+    };
+    let Ok(bytes) = storage.read(path) else {
+        return;
+    };
+    let Ok(container) = serde_json::from_slice::<Value>(&bytes) else {
+        return;
+    };
+    for record in pool::pool_records_of(&container) {
+        match scan_pool_record(record, rule, week, sub, now, oldest_rln_epoch) {
+            Some(ScannedPoolRecord::Plain(record)) => records.push(record),
+            Some(ScannedPoolRecord::Rln(record, admission)) => {
+                rln_records.push((record, admission));
+            }
+            None => {}
+        }
+    }
+}
+
+fn scan_all_pool_records(
+    storage: &epix_xite::XiteStorage,
+    rules: &[PoolRule],
+    now: i64,
+) -> (Vec<Value>, Vec<(Value, PoolAdmissionRecord)>) {
+    let current_epoch = pool::epoch_now(now);
+    let oldest_rln_epoch = rln_oldest_active_epoch(current_epoch);
+    let current_week = pool::week_of(current_epoch);
+    let mut records = Vec::new();
+    let mut rln_records = Vec::new();
+    for rule in rules {
+        for path in pool::sync_shard_paths(rule, current_week) {
+            scan_pool_shard(
+                storage,
+                rule,
+                &path,
+                now,
+                oldest_rln_epoch,
+                &mut records,
+                &mut rln_records,
+            );
+        }
+    }
+    (records, rln_records)
 }
 
 /// Result of a channel outbox append that reached at least one peer. A route
@@ -253,6 +617,40 @@ fn admission_record(record: &Value) -> Option<PoolAdmissionRecord> {
     })
 }
 
+fn collect_pool_admission_shard(
+    storage: &epix_xite::XiteStorage,
+    rule: &PoolRule,
+    week: i64,
+    sub: u16,
+    now: i64,
+    cutoff: i64,
+) -> Result<Vec<PoolAdmissionRecord>, String> {
+    let path = format!("{}/w{week}/{sub:02x}.json", rule.dir);
+    let container = read_pool_container(storage, &path)?;
+    let mut records = Vec::new();
+    for record in pool::pool_records_of(&container) {
+        let epoch = record.get("epoch").and_then(Value::as_i64).unwrap_or(-1);
+        if epoch < cutoff {
+            continue;
+        }
+        pool::verify_pool_record(&record, rule, week, now)
+            .map_err(|error| format!("invalid active RLN record in {path}: {error:?}"))?;
+        let routed_here = record
+            .get("tag")
+            .and_then(Value::as_str)
+            .and_then(b64_decode)
+            .is_some_and(|tag| pool::shard_sub(&tag, rule.fanout) == sub);
+        if !routed_here {
+            return Err(format!("misrouted active RLN record in {path}"));
+        }
+        records.push(
+            admission_record(&record)
+                .ok_or_else(|| format!("malformed active RLN admission record in {path}"))?,
+        );
+    }
+    Ok(records)
+}
+
 fn collect_pool_admission_records(
     storage: &epix_xite::XiteStorage,
     rules: &[PoolRule],
@@ -266,29 +664,9 @@ fn collect_pool_admission_records(
     for rule in rules.iter().filter(|rule| rule.rln_required) {
         for week in oldest_week.max(rule.since_week)..=newest_week {
             for sub in 0..rule.fanout {
-                let path = format!("{}/w{week}/{sub:02x}.json", rule.dir);
-                let container = read_pool_container(storage, &path)?;
-                for record in pool::pool_records_of(&container) {
-                    let epoch = record.get("epoch").and_then(Value::as_i64).unwrap_or(-1);
-                    if epoch < cutoff {
-                        continue;
-                    }
-                    pool::verify_pool_record(&record, rule, week, now).map_err(|error| {
-                        format!("invalid active RLN record in {path}: {error:?}")
-                    })?;
-                    let routed_here = record
-                        .get("tag")
-                        .and_then(Value::as_str)
-                        .and_then(b64_decode)
-                        .is_some_and(|tag| pool::shard_sub(&tag, rule.fanout) == sub);
-                    if !routed_here {
-                        return Err(format!("misrouted active RLN record in {path}"));
-                    }
-                    let admitted = admission_record(&record).ok_or_else(|| {
-                        format!("malformed active RLN admission record in {path}")
-                    })?;
-                    records.push(admitted);
-                }
+                records.extend(collect_pool_admission_shard(
+                    storage, rule, week, sub, now, cutoff,
+                )?);
             }
         }
     }
@@ -880,72 +1258,114 @@ impl AppState {
         // record's RLN nullifier — which `merge_pool` then drops — permanently
         // denying delivery of the real message. This also gates the SNARK verify
         // behind cheap checks, blunting ingest DoS amplification.
-        let (kept, evicted, suppress_delivery, offenders, errors, permit) =
-            tokio::task::spawn_blocking(move || {
-                let mut candidates: Vec<(PoolRecordId, Value, PoolAdmissionRecord)> = records
-                .into_iter()
-                    .filter_map(|record| {
-                        if pool::verify_pool_record(&record, &rule, week, now).is_err() {
-                            return None;
-                    }
-                        let admission = admission_record(&record)?;
-                        if admission.epoch < oldest_epoch {
-                            return None;
-                    }
-                        Some((admission.id, record, admission))
-                })
-                    .collect();
-                // Deterministic within-batch order prevents a higher id admitted
-                // earlier in the same container from surviving until a later disk
-                // cleanup pass.
-                candidates.sort_by_key(|(id, _, _)| *id);
-                let admission_records: Vec<PoolAdmissionRecord> = candidates
-                    .iter()
-                    .map(|(_, _, record)| record.clone())
-                    .collect();
-                let mut batch = admission.admit_records(&address, &admission_records);
-                let mut kept = Vec::new();
-                let mut evicted = BTreeSet::new();
-                let mut suppress_delivery = BTreeSet::new();
-                let mut offenders = BTreeSet::new();
-                let mut errors = Vec::new();
-                for ((id, record, _), decision) in
-                    candidates.into_iter().zip(batch.decisions.drain(..))
-                {
-                    evicted.extend(decision.evict);
-                    offenders.extend(decision.offenders);
-                    if let Some(error) = decision.error {
-                        errors.push(error);
-                    }
-                    if decision.admit {
-                        if !decision.deliver {
-                            suppress_delivery.insert(id);
-                        }
-                        kept.push((id, record));
-                    }
-                }
-                kept.retain(|(id, _)| !evicted.contains(id));
-                suppress_delivery.retain(|id| !evicted.contains(id));
-                (
-                    kept.into_iter()
-                        .map(|(_, record)| record)
-                        .collect::<Vec<Value>>(),
-                    evicted.into_iter().collect::<Vec<PoolRecordId>>(),
-                    suppress_delivery.into_iter().collect::<Vec<PoolRecordId>>(),
-                    offenders.into_iter().collect::<Vec<String>>(),
-                    errors,
-                    batch.permit.take(),
-                )
+        tokio::task::spawn_blocking(move || {
+            // Stable order ensures opposite-first replicas pick the same survivor.
+            let candidates =
+                pool_admission_candidates(records, &rule, week, now, oldest_epoch);
+            apply_pool_admission_batch(admission, address, candidates)
         })
         .await
-        .unwrap_or_default();
-        FilteredRlnAdmission {
-            container: pool::make_pool_container(kept),
-            evicted,
-            suppress_delivery,
-            offenders,
-            errors,
-            permit,
+        .unwrap_or_else(|_| FilteredRlnAdmission {
+            container: pool::make_pool_container(Vec::new()),
+            ..FilteredRlnAdmission::default()
+        })
+    }
+
+    async fn prepare_pool_admission(
+        &self,
+        address: &str,
+        rule: &PoolRule,
+        week: i64,
+        container: Value,
+    ) -> Result<FilteredRlnAdmission, String> {
+        let mut filtered = if rule.rln_required {
+            self.filter_rln_admitted(address, rule, week, container)
+                .await
+        } else {
+            FilteredRlnAdmission {
+                container,
+                ..FilteredRlnAdmission::default()
+            }
+        };
+        if filtered.errors.is_empty() {
+            return Ok(filtered);
+        }
+        let error = filtered.errors.join("; ");
+        drop(filtered.permit.take());
+        self.log(
+            "ERROR",
+            format!("RLN: admission failed for {address}: {error}"),
+        )
+        .await;
+        Err(error)
+    }
+
+    async fn commit_outbound_pool_shard(
+        &self,
+        address: &str,
+        rule: &PoolRule,
+        route: &OutboundPoolRoute,
+        incoming: &Value,
+        evicted: &[PoolRecordId],
+    ) -> Result<PoolWriteOutcome, String> {
+        let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
+        let shard_lock = self.pool_shard_lock(address, &route.shard);
+        let outcome = {
+            let _guard = shard_lock.lock().await;
+            merge_outbound_pool_shard(&storage, rule, route, incoming, evicted)
+        };
+        drop(shard_lock);
+        self.release_pool_shard_lock(address, &route.shard);
+        outcome
+    }
+
+    async fn commit_inbound_pool_shard(
+        &self,
+        address: &str,
+        merge: &InboundPoolMerge<'_>,
+    ) -> Result<PoolWriteOutcome, String> {
+        let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
+        let shard_lock = self.pool_shard_lock(address, merge.inner_path);
+        let outcome = {
+            let _guard = shard_lock.lock().await;
+            merge_inbound_pool_shard(&storage, merge)
+        };
+        drop(shard_lock);
+        self.release_pool_shard_lock(address, merge.inner_path);
+        outcome
+    }
+
+    async fn cleanup_prior_pool_routes(
+        &self,
+        address: &str,
+        current_shard: &str,
+        cleanup_shards: &[String],
+        record_id: Option<PoolRecordId>,
+    ) -> Result<(), String> {
+        if cleanup_shards.is_empty() {
+            return Ok(());
+        }
+        let record_id = record_id.ok_or("outbound pool record has no stable payload id")?;
+        for old_shard in cleanup_shards {
+            if old_shard == current_shard {
+                continue;
+            }
+            self.remove_pool_record_from_exact_shard(address, old_shard, record_id)
+                .await
+                .map_err(|error| format!("could not clean prior pool route {old_shard}: {error}"))?;
+        }
+        Ok(())
+    }
+
+    async fn log_pool_offenders(&self, address: &str, offenders: &[String]) {
+        for offender in offenders {
+            self.log(
+                "WARN",
+                format!(
+                    "RLN: quarantined a double-signal for {address}; offender commitment {offender}"
+                ),
+            )
+            .await;
         }
     }
 
@@ -1184,124 +1604,22 @@ impl AppState {
             .into_iter()
             .next()
             .ok_or("no pool configured on this xite")?;
-
-        let tag = record
-            .get("tag")
-            .and_then(|v| v.as_str())
-            .and_then(b64_decode)
-            .ok_or("pool record missing tag")?;
-        let epoch =
-            record.get("epoch").and_then(|v| v.as_i64()).ok_or("pool record missing epoch")?;
-        let shard = pool::shard_path(&rule, epoch, &tag);
-        if expected_shard.is_some_and(|expected| expected != shard) {
-            return Err(format!(
-                "staged pool route changed: expected {}, current rule routes to {shard}",
-                expected_shard.unwrap_or_default()
-            ));
-        }
-        let record_id = pool_record_id(&record);
-        let mut filtered = if rule.rln_required {
-            self.filter_rln_admitted(
+        let route = outbound_pool_route(&rule, &record, expected_shard)?;
+        let mut filtered = self
+            .prepare_pool_admission(
                 address,
                 &rule,
-                pool::week_of(epoch),
+                pool::week_of(route.epoch),
                 pool::make_pool_container(vec![record]),
             )
-            .await
-        } else {
-            FilteredRlnAdmission {
-                container: pool::make_pool_container(vec![record]),
-                ..FilteredRlnAdmission::default()
-            }
-        };
+            .await?;
         let admission_permit = filtered.permit.take();
-        if !filtered.errors.is_empty() {
-            let error = filtered.errors.join("; ");
-            drop(admission_permit);
-            self.log(
-                "ERROR",
-                format!("RLN: admission failed for {address}: {error}"),
-            )
-            .await;
-            return Err(error);
-        }
         let incoming = filtered.container;
         let evicted = filtered.evicted;
-
-        // Serialize the read-merge-write against a concurrent inbound merge on the
-        // same shard, or the just-appended record could be clobbered before the
-        // spawned publish re-reads the shard (and the recipient never gets it).
-        // Fetch storage before the lock so the critical section holds no `?`
-        // early-exit that would skip the lock-map cleanup below.
-        let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
-        let shard_lock = self.pool_shard_lock(address, &shard);
-        let outcome: Result<PoolWriteOutcome, String> = {
-            let _guard = shard_lock.lock().await;
-            (|| -> Result<PoolWriteOutcome, String> {
-                let existing = read_pool_container(&storage, &shard)?;
-                let already_present = record_id.is_some_and(|id| {
-                    pool::pool_records_of(&existing)
-                        .iter()
-                        .any(|record| pool_record_id(record) == Some(id))
-                });
-                if rule.rln_required
-                    && pool::pool_records_of(&incoming).is_empty()
-                    && evicted.is_empty()
-                    && !already_present
-                {
-                    Err("local RLN record was rejected by admission".into())
-                } else {
-                    let evicted_here: BTreeSet<PoolRecordId> = evicted.iter().copied().collect();
-                    let before = pool::pool_records_of(&existing);
-                    let filtered: Vec<Value> = before
-                        .iter()
-                        .filter(|record| {
-                            admission_record(record)
-                                .is_none_or(|record| !evicted_here.contains(&record.id))
-                        })
-                        .cloned()
-                        .collect();
-                    let existing = if filtered.len() != before.len() {
-                        pool::make_pool_container(filtered)
-                    } else {
-                        existing
-                    };
-            let (merged, delta) = pool::merge_pool(
-                &existing,
-                &incoming,
-                &rule,
-                pool::week_of(epoch),
-                pool::shard_sub(&tag, rule.fanout),
-                now_ms(),
-            );
-                    let expected: BTreeSet<PoolRecordId> = pool::pool_records_of(&incoming)
-                        .iter()
-                        .filter_map(pool_record_id)
-                        .collect();
-                    let survived: BTreeSet<PoolRecordId> = pool::pool_records_of(&merged)
-                        .iter()
-                        .filter_map(pool_record_id)
-                        .collect();
-                    if !expected.is_subset(&survived) {
-                        Ok(PoolWriteOutcome::CapacityRejected)
-                    } else {
-                        let snapshot = serde_json::to_vec(&merged).map_err(|e| e.to_string())?;
-                        storage
-                            .write_atomic_durable(&shard, &snapshot)
-                            .map_err(|e| e.to_string())?;
-                        Ok(PoolWriteOutcome::Committed {
-                            delta,
-                            accepted: true,
-                            snapshot,
-                        })
-                    }
-                }
-            })()
-        };
-        drop(shard_lock);
-        self.release_pool_shard_lock(address, &shard);
-
-        let (delta, snapshot) = match outcome {
+        let (delta, snapshot) = match self
+            .commit_outbound_pool_shard(address, &rule, &route, &incoming, &evicted)
+            .await
+        {
             Ok(PoolWriteOutcome::Committed {
                 delta, snapshot, ..
             }) => (delta, snapshot),
@@ -1315,48 +1633,24 @@ impl AppState {
             }
         };
         if let Err(e) = self
-            .remove_pool_records_except(address, &evicted, Some(&shard))
+            .remove_pool_records_except(address, &evicted, Some(&route.shard))
             .await
         {
             drop(admission_permit);
             return Err(e);
         }
-        if !cleanup_shards.is_empty() {
-            let cleanup_id = record_id.ok_or("outbound pool record has no stable payload id")?;
-            for old_shard in cleanup_shards {
-                if old_shard != &shard {
-                    if let Err(error) = self
-                        .remove_pool_record_from_exact_shard(address, old_shard, cleanup_id)
-                        .await
-                    {
-                        drop(admission_permit);
-                        return Err(format!(
-                            "could not clean prior pool route {old_shard}: {error}"
-                        ));
-                    }
-                }
-            }
+        if let Err(error) = self
+            .cleanup_prior_pool_routes(address, &route.shard, cleanup_shards, route.record_id)
+            .await
+        {
+            drop(admission_permit);
+            return Err(error);
         }
         drop(admission_permit);
-        for offender in &filtered.offenders {
-            self.log(
-                "WARN",
-                format!(
-                    "RLN: quarantined a double-signal for {address}; offender commitment {offender}"
-                ),
-            )
-                .await;
-        }
-        let suppress_delivery: BTreeSet<PoolRecordId> =
-            filtered.suppress_delivery.into_iter().collect();
-        let delivered: Vec<Value> = delta
-            .into_iter()
-            .filter(|record| {
-                pool_record_id(record).is_none_or(|id| !suppress_delivery.contains(&id))
-            })
-            .collect();
+        self.log_pool_offenders(address, &filtered.offenders).await;
+        let delivered = deliverable_pool_records(delta, filtered.suppress_delivery);
         self.emit_pool_delta(address, delivered);
-        Ok((shard, snapshot, record_id))
+        Ok((route.shard, snapshot, route.record_id))
     }
 
     // --- inbound (peer push / sweep) -------------------------------------
@@ -1415,23 +1709,9 @@ impl AppState {
         // duplicate payload is accepted if it is already in the durable shard,
         // but a malformed, misrouted, RLN-rejected, or capacity-evicted record
         // must make the EDX request fail so the sender retains its outbox row.
-        let offered = pool::pool_records_of(&incoming);
-        let offered_ids: BTreeSet<PoolRecordId> =
-            offered.iter().filter_map(pool_record_id).collect();
-        let offer_well_formed = incoming.get("record_format").and_then(Value::as_str)
-            == Some(pool::POOL_RECORD_FORMAT)
-            && incoming
-                .get(pool::POOL_RECORDS_KEY)
-                .is_some_and(Value::is_array)
-            && offered.len() == offered_ids.len()
-            && offered.iter().all(|record| {
-                pool::verify_pool_record(record, &rule, week, now_ms()).is_ok()
-                    && record
-                        .get("tag")
-                        .and_then(Value::as_str)
-                        .and_then(b64_decode)
-                        .is_some_and(|tag| pool::shard_sub(&tag, rule.fanout) == sub)
-            });
+        let offered_ids = pool_record_ids(&incoming);
+        let offer_well_formed =
+            inbound_offer_is_well_formed(&incoming, &rule, week, sub, &offered_ids);
 
         // Bind the incoming records to THIS shard's sub-index FIRST — before any
         // nullifier-mutating RLN admission. A record whose tag routes to a
@@ -1444,92 +1724,23 @@ impl AppState {
         // Anonymous rate-limiting: for an RLN pool, drop any inbound record whose
         // proof does not verify (and let the verifier track nullifiers / evict
         // double-signallers) BEFORE it is merged into the shard we store & serve.
-        let mut filtered = if rule.rln_required {
-            self.filter_rln_admitted(address, &rule, week, incoming)
-                .await
-        } else {
-            FilteredRlnAdmission {
-                container: incoming,
-                ..FilteredRlnAdmission::default()
-            }
-        };
+        let mut filtered = self
+            .prepare_pool_admission(address, &rule, week, incoming)
+            .await?;
         let admission_permit = filtered.permit.take();
-        if !filtered.errors.is_empty() {
-            let error = filtered.errors.join("; ");
-            drop(admission_permit);
-            self.log(
-                "ERROR",
-                format!("RLN: admission failed for {address}: {error}"),
-            )
-            .await;
-            return Err(error);
-        }
         let incoming = filtered.container;
         let evicted = filtered.evicted;
-
-        // Fetch storage before taking the shard lock so the read-merge-write
-        // critical section holds no `?` early-exit that would skip lock cleanup.
-        let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
-
-        // Serialize the read-merge-write against a concurrent local append or
-        // another inbound merge on the same shard (see `pool_shard_lock`).
-        let shard_lock = self.pool_shard_lock(address, inner_path);
-        let outcome: Result<PoolWriteOutcome, String> = {
-            let _guard = shard_lock.lock().await;
-            (|| -> Result<PoolWriteOutcome, String> {
-                let existing = read_pool_container(&storage, inner_path)?;
-                let evicted_here: BTreeSet<PoolRecordId> = evicted.iter().copied().collect();
-                let before = pool::pool_records_of(&existing);
-                let filtered: Vec<Value> = before
-                    .iter()
-                    .filter(|record| {
-                        admission_record(record)
-                            .is_none_or(|record| !evicted_here.contains(&record.id))
-                    })
-                    .cloned()
-                    .collect();
-                let removed_here = filtered.len() != before.len();
-                let existing = if removed_here {
-                    pool::make_pool_container(filtered)
-                } else {
-                    existing
-                };
-                let (merged, delta) =
-                    pool::merge_pool(&existing, &incoming, &rule, week, sub, now_ms());
-                let expected: BTreeSet<PoolRecordId> = pool::pool_records_of(&incoming)
-                    .iter()
-                    .filter_map(pool_record_id)
-                    .collect();
-                let survived: BTreeSet<PoolRecordId> = pool::pool_records_of(&merged)
-                    .iter()
-                    .filter_map(pool_record_id)
-                    .collect();
-                if !expected.is_subset(&survived) {
-                    Ok(PoolWriteOutcome::CapacityRejected)
-                } else if !removed_here && merged == existing {
-                    let snapshot = serde_json::to_vec(&merged).map_err(|e| e.to_string())?;
-                    Ok(PoolWriteOutcome::Committed {
-                        delta: Vec::new(),
-                        accepted: offer_well_formed && offered_ids.is_subset(&survived),
-                        snapshot,
-                    })
-            } else {
-                    let snapshot = serde_json::to_vec(&merged).map_err(|e| e.to_string())?;
-                    storage
-                        .write_atomic_durable(inner_path, &snapshot)
-                        .map_err(|e| e.to_string())?;
-                    Ok(PoolWriteOutcome::Committed {
-                        delta,
-                        accepted: offer_well_formed && offered_ids.is_subset(&survived),
-                        snapshot,
-                    })
-            }
-            })()
+        let merge = InboundPoolMerge {
+            inner_path,
+            rule: &rule,
+            week,
+            sub,
+            incoming: &incoming,
+            evicted: &evicted,
+            offer_well_formed,
+            offered_ids: &offered_ids,
         };
-        drop(shard_lock);
-        self.release_pool_shard_lock(address, inner_path);
-
-        let (delta, accepted) = match outcome {
+        let (delta, accepted) = match self.commit_inbound_pool_shard(address, &merge).await {
             Ok(PoolWriteOutcome::Committed {
                 delta, accepted, ..
             }) => (delta, accepted),
@@ -1554,30 +1765,14 @@ impl AppState {
             return Err(e);
         }
         drop(admission_permit);
-        for offender in &filtered.offenders {
-            self.log(
-                "WARN",
-                format!(
-                    "RLN: quarantined a double-signal for {address}; offender commitment {offender}"
-                ),
-            )
-            .await;
-        }
+        self.log_pool_offenders(address, &filtered.offenders).await;
         if !accepted {
             return Err("peer pool update was not retained exactly".into());
         }
         if delta.is_empty() {
             return Ok(false);
         }
-        let suppress_delivery: BTreeSet<PoolRecordId> =
-            filtered.suppress_delivery.into_iter().collect();
-        let delivered: Vec<Value> = delta
-            .iter()
-            .filter(|record| {
-                pool_record_id(record).is_none_or(|id| !suppress_delivery.contains(&id))
-            })
-            .cloned()
-            .collect();
+        let delivered = deliverable_pool_records(delta, filtered.suppress_delivery);
         self.emit_pool_delta(address, delivered);
 
         let this = self.clone();
@@ -1713,68 +1908,29 @@ impl AppState {
         let Some(storage) = self.xite_storage(address).await else {
             return Vec::new();
         };
-        let now = now_ms();
-        let current_epoch = pool::epoch_now(now);
-        let oldest_rln_epoch = rln_oldest_active_epoch(current_epoch);
-        let cur_week = pool::week_of(current_epoch);
-        let mut records = Vec::new();
-        let mut rln_records = Vec::new();
-        for rule in &rules {
-            for path in pool::sync_shard_paths(rule, cur_week) {
-                let Some((week, sub)) = pool::parse_shard_path(rule, &path) else {
-                    continue;
-                };
-                if let Ok(bytes) = storage.read(&path) {
-                    if let Ok(container) = serde_json::from_slice::<Value>(&bytes) {
-                        for record in pool::pool_records_of(&container) {
-                            if pool::verify_pool_record(&record, rule, week, now).is_err() {
-                                continue;
-                            }
-                            let routed_here = record
-                                .get("tag")
-                                .and_then(|value| value.as_str())
-                                .and_then(b64_decode)
-                                .is_some_and(|tag| pool::shard_sub(&tag, rule.fanout) == sub);
-                            if !routed_here {
-                                continue;
-                            }
-                            if rule.rln_required {
-                                let Some(admission) = admission_record(&record) else {
-                                    continue;
-                                };
-                                if admission.epoch < oldest_rln_epoch {
-                                    continue;
-                                }
-                                rln_records.push((record, admission));
-                            } else {
-                                records.push(record);
-                    }
-                }
-            }
+        let (mut records, rln_records) = scan_all_pool_records(&storage, &rules, now_ms());
+        if rln_records.is_empty() {
+            return records;
         }
-            }
-        }
-        if !rln_records.is_empty() {
-            let Some(admission) = self.pool_admission.read().await.clone() else {
-                return records;
-            };
-            let address = address.to_string();
-            let checks: Vec<PoolAdmissionRecord> = rln_records
-                .iter()
-                .map(|(_, admission)| admission.clone())
-                .collect();
-            let allowed = tokio::task::spawn_blocking(move || {
-                admission.allow_rescan_records(&address, &checks)
-            })
-            .await
-            .unwrap_or_default();
-            records.extend(
-                rln_records
-                    .into_iter()
-                    .zip(allowed)
-                    .filter_map(|((record, _), allowed)| allowed.then_some(record)),
-            );
-        }
+        let Some(admission) = self.pool_admission.read().await.clone() else {
+            return records;
+        };
+        let address = address.to_string();
+        let checks: Vec<PoolAdmissionRecord> = rln_records
+            .iter()
+            .map(|(_, admission)| admission.clone())
+            .collect();
+        let allowed = tokio::task::spawn_blocking(move || {
+            admission.allow_rescan_records(&address, &checks)
+        })
+        .await
+        .unwrap_or_default();
+        records.extend(
+            rln_records
+                .into_iter()
+                .zip(allowed)
+                .filter_map(|((record, _), allowed)| allowed.then_some(record)),
+        );
         records
     }
 }

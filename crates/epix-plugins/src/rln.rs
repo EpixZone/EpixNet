@@ -140,6 +140,17 @@ fn proof_touches_poisoned_with_root_history(
     Err(wrong_units.unwrap_or(RlnError::InvalidProof))
 }
 
+fn parse_roster_commitments(roster: &[String]) -> Result<Vec<Fr>, String> {
+    let commitments: Vec<_> = roster
+        .iter()
+        .filter_map(|value| commitment_from_hex(value))
+        .collect();
+    if commitments.len() != roster.len() {
+        return Err("roster contains an invalid identity commitment".into());
+    }
+    Ok(commitments)
+}
+
 #[derive(Default)]
 struct AdmissionParts {
     persist: bool,
@@ -177,6 +188,8 @@ struct ProvisionalReservation {
     first_unit: u32,
     weight: u32,
 }
+
+type ParsedProvisionalKey = (String, String, u64, [u8; 32]);
 
 struct RlnReservationBatchInner {
     usage: Arc<UsageLedger>,
@@ -411,161 +424,148 @@ impl RlnAdmission {
         content: Option<&Value>,
         retained: &[PoolAdmissionRecord],
     ) -> PoolAdmissionRefresh {
-        let descriptor = content.map(parse_rln_descriptor).transpose();
-        let descriptor = match descriptor {
-            Ok(descriptor) => descriptor.flatten(),
-            Err(error) => {
-                self.pools
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(address);
-                return PoolAdmissionRefresh {
-                    error: Some(error),
-                    ..PoolAdmissionRefresh::default()
-                };
-            }
+        let descriptor = match content.map(parse_rln_descriptor).transpose() {
+            Ok(Some(Some(descriptor))) => descriptor,
+            Ok(Some(None)) | Ok(None) => return self.disable_pool(address),
+            Err(error) => return self.failed_refresh(address, error),
         };
-        let Some((limit, smallest_bucket, roster)) = descriptor else {
-            self.pools
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(address);
-            return match self.root_history.remove(address) {
-                Ok(()) => PoolAdmissionRefresh::default(),
-                Err(error) => PoolAdmissionRefresh {
-                    error: Some(error),
-                    ..PoolAdmissionRefresh::default()
-                },
-            };
+        let (limit, smallest_bucket, roster) = descriptor;
+        let commitments = match parse_roster_commitments(&roster) {
+            Ok(commitments) => commitments,
+            Err(error) => return self.failed_refresh(address, error),
         };
-        let commitments: Vec<_> = roster
-            .iter()
-            .filter_map(|h| commitment_from_hex(h))
-            .collect();
-        if commitments.len() != roster.len() {
-            self.pools
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
-                .remove(address);
-            return PoolAdmissionRefresh {
-                error: Some("roster contains an invalid identity commitment".into()),
+        let (mut candidate_pool, oldest_epoch) = match self.build_candidate_pool(
+            address,
+            limit,
+            smallest_bucket,
+            &commitments,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => return self.failed_refresh(address, error),
+        };
+        let (evict, offenders) = match self.scan_retained_records(
+            address,
+            oldest_epoch,
+            &mut candidate_pool,
+            retained,
+        ) {
+            Ok(result) => result,
+            Err(error) => return self.failed_refresh(address, error),
+        };
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(address.to_string(), candidate_pool);
+        PoolAdmissionRefresh {
+            evict,
+            offenders,
+            loaded_members: Some(commitments.len()),
+            error: None,
+            permit: None,
+        }
+    }
+
+    fn remove_pool(&self, address: &str) {
+        self.pools
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(address);
+    }
+
+    fn failed_refresh(&self, address: &str, error: String) -> PoolAdmissionRefresh {
+        self.remove_pool(address);
+        PoolAdmissionRefresh {
+            error: Some(error),
+            ..PoolAdmissionRefresh::default()
+        }
+    }
+
+    fn disable_pool(&self, address: &str) -> PoolAdmissionRefresh {
+        self.remove_pool(address);
+        match self.root_history.remove(address) {
+            Ok(()) => PoolAdmissionRefresh::default(),
+            Err(error) => PoolAdmissionRefresh {
+                error: Some(error),
                 ..PoolAdmissionRefresh::default()
-            };
+            },
         }
-        // Per-pool external-nullifier domain (derived from the pool address) so an
-        // identity's nullifiers never collide across pools. The send side derives
-        // it the same way inside the gate.
+    }
+
+    fn build_candidate_pool(
+        &self,
+        address: &str,
+        limit: u32,
+        smallest_bucket: usize,
+        commitments: &[Fr],
+    ) -> Result<(Pool, u64), String> {
+        // Per-pool external-nullifier domain comes from the pool address.
         let domain = message_signal(address.as_bytes());
-        match PoolGate::from_roster(domain, limit, &commitments) {
-            Ok(mut gate) => {
-                let current_epoch = epix_content::pool::epoch_now(epix_core::time::now_ms());
-                let oldest_epoch = rln_oldest_active_epoch(current_epoch) as u64;
-                let poisoned = match self.poison.snapshot_and_prune(address, oldest_epoch) {
-                    Ok(poisoned) => poisoned,
-                    Err(error) => {
-                        self.pools
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .remove(address);
-                        return PoolAdmissionRefresh {
-                            error: Some(error),
-                            ..PoolAdmissionRefresh::default()
-                        };
-                    }
-                };
-                for (epoch, keys) in poisoned {
-                    gate.poison_nullifiers(epoch, &keys);
-                }
-                let new_root = gate.root();
-                let current_epoch = current_epoch.max(0) as u64;
-                let historical_roots = match self.root_history.activate(
-                    address,
-                    &new_root,
-                    smallest_bucket,
-                    limit,
-                    current_epoch,
-                    oldest_epoch,
-                ) {
-                    Ok(history) => history,
-                    Err(error) => {
-                        self.pools
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .remove(address);
-                        return PoolAdmissionRefresh {
-                            error: Some(error),
-                            ..PoolAdmissionRefresh::default()
-                        };
-                    }
-                };
-                // The descriptor transition is durable before retained records
-                // are verified. A crash cannot forget which old root and weight
-                // policy admitted an immutable record.
-                let mut candidate_pool = Pool {
-                    gate,
-                    smallest_bucket,
-                    limit,
-                    historical_roots,
-                };
-                let mut evict = BTreeSet::new();
-                let mut offenders = BTreeSet::new();
-                let mut observed = BTreeSet::new();
-                let mut retained = retained.to_vec();
-                retained.sort_by_key(|record| record.id);
-                for record in retained {
-                    let admission = admit_with_root_history(&mut candidate_pool, &record);
-                    let parts = self.resolve_admission(
-                        address,
-                        record.epoch.max(0) as u64,
-                        oldest_epoch,
-                        &mut candidate_pool.gate,
-                        admission,
-                    );
-                    if let Some(error) = parts.error {
-                        self.pools
-                            .lock()
-                            .unwrap_or_else(PoisonError::into_inner)
-                            .remove(address);
-                        return PoolAdmissionRefresh {
-                            error: Some(error),
-                            ..PoolAdmissionRefresh::default()
-                        };
-                    }
-                    offenders.extend(parts.offenders);
-                    evict.extend(parts.evict.iter().copied());
-                    for displaced in parts.evict {
-                        observed.remove(&displaced);
-                    }
-                    if parts.persist {
-                        observed.insert(record.id);
-                    } else if !observed.contains(&record.id) {
-                        evict.insert(record.id);
-                    }
-                }
-                evict.retain(|id| !observed.contains(id));
-                self.pools
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .insert(address.to_string(), candidate_pool);
-                PoolAdmissionRefresh {
-                    evict: evict.into_iter().collect(),
-                    offenders: offenders.into_iter().collect(),
-                    loaded_members: Some(commitments.len()),
-                    error: None,
-                    permit: None,
-                }
+        let mut gate = PoolGate::from_roster(domain, limit, commitments)
+            .map_err(|error| error.to_string())?;
+        let current_epoch = epix_content::pool::epoch_now(epix_core::time::now_ms());
+        let oldest_epoch = rln_oldest_active_epoch(current_epoch) as u64;
+        for (epoch, keys) in self.poison.snapshot_and_prune(address, oldest_epoch)? {
+            gate.poison_nullifiers(epoch, &keys);
+        }
+        let historical_roots = self.root_history.activate(
+            address,
+            &gate.root(),
+            smallest_bucket,
+            limit,
+            current_epoch.max(0) as u64,
+            oldest_epoch,
+        )?;
+        Ok((
+            Pool {
+                gate,
+                smallest_bucket,
+                limit,
+                historical_roots,
+            },
+            oldest_epoch,
+        ))
+    }
+
+    fn scan_retained_records(
+        &self,
+        address: &str,
+        oldest_epoch: u64,
+        candidate_pool: &mut Pool,
+        retained: &[PoolAdmissionRecord],
+    ) -> Result<(Vec<PoolRecordId>, Vec<String>), String> {
+        let mut evict = BTreeSet::new();
+        let mut offenders = BTreeSet::new();
+        let mut observed = BTreeSet::new();
+        let mut retained = retained.to_vec();
+        retained.sort_by_key(|record| record.id);
+        for record in retained {
+            let admission = admit_with_root_history(candidate_pool, &record);
+            let parts = self.resolve_admission(
+                address,
+                record.epoch.max(0) as u64,
+                oldest_epoch,
+                &mut candidate_pool.gate,
+                admission,
+            );
+            if let Some(error) = parts.error {
+                return Err(error);
             }
-            Err(e) => {
-                self.pools
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(address);
-                PoolAdmissionRefresh {
-                    error: Some(e.to_string()),
-                    ..PoolAdmissionRefresh::default()
-                }
+            offenders.extend(parts.offenders);
+            evict.extend(parts.evict.iter().copied());
+            for displaced in parts.evict {
+                observed.remove(&displaced);
+            }
+            if parts.persist {
+                observed.insert(record.id);
+            } else if !observed.contains(&record.id) {
+                evict.insert(record.id);
             }
         }
+        evict.retain(|id| !observed.contains(id));
+        Ok((
+            evict.into_iter().collect(),
+            offenders.into_iter().collect(),
+        ))
     }
 
     /// Produce the RLN proof blob for `identity` (a member of `address`'s pool)
@@ -1785,94 +1785,10 @@ impl UsageLedger {
     ) -> Result<(), String> {
         let mut state = self.spent.lock().unwrap_or_else(PoisonError::into_inner);
         self.reload_if_poisoned(&mut state)?;
-        let result = (|| -> Result<HashMap<String, u32>, String> {
-            let mut candidate = state.as_ref().map_err(Clone::clone)?.clone();
-            let provisional_keys: Vec<String> = candidate
-                .keys()
-                .filter(|key| key.starts_with("reservation-provisional|"))
-                .cloned()
-                .collect();
-            let mut orphaned = Vec::new();
-            for key in provisional_keys {
-                let mut parts = key.split('|');
-                if parts.next() != Some("reservation-provisional") {
-                    continue;
-            }
-                let address = parts
-                    .next()
-                    .ok_or("invalid provisional RLN reservation address")?;
-                let id_hex = parts
-                    .next()
-                    .ok_or("invalid provisional RLN reservation id")?;
-                let epoch = parts
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .ok_or("invalid provisional RLN reservation epoch")?;
-                if parts.next().is_some() {
-                    return Err("invalid provisional RLN reservation key".into());
-                }
-                let id_bytes =
-                    hex::decode(id_hex).map_err(|_| "invalid provisional RLN reservation id")?;
-                let reservation_id: [u8; 32] = id_bytes
-                    .try_into()
-                    .map_err(|_| "invalid provisional RLN reservation id")?;
-                if active.contains(&key) {
-                    candidate.remove(&key);
-                    continue;
-                }
-                let first_key = format!("reservation|{address}|{id_hex}|{epoch}");
-                let weight_key = format!("reservation-weight|{address}|{id_hex}|{epoch}");
-                let first_unit = candidate
-                    .get(&first_key)
-                    .copied()
-                    .ok_or("provisional RLN reservation has no first unit")?;
-                let weight = candidate
-                    .get(&weight_key)
-                    .copied()
-                    .ok_or("provisional RLN reservation has no weight")?;
-                orphaned.push(ProvisionalReservation {
-                    address: address.to_string(),
-                    epoch,
-                    reservation_id,
-                    first_unit,
-                    weight,
-                });
-            }
-            orphaned.sort_by(|a, b| {
-                (&a.address, a.epoch, a.first_unit).cmp(&(&b.address, b.epoch, b.first_unit))
-            });
-            for reservation in orphaned.into_iter().rev() {
-                let cursor_key = format!("{}|{}", reservation.address, reservation.epoch);
-                let expected_tail = reservation
-                    .first_unit
-                    .checked_add(reservation.weight)
-                    .ok_or("RLN provisional reservation overflow")?;
-                if candidate.get(&cursor_key).copied() != Some(expected_tail) {
-                    return Err("orphaned RLN reservation is no longer the usage tail".into());
-                }
-                let id = hex::encode(reservation.reservation_id);
-                candidate.remove(&format!(
-                    "reservation|{}|{}|{}",
-                    reservation.address, id, reservation.epoch
-                ));
-                candidate.remove(&format!(
-                    "reservation-weight|{}|{}|{}",
-                    reservation.address, id, reservation.epoch
-                ));
-                candidate.remove(&Self::provisional_key(
-                    &reservation.address,
-                    reservation.epoch,
-                    reservation.reservation_id,
-                ));
-                if reservation.first_unit == 0 {
-                    candidate.remove(&cursor_key);
-                } else {
-                    candidate.insert(cursor_key, reservation.first_unit);
-            }
-        }
-            Self::persist(&self.path, &candidate)?;
-            Ok(candidate)
-        })();
+        let result = self.reconciled_candidate(
+            state.as_ref().map_err(Clone::clone)?,
+            active,
+        );
         match result {
             Ok(candidate) => {
                 *state = Ok(candidate);
@@ -1883,6 +1799,129 @@ impl UsageLedger {
                 Err(error)
             }
         }
+    }
+
+    fn reconciled_candidate(
+        &self,
+        current: &HashMap<String, u32>,
+        active: &std::collections::HashSet<String>,
+    ) -> Result<HashMap<String, u32>, String> {
+        let mut candidate = current.clone();
+        let mut orphaned = Self::collect_orphaned_reservations(&mut candidate, active)?;
+        orphaned.sort_by(|a, b| {
+            (&a.address, a.epoch, a.first_unit).cmp(&(&b.address, b.epoch, b.first_unit))
+        });
+        for reservation in orphaned.into_iter().rev() {
+            Self::rewind_orphaned_reservation(&mut candidate, &reservation)?;
+        }
+        Self::persist(&self.path, &candidate)?;
+        Ok(candidate)
+    }
+
+    fn collect_orphaned_reservations(
+        candidate: &mut HashMap<String, u32>,
+        active: &std::collections::HashSet<String>,
+    ) -> Result<Vec<ProvisionalReservation>, String> {
+        let provisional_keys: Vec<String> = candidate
+            .keys()
+            .filter(|key| key.starts_with("reservation-provisional|"))
+            .cloned()
+            .collect();
+        let mut orphaned = Vec::new();
+        for key in provisional_keys {
+            let Some((address, id_hex, epoch, reservation_id)) =
+                Self::parse_provisional_key(&key)?
+            else {
+                continue;
+            };
+            if active.contains(&key) {
+                candidate.remove(&key);
+                continue;
+            }
+            let first_unit = candidate
+                .get(&format!("reservation|{address}|{id_hex}|{epoch}"))
+                .copied()
+                .ok_or("provisional RLN reservation has no first unit")?;
+            let weight = candidate
+                .get(&format!("reservation-weight|{address}|{id_hex}|{epoch}"))
+                .copied()
+                .ok_or("provisional RLN reservation has no weight")?;
+            orphaned.push(ProvisionalReservation {
+                address,
+                epoch,
+                reservation_id,
+                first_unit,
+                weight,
+            });
+        }
+        Ok(orphaned)
+    }
+
+    fn parse_provisional_key(
+        key: &str,
+    ) -> Result<Option<ParsedProvisionalKey>, String> {
+        let mut parts = key.split('|');
+        if parts.next() != Some("reservation-provisional") {
+            return Ok(None);
+        }
+        let address = parts
+            .next()
+            .ok_or("invalid provisional RLN reservation address")?;
+        let id_hex = parts
+            .next()
+            .ok_or("invalid provisional RLN reservation id")?;
+        let epoch = parts
+            .next()
+            .and_then(|value| value.parse::<u64>().ok())
+            .ok_or("invalid provisional RLN reservation epoch")?;
+        if parts.next().is_some() {
+            return Err("invalid provisional RLN reservation key".into());
+        }
+        let id_bytes = hex::decode(id_hex)
+            .map_err(|_| "invalid provisional RLN reservation id")?;
+        let reservation_id = id_bytes
+            .try_into()
+            .map_err(|_| "invalid provisional RLN reservation id")?;
+        Ok(Some((
+            address.to_string(),
+            id_hex.to_string(),
+            epoch,
+            reservation_id,
+        )))
+    }
+
+    fn rewind_orphaned_reservation(
+        candidate: &mut HashMap<String, u32>,
+        reservation: &ProvisionalReservation,
+    ) -> Result<(), String> {
+        let cursor_key = format!("{}|{}", reservation.address, reservation.epoch);
+        let expected_tail = reservation
+            .first_unit
+            .checked_add(reservation.weight)
+            .ok_or("RLN provisional reservation overflow")?;
+        if candidate.get(&cursor_key).copied() != Some(expected_tail) {
+            return Err("orphaned RLN reservation is no longer the usage tail".into());
+        }
+        let id = hex::encode(reservation.reservation_id);
+        candidate.remove(&format!(
+            "reservation|{}|{}|{}",
+            reservation.address, id, reservation.epoch
+        ));
+        candidate.remove(&format!(
+            "reservation-weight|{}|{}|{}",
+            reservation.address, id, reservation.epoch
+        ));
+        candidate.remove(&Self::provisional_key(
+            &reservation.address,
+            reservation.epoch,
+            reservation.reservation_id,
+        ));
+        if reservation.first_unit == 0 {
+            candidate.remove(&cursor_key);
+        } else {
+            candidate.insert(cursor_key, reservation.first_unit);
+        }
+        Ok(())
     }
 
     fn persist(path: &Option<PathBuf>, spent: &HashMap<String, u32>) -> Result<(), String> {

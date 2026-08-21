@@ -71,6 +71,13 @@ struct SeenShare {
     record_id: RecordId,
 }
 
+struct OverlapScan {
+    overlap_records: BTreeSet<RecordId>,
+    recovered_secret: Option<SecretFr>,
+    same_share: usize,
+    incoming_keys: Vec<NullifierId>,
+}
+
 /// Records the first share seen for each nullifier, per epoch, so a second
 /// distinct share reveals the offender. Kept in memory over the active epoch
 /// window and pruned with [`NullifierLog::prune_before`].
@@ -106,64 +113,24 @@ impl NullifierLog {
         record_id: RecordId,
         slots: &[Slot],
     ) -> Result<Observation, RlnError> {
-        let mut overlap_records = BTreeSet::new();
-        let mut recovered_secret: Option<SecretFr> = None;
-        let mut same_share = 0usize;
-        let mut incoming_keys = Vec::with_capacity(slots.len());
-
-        // First pass discovers the complete overlap component touched by this
-        // record and obtains slashing evidence from every differing share.
-        for slot in slots {
-            let key = fr_key(&slot.nullifier)?;
-            incoming_keys.push(key);
-            if self
-                .poisoned
-                .get(&epoch)
-                .is_some_and(|poisoned| poisoned.contains(&key))
-            {
-                return Ok(Observation::Quarantined);
-            }
-            if let Some(first) = self.seen.get(&epoch).and_then(|m| m.get(&key)) {
-                overlap_records.insert(first.record_id);
-                if first.share.0 != slot.share.0 {
-                    let recovered = compute_id_secret(first.share, slot.share)
-                        .map_err(|e| RlnError::Recover(e.to_string()))?;
-                    if let Some(expected) = &recovered_secret {
-                        if **expected != *recovered {
-                            return Err(RlnError::Recover(
-                                "colliding slots recovered different identity secrets".into(),
-                            ));
-                        }
-                    } else {
-                        recovered_secret = Some(recovered);
-                    }
-                } else {
-                    same_share += 1;
-                }
-            }
-        }
+        let Some(scan) = self.scan_overlap(epoch, slots)? else {
+            return Ok(Observation::Quarantined);
+        };
+        let OverlapScan {
+            overlap_records,
+            recovered_secret,
+            same_share,
+            incoming_keys,
+        } = scan;
 
         if let Some(recovered_secret) = recovered_secret {
-            // Quarantine the whole conflicting component. Keeping a
-            // deterministic replacement would make each new lower record id a
-            // fresh application delivery and turn rate limiting into a grind.
-            // Leave the observed shares in memory so repeated traffic remains
-            // quarantined until the epoch ages out.
-            let mut poisoned_nullifiers: BTreeSet<NullifierId> =
-                incoming_keys.into_iter().collect();
-            if let Some(records) = self.records.get(&epoch) {
-                for record_id in &overlap_records {
-                    if let Some(keys) = records.get(record_id) {
-                        poisoned_nullifiers.extend(keys.iter().copied());
-                    }
-                }
-            }
-            return Ok(Observation::DoubleSignal {
+            return Ok(self.double_signal_observation(
+                epoch,
                 recovered_secret,
-                conflicting_records: overlap_records.into_iter().collect(),
-                poisoned_nullifiers: poisoned_nullifiers.into_iter().collect(),
-            });
-                }
+                overlap_records,
+                incoming_keys,
+            ));
+        }
 
         // With no different share, only one complete wrapper or allowance
         // window may survive. Select it by stable id so opposite-first
@@ -175,7 +142,7 @@ impl NullifierLog {
                 keep_record,
                 evicted_records,
             });
-            }
+        }
         if same_share > 0 {
             let (keep_record, evicted_records) =
                 self.resolve_overlap(epoch, record_id, slots, &overlap_records)?;
@@ -186,6 +153,93 @@ impl NullifierLog {
         }
         self.insert_record(epoch, record_id, slots)?;
         Ok(Observation::Fresh)
+    }
+
+    /// Discover the complete overlap component before mutating live state.
+    fn scan_overlap(&self, epoch: u64, slots: &[Slot]) -> Result<Option<OverlapScan>, RlnError> {
+        let mut scan = OverlapScan {
+            overlap_records: BTreeSet::new(),
+            recovered_secret: None,
+            same_share: 0,
+            incoming_keys: Vec::with_capacity(slots.len()),
+        };
+        for slot in slots {
+            let Some(key) = self.scan_slot(epoch, slot, &mut scan)? else {
+                return Ok(None);
+            };
+            scan.incoming_keys.push(key);
+        }
+        Ok(Some(scan))
+    }
+
+    fn scan_slot(
+        &self,
+        epoch: u64,
+        slot: &Slot,
+        scan: &mut OverlapScan,
+    ) -> Result<Option<NullifierId>, RlnError> {
+        let key = fr_key(&slot.nullifier)?;
+        if self
+            .poisoned
+            .get(&epoch)
+            .is_some_and(|poisoned| poisoned.contains(&key))
+        {
+            return Ok(None);
+        }
+        let Some(first) = self.seen.get(&epoch).and_then(|seen| seen.get(&key)) else {
+            return Ok(Some(key));
+        };
+        scan.overlap_records.insert(first.record_id);
+        if first.share.0 == slot.share.0 {
+            scan.same_share += 1;
+            return Ok(Some(key));
+        }
+        Self::merge_recovered_secret(&mut scan.recovered_secret, first.share, slot.share)?;
+        Ok(Some(key))
+    }
+
+    fn merge_recovered_secret(
+        expected: &mut Option<SecretFr>,
+        first: (Fr, Fr),
+        second: (Fr, Fr),
+    ) -> Result<(), RlnError> {
+        let recovered = compute_id_secret(first, second)
+            .map_err(|error| RlnError::Recover(error.to_string()))?;
+        match expected {
+            Some(expected) if **expected != *recovered => Err(RlnError::Recover(
+                "colliding slots recovered different identity secrets".into(),
+            )),
+            Some(_) => Ok(()),
+            None => {
+                *expected = Some(recovered);
+                Ok(())
+            }
+        }
+    }
+
+    fn double_signal_observation(
+        &self,
+        epoch: u64,
+        recovered_secret: SecretFr,
+        overlap_records: BTreeSet<RecordId>,
+        incoming_keys: Vec<NullifierId>,
+    ) -> Observation {
+        // Quarantine the whole conflicting component. Keeping a deterministic
+        // replacement would make each lower record id a fresh delivery.
+        let mut poisoned_nullifiers: BTreeSet<NullifierId> =
+            incoming_keys.into_iter().collect();
+        if let Some(records) = self.records.get(&epoch) {
+            for record_id in &overlap_records {
+                if let Some(keys) = records.get(record_id) {
+                    poisoned_nullifiers.extend(keys.iter().copied());
+                }
+            }
+        }
+        Observation::DoubleSignal {
+            recovered_secret,
+            conflicting_records: overlap_records.into_iter().collect(),
+            poisoned_nullifiers: poisoned_nullifiers.into_iter().collect(),
+        }
     }
 
     fn insert_record(

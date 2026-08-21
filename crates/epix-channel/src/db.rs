@@ -14,8 +14,8 @@
 use epix_core::{Error, Result};
 use epix_db::Database;
 use epix_envelope::{
-    EnvelopeStore, InboundCommit, NewSession, OutboundCommit, OutboundRecovery, PendingOutbound,
-    RlnReservation, SessionMatch,
+    EnvelopeStore, InboundCommit, NewSession, OutboundCommit, OutboundMessage, OutboundRecovery,
+    OutboundSession, PendingOutbound, RlnReservation, SessionMatch,
 };
 use rusqlite::OptionalExtension;
 use serde_json::Value;
@@ -443,30 +443,39 @@ impl ChannelDb {
     fn ensure_encryption_compatible(&self) -> Result<()> {
         let mut conn = self.db.conn()?;
         if self.enc_key.is_none() {
-            let has_encrypted: i64 = conn
-                .query_row(
-                    "SELECT EXISTS(
-                    SELECT 1 FROM msg WHERE enc=1
-                    UNION ALL
-                    SELECT 1 FROM session WHERE enc=1
-                    UNION ALL
-                    SELECT 1 FROM thread WHERE enc=1
-                    UNION ALL
-                    SELECT 1 FROM outbound WHERE key_enc=1
-                 )",
-                    [],
-                    |row| row.get(0),
-                )
-                .map_err(db_err)?;
-            if has_encrypted != 0 {
-                return Err(Error::Db(
-                    "channels.db contains encrypted rows; enable channel_encrypt_at_rest to open it"
-                        .into(),
-                ));
-            }
-            return Ok(());
+            return Self::reject_encrypted_rows_without_key(&conn);
         }
 
+        self.authenticate_encrypted_rows(&conn)?;
+        self.encrypt_plaintext_rows(&mut conn)
+    }
+
+    fn reject_encrypted_rows_without_key(conn: &rusqlite::Connection) -> Result<()> {
+        let has_encrypted: i64 = conn
+            .query_row(
+                "SELECT EXISTS(
+                SELECT 1 FROM msg WHERE enc=1
+                UNION ALL
+                SELECT 1 FROM session WHERE enc=1
+                UNION ALL
+                SELECT 1 FROM thread WHERE enc=1
+                UNION ALL
+                SELECT 1 FROM outbound WHERE key_enc=1
+             )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(db_err)?;
+        if has_encrypted != 0 {
+            return Err(Error::Db(
+                "channels.db contains encrypted rows; enable channel_encrypt_at_rest to open it"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn authenticate_encrypted_rows(&self, conn: &rusqlite::Connection) -> Result<()> {
         // Authenticate every encrypted field before touching plaintext rows.
         // Sampling one row would let a later corrupt or differently-keyed row
         // survive startup and fail only after the index was already in use.
@@ -519,7 +528,10 @@ impl ChannelDb {
                 self.dec_text(&row.map_err(db_err)?, 1)?;
             }
         }
+        Ok(())
+    }
 
+    fn encrypt_plaintext_rows(&self, conn: &mut rusqlite::Connection) -> Result<()> {
         // Enabling encryption on an existing plaintext index is an all-or-none
         // migration. No successful open may leave sensitive enc=0 rows behind.
         let tx = conn.transaction().map_err(db_err)?;
@@ -1309,39 +1321,49 @@ impl ChannelDb {
         for commit in commits {
             sent_rows += usize::from(commit.sent.is_some());
             for session in &commit.sessions {
-                if let Some(session_id) = session.session_id {
-                    if !session_ids.insert(session_id) {
-                        return Err(Error::Db(format!(
-                            "outbound batch advances session {session_id} more than once"
-                        )));
-                    }
-                    if session.ratchet_before.is_none() {
-                        return Err(Error::Db(format!(
-                            "outbound session {session_id} is missing its compare-and-swap state"
-                        )));
-                    }
-                } else if session.ratchet_before.is_some() {
-                    return Err(Error::Db(
-                        "new outbound session unexpectedly has prior ratchet state".into(),
-                    ));
-                }
-                let leg = (
-                    session.identity_id,
-                    session.conv_id.clone(),
-                    session.peer_ik.clone(),
-                );
-                if !legs.insert(leg) {
-                    return Err(Error::Db(format!(
-                        "outbound batch advances leg {}/{}/{} more than once",
-                        session.identity_id, session.conv_id, session.peer_ik
-                    )));
-                }
+                Self::validate_outbound_session(session, &mut session_ids, &mut legs)?;
             }
         }
         if sent_rows > 1 {
             return Err(Error::Db(
                 "outbound batch contains more than one logical sent message".into(),
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_outbound_session(
+        session: &OutboundSession,
+        session_ids: &mut std::collections::HashSet<i64>,
+        legs: &mut std::collections::HashSet<(i64, String, String)>,
+    ) -> Result<()> {
+        if let Some(session_id) = session.session_id {
+            if !session_ids.insert(session_id) {
+                return Err(Error::Db(format!(
+                    "outbound batch advances session {session_id} more than once"
+                )));
+            }
+            if session.ratchet_before.is_none() {
+                return Err(Error::Db(format!(
+                    "outbound session {session_id} is missing its compare-and-swap state"
+                )));
+            }
+        } else if session.ratchet_before.is_some() {
+            return Err(Error::Db(
+                "new outbound session unexpectedly has prior ratchet state".into(),
+            ));
+        }
+
+        let leg = (
+            session.identity_id,
+            session.conv_id.clone(),
+            session.peer_ik.clone(),
+        );
+        if !legs.insert(leg) {
+            return Err(Error::Db(format!(
+                "outbound batch advances leg {}/{}/{} more than once",
+                session.identity_id, session.conv_id, session.peer_ik
+            )));
         }
         Ok(())
     }
@@ -1362,140 +1384,10 @@ impl ChannelDb {
         }
 
         for session in &commit.sessions {
-            reject_revoked_peer(
-                tx,
-                session.peer_xid.as_deref(),
-                session.peer_auth.as_deref(),
-                &session.peer_ik,
-            )?;
-            let (ratchet_stored, enc) = self.enc_blob(&session.ratchet_after);
-            if let Some(session_id) = session.session_id {
-                let current = tx
-                    .query_row(
-                        "SELECT identity_id, conv_id, peer_ik, ratchet, enc
-                         FROM session WHERE session_id=?1",
-                        [session_id],
-                        |row| {
-                            Ok((
-                                row.get::<_, i64>(0)?,
-                                row.get::<_, String>(1)?,
-                                row.get::<_, String>(2)?,
-                                row.get::<_, Vec<u8>>(3)?,
-                                row.get::<_, i64>(4)?,
-                            ))
-                        },
-                    )
-                    .optional()
-                    .map_err(db_err)?
-                    .ok_or_else(|| {
-                        Error::Db(format!(
-                            "outbound session {session_id} disappeared before commit"
-                        ))
-                    })?;
-                if current.0 != session.identity_id
-                    || current.1 != session.conv_id
-                    || current.2 != session.peer_ik
-                {
-                    return Err(Error::Db(format!(
-                        "outbound session {session_id} does not match its staged leg"
-                    )));
-                }
-                let before = session.ratchet_before.as_deref().ok_or_else(|| {
-                    Error::Db(format!(
-                        "outbound session {session_id} is missing its compare-and-swap state"
-                    ))
-                })?;
-                if self.dec_blob(&current.3, current.4)? != before {
-                    return Err(Error::Db(format!(
-                        "outbound session {session_id} advanced after it was sealed"
-                    )));
-                }
-                let changed = tx
-                    .execute(
-                        "UPDATE session SET ratchet=?1, enc=?2,
-                            peer_auth=COALESCE(?3, peer_auth)
-                         WHERE session_id=?4",
-                        rusqlite::params![ratchet_stored, enc, session.peer_auth, session_id],
-                    )
-                    .map_err(db_err)?;
-                if changed != 1 {
-                    return Err(Error::Db(format!(
-                        "outbound session {session_id} disappeared before commit"
-                    )));
-                }
-            } else {
-                tx.execute(
-                    "INSERT INTO session
-                        (identity_id, conv_id, peer_xid, peer_ik, peer_auth, role,
-                         ratchet, enc, established_ms)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    rusqlite::params![
-                        session.identity_id,
-                        session.conv_id,
-                        session.peer_xid,
-                        session.peer_ik,
-                        session.peer_auth,
-                        session.role,
-                        ratchet_stored,
-                        enc,
-                        session.established_ms,
-                    ],
-                )
-                .map_err(db_err)?;
-                let session_id = tx.last_insert_rowid();
-                for (n, tag) in &session.recv_tags {
-                    tx.execute(
-                        "INSERT OR IGNORE INTO expected_tag (tag, session_id, n) VALUES (?1, ?2, ?3)",
-                        rusqlite::params![tag, session_id, *n as i64],
-                    )
-                    .map_err(db_err)?;
-                }
-            }
+            self.commit_outbound_session_tx(tx, session)?;
         }
 
-        let msg_id = if let Some(sent) = &commit.sent {
-            let members_json = if sent.members.is_empty() {
-                None
-            } else {
-                Some(serde_json::to_string(&sent.members)?)
-            };
-            let (subject_stored, body_stored, snippet_stored, enc) =
-                self.seal_content(&sent.subject, &sent.body);
-            let thread_id = upsert_thread_tx(
-                tx,
-                sent.identity_id,
-                &sent.conv_id,
-                sent.peer_xid.as_deref(),
-                members_json.as_deref(),
-                &subject_stored,
-                &snippet_stored,
-                enc,
-                sent.sent_ms,
-                0,
-                1,
-            )?;
-            tx.execute(
-                "INSERT INTO msg
-                    (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
-                     sent_ms, received_ms, epoch, read, sign_h)
-                 VALUES (?1, ?2, ?3, 'out', ?4, ?5, ?6, ?7, ?8, ?8, 0, 1, NULL)",
-                rusqlite::params![
-                    sent.identity_id,
-                    thread_id,
-                    sent.conv_id,
-                    sent.sender_xid,
-                    subject_stored,
-                    body_stored,
-                    enc,
-                    sent.sent_ms,
-                ],
-            )
-            .map_err(db_err)?;
-            tx.last_insert_rowid()
-        } else {
-            0
-        };
-
+        let msg_id = self.insert_outbound_message_tx(tx, commit.sent.as_ref())?;
         let (author_key, key_enc) = self.enc_text(&commit.recovery.author_private_key);
         let (rln_first_unit, rln_weight, rln_root) = commit
             .recovery
@@ -1536,6 +1428,161 @@ impl ChannelDb {
             .map_err(db_err)?;
         }
         Ok((outbox_id, msg_id))
+    }
+
+    fn commit_outbound_session_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        session: &OutboundSession,
+    ) -> Result<()> {
+        reject_revoked_peer(
+            tx,
+            session.peer_xid.as_deref(),
+            session.peer_auth.as_deref(),
+            &session.peer_ik,
+        )?;
+        let (ratchet_stored, enc) = self.enc_blob(&session.ratchet_after);
+        let Some(session_id) = session.session_id else {
+            return Self::insert_outbound_session_tx(tx, session, ratchet_stored, enc);
+        };
+
+        let current = tx
+            .query_row(
+                "SELECT identity_id, conv_id, peer_ik, ratchet, enc
+                 FROM session WHERE session_id=?1",
+                [session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Vec<u8>>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                Error::Db(format!(
+                    "outbound session {session_id} disappeared before commit"
+                ))
+            })?;
+        if current.0 != session.identity_id
+            || current.1 != session.conv_id
+            || current.2 != session.peer_ik
+        {
+            return Err(Error::Db(format!(
+                "outbound session {session_id} does not match its staged leg"
+            )));
+        }
+        let before = session.ratchet_before.as_deref().ok_or_else(|| {
+            Error::Db(format!(
+                "outbound session {session_id} is missing its compare-and-swap state"
+            ))
+        })?;
+        if self.dec_blob(&current.3, current.4)? != before {
+            return Err(Error::Db(format!(
+                "outbound session {session_id} advanced after it was sealed"
+            )));
+        }
+        let changed = tx
+            .execute(
+                "UPDATE session SET ratchet=?1, enc=?2,
+                    peer_auth=COALESCE(?3, peer_auth)
+                 WHERE session_id=?4",
+                rusqlite::params![ratchet_stored, enc, session.peer_auth, session_id],
+            )
+            .map_err(db_err)?;
+        if changed != 1 {
+            return Err(Error::Db(format!(
+                "outbound session {session_id} disappeared before commit"
+            )));
+        }
+        Ok(())
+    }
+
+    fn insert_outbound_session_tx(
+        tx: &rusqlite::Transaction<'_>,
+        session: &OutboundSession,
+        ratchet_stored: Vec<u8>,
+        enc: i64,
+    ) -> Result<()> {
+        tx.execute(
+            "INSERT INTO session
+                (identity_id, conv_id, peer_xid, peer_ik, peer_auth, role,
+                 ratchet, enc, established_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            rusqlite::params![
+                session.identity_id,
+                session.conv_id,
+                session.peer_xid,
+                session.peer_ik,
+                session.peer_auth,
+                session.role,
+                ratchet_stored,
+                enc,
+                session.established_ms,
+            ],
+        )
+        .map_err(db_err)?;
+        let session_id = tx.last_insert_rowid();
+        for (n, tag) in &session.recv_tags {
+            tx.execute(
+                "INSERT OR IGNORE INTO expected_tag (tag, session_id, n) VALUES (?1, ?2, ?3)",
+                rusqlite::params![tag, session_id, *n as i64],
+            )
+            .map_err(db_err)?;
+        }
+        Ok(())
+    }
+
+    fn insert_outbound_message_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        sent: Option<&OutboundMessage>,
+    ) -> Result<i64> {
+        let Some(sent) = sent else {
+            return Ok(0);
+        };
+        let members_json = if sent.members.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&sent.members)?)
+        };
+        let (subject_stored, body_stored, snippet_stored, enc) =
+            self.seal_content(&sent.subject, &sent.body);
+        let thread_id = upsert_thread_tx(
+            tx,
+            sent.identity_id,
+            &sent.conv_id,
+            sent.peer_xid.as_deref(),
+            members_json.as_deref(),
+            &subject_stored,
+            &snippet_stored,
+            enc,
+            sent.sent_ms,
+            0,
+            1,
+        )?;
+        tx.execute(
+            "INSERT INTO msg
+                (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
+                 sent_ms, received_ms, epoch, read, sign_h)
+             VALUES (?1, ?2, ?3, 'out', ?4, ?5, ?6, ?7, ?8, ?8, 0, 1, NULL)",
+            rusqlite::params![
+                sent.identity_id,
+                thread_id,
+                sent.conv_id,
+                sent.sender_xid,
+                subject_stored,
+                body_stored,
+                enc,
+                sent.sent_ms,
+            ],
+        )
+        .map_err(db_err)?;
+        Ok(tx.last_insert_rowid())
     }
 
     fn query_pending_outbound<P: rusqlite::Params>(

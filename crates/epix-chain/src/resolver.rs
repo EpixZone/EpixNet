@@ -152,14 +152,8 @@ impl XidResolver {
         use_snapshot_cache: bool,
     ) -> Result<(DomainSnapshot, Option<(u64, String)>)> {
         let key = format!("{name}.{tld}");
-        if use_snapshot_cache {
-            if let Some((snap, at, binding)) = self.cache.read().await.get(&key) {
-                let checkpoint_current =
-                    snapshot_binding_current(binding.as_ref(), crate::verify_finality_enabled());
-                if at.elapsed() < self.ttl && checkpoint_current {
-                    return Ok((snap.clone(), binding.clone()));
-                }
-            }
+        if let Some(cached) = self.cached_snapshot(&key, use_snapshot_cache).await {
+            return Ok(cached);
         }
 
         let data = self
@@ -229,28 +223,48 @@ impl XidResolver {
         }
 
         // Step 3 - the proof root must be a state digest validators finalized.
-        let binding = if verify {
-            // Cryptographic: verify signed validator power over `proof_root`
-            // against the pinned set (no trust in any RPC boolean).
-            self.verify_finality_gated(proof_root).await?
-        } else {
-            // Legacy: the digest is confirmed finalized via the RPC boolean,
-            // cached briefly (global chain state). A proof that doesn't match the
-            // cached digest forces a fresh fetch before we reject it.
-            match self.digest_matches(proof_root, false).await? {
-                Some(binding) => binding,
-                None => self
-                    .digest_matches(proof_root, true)
-                    .await?
-                    .ok_or(ChainError::DigestMismatch)?,
-            }
-        };
+        let binding = self.finality_binding(proof_root, verify).await?;
 
         let binding = self
             .publish_snapshot(key, snapshot.clone(), &binding)
             .await?;
         Ok((snapshot, binding))
+    }
+
+    async fn cached_snapshot(
+        &self,
+        key: &str,
+        use_snapshot_cache: bool,
+    ) -> Option<(DomainSnapshot, Option<(u64, String)>)> {
+        if !use_snapshot_cache {
+            return None;
         }
+        let cache = self.cache.read().await;
+        let (snapshot, cached_at, binding) = cache.get(key)?;
+        let checkpoint_current =
+            snapshot_binding_current(binding.as_ref(), crate::verify_finality_enabled());
+        (cached_at.elapsed() < self.ttl && checkpoint_current)
+            .then(|| (snapshot.clone(), binding.clone()))
+    }
+
+    async fn finality_binding(&self, proof_root: &str, verify: bool) -> Result<FinalityBinding> {
+        if verify {
+            // Cryptographic: verify signed validator power over `proof_root`
+            // against the pinned set (no trust in any RPC boolean).
+            return self.verify_finality_gated(proof_root).await;
+        }
+
+        // Legacy: the digest is confirmed finalized via the RPC boolean,
+        // cached briefly (global chain state). A proof that doesn't match the
+        // cached digest forces a fresh fetch before we reject it.
+        match self.digest_matches(proof_root, false).await? {
+            Some(binding) => Ok(binding),
+            None => self
+                .digest_matches(proof_root, true)
+                .await?
+                .ok_or(ChainError::DigestMismatch),
+        }
+    }
 
     async fn publish_snapshot(
         &self,
