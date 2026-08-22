@@ -8,7 +8,7 @@ not source - the source lives in the separate `EpixZone/epix-wallet` repo
 You normally do not stage it by hand. The wallet build is pinned by
 `shells/wallet-ext.rev` (an epix-wallet commit on its `epix` branch). When this
 directory is missing or does not match the pin, `epix-browser`'s `build.rs`
-downloads that commit's immutable `wallet-<rev>` GitHub release (the wallet CI
+downloads that commit's versioned `wallet-<rev>` GitHub release (the wallet CI
 publishes one per push to `epix`), so a fresh clone builds with no wallet
 checkout at all. When the staged copy already matches the pin, the build reuses
 it with no network access.

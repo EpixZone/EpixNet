@@ -3,9 +3,9 @@
 //!
 //! The wallet extension (the forked Keplr build, staged at `shells/wallet-ext`)
 //! is embedded in the binary and written out as an XPI into
-//! `<profile>/extensions/<id>.xpi`. It carries the whole Epix browser policy -
-//! the wallet, the clearnet-block enforcement, and the Tor/I2P panel - so it
-//! fully replaces the old standalone `browser-ext`. The native-messaging
+//! `<profile>/extensions/<id>.xpi`. It carries the wallet, live direct/Tor
+//! routing for general clearnet, and the Tor/I2P panel, fully replacing the old
+//! standalone `browser-ext`. The native-messaging
 //! manifest is written to Firefox's per-user host directory, pointing at the
 //! `epix-nmh` binary (a sibling of this launcher) and allowing the wallet id.
 //! Prefs to allow the unsigned extension (Developer Edition / ESR) are set by
@@ -13,7 +13,7 @@
 //!
 //! `shells/wallet-ext` is a build artifact (gitignored): when it is missing or
 //! stale, this crate's `build.rs` downloads the wallet build pinned by
-//! `shells/wallet-ext.rev` (its immutable `wallet-<rev>` release) before
+//! `shells/wallet-ext.rev` (its versioned `wallet-<rev>` release) before
 //! `include_dir!` embeds it (see `shells/wallet-ext/README.md` for local-build
 //! overrides and how to bump the pin).
 
