@@ -5,12 +5,11 @@
 //! a request; we answer. This module has the pure request handling (so it is
 //! unit-testable); `main` does the stdio framing.
 //!
-//! Requests the extension makes:
+//! Native host requests:
 //! - `{"cmd":"status"}` -> `{ serving, ui_port }`
+//! - `{"cmd":"getTorClearnet"}` -> `{ on: bool }`
+//! - `{"cmd":"setTorClearnet","on":true}` -> `{ ok, on }`
 //! - `{"cmd":"resolve","name":"talk.epix"}` -> `{ address }` or `{ error }`
-//! - `{"cmd":"getClearnetAllow","xite":"talk.epix"}` -> `{ allow: bool }`
-//! - `{"cmd":"setClearnetAllow","xite":"talk.epix","allow":true}` -> `{ ok }`
-//! - `{"cmd":"listClearnetAllow"}` -> `{ xites: [..] }`
 //! - `{"cmd":"ledgerList"}` -> `{ devices: [..] }` (Ledger over HID)
 //! - `{"cmd":"ledgerExchange","apdu":"<hex>"}` -> `{ response: "<hex>" }`
 
@@ -20,8 +19,10 @@ use std::path::{Path, PathBuf};
 
 pub mod ledger;
 
-/// Per-browser settings persisted next to the node data (which xites may reach
-/// clearnet). The extension enforces the block; this is the source of truth.
+/// Per-browser settings persisted next to the node data. `tor_clearnet` selects
+/// direct or Tor transport for general clearnet. `clearnet_allow` is retained
+/// only for compatibility with older wallet builds and profiles; routing never
+/// consults it.
 pub struct Settings {
     path: PathBuf,
 }
@@ -182,6 +183,8 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
                 },
             }
         }
+        // Backward compatibility for older wallet builds that still consult
+        // the per-site values. Current wallet builds ignore these commands.
         "getClearnetAllow" => {
             let xite = req.get("site").and_then(|v| v.as_str()).unwrap_or("");
             json!({ "allow": settings.clearnet_allowed(xite) })

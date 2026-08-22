@@ -22,7 +22,7 @@ separate `EpixZone/epix-wallet` repo (branch `epix`); the shells consume a
 prebuilt artifact, so you do not need a wallet checkout to build them.
 
 - The wallet's CI builds the Firefox WebExtension on every push to `epix` and
-  publishes it to an immutable `wallet-<rev>` GitHub release
+  publishes it to a versioned `wallet-<rev>` GitHub release
   (`epix-wallet-firefox.zip`), one per commit.
 - `shells/wallet-ext.rev` pins which wallet commit to embed. Bumping it (a
   one-line PR) is how EpixNet adopts a new wallet, keeping builds reproducible.
@@ -38,8 +38,8 @@ prebuilt artifact, so you do not need a wallet checkout to build them.
 How each shell runs it:
 
 - **Desktop (Firefox)**: the wallet is a real WebExtension, installed into the
-  managed profile. It carries the whole browser policy (the clearnet block and
-  the Tor/I2P shield) and its own popup UI.
+  managed profile. It carries the Tor/I2P shield, live direct/Tor routing for
+  general clearnet, and its own popup UI.
 - **Android (GeckoView)**: the same WebExtension, installed with
   `ensureBuiltIn`; the Epix button opens its popup in a sheet and the app
   answers the wallet's `zone.epix.nmh` native messages itself.
@@ -49,6 +49,10 @@ How each shell runs it:
   WebExtension shim (`mobile-shim.ts` in the wallet repo) provides the
   `browser.*` surface, backed by the host app for storage and the native-host
   commands. The Epix button opens it in a sheet.
+
+`.epix` pages may call ordinary HTTPS APIs in either routing mode. The
+route-clearnet setting chooses whether general clearnet requests travel directly
+or through Tor; it does not grant or deny API access.
 
 To build the wallet artifact from source, from a checkout of `epix-wallet`:
 
@@ -103,21 +107,20 @@ script builds both, then runs. (The packaged app already bundles both.)
 ## What needs a platform toolchain (not built in CI here)
 
 The shell projects below are complete source + config, but building them needs
-tools not present in this environment. They are scaffolds: the load-bearing
-integration points (core embedding, node boot, web view wiring, `epix://`
-registration) are in place; the browser-policy layer (per-engine CSP/clearnet
-enforcement, secure-context handling) is the remaining work, tracked in
-`../Epix/PLAN.md` (Workstream B/C + Phase 8b spikes).
+tools not present in this environment. The load-bearing integration points
+(core embedding, node boot, web view wiring, `epix://` registration, and live
+direct/Tor routing) are in place; remaining secure-context and platform-specific
+work is tracked in `../Epix/PLAN.md` (Workstream B/C + Phase 8b spikes).
 
 ### Desktop - real Firefox (`crates/epix-browser`)
 
 The desktop browser is **real Firefox**, not a WebView, so you get genuine
 extension support. `epix-browser` is a launcher that bundles the node with
 Firefox: it boots the embedded node, writes a managed Firefox profile whose
-proxy PAC routes every `*.epix` host to the node (clearnet stays DIRECT), and
-launches Firefox at the xite. The node serves `*.epix` hosts in
-transparent-proxy mode (`Host: dashboard.epix` -> that xite, host-relative
-wrapper URLs), so the address bar reads `dashboard.epix`.
+proxy PAC routes xites and I2P to their local proxies and general clearnet
+either directly or through Tor, and launches Firefox at the xite. The node
+serves `*.epix` hosts in transparent-proxy mode (`Host: dashboard.epix` -> that
+xite, host-relative wrapper URLs), so the address bar reads `dashboard.epix`.
 
 ```
 cargo run -p epix-browser            # opens dashboard.epix
@@ -131,10 +134,9 @@ What works now (all verified on macOS):
 - **Secure origins**: the node serves `.epix` over real https via a per-install
   local CA (`crates/epix-browser/src/ca.rs` + `proxy.rs`); xites are secure
   contexts, no warning.
-- **Clearnet-block extension + native host**: a bundled WebExtension
-  (`shells/browser-ext`) blocks `.epix` pages from reaching clearnet (per-site
-  toggle), with a Rust native-messaging host (`crates/epix-nmh`) for resolution
-  and settings.
+- **Epix Wallet + native host**: the staged wallet WebExtension provides live
+  direct/Tor routing for general clearnet and the Tor/I2P controls, with a Rust
+  native-messaging host (`crates/epix-nmh`) for status, resolution, and settings.
 - **On-demand resolve+clone**: type any `talk.epix` and the node resolves it
   on-chain and clones it live.
 
@@ -194,9 +196,8 @@ are gitignored - they are build artifacts.
 `MainActivity` loads the core (`System.loadLibrary("epix_ffi")`), boots the node
 on a coroutine, and points GeckoView at the local node URL. The `epix://`
 intent-filter is in `AndroidManifest.xml`. It installs the Epix Wallet as a
-built-in WebExtension (`ensureBuiltIn`) - the same `installBuiltIn` +
-`webRequest` mechanism also carries the browser policy, since GeckoView has no
-`shouldInterceptRequest`. The `stageWalletExt` Gradle task stages the wallet
+built-in WebExtension (`ensureBuiltIn`), while the host app applies live proxy
+preferences to GeckoView. The `stageWalletExt` Gradle task stages the wallet
 build into `app/src/main/assets/extensions/wallet/` (see "The Epix Wallet").
 
 The shell looks like a browser: an address bar (type `talk.epix`, an `epix1…`
@@ -214,9 +215,12 @@ The "Route clearnet through Tor" switch (default on, opt-out, like the desktop
 extension) points the web engine's proxy at the node's Tor SOCKS listener
 (127.0.0.1:43111, the same one the desktop launcher's PAC uses). The node's own
 loopback is excluded, so the UI and every `.epix` page (served from 127.0.0.1)
-load directly while clearnet requests exit through Tor. Android sets GeckoView's
-`network.proxy.*` prefs live; iOS 17+ sets `WKWebsiteDataStore.proxyConfigurations`.
-Both apply immediately, no relaunch (the desktop version applies on relaunch).
+load directly while clearnet requests exit through Tor. Android sets
+GeckoView's `network.proxy.*` prefs live; iOS 17+ sets
+`WKWebsiteDataStore.proxyConfigurations`. Desktop and Android apply the change
+to new requests without a relaunch. iOS updates the current data stores on iOS
+17+, but relaunching the shell is required to guarantee every existing
+connection uses the new route.
 
 ### iOS (`ios/`) - Swift + WKWebView
 

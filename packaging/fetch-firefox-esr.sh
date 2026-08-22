@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Download Firefox ESR for bundling into the release app. The shipping bundle
 # uses ESR (a stable ~yearly cadence we can security-patch on our schedule, and
-# it honors the unsigned-extension pref our clearnet-block extension needs).
+# it honors the unsigned-extension pref the bundled Epix Wallet needs).
 #
 # Usage: packaging/fetch-firefox-esr.sh [os]   (os: osx | linux | win64)
 # Writes into packaging/firefox-esr/. build-app.sh picks it up automatically.

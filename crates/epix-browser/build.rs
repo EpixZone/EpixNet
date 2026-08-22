@@ -22,8 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// The epix-wallet release-download base. Each wallet build is published as an
-/// immutable `wallet-<rev>` release (see the wallet repo's
+/// The epix-wallet release-download base. Each wallet build is published as a
+/// versioned `wallet-<rev>` release (see the wallet repo's
 /// `.github/workflows/build-dist.yml`); `wallet_dist_url` appends the pinned rev.
 const WALLET_RELEASE_BASE: &str =
     "https://github.com/EpixZone/epix-wallet/releases/download";
