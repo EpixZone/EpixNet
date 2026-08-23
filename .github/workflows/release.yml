@@ -11,7 +11,23 @@ on:
     # the leading `v`. A tag without it does not trigger a release. To reject
     # such tags at creation time, add a repository tag ruleset (see below).
     tags: ["v*"]
+  # Publishing a release (INCLUDING a pre-release) also builds, so a release
+  # cut in the UI from an already-pushed tag - or published from a draft -
+  # gets its binaries without a manual re-run. The intended flow: publish a
+  # pre-release, test the attached binaries, then flip it to latest -
+  # promoting fires no `published` event, so the tested assets are kept
+  # untouched.
+  release:
+    types: [published]
   workflow_dispatch:
+
+# One build per tag at a time. A release created in the UI with a NEW tag
+# fires BOTH the tag push and `release published` within seconds; cancelling
+# the older run keeps that to a single build (the surviving run attaches to
+# the existing release via the upload branch below).
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: true
 
 permissions:
   contents: write # create the GitHub Release + upload assets
