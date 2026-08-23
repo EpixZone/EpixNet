@@ -1143,10 +1143,10 @@ async fn resync_loop(
 /// update hints and resync the hinted xites immediately, instead of waiting for
 /// the next full `resync_loop` tick.
 ///
-/// A peer records a small `(xite, modified)` notification whenever it receives
-/// an EDX update push (`apply_update` calls `record_update_hint`), so the hint
-/// spreads with the publish flood - the announce is now intrinsic to the push
-/// rather than a separate message. This loop pulls those notifications
+/// A peer records a small `(xite, modified)` notification after an EDX update
+/// is verified and its required files have landed, so the hint spreads with
+/// the publish flood without advertising content the relay cannot serve. This
+/// loop pulls those notifications
 /// from a spread of connectable peers, keeps a per-peer cursor so each is seen
 /// once, and - for any hint naming a xite we host at an older version
 /// (`needs_sync`) - triggers a targeted resync of that one xite. The relay is

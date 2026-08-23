@@ -4185,15 +4185,19 @@ mod tests {
         let state = AppState::new("test");
         let storage = XiteStorage::new(files_dir.path());
         storage.write("a.bin", b"aaaa").unwrap();
-        let target =
-            &epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
-        let content = json!({
+        let target_key = epix_crypt::new_seed();
+        let target = &epix_crypt::privatekey_to_address(&target_key).unwrap();
+        let mut content = json!({
             "address": target, "modified": 1.0, "files": {},
             "files_optional": {
                 "a.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"aaaa") },
                 "b.bin": { "size": 4, "sha512": XiteStorage::hash_bytes(b"bbbb") },
             },
         });
+        epix_content::sign(&mut content, &target_key).unwrap();
+        storage
+            .write("content.json", &serde_json::to_vec(&content).unwrap())
+            .unwrap();
         state.add_xite(target, XiteEntry { storage, content: Some(content) }).await;
         // The dashboard runs on an ADMIN xite.
         state
@@ -4694,23 +4698,34 @@ mod tests {
         let state = AppState::new("test");
         let dir = tempfile::tempdir().unwrap();
         let storage = epix_xite::XiteStorage::new(dir.path());
-        storage.write("content.json", br#"{"address":"1Big","files_optional":{}}"#).unwrap();
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let mut content = json!({
+            "address": address,
+            "modified": 1.0,
+            "files": {},
+            "files_optional": {},
+        });
+        epix_content::sign(&mut content, &key).unwrap();
+        storage
+            .write("content.json", &serde_json::to_vec(&content).unwrap())
+            .unwrap();
         state
             .add_xite(
-                "1Big",
+                &address,
                 crate::state::XiteEntry {
                     storage,
                     // Owned xite so the upload permission check passes.
-                    content: Some(json!({ "address": "1Big" })),
+                    content: Some(content),
                 },
             )
             .await;
-        state.set_owned("1Big", true).await;
+        state.set_owned(&address, true).await;
 
         // A multi-piece file (3 pieces of 4 bytes) via the state path.
         let body = b"AAAABBBBCCCC";
         let (nonce, piece_size, rel) =
-            state.bigfile_upload_init("1Big", "data/movie.bin", body.len() as u64).await.unwrap();
+            state.bigfile_upload_init(&address, "data/movie.bin", body.len() as u64).await.unwrap();
         assert_eq!(piece_size, 1024 * 1024);
         assert_eq!(rel, "movie.bin");
 
@@ -4721,8 +4736,8 @@ mod tests {
         assert_eq!(result.merkle_root, epix_xite::XiteStorage::hash_bytes(body));
 
         // The file was written and content.json gained a files_optional entry.
-        assert_eq!(state.read_file("1Big", "data/movie.bin").await.as_deref(), Some(&body[..]));
-        let content = state.content("1Big").await.unwrap();
+        assert_eq!(state.read_file(&address, "data/movie.bin").await.as_deref(), Some(&body[..]));
+        let content = state.content(&address).await.unwrap();
         let entry = &content["files_optional"]["data/movie.bin"];
         assert_eq!(entry["size"], body.len());
         assert_eq!(entry["sha512"], result.merkle_root);
@@ -4925,7 +4940,21 @@ mod tests {
 
         let xite = "1BlogAddr";
         let state = AppState::new("test");
-        state.add_xite(xite, XiteEntry { storage, content: None }).await;
+        state
+            .add_xite(
+                xite,
+                XiteEntry {
+                    storage,
+                    content: Some(json!({
+                        "files": {
+                            "dbschema.json": {},
+                            "data/alice/data.json": {}
+                        }
+                    })),
+                },
+            )
+            .await;
+        state.set_owned(xite, true).await;
         state
             .set_feed_follow(
                 xite,

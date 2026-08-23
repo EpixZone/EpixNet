@@ -31,7 +31,7 @@ async fn spawn_edx_seeder(address: &str, src: XiteStorage) -> std::net::SocketAd
     let state = AppState::new("source");
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(store_dir.path()).unwrap());
-    state.set_edx_store(store.clone()).await;
+    state.set_edx_store(store.clone()).await.unwrap();
     state.add_xite(address, XiteEntry { storage: src, content: None }).await;
     assert!(state.load_content_from_disk(address).await, "load registers files into the EDX store");
     std::mem::forget(store_dir);

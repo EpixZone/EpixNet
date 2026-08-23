@@ -353,29 +353,55 @@ async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::new("ws-test");
 
-    // A merger with a version-3 schema and no data of its own.
-    let merger = "1Merger";
+    // A merger with a version-3 schema and no data of its own. Db authority
+    // flows from an accepted manifest authority, so the merger is a real
+    // address whose signed root declares its dbschema.json.
+    let merger_key = epix_crypt::new_seed();
+    let merger = epix_crypt::privatekey_to_address(&merger_key).unwrap();
     let mstore = XiteStorage::new(dir.path().join("merger"));
-    mstore
-        .write(
-            "dbschema.json",
-            br#"{ "db_name":"Merger","db_file":"db.db","version":3,
+    let schema = br#"{ "db_name":"Merger","db_file":"db.db","version":3,
                  "maps": { ".+/data/.*/data.json": { "to_table": [{"node":"posts","table":"post"}] } },
-                 "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#,
-        )
-        .unwrap();
-    state.add_xite(merger, XiteEntry { storage: mstore, content: None }).await;
-
-    // A hub of the merged type with a user's data.json already on disk.
-    let hub = XiteStorage::new(dir.path().join("hub"));
-    hub.write("data/u1/data.json", br#"{ "posts": [ {"post_id":1,"title":"hub row"} ] }"#)
+                 "tables": { "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] } } }"#;
+    mstore.write("dbschema.json", schema).unwrap();
+    let mut merger_root = json!({
+        "address": merger,
+        "modified": 1.0,
+        "files": { "dbschema.json": {
+            "size": schema.len(), "sha512": XiteStorage::hash_bytes(schema)
+        } },
+    });
+    epix_content::sign(&mut merger_root, &merger_key).unwrap();
+    mstore
+        .write("content.json", epix_content::dumps_content(&merger_root).as_bytes())
         .unwrap();
     state
-        .add_xite("1Hub", XiteEntry { storage: hub, content: Some(json!({ "merged_type": "Test" })) })
+        .add_xite(&merger, XiteEntry { storage: mstore, content: Some(merger_root) })
+        .await;
+
+    // A hub of the merged type with a user's data.json already on disk,
+    // declared (size + sha512) by the hub's signed root.
+    let hub_key = epix_crypt::new_seed();
+    let hub_address = epix_crypt::privatekey_to_address(&hub_key).unwrap();
+    let hub = XiteStorage::new(dir.path().join("hub"));
+    let row = br#"{ "posts": [ {"post_id":1,"title":"hub row"} ] }"#;
+    hub.write("data/u1/data.json", row).unwrap();
+    let mut hub_root = json!({
+        "address": hub_address,
+        "modified": 1.0,
+        "merged_type": "Test",
+        "files": { "data/u1/data.json": {
+            "size": row.len(), "sha512": XiteStorage::hash_bytes(row)
+        } },
+    });
+    epix_content::sign(&mut hub_root, &hub_key).unwrap();
+    hub.write("content.json", epix_content::dumps_content(&hub_root).as_bytes())
+        .unwrap();
+    state
+        .add_xite(&hub_address, XiteEntry { storage: hub, content: Some(hub_root) })
         .await;
 
     let registry = CommandRegistry::with_defaults();
-    let session = WsSession::new(state.clone(), Some(merger.to_string()));
+    let session = WsSession::new(state.clone(), Some(merger.clone()));
 
     // No grant yet: the merger db holds no merged rows.
     let rows =
@@ -398,7 +424,7 @@ async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
     let pushed = std::iter::from_fn(|| events.try_recv().ok())
         .find(|ev| ev.payload.contains("\"setSiteInfo\""))
         .expect("permissionAdd pushes setSiteInfo");
-    assert_eq!(pushed.target.as_deref(), Some(merger));
+    assert_eq!(pushed.target.as_deref(), Some(merger.as_str()));
 }
 
 /// A private key is checked when it is SAVED, not later when it is used. A
