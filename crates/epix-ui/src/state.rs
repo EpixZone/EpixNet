@@ -17560,16 +17560,31 @@ impl AppState {
             for (address, storage, manifests) in registrations {
                 let xite = Xite::new(address, storage);
                 for manifest in manifests {
-                    let (added, missed) = xite
-                        .edx_register_verified_manifest(
-                            &store,
-                            &manifest.inner_path,
-                            &manifest.content,
-                            now,
-                        )
-                        .map_err(|error| error.to_string())?;
-                    registered = registered.saturating_add(added);
-                    skipped = skipped.saturating_add(missed);
+                    // A single manifest that cannot register (a malformed
+                    // declared path, an unregisterable entry) skips with a
+                    // warning: its files stay on the xite tree and simply
+                    // are not Store-served. Failing the whole activation
+                    // here took every OTHER xite's serving and all local
+                    // mutation down with it (one Windows-signed manifest
+                    // once bricked the node this way).
+                    match xite.edx_register_verified_manifest(
+                        &store,
+                        &manifest.inner_path,
+                        &manifest.content,
+                        now,
+                    ) {
+                        Ok((added, missed)) => {
+                            registered = registered.saturating_add(added);
+                            skipped = skipped.saturating_add(missed);
+                        }
+                        Err(error) => {
+                            eprintln!(
+                                "[WARN] Skipping Store registration of {}: {error}",
+                                manifest.inner_path
+                            );
+                            skipped = skipped.saturating_add(1);
+                        }
+                    }
                 }
             }
             Ok((registered, skipped))

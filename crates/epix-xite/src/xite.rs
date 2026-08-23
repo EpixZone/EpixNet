@@ -2050,8 +2050,17 @@ impl Xite {
         let dir_prefix = inner_path
             .strip_suffix("content.json")
             .ok_or_else(|| Error::Protocol(format!("not a content manifest: {inner_path}")))?;
+        // Backslashes normalize like verify_content_rules does: manifests
+        // signed on Windows declare `data\users\...\content.json`, and the
+        // verify path (matching Python EpixNet) accepts them - registration
+        // must not reject what verification accepted.
         if inner_path != "content.json"
-            && content.get("inner_path").and_then(Value::as_str) != Some(inner_path)
+            && content
+                .get("inner_path")
+                .and_then(Value::as_str)
+                .map(|declared| declared.replace('\\', "/"))
+                .as_deref()
+                != Some(inner_path)
         {
             return Err(Error::Protocol(format!(
                 "verified manifest path mismatch: {inner_path}"
