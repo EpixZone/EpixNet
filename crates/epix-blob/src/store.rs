@@ -4892,6 +4892,15 @@ fn copy_regular_file_beneath(
                 format!("materialized bytes do not hash to {expected_id}"),
             ));
         }
+        let verify_existing_and_drop_temporary = |directory: &File| -> io::Result<OutboardBytes> {
+            let installed = open_regular_beneath(root, relative)?;
+            let outboard = verify_open_file_complete(installed, expected_size, expected_id)?;
+            rustix::fs::unlinkat(directory, &temporary_name, AtFlags::empty())
+                .map_err(io::Error::from)?;
+            directory.sync_all()?;
+            Ok(outboard)
+        };
+        let mut moved = false;
         match rustix::fs::linkat(
             &directory,
             &temporary_name,
@@ -4903,18 +4912,37 @@ fn copy_regular_file_beneath(
             Err(error)
                 if io::Error::from(error).kind() == io::ErrorKind::AlreadyExists =>
             {
-                let installed = open_regular_beneath(root, relative)?;
-                let outboard =
-                    verify_open_file_complete(installed, expected_size, expected_id)?;
-                rustix::fs::unlinkat(&directory, &temporary_name, AtFlags::empty())
-                    .map_err(io::Error::from)?;
-                directory.sync_all()?;
-                return Ok(outboard);
+                return verify_existing_and_drop_temporary(&directory);
+            }
+            // Android SELinux denies linkat for app domains outright. A
+            // rename with NOREPLACE installs the temporary with the same
+            // never-replace contract, it just cannot keep the temporary
+            // name alive through the swap (nothing needs it afterwards).
+            Err(error)
+                if io::Error::from(error).kind() == io::ErrorKind::PermissionDenied =>
+            {
+                match rustix::fs::renameat_with(
+                    &directory,
+                    &temporary_name,
+                    &directory,
+                    &final_name,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => moved = true,
+                    Err(error)
+                        if io::Error::from(error).kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        return verify_existing_and_drop_temporary(&directory);
+                    }
+                    Err(error) => return Err(io::Error::from(error)),
+                }
             }
             Err(error) => return Err(io::Error::from(error)),
         }
-        rustix::fs::unlinkat(&directory, &temporary_name, AtFlags::empty())
-            .map_err(io::Error::from)?;
+        if !moved {
+            rustix::fs::unlinkat(&directory, &temporary_name, AtFlags::empty())
+                .map_err(io::Error::from)?;
+        }
         directory.sync_all()?;
         let installed = open_regular_beneath(root, relative)?;
         verify_open_file_complete(installed, expected_size, expected_id)
