@@ -4761,7 +4761,7 @@ pub fn self_exe() -> Option<String> {
 /// fallback, so a node whose shell cannot relaunch (the mobile apps) plainly
 /// shuts down instead.
 fn spawn_relauncher(argv: &[String]) {
-    if argv.first().map(|s| s.is_empty()).unwrap_or(true) {
+    if argv.first().map(String::is_empty).unwrap_or(true) {
         return;
     }
     let pid = std::process::id();
@@ -5345,7 +5345,7 @@ impl AppState {
             push(t.to_string());
         }
         let shared = self.shared_trackers().await;
-        let cutoff = now_secs() as i64 - TRACKER_WORKING_SECS;
+        let cutoff = now_secs() - TRACKER_WORKING_SECS;
         let stats = self.tracker_stats.read().await;
         for t in shared {
             let recent = stats
@@ -5457,7 +5457,7 @@ impl AppState {
             let stats = self.tracker_stats.read().await;
             let Some(entry) = stats.get(&key) else { return };
             let get = |k: &str| entry.get(k).and_then(|v| v.as_i64()).unwrap_or(0);
-            let now = now_secs() as i64;
+            let now = now_secs();
             get("num_error") >= SHARED_TRACKER_ERROR_LIMIT
                 && now - get("time_success") > SHARED_TRACKER_DEAD_SECS
                 && now - get("time_first_request") > SHARED_TRACKER_DEAD_SECS
@@ -8266,7 +8266,7 @@ impl AppState {
             return false;
         }
         let wait = 60 * num_error.min(30);
-        now_secs() as i64 - time_request < wait
+        now_secs() - time_request < wait
     }
 
     /// Per-tracker announce stats for the dashboard. `announcerStats`.
@@ -12418,7 +12418,7 @@ impl AppState {
     /// The Epix chain's xID auth/linking xite - where "New" and the
     /// not-yet-linked redirect send the user to link an identity address to
     /// their xID name. EpixNet's `xid_xite`.
-    const XID_XITE: &'static str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
+    const XID_XITE: &str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
 
     /// Show the xID cert-selection dialog and act on the choice (EpixNet's
     /// `actionCertXid`). Discovers which of the user's addresses already map
@@ -17518,7 +17518,7 @@ impl AppState {
                     x.settings.cache.optional_stats.entry(inner_path.to_string()).or_default();
                 let first = stat.time_downloaded == 0;
                 if first {
-                    stat.time_downloaded = now_secs() as i64;
+                    stat.time_downloaded = now_secs();
                 }
                 first
             };
@@ -26930,7 +26930,7 @@ impl AppState {
         schedule: &mut HashMap<String, (u32, i64)>,
     ) {
         let (fails, next_at) = schedule.get(addr).copied().unwrap_or((0, 0));
-        if next_at > now_secs() as i64 {
+        if next_at > now_secs() {
             return;
         }
         if self.optional_pass_in_flight(addr) {
@@ -26942,14 +26942,14 @@ impl AppState {
         self.set_optional_owed(addr, owed).await;
         if owed == 0 {
             // Complete: park it on the slow re-verify interval.
-            schedule.insert(addr.to_string(), (0, now_secs() as i64 + 600));
+            schedule.insert(addr.to_string(), (0, now_secs() + 600));
             return;
         }
         if fails == 0 {
             self.log("INFO", format!("Resuming optional download for {addr}")).await;
         }
         let delay = (60i64 * (1i64 << fails.min(4))).min(600);
-        schedule.insert(addr.to_string(), (fails + 1, now_secs() as i64 + delay));
+        schedule.insert(addr.to_string(), (fails + 1, now_secs() + delay));
         self.spawn_retry_pass(addr.to_string(), dirs.clone());
     }
 
@@ -27014,12 +27014,12 @@ impl AppState {
     ) {
         let key = format!("core:{addr}");
         let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
-        if next_at > now_secs() as i64 {
+        if next_at > now_secs() {
             return;
         }
         if self.xite_core_complete(addr).await {
             // Whole core on disk: park on the slow re-verify.
-            schedule.insert(key, (0, now_secs() as i64 + 600));
+            schedule.insert(key, (0, now_secs() + 600));
             return;
         }
         self.log("INFO", format!("Resuming interrupted download of {addr}")).await;
@@ -27032,7 +27032,7 @@ impl AppState {
         // long after a retry would have worked. 20s doubling to 90s keeps a
         // dead xite cheap while catching a peer that just came up.
         let delay = (20i64 * (1i64 << fails.min(3))).min(90);
-        schedule.insert(key, (fails + 1, now_secs() as i64 + delay));
+        schedule.insert(key, (fails + 1, now_secs() + delay));
         let state = self.clone();
         let addr = addr.to_string();
         tokio::spawn(async move {
@@ -27581,7 +27581,7 @@ impl AppState {
                 self.add_transfer(address, batch.bytes, 0).await;
             }
             let done: std::collections::HashSet<&str> =
-                batch.done.iter().map(|s| s.as_str()).collect();
+                batch.done.iter().map(String::as_str).collect();
             if done.is_empty() {
                 continue;
             }

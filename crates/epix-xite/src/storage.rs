@@ -213,7 +213,7 @@ fn create_directory_durable(directory: &Path) -> std::io::Result<()> {
         .ok_or_else(|| std::io::Error::other("directory has no parent"))?;
     let name = directory
         .file_name()
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("directory");
     let sequence = DURABLE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary = parent.join(format!(

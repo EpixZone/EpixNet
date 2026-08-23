@@ -5207,6 +5207,8 @@ impl EdxFetcher for RuntimeEdxFetcher {
             &work.served,
         )
         .await;
+        // Bound to a local on purpose: the tail-expression form keeps the
+        // MutexGuard temporary alive across the return and fails borrowck.
         let served = std::mem::take(&mut *work.served.lock().expect("signed queue"));
         served
     }
