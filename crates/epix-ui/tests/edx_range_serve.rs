@@ -4,12 +4,13 @@
 //! single window.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use epix_core::PeerAddr;
 use epix_ui::state::{
-    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, XiteEntry,
+    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxPushProgress, EdxWant,
+    UpdatePayload, XiteEntry,
 };
 use epix_ui::UiServer;
 use epix_xite::XiteStorage;
@@ -68,10 +69,10 @@ impl EdxFetcher for RangeFetcher {
         _: &str,
         _: Arc<Vec<u8>>,
         _: f64,
-        _: Arc<HashMap<String, Vec<epix_content::DiffAction>>>,
+        _: Arc<UpdatePayload>,
         _: Arc<Vec<String>>,
-        _: Arc<AtomicBool>,
-    ) -> Result<(), EdxPushError> {
+        _: Arc<EdxPushProgress>,
+    ) -> Result<bool, EdxPushError> {
         unreachable!()
     }
     async fn fetch_files(
@@ -121,34 +122,50 @@ impl EdxFetcher for RangeFetcher {
 
 /// A registered xite declaring `media/movie.mp4` with `b3` + `size` (an EDX
 /// entry, no piecemap) that is NOT on disk, plus a fetcher that can serve its
-/// ranges. Returns the router and the whole-file fetch counter.
-async fn router_with_declared_edx_file(body: &[u8]) -> (axum::Router, Arc<AtomicUsize>) {
+/// ranges. The declaration must come from a SIGNED on-disk manifest: range
+/// serving resolves it through the verified manifest index, so an unsigned
+/// in-memory root would 404. Returns the router, the xite address, and the
+/// whole-file fetch counter.
+async fn router_with_declared_edx_file(
+    body: &[u8],
+) -> (axum::Router, String, Arc<AtomicUsize>) {
     router_with_edx_fetcher(body, None).await
 }
 
 /// [`router_with_declared_edx_file`], but the fetcher lands at most `cap`
 /// bytes per range (a partial fetch over a slow overlay).
-async fn router_with_partial_edx_file(body: &[u8], cap: usize) -> (axum::Router, Arc<AtomicUsize>) {
+async fn router_with_partial_edx_file(
+    body: &[u8],
+    cap: usize,
+) -> (axum::Router, String, Arc<AtomicUsize>) {
     router_with_edx_fetcher(body, Some(cap)).await
 }
 
 async fn router_with_edx_fetcher(
     body: &[u8],
     cap: Option<usize>,
-) -> (axum::Router, Arc<AtomicUsize>) {
+) -> (axum::Router, String, Arc<AtomicUsize>) {
     let state = AppState::new("range-test");
     let dir = tempfile::tempdir().unwrap();
     let id = epix_blob::ObjId::of(body);
+    let key = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&key).unwrap();
+    let storage = XiteStorage::new(dir.path().join("site"));
+    let mut root = json!({
+        "address": address,
+        "modified": 1.0,
+        "files": {
+            "media/movie.mp4": {
+                "size": body.len(),
+                "sha512": XiteStorage::hash_bytes(body),
+                "b3": id.to_string(),
+            }
+        },
+    });
+    epix_content::sign(&mut root, &key).unwrap();
+    storage.write("content.json", &serde_json::to_vec(&root).unwrap()).unwrap();
     state
-        .add_xite("1RangeTest", XiteEntry {
-            storage: XiteStorage::new(dir.path().join("site")),
-            content: Some(json!({
-                "address": "1RangeTest",
-                "files": {
-                    "media/movie.mp4": { "size": body.len(), "b3": id.to_string() }
-                },
-            })),
-        })
+        .add_xite(&address, XiteEntry { storage, content: Some(root) })
         .await;
     let whole_file_calls = Arc::new(AtomicUsize::new(0));
     state
@@ -159,13 +176,13 @@ async fn router_with_edx_fetcher(
         }))
         .await;
     std::mem::forget(dir);
-    (UiServer::new(state).router(), whole_file_calls)
+    (UiServer::new(state).router(), address, whole_file_calls)
 }
 
-fn get_range(uri: &str, range: &str) -> axum::extract::Request {
+fn get_range(address: &str, range: &str) -> axum::extract::Request {
     axum::extract::Request::builder()
-        .uri(uri)
-        .header("referer", "http://localhost/1RangeTest/")
+        .uri(format!("/{address}/media/movie.mp4"))
+        .header("referer", format!("http://localhost/{address}/"))
         .header("range", range)
         .body(axum::body::Body::empty())
         .unwrap()
@@ -187,9 +204,8 @@ async fn parts(resp: axum::response::Response) -> (u16, String, Vec<u8>) {
 #[tokio::test]
 async fn range_of_a_missing_edx_file_seeks_instead_of_downloading_the_whole_file() {
     let body: Vec<u8> = (0..2048).map(|i| i as u8).collect();
-    let (router, whole_file_calls) = router_with_declared_edx_file(&body).await;
-    let resp =
-        router.oneshot(get_range("/1RangeTest/media/movie.mp4", "bytes=0-1023")).await.unwrap();
+    let (router, address, whole_file_calls) = router_with_declared_edx_file(&body).await;
+    let resp = router.oneshot(get_range(&address, "bytes=0-1023")).await.unwrap();
     let (status, content_range, served) = parts(resp).await;
     assert_eq!(status, 206);
     assert_eq!(content_range, "bytes 0-1023/2048");
@@ -208,9 +224,8 @@ async fn a_partial_fetch_serves_the_prefix_as_a_shorter_206() {
     // 206 whose Content-Range matches what is actually served - the
     // browser re-requests the remainder - never a 404 for bytes we hold.
     let body: Vec<u8> = (0..4096).map(|i| i as u8).collect();
-    let (router, whole_file_calls) = router_with_partial_edx_file(&body, 1024).await;
-    let resp =
-        router.oneshot(get_range("/1RangeTest/media/movie.mp4", "bytes=0-4095")).await.unwrap();
+    let (router, address, whole_file_calls) = router_with_partial_edx_file(&body, 1024).await;
+    let resp = router.oneshot(get_range(&address, "bytes=0-4095")).await.unwrap();
     let (status, content_range, served) = parts(resp).await;
     assert_eq!(status, 206);
     assert_eq!(content_range, "bytes 0-1023/4096");
@@ -221,8 +236,8 @@ async fn a_partial_fetch_serves_the_prefix_as_a_shorter_206() {
 #[tokio::test]
 async fn an_open_ended_range_serves_one_window_not_the_whole_file() {
     let body: Vec<u8> = (0..5 * 1024 * 1024).map(|i| i as u8).collect();
-    let (router, whole_file_calls) = router_with_declared_edx_file(&body).await;
-    let resp = router.oneshot(get_range("/1RangeTest/media/movie.mp4", "bytes=0-")).await.unwrap();
+    let (router, address, whole_file_calls) = router_with_declared_edx_file(&body).await;
+    let resp = router.oneshot(get_range(&address, "bytes=0-")).await.unwrap();
     let (status, content_range, served) = parts(resp).await;
     assert_eq!(status, 206);
     assert_eq!(served.len(), 4 * 1024 * 1024, "one window, not the whole 5 MiB file");

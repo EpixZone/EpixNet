@@ -36,6 +36,18 @@ pub mod caps {
     /// bit; everyone else keeps receiving the legacy `Err { BUSY }`, which
     /// older nodes can decode.
     pub const RETRY_AFTER: u32 = 1 << 3;
+    /// Accepts versioned signed-CRDT merge-record envelopes in the `inline`
+    /// field of [`super::Req::Update`]. Larger deltas use an immutable object
+    /// marker and are pulled over the same session before the receiver replies
+    /// `Ok`. A sender must leave `inline` empty for a peer that does not
+    /// advertise this bit, so older receivers keep using their ordinary pull
+    /// and anti-entropy paths.
+    pub const INLINE_MERGE: u32 = 1 << 4;
+
+    /// Whether every bit in `required` was advertised by the peer.
+    pub const fn supports(advertised: u32, required: u32) -> bool {
+        advertised & required == required
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -261,7 +273,7 @@ mod tests {
                     net: NET_ID.into(),
                     node_pk: vec![2; 33],
                     binding_sig: vec![9; 64],
-                    caps: caps::MESH | caps::CONTROL,
+                    caps: caps::MESH | caps::CONTROL | caps::INLINE_MERGE,
                     listen: vec![PeerAddr::parse("1.2.3.4:26552").unwrap()],
                     version: "0.3.9".into(),
                 })),
@@ -274,7 +286,7 @@ mod tests {
                         net: NET_ID.into(),
                         node_pk: vec![3; 33],
                         binding_sig: vec![],
-                        caps: caps::MESH,
+                        caps: caps::MESH | caps::INLINE_MERGE,
                         observed: Some(PeerAddr::parse("5.6.7.8:26552").unwrap()),
                         version: "0.3.9".into(),
                     }),
@@ -372,6 +384,21 @@ mod tests {
         for f in &frames {
             assert_eq!(&round_trip(f), f);
         }
+    }
+
+    #[test]
+    fn capability_bits_are_distinct_and_composable() {
+        let bits = [caps::SHARDS, caps::MESH, caps::CONTROL, caps::RETRY_AFTER, caps::INLINE_MERGE];
+        let mut combined = 0;
+        for bit in bits {
+            assert_eq!(bit.count_ones(), 1, "each capability occupies one bit");
+            assert_eq!(combined & bit, 0, "capability bit reused: {bit:#x}");
+            combined |= bit;
+        }
+
+        assert!(caps::supports(combined, caps::INLINE_MERGE));
+        assert!(caps::supports(combined, caps::MESH | caps::INLINE_MERGE));
+        assert!(!caps::supports(caps::MESH, caps::INLINE_MERGE));
     }
 
     /// Postcard encodes variants by index: this pins the current

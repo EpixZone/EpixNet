@@ -32,6 +32,9 @@ pub struct DbSchema {
     /// `path-regex -> how that file populates the db`.
     #[serde(default)]
     pub maps: BTreeMap<String, MapSettings>,
+    /// Named read-only feed queries exposed by the xite.
+    #[serde(default)]
+    pub feeds: BTreeMap<String, String>,
 }
 
 fn default_version() -> i64 {
@@ -114,7 +117,10 @@ impl DbSchema {
     /// Columns that land on the per-file `json` row (union of every map's
     /// `to_json_table`), so the `json` table can be created wide enough.
     pub fn json_table_cols(&self) -> BTreeSet<String> {
-        self.maps.values().flat_map(|m| m.to_json_table.iter().cloned()).collect()
+        self.maps
+            .values()
+            .flat_map(|m| m.to_json_table.iter().cloned())
+            .collect()
     }
 }
 
@@ -129,7 +135,9 @@ fn safe_identifier(name: &str) -> Result<()> {
     if ok {
         Ok(())
     } else {
-        Err(Error::Db(format!("unsafe table name in dbschema.json: {name:?}")))
+        Err(Error::Db(format!(
+            "unsafe table name in dbschema.json: {name:?}"
+        )))
     }
 }
 
@@ -170,10 +178,12 @@ pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
         // (the json table's own columns depend on the schema version too).
         for name in schema.tables.keys() {
             if name != "keyvalue" {
-                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name};")).map_err(db)?;
+                conn.execute_batch(&format!("DROP TABLE IF EXISTS {name};"))
+                    .map_err(db)?;
             }
         }
-        conn.execute_batch("DROP TABLE IF EXISTS json;").map_err(db)?;
+        conn.execute_batch("DROP TABLE IF EXISTS json;")
+            .map_err(db)?;
     }
 
     for (name, table) in &schema.tables {
@@ -183,8 +193,14 @@ pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
         if table.cols.is_empty() {
             return Err(Error::Db(format!("table `{name}` has no columns")));
         }
-        let cols = table.cols.iter().map(|(n, t)| format!("{n} {t}")).collect::<Vec<_>>().join(", ");
-        conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {name} ({cols});")).map_err(db)?;
+        let cols = table
+            .cols
+            .iter()
+            .map(|(n, t)| format!("{n} {t}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {name} ({cols});"))
+            .map_err(db)?;
         for idx in &table.indexes {
             conn.execute_batch(&format!("{idx};")).map_err(db)?;
         }
@@ -210,7 +226,10 @@ fn create_meta_tables(conn: &Connection, schema: &DbSchema) -> Result<()> {
     // Base identity columns for a data file, by schema version. Version 3 adds
     // a `xite` column so a merger xite's db can aggregate rows from many xites.
     let (id_cols, unique) = match schema.version {
-        1 => ("path VARCHAR(255)", "CREATE UNIQUE INDEX IF NOT EXISTS path ON json(path)"),
+        1 => (
+            "path VARCHAR(255)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS path ON json(path)",
+        ),
         3 => (
             "site VARCHAR(255), directory VARCHAR(255), file_name VARCHAR(255)",
             "CREATE UNIQUE INDEX IF NOT EXISTS path ON json(site, directory, file_name)",
@@ -256,7 +275,9 @@ mod tests {
     }
 
     fn columns(conn: &Connection, table: &str) -> Vec<String> {
-        let mut stmt = conn.prepare(&format!("PRAGMA table_info({table})")).unwrap();
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .unwrap();
         let rows = stmt.query_map([], |r| r.get::<_, String>(1)).unwrap();
         rows.filter_map(|r| r.ok()).collect()
     }
@@ -267,21 +288,30 @@ mod tests {
         // v1 schema with a `title` column.
         apply(&conn, &schema_with_col(1, "title")).unwrap();
         assert!(columns(&conn, "post").contains(&"title".to_string()));
-        conn.execute("INSERT INTO post (post_id, title) VALUES (1, 'hi')", []).unwrap();
+        conn.execute("INSERT INTO post (post_id, title) VALUES (1, 'hi')", [])
+            .unwrap();
 
         // Re-applying the same version keeps the table (and its row).
         apply(&conn, &schema_with_col(1, "title")).unwrap();
-        let count: i64 =
-            conn.query_row("SELECT count(*) FROM post", [], |r| r.get(0)).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT count(*) FROM post", [], |r| r.get(0))
+            .unwrap();
         assert_eq!(count, 1, "same version does not rebuild");
 
         // Bumping the version to 2 with a different column rebuilds the table.
         apply(&conn, &schema_with_col(2, "body")).unwrap();
         let cols = columns(&conn, "post");
         assert!(cols.contains(&"body".to_string()), "new column present");
-        assert!(!cols.contains(&"title".to_string()), "old column gone (rebuilt)");
+        assert!(
+            !cols.contains(&"title".to_string()),
+            "old column gone (rebuilt)"
+        );
         let stored: i64 = conn
-            .query_row("SELECT value FROM keyvalue WHERE json_id=0 AND key='db.version'", [], |r| r.get(0))
+            .query_row(
+                "SELECT value FROM keyvalue WHERE json_id=0 AND key='db.version'",
+                [],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(stored, 2, "stored version advanced");
     }

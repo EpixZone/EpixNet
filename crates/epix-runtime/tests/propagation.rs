@@ -61,7 +61,7 @@ async fn propagation_poll_triggers_resync_of_a_hinted_xite() {
     let src_state = AppState::new("source");
     let store_dir = tempfile::tempdir().unwrap();
     let store = Arc::new(Store::open(store_dir.path()).unwrap());
-    src_state.set_edx_store(store.clone()).await;
+    src_state.set_edx_store(store.clone()).await.unwrap();
     src_state.add_xite(&address, XiteEntry { storage: src.clone(), content: None }).await;
     assert!(
         src_state.load_content_from_disk(&address).await,

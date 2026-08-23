@@ -176,9 +176,11 @@ pub struct ContentStats {
 fn sum_sizes(map: Option<&serde_json::Map<String, Value>>) -> i64 {
     map.map(|m| {
         m.values()
-            .filter_map(|v| v.get("size").and_then(|s| s.as_i64()))
-            .filter(|&s| s >= 0)
-            .sum()
+            .filter_map(|v| {
+                v.get("size")
+                    .and_then(epix_content::verify::exact_nonnegative_size)
+            })
+            .fold(0i64, i64::saturating_add)
     })
     .unwrap_or(0)
 }
@@ -222,6 +224,23 @@ mod tests {
         assert_eq!(s.files_optional, 1);
         assert_eq!(s.includes, 1);
         assert_eq!(s.modified, 1777992697.0);
+    }
+
+    #[test]
+    fn stats_saturate_untrusted_size_totals() {
+        let content = json!({
+            "files": {
+                "first.bin": {"size": i64::MAX},
+                "second.bin": {"size": 1},
+            },
+            "files_optional": {
+                "first-optional.bin": {"size": i64::MAX},
+                "second-optional.bin": {"size": 1},
+            },
+        });
+        let stats = content_stats(&content);
+        assert_eq!(stats.size, i64::MAX);
+        assert_eq!(stats.size_optional, i64::MAX);
     }
 
     #[test]

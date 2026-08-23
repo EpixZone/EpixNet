@@ -27,21 +27,45 @@ async fn call_params(ws: &mut Ws, cmd: &str, params: Value, id: i64) -> Value {
     }
 }
 
-async fn start_server() -> (std::net::SocketAddr, tempfile::TempDir) {
+/// Start a UI server with one owned, SIGNED test xite (real key + address,
+/// verified-authority root on disk). Ingest and db authority flow from an
+/// accepted manifest authority, so the root must declare every managed file -
+/// including `data/test.json`, the exact bytes `own_write_is_not_echoed_back`
+/// later writes. Returns the bound address, the xite's bech32 address, and
+/// the tempdir keeping the storage alive.
+async fn start_server() -> (std::net::SocketAddr, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(dir.path());
-    storage.write("index.html", b"<html>hi from xite</html>").unwrap();
+    let index = b"<html>hi from xite</html>";
+    storage.write("index.html", index).unwrap();
+    let test_json = br#"{"topic":[]}"#;
+
+    let key = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&key).unwrap();
+    let mut root = json!({
+        "address": address,
+        "title": "Test Xite",
+        "modified": 1.0,
+        "files": {
+            "index.html": {
+                "size": index.len(), "sha512": XiteStorage::hash_bytes(index)
+            },
+            "data/test.json": {
+                "size": test_json.len(), "sha512": XiteStorage::hash_bytes(test_json)
+            },
+        },
+    });
+    epix_content::sign(&mut root, &key).unwrap();
+    storage
+        .write("content.json", epix_content::dumps_content(&root).as_bytes())
+        .unwrap();
 
     let state = AppState::new("0.1.0");
     state
-        .add_xite(
-            "epix1xite",
-            XiteEntry {
-                storage,
-                content: Some(json!({ "title": "Test Xite", "files": { "index.html": {} } })),
-            },
-        )
+        .add_xite(&address, XiteEntry { storage, content: Some(root) })
         .await;
+    // The operator's own xite: local writes (fileWrite) stay served as-is.
+    state.set_owned(&address, true).await;
     // Seed the chart db so the Stats page has data to query.
     state.collect_chart().await;
 
@@ -51,13 +75,13 @@ async fn start_server() -> (std::net::SocketAddr, tempfile::TempDir) {
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    (addr, dir)
+    (addr, address, dir)
 }
 
 #[tokio::test]
 async fn serves_xite_files_over_http() {
-    let (addr, _dir) = start_server().await;
-    let body = reqwest::get(format!("http://{addr}/epix1xite/index.html"))
+    let (addr, xite, _dir) = start_server().await;
+    let body = reqwest::get(format!("http://{addr}/{xite}/index.html"))
         .await
         .unwrap();
     assert_eq!(body.status(), 200);
@@ -76,7 +100,7 @@ async fn serves_xite_files_over_http() {
     assert_eq!(body.text().await.unwrap(), "<html>hi from xite</html>");
 
     // The wrapper page carries a script-nonce CSP (not the sandbox one).
-    let wrapper = reqwest::get(format!("http://{addr}/epix1xite/")).await.unwrap();
+    let wrapper = reqwest::get(format!("http://{addr}/{xite}/")).await.unwrap();
     let wcsp = wrapper.headers()["content-security-policy"].to_str().unwrap();
     assert!(wcsp.contains("script-src 'nonce-"), "wrapper CSP has a script nonce: {wcsp}");
     // WebAssembly compilation is allowed (the wallet's injected provider is
@@ -86,7 +110,7 @@ async fn serves_xite_files_over_http() {
     assert!(!wcsp.contains(" 'unsafe-eval'"), "JS eval stays blocked: {wcsp}");
     assert!(!wcsp.contains("sandbox"));
 
-    let missing = reqwest::get(format!("http://{addr}/epix1xite/nope.txt"))
+    let missing = reqwest::get(format!("http://{addr}/{xite}/nope.txt"))
         .await
         .unwrap();
     assert_eq!(missing.status(), 404);
@@ -375,11 +399,11 @@ async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
 
 #[tokio::test]
 async fn rejects_cross_origin_websocket() {
-    let (addr, _dir) = start_server().await;
+    let (addr, xite, _dir) = start_server().await;
     // A WebSocket from a foreign Origin is refused (can't drive the local API).
     use tokio_tungstenite::tungstenite::http;
     let req = http::Request::builder()
-        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key=epix1xite"))
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}"))
         .header("Host", addr.to_string())
         .header("Origin", "http://evil.example.com")
         .header("Connection", "Upgrade")
@@ -398,8 +422,8 @@ async fn own_write_is_not_echoed_back() {
     // file_done must not receive the event (an echo re-renders the page
     // mid-interaction), while every other connection on the xite does.
     use base64::Engine;
-    let (addr, _dir) = start_server().await;
-    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key=epix1xite");
+    let (addr, xite, _dir) = start_server().await;
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
     let (mut writer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
     let (mut watcher, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
     call_params(&mut writer, "channelJoin", json!({ "channels": ["siteChanged"] }), 1).await;
@@ -432,8 +456,8 @@ async fn own_write_is_not_echoed_back() {
 
 #[tokio::test]
 async fn handles_epixframe_websocket_commands() {
-    let (addr, _dir) = start_server().await;
-    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key=epix1xite");
+    let (addr, xite, _dir) = start_server().await;
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let pong = call(&mut ws, "ping", 1).await;
@@ -443,11 +467,11 @@ async fn handles_epixframe_websocket_commands() {
     let info = call(&mut ws, "serverInfo", 2).await;
     assert_eq!(info["result"]["version"], "0.1.0");
 
-    let xite = call(&mut ws, "siteInfo", 3).await;
-    assert_eq!(xite["result"]["address"], "epix1xite");
-    assert_eq!(xite["result"]["content"]["title"], "Test Xite");
+    let info = call(&mut ws, "siteInfo", 3).await;
+    assert_eq!(info["result"]["address"].as_str(), Some(xite.as_str()));
+    assert_eq!(info["result"]["content"]["title"], "Test Xite");
     // A xite holds no permissions until the user grants one.
-    assert!(xite["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
+    assert!(info["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
 
     // An admin command from the inner page (small id) is refused...
     let denied = call(&mut ws, "siteList", 4).await;

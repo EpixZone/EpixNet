@@ -10,7 +10,8 @@ use regex::Regex;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::Connection;
 use serde_json::{Map, Value};
-use std::path::Path;
+use std::io::Read;
+use std::path::{Component, Path, PathBuf};
 
 fn db_err(e: rusqlite::Error) -> Error {
     Error::Db(e.to_string())
@@ -49,8 +50,12 @@ fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str, xite: &str) -> 
         1 => {
             conn.execute("INSERT OR IGNORE INTO json (path) VALUES (?1)", [&rel_path])
                 .map_err(db_err)?;
-            conn.query_row("SELECT json_id FROM json WHERE path = ?1", [&rel_path], |r| r.get(0))
-                .map_err(db_err)
+            conn.query_row(
+                "SELECT json_id FROM json WHERE path = ?1",
+                [&rel_path],
+                |r| r.get(0),
+            )
+            .map_err(db_err)
         }
         3 => {
             // Merger paths are keyed `<xite>/<inner path>` so the schema
@@ -58,7 +63,9 @@ fn json_id(conn: &Connection, schema: &DbSchema, rel_path: &str, xite: &str) -> 
             // the xite segment (EpixNet's v3 getJsonRow splits the path into
             // xite / directory / file_name). Queries rely on that shape, e.g.
             // REPLACE(json.directory, 'data/users/', '') for the user name.
-            let inner = rel_path.strip_prefix(&format!("{xite}/")).unwrap_or(rel_path.as_str());
+            let inner = rel_path
+                .strip_prefix(&format!("{xite}/"))
+                .unwrap_or(rel_path.as_str());
             let (dir, name) = inner.rsplit_once('/').unwrap_or(("", inner));
             conn.execute(
                 "INSERT OR IGNORE INTO json (site, directory, file_name) VALUES (?1, ?2, ?3)",
@@ -109,9 +116,16 @@ fn insert_row(
     cols.push("json_id");
     params.push(SqlValue::Integer(json_id));
 
-    let placeholders = (1..=cols.len()).map(|i| format!("?{i}")).collect::<Vec<_>>().join(", ");
-    let sql = format!("INSERT OR REPLACE INTO {table} ({}) VALUES ({placeholders})", cols.join(", "));
-    conn.execute(&sql, rusqlite::params_from_iter(params.iter())).map_err(db_err)?;
+    let placeholders = (1..=cols.len())
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "INSERT OR REPLACE INTO {table} ({}) VALUES ({placeholders})",
+        cols.join(", ")
+    );
+    conn.execute(&sql, rusqlite::params_from_iter(params.iter()))
+        .map_err(db_err)?;
     Ok(())
 }
 
@@ -122,7 +136,13 @@ fn insert_row(
 /// still stores the key - filtering it out left every conv_id NULL and the
 /// inbox unable to look conversations up.
 fn allowed_cols(schema: &DbSchema, entry: &ToTable) -> Vec<String> {
-    if let ToTable::Spec { import_cols: Some(cols), key_col, val_col, .. } = entry {
+    if let ToTable::Spec {
+        import_cols: Some(cols),
+        key_col,
+        val_col,
+        ..
+    } = entry
+    {
         let mut cols = cols.clone();
         for extra in [key_col, val_col].into_iter().flatten() {
             if !cols.contains(extra) {
@@ -200,8 +220,11 @@ pub fn update_json(
         let table_jid = match &map.file_name {
             Some(fname) => {
                 let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                let sibling =
-                    if dir.is_empty() { fname.clone() } else { format!("{dir}/{fname}") };
+                let sibling = if dir.is_empty() {
+                    fname.clone()
+                } else {
+                    format!("{dir}/{fname}")
+                };
                 json_id(conn, schema, &sibling, xite)?
             }
             None => jid,
@@ -225,14 +248,23 @@ pub fn update_json(
             let table = entry.table();
             let node = entry.node();
             let allowed = allowed_cols(schema, entry);
-            conn.execute(&format!("DELETE FROM {table} WHERE json_id = ?1"), [table_jid])
-                .map_err(db_err)?;
+            conn.execute(
+                &format!("DELETE FROM {table} WHERE json_id = ?1"),
+                [table_jid],
+            )
+            .map_err(db_err)?;
 
-            let Some(node_data) = table_data.get(node) else { continue };
+            let Some(node_data) = table_data.get(node) else {
+                continue;
+            };
 
             match entry {
                 // Dict-mapped: `key_col` carries the map key.
-                ToTable::Spec { key_col: Some(key_col), val_col, .. } => {
+                ToTable::Spec {
+                    key_col: Some(key_col),
+                    val_col,
+                    ..
+                } => {
                     if let Some(obj) = node_data.as_object() {
                         for (k, v) in obj {
                             if let Some(val_col) = val_col {
@@ -277,7 +309,12 @@ pub fn populate(conn: &Connection, schema: &DbSchema, db_dir: &Path) -> Result<u
 
 /// Like [`populate`], but tags every row with `xite` - for a version-3 merger
 /// db aggregating data from several merged xites (call once per merged xite).
-pub fn populate_xite(conn: &Connection, schema: &DbSchema, db_dir: &Path, xite: &str) -> Result<usize> {
+pub fn populate_xite(
+    conn: &Connection,
+    schema: &DbSchema,
+    db_dir: &Path,
+    xite: &str,
+) -> Result<usize> {
     populate_xite_filtered(conn, schema, db_dir, xite, &[], "")
 }
 
@@ -311,7 +348,9 @@ pub fn populate_xite_filtered(
     let mut count = 0;
     let mut stack = vec![db_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else { continue };
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in entries.flatten() {
             let path = entry.path();
             if path.is_dir() {
@@ -321,7 +360,9 @@ pub fn populate_xite_filtered(
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            let Ok(rel) = path.strip_prefix(db_dir) else { continue };
+            let Ok(rel) = path.strip_prefix(db_dir) else {
+                continue;
+            };
             let rel_body = rel.to_string_lossy().replace('\\', "/");
             let rel_str = if path_prefix.is_empty() {
                 rel_body
@@ -331,11 +372,235 @@ pub fn populate_xite_filtered(
             if !exclude.is_empty() && exclude.iter().any(|e| rel_str.contains(e.as_str())) {
                 continue;
             }
-            let Ok(bytes) = std::fs::read(&path) else { continue };
-            let Ok(data) = serde_json::from_slice::<Value>(&bytes) else { continue };
+            let Ok(bytes) = std::fs::read(&path) else {
+                continue;
+            };
+            let Ok(data) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
             if update_json(conn, schema, &rel_str, &data, xite)? {
                 count += 1;
             }
+        }
+    }
+    Ok(count)
+}
+
+fn unsafe_population_path(rel_path: &str, reason: &str) -> Error {
+    Error::Db(format!("unsafe population path `{rel_path}`: {reason}"))
+}
+
+fn validate_relative_path(rel_path: &str) -> Result<PathBuf> {
+    if rel_path.is_empty() || rel_path.contains('\\') {
+        return Err(unsafe_population_path(rel_path, "path is not normalized"));
+    }
+    let path = Path::new(rel_path);
+    if path.is_absolute() {
+        return Err(unsafe_population_path(rel_path, "path is absolute"));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        let Component::Normal(part) = component else {
+            return Err(unsafe_population_path(rel_path, "path is not normalized"));
+        };
+        normalized.push(part);
+    }
+    if normalized.to_string_lossy().replace('\\', "/") != rel_path {
+        return Err(unsafe_population_path(rel_path, "path is not normalized"));
+    }
+    Ok(normalized)
+}
+
+#[cfg(windows)]
+fn is_link_like(metadata: &std::fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+    metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+#[cfg(not(windows))]
+fn is_link_like(metadata: &std::fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
+}
+
+fn population_root(db_dir: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match std::fs::symlink_metadata(db_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Error::Db(format!(
+                "invalid population directory `{}`: {error}",
+                db_dir.display()
+            )))
+        }
+    };
+    if is_link_like(&metadata) || !metadata.is_dir() {
+        return Err(Error::Db(format!(
+            "invalid population directory `{}`: expected a real directory",
+            db_dir.display()
+        )));
+    }
+    db_dir.canonicalize().map(Some).map_err(|error| {
+        Error::Db(format!(
+            "invalid population directory `{}`: {error}",
+            db_dir.display()
+        ))
+    })
+}
+
+fn read_regular_relative_file(
+    db_dir: &Path,
+    canonical_db_dir: &Path,
+    rel_path: &str,
+    normalized: &Path,
+) -> Result<Option<Vec<u8>>> {
+    let mut path = db_dir.to_path_buf();
+    let component_count = normalized.components().count();
+    for (index, component) in normalized.components().enumerate() {
+        let Component::Normal(part) = component else {
+            unreachable!()
+        };
+        path.push(part);
+        let metadata = match std::fs::symlink_metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Ok(None),
+        };
+        if is_link_like(&metadata) {
+            return Err(unsafe_population_path(rel_path, "path contains a symlink"));
+        }
+        let is_target = index + 1 == component_count;
+        if (!is_target && !metadata.is_dir()) || (is_target && !metadata.is_file()) {
+            return Err(unsafe_population_path(
+                rel_path,
+                "target is not a regular file",
+            ));
+        }
+    }
+
+    let canonical_path = match path.canonicalize() {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+    if !canonical_path.starts_with(canonical_db_dir) {
+        return Err(unsafe_population_path(
+            rel_path,
+            "path escapes the population directory",
+        ));
+    }
+    let mut file = match std::fs::File::open(&path) {
+        Ok(file) => file,
+        Err(_) => return Ok(None),
+    };
+    if !file
+        .metadata()
+        .map(|metadata| metadata.is_file())
+        .unwrap_or(false)
+    {
+        return Err(unsafe_population_path(
+            rel_path,
+            "target is not a regular file",
+        ));
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return Ok(None);
+    }
+    Ok(Some(bytes))
+}
+
+/// Populate only the supplied normalized relative paths. Unlike
+/// [`populate_xite_filtered`], this never walks `db_dir`.
+pub fn populate_xite_paths_filtered(
+    conn: &Connection,
+    schema: &DbSchema,
+    db_dir: &Path,
+    xite: &str,
+    rel_paths: &[String],
+    exclude: &[String],
+    path_prefix: &str,
+) -> Result<usize> {
+    let normalized_paths = rel_paths
+        .iter()
+        .map(|rel_path| validate_relative_path(rel_path))
+        .collect::<Result<Vec<_>>>()?;
+    let Some(canonical_db_dir) = population_root(db_dir)? else {
+        return Ok(0);
+    };
+    let mut count = 0;
+    for (rel_path, normalized) in rel_paths.iter().zip(normalized_paths) {
+        if normalized
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let matched_path = if path_prefix.is_empty() {
+            rel_path.clone()
+        } else {
+            format!("{path_prefix}/{rel_path}")
+        };
+        if !exclude.is_empty()
+            && exclude
+                .iter()
+                .any(|entry| matched_path.contains(entry.as_str()))
+        {
+            continue;
+        }
+        let Some(bytes) =
+            read_regular_relative_file(db_dir, &canonical_db_dir, rel_path, &normalized)?
+        else {
+            continue;
+        };
+        let Ok(data) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        if update_json(conn, schema, &matched_path, &data, xite)? {
+            count += 1;
+        }
+    }
+    Ok(count)
+}
+
+/// Populate already-verified JSON values. Every path is validated before any
+/// database mutation, and exclusions are applied to the same matched path the
+/// schema sees.
+pub fn populate_values_filtered(
+    conn: &Connection,
+    schema: &DbSchema,
+    xite: &str,
+    values: &[(String, Value)],
+    exclude: &[String],
+    path_prefix: &str,
+) -> Result<usize> {
+    let normalized_paths = values
+        .iter()
+        .map(|(rel_path, _)| validate_relative_path(rel_path))
+        .collect::<Result<Vec<_>>>()?;
+    let mut count = 0;
+    for ((rel_path, data), normalized) in values.iter().zip(normalized_paths) {
+        if normalized
+            .extension()
+            .and_then(|extension| extension.to_str())
+            != Some("json")
+        {
+            continue;
+        }
+        let matched_path = if path_prefix.is_empty() {
+            rel_path.clone()
+        } else {
+            format!("{path_prefix}/{rel_path}")
+        };
+        if !exclude.is_empty()
+            && exclude
+                .iter()
+                .any(|entry| matched_path.contains(entry.as_str()))
+        {
+            continue;
+        }
+        if update_json(conn, schema, &matched_path, data, xite)? {
+            count += 1;
         }
     }
     Ok(count)
@@ -367,7 +632,8 @@ pub fn query(conn: &Connection, sql: &str, params: &[Value]) -> Result<Vec<Value
 /// by the statement (`last_insert_rowid`).
 pub fn execute(conn: &Connection, sql: &str, params: &[Value]) -> Result<i64> {
     let sql_params: Vec<SqlValue> = params.iter().map(to_sql).collect();
-    conn.execute(sql, rusqlite::params_from_iter(sql_params.iter())).map_err(db_err)?;
+    conn.execute(sql, rusqlite::params_from_iter(sql_params.iter()))
+        .map_err(db_err)?;
     Ok(conn.last_insert_rowid())
 }
 
@@ -377,7 +643,9 @@ pub fn execute(conn: &Connection, sql: &str, params: &[Value]) -> Result<i64> {
 /// Keep only characters that can appear in a column reference - the dict keys
 /// become SQL identifiers (EpixNet's safe_sql_identifier).
 fn safe_sql_identifier(s: &str) -> String {
-    s.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.').collect()
+    s.chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '.')
+        .collect()
 }
 
 /// Quote a JSON value for embedding directly in SQL (only used for the
@@ -403,7 +671,12 @@ fn sql_quote(v: &Value) -> String {
 /// `{post_uri: [...]}`).
 fn expand_where_dict(sql: &str, map: &Map<String, Value>) -> Option<(String, Vec<SqlValue>)> {
     let pos = sql.rfind('?')?;
-    let head = sql.trim_start().split_whitespace().next().unwrap_or("").to_uppercase();
+    let head = sql
+        .trim_start()
+        .split_whitespace()
+        .next()
+        .unwrap_or("")
+        .to_uppercase();
     if !matches!(head.as_str(), "SELECT" | "DELETE" | "UPDATE") {
         return None;
     }
@@ -443,7 +716,11 @@ fn expand_where_dict(sql: &str, map: &Map<String, Value>) -> Option<(String, Vec
             }
         }
     }
-    let clause = if wheres.is_empty() { "1".to_string() } else { wheres.join(" AND ") };
+    let clause = if wheres.is_empty() {
+        "1".to_string()
+    } else {
+        wheres.join(" AND ")
+    };
     let out = format!("{}{}{}", &sql[..pos], clause, &sql[pos + 1..]);
     Some((out, values))
 }
@@ -470,10 +747,9 @@ pub fn query_value(conn: &Connection, sql: &str, params: &Value) -> Result<Vec<V
                 // (EpixPost passes helper keys like `directories` alongside its
                 // feed SQL); binding an unreferenced name errors in rusqlite,
                 // so skip them.
-                let referenced =
-                    Regex::new(&format!(r":{}([^0-9A-Za-z_]|$)", regex::escape(base)))
-                        .map_err(|e| Error::Db(e.to_string()))?
-                        .is_match(&sql);
+                let referenced = Regex::new(&format!(r":{}([^0-9A-Za-z_]|$)", regex::escape(base)))
+                    .map_err(|e| Error::Db(e.to_string()))?
+                    .is_match(&sql);
                 if !referenced {
                     continue;
                 }
@@ -494,8 +770,10 @@ pub fn query_value(conn: &Connection, sql: &str, params: &Value) -> Result<Vec<V
                     _ => named.push((format!(":{base}"), to_sql(v))),
                 }
             }
-            let refs: Vec<(&str, &dyn rusqlite::ToSql)> =
-                named.iter().map(|(k, v)| (k.as_str(), v as &dyn rusqlite::ToSql)).collect();
+            let refs: Vec<(&str, &dyn rusqlite::ToSql)> = named
+                .iter()
+                .map(|(k, v)| (k.as_str(), v as &dyn rusqlite::ToSql))
+                .collect();
             let mut stmt = conn.prepare(&sql).map_err(db_err)?;
             collect(&mut stmt, refs.as_slice())
         }
@@ -531,7 +809,14 @@ mod merge_tests {
         apply(&conn, &schema).unwrap();
         let xite = "epix1hub";
         // The user's data.json (profile) creates its json row.
-        update_json(&conn, &schema, "epix1hub/data/users/u/data.json", &json!({"user_name":"alice"}), xite).unwrap();
+        update_json(
+            &conn,
+            &schema,
+            "epix1hub/data/users/u/data.json",
+            &json!({"user_name":"alice"}),
+            xite,
+        )
+        .unwrap();
         // posts.json: post 1 live, post 2 edited (v2 supersedes v1), post 3 tombstoned.
         let posts = json!({ "record_format":"epix-orset-1", "post":[
             {"post_id":1,"body":"one","clock":1,"supersedes":0,"deleted":false},
@@ -540,7 +825,14 @@ mod merge_tests {
             {"post_id":3,"body":"gone","clock":1,"supersedes":0,"deleted":false},
             {"post_id":3,"body":"","clock":5,"supersedes":1,"deleted":true}
         ]});
-        update_json(&conn, &schema, "epix1hub/data/users/u/posts.json", &posts, xite).unwrap();
+        update_json(
+            &conn,
+            &schema,
+            "epix1hub/data/users/u/posts.json",
+            &posts,
+            xite,
+        )
+        .unwrap();
 
         // Live winners only, joined to the data.json profile row.
         let mut stmt = conn
@@ -553,7 +845,10 @@ mod merge_tests {
             .collect();
         assert_eq!(
             rows,
-            vec![(1, "one".into(), "alice".into()), (2, "two-v2".into(), "alice".into())],
+            vec![
+                (1, "one".into(), "alice".into()),
+                (2, "two-v2".into(), "alice".into())
+            ],
             "post 3 tombstoned (absent), post 2 folded to the edit, both joined to alice"
         );
     }

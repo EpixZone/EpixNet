@@ -36,14 +36,27 @@ impl ContentDb {
     pub fn add_xite(&self, address: &str) -> Result<i64> {
         let conn = self.db.conn()?;
         let dberr = |e: rusqlite::Error| Error::Db(e.to_string());
-        conn.execute("INSERT OR IGNORE INTO xite (address) VALUES (?1)", [address])
-            .map_err(dberr)?;
-        conn.query_row("SELECT xite_id FROM xite WHERE address = ?1", [address], |r| r.get(0))
-            .map_err(dberr)
+        conn.execute(
+            "INSERT OR IGNORE INTO xite (address) VALUES (?1)",
+            [address],
+        )
+        .map_err(dberr)?;
+        conn.query_row(
+            "SELECT xite_id FROM xite WHERE address = ?1",
+            [address],
+            |r| r.get(0),
+        )
+        .map_err(dberr)
     }
 
     /// Upsert a content.json file's metadata.
-    pub fn set_content(&self, xite_id: i64, inner_path: &str, modified: i64, size: i64) -> Result<()> {
+    pub fn set_content(
+        &self,
+        xite_id: i64,
+        inner_path: &str,
+        modified: i64,
+        size: i64,
+    ) -> Result<()> {
         self.db
             .conn()?
             .execute(
