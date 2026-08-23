@@ -137,6 +137,7 @@ pub type Result<T> = std::result::Result<T, ChainError>;
 /// one RPC per user per resync cycle.
 pub mod xid_signers {
     use std::collections::HashMap;
+    use std::future::Future;
     use std::sync::RwLock;
     use std::time::{Duration, Instant};
 
@@ -170,21 +171,113 @@ pub mod xid_signers {
         }
     }
 
-    /// The addresses that may sign for `name.tld`'s user content: its linked
-    /// identity addresses (all of them - a signature matching any is valid,
-    /// EpixNet's `resolveUserSigners`). Empty if the name doesn't resolve.
-    pub async fn resolve(name: &str, tld: &str) -> Vec<String> {
+    async fn resolve_checked_with<F, Fut>(
+        name: &str,
+        tld: &str,
+        fetch: F,
+    ) -> super::Result<Vec<String>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = super::Result<Vec<String>>>,
+    {
         let key = format!("{name}.{tld}");
         if let Some(hit) = cached(&key) {
-            return hit;
+            return Ok(hit);
         }
-        let Ok(domain) = super::shared_resolver().resolve(name, tld).await else {
-            return Vec::new();
-        };
-        let signers: Vec<String> =
-            domain.identities.iter().map(|i| i.address.clone()).collect();
+        let signers = fetch().await?;
         store(key, signers.clone());
-        signers
+        Ok(signers)
+    }
+
+    /// Resolve every identity address allowed to sign `name.tld` user content.
+    ///
+    /// Unlike [`resolve`], this checked form preserves chain lookup failures so
+    /// callers can distinguish an authoritative empty identity list from an
+    /// RPC, proof, malformed-response, or not-found error. Only successful
+    /// resolutions enter the signer cache.
+    pub async fn resolve_checked(name: &str, tld: &str) -> super::Result<Vec<String>> {
+        resolve_checked_with(name, tld, || async {
+            let domain = super::shared_resolver().resolve(name, tld).await?;
+            Ok(domain
+                .identities
+                .iter()
+                .map(|identity| identity.address.clone())
+                .collect())
+        })
+        .await
+    }
+
+    /// The addresses that may sign for `name.tld`'s user content: its linked
+    /// identity addresses (all of them - a signature matching any is valid,
+    /// EpixNet's `resolveUserSigners`). Empty if the name doesn't resolve or
+    /// the checked chain lookup fails.
+    pub async fn resolve(name: &str, tld: &str) -> Vec<String> {
+        resolve_checked(name, tld).await.unwrap_or_default()
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::ChainError;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        #[tokio::test]
+        async fn checked_resolution_does_not_cache_failures() {
+            clear();
+            let attempts = AtomicUsize::new(0);
+
+            let error = resolve_checked_with("retryable", "test", || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(ChainError::Rpc("offline".into()))
+            })
+            .await;
+            assert!(matches!(error, Err(ChainError::Rpc(message)) if message == "offline"));
+
+            let signers = resolve_checked_with("retryable", "test", || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Ok(vec!["epix1signer".to_string()])
+            })
+            .await
+            .unwrap();
+            assert_eq!(signers, ["epix1signer"]);
+            assert_eq!(attempts.load(Ordering::Relaxed), 2);
+
+            let cached = resolve_checked_with("retryable", "test", || async {
+                attempts.fetch_add(1, Ordering::Relaxed);
+                Err(ChainError::Malformed("must not run".into()))
+            })
+            .await
+            .unwrap();
+            assert_eq!(cached, signers);
+            assert_eq!(attempts.load(Ordering::Relaxed), 2);
+            clear();
+        }
+
+        #[tokio::test]
+        async fn checked_resolution_preserves_chain_error_kinds() {
+            let rpc = resolve_checked_with("rpc", "test", || async {
+                Err(ChainError::Rpc("down".into()))
+            })
+            .await;
+            assert!(matches!(rpc, Err(ChainError::Rpc(_))));
+
+            let proof =
+                resolve_checked_with("proof", "test", || async { Err(ChainError::MerkleInvalid) })
+                    .await;
+            assert!(matches!(proof, Err(ChainError::MerkleInvalid)));
+
+            let malformed = resolve_checked_with("malformed", "test", || async {
+                Err(ChainError::Malformed("bad response".into()))
+            })
+            .await;
+            assert!(matches!(malformed, Err(ChainError::Malformed(_))));
+
+            let missing = resolve_checked_with("missing", "test", || async {
+                Err(ChainError::NotFound("missing.test".into()))
+            })
+            .await;
+            assert!(matches!(missing, Err(ChainError::NotFound(_))));
+        }
     }
 }
 

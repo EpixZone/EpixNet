@@ -14,7 +14,7 @@ pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, OptionalFileStat, XiteSettings};
 pub use piecefield::Piecefield;
 pub use piecemap::{build_piecemap, hash_bigfile, parse_piecemap, BigfileHash};
-pub use xite::{FileEntry, SignOpts, Xite};
+pub use xite::{FileEntry, PreparedChildSign, PreparedRootSign, SignOpts, Xite};
 pub use storage::XiteStorage;
 
 #[cfg(test)]
@@ -239,7 +239,7 @@ mod tests {
         xite.storage.write("new.jpg", b"NEW").unwrap();
         let content = serde_json::to_vec(&json!({
             "optional": ".*jpg",
-            "files_optional": { "gone.jpg": { "size": 3, "sha512": "aa" } },
+            "files_optional": { "gone.jpg": { "size": 3, "sha512": "aa".repeat(32) } },
         }))
         .unwrap();
         xite.storage.write("content.json", &content).unwrap();
@@ -255,7 +255,7 @@ mod tests {
         .unwrap();
         let kept = xite.content.clone().unwrap();
         let optional = kept["files_optional"].as_object().unwrap();
-        assert_eq!(optional["gone.jpg"], json!({ "size": 3, "sha512": "aa" }));
+        assert_eq!(optional["gone.jpg"], json!({ "size": 3, "sha512": "aa".repeat(32) }));
         assert_eq!(optional["new.jpg"]["sha512"], XiteStorage::hash_bytes(b"NEW"));
         assert!(kept["files"].as_object().unwrap().is_empty());
 

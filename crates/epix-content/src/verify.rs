@@ -36,6 +36,41 @@ fn err<T>(msg: impl Into<String>) -> Result<T, VerifyError> {
     Err(VerifyError(msg.into()))
 }
 
+/// Decode a manifest byte size without changing the signed JSON value.
+/// Integer-form JSON may use the full nonnegative i64 range. Legacy and
+/// foreign signers may encode the same value as an integral float (`10.0`),
+/// which is accepted only inside IEEE-754's exact integer range. This keeps
+/// every consumer on one representation without accepting rounded magnitudes.
+pub fn exact_nonnegative_size(value: &Value) -> Option<i64> {
+    if let Some(size) = value.as_i64() {
+        return (size >= 0).then_some(size);
+    }
+    // Keep the boundary strictly below 2^53. serde_json stores float-form
+    // numbers as f64, so the signed lexeme `9007199254740993.0` has already
+    // rounded to 2^53 by the time it reaches this function. Rejecting 2^53
+    // prevents that imprecise magnitude from being accepted as a different
+    // declared size.
+    const MAX_EXACT_FLOAT_INTEGER: f64 = 9_007_199_254_740_991.0;
+    let size = value.as_f64()?;
+    if !size.is_finite()
+        || size.is_sign_negative()
+        || size.fract() != 0.0
+        || size > MAX_EXACT_FLOAT_INTEGER
+    {
+        return None;
+    }
+    let integer = size as i64;
+    ((integer as f64) == size).then_some(integer)
+}
+
+/// Two conservative, platform-independent case keys for signed filesystem
+/// destinations. Using both catches ordinary Unicode case pairs (`Ä`/`ä`)
+/// and one-to-many uppercase expansions (`straße`/`STRASSE`) without making
+/// the protocol reject otherwise valid non-ASCII filenames.
+pub fn portable_path_case_keys(path: &str) -> (String, String) {
+    (path.to_lowercase(), path.to_uppercase())
+}
+
 /// What a verifier needs from the surrounding xite: the xite address, the size
 /// limit, and any already-loaded parent content.json values (to resolve the
 /// rules for an included/user file).
@@ -144,6 +179,37 @@ pub fn get_rules(inner_path: &str, content: &Value, ctx: &dyn VerifyContext) -> 
         }
         if parent.get("user_contents").is_some() {
             return user_content_rules(&parent, inner_path, content);
+        }
+    }
+    None
+}
+
+/// The stored content.json whose current rules govern `inner_path`. Includes
+/// may skip directory levels, so this cannot be derived by removing one path
+/// segment. Archive replay uses the exact governing path to require a verified
+/// trust chain before executing a child's destructive directives.
+pub fn governing_content_path(inner_path: &str, ctx: &dyn VerifyContext) -> Option<String> {
+    if inner_path == "content.json" {
+        return Some("content.json".to_string());
+    }
+    let parts: Vec<&str> = inner_path.split('/').collect();
+    for cut in (0..parts.len().saturating_sub(1)).rev() {
+        let parent_dir = parts[..cut].join("/");
+        let candidate = if parent_dir.is_empty() {
+            "content.json".to_string()
+        } else {
+            format!("{parent_dir}/content.json")
+        };
+        let Some(parent) = ctx.loaded_content(&candidate) else {
+            continue;
+        };
+        let relative = parts[cut..].join("/");
+        let declared_include = parent
+            .get("includes")
+            .and_then(Value::as_object)
+            .is_some_and(|includes| includes.contains_key(&relative));
+        if declared_include || parent.get("user_contents").is_some() {
+            return Some(candidate);
         }
     }
     None
@@ -284,6 +350,42 @@ pub fn user_content_xid_names(parent: &Value, inner_path: &str) -> Vec<String> {
     names
 }
 
+/// Every xID name whose current signer addresses may authorize one child
+/// content.json through this exact parent. This includes ordinary `includes`
+/// signer rules as well as the user-content names handled by
+/// [`user_content_xid_names`].
+pub fn content_xid_names(parent: &Value, inner_path: &str) -> Vec<String> {
+    let mut names = user_content_xid_names(parent, inner_path);
+    let looks_like_name = |value: &str| {
+        value.contains('.') && !value.contains('@') && !value.contains('/')
+    };
+    let parent_inner = parent
+        .get("inner_path")
+        .and_then(Value::as_str)
+        .unwrap_or("content.json");
+    let parent_dir = dirname(parent_inner);
+    let relative = inner_path
+        .strip_prefix(&parent_dir)
+        .unwrap_or(inner_path)
+        .trim_start_matches('/');
+    if let Some(signers) = parent
+        .get("includes")
+        .and_then(Value::as_object)
+        .and_then(|includes| includes.get(relative))
+        .and_then(|rules| rules.get("signers"))
+        .and_then(Value::as_array)
+    {
+        for signer in signers.iter().filter_map(Value::as_str) {
+            if looks_like_name(signer) {
+                names.push(signer.to_string());
+            }
+        }
+    }
+    names.sort();
+    names.dedup();
+    names
+}
+
 /// The user-directory segment of `inner_path` relative to the `user_contents`
 /// parent (e.g. `data/users/<addr>/data.json` -> `<addr>`).
 fn user_dir_segment(parent: &Value, inner_path: &str) -> Option<String> {
@@ -387,19 +489,11 @@ fn verify_content_rules(
         }
     }
     verify_file_metadata(content)?;
-    // Valid relative filenames.
-    for node in ["files", "files_optional", "files_merged"] {
-        if let Some(files) = content.get(node).and_then(|v| v.as_object()) {
-            for path in files.keys() {
-                if !is_valid_relative_path(path) {
-                    return err(format!("Invalid relative path: {path}"));
-                }
-            }
-        }
-    }
-    // A merge file (`files_merged`, verified per-record, no whole-file hash) may
-    // NEVER also appear as a hashed file - that would re-arm the last-writer-
-    // wins overwrite this class exists to prevent. Universal invariant.
+    // A merge file (`files_merged`, verified per-record, no whole-file hash)
+    // may NEVER also appear as a hashed file - that would re-arm the
+    // last-writer-wins overwrite this class exists to prevent. Universal
+    // invariant, checked before the generic destination-collision loop so
+    // the specific error is the one reported.
     if let Some(merged) = content.get("files_merged").and_then(|v| v.as_object()) {
         for path in merged.keys() {
             let hashed = ["files", "files_optional"].iter().any(|n| {
@@ -410,6 +504,41 @@ fn verify_content_rules(
             }
         }
     }
+    // Valid relative filenames.
+    let destination_prefix = dirname(inner_path);
+    let mut lower_destinations = std::collections::HashMap::new();
+    let mut upper_destinations = std::collections::HashMap::new();
+    for node in ["files", "files_optional", "files_merged", "includes"] {
+        if let Some(files) = content.get(node).and_then(|v| v.as_object()) {
+            for path in files.keys() {
+                if !is_valid_relative_path(path) {
+                    return err(format!("Invalid relative path: {path}"));
+                }
+                if node == "files_merged" && is_merge_manifest_alias(path) {
+                    return err(format!("Merge file aliases content.json: {path}"));
+                }
+                let full = format!("{destination_prefix}{path}");
+                let (lower, upper) = portable_path_case_keys(&full);
+                let previous = lower_destinations
+                    .get(&lower)
+                    .or_else(|| upper_destinations.get(&upper));
+                if let Some(previous) = previous {
+                    return err(format!(
+                        "Case-insensitive content destination collision: {previous} and {node}:{path}"
+                    ));
+                }
+                let declaration = format!("{node}:{path}");
+                lower_destinations.insert(lower, declaration.clone());
+                upper_destinations.insert(upper, declaration);
+            }
+        }
+    }
+    // Validate each aggregate even for a root manifest. Root files are not
+    // constrained by include max_size rules, but clone progress and settings
+    // store their totals in i64 and must never receive a signed overflowing
+    // set.
+    let files_size = sum_file_sizes(content, "files")?;
+    let files_size_optional = sum_file_sizes(content, "files_optional")?;
 
     if inner_path == "content.json" {
         // Root content.json bigger than the size limit is rejected.
@@ -427,9 +556,9 @@ fn verify_content_rules(
         return err("No rules");
     };
     let content_size = raw_len
-        .checked_add(sum_file_sizes(content, "files")?)
+        .checked_add(files_size)
         .ok_or_else(|| VerifyError("files size total overflow".to_string()))?;
-    let content_size_optional = sum_file_sizes(content, "files_optional")?;
+    let content_size_optional = files_size_optional;
     if let Some(max) = rules.get("max_size").and_then(|v| v.as_i64()) {
         if content_size > max {
             return err(format!("Include too large {content_size}B > {max}B"));
@@ -512,22 +641,13 @@ fn verify_file_metadata(content: &Value) -> Result<(), VerifyError> {
             let Some(metadata) = value.as_object() else {
                 return err(format!("Invalid {node} entry {path}: expected an object"));
             };
-            // JSON number representation is signer-dependent: an integral
-            // float (10.0) from an older or foreign signer is the same
-            // declared size, and rejecting it would retroactively invalidate
-            // an already-signed manifest. Anything non-integral or negative
-            // is still refused.
-            let size_ok = metadata.get("size").is_some_and(|value| {
-                value
-                    .as_i64()
-                    .or_else(|| {
-                        value
-                            .as_f64()
-                            .filter(|f| f.fract() == 0.0 && *f >= 0.0 && *f <= i64::MAX as f64)
-                            .map(|f| f as i64)
-                    })
-                    .is_some_and(|size| size >= 0)
-            });
+            // Every consumer uses the same exact decoder. Integral floats from
+            // legacy signers remain valid without bypassing availability or
+            // aggregate-size checks.
+            let size_ok = metadata
+                .get("size")
+                .and_then(exact_nonnegative_size)
+                .is_some();
             if !size_ok {
                 return err(format!(
                     "Invalid {node} entry {path}: size must be a nonnegative integer"
@@ -627,6 +747,22 @@ pub fn verify_content_file(
     verify_content_rules(inner_path, content, raw_len, ctx)
 }
 
+/// The structural manifest rules alone (path validity, case-insensitive
+/// destination collisions, merge/hashed exclusivity, size aggregation) with
+/// no signature or signer-authorization checks. [`verify_content_file`]
+/// enforces these same rules on every load, so a signer must run this on a
+/// freshly built manifest BEFORE committing it: a manifest failing them
+/// would sign fine and then be rejected by this very node on restart,
+/// bricking the xite at sign time.
+pub fn verify_content_structure(
+    inner_path: &str,
+    content: &Value,
+    raw_len: i64,
+    ctx: &dyn VerifyContext,
+) -> Result<(), VerifyError> {
+    verify_content_rules(inner_path, content, raw_len, ctx)
+}
+
 /// EpixNet's `isArchived`: whether the parent's `user_contents` marks this
 /// file's directory as archived (`archived[dirname] >= modified`) or the whole
 /// tree as archived before a time (`archived_before >= modified`).
@@ -657,8 +793,7 @@ fn sum_file_sizes(content: &Value, node: &str) -> Result<i64, VerifyError> {
     let mut total = 0i64;
     for size in files
         .values()
-        .filter_map(|file| file.get("size").and_then(Value::as_i64))
-        .filter(|size| *size >= 0)
+        .filter_map(|file| file.get("size").and_then(exact_nonnegative_size))
     {
         total = total
             .checked_add(size)
@@ -670,8 +805,10 @@ fn sum_file_sizes(content: &Value, node: &str) -> Result<i64, VerifyError> {
 /// EpixNet's `isValidRelativePath`: no `..` traversal, no leading slash, no
 /// control/quote characters, not absolute, and no Windows-reserved device names
 /// (a xite carrying `CON/x.txt` would be undownloadable on Windows peers).
-fn is_valid_relative_path(path: &str) -> bool {
-    if path.is_empty() || path.starts_with('/') {
+/// Whether a protocol inner path has one canonical, portable filesystem form.
+/// Recovery uses this same gate before trusting journal paths.
+pub fn is_valid_relative_path(path: &str) -> bool {
+    if path.is_empty() || path.starts_with('/') || path.ends_with('/') {
         return false;
     }
     // Traversal is a whole path SEGMENT equal to `..` (or `.`), not any `..`
@@ -680,7 +817,10 @@ fn is_valid_relative_path(path: &str) -> bool {
     // The old `path.contains("..")` rejected those, so a validly-signed content
     // .json failed verification: the clone never finalized and the xite was
     // dropped on restart.
-    if path.split('/').any(|segment| segment == ".." || segment == ".") {
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == ".." || segment == ".")
+    {
         return false;
     }
     // Reject characters EpixNet forbids in inner paths.
@@ -690,18 +830,31 @@ fn is_valid_relative_path(path: &str) -> bool {
     {
         return false;
     }
-    // Reserved on Windows, as a directory segment or a file's base name
-    // (`CON`, `CON.txt`, and `a/PRN/b` are all invalid there). Uppercase only,
-    // exactly like EpixNet's regex - being stricter would reject content that
-    // Python nodes accept and split the network.
+    // Windows ignores trailing spaces/dots and treats device names
+    // case-insensitively. Reject those aliases on every platform so two peers
+    // cannot map one signed path to different files.
     !path.split('/').any(|segment| {
-        let base = segment.split('.').next().unwrap_or(segment);
-        matches!(base, "CON" | "PRN" | "AUX" | "NUL" | "CONOUT$" | "CONIN$")
+        let trimmed = segment.trim_end_matches([' ', '.']);
+        if trimmed.is_empty() || trimmed != segment {
+            return true;
+        }
+        let base = trimmed.split('.').next().unwrap_or(trimmed).to_ascii_uppercase();
+        matches!(base.as_str(), "CON" | "PRN" | "AUX" | "NUL" | "CONOUT$" | "CONIN$")
             || (base.len() == 4
                 && (base.starts_with("COM") || base.starts_with("LPT"))
                 && base.as_bytes()[3].is_ascii_digit()
                 && base.as_bytes()[3] != b'0')
     })
+}
+
+/// Whether a merge-file path's Windows-normalized terminal component aliases
+/// a content manifest. State uses the same predicate before taking path locks.
+pub fn is_merge_manifest_alias(path: &str) -> bool {
+    let normalized = path.replace('\\', "/");
+    let terminal = normalized.rsplit('/').next().unwrap_or(&normalized);
+    terminal
+        .trim_end_matches([' ', '.'])
+        .eq_ignore_ascii_case("content.json")
 }
 
 /// Anchored full-string regex match (`^pat$`), as EpixNet's `SafeRe.match` with
@@ -762,6 +915,30 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    #[test]
+    fn exact_size_accepts_legacy_integral_floats_without_rounded_magnitudes() {
+        assert_eq!(exact_nonnegative_size(&json!(0)), Some(0));
+        assert_eq!(exact_nonnegative_size(&json!(i64::MAX)), Some(i64::MAX));
+        assert_eq!(exact_nonnegative_size(&json!(1.0)), Some(1));
+        assert_eq!(
+            exact_nonnegative_size(&json!(9_007_199_254_740_991.0)),
+            Some(9_007_199_254_740_991)
+        );
+
+        for invalid in [
+            json!(-1),
+            json!(-0.0),
+            json!(1.5),
+            json!(u64::MAX),
+            json!("1"),
+            serde_json::from_str("9007199254740993.0").unwrap(),
+        ] {
+            assert_eq!(exact_nonnegative_size(&invalid), None, "{invalid}");
+        }
+        assert!(serde_json::Number::from_f64(f64::INFINITY).is_none());
+        assert!(serde_json::Number::from_f64(f64::NAN).is_none());
+    }
+
     struct Ctx {
         address: String,
         loaded: std::collections::HashMap<String, Value>,
@@ -820,6 +997,39 @@ mod tests {
     }
 
     #[test]
+    fn root_required_and_optional_size_totals_reject_overflow() {
+        let pk = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+        let ctx = Ctx {
+            address: addr.clone(),
+            loaded: Default::default(),
+            limit: i64::MAX,
+        };
+
+        for node in ["files", "files_optional"] {
+            let mut content = json!({
+                "address": addr.clone(),
+                "inner_path": "content.json",
+                "modified": 1,
+                "files": {},
+                "files_optional": {},
+            });
+            content[node] = json!({
+                "first.bin": { "size": i64::MAX, "sha512": "a".repeat(64) },
+                "second.bin": { "size": 1, "sha512": "b".repeat(64) },
+            });
+            let (content, bytes) = sign_content(content, &pk);
+            let error = verify_content_file("content.json", &content, bytes.len() as i64, &ctx)
+                .unwrap_err();
+            assert!(
+                error.0.contains(&format!("{node} size total overflow")),
+                "{node}: {}",
+                error.0
+            );
+        }
+    }
+
+    #[test]
     fn root_file_metadata_requires_sizes_and_64_character_hashes() {
         let pk = epix_crypt::new_seed();
         let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
@@ -832,7 +1042,7 @@ mod tests {
                 "modified": 1,
                 "files": {
                     "required.bin": {
-                        "size": 0,
+                        "size": 1.0,
                         "sha512": "a".repeat(64),
                         "b3": "B".repeat(64),
                     },
@@ -1048,6 +1258,25 @@ mod tests {
         );
         let e = verify_content_file(&inner, &c, b.len() as i64, &ctx).unwrap_err();
         assert!(format!("{e:?}").contains("also declared as a hashed file"), "{e:?}");
+
+        let merge_value = |path: &str| {
+            let mut merged = serde_json::Map::new();
+            merged.insert(path.to_string(), json!({ "class": "epix-orset-1" }));
+            Value::Object(merged)
+        };
+        for alias in ["content.json", "nested/content.json", "nested/Content.Json"] {
+            let (c, b) = make(merge_value(alias), json!({}));
+            let e = verify_content_file(&inner, &c, b.len() as i64, &ctx).unwrap_err();
+            assert!(e.0.contains("aliases content.json"), "{alias}: {}", e.0);
+        }
+        for alias in ["content.json.", "nested/CONTENT.JSON "] {
+            assert!(is_merge_manifest_alias(alias), "{alias}");
+            let (c, b) = make(merge_value(alias), json!({}));
+            let e = verify_content_file(&inner, &c, b.len() as i64, &ctx).unwrap_err();
+            assert!(e.0.contains("Invalid relative path"), "{alias}: {}", e.0);
+        }
+        assert!(is_merge_manifest_alias(r"nested\Content.Json. "));
+        assert!(!is_merge_manifest_alias("nested/not-content.json"));
     }
 
     #[test]
@@ -1162,18 +1391,31 @@ mod tests {
         assert!(!is_valid_relative_path("a/../b"));
         assert!(!is_valid_relative_path("a/.."));
         assert!(!is_valid_relative_path("a/./b"));
+        assert!(!is_valid_relative_path("a//b"));
+        assert!(!is_valid_relative_path("a/"));
         assert!(!is_valid_relative_path("/etc/passwd"));
         assert!(!is_valid_relative_path("a\\b"));
-        // Windows-reserved device names, matching EpixNet's (uppercase-only)
-        // regex: as a segment or a base name, at any depth.
+        assert!(!is_valid_relative_path("file.txt:stream"));
+        assert!(!is_valid_relative_path("name."));
+        assert!(!is_valid_relative_path("name "));
+        assert!(!is_valid_relative_path("dir./file"));
+        // Windows-reserved device names are case-insensitive, as a segment or
+        // a file's base name, at any depth.
         assert!(!is_valid_relative_path("CON"));
         assert!(!is_valid_relative_path("CON.txt"));
+        assert!(!is_valid_relative_path("con.txt"));
         assert!(!is_valid_relative_path("data/PRN/file.txt"));
+        assert!(!is_valid_relative_path("data/prn/file.txt"));
+        assert!(!is_valid_relative_path("aux"));
+        assert!(!is_valid_relative_path("nul.bin"));
+        assert!(!is_valid_relative_path("ConIn$"));
+        assert!(!is_valid_relative_path("conout$.log"));
         assert!(!is_valid_relative_path("COM1.log"));
+        assert!(!is_valid_relative_path("com9.log"));
         assert!(!is_valid_relative_path("js/LPT9"));
+        assert!(!is_valid_relative_path("js/lpt1.txt"));
         assert!(is_valid_relative_path("CONFIG.txt")); // prefix only, allowed
         assert!(is_valid_relative_path("COM0.txt")); // COM0 is not reserved
-        assert!(is_valid_relative_path("con.txt")); // lowercase, like EpixNet
     }
 
     /// A user content.json signed by its own dir keypair, with a permissive
@@ -1218,6 +1460,90 @@ mod tests {
 
         let error = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
         assert!(error.0.contains("size must be a nonnegative integer"), "{}", error.0);
+    }
+
+    #[test]
+    fn signed_manifest_rejects_case_folded_paths_in_one_section() {
+        for extra in [
+            json!({
+                "files": {
+                    "Media/Foo.bin": { "size": 1, "sha512": "a".repeat(64) },
+                    "media/foo.BIN": { "size": 1, "sha512": "b".repeat(64) },
+                },
+            }),
+            json!({
+                "includes": {
+                    "Users/A/content.json": {},
+                    "users/a/CONTENT.JSON": {},
+                },
+            }),
+            json!({
+                "files": {
+                    "Media/Ä.bin": { "size": 1, "sha512": "a".repeat(64) },
+                    "media/ä.BIN": { "size": 1, "sha512": "b".repeat(64) },
+                },
+            }),
+            json!({
+                "files": {
+                    "straße.bin": { "size": 1, "sha512": "a".repeat(64) },
+                    "STRASSE.BIN": { "size": 1, "sha512": "b".repeat(64) },
+                },
+            }),
+        ] {
+            let (inner, content, bytes, loaded) =
+                user_content_fixture(json!({}), extra);
+            let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+
+            let error =
+                verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+            assert!(
+                error.0.contains("Case-insensitive content destination collision"),
+                "{}",
+                error.0
+            );
+        }
+    }
+
+    #[test]
+    fn signed_manifest_rejects_case_folded_paths_across_sections() {
+        for extra in [
+            json!({
+                "files": {
+                    "Media/Foo.bin": { "size": 1, "sha512": "a".repeat(64) },
+                },
+                "files_optional": {
+                    "media/foo.BIN": { "size": 1, "sha512": "b".repeat(64) },
+                },
+            }),
+            json!({
+                "files": {
+                    "Media/Foo.bin": { "size": 1, "sha512": "a".repeat(64) },
+                },
+                "files_merged": {
+                    "media/foo.BIN": { "class": "epix-orset-1" },
+                },
+            }),
+            json!({
+                "files": {
+                    "Users/A/content.json": { "size": 1, "sha512": "a".repeat(64) },
+                },
+                "includes": {
+                    "users/a/CONTENT.JSON": {},
+                },
+            }),
+        ] {
+            let (inner, content, bytes, loaded) =
+                user_content_fixture(json!({}), extra);
+            let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+
+            let error =
+                verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
+            assert!(
+                error.0.contains("Case-insensitive content destination collision"),
+                "{}",
+                error.0
+            );
+        }
     }
 
     #[test]
@@ -1331,5 +1657,21 @@ mod tests {
             data,
         };
         assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
+    }
+
+    #[test]
+    fn content_xid_names_include_skipped_level_include_signers() {
+        let parent = json!({
+            "inner_path": "content.json",
+            "includes": {
+                "deep/path/content.json": {
+                    "signers": ["admin.epix", "epix1address", "admin.epix"]
+                }
+            }
+        });
+        assert_eq!(
+            content_xid_names(&parent, "deep/path/content.json"),
+            vec!["admin.epix".to_string()]
+        );
     }
 }

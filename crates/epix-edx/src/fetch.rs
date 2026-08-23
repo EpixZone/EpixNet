@@ -75,6 +75,49 @@ fn busy_err(retry_after_ms: u32) -> std::io::Error {
     )
 }
 
+/// A rejected [`Req::Update`], kept typed so the publishing layer can
+/// distinguish a temporary Busy response from a permanent refusal. Generic
+/// `io::ErrorKind::QuotaExceeded` cannot carry that distinction because the
+/// wire maps both `LIMIT` and legacy `BUSY` to it.
+#[derive(Debug)]
+pub enum PushUpdateError {
+    /// The peer is alive but cannot accept this Update yet. New peers carry an
+    /// exact retry hint; legacy `Err { BUSY }` peers leave it absent.
+    Busy {
+        message: String,
+        retry_after: Option<std::time::Duration>,
+    },
+    /// A protocol, transport, or permanent remote refusal.
+    Refused(std::io::Error),
+}
+
+impl std::fmt::Display for PushUpdateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy {
+                message,
+                retry_after: Some(delay),
+            } => {
+                write!(f, "{message}, retry after {delay:?}")
+            }
+            Self::Busy {
+                message,
+                retry_after: None,
+            } => f.write_str(message),
+            Self::Refused(error) => error.fmt(f),
+        }
+    }
+}
+
+impl std::error::Error for PushUpdateError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Busy { .. } => None,
+            Self::Refused(error) => Some(error),
+        }
+    }
+}
+
 // Advertising `caps::RETRY_AFTER` in our Hello means the server may answer
 // ANY request with `Resp::Busy` (its serve-slots gate refuses before it
 // even looks at the request type), so every decoder below must map Busy to
@@ -392,8 +435,8 @@ pub async fn push_update(
     diffs: Vec<(String, Vec<u8>)>,
     sender_peers: Vec<String>,
     inline: Vec<(ObjId, Vec<u8>)>,
-) -> std::io::Result<()> {
-    match conn
+) -> Result<(), PushUpdateError> {
+    let response = conn
         .request(Req::Update {
             xite: xite.into(),
             inner_path: inner_path.into(),
@@ -403,12 +446,25 @@ pub async fn push_update(
             diffs,
             sender_peers,
         })
-        .await?
-    {
+        .await
+        .map_err(PushUpdateError::Refused)?;
+    match response {
         Resp::Ok => Ok(()),
-        Resp::Err { code, msg } => Err(remote_err(code, &msg)),
-        Resp::Busy { retry_after_ms } => Err(busy_err(retry_after_ms)),
-        other => Err(proto_err(format!("expected Ok, got {other:?}"))),
+        Resp::Err {
+            code: err::BUSY,
+            msg,
+        } => Err(PushUpdateError::Busy {
+            message: msg,
+            retry_after: None,
+        }),
+        Resp::Busy { retry_after_ms } => Err(PushUpdateError::Busy {
+            message: "peer busy".into(),
+            retry_after: Some(std::time::Duration::from_millis(retry_after_ms as u64)),
+        }),
+        Resp::Err { code, msg } => Err(PushUpdateError::Refused(remote_err(code, &msg))),
+        other => Err(PushUpdateError::Refused(proto_err(format!(
+            "expected Ok, got {other:?}"
+        )))),
     }
 }
 
@@ -531,10 +587,16 @@ async fn store_many_items(
         // insert_bytes re-verifies BLAKE3(bytes) == id; a lying
         // peer's blob fails here and is not counted.
         let store = store.clone();
-        let ok =
-            tokio::task::spawn_blocking(move || store.insert_bytes(id, Ns::Plain, &bytes, now))
-                .await
-                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        let ok = tokio::task::spawn_blocking(move || {
+            // A whole-blob insert must stay in the namespace the object was
+            // reserved under: a shard pull that lands as one blob would
+            // otherwise re-file its ciphertext as Plain, and the volunteer
+            // shard budget (ns_bytes(Ns::Shard)) would never see it.
+            let ns = store.object_ns(id).ok().flatten().unwrap_or(Ns::Plain);
+            store.insert_bytes(id, ns, &bytes, now)
+        })
+        .await
+        .map_err(|e| std::io::Error::other(e.to_string()))?;
         if ok.is_ok() {
             got.insert(id);
             inserted += 1;
@@ -1117,6 +1179,80 @@ mod tests {
 
         let err = get_trackers(&client).await.unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::QuotaExceeded, "{err}");
+
+        let err = push_update(
+            &client,
+            "1Forum",
+            "content.json",
+            b"{}",
+            1.0,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            PushUpdateError::Busy {
+                retry_after: Some(delay),
+                ..
+            } if delay == std::time::Duration::from_secs(2)
+        ));
+        drop(server);
+    }
+
+    #[tokio::test]
+    async fn update_busy_and_limit_stay_distinct() {
+        let (a, b) = tokio::io::duplex(1 << 16);
+        let (client, _client_in) = Conn::start(a, true);
+        let (server, mut server_in) = Conn::start(b, false);
+
+        let srv = server.clone();
+        tokio::spawn(async move {
+            let replies = [
+                Resp::Err {
+                    code: err::BUSY,
+                    msg: "legacy busy".into(),
+                },
+                Resp::Err {
+                    code: err::LIMIT,
+                    msg: "hard limit".into(),
+                },
+            ];
+            for response in replies {
+                let inc = server_in.recv().await.expect("server received Update");
+                srv.respond(inc.stream, response)
+                    .await
+                    .expect("server sent reply");
+            }
+        });
+
+        let push = || {
+            push_update(
+                &client,
+                "1Forum",
+                "content.json",
+                b"{}",
+                1.0,
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+            )
+        };
+        assert!(matches!(
+            push().await.unwrap_err(),
+            PushUpdateError::Busy {
+                message,
+                retry_after: None,
+            } if message == "legacy busy"
+        ));
+        assert!(matches!(
+            push().await.unwrap_err(),
+            PushUpdateError::Refused(error)
+                if error.kind() == std::io::ErrorKind::QuotaExceeded
+                    && error.to_string().contains("hard limit")
+        ));
         drop(server);
     }
 }

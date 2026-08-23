@@ -446,13 +446,30 @@ pub async fn serve(
 ) -> Option<PeerIdentity> {
     let identity = hello_gate(&conn, &mut incoming, &ctx, handshake_hash.as_ref()).await?;
     let reach = if handshake_hash.is_some() { Reach::Clearnet } else { Reach::Overlay };
-    Some(serve_requests(conn, incoming, ctx, identity, reach, true, None).await)
+    Some(
+        serve_requests(
+            conn,
+            incoming,
+            ctx,
+            identity,
+            reach,
+            true,
+            ServeActivityHooks::default(),
+        )
+        .await,
+    )
 }
 
 /// Notification that a request served on an authenticated outbound link has
 /// completed. A connection pool uses this to renew the reverse-serving lease
 /// after a long range response, without exposing pool state to this crate.
 pub type ServeActivityHook = Arc<dyn Fn() + Send + Sync>;
+
+#[derive(Default)]
+struct ServeActivityHooks {
+    on_request: Option<ServeActivityHook>,
+    on_complete: Option<ServeActivityHook>,
+}
 
 /// Serve reverse requests on a link whose peer was already authenticated by
 /// [`client_hello`]. No second `Hello` is expected or accepted.
@@ -474,7 +491,16 @@ pub async fn serve_authenticated(
     identity: PeerIdentity,
     reach: Reach,
 ) -> PeerIdentity {
-    serve_requests(conn, incoming, ctx, identity, reach, false, None).await
+    serve_requests(
+        conn,
+        incoming,
+        ctx,
+        identity,
+        reach,
+        false,
+        ServeActivityHooks::default(),
+    )
+    .await
 }
 
 /// [`serve_authenticated`] with a completion hook for connection-pool lease
@@ -488,7 +514,47 @@ pub async fn serve_authenticated_tracked(
     reach: Reach,
     on_activity: ServeActivityHook,
 ) -> PeerIdentity {
-    serve_requests(conn, incoming, ctx, identity, reach, false, Some(on_activity)).await
+    serve_requests(
+        conn,
+        incoming,
+        ctx,
+        identity,
+        reach,
+        false,
+        ServeActivityHooks {
+            on_request: None,
+            on_complete: Some(on_activity),
+        },
+    )
+    .await
+}
+
+/// [`serve_authenticated_tracked`] with separate request-start and completion
+/// hooks. Connection pools use the start notification to prove a peer is
+/// actively pulling before a long handler finishes, while the completion
+/// notification renews the idle lease after that handler's final response.
+pub async fn serve_authenticated_observed(
+    conn: Conn,
+    incoming: mpsc::Receiver<Incoming>,
+    ctx: Arc<ServeCtx>,
+    identity: PeerIdentity,
+    reach: Reach,
+    on_request: ServeActivityHook,
+    on_complete: ServeActivityHook,
+) -> PeerIdentity {
+    serve_requests(
+        conn,
+        incoming,
+        ctx,
+        identity,
+        reach,
+        false,
+        ServeActivityHooks {
+            on_request: Some(on_request),
+            on_complete: Some(on_complete),
+        },
+    )
+    .await
 }
 
 /// Result of assigning one established request to its bounded handler lane.
@@ -543,7 +609,7 @@ async fn serve_requests(
     identity: PeerIdentity,
     reach: Reach,
     reap_idle: bool,
-    on_activity: Option<ServeActivityHook>,
+    hooks: ServeActivityHooks,
 ) -> PeerIdentity {
 
     // Register the connection with the governor (reachability from the
@@ -580,6 +646,9 @@ async fn serve_requests(
         let Some(inc) = next_request(&mut incoming, reap_idle).await else {
             break;
         };
+        if let Some(on_request) = &hooks.on_request {
+            on_request();
+        }
         // Updates and the requests they may synchronously issue back over this
         // same duplex link need independent bounded lanes. If eight Updates on
         // each endpoint occupied the one shared semaphore, all sixteen could
@@ -602,11 +671,11 @@ async fn serve_requests(
         let conn = conn.clone();
         let ctx = ctx.clone();
         let identity = identity.clone();
-        let on_activity = on_activity.clone();
+        let on_complete = hooks.on_complete.clone();
         tokio::spawn(async move {
             handle(conn, ctx, identity, reach, inc).await;
-            if let Some(on_activity) = on_activity {
-                on_activity();
+            if let Some(on_complete) = on_complete {
+                on_complete();
             }
             drop(permit);
         });
@@ -1822,6 +1891,55 @@ mod tests {
         })
         .await
         .expect("completion hook fires");
+        assert_eq!(completed.load(Ordering::Relaxed), 1);
+        client.shutdown();
+    }
+
+    #[tokio::test]
+    async fn observed_authenticated_serve_reports_request_start_and_completion() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (client_io, server_io) = tokio::io::duplex(1 << 20);
+        let (client, _client_incoming) = Conn::start(client_io, true);
+        let (server, server_incoming) = Conn::start(server_io, false);
+        let dir = tempfile::tempdir().unwrap();
+        let ctx = Arc::new(ctx_for(
+            store_in(&dir),
+            Fixture {
+                signed: Some(b"observed".to_vec()),
+                block: false,
+            },
+        ));
+        let started = Arc::new(AtomicUsize::new(0));
+        let completed = Arc::new(AtomicUsize::new(0));
+        let start_count = started.clone();
+        let complete_count = completed.clone();
+        tokio::spawn(serve_authenticated_observed(
+            server,
+            server_incoming,
+            ctx,
+            (*peer()).clone(),
+            Reach::Overlay,
+            Arc::new(move || {
+                start_count.fetch_add(1, Ordering::Relaxed);
+            }),
+            Arc::new(move || {
+                complete_count.fetch_add(1, Ordering::Relaxed);
+            }),
+        ));
+
+        let got = crate::fetch::fetch_signed(&client, "1Forum", "content.json")
+            .await
+            .expect("signed response succeeds");
+        assert_eq!(got, b"observed");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while completed.load(Ordering::Relaxed) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("completion hook fires");
+        assert_eq!(started.load(Ordering::Relaxed), 1);
         assert_eq!(completed.load(Ordering::Relaxed), 1);
         client.shutdown();
     }

@@ -11,9 +11,9 @@ pub use content_db::ContentDb;
 pub use schema::{DbSchema, MapSettings, TableSchema, ToTable};
 
 use epix_core::{Error, Result};
-use serde_json::Value;
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
+use serde_json::Value;
 
 pub type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
@@ -38,9 +38,8 @@ impl Database {
 
     fn from_manager(mgr: SqliteConnectionManager, max_size: u32) -> Result<Self> {
         // WAL + foreign keys on every checked-out connection.
-        let mgr = mgr.with_init(|c| {
-            c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;")
-        });
+        let mgr =
+            mgr.with_init(|c| c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"));
         let pool = Pool::builder()
             .max_size(max_size)
             .build(mgr)
@@ -61,7 +60,11 @@ impl Database {
 
     /// Populate the db from JSON data files under `db_dir`, per the schema's
     /// `maps`. Returns the number of files ingested.
-    pub fn populate(&self, schema: &DbSchema, db_dir: impl AsRef<std::path::Path>) -> Result<usize> {
+    pub fn populate(
+        &self,
+        schema: &DbSchema,
+        db_dir: impl AsRef<std::path::Path>,
+    ) -> Result<usize> {
         let conn = self.conn()?;
         populate::populate(&conn, schema, db_dir.as_ref())
     }
@@ -76,6 +79,27 @@ impl Database {
     ) -> Result<usize> {
         let conn = self.conn()?;
         populate::populate_xite_filtered(&conn, schema, db_dir.as_ref(), "", exclude, "")
+    }
+
+    /// Populate only the supplied normalized paths under `db_dir`, skipping
+    /// paths matched by `exclude`. The directory is not walked.
+    pub fn populate_paths_filtered(
+        &self,
+        schema: &DbSchema,
+        db_dir: impl AsRef<std::path::Path>,
+        rel_paths: &[String],
+        exclude: &[String],
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        populate::populate_xite_paths_filtered(
+            &conn,
+            schema,
+            db_dir.as_ref(),
+            "",
+            rel_paths,
+            exclude,
+            "",
+        )
     }
 
     /// Route ONE data file under `db_dir` into the db, per the schema's `maps`
@@ -123,6 +147,64 @@ impl Database {
         populate::populate_xite_prefixed(&conn, schema, db_dir.as_ref(), xite, xite)
     }
 
+    /// Populate a version-3 merger db from only the supplied normalized paths
+    /// under one merged xite. Paths are matched as `<xite>/<relative path>`.
+    pub fn populate_xite_paths(
+        &self,
+        schema: &DbSchema,
+        db_dir: impl AsRef<std::path::Path>,
+        xite: &str,
+        rel_paths: &[String],
+    ) -> Result<usize> {
+        self.populate_xite_paths_filtered(schema, db_dir, xite, rel_paths, &[])
+    }
+
+    /// Populate a version-3 merger db from only the supplied normalized paths,
+    /// excluding paths that contain one of the supplied author identifiers.
+    pub fn populate_xite_paths_filtered(
+        &self,
+        schema: &DbSchema,
+        db_dir: impl AsRef<std::path::Path>,
+        xite: &str,
+        rel_paths: &[String],
+        exclude: &[String],
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        populate::populate_xite_paths_filtered(
+            &conn,
+            schema,
+            db_dir.as_ref(),
+            xite,
+            rel_paths,
+            exclude,
+            xite,
+        )
+    }
+
+    /// Populate an ordinary xite database from already-verified JSON values.
+    pub fn populate_values_filtered(
+        &self,
+        schema: &DbSchema,
+        values: &[(String, Value)],
+        exclude: &[String],
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        populate::populate_values_filtered(&conn, schema, "", values, exclude, "")
+    }
+
+    /// Populate a version-3 merger database from already-verified JSON values
+    /// belonging to one source xite.
+    pub fn populate_xite_values_filtered(
+        &self,
+        schema: &DbSchema,
+        xite: &str,
+        values: &[(String, Value)],
+        exclude: &[String],
+    ) -> Result<usize> {
+        let conn = self.conn()?;
+        populate::populate_values_filtered(&conn, schema, xite, values, exclude, xite)
+    }
+
     /// Run a read query, returning rows as JSON objects.
     pub fn query(&self, sql: &str, params: &[Value]) -> Result<Vec<Value>> {
         let conn = self.conn()?;
@@ -137,7 +219,9 @@ impl Database {
 
     /// Run several statements with no params (DDL/schema setup).
     pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.conn()?.execute_batch(sql).map_err(|e| Error::Db(e.to_string()))
+        self.conn()?
+            .execute_batch(sql)
+            .map_err(|e| Error::Db(e.to_string()))
     }
 
     /// Run a read query whose params are a JSON value (object = named binds,
@@ -250,18 +334,31 @@ mod tests {
         .unwrap();
 
         // Reads work, params bind, and functions/CTEs are allowed.
-        let rows = db.query_untrusted("SELECT title FROM post WHERE post_id = ?", &json!([1])).unwrap();
+        let rows = db
+            .query_untrusted("SELECT title FROM post WHERE post_id = ?", &json!([1]))
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["title"], "hi");
-        db.query_untrusted("SELECT COUNT(*) AS n FROM post", &Value::Null).unwrap();
+        db.query_untrusted("SELECT COUNT(*) AS n FROM post", &Value::Null)
+            .unwrap();
 
         // Writes and DDL are refused by the authorizer.
-        assert!(db.query_untrusted("INSERT INTO post VALUES (3, 'no')", &Value::Null).is_err());
-        assert!(db.query_untrusted("UPDATE post SET title = 'x'", &Value::Null).is_err());
-        assert!(db.query_untrusted("DELETE FROM post", &Value::Null).is_err());
-        assert!(db.query_untrusted("CREATE TABLE pwned (x)", &Value::Null).is_err());
+        assert!(db
+            .query_untrusted("INSERT INTO post VALUES (3, 'no')", &Value::Null)
+            .is_err());
+        assert!(db
+            .query_untrusted("UPDATE post SET title = 'x'", &Value::Null)
+            .is_err());
+        assert!(db
+            .query_untrusted("DELETE FROM post", &Value::Null)
+            .is_err());
+        assert!(db
+            .query_untrusted("CREATE TABLE pwned (x)", &Value::Null)
+            .is_err());
         // The data is untouched by the rejected writes.
-        let after = db.query_untrusted("SELECT COUNT(*) AS n FROM post", &Value::Null).unwrap();
+        let after = db
+            .query_untrusted("SELECT COUNT(*) AS n FROM post", &Value::Null)
+            .unwrap();
         assert_eq!(after[0]["n"].as_i64().unwrap(), 2);
 
         // The file-write primitive: ATTACH to an on-disk path must be refused,
@@ -273,24 +370,38 @@ mod tests {
         assert!(!target.exists(), "ATTACH must not create a file on disk");
 
         // The authorizer was cleared: the node's own connection can still write.
-        db.execute_batch("INSERT INTO post VALUES (4, 'ok')").unwrap();
+        db.execute_batch("INSERT INTO post VALUES (4, 'ok')")
+            .unwrap();
     }
 
     #[test]
     fn content_db_tracks_xite_files() {
         let cdb = ContentDb::open(Database::open_in_memory().unwrap()).unwrap();
-        let xite = cdb.add_xite("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g").unwrap();
+        let xite = cdb
+            .add_xite("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g")
+            .unwrap();
         // add_xite is idempotent.
-        assert_eq!(xite, cdb.add_xite("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g").unwrap());
+        assert_eq!(
+            xite,
+            cdb.add_xite("epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g")
+                .unwrap()
+        );
 
         cdb.set_content(xite, "content.json", 1777, 9120).unwrap();
-        cdb.set_content(xite, "data/users/content.json", 1700, 50).unwrap();
-        assert_eq!(cdb.get_content(xite, "content.json").unwrap(), Some((1777, 9120)));
+        cdb.set_content(xite, "data/users/content.json", 1700, 50)
+            .unwrap();
+        assert_eq!(
+            cdb.get_content(xite, "content.json").unwrap(),
+            Some((1777, 9120))
+        );
         assert_eq!(cdb.get_content(xite, "missing.json").unwrap(), None);
 
         // Upsert updates in place.
         cdb.set_content(xite, "content.json", 1888, 9200).unwrap();
-        assert_eq!(cdb.get_content(xite, "content.json").unwrap(), Some((1888, 9200)));
+        assert_eq!(
+            cdb.get_content(xite, "content.json").unwrap(),
+            Some((1888, 9200))
+        );
 
         let listed = cdb.list_content(xite).unwrap();
         assert_eq!(listed.len(), 2);
@@ -333,7 +444,9 @@ mod tests {
         let db = Database::open_in_memory().unwrap();
         db.apply_schema(&schema).unwrap();
         db.populate(&schema, dir.path()).unwrap();
-        let rows = db.query("SELECT conv_id, peer_xid FROM conversation", &[]).unwrap();
+        let rows = db
+            .query("SELECT conv_id, peer_xid FROM conversation", &[])
+            .unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0]["conv_id"], serde_json::json!("abc123"));
         assert_eq!(rows[0]["peer_xid"], serde_json::json!("mud.epix"));
@@ -346,8 +459,10 @@ mod tests {
         // that has no such placeholder, and the page dies if this errors.
         let db = Database::open_in_memory().unwrap();
         let conn = db.conn().unwrap();
-        conn.execute("CREATE TABLE t (id INTEGER, name TEXT)", []).unwrap();
-        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')", []).unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER, name TEXT)", [])
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')", [])
+            .unwrap();
         drop(conn);
 
         let rows = db
@@ -361,7 +476,10 @@ mod tests {
 
         // A dict with no referenced keys at all still runs the query.
         let rows = db
-            .query_value("SELECT * FROM t", &serde_json::json!({ "directories": "all" }))
+            .query_value(
+                "SELECT * FROM t",
+                &serde_json::json!({ "directories": "all" }),
+            )
             .unwrap();
         assert_eq!(rows.len(), 2);
     }
@@ -397,7 +515,11 @@ mod tests {
         )
         .unwrap();
         // A non-matching file is skipped.
-        std::fs::write(dir.path().join("content.json"), r#"{"posts":[{"post_id":99}]}"#).unwrap();
+        std::fs::write(
+            dir.path().join("content.json"),
+            r#"{"posts":[{"post_id":99}]}"#,
+        )
+        .unwrap();
 
         let db = Database::open_in_memory().unwrap();
         db.apply_schema(&schema).unwrap();
@@ -405,23 +527,222 @@ mod tests {
         assert_eq!(ingested, 1, "only data/alice/data.json matched");
 
         // Rows landed, unknown col (`extra`) filtered, json_id linked.
-        let rows = db.query("SELECT post_id, title, date_added FROM post ORDER BY post_id", &[]).unwrap();
+        let rows = db
+            .query(
+                "SELECT post_id, title, date_added FROM post ORDER BY post_id",
+                &[],
+            )
+            .unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["title"], "Hello");
         assert_eq!(rows[1]["title"], "World");
         assert_eq!(rows[1]["date_added"], 200);
 
         // Parameterized query works.
-        let one = db.query("SELECT title FROM post WHERE post_id = ?1", &[Value::from(2)]).unwrap();
+        let one = db
+            .query(
+                "SELECT title FROM post WHERE post_id = ?1",
+                &[Value::from(2)],
+            )
+            .unwrap();
         assert_eq!(one[0]["title"], "World");
 
         // keyvalue captured.
-        let kv = db.query("SELECT value FROM keyvalue WHERE key = 'next_post_id'", &[]).unwrap();
+        let kv = db
+            .query("SELECT value FROM keyvalue WHERE key = 'next_post_id'", &[])
+            .unwrap();
         assert_eq!(kv[0]["value"], 3);
 
         // Re-populating is idempotent (INSERT OR REPLACE + DELETE by json_id).
         db.populate(&schema, dir.path()).unwrap();
         let again = db.query("SELECT COUNT(*) AS n FROM post", &[]).unwrap();
         assert_eq!(again[0]["n"], 2);
+    }
+
+    #[test]
+    fn path_population_ingests_only_listed_json_and_applies_exclusion_first() {
+        let schema = DbSchema::from_json(
+            r#"{
+              "db_name": "Allowed", "db_file": "db/db.db", "version": 2,
+              "maps": {
+                "data/.*/data.json": {
+                  "to_table": [{"node": "posts", "table": "post"}]
+                }
+              },
+              "tables": {
+                "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] }
+              }
+            }"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for author in ["allowed", "unlisted", "blocked"] {
+            std::fs::create_dir_all(dir.path().join(format!("data/{author}"))).unwrap();
+            std::fs::write(
+                dir.path().join(format!("data/{author}/data.json")),
+                format!(r#"{{"posts":[{{"post_id":1,"title":"{author}"}}]}}"#),
+            )
+            .unwrap();
+        }
+
+        let db = Database::open_in_memory().unwrap();
+        db.apply_schema(&schema).unwrap();
+        let paths = vec![
+            "data/allowed/data.json".to_string(),
+            "data/blocked/data.json".to_string(),
+        ];
+        let excluded = vec!["data/blocked/".to_string()];
+        let ingested = db
+            .populate_paths_filtered(&schema, dir.path(), &paths, &excluded)
+            .unwrap();
+        assert_eq!(ingested, 1);
+        let rows = db.query("SELECT title FROM post", &[]).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"title": "allowed"})]);
+    }
+
+    #[test]
+    fn xite_path_population_preserves_v3_prefix_and_json_shape() {
+        let schema = DbSchema::from_json(
+            r#"{
+              "db_name": "Merger", "db_file": "db/db.db", "version": 3,
+              "maps": {
+                ".+/data/users/.+/data.json": {
+                  "to_table": [{"node": "posts", "table": "post"}]
+                }
+              },
+              "tables": {
+                "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] }
+              }
+            }"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let user_dir = dir.path().join("data/users/alice");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        std::fs::write(
+            user_dir.join("data.json"),
+            r#"{"posts":[{"post_id":7,"title":"prefixed"}]}"#,
+        )
+        .unwrap();
+
+        let db = Database::open_in_memory().unwrap();
+        db.apply_schema(&schema).unwrap();
+        let paths = vec!["data/users/alice/data.json".to_string()];
+        let ingested = db
+            .populate_xite_paths(&schema, dir.path(), "epix1child", &paths)
+            .unwrap();
+        assert_eq!(ingested, 1);
+        let rows = db
+            .query(
+                "SELECT p.title, j.site, j.directory, j.file_name FROM post p JOIN json j USING(json_id)",
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![serde_json::json!({
+                "title": "prefixed",
+                "site": "epix1child",
+                "directory": "data/users/alice",
+                "file_name": "data.json"
+            })]
+        );
+    }
+
+    #[test]
+    fn xite_path_population_treats_a_missing_db_dir_as_empty_after_validation() {
+        let schema = DbSchema::from_json(
+            r#"{
+              "db_name": "Merger", "db_file": "db/db.db", "version": 3,
+              "maps": {
+                ".+/data/users/.+/data.json": {
+                  "to_table": [{"node": "posts", "table": "post"}]
+                }
+              },
+              "tables": {
+                "post": { "cols": [["post_id","INTEGER"],["json_id","INTEGER"]] }
+              }
+            }"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let missing_db_dir = dir.path().join("not-downloaded");
+        let db = Database::open_in_memory().unwrap();
+        db.apply_schema(&schema).unwrap();
+
+        let valid = vec!["data/users/alice/data.json".to_string()];
+        let ingested = db
+            .populate_xite_paths_filtered(&schema, &missing_db_dir, "epix1child", &valid, &[])
+            .unwrap();
+        assert_eq!(ingested, 0);
+
+        let invalid = vec!["../outside.json".to_string()];
+        assert!(db
+            .populate_xite_paths_filtered(&schema, &missing_db_dir, "epix1child", &invalid, &[],)
+            .is_err());
+    }
+
+    #[test]
+    fn path_population_rejects_non_normal_paths_before_ingesting() {
+        let schema = DbSchema::from_json(
+            r#"{
+              "db_name": "Safe", "db_file": "db/db.db", "version": 2,
+              "maps": {"data/.*/data.json": {"to_table": [{"node": "posts", "table": "post"}]}},
+              "tables": {"post": {"cols": [["post_id","INTEGER"],["json_id","INTEGER"]]}}
+            }"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("data/alice")).unwrap();
+        std::fs::write(
+            dir.path().join("data/alice/data.json"),
+            r#"{"posts":[{"post_id":1}]}"#,
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.apply_schema(&schema).unwrap();
+        let paths = vec![
+            "data/alice/data.json".to_string(),
+            "../outside.json".to_string(),
+        ];
+        assert!(db
+            .populate_paths_filtered(&schema, dir.path(), &paths, &[])
+            .is_err());
+        let rows = db.query("SELECT COUNT(*) AS n FROM post", &[]).unwrap();
+        assert_eq!(rows[0]["n"], 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn path_population_rejects_symlink_targets() {
+        use std::os::unix::fs::symlink;
+
+        let schema = DbSchema::from_json(
+            r#"{
+              "db_name": "Safe", "db_file": "db/db.db", "version": 2,
+              "maps": {"data/.*/data.json": {"to_table": [{"node": "posts", "table": "post"}]}},
+              "tables": {"post": {"cols": [["post_id","INTEGER"],["json_id","INTEGER"]]}}
+            }"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("data.json"),
+            r#"{"posts":[{"post_id":9}]}"#,
+        )
+        .unwrap();
+        std::fs::create_dir_all(dir.path().join("data/alice")).unwrap();
+        symlink(
+            outside.path().join("data.json"),
+            dir.path().join("data/alice/data.json"),
+        )
+        .unwrap();
+        let db = Database::open_in_memory().unwrap();
+        db.apply_schema(&schema).unwrap();
+        let paths = vec!["data/alice/data.json".to_string()];
+        assert!(db
+            .populate_paths_filtered(&schema, dir.path(), &paths, &[])
+            .is_err());
     }
 }

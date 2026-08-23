@@ -17,7 +17,7 @@ use epix_edx::conn::{Conn, Incoming};
 use epix_edx::msg::{caps, Hello, Req};
 use epix_edx::sched::{needed_groups, Deadline, PeerHandle, Swarm};
 use epix_edx::server::{
-    client_hello, serve, serve_authenticated_tracked, ControlProvider, PeerIdentity, ServeCtx,
+    client_hello, serve, serve_authenticated_observed, ControlProvider, PeerIdentity, ServeCtx,
     SignedProvider, UpdateSource,
 };
 use epix_edx::sim::Class;
@@ -478,29 +478,24 @@ fn select_update_merge_wire(
     }
 }
 
-/// Decode one inline object that MAY be a merge envelope. `Ok(None)` means
-/// the object is validly carried (hash matches) but of a kind this build
-/// does not own — a future inline payload type. It is not ours to decode,
-/// and failing the whole Update over it (manifest bump included) would let
-/// one novel entry stall propagation, so unknown kinds are skipped. A
-/// corrupt hash, a malformed envelope BEHIND our magic, or an unsafe path
-/// still fails closed.
-fn decode_inline_merge_envelope(
-    id: ObjId,
-    bytes: &[u8],
-) -> Result<Option<InlineMergeDelta>, String> {
+/// Decode one merge envelope. `INLINE_MERGE` promises that every entry uses
+/// this versioned format, so an unknown kind must fail closed. Silently
+/// skipping it would answer `Ok` and let a sender retire payload state that
+/// this receiver never handled. A future inline kind needs its own negotiated
+/// capability or an explicitly optional envelope bit.
+fn decode_inline_merge_envelope(id: ObjId, bytes: &[u8]) -> Result<InlineMergeDelta, String> {
     if ObjId::of(bytes) != id {
         return Err("inline merge object hash mismatch".into());
     }
     if !bytes.starts_with(INLINE_MERGE_MAGIC) {
-        return Ok(None);
+        return Err("unsupported inline object on merge-capable Update".into());
     }
     let delta = postcard::from_bytes::<InlineMergeDelta>(&bytes[INLINE_MERGE_MAGIC.len()..])
         .map_err(|e| format!("malformed inline merge envelope: {e}"))?;
     if !safe_inner_path(&delta.path) {
         return Err(format!("unsafe inline merge path: {}", delta.path));
     }
-    Ok(Some(delta))
+    Ok(delta)
 }
 
 fn add_merge_payload_bytes(
@@ -532,9 +527,7 @@ fn decode_inline_merges(inline: &[(ObjId, Vec<u8>)]) -> Result<DecodedInlineMerg
     let mut out = DecodedInlineMerges::default();
     let mut total_delta_bytes = 0u64;
     for (id, bytes) in inline {
-        let Some(delta) = decode_inline_merge_envelope(*id, bytes)? else {
-            continue;
-        };
+        let delta = decode_inline_merge_envelope(*id, bytes)?;
         out.insert(delta, &mut total_delta_bytes)?;
     }
     Ok(out)
@@ -596,13 +589,102 @@ fn drop_if_unfilled(store: &Store, id: ObjId, fresh: bool) {
 /// one that created the record. An entry is erased when its count reaches zero,
 /// so the map is bounded by the number of concurrent fetches.
 type ObjClaims = Arc<Mutex<HashMap<ObjId, (usize, bool)>>>;
-type MergePrepareGate = Arc<tokio::sync::OnceCell<Result<(), String>>>;
-type MergePrepareGates = Arc<Mutex<HashMap<ObjId, MergePrepareGate>>>;
+type MergePrepareCell = tokio::sync::OnceCell<Result<(), String>>;
+type MergePrepareGate = Arc<MergePrepareCell>;
+type MergePrepareGates = Arc<Mutex<HashMap<ObjId, std::sync::Weak<MergePrepareCell>>>>;
+type MergeQuotaMemo = Arc<Mutex<Option<(std::sync::Weak<UpdatePayload>, Arc<MergeQuotaWave>)>>>;
+
+/// One payload fanout's final quota reconciliation. Every peer still owns an
+/// independent Store eviction hold through its Update RPC. The last lease
+/// clears after its hold and runs the table scan exactly when the object is
+/// finally evictable. A later peer may start a new lease and safely reconcile
+/// again. Drop-based cleanup also covers cancellation and error paths.
+/// `Store::enforce_quota` scans the whole object table; one publish's
+/// staggered per-peer leases can drive the wave count to zero many times per
+/// batch, so transitions inside this window skip the scan. The fetch paths
+/// call `enforce_quota` on their own, covering any residual overshoot -
+/// the same tolerance the old flat 5-second throttle had.
+const QUOTA_ENFORCE_THROTTLE_MS: u64 = 5_000;
+
+struct MergeQuotaWave {
+    store: Arc<Store>,
+    quota: u64,
+    active: std::sync::atomic::AtomicUsize,
+    created: std::time::Instant,
+    /// Elapsed ms since `created`, plus 1, of the last enforcement; 0 = never.
+    enforced_at: std::sync::atomic::AtomicU64,
+}
+
+impl MergeQuotaWave {
+    fn new(store: Arc<Store>, quota: u64) -> Arc<Self> {
+        Arc::new(Self {
+            store,
+            quota,
+            active: std::sync::atomic::AtomicUsize::new(0),
+            created: std::time::Instant::now(),
+            enforced_at: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    fn lease(self: &Arc<Self>) -> MergeQuotaLease {
+        self.active
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        MergeQuotaLease { wave: self.clone() }
+    }
+}
+
+struct MergeQuotaLease {
+    wave: Arc<MergeQuotaWave>,
+}
+
+impl Drop for MergeQuotaLease {
+    fn drop(&mut self) {
+        if self
+            .wave
+            .active
+            .fetch_sub(1, std::sync::atomic::Ordering::AcqRel)
+            == 1
+        {
+            let now = self.wave.created.elapsed().as_millis() as u64 + 1;
+            let last = self
+                .wave
+                .enforced_at
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let due = last == 0 || now.saturating_sub(last) >= QUOTA_ENFORCE_THROTTLE_MS;
+            if due
+                && self
+                    .wave
+                    .enforced_at
+                    .compare_exchange(
+                        last,
+                        now,
+                        std::sync::atomic::Ordering::Relaxed,
+                        std::sync::atomic::Ordering::Relaxed,
+                    )
+                    .is_ok()
+            {
+                let _ = self.wave.store.enforce_quota(self.wave.quota);
+            }
+        }
+    }
+}
 
 struct PreparedMergeObjects<'a> {
     _preparations: Vec<MergePrepareGate>,
     _holds: Vec<epix_blob::store::EvictionHold<'a>>,
+    quota: Option<MergeQuotaLease>,
     objects: HashMap<String, EdxObjectRef>,
+}
+
+impl Drop for PreparedMergeObjects<'_> {
+    fn drop(&mut self) {
+        // The final quota lease must see every per-peer eviction hold gone.
+        // Release completed preparation gates too, so a peer starting after
+        // enforcement cannot reuse an `Ok` cell for an object just evicted.
+        self._holds.clear();
+        self._preparations.clear();
+        self.quota.take();
+    }
 }
 
 /// Fetch guards shared by every runtime adapter that writes into one Store.
@@ -909,14 +991,8 @@ fn safe_inner_path(inner_path: &str) -> bool {
         && inner_path.split('/').all(|seg| !seg.is_empty() && seg != "." && seg != "..")
 }
 
-/// True for a signed manifest: the root content.json or a child
-/// `<dir>/content.json` (the segment form, so `evilcontent.json` is not one).
-fn is_content_json(inner_path: &str) -> bool {
-    inner_path == "content.json" || inner_path.ends_with("/content.json")
-}
-
-/// Backs epix-edx's signed-content requests with the node's live xite
-/// registry (raw content.json bytes, listModified, inbound update apply).
+/// Backs epix-edx signed-content requests with the node's accepted manifest
+/// index and exact-chain update application.
 struct AppStateProvider {
     state: Arc<AppState>,
 }
@@ -997,57 +1073,33 @@ impl InboundEdxSource for LiveUpdateSource {
 #[async_trait::async_trait]
 impl SignedProvider for AppStateProvider {
     async fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>> {
-        // Serve signed content only: a content.json, or a merge file the
-        // governing content.json declares (the record files a forum-style xite
-        // propagates this way). Without the gate a peer names ANY hosted file,
-        // so one request could point at a gigabyte of media and we would read
-        // it whole into memory - a remote allocation lever.
         if !safe_inner_path(inner_path) {
             return None;
         }
-        if !is_content_json(inner_path)
-            && !self.state.is_declared_merge_file(xite, inner_path).await
-        {
-            return None;
-        }
-        let root = self.state.xite_root(xite).await?;
-        let path = epix_xite::XiteStorage::new(root).path(inner_path).ok()?;
-        // Bounded, and off the async worker: the body is small, but the read
-        // is a blocking syscall and must not run on a runtime thread.
-        tokio::task::spawn_blocking(move || -> Option<Vec<u8>> {
-            use std::io::Read;
-            // One byte past the cap, so an oversize file is detected without
-            // ever allocating it.
-            let mut f = std::fs::File::open(&path).ok()?.take(MAX_SIGNED_BYTES + 1);
-            let mut buf = Vec::new();
-            f.read_to_end(&mut buf).ok()?;
-            if buf.len() as u64 > MAX_SIGNED_BYTES {
-                return None; // past the cap: refuse instead of shipping it
-            }
-            Some(buf)
-        })
-        .await
-        .ok()?
+        self.state
+            .edx_read_verified_signed(xite, inner_path, MAX_SIGNED_BYTES)
+            .await
     }
 
     async fn list_signed(&self, xite: &str, since: u64) -> Vec<(String, u64, u64)> {
-        // list_modified keys each changed content.json by its `modified`
-        // time; per-file byte size is not tracked here, so report 0.
         self.state
-            .list_modified(xite, since as f64)
+            .edx_verified_signed_list(xite, since as f64, MAX_SIGNED_BYTES)
             .await
-            .into_iter()
-            .filter_map(|(path, v)| v.as_f64().map(|m| (path, m as u64, 0u64)))
-            .collect()
     }
 
     async fn xite_summary(&self, xite: &str) -> Option<(u64, u64, u64)> {
-        let m = self.state.list_modified(xite, 0.0).await;
-        if m.is_empty() {
+        let entries = self
+            .state
+            .edx_verified_signed_list(xite, 0.0, MAX_SIGNED_BYTES)
+            .await;
+        if entries.is_empty() {
             return None;
         }
-        let newest = m.values().filter_map(|v| v.as_f64()).fold(0.0_f64, f64::max) as u64;
-        Some((m.len() as u64, newest, 0))
+        let newest = entries.iter().map(|(_, modified, _)| *modified).max().unwrap_or(0);
+        let held_bytes = entries
+            .iter()
+            .fold(0u64, |total, (_, _, size)| total.saturating_add(*size));
+        Some((entries.len() as u64, newest, held_bytes))
     }
 
     async fn apply_update(
@@ -1516,7 +1568,45 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
 /// the shared control link, higher lanes are the extra transfer paths a bulk
 /// fetch stripes across (see [`Transport::dial_lane`]).
 type LinkKey = (PeerAddr, u8);
-type LinkActivity = Arc<Mutex<tokio::time::Instant>>;
+
+/// Last-use lease plus a reverse-request event stream for one pooled link.
+/// Local borrowers only renew the lease. Reverse request start/completion also
+/// advances `events`, which lets an Update distinguish a peer actively pulling
+/// dependencies from one that merely completed Hello and then stopped reading.
+struct LinkActivityState {
+    last: Mutex<tokio::time::Instant>,
+    events: tokio::sync::watch::Sender<u64>,
+}
+
+type LinkActivity = Arc<LinkActivityState>;
+
+impl LinkActivityState {
+    fn new() -> LinkActivity {
+        let (events, _) = tokio::sync::watch::channel(0);
+        Arc::new(Self {
+            last: Mutex::new(tokio::time::Instant::now()),
+            events,
+        })
+    }
+
+    fn touch(&self) {
+        *self.last.lock().expect("link activity") = tokio::time::Instant::now();
+    }
+
+    fn note_reverse_request(&self) {
+        self.touch();
+        self.events
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+    }
+
+    fn last(&self) -> tokio::time::Instant {
+        *self.last.lock().expect("link activity")
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.events.subscribe()
+    }
+}
 
 #[derive(Default)]
 struct LinkPool {
@@ -1554,7 +1644,7 @@ impl Drop for PooledLink {
 
 /// What a pooled dial hands back: the multiplexed link, who the peer proved to
 /// be, and the link's row in the diagnostics registry.
-type Link = (Conn, PeerIdentity, Arc<ConnHandle>);
+type Link = (Conn, PeerIdentity, Arc<ConnHandle>, LinkActivity);
 
 /// A newly opened link also owns the reverse-request loop that consumes the
 /// dialer's inbound request channel. Cached hits return the public [`Link`]
@@ -1599,15 +1689,20 @@ impl LinkPool {
             let reverse_live =
                 l.reverse_serve.as_ref().map_or(true, |task| !task.is_finished());
             let pool_holders = 1 + usize::from(l.reverse_serve.is_some());
-            let last_activity = *l.activity.lock().expect("link activity");
+            let last_activity = l.activity.last();
             !l.conn.is_closed()
                 && reverse_live
                 && (l.conn.holders() > pool_holders
                     || now.saturating_duration_since(last_activity) < LINK_POOL_IDLE)
         });
         let link = map.get_mut(&(peer.clone(), lane))?;
-        *link.activity.lock().expect("link activity") = now;
-        Some((link.conn.clone(), link.identity.clone(), link.reg.clone()))
+        link.activity.touch();
+        Some((
+            link.conn.clone(),
+            link.identity.clone(),
+            link.reg.clone(),
+            link.activity.clone(),
+        ))
     }
 
     fn store(&self, peer: PeerAddr, lane: u8, opened: OpenedLink) {
@@ -1660,7 +1755,12 @@ impl LinkPool {
             return Ok(hit);
         }
         let opened = dial().await?;
-        let link = (opened.0.clone(), opened.1.clone(), opened.2.clone());
+        let link = (
+            opened.0.clone(),
+            opened.1.clone(),
+            opened.2.clone(),
+            opened.4.clone(),
+        );
         self.store(peer.clone(), lane, opened);
         Ok(link)
     }
@@ -1724,11 +1824,11 @@ struct RuntimeEdxFetcher {
             )>,
         >,
     >,
-    /// When the per-push quota reconciliation last ran (unix millis). The
-    /// enforce pass scans the whole object table, so the up-to-100 dials of
-    /// one publish must not each pay it; the many insert-path enforcers keep
-    /// the store bounded regardless.
-    quota_enforced_at: Arc<std::sync::atomic::AtomicU64>,
+    /// One final-quota wave for the Arc'd payload currently fanning out. Every
+    /// peer holds the object independently, and the last lease reconciles only
+    /// after the last hold drops. Weak payload identity prevents cross-publish
+    /// reuse without retaining payload bytes.
+    merge_quota_memo: MergeQuotaMemo,
 }
 
 struct MaterializeOptions<'a> {
@@ -1891,6 +1991,7 @@ async fn prepare_merge_delta_object_once(
     payload: Arc<UpdatePayload>,
     path: String,
     object: EdxObjectRef,
+    quota: Option<MergeQuotaLease>,
 ) -> Result<(), String> {
     if object.size == 0 || object.size > MAX_MERGE_DELTA_OBJECT_BYTES {
         return Err("merge delta object size is outside the allowed range".into());
@@ -1902,6 +2003,10 @@ async fn prepare_merge_delta_object_once(
     let object_id = object.id;
     let object_size = object.size;
     tokio::task::spawn_blocking(move || {
+        // A blocking insertion cannot be cancelled once it starts. Keep its
+        // own wave lease until the worker exits so an aborted async caller
+        // cannot enforce quota and then let this object appear afterward.
+        let _quota = quota;
         let records = payload
             .merge_deltas
             .get(&path)
@@ -1984,7 +2089,7 @@ impl RuntimeEdxFetcher {
             merge_prepare: Arc::default(),
             xfer: Arc::default(),
             inline_wire_memo: Arc::default(),
-            quota_enforced_at: Arc::default(),
+            merge_quota_memo: Arc::default(),
         }
     }
 
@@ -1993,8 +2098,61 @@ impl RuntimeEdxFetcher {
     /// one publish is checked and prepared again on a later retry.
     fn merge_prepare_gate(&self, id: ObjId) -> MergePrepareGate {
         let mut gates = self.merge_prepare.lock().expect("merge preparation gates");
-        gates.retain(|_, gate| Arc::strong_count(gate) > 1);
-        gates.entry(id).or_default().clone()
+        gates.retain(|_, gate| gate.strong_count() > 0);
+        if let Some(gate) = gates.get(&id).and_then(std::sync::Weak::upgrade) {
+            return gate;
+        }
+        let gate = Arc::new(tokio::sync::OnceCell::new());
+        gates.insert(id, Arc::downgrade(&gate));
+        gate
+    }
+
+    fn merge_quota_lease(
+        &self,
+        store: &Arc<Store>,
+        payload: &Arc<UpdatePayload>,
+    ) -> MergeQuotaLease {
+        let mut memo = self.merge_quota_memo.lock().expect("merge quota memo");
+        let wave = memo
+            .as_ref()
+            .and_then(|(weak, wave)| {
+                weak.upgrade()
+                    .filter(|live| Arc::ptr_eq(live, payload))
+                    .filter(|_| Arc::ptr_eq(&wave.store, store))
+                    .map(|_| wave.clone())
+            })
+            .unwrap_or_else(|| {
+                let wave = MergeQuotaWave::new(store.clone(), store_quota());
+                *memo = Some((Arc::downgrade(payload), wave.clone()));
+                wave
+            });
+        wave.lease()
+    }
+
+    fn inline_merge_candidate(
+        &self,
+        payload: &Arc<UpdatePayload>,
+    ) -> Result<Option<InlineMergeWire>, EdxPushError> {
+        let hit = self
+            .inline_wire_memo
+            .lock()
+            .expect("inline wire memo")
+            .clone()
+            .and_then(|(weak, wire)| {
+                weak.upgrade()
+                    .filter(|live| Arc::ptr_eq(live, payload))
+                    .map(|_| wire)
+            });
+        let wire = match hit {
+            Some(wire) => wire,
+            None => {
+                let wire = Arc::new(encode_inline_merge_records(&payload.merge_deltas));
+                *self.inline_wire_memo.lock().expect("inline wire memo") =
+                    Some((Arc::downgrade(payload), wire.clone()));
+                wire
+            }
+        };
+        wire.as_ref().clone().map_err(EdxPushError::Refused)
     }
 
     async fn prepare_merge_delta_object(
@@ -2003,10 +2161,14 @@ impl RuntimeEdxFetcher {
         payload: Arc<UpdatePayload>,
         path: String,
         object: EdxObjectRef,
+        quota: Option<&MergeQuotaLease>,
     ) -> Result<MergePrepareGate, String> {
         let gate = self.merge_prepare_gate(object.id);
+        let preparation_quota = quota.map(|lease| lease.wave.lease());
         let prepared = gate
-            .get_or_init(|| prepare_merge_delta_object_once(store, payload, path, object))
+            .get_or_init(|| {
+                prepare_merge_delta_object_once(store, payload, path, object, preparation_quota)
+            })
             .await
             .clone();
         prepared?;
@@ -2017,6 +2179,7 @@ impl RuntimeEdxFetcher {
         &self,
         store: &'a Arc<Store>,
         payload: Arc<UpdatePayload>,
+        quota: Option<MergeQuotaLease>,
     ) -> Result<PreparedMergeObjects<'a>, String> {
         let mut holds = Vec::new();
         let mut preparations = Vec::new();
@@ -2036,6 +2199,7 @@ impl RuntimeEdxFetcher {
                     payload.clone(),
                     path.to_string(),
                     object,
+                    quota.as_ref(),
                 )
                 .await?,
             );
@@ -2044,6 +2208,7 @@ impl RuntimeEdxFetcher {
         Ok(PreparedMergeObjects {
             _holds: holds,
             _preparations: preparations,
+            quota,
             objects,
         })
     }
@@ -2164,19 +2329,20 @@ impl RuntimeEdxFetcher {
             // manifest, merge file, or large hashed object from the exact
             // source that announced it. NAT and overlay reachability no longer
             // require a second dial for that handoff.
-            let activity = Arc::new(Mutex::new(tokio::time::Instant::now()));
+            let activity = LinkActivityState::new();
             let on_activity = {
                 let activity = activity.clone();
                 Arc::new(move || {
-                    *activity.lock().expect("link activity") = tokio::time::Instant::now();
+                    activity.note_reverse_request();
                 })
             };
-            let reverse = tokio::spawn(serve_authenticated_tracked(
+            let reverse = tokio::spawn(serve_authenticated_observed(
                 conn.clone(),
                 incoming,
                 ctx,
                 identity.clone(),
                 reach,
+                on_activity.clone(),
                 on_activity,
             ));
             let reverse = reverse.abort_handle();
@@ -2224,7 +2390,7 @@ impl RuntimeEdxFetcher {
         F: FnOnce(Conn) -> Fut,
         Fut: std::future::Future<Output = std::io::Result<T>>,
     {
-        let (conn, _identity, reg) = self.link(peer).await?;
+        let (conn, _identity, reg, _activity) = self.link(peer).await?;
         reg.note_cmd_sent(label, None);
         match tokio::time::timeout(EDX_FETCH_TIMEOUT, f(conn)).await {
             Ok(Ok(v)) => Ok(v),
@@ -2269,12 +2435,24 @@ impl RuntimeEdxFetcher {
         let peers = self.state.fetch_session_peers(address, 8).await;
 
         // Fetch each ciphertext shard object into the store, verified by its
-        // BLAKE3 address (== the shard's bao root).
+        // BLAKE3 address (== the shard's bao root). The bytes stay in the
+        // Store; decrypt streams each chunk back out on demand below, so the
+        // whole ciphertext is never resident alongside the plaintext.
         for c in &shard.chunks {
             let id = c.cipher_addr;
             let csize = c.csize as u64;
             if store.is_complete(id).unwrap_or(false) {
-                continue;
+                match store.read_bytes(id, now) {
+                    // Readable in the Store; decrypt reads it again below.
+                    Ok(_) => continue,
+                    Err(_) => {
+                        // A crash-torn Slab can still be logically complete.
+                        // Revalidation converts it to an empty Sparse record
+                        // while retaining typed owners, so this same fetch can
+                        // refill it instead of skipping it forever.
+                        let _ = store.revalidate(id);
+                    }
+                }
             }
             let mut handles: Vec<PeerHandle> = Vec::new();
             let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
@@ -2282,7 +2460,7 @@ impl RuntimeEdxFetcher {
                 // Pooled: this loop runs once per chunk over the same peers, so
                 // dialing here meant a handshake (and an overlay circuit) per
                 // chunk per peer.
-                let Ok((conn, identity, reg)) = self.link(peer).await else { continue };
+                let Ok((conn, identity, reg, _activity)) = self.link(peer).await else { continue };
                 reg.note_cmd_sent("GetBitfield", Some(address));
                 if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
@@ -2312,6 +2490,10 @@ impl RuntimeEdxFetcher {
             if !store.is_complete(id).unwrap_or(false) {
                 return Err(format!("shard {id} did not complete"));
             }
+            store.read_bytes(id, now).map_err(|error| {
+                let _ = store.revalidate(id);
+                format!("completed shard {id} is unreadable: {error}")
+            })?;
         }
 
         // Decrypt: the store is the shard fetcher, keyed by ciphertext address.
@@ -2397,14 +2579,24 @@ impl RuntimeEdxFetcher {
         let now = now_secs();
 
         // The shards we are responsible for and do not already hold.
-        let want: Vec<&epix_blob::manifest::ShardChunk> = shard
-            .chunks
-            .iter()
-            .filter(|c| {
-                epix_blob::responsibility::responsible(&cid, c.cipher_addr, quota, universe)
-                    && !store.is_complete(c.cipher_addr).unwrap_or(false)
-            })
-            .collect();
+        let mut want = Vec::new();
+        for chunk in &shard.chunks {
+            if !epix_blob::responsibility::responsible(
+                &cid,
+                chunk.cipher_addr,
+                quota,
+                universe,
+            ) {
+                continue;
+            }
+            if store.is_complete(chunk.cipher_addr).unwrap_or(false) {
+                if store.read_bytes(chunk.cipher_addr, now).is_ok() {
+                    continue;
+                }
+                let _ = store.revalidate(chunk.cipher_addr);
+            }
+            want.push(chunk);
+        }
         if want.is_empty() {
             return Ok(0);
         }
@@ -2488,7 +2680,7 @@ impl RuntimeEdxFetcher {
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
         for peer in peers {
-            let Ok((conn, identity, reg)) = self.link(peer).await else { continue };
+            let Ok((conn, identity, reg, _activity)) = self.link(peer).await else { continue };
             reg.note_cmd_sent("GetBitfield", Some(address));
             if let Ok(Ok((_sz, bits))) =
                 tokio::time::timeout(EDX_FETCH_TIMEOUT, epix_edx::fetch::fetch_bitfield(&conn, id))
@@ -2700,7 +2892,7 @@ impl RuntimeEdxFetcher {
         // for us, takes its half-built lanes down with it: leaving circuits to
         // finish for a node that is no use to this fetch is exactly the churn
         // that gets guards disabled.
-        let Ok((conn, identity, reg)) = self.link(&peer).await else {
+        let Ok((conn, identity, reg, _activity)) = self.link(&peer).await else {
             lanes.abort_all();
             let _ = tx.send((peer.clone(), None, true));
             return (peer, false);
@@ -2741,7 +2933,12 @@ impl RuntimeEdxFetcher {
         for lane in 1..lanes_for(peer) {
             let this = self.clone();
             let peer = peer.clone();
-            join.spawn(async move { this.link_lane(&peer, lane).await.ok().map(|(c, _, _)| c) });
+            join.spawn(async move {
+                this.link_lane(&peer, lane)
+                    .await
+                    .ok()
+                    .map(|(conn, _, _, _)| conn)
+            });
         }
         join
     }
@@ -3331,7 +3528,7 @@ impl RuntimeEdxFetcher {
             let Some(res) = next else { break };
             let Ok((peer, r, took)) = res else { continue };
             match r {
-                Ok((conn, identity, reg)) => {
+                Ok((conn, identity, reg, _activity)) => {
                     outcomes.push((peer.clone(), true));
                     links.lock().expect("session").push(SessionPeer {
                         conn,
@@ -3358,7 +3555,7 @@ impl RuntimeEdxFetcher {
             while let Some(res) = join.join_next().await {
                 let Ok((peer, r, _)) = res else { continue };
                 match r {
-                    Ok((conn, identity, reg)) => {
+                    Ok((conn, identity, reg, _activity)) => {
                         late.push((peer.clone(), true));
                         let count = {
                             let mut held = late_links.lock().expect("session");
@@ -4758,6 +4955,135 @@ impl RuntimeEdxFetcher {
     }
 }
 
+struct UpdateFrame<'a> {
+    signed: &'a [u8],
+    diffs: Vec<(String, Vec<u8>)>,
+    inline: InlineMergeWire,
+}
+
+fn update_frame<'a>(
+    signed: &'a [u8],
+    payload: &UpdatePayload,
+    inline: InlineMergeWire,
+) -> UpdateFrame<'a> {
+    let inline_len = inline_merge_wire_len(&inline);
+    let candidate_diffs = encode_edx_diffs(&payload.diffs);
+    let candidate_len: usize = candidate_diffs
+        .iter()
+        .map(|(path, bytes)| path.len() + bytes.len() + 16)
+        .sum();
+    let diffs = if inline_len + candidate_len < UPDATE_FRAME_BUDGET {
+        candidate_diffs
+    } else {
+        Vec::new()
+    };
+    let diffs_len: usize = diffs
+        .iter()
+        .map(|(path, bytes)| path.len() + bytes.len() + 16)
+        .sum();
+    let signed = if signed.len() + inline_len + diffs_len < UPDATE_FRAME_BUDGET {
+        signed
+    } else {
+        &[]
+    };
+    UpdateFrame {
+        signed,
+        diffs,
+        inline,
+    }
+}
+
+struct OutboundUpdate<'a> {
+    address: &'a str,
+    inner_path: &'a str,
+    modified: f64,
+    sender_peers: Vec<String>,
+    frame: UpdateFrame<'a>,
+}
+
+/// Closes an Update's source link if its request future is cancelled WHILE
+/// the receiver may still pull prepared delta objects back over it. The guard
+/// is declared after the prepared object holds, so Rust drops it first: the
+/// receiver loses its pull channel before those objects become evictable.
+/// Normal Busy, refusal, and success responses disarm it.
+///
+/// `Conn::shutdown` kills every multiplexed stream on the pooled lane-0 link
+/// (concurrent shard swarms, GetSigned, PEX to the same peer), so the guard
+/// arms only for updates the receiver must answer with reverse pulls - a
+/// legacy peer taking merge deltas as pull-able objects. Inline-only and
+/// plain manifest pushes enqueue one complete frame atomically and abandon
+/// only the response await, so cancelling them never corrupts the link.
+struct UpdateRequestGuard {
+    conn: Conn,
+    armed: bool,
+}
+
+impl UpdateRequestGuard {
+    fn new(conn: &Conn, receiver_must_pull: bool) -> Self {
+        Self {
+            conn: conn.clone(),
+            armed: receiver_must_pull,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for UpdateRequestGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.conn.shutdown();
+        }
+    }
+}
+
+fn map_update_push_error(error: epix_edx::fetch::PushUpdateError) -> EdxPushError {
+    match error {
+        epix_edx::fetch::PushUpdateError::Busy {
+            message,
+            retry_after,
+        } => EdxPushError::Busy {
+            message,
+            retry_after,
+        },
+        epix_edx::fetch::PushUpdateError::Refused(error) => {
+            EdxPushError::Refused(error.to_string())
+        }
+    }
+}
+
+async fn send_update_request(
+    conn: &Conn,
+    activity: &LinkActivity,
+    progress: &epix_ui::state::EdxPushProgress,
+    update: OutboundUpdate<'_>,
+) -> Result<(), EdxPushError> {
+    let mut reverse_events = activity.subscribe();
+    let request = epix_edx::fetch::push_update(
+        conn,
+        update.address,
+        update.inner_path,
+        update.frame.signed,
+        update.modified,
+        update.frame.diffs,
+        update.sender_peers,
+        update.frame.inline,
+    );
+    tokio::pin!(request);
+    let result = tokio::select! {
+        result = &mut request => result,
+        changed = reverse_events.changed() => {
+            if changed.is_ok() {
+                progress.active.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            request.await
+        }
+    };
+    result.map_err(map_update_push_error)
+}
+
 #[async_trait::async_trait]
 impl EdxFetcher for RuntimeEdxFetcher {
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
@@ -4801,7 +5127,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // (peer unreachable - score ConnectFail); a live peer that simply does
         // not serve this content answers with an error we map to Ok(None)
         // (score FileFail), so the caller tries another peer.
-        let (conn, _identity, reg) = self.link(&peer).await?;
+        let (conn, _identity, reg, _activity) = self.link(&peer).await?;
         reg.note_cmd_sent("GetSigned", Some(address));
         match tokio::time::timeout(
             EDX_FETCH_TIMEOUT,
@@ -5020,62 +5346,21 @@ impl EdxFetcher for RuntimeEdxFetcher {
         modified: f64,
         payload: Arc<UpdatePayload>,
         sender_peers: Arc<Vec<String>>,
-        progressed: Arc<std::sync::atomic::AtomicBool>,
+        progress: Arc<epix_ui::state::EdxPushProgress>,
     ) -> Result<bool, EdxPushError> {
-        // Dial the peer as an EDX link and push the update. A dial/handshake
-        // failure means the peer looks unreachable (back it off); a failure
-        // after the link is up means it answered but refused (alive).
-        let (conn, identity, reg) =
+        let (conn, identity, reg, activity) =
             self.link(&peer).await.map_err(EdxPushError::Unreachable)?;
-        // The link is up: from here a timeout is a slow-but-live peer, not an
-        // unreachable one (the caller scores it Refused, not a backoff).
-        progressed.store(true, std::sync::atomic::Ordering::Relaxed);
+        progress
+            .linked
+            .store(true, std::sync::atomic::Ordering::Relaxed);
 
-        // Keep the whole Req::Update under the frame cap. A small signed
-        // merge delta gets first claim on the frame because it makes a post
-        // visible in one hop. Regular diffs come next. The signed manifest is
-        // refetchable over this same authenticated session, so it is omitted
-        // when the smaller fast-path data would otherwise overflow the frame.
         let supports_inline = caps::supports(identity.caps, caps::INLINE_MERGE);
         if !payload.merge_objects.is_empty() {
             return Err(EdxPushError::Refused(
                 "outbound update contains unresolved merge object references".into(),
             ));
         }
-        // Validate the complete changed-path set even for an older peer. A
-        // capable peer receives either every small delta or an immutable
-        // object marker for every non-empty delta. A legacy empty value stays
-        // an explicit full-file pull marker. No path is silently omitted.
-        // Encoded once per publish: every dial of the fan-out shares the same
-        // Arc'd payload, so the memo hands back the finished encoding and
-        // each peer only pays the copy its own frame needs.
-        let candidate_inline = {
-            let hit = self
-                .inline_wire_memo
-                .lock()
-                .expect("inline wire memo")
-                .clone()
-                .and_then(|(weak, wire)| {
-                    weak.upgrade()
-                        .filter(|live| Arc::ptr_eq(live, &payload))
-                        .map(|_| wire)
-                });
-            match hit {
-                Some(wire) => wire,
-                None => {
-                    let wire = Arc::new(encode_inline_merge_records(&payload.merge_deltas));
-                    *self.inline_wire_memo.lock().expect("inline wire memo") =
-                        Some((Arc::downgrade(&payload), wire.clone()));
-                    wire
-                }
-            }
-        };
-        let candidate_inline =
-            candidate_inline.as_ref().clone().map_err(EdxPushError::Refused)?;
-        // Declared before the holds so reverse drop order always releases the
-        // holds before their Store owner. A hold is taken before each blocking
-        // insert, closing the quota-eviction race between registration and the
-        // receiver's same-session GetRange.
+        let candidate_inline = self.inline_merge_candidate(&payload)?;
         let delta_store = if supports_inline && candidate_inline.is_none() {
             Some(
                 self.state
@@ -5086,12 +5371,19 @@ impl EdxFetcher for RuntimeEdxFetcher {
         } else {
             None
         };
+        let has_objects = payload
+            .merge_deltas
+            .values()
+            .any(|records| !records.is_empty());
         let prepared = match delta_store.as_ref() {
-            Some(store) => Some(
-                self.prepare_merge_delta_objects(store, payload.clone())
-                    .await
-                    .map_err(EdxPushError::Refused)?,
-            ),
+            Some(store) => {
+                let quota = has_objects.then(|| self.merge_quota_lease(store, &payload));
+                Some(
+                    self.prepare_merge_delta_objects(store, payload.clone(), quota)
+                        .await
+                        .map_err(EdxPushError::Refused)?,
+                )
+            }
             None => None,
         };
         let empty_objects = HashMap::new();
@@ -5105,67 +5397,30 @@ impl EdxFetcher for RuntimeEdxFetcher {
             delta_objects,
         )
         .map_err(EdxPushError::Refused)?;
-        let inline_len = inline_merge_wire_len(&wire_inline);
-
-        let candidate_diffs = encode_edx_diffs(&payload.diffs);
-        let diffs_len: usize =
-            candidate_diffs.iter().map(|(path, bytes)| path.len() + bytes.len() + 16).sum();
-        let wire_diffs = if inline_len + diffs_len < UPDATE_FRAME_BUDGET {
-            candidate_diffs
-        } else {
-            Vec::new()
-        };
-        let diffs_len: usize =
-            wire_diffs.iter().map(|(path, bytes)| path.len() + bytes.len() + 16).sum();
-        let body = if signed.len() + inline_len + diffs_len < UPDATE_FRAME_BUDGET {
-            signed.as_slice()
-        } else {
-            &[]
-        };
+        // A legacy (non-inline) receiver answers a delta-carrying Update by
+        // pulling the prepared objects back over this link; only that case
+        // needs the cancellation teardown.
+        let receiver_must_pull = !delta_objects.is_empty() && wire_inline.is_empty();
+        let frame = update_frame(signed.as_slice(), &payload, wire_inline);
         reg.note_cmd_sent("Update", Some(address));
-        let pushed = epix_edx::fetch::push_update(
+        let request_guard = UpdateRequestGuard::new(&conn, receiver_must_pull);
+        let pushed = send_update_request(
             &conn,
-            address,
-            inner_path,
-            body,
-            modified,
-            wire_diffs,
-            sender_peers.as_ref().clone(),
-            wire_inline,
+            &activity,
+            &progress,
+            OutboundUpdate {
+                address,
+                inner_path,
+                modified,
+                sender_peers: sender_peers.as_ref().clone(),
+                frame,
+            },
         )
-        .await
-        .map_err(|e| {
-            // A typed BUSY (or the legacy Err{BUSY}) rides a QuotaExceeded
-            // io::Error (see fetch::busy_err/remote_err): the peer is alive
-            // and asked us to come back, so keep it distinct from a refusal —
-            // Refused is scored as a file failure against the peer.
-            if e.kind() == std::io::ErrorKind::QuotaExceeded {
-                EdxPushError::Busy(e.to_string())
-            } else {
-                EdxPushError::Refused(e.to_string())
-            }
-        });
+        .await;
+        request_guard.disarm();
+        // PreparedMergeObjects drops Store holds before the final shared quota
+        // lease, including when this future is cancelled or returns an error.
         drop(prepared);
-        if let Some(store) = delta_store.as_ref() {
-            // Reconcile the store once the eviction hold dropped — but not
-            // once per dialed peer: the enforce pass walks the whole object
-            // table, and one publish fans out to up to 100 candidates whose
-            // holds all cover the same freshly-inserted delta object. A
-            // short throttle keeps one reconciliation per wave; the insert
-            // paths enforce on their own regardless.
-            use std::sync::atomic::Ordering;
-            const QUOTA_ENFORCE_THROTTLE_MS: u64 = 5_000;
-            let now = epix_core::now_ms().max(0) as u64;
-            let last = self.quota_enforced_at.load(Ordering::Relaxed);
-            if now.saturating_sub(last) >= QUOTA_ENFORCE_THROTTLE_MS
-                && self
-                    .quota_enforced_at
-                    .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
-                    .is_ok()
-            {
-                let _ = store.enforce_quota(store_quota());
-            }
-        }
         pushed?;
         // A capable receiver answers only after inline records or the verified
         // immutable delta object have been authorized, unioned, and written.
@@ -5181,7 +5436,11 @@ impl EdxFetcher for RuntimeEdxFetcher {
         staged: Option<serde_json::Value>,
         on_file: Option<EdxBatchProgress>,
     ) -> EdxBatch {
-        let mut batch = EdxBatch { done: Vec::new(), missed: Vec::new(), bytes: 0 };
+        let mut batch = EdxBatch {
+            done: Vec::new(),
+            missed: Vec::new(),
+            bytes: 0,
+        };
         let Some(store) = self.state.edx_store().await else {
             // No store: nothing can be fetched, so every file is missed.
             batch.missed = want.into_iter().map(|w| w.inner_path).collect();
@@ -5203,10 +5462,21 @@ impl EdxFetcher for RuntimeEdxFetcher {
         };
 
         let progress = BatchProgress::new(on_file);
-        let (plain, shard_paths) = self.resolve_wants(address, want, &content, &mut batch).await;
-        let pending =
-            self.drain_locally_complete(address, &store, plain, &progress, &mut batch).await;
-        self.fetch_shard_paths(address, &content, shard_paths, &store, &progress, &mut batch).await;
+        let (plain, shard_paths) = self
+            .resolve_wants(address, want, &content, &mut batch)
+            .await;
+        let pending = self
+            .drain_locally_complete(address, &store, plain, &progress, &mut batch)
+            .await;
+        self.fetch_shard_paths(
+            address,
+            &content,
+            shard_paths,
+            &store,
+            &progress,
+            &mut batch,
+        )
+        .await;
 
         if pending.is_empty() {
             return batch;
@@ -5237,8 +5507,10 @@ impl EdxFetcher for RuntimeEdxFetcher {
             return batch;
         }
 
-        self.fetch_tiers(address, &store, &session, pending, &content, &progress, &mut batch, now)
-            .await;
+        self.fetch_tiers(
+            address, &store, &session, pending, &content, &progress, &mut batch, now,
+        )
+        .await;
         if !batch.missed.is_empty() {
             // Name the session that failed: without this a fetch that landed
             // nothing from N live links was indistinguishable from an empty
@@ -5266,7 +5538,7 @@ impl EdxFetcher for RuntimeEdxFetcher {
     ) -> Result<Option<Vec<(String, u64, u64)>>, String> {
         // Same split as fetch_signed: Err = unreachable (score ConnectFail),
         // Ok(None) = alive but served no list, so try another peer.
-        let (conn, _identity, reg) = self.link(&peer).await?;
+        let (conn, _identity, reg, _activity) = self.link(&peer).await?;
         reg.note_cmd_sent("ListSigned", Some(address));
         match tokio::time::timeout(
             EDX_FETCH_TIMEOUT,
@@ -5386,7 +5658,7 @@ impl LinkOpener for RuntimeEdxFetcher {
     async fn open_link(&self, peer: PeerAddr) -> Result<Arc<dyn PeerLink>, String> {
         // Shares the pool: a peer the warm pool holds open is the same link a
         // fetch or a control RPC uses, instead of a second one beside it.
-        let (conn, identity, reg) = self.link(&peer).await?;
+        let (conn, identity, reg, _activity) = self.link(&peer).await?;
         Ok(Arc::new(WarmLink { conn, version: identity.version, reg }))
     }
 }
@@ -5440,16 +5712,21 @@ pub async fn enable_serving(
             return None;
         }
     };
-    state.set_edx_store(store.clone()).await;
+    let tally = match state.set_edx_store(store.clone()).await {
+        Ok(tally) => tally,
+        Err(error) => {
+            state
+                .log("WARN", format!("EDX Store activation failed: {error}"))
+                .await;
+            return None;
+        }
+    };
     let fetcher = Arc::new(RuntimeEdxFetcher::new(state.clone(), privatekey, choker));
     state.set_edx_fetcher(fetcher.clone()).await;
     // Same object behind both seams: the warm pool needs only a ping, so it
     // takes the narrow one.
     state.set_link_opener(fetcher).await;
-    // Register any xites already loaded before the store was installed, so
-    // serving does not depend on load order.
-    let n = state.edx_register_all_loaded().await;
-    state.log("INFO", format!("EDX object store enabled: registered {n}")).await;
+    state.log("INFO", format!("EDX object store enabled: registered {tally}")).await;
     Some(store)
 }
 
@@ -5663,42 +5940,155 @@ mod tests {
     async fn get_signed_serves_only_signed_paths() {
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
-        let content =
-            serde_json::to_vec(&serde_json::json!({ "files_merged": { "data/posts.json": {} } }))
-                .unwrap();
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let child_path = "data/users/alice/content.json";
+        let mut root = serde_json::json!({
+            "address": address,
+            "modified": 1.0,
+            "files": {},
+            "files_merged": { "data/posts.json": { "class": "epix-orset-1" } },
+            "includes": {
+                (child_path): {
+                    "merge_files": {
+                        "posts.json": { "class": "epix-orset-1", "max_size": 100_000 }
+                    }
+                }
+            },
+        });
+        epix_content::sign(&mut root, &key).unwrap();
+        let content = serde_json::to_vec(&root).unwrap();
+        let mut child = serde_json::json!({
+            "address": address,
+            "inner_path": child_path,
+            "modified": 1.0,
+            "files": {},
+        });
+        epix_content::sign(&mut child, &key).unwrap();
+        let child_bytes = serde_json::to_vec(&child).unwrap();
+        let posts = serde_json::to_vec(&epix_content::make_container(Vec::new())).unwrap();
         storage.write("content.json", &content).unwrap();
-        storage.write("data/users/alice/content.json", b"{}").unwrap();
-        storage.write("data/posts.json", b"[]").unwrap();
+        storage.write(child_path, &child_bytes).unwrap();
+        storage.write("data/posts.json", &posts).unwrap();
         storage.write("movie.bin", &vec![7u8; 64 * 1024]).unwrap();
         // Really on disk, so refusing it can only come from the segment-form
         // check - not from an ENOENT that would refuse it either way.
         storage.write("evilcontent.json", b"leak").unwrap();
 
-        let address = "1SignedPathTest";
         let state = AppState::new("provider");
         state
-            .add_xite(address, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .add_xite(
+                &address,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(root),
+                },
+            )
             .await;
         let p = AppStateProvider { state };
 
-        assert_eq!(p.get_signed(address, "content.json").await, Some(content));
+        assert_eq!(p.get_signed(&address, "content.json").await, Some(content));
         assert_eq!(
-            p.get_signed(address, "data/users/alice/content.json").await,
-            Some(b"{}".to_vec()),
+            p.get_signed(&address, child_path).await,
+            Some(child_bytes),
             "a child content.json is signed content too"
         );
         assert_eq!(
-            p.get_signed(address, "data/posts.json").await,
-            Some(b"[]".to_vec()),
+            p.get_signed(&address, "data/posts.json").await,
+            Some(posts),
             "a declared merge file still propagates"
         );
-        assert!(p.get_signed(address, "movie.bin").await.is_none(), "hosted media is not signed");
-        assert!(p.get_signed(address, "../content.json").await.is_none(), "no traversal");
-        assert!(p.get_signed(address, "/etc/passwd").await.is_none(), "no absolute path");
+        assert!(p.get_signed(&address, "movie.bin").await.is_none(), "hosted media is not signed");
+        assert!(p.get_signed(&address, "../content.json").await.is_none(), "no traversal");
+        assert!(p.get_signed(&address, "/etc/passwd").await.is_none(), "no absolute path");
         assert!(
-            p.get_signed(address, "evilcontent.json").await.is_none(),
+            p.get_signed(&address, "evilcontent.json").await.is_none(),
             "a file that merely ENDS in content.json is not signed content"
         );
+    }
+
+    #[tokio::test]
+    async fn signed_provider_excludes_a_revoked_stale_child_from_get_list_and_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let child_path = "data/users/alice/content.json";
+        let merge_path = "data/users/alice/posts.json";
+        let mut root_v1 = serde_json::json!({
+            "address": address,
+            "modified": 1.0,
+            "files": {},
+            "includes": {
+                (child_path): {
+                    "merge_files": {
+                        "posts.json": { "class": "epix-orset-1", "max_size": 100_000 }
+                    }
+                }
+            },
+        });
+        epix_content::sign(&mut root_v1, &key).unwrap();
+        let mut child = serde_json::json!({
+            "address": address,
+            "inner_path": child_path,
+            "modified": 2.0,
+            "files": {},
+            "files_merged": { "posts.json": { "class": "epix-orset-1" } },
+        });
+        epix_content::sign(&mut child, &key).unwrap();
+        let child_bytes = serde_json::to_vec(&child).unwrap();
+        let merge_bytes = serde_json::to_vec(&epix_content::make_container(Vec::new())).unwrap();
+        storage
+            .write("content.json", &serde_json::to_vec(&root_v1).unwrap())
+            .unwrap();
+        storage.write(child_path, &child_bytes).unwrap();
+        storage.write(merge_path, &merge_bytes).unwrap();
+
+        let state = AppState::new("provider");
+        state
+            .add_xite(
+                &address,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(root_v1),
+                },
+            )
+            .await;
+        let provider = AppStateProvider { state: state.clone() };
+        assert_eq!(provider.get_signed(&address, child_path).await, Some(child_bytes));
+        assert_eq!(provider.get_signed(&address, merge_path).await, Some(merge_bytes));
+        assert!(provider
+            .list_signed(&address, 0)
+            .await
+            .iter()
+            .any(|(path, _, _)| path == child_path));
+
+        let mut root_v2 = serde_json::json!({
+            "address": address,
+            "modified": 3.0,
+            "files": {},
+        });
+        epix_content::sign(&mut root_v2, &key).unwrap();
+        storage
+            .write("content.json", &serde_json::to_vec(&root_v2).unwrap())
+            .unwrap();
+        state
+            .add_xite(
+                &address,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(root_v2),
+                },
+            )
+            .await;
+        assert!(storage.exists(child_path));
+
+        assert!(provider.get_signed(&address, child_path).await.is_none());
+        assert!(provider.get_signed(&address, merge_path).await.is_none());
+        let listed = provider.list_signed(&address, 0).await;
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].0, "content.json");
+        assert_eq!(provider.xite_summary(&address).await.map(|summary| summary.0), Some(1));
     }
 
     /// A peer-supplied inner_path is bounded in length AND depth before it can
@@ -5729,15 +6119,30 @@ mod tests {
     async fn get_signed_refuses_a_body_past_the_cap() {
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
-        storage.write("content.json", &vec![b'x'; MAX_SIGNED_BYTES as usize + 1]).unwrap();
-
-        let address = "1CapTest";
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let mut root = serde_json::json!({
+            "address": address,
+            "modified": 1.0,
+            "files": {},
+            "padding": "x".repeat(MAX_SIGNED_BYTES as usize + 1),
+        });
+        epix_content::sign(&mut root, &key).unwrap();
+        let body = serde_json::to_vec(&root).unwrap();
+        assert!(body.len() as u64 > MAX_SIGNED_BYTES);
+        storage.write("content.json", &body).unwrap();
         let state = AppState::new("provider");
         state
-            .add_xite(address, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .add_xite(
+                &address,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(root),
+                },
+            )
             .await;
         let p = AppStateProvider { state };
-        assert!(p.get_signed(address, "content.json").await.is_none(), "over the cap: refused");
+        assert!(p.get_signed(&address, "content.json").await.is_none(), "over the cap: refused");
     }
 
     /// The serve cap must not sit below the client's reassembly cap (8 MiB in
@@ -5749,17 +6154,31 @@ mod tests {
     async fn get_signed_serves_a_body_the_client_would_still_accept() {
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
-        let body = vec![b'x'; 5 * 1024 * 1024];
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let mut root = serde_json::json!({
+            "address": address,
+            "modified": 1.0,
+            "files": {},
+            "padding": "x".repeat(5 * 1024 * 1024),
+        });
+        epix_content::sign(&mut root, &key).unwrap();
+        let body = serde_json::to_vec(&root).unwrap();
+        assert!(body.len() as u64 <= MAX_SIGNED_BYTES);
         storage.write("content.json", &body).unwrap();
-
-        let address = "1BigContentTest";
         let state = AppState::new("provider");
         state
-            .add_xite(address, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .add_xite(
+                &address,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(root),
+                },
+            )
             .await;
         let p = AppStateProvider { state };
         assert_eq!(
-            p.get_signed(address, "content.json").await.map(|b| b.len()),
+            p.get_signed(&address, "content.json").await.map(|b| b.len()),
             Some(body.len()),
             "a 5 MiB content.json is under the client's cap, so it must be servable"
         );
@@ -5814,6 +6233,71 @@ mod tests {
         .unwrap()
     }
 
+    /// EpixNet-style signed authority chain for a user_contents tree: a
+    /// signed `data/users/content.json` parent carrying `user_contents`, and
+    /// a signed root content.json declaring that parent under `includes`.
+    /// Serving and inbound-update application only trust manifests whose
+    /// full authority chain verifies (root -> parent -> per-user child), so
+    /// every test tree needs these two signed manifests even when the test
+    /// only cares about the per-user child. Returns (parent_bytes,
+    /// root_bytes, root_value).
+    fn signed_user_chain(
+        xite_addr: &str,
+        xite_pk: &str,
+        user_contents: serde_json::Value,
+    ) -> (Vec<u8>, Vec<u8>, serde_json::Value) {
+        let mut parent = serde_json::json!({
+            "address": xite_addr,
+            "inner_path": "data/users/content.json",
+            "modified": 1000,
+            "files": {},
+            "user_contents": user_contents,
+        });
+        epix_content::sign(&mut parent, xite_pk).unwrap();
+        let mut root = serde_json::json!({
+            "address": xite_addr,
+            "inner_path": "content.json",
+            "modified": 1000,
+            "files": {},
+            "includes": { "data/users/content.json": { "signers": [] } },
+        });
+        epix_content::sign(&mut root, xite_pk).unwrap();
+        (
+            serde_json::to_vec(&parent).unwrap(),
+            serde_json::to_vec(&root).unwrap(),
+            root,
+        )
+    }
+
+    #[tokio::test]
+    async fn enable_serving_quarantines_a_corrupt_loaded_root() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let privatekey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privatekey).unwrap();
+        let xite_dir = data_dir.path().join("data").join(&address);
+        let storage = XiteStorage::new(&xite_dir);
+        storage.write("content.json", b"not signed json").unwrap();
+
+        let state = AppState::new("corrupt-store-barrier");
+        state
+            .add_xite(&address, XiteEntry { storage, content: None })
+            .await;
+        assert!(state.edx_store().await.is_none());
+        assert!(state.link_opener().await.is_none());
+
+        let enabled = enable_serving(&state, data_dir.path(), privatekey, None).await;
+
+        // One unverifiable xite is quarantined; it must not take EDX
+        // activation (and with it every other xite's serving and all local
+        // mutation) down with it.
+        assert!(enabled.is_some(), "a corrupt loaded root must be quarantined, not fatal");
+        assert!(state.edx_store().await.is_some(), "the Store was not exposed");
+        assert!(
+            state.link_opener().await.is_some(),
+            "fetch/link hooks were not installed after quarantined activation"
+        );
+    }
+
     /// Bring up a seeder node serving an EDX xite (index.html + a 400 KB
     /// movie.bin) on a real TCP port. Returns its address, the signed
     /// content.json bytes + value, the movie bytes, and the socket address.
@@ -5854,7 +6338,7 @@ mod tests {
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
@@ -5944,7 +6428,7 @@ mod tests {
         let state_b = AppState::new("uploader");
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
@@ -6030,7 +6514,7 @@ mod tests {
         state_a.set_transport(transport).await;
         let a_store_dir = tempfile::tempdir().unwrap();
         let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
-        state_a.set_edx_store(a_store).await;
+        state_a.set_edx_store(a_store).await.unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -6068,7 +6552,10 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
+        state_a
+            .set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path())))
+            .await
+            .unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -6116,7 +6603,10 @@ mod tests {
             .await;
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let store_dir = tempfile::tempdir().unwrap();
-        state.set_edx_store(Arc::new(test_store(store_dir.path(), dir.path()))).await;
+        state
+            .set_edx_store(Arc::new(test_store(store_dir.path(), dir.path())))
+            .await
+            .unwrap();
         std::mem::forget(store_dir);
         state
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
@@ -6257,7 +6747,7 @@ mod tests {
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
@@ -6313,7 +6803,7 @@ mod tests {
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         state_b
             .add_xite(
                 &address,
@@ -6364,7 +6854,7 @@ mod tests {
         let state = AppState::new("node-c");
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(test_store(store_dir.path(), dir.path()));
-        state.set_edx_store(store.clone()).await;
+        state.set_edx_store(store.clone()).await.unwrap();
         state
             .add_xite(address, XiteEntry { storage, content: None })
             .await;
@@ -6493,7 +6983,10 @@ mod tests {
             .await;
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let store_dir = tempfile::tempdir().unwrap();
-        state.set_edx_store(Arc::new(test_store(store_dir.path(), dir.path()))).await;
+        state
+            .set_edx_store(Arc::new(test_store(store_dir.path(), dir.path())))
+            .await
+            .unwrap();
         state
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state.clone(),
@@ -6503,7 +6996,10 @@ mod tests {
             .await;
         state.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
         assert!(!dir.path().join("content.json").exists(), "manifest is staged, not committed");
-        let _ = cb;
+        let transaction = state
+            .begin_staged_root_transaction(&address, &cb)
+            .await
+            .expect("signed staged manifest starts a transaction");
 
         let needed = ["index.html", "movie.bin"]
             .into_iter()
@@ -6527,7 +7023,7 @@ mod tests {
                 needed,
                 vec![epix_core::PeerAddr::Ip(addr)],
                 Some(&content),
-                Some((&address, "content.json")),
+                Some(&transaction),
                 Some(on_file),
             )
             .await;
@@ -6658,7 +7154,7 @@ mod tests {
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
         let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
-        state_a.set_edx_store(a_store.clone()).await;
+        state_a.set_edx_store(a_store.clone()).await.unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -6698,7 +7194,7 @@ mod tests {
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
         let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
-        state_a.set_edx_store(a_store.clone()).await;
+        state_a.set_edx_store(a_store.clone()).await.unwrap();
         let choker: SharedChoker = Arc::new(Mutex::new(Choker::new(EDX_UPLOAD_CAP_BPS)));
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
@@ -6755,7 +7251,7 @@ mod tests {
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
         let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
-        state_a.set_edx_store(a_store.clone()).await;
+        state_a.set_edx_store(a_store.clone()).await.unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -6898,7 +7394,7 @@ mod tests {
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
         let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
-        state_a.set_edx_store(a_store.clone()).await;
+        state_a.set_edx_store(a_store.clone()).await.unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -6960,7 +7456,7 @@ mod tests {
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
         let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
-        state_a.set_edx_store(a_store.clone()).await;
+        state_a.set_edx_store(a_store.clone()).await.unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -7029,7 +7525,7 @@ mod tests {
     /// the backing state/task are leaked to outlive the test.
     async fn serve_edx(store: Arc<Store>) -> std::net::SocketAddr {
         let state = AppState::new("edx-seeder");
-        state.set_edx_store(store.clone()).await;
+        state.set_edx_store(store.clone()).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let sa = listener.local_addr().unwrap();
         let server = epix_protocol::PeerServer::new(edx_hook(
@@ -7075,7 +7571,7 @@ mod tests {
         let store_dir = tempfile::tempdir().unwrap();
         let store = Arc::new(test_store(store_dir.path(), &xite_path));
         std::mem::forget(store_dir);
-        state.set_edx_store(store.clone()).await;
+        state.set_edx_store(store.clone()).await.unwrap();
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         state.add_peers(&addr, [epix_core::PeerAddr::Ip(seeder)]).await;
         state.config_set("volunteer_quota_bytes", serde_json::json!(quota)).await;
@@ -7194,19 +7690,44 @@ mod tests {
         storage.write("index.html", b"<h1>forum</h1>").unwrap();
         let post = b"a forum post by alice, delivered over EDX not msgpack".to_vec();
         storage.write("data/users/alice/data.json", &post).unwrap();
+        // The signed user_contents parent the child verifies against. The
+        // serving side only trusts manifests whose whole authority chain
+        // verifies, so the parent must be signed and the root must declare it.
+        let (parent_bytes, _, _) = signed_user_chain(
+            &address,
+            &privkey,
+            serde_json::json!({
+                "cert_signers": {},
+                "permissions": {},
+                "permission_rules": { ".*": { "max_size": 100000 } },
+            }),
+        );
+        storage.write("data/users/content.json", &parent_bytes).unwrap();
         // A child content.json declaring the per-user file with its b3 (what
-        // sign_child stamps in production; constructed here to skip the cert
-        // flow). The transfer path reads the files map, not the signature.
+        // sign_child stamps in production). Signed with the xite key - always
+        // a valid signer - to skip the cert flow.
         let b3 = epix_blob::ObjId::of(&post);
-        let child = serde_json::json!({
-            "files": { "data.json": { "size": post.len(), "b3": b3.to_string() } },
+        let mut child = serde_json::json!({
+            "files": {
+                "data.json": {
+                    "size": post.len(),
+                    "sha512": XiteStorage::hash_bytes(&post),
+                    "b3": b3.to_string(),
+                }
+            },
             "modified": 1000, "address": address,
             "inner_path": "data/users/alice/content.json",
         });
+        epix_content::sign(&mut child, &privkey).unwrap();
         storage
             .write("data/users/alice/content.json", &serde_json::to_vec(&child).unwrap())
             .unwrap();
         let mut xite = Xite::new(epix_core::Address::parse(address.clone()).unwrap(), storage);
+        // The root must authorize the user_contents parent, or the walk stops
+        // at the root and nothing under data/users/ is served.
+        xite.content = Some(serde_json::json!({
+            "includes": { "data/users/content.json": { "signers": [] } },
+        }));
         xite.sign(&privkey, 1000.0).unwrap();
         let content_bytes = xite.storage.read("content.json").unwrap();
 
@@ -7214,7 +7735,7 @@ mod tests {
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
@@ -7245,6 +7766,7 @@ mod tests {
         let a_dir = tempfile::tempdir().unwrap();
         let a_storage = XiteStorage::new(a_dir.path());
         a_storage.write("content.json", &content_bytes).unwrap();
+        a_storage.write("data/users/content.json", &parent_bytes).unwrap();
         a_storage
             .write("data/users/alice/content.json", &serde_json::to_vec(&child).unwrap())
             .unwrap();
@@ -7254,7 +7776,10 @@ mod tests {
         assert!(state_a.load_content_from_disk(&address).await);
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
+        state_a
+            .set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path())))
+            .await
+            .unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -7320,16 +7845,17 @@ mod tests {
             "the object id binds path and bytes"
         );
 
-        // An inline object of a kind this build does not own (no merge magic)
-        // is skipped, not fatal: one novel entry from a future build must not
-        // stall the whole Update. Its hash still has to bind the bytes.
+        // INLINE_MERGE promises this exact envelope format. Silently accepting
+        // another kind would give its sender a payload-aware ACK for bytes this
+        // receiver discarded.
         let foreign = b"not a runtime merge envelope".to_vec();
-        let skipped =
-            decode_inline_merges(&[(ObjId::of(&foreign), foreign.clone())]).unwrap();
-        assert!(skipped.deltas.is_empty() && skipped.objects.is_empty());
+        assert!(
+            decode_inline_merges(&[(ObjId::of(&foreign), foreign.clone())]).is_err(),
+            "a foreign inline object fails closed"
+        );
         assert!(
             decode_inline_merges(&[(ObjId::of(b"other"), foreign)]).is_err(),
-            "a corrupt hash fails closed even for a foreign inline object"
+            "a corrupt hash also fails closed"
         );
 
         // Garbage BEHIND our magic is ours to judge - still fatal.
@@ -7339,6 +7865,27 @@ mod tests {
             decode_inline_merges(&[(ObjId::of(&ours), ours)]).is_err(),
             "a malformed envelope behind the merge magic fails closed"
         );
+    }
+
+    #[test]
+    fn update_push_errors_preserve_busy_hints_and_refuse_limits() {
+        let delay = std::time::Duration::from_secs(3);
+        assert!(matches!(
+            map_update_push_error(epix_edx::fetch::PushUpdateError::Busy {
+                message: "try later".into(),
+                retry_after: Some(delay),
+            }),
+            EdxPushError::Busy {
+                message,
+                retry_after: Some(got),
+            } if message == "try later" && got == delay
+        ));
+
+        let limit = std::io::Error::new(std::io::ErrorKind::QuotaExceeded, "peer: 413 hard limit");
+        assert!(matches!(
+            map_update_push_error(epix_edx::fetch::PushUpdateError::Refused(limit)),
+            EdxPushError::Refused(message) if message.contains("hard limit")
+        ));
     }
 
     #[test]
@@ -7358,6 +7905,41 @@ mod tests {
         let decoded = decode_inline_merges(&wire).unwrap();
         assert!(decoded.deltas.is_empty());
         assert_eq!(decoded.objects.get("posts.json"), Some(&object));
+    }
+
+    #[test]
+    fn merge_quota_wave_reconciles_after_the_final_eviction_hold() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let bytes = vec![7u8; 4096];
+        let id = ObjId::of(&bytes);
+        store.insert_bytes(id, Ns::Plain, &bytes, 1).unwrap();
+
+        let wave = MergeQuotaWave::new(store.clone(), 0);
+        let hold_a = store.hold_eviction(id);
+        let lease_a = wave.lease();
+        let hold_b = store.hold_eviction(id);
+        let lease_b = wave.lease();
+        let insertion_lease = wave.lease();
+
+        drop(hold_a);
+        drop(lease_a);
+        assert!(
+            store.contains(id).unwrap(),
+            "an earlier peer cannot evict an object another fanout RPC still serves"
+        );
+
+        drop(hold_b);
+        drop(lease_b);
+        assert!(
+            store.contains(id).unwrap(),
+            "a blocking insertion lease delays reconciliation after async callers cancel"
+        );
+        drop(insertion_lease);
+        assert!(
+            !store.contains(id).unwrap(),
+            "the last cancellation-safe lease enforces after the final hold drops"
+        );
     }
 
     #[test]
@@ -7478,6 +8060,50 @@ mod tests {
         assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
+    #[tokio::test]
+    async fn an_evicted_merge_delta_is_prepared_again_before_later_fanout() {
+        let state = AppState::new("prepare-after-eviction");
+        let fetcher = RuntimeEdxFetcher::new(state, String::new(), None);
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let records = br#"{"record_format":"epix-orset-1","posts":[{"id":1}]}"#.to_vec();
+        let id = ObjId::of(&records);
+        let payload = Arc::new(UpdatePayload {
+            merge_deltas: HashMap::from([("posts.json".to_string(), records)]),
+            ..UpdatePayload::default()
+        });
+
+        {
+            let prepared = fetcher
+                .prepare_merge_delta_objects(&store, payload.clone(), None)
+                .await
+                .expect("first fanout prepares the merge object");
+            assert_eq!(
+                prepared.objects.get("posts.json").map(|object| object.id),
+                Some(id)
+            );
+            assert!(store.contains(id).unwrap());
+        }
+        store.enforce_quota(0).unwrap();
+        assert!(
+            !store.contains(id).unwrap(),
+            "the first fanout object was evicted"
+        );
+
+        let prepared = fetcher
+            .prepare_merge_delta_objects(&store, payload, None)
+            .await
+            .expect("later fanout reinserts an evicted merge object");
+        assert_eq!(
+            prepared.objects.get("posts.json").map(|object| object.id),
+            Some(id)
+        );
+        assert!(
+            store.contains(id).unwrap(),
+            "an object must exist before it is advertised to the later peer"
+        );
+    }
+
     /// A rejected update must not become a propagation hint. Otherwise peers
     /// can announce a version whose files they never verified or obtained.
     #[tokio::test]
@@ -7526,19 +8152,19 @@ mod tests {
         let b_dir = tempfile::tempdir().unwrap();
         let b_path = b_dir.path().to_path_buf();
         let storage = XiteStorage::new(b_dir.path());
-        // Parent user_contents rules the pushed child verifies against.
-        let parent = serde_json::json!({
-            "address": xite_addr,
-            "inner_path": "data/users/content.json",
-            "user_contents": {
+        // The signed user_contents parent (plus the signed root authorizing
+        // it) the pushed child verifies against.
+        let (parent_bytes, root_bytes, root) = signed_user_chain(
+            &xite_addr,
+            &xite_pk,
+            serde_json::json!({
                 "cert_signers": {},
                 "permissions": {},
                 "permission_rules": { ".*": { "max_size": 100000 } },
-            },
-        });
-        storage
-            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
-            .unwrap();
+            }),
+        );
+        storage.write("content.json", &root_bytes).unwrap();
+        storage.write("data/users/content.json", &parent_bytes).unwrap();
         let data_v1: &[u8] = br#"{ "posts": [ {"post_id":1,"title":"First"} ] }"#;
         storage.write(&format!("{user_dir}/data.json"), data_v1).unwrap();
         let mut c1 = serde_json::json!({
@@ -7552,14 +8178,13 @@ mod tests {
             .write(&format!("{user_dir}/content.json"), &serde_json::to_vec(&c1).unwrap())
             .unwrap();
 
-        let root = serde_json::json!({ "address": xite_addr, "modified": 1.0, "files": {} });
         let state_b = AppState::new("node-b");
         state_b
             .add_xite(&xite_addr, XiteEntry { storage: XiteStorage::new(&b_path), content: Some(root) })
             .await;
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), b_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         let prop_b = Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
         state_b.set_prop_store(prop_b.clone());
         std::mem::forget(b_dir);
@@ -7600,12 +8225,15 @@ mod tests {
         let state_a = AppState::new("node-a");
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a
+            .set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap()))
+            .await
+            .unwrap();
         std::mem::forget(a_store_dir);
         let fetcher =
             RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
 
-        let progressed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress = Arc::new(epix_ui::state::EdxPushProgress::default());
         let pushed = fetcher
             .push_update(
                 epix_core::PeerAddr::Ip(addr),
@@ -7620,11 +8248,14 @@ mod tests {
                     require_merge_delivery: false,
                 }),
                 Arc::new(Vec::new()),
-                progressed.clone(),
+                progress.clone(),
             )
             .await;
         assert!(pushed.is_ok(), "the peer accepted the EDX update push");
-        assert!(progressed.load(std::sync::atomic::Ordering::Relaxed), "the link came up");
+        assert!(
+            progress.linked.load(std::sync::atomic::Ordering::Relaxed),
+            "the link came up"
+        );
 
         // B has no transport: the only way data.json can reach v2 is the diff
         // patch that rode the push. Poll B's disk until it lands.
@@ -7665,10 +8296,10 @@ mod tests {
         let user_dir = format!("data/users/{author}");
         let child_path = format!("{user_dir}/content.json");
         let posts_path = format!("{user_dir}/posts.json");
-        let parent = serde_json::json!({
-            "address": xite_addr,
-            "inner_path": "data/users/content.json",
-            "user_contents": {
+        let (parent_bytes, root_bytes, root) = signed_user_chain(
+            &xite_addr,
+            &xite_key,
+            serde_json::json!({
                 "cert_signers": {},
                 "permissions": {},
                 "permission_rules": {
@@ -7682,8 +8313,8 @@ mod tests {
                         }
                     }
                 }
-            }
-        });
+            }),
+        );
         let mut old_child = serde_json::json!({
             "address": xite_addr,
             "inner_path": child_path,
@@ -7718,8 +8349,9 @@ mod tests {
 
         let receiver_dir = tempfile::tempdir().unwrap();
         let receiver_storage = XiteStorage::new(receiver_dir.path());
+        receiver_storage.write("content.json", &root_bytes).unwrap();
         receiver_storage
-            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .write("data/users/content.json", &parent_bytes)
             .unwrap();
         receiver_storage
             .write(&child_path, &serde_json::to_vec(&old_child).unwrap())
@@ -7730,7 +8362,6 @@ mod tests {
                 &serde_json::to_vec(&epix_content::make_container(Vec::new())).unwrap(),
             )
             .unwrap();
-        let root = serde_json::json!({ "address": xite_addr, "modified": 1.0, "files": {} });
         let receiver = AppState::new("receiver-small-inline");
         receiver
             .add_xite(
@@ -7746,7 +8377,10 @@ mod tests {
             receiver_store_dir.path(),
             receiver_dir.path(),
         ));
-        receiver.set_edx_store(receiver_store.clone()).await;
+        receiver
+            .set_edx_store(receiver_store.clone())
+            .await
+            .unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let receiver_addr = listener.local_addr().unwrap();
@@ -7765,8 +8399,9 @@ mod tests {
 
         let publisher_dir = tempfile::tempdir().unwrap();
         let publisher_storage = XiteStorage::new(publisher_dir.path());
+        publisher_storage.write("content.json", &root_bytes).unwrap();
         publisher_storage
-            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .write("data/users/content.json", &parent_bytes)
             .unwrap();
         publisher_storage.write(&child_path, &new_child_bytes).unwrap();
         publisher_storage.write(&posts_path, &delta).unwrap();
@@ -7787,10 +8422,12 @@ mod tests {
                 publisher_store_dir.path(),
                 publisher_dir.path(),
             )))
-            .await;
+            .await
+            .unwrap();
         assert!(publisher.own_dialable_addresses().await.is_empty());
         let fetcher = RuntimeEdxFetcher::new(publisher, epix_crypt::new_seed(), None);
 
+        let progress = Arc::new(epix_ui::state::EdxPushProgress::default());
         let pushed = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             fetcher.push_update(
@@ -7806,12 +8443,16 @@ mod tests {
                     require_merge_delivery: false,
                 }),
                 Arc::new(Vec::new()),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                progress.clone(),
             ),
         )
         .await
         .expect("small inline delivery must finish in one short round trip");
         assert!(matches!(pushed, Ok(true)), "the capable peer acknowledged the inline payload");
+        assert!(
+            !progress.active.load(std::sync::atomic::Ordering::Relaxed),
+            "a handshake plus inline ACK is not reverse-transfer activity"
+        );
 
         let received: serde_json::Value =
             serde_json::from_slice(&receiver_storage.read(&posts_path).unwrap()).unwrap();
@@ -7839,10 +8480,10 @@ mod tests {
         let child_path = format!("{user_dir}/content.json");
         let posts_path = format!("{user_dir}/posts.json");
 
-        let parent = serde_json::json!({
-            "address": xite_addr,
-            "inner_path": "data/users/content.json",
-            "user_contents": {
+        let (parent_bytes, root_bytes, root) = signed_user_chain(
+            &xite_addr,
+            &xite_key,
+            serde_json::json!({
                 "cert_signers": {},
                 "permissions": {},
                 "permission_rules": {
@@ -7856,8 +8497,8 @@ mod tests {
                         }
                     }
                 }
-            }
-        });
+            }),
+        );
         let mut old_child = serde_json::json!({
             "address": xite_addr,
             "inner_path": child_path,
@@ -7925,14 +8566,14 @@ mod tests {
         // no outbound transport and receives no advertised dial-back address.
         let receiver_dir = tempfile::tempdir().unwrap();
         let receiver_storage = XiteStorage::new(receiver_dir.path());
+        receiver_storage.write("content.json", &root_bytes).unwrap();
         receiver_storage
-            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .write("data/users/content.json", &parent_bytes)
             .unwrap();
         receiver_storage
             .write(&child_path, &serde_json::to_vec(&old_child).unwrap())
             .unwrap();
         receiver_storage.write(&posts_path, &base_posts).unwrap();
-        let root = serde_json::json!({ "address": xite_addr, "modified": 1.0, "files": {} });
         let receiver = AppState::new("receiver");
         receiver
             .add_xite(
@@ -7948,7 +8589,10 @@ mod tests {
             receiver_store_dir.path(),
             receiver_dir.path(),
         ));
-        receiver.set_edx_store(receiver_store.clone()).await;
+        receiver
+            .set_edx_store(receiver_store.clone())
+            .await
+            .unwrap();
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let receiver_addr = listener.local_addr().unwrap();
@@ -7969,8 +8613,9 @@ mod tests {
         // loop attached to the same connection used for Req::Update.
         let publisher_dir = tempfile::tempdir().unwrap();
         let publisher_storage = XiteStorage::new(publisher_dir.path());
+        publisher_storage.write("content.json", &root_bytes).unwrap();
         publisher_storage
-            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .write("data/users/content.json", &parent_bytes)
             .unwrap();
         publisher_storage.write(&child_path, &new_child_bytes).unwrap();
         publisher_storage.write(&posts_path, &published_posts).unwrap();
@@ -7991,7 +8636,8 @@ mod tests {
                 publisher_store_dir.path(),
                 publisher_dir.path(),
             )))
-            .await;
+            .await
+            .unwrap();
         assert!(
             publisher.own_dialable_addresses().await.is_empty(),
             "the publisher must not advertise a reverse-dial route"
@@ -8004,6 +8650,7 @@ mod tests {
             require_merge_delivery: false,
         };
 
+        let progress = Arc::new(epix_ui::state::EdxPushProgress::default());
         let pushed = tokio::time::timeout(
             std::time::Duration::from_secs(10),
             fetcher.push_update(
@@ -8014,7 +8661,7 @@ mod tests {
                 2000.0,
                 Arc::new(payload),
                 Arc::new(Vec::new()),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                progress.clone(),
             ),
         )
         .await
@@ -8022,6 +8669,10 @@ mod tests {
         assert!(
             matches!(pushed, Ok(true)),
             "the receiver acknowledged durable merge delivery"
+        );
+        assert!(
+            progress.active.load(std::sync::atomic::Ordering::Relaxed),
+            "the same-session object pull marks real reverse activity"
         );
 
         // Req::Update is answered only after the receiver's synchronous merge
@@ -8054,22 +8705,15 @@ mod tests {
         let child_path = format!("{user_dir}/content.json");
         let file_path = format!("{user_dir}/large.bin");
 
-        let mut root = serde_json::json!({
-            "address": xite_addr,
-            "modified": 1,
-            "files": {}
-        });
-        epix_content::sign(&mut root, &xite_key).unwrap();
-        let root_bytes = serde_json::to_vec(&root).unwrap();
-        let parent = serde_json::json!({
-            "address": xite_addr,
-            "inner_path": "data/users/content.json",
-            "user_contents": {
+        let (parent_bytes, root_bytes, root) = signed_user_chain(
+            &xite_addr,
+            &xite_key,
+            serde_json::json!({
                 "cert_signers": {},
                 "permissions": {},
                 "permission_rules": { ".*": { "max_size": 8 * 1024 * 1024 } }
-            }
-        });
+            }),
+        );
         let mut old_child = serde_json::json!({
             "address": xite_addr,
             "inner_path": child_path,
@@ -8101,12 +8745,17 @@ mod tests {
         let new_child_bytes = serde_json::to_vec(&new_child).unwrap();
 
         // Receiver. It has no outbound transport and starts without the file
-        // or a propagation hint for the incoming child version.
+        // or a propagation hint for the incoming child version. Its tree uses
+        // the production `<data_dir>/data/<address>` layout: the inbound
+        // hashed-file promotion stages under `<data>/.epix-stage`, and the
+        // object store only adopts/materializes paths inside its xite root.
         let receiver_dir = tempfile::tempdir().unwrap();
-        let receiver_storage = XiteStorage::new(receiver_dir.path());
+        let receiver_data_root = receiver_dir.path().join("data");
+        let receiver_xite_dir = receiver_data_root.join(&xite_addr);
+        let receiver_storage = XiteStorage::new(&receiver_xite_dir);
         receiver_storage.write("content.json", &root_bytes).unwrap();
         receiver_storage
-            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .write("data/users/content.json", &parent_bytes)
             .unwrap();
         receiver_storage
             .write(&child_path, &serde_json::to_vec(&old_child).unwrap())
@@ -8124,9 +8773,12 @@ mod tests {
         let receiver_store_dir = tempfile::tempdir().unwrap();
         let receiver_store = Arc::new(test_store(
             receiver_store_dir.path(),
-            receiver_dir.path(),
+            &receiver_data_root,
         ));
-        receiver.set_edx_store(receiver_store.clone()).await;
+        receiver
+            .set_edx_store(receiver_store.clone())
+            .await
+            .unwrap();
         let receiver_hints =
             Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
         receiver.set_prop_store(receiver_hints.clone());
@@ -8154,7 +8806,7 @@ mod tests {
         let publisher_storage = XiteStorage::new(publisher_dir.path());
         publisher_storage.write("content.json", &root_bytes).unwrap();
         publisher_storage
-            .write("data/users/content.json", &serde_json::to_vec(&parent).unwrap())
+            .write("data/users/content.json", &parent_bytes)
             .unwrap();
         publisher_storage.write(&child_path, &new_child_bytes).unwrap();
         publisher_storage.write(&file_path, &large_file).unwrap();
@@ -8174,7 +8826,10 @@ mod tests {
             publisher_store_dir.path(),
             publisher_dir.path(),
         ));
-        publisher.set_edx_store(publisher_store.clone()).await;
+        publisher
+            .set_edx_store(publisher_store.clone())
+            .await
+            .unwrap();
         let registered = publisher
             .edx_register_xite(&xite_addr)
             .await
@@ -8187,6 +8842,7 @@ mod tests {
         );
 
         let fetcher = RuntimeEdxFetcher::new(publisher, epix_crypt::new_seed(), None);
+        let progress = Arc::new(epix_ui::state::EdxPushProgress::default());
         let pushed = tokio::time::timeout(
             std::time::Duration::from_secs(5),
             fetcher.push_update(
@@ -8197,12 +8853,16 @@ mod tests {
                 2000.0,
                 Arc::new(UpdatePayload::default()),
                 Arc::new(Vec::new()),
-                Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                progress.clone(),
             ),
         )
         .await
         .expect("the outbound Update session connected");
         assert!(matches!(pushed, Ok(true)), "the child manifest was accepted");
+        assert!(
+            progress.active.load(std::sync::atomic::Ordering::Relaxed),
+            "the same-session file pull marks real reverse activity"
+        );
 
         // The hint is persistent. Whenever it first becomes observable, the
         // file must already exist and verify against the signed SHA-512 entry.
@@ -8261,7 +8921,7 @@ mod tests {
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         state_b
             .add_xite(&address, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
             .await;
@@ -8293,7 +8953,10 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
+        state_a
+            .set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path())))
+            .await
+            .unwrap();
         state_a
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_a.clone(),
@@ -8325,7 +8988,10 @@ mod tests {
             .await;
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path()))).await;
+        state_a
+            .set_edx_store(Arc::new(test_store(a_store_dir.path(), a_dir.path())))
+            .await
+            .unwrap();
         state_a.add_peers(&address, [epix_core::PeerAddr::Ip(addr)]).await;
 
         // Reciprocity on: the fetcher holds the shared choker.
@@ -8353,9 +9019,14 @@ mod tests {
         let (address, _bytes, _content, _movie, addr, _pk) = spawn_seeder().await;
         let state_a = AppState::new("node-a");
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
-        let dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(Store::open(dir.path()).unwrap())).await;
-        std::mem::forget(dir);
+        let store_dir = tempfile::tempdir().unwrap();
+        let xite_root = tempfile::tempdir().unwrap();
+        state_a
+            .set_edx_store(Arc::new(test_store(store_dir.path(), xite_root.path())))
+            .await
+            .unwrap();
+        std::mem::forget(store_dir);
+        std::mem::forget(xite_root);
         let fetcher =
             RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
         let peer = PeerAddr::Ip(addr);
@@ -8411,7 +9082,7 @@ mod tests {
 
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -8433,7 +9104,10 @@ mod tests {
         let state_a = AppState::new("node-a");
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
-        state_a.set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap())).await;
+        state_a
+            .set_edx_store(Arc::new(Store::open(a_store_dir.path()).unwrap()))
+            .await
+            .unwrap();
         std::mem::forget(a_store_dir);
         let fetcher =
             RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
@@ -8500,7 +9174,10 @@ mod tests {
         let state = AppState::new("client");
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let dir = tempfile::tempdir().unwrap();
-        state.set_edx_store(Arc::new(Store::open(dir.path()).unwrap())).await;
+        state
+            .set_edx_store(Arc::new(Store::open(dir.path()).unwrap()))
+            .await
+            .unwrap();
         std::mem::forget(dir);
         let fetcher = RuntimeEdxFetcher::new(state.clone(), epix_crypt::new_seed(), None);
         let peer = PeerAddr::Ip(addr);
@@ -8578,7 +9255,10 @@ mod tests {
         let state = AppState::with_data_dir("client", root.path());
         state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let store_dir = tempfile::tempdir().unwrap();
-        state.set_edx_store(Arc::new(Store::open(store_dir.path()).unwrap())).await;
+        state
+            .set_edx_store(Arc::new(Store::open(store_dir.path()).unwrap()))
+            .await
+            .unwrap();
         let xite_dir = tempfile::tempdir().unwrap();
         state
             .add_xite(xite, XiteEntry { storage: XiteStorage::new(xite_dir.path()), content: None })
@@ -8618,7 +9298,7 @@ mod tests {
         let state_b = AppState::new("node-b");
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(Store::open(store_dir.path()).unwrap());
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         std::mem::forget(store_dir);
         let seen: Arc<Mutex<Vec<PeerAddr>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_hook = seen.clone();
@@ -8705,7 +9385,10 @@ mod tests {
                 .await;
             state.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
             let sd = tempfile::tempdir().unwrap();
-            state.set_edx_store(Arc::new(test_store(sd.path(), dir.path()))).await;
+            state
+                .set_edx_store(Arc::new(test_store(sd.path(), dir.path())))
+                .await
+                .unwrap();
             state
                 .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                     state.clone(),
@@ -8840,7 +9523,22 @@ mod tests {
     }
 
     fn test_link_activity() -> LinkActivity {
-        Arc::new(Mutex::new(tokio::time::Instant::now()))
+        LinkActivityState::new()
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_update_closes_its_reverse_pull_session() {
+        let (source_io, peer_io) = tokio::io::duplex(1024);
+        let (source, _source_incoming) = Conn::start(source_io, true);
+        let (_peer, _peer_incoming) = Conn::start(peer_io, false);
+        let guard = UpdateRequestGuard::new(&source, true);
+
+        drop(guard);
+
+        assert!(
+            source.is_closed(),
+            "holds cannot release while a cancelled receiver can still pull"
+        );
     }
 
     /// A pooled control link that nobody uses must be dropped, not held for the
@@ -8907,7 +9605,7 @@ mod tests {
             ),
         );
         tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
-        *activity.lock().expect("link activity") = tokio::time::Instant::now();
+        activity.note_reverse_request();
 
         assert!(
             pool.live(&peer, 0).is_some(),
@@ -9148,17 +9846,18 @@ mod tests {
         let user_dir = format!("data/users/{user_addr}");
         let child_path = format!("{user_dir}/content.json");
 
-        // The rules the pushed child verifies against, on both nodes.
-        let parent = serde_json::json!({
-            "address": xite_addr,
-            "inner_path": "data/users/content.json",
-            "user_contents": {
+        // The signed rules chain the pushed child verifies against, on both
+        // nodes: a signed user_contents parent plus the signed root that
+        // authorizes it.
+        let (parent_bytes, root_bytes, root) = signed_user_chain(
+            &xite_addr,
+            &xite_pk,
+            serde_json::json!({
                 "cert_signers": {},
                 "permissions": {},
                 "permission_rules": { ".*": { "max_size": 100000 } },
-            },
-        });
-        let parent_bytes = serde_json::to_vec(&parent).unwrap();
+            }),
+        );
         let data: &[u8] = br#"{ "posts": [] }"#;
         let child = |modified: i64| {
             let mut c = serde_json::json!({
@@ -9176,6 +9875,7 @@ mod tests {
         // Publisher P: an EDX server that serves v2 of the child over GetSigned.
         let p_dir = tempfile::tempdir().unwrap();
         let p_storage = XiteStorage::new(p_dir.path());
+        p_storage.write("content.json", &root_bytes).unwrap();
         p_storage.write("data/users/content.json", &parent_bytes).unwrap();
         p_storage.write(&child_path, &child(2000)).unwrap();
         let state_p = AppState::new("publisher");
@@ -9184,7 +9884,7 @@ mod tests {
             .await;
         let p_store_dir = tempfile::tempdir().unwrap();
         let p_store = Arc::new(test_store(p_store_dir.path(), p_dir.path()));
-        state_p.set_edx_store(p_store.clone()).await;
+        state_p.set_edx_store(p_store.clone()).await.unwrap();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let p_addr = listener.local_addr().unwrap();
         let server = epix_protocol::PeerServer::new(edx_hook(
@@ -9205,10 +9905,10 @@ mod tests {
         // Receiver R: holds v1 of the same child, and can dial P.
         let r_dir = tempfile::tempdir().unwrap();
         let r_storage = XiteStorage::new(r_dir.path());
+        r_storage.write("content.json", &root_bytes).unwrap();
         r_storage.write("data/users/content.json", &parent_bytes).unwrap();
         r_storage.write(&child_path, &child(1000)).unwrap();
         r_storage.write(&format!("{user_dir}/data.json"), data).unwrap();
-        let root = serde_json::json!({ "address": xite_addr, "modified": 1.0, "files": {} });
         let state_r = AppState::new("receiver");
         state_r
             .add_xite(
@@ -9218,7 +9918,10 @@ mod tests {
             .await;
         state_r.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let r_store_dir = tempfile::tempdir().unwrap();
-        state_r.set_edx_store(Arc::new(test_store(r_store_dir.path(), r_dir.path()))).await;
+        state_r
+            .set_edx_store(Arc::new(test_store(r_store_dir.path(), r_dir.path())))
+            .await
+            .unwrap();
         state_r
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state_r.clone(),
@@ -9310,7 +10013,7 @@ mod tests {
             .await;
         let store_dir = tempfile::tempdir().unwrap();
         let store_b = Arc::new(test_store(store_dir.path(), xite_dir.path()));
-        state_b.set_edx_store(store_b.clone()).await;
+        state_b.set_edx_store(store_b.clone()).await.unwrap();
         std::mem::forget(xite_dir);
         std::mem::forget(store_dir);
 
@@ -9375,7 +10078,7 @@ mod tests {
         state_a.set_transport(Arc::new(TcpTransport) as Arc<dyn Transport>).await;
         let a_store_dir = tempfile::tempdir().unwrap();
         let a_store = Arc::new(test_store(a_store_dir.path(), a_dir.path()));
-        state_a.set_edx_store(a_store.clone()).await;
+        state_a.set_edx_store(a_store.clone()).await.unwrap();
         std::mem::forget(a_dir);
         std::mem::forget(a_store_dir);
         let fetcher = RuntimeEdxFetcher::new(state_a.clone(), epix_crypt::new_seed(), None);
@@ -9478,9 +10181,18 @@ mod tests {
     /// disk) - the shape a clone is in while it downloads.
     async fn staged_only_node(
         files: serde_json::Value,
-    ) -> (Arc<AppState>, String, serde_json::Value, tempfile::TempDir) {
-        let address = "epix1zerobytefiletestaddressaaaaaaaaaaaaaaa".to_string();
-        let content = serde_json::json!({ "address": address, "files": files });
+    ) -> (
+        Arc<AppState>,
+        String,
+        serde_json::Value,
+        Vec<u8>,
+        tempfile::TempDir,
+    ) {
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let mut content = serde_json::json!({ "address": address, "modified": 1, "files": files });
+        epix_content::sign(&mut content, &key).unwrap();
+        let signed = serde_json::to_vec(&content).unwrap();
         let state = AppState::new("node-a");
         let dir = tempfile::tempdir().unwrap();
         state
@@ -9490,7 +10202,10 @@ mod tests {
             )
             .await;
         let store_dir = tempfile::tempdir().unwrap();
-        state.set_edx_store(Arc::new(test_store(store_dir.path(), dir.path()))).await;
+        state
+            .set_edx_store(Arc::new(test_store(store_dir.path(), dir.path())))
+            .await
+            .unwrap();
         state
             .set_edx_fetcher(Arc::new(RuntimeEdxFetcher::new(
                 state.clone(),
@@ -9498,7 +10213,7 @@ mod tests {
                 None,
             )))
             .await;
-        (state, address, content, dir)
+        (state, address, content, signed, dir)
     }
 
     /// A zero-length file needs no bytes from anyone, so it must land with NO
@@ -9513,10 +10228,15 @@ mod tests {
     #[tokio::test]
     async fn a_zero_length_file_lands_without_any_peer() {
         let empty = ObjId::of(&[]).to_string();
-        let (state, address, content, dir) = staged_only_node(serde_json::json!({
-            "empty.txt": { "b3": empty, "size": 0, "sha512": "x" },
+        let empty_sha512 = XiteStorage::hash_bytes(&[]);
+        let (state, address, content, signed, dir) = staged_only_node(serde_json::json!({
+            "empty.txt": { "b3": empty, "size": 0, "sha512": empty_sha512 },
         }))
         .await;
+        let transaction = state
+            .begin_staged_root_transaction(&address, &signed)
+            .await
+            .expect("signed staged manifest starts a transaction");
 
         // No transport, no peers: if this needed the network it cannot pass.
         let missed = state
@@ -9525,11 +10245,11 @@ mod tests {
                 vec![epix_xite::FileEntry {
                     inner_path: "empty.txt".to_string(),
                     size: 0,
-                    sha512: "x".to_string(),
+                    sha512: XiteStorage::hash_bytes(&[]),
                 }],
                 vec![],
                 Some(&content),
-                Some((&address, "content.json")),
+                Some(&transaction),
                 None,
             )
             .await;
@@ -9545,8 +10265,12 @@ mod tests {
     /// so this cannot become a way to fake a file into a xite.
     #[tokio::test]
     async fn a_non_empty_file_is_never_shortcut_to_disk() {
-        let (state, address, content, dir) = staged_only_node(serde_json::json!({
-            "real.bin": { "b3": ObjId([3u8; 32]).to_string(), "size": 64, "sha512": "x" },
+        let (state, address, content, _signed, dir) = staged_only_node(serde_json::json!({
+            "real.bin": {
+                "b3": ObjId([3u8; 32]).to_string(),
+                "size": 64,
+                "sha512": XiteStorage::hash_bytes(&[0u8; 64])
+            },
         }))
         .await;
 

@@ -4,13 +4,13 @@
 //! single window.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use epix_core::PeerAddr;
 use epix_ui::state::{
-    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxWant, UpdatePayload,
-    XiteEntry,
+    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxPushProgress, EdxWant,
+    UpdatePayload, XiteEntry,
 };
 use epix_ui::UiServer;
 use epix_xite::XiteStorage;
@@ -71,7 +71,7 @@ impl EdxFetcher for RangeFetcher {
         _: f64,
         _: Arc<UpdatePayload>,
         _: Arc<Vec<String>>,
-        _: Arc<AtomicBool>,
+        _: Arc<EdxPushProgress>,
     ) -> Result<bool, EdxPushError> {
         unreachable!()
     }

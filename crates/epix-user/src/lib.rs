@@ -36,6 +36,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use std::collections::HashMap;
+use std::io::Write;
 use std::path::Path;
 
 /// The dedicated index range for standalone identity addresses (separate from
@@ -507,15 +508,31 @@ impl User {
     /// Persist to a `users.json` file, preserving any other users' entries so a
     /// multi-identity (or Python-written) file is not clobbered.
     pub fn save(&self, path: &Path) -> Result<(), String> {
-        let mut users: Map<String, Value> = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice::<Value>(&b).ok())
-            .and_then(|v| v.as_object().cloned())
-            .unwrap_or_default();
+        let mut users: Map<String, Value> = match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(Value::Object(users)) => users,
+                Ok(_) => return Err(format!("read {}: users file is not an object", path.display())),
+                Err(error) => return Err(format!("parse {}: {error}", path.display())),
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Map::new(),
+            Err(error) => return Err(format!("read {}: {error}", path.display())),
+        };
         users.insert(self.master_address.clone(), self.to_file_entry());
         let bytes = serde_json::to_vec_pretty(&Value::Object(users))
             .map_err(|e| format!("serialize user: {e}"))?;
-        std::fs::write(path, bytes).map_err(|e| format!("write {}: {e}", path.display()))
+        let parent = path.parent().ok_or_else(|| {
+            format!("write {}: destination has no parent", path.display())
+        })?;
+        let mut temporary = tempfile::NamedTempFile::new_in(parent)
+            .map_err(|e| format!("create temporary {}: {e}", path.display()))?;
+        temporary
+            .write_all(&bytes)
+            .and_then(|()| temporary.as_file().sync_all())
+            .map_err(|e| format!("write temporary {}: {e}", path.display()))?;
+        let temporary = temporary.into_temp_path();
+        epix_fs::replace_file_write_through(temporary.as_ref(), path)
+            .map_err(|e| format!("durably replace {}: {e}", path.display()))?;
+        Ok(())
     }
 }
 
