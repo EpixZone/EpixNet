@@ -18491,7 +18491,14 @@ impl AppState {
                     .flatten()
             })
             .unwrap_or_default();
-        if !accepted_paths.iter().any(|path| path == inner_path) {
+        // Governing files (any content.json, dbschema.json) always pass: the
+        // db-authority path filter only knows DATA files, and a root change
+        // must reach rebuild_xite_db and the event tail (bump_modified,
+        // file_done, pool-rule/RLN-roster refresh) even on a xite with no
+        // accepted authority yet - those read the already-adopted content.
+        let governing_file =
+            inner_path.ends_with("content.json") || inner_path == "dbschema.json";
+        if !governing_file && !accepted_paths.iter().any(|path| path == inner_path) {
             return;
         }
         let source_epoch = self.bump_db_source_epoch(&canonical);
@@ -18573,10 +18580,13 @@ impl AppState {
         }
         drop(tree);
         drop(_activation);
-        if governing_changed && !self.rebuild_xite_db(address).await {
-            return;
-        }
-        if merged {
+        // A failed rebuild (an unverified or unowned local xite has no db
+        // authority) must not swallow the event tail below: bump_modified,
+        // file_done, and the pool-rule/RLN-roster refresh all read the
+        // already-ADOPTED content and are independent of the database.
+        // Only the merger propagation depends on a fresh db.
+        let db_rebuilt = !governing_changed || self.rebuild_xite_db(address).await;
+        if db_rebuilt && merged {
             self.rebuild_merger_dbs().await;
         }
         let _activation = self.xite_activation_gate.clone().read_owned().await;
@@ -18586,14 +18596,22 @@ impl AppState {
             xites.get(address).is_some_and(|xite| {
                 xite.storage.root() == storage.root()
                     && canonical_address(xite.content.as_ref(), address) == canonical
-                    && self
-                        .managed_db_paths_locked(
-                            &canonical,
-                            xite.content.as_ref(),
-                            xite.settings.own,
-                        )
-                        .iter()
-                        .any(|path| path == inner_path)
+                    // Manifests always qualify for the event tail below:
+                    // bump_modified/file_done are notifications, and the
+                    // pool-rule refresh re-reads the already-adopted root -
+                    // none of it ingests bytes, so the managed-db-path gate
+                    // (which knows only data files) must not filter them or
+                    // a root change never refreshes the RLN roster/pool
+                    // rules until restart.
+                    && (inner_path.ends_with("content.json")
+                        || self
+                            .managed_db_paths_locked(
+                                &canonical,
+                                xite.content.as_ref(),
+                                xite.settings.own,
+                            )
+                            .iter()
+                            .any(|path| path == inner_path))
                     && self.db_filter_epoch() == filter_epoch
             })
         };
