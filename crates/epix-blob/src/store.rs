@@ -1231,9 +1231,8 @@ impl Store {
                 }
             }
             return Err(commit_error);
-        } else {
-            *open = next_open;
         }
+        *open = next_open;
         if let Some(previous) = previous {
             match previous.loc {
                 Loc::Sparse => {
@@ -4225,9 +4224,8 @@ impl Store {
                     }
                 }
                 return Err(commit_error);
-            } else {
-                *open = next_open;
             }
+            *open = next_open;
         }
 
         // All live objects moved; drop the victim slab.
@@ -5143,7 +5141,7 @@ fn extern_suffix_after_prefix(
     Ok(path
         .components()
         .skip(prefix_keys.len())
-        .map(|component| component.as_os_str())
+        .map(std::path::Component::as_os_str)
         .collect())
 }
 
@@ -5372,7 +5370,7 @@ fn store_temp_path(destination: &std::path::Path, purpose: &str) -> io::Result<P
         .ok_or_else(|| io::Error::other("Store destination has no parent"))?;
     let name = destination
         .file_name()
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .unwrap_or("object");
     let sequence = STORE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     Ok(parent.join(format!(

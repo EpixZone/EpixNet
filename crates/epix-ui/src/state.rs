@@ -1441,7 +1441,7 @@ fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
         .ok_or_else(|| format!("xite root has no parent: {}", path.display()))?;
     let name = path
         .file_name()
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| format!("xite root has no portable name: {}", path.display()))?;
     let quarantine = parent.join(format!(".{name}.epix-remove"));
 
@@ -1870,14 +1870,14 @@ fn load_promotion_recovery_plan(
         return Err(format!("unsafe governing manifest: {}", journal.governing));
     }
     let candidate_digest = parse_journal_object_id(&journal.candidate_digest, "candidate digest")?;
-    if stage_root.file_name().and_then(|name| name.to_str()) != Some(journal.candidate_digest.as_str()) {
+    if stage_root.file_name().and_then(std::ffi::OsStr::to_str) != Some(journal.candidate_digest.as_str()) {
         return Err(format!("promotion stage digest mismatch: {}", stage_root.display()));
     }
     let governing_namespace = epix_blob::ObjId::of(journal.governing.as_bytes()).to_string();
     if stage_root
         .parent()
         .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         != Some(governing_namespace.as_str())
     {
         return Err(format!("promotion governing namespace mismatch: {}", stage_root.display()));
@@ -1887,7 +1887,7 @@ fn load_promotion_recovery_plan(
         .parent()
         .and_then(Path::parent)
         .and_then(Path::file_name)
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         != Some(canonical_namespace.as_str())
     {
         return Err(format!("promotion canonical namespace mismatch: {}", stage_root.display()));
@@ -6700,7 +6700,7 @@ impl AppState {
             .ok_or_else(|| format!("{} has no parent", path.display()))?;
         let name = path
             .file_name()
-            .and_then(|name| name.to_str())
+            .and_then(std::ffi::OsStr::to_str)
             .ok_or_else(|| format!("{} has no portable file name", path.display()))?;
         XiteStorage::new(parent)
             .write_atomic_durable(name, bytes)
@@ -16357,7 +16357,7 @@ impl AppState {
         plan.files.iter().any(|file| {
             file.inner_path == "content.json" || file.inner_path.ends_with("/content.json")
         }) || plan.archives.iter().any(|archive| {
-            archive.final_path.file_name().and_then(|name| name.to_str()) == Some("content.json")
+            archive.final_path.file_name().and_then(std::ffi::OsStr::to_str) == Some("content.json")
         })
     }
 
@@ -22192,7 +22192,7 @@ impl AppState {
             let full = Self::child_merge_full_path(commit.inner_path, &relative);
             let aliases_manifest = Path::new(&full)
                 .file_name()
-                .and_then(|name| name.to_str())
+                .and_then(std::ffi::OsStr::to_str)
                 .is_some_and(|name| name.eq_ignore_ascii_case("content.json"));
             if full.eq_ignore_ascii_case(&commit.transaction.lease.governing)
                 || aliases_manifest
