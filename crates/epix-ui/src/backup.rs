@@ -202,7 +202,7 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
 fn zite_addresses(data_root: &Path) -> Vec<String> {
     let mut addrs: Vec<String> = std::fs::read_dir(data_root.join("data"))
         .map(|rd| {
-            rd.filter_map(|e| e.ok())
+            rd.filter_map(Result::ok)
                 .filter(|e| e.path().is_dir())
                 .filter_map(|e| e.file_name().into_string().ok())
                 .filter(|n| epix_crypt::is_valid_address(n))
@@ -218,7 +218,7 @@ fn zite_addresses(data_root: &Path) -> Vec<String> {
 /// follow a link out of the data dir.
 fn collect_files(dir: &Path, prefix: &str, out: &mut Vec<(PathBuf, String)>) {
     let Ok(rd) = std::fs::read_dir(dir) else { return };
-    for entry in rd.filter_map(|e| e.ok()) {
+    for entry in rd.filter_map(Result::ok) {
         let path = entry.path();
         let Ok(ft) = entry.file_type() else { continue };
         let Ok(name) = entry.file_name().into_string() else { continue };
@@ -391,7 +391,7 @@ fn write_archive(
 pub fn list_backups(data_root: &Path) -> Vec<BackupInfo> {
     let mut out: Vec<BackupInfo> = std::fs::read_dir(data_root.join(BACKUPS_DIR))
         .map(|rd| {
-            rd.filter_map(|e| e.ok())
+            rd.filter_map(Result::ok)
                 .filter(|e| {
                     let name = e.file_name();
                     let name = name.to_string_lossy();
@@ -1002,7 +1002,7 @@ fn selected_components(form: &std::collections::HashMap<String, String>) -> Vec<
         .filter(|c| {
             form.get(&format!("comp_{c}")).map(|v| v == "on" || v == "true").unwrap_or(false)
         })
-        .map(|c| c.to_string())
+        .map(ToString::to_string)
         .collect()
 }
 
@@ -1593,7 +1593,7 @@ mod tests {
     }
 
     fn all_components() -> Vec<String> {
-        COMPONENTS.iter().map(|c| c.to_string()).collect()
+        COMPONENTS.iter().map(ToString::to_string).collect()
     }
 
     #[test]

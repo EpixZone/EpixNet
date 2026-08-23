@@ -31,7 +31,7 @@ fn build_torrent() -> Torrent {
     let data: Vec<u8> = (0..40u8).collect(); // 40 bytes => pieces of 16,16,8
     let mut pieces = Vec::new();
     for chunk in data.chunks(piece_len) {
-        pieces.extend_from_slice(&Sha1::digest(chunk));
+        pieces.extend_from_slice(&Sha1::digest(chunk)); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
     }
     let info = Value::Dict(BTreeMap::from([
         (b"length".to_vec(), Value::Int(data.len() as i64)),
@@ -40,7 +40,7 @@ fn build_torrent() -> Torrent {
         (b"pieces".to_vec(), Value::Bytes(pieces)),
     ]));
     let info = encode(&info);
-    let info_hash: [u8; 20] = Sha1::digest(&info).into();
+    let info_hash: [u8; 20] = Sha1::digest(&info).into(); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
     Torrent { data, info, info_hash, piece_len }
 }
 

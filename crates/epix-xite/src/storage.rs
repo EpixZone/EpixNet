@@ -60,7 +60,7 @@ impl XiteStorage {
         let parent =
             p.parent().ok_or_else(|| Error::Other(format!("no parent dir: {inner_path}")))?;
         std::fs::create_dir_all(parent).map_err(Error::Io)?;
-        let name = p.file_name().and_then(|n| n.to_str()).unwrap_or("content.json");
+        let name = p.file_name().and_then(std::ffi::OsStr::to_str).unwrap_or("content.json");
         let tmp = parent.join(format!("{name}.epixtmp"));
         {
             let mut f = std::fs::File::create(&tmp).map_err(Error::Io)?;

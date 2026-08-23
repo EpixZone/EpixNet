@@ -296,7 +296,7 @@ impl Peer {
 
         // Reject a peer whose info dict doesn't match the magnet's xt.
         use sha1::{Digest, Sha1};
-        let h: [u8; 20] = Sha1::digest(&buf).into();
+        let h: [u8; 20] = Sha1::digest(&buf).into(); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
         if h != info_hash {
             return Err(PeerError::Malformed("metadata info-hash mismatch"));
         }

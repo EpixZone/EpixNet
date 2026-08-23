@@ -133,33 +133,6 @@ fn pem_to_der(pem: &str) -> Result<CertificateDer<'static>, String> {
     Ok(CertificateDer::from(der))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// The CA cert must be byte-identical across loads. The previous code
-    /// regenerated it each launch (new serial + randomized ECDSA signature), so
-    /// its fingerprint changed every run and forced certutil to re-sync Firefox's
-    /// trust store - a race that produced SEC_ERROR_UNKNOWN_ISSUER.
-    #[test]
-    fn ca_cert_is_stable_across_loads() {
-        // Securely-created unique temp dir (auto-removed on drop).
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let dir = tmp.path();
-
-        let first = LocalCa::load_or_create(dir).expect("first load");
-        let second = LocalCa::load_or_create(dir).expect("second load reuses persisted cert");
-
-        assert_eq!(first.cert_pem(), second.cert_pem(), "CA PEM changed across loads");
-        assert_eq!(first.ca_cert_der, second.ca_cert_der, "CA DER changed across loads");
-        // The reused DER must match what we persisted on disk.
-        let on_disk = std::fs::read_to_string(dir.join("ca-cert.pem")).unwrap();
-        assert_eq!(pem_to_der(&on_disk).unwrap(), second.ca_cert_der);
-        // A freshly minted leaf still chains to the reused CA (issuer name + key).
-        let leaf = second.leaf_for("dashboard.epix").expect("leaf mint");
-        assert_eq!(leaf.cert.len(), 2, "leaf chain should be [leaf, ca]");
-    }
-}
 
 /// A rustls cert resolver that mints (and caches) a leaf per SNI host on the
 /// fly, so any `*.epix` host gets a valid cert without pre-provisioning.
@@ -196,5 +169,33 @@ impl ResolvesServerCert for EpixCertResolver {
         // generic name; the leaf then won't match, surfacing as a cert error.
         let host = client_hello.server_name().unwrap_or("epix").to_string();
         self.cert_for(&host)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The CA cert must be byte-identical across loads. The previous code
+    /// regenerated it each launch (new serial + randomized ECDSA signature), so
+    /// its fingerprint changed every run and forced certutil to re-sync Firefox's
+    /// trust store - a race that produced SEC_ERROR_UNKNOWN_ISSUER.
+    #[test]
+    fn ca_cert_is_stable_across_loads() {
+        // Securely-created unique temp dir (auto-removed on drop).
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dir = tmp.path();
+
+        let first = LocalCa::load_or_create(dir).expect("first load");
+        let second = LocalCa::load_or_create(dir).expect("second load reuses persisted cert");
+
+        assert_eq!(first.cert_pem(), second.cert_pem(), "CA PEM changed across loads");
+        assert_eq!(first.ca_cert_der, second.ca_cert_der, "CA DER changed across loads");
+        // The reused DER must match what we persisted on disk.
+        let on_disk = std::fs::read_to_string(dir.join("ca-cert.pem")).unwrap();
+        assert_eq!(pem_to_der(&on_disk).unwrap(), second.ca_cert_der);
+        // A freshly minted leaf still chains to the reused CA (issuer name + key).
+        let leaf = second.leaf_for("dashboard.epix").expect("leaf mint");
+        assert_eq!(leaf.cert.len(), 2, "leaf chain should be [leaf, ca]");
     }
 }
