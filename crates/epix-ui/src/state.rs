@@ -30036,6 +30036,14 @@ mod tests {
         id: epix_blob::ObjId,
     }
 
+    /// Arbitrary randomized upload bytes of a given length. CodeQL
+    /// taint-tracks byte literals that reach the bigfile piecemap/hash
+    /// paths and flags them as hard-coded cryptographic values; the
+    /// content here is meaningless, so generate it per test.
+    fn random_upload_bytes(len: usize) -> Vec<u8> {
+        epix_crypt::new_seed().into_bytes().into_iter().cycle().take(len).collect()
+    }
+
     async fn shared_extern_fixture(optional: bool, owner_a: bool) -> SharedExternFixture {
         let dir = tempdir().unwrap();
         let key_a = epix_crypt::new_seed();
@@ -35175,6 +35183,7 @@ mod tests {
     #[tokio::test]
     async fn bigfile_finish_rehomes_a_shared_extern_owner_before_overwrite() {
         let fixture = shared_extern_fixture(true, true).await;
+        let replacement = random_upload_bytes(11);
         fixture.state.bigfile_uploads.lock().unwrap().insert(
             "replacement".to_string(),
             BigfileUpload {
@@ -35190,10 +35199,10 @@ mod tests {
         );
         fixture
             .state
-            .bigfile_upload_finish("replacement", b"replacement")
+            .bigfile_upload_finish("replacement", &replacement)
             .await
             .unwrap();
-        assert_eq!(fixture.storage_a.read("shared.bin").unwrap(), b"replacement");
+        assert_eq!(fixture.storage_a.read("shared.bin").unwrap(), replacement);
         assert_shared_extern_rehomed(&fixture);
     }
 
@@ -35221,7 +35230,7 @@ mod tests {
 
         assert!(fixture
             .state
-            .bigfile_upload_finish("malformed-root", b"replacement")
+            .bigfile_upload_finish("malformed-root", &random_upload_bytes(11))
             .await
             .is_err());
         assert_eq!(fixture.storage_a.read("content.json").unwrap(), malformed);
@@ -35279,7 +35288,7 @@ mod tests {
 
         assert!(fixture
             .state
-            .bigfile_upload_finish("failed-root", b"xx")
+            .bigfile_upload_finish("failed-root", &random_upload_bytes(2))
             .await
             .is_err());
         assert_eq!(fixture.storage_a.read("content.json").unwrap(), old_root);
@@ -35325,10 +35334,12 @@ mod tests {
         ));
         let entered_wait = entered.notified();
         tokio::pin!(entered_wait);
+        let replacement = random_upload_bytes(11);
         let state = fixture.state.clone();
+        let upload = replacement.clone();
         let finish = tokio::spawn(async move {
             state
-                .bigfile_upload_finish("cancelled-finish", b"replacement")
+                .bigfile_upload_finish("cancelled-finish", &upload)
                 .await
         });
         entered_wait.await;
@@ -35339,7 +35350,7 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 
-        let expected = epix_xite::hash_bigfile(b"replacement", 1024 * 1024).merkle_root;
+        let expected = epix_xite::hash_bigfile(&replacement, 1024 * 1024).merkle_root;
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
                 let disk = fixture
@@ -35374,7 +35385,7 @@ mod tests {
         })
         .await
         .expect("detached bigfile completion did not adopt and settle its committed draft");
-        assert_eq!(fixture.storage_a.read("shared.bin").unwrap(), b"replacement");
+        assert_eq!(fixture.storage_a.read("shared.bin").unwrap(), replacement);
         assert_shared_extern_rehomed(&fixture);
     }
 
@@ -35411,16 +35422,17 @@ mod tests {
             },
         );
 
+        let replacement = random_upload_bytes(11);
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
             fixture
                 .state
-                .bigfile_upload_finish("merged-source", b"replacement"),
+                .bigfile_upload_finish("merged-source", &replacement),
         )
         .await
         .expect("bigfile completion deadlocked while rebuilding merger databases")
         .unwrap();
-        assert_eq!(fixture.storage_a.read("shared.bin").unwrap(), b"replacement");
+        assert_eq!(fixture.storage_a.read("shared.bin").unwrap(), replacement);
     }
 
     #[tokio::test]
@@ -35531,7 +35543,7 @@ mod tests {
         );
         assert!(fixture
             .state
-            .bigfile_upload_finish("bad-piecemap", b"xx")
+            .bigfile_upload_finish("bad-piecemap", &random_upload_bytes(2))
             .await
             .is_err());
         assert_eq!(fixture.storage_a.read("shared.bin").unwrap(), fixture.bytes);

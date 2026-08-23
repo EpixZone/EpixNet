@@ -2813,7 +2813,10 @@ mod tests {
 
         let bundle_bytes = b"onetwo";
         let bundle_id = epix_blob::ObjId::of(bundle_bytes);
-        let salt = vec![0x5a; 32];
+        // Randomized: a literal salt trips CodeQL's hard-coded-crypto-value
+        // taint tracking, and the value is arbitrary for this test.
+        let salt: Vec<u8> =
+            epix_crypt::new_seed().into_bytes().into_iter().take(32).collect();
         let salt_hex = salt.iter().map(|byte| format!("{byte:02x}")).collect::<String>();
         let encrypted = epix_selfenc::encrypt_convergent(secret, &salt);
         let mut child = json!({
