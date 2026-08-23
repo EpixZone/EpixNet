@@ -535,9 +535,9 @@ fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
     }
     if !ext_capable {
         println!(
-            "· note: {} enforces extension signing, so the clearnet-block extension \
-             won't load. Use Firefox ESR or Developer Edition (the shipping bundle \
-             uses ESR).",
+            "· note: {} enforces extension signing, so the Epix Wallet extension \
+             and its live routing controls won't load. Use Firefox ESR or Developer \
+             Edition (the shipping bundle uses ESR).",
             firefox.display()
         );
         return;
@@ -1056,11 +1056,11 @@ fn write_profile(
 ) -> std::io::Result<()> {
     std::fs::create_dir_all(profile)?;
 
-    // The file PAC does all routing (the browser proxy API proved unreliable for
-    // this): `.epix` -> the node's browser proxy; clearnet -> the node's Tor
-    // SOCKS listener when the user has turned on "route clearnet through Tor",
-    // else DIRECT. The toggle updates the persisted setting; this PAC is rebuilt
-    // from it on the next launch.
+    // The file PAC supplies the launch-time fallback route: `.epix` -> the node's
+    // browser proxy; clearnet -> the node's Tor SOCKS listener when the user has
+    // turned on "route clearnet through Tor", else DIRECT. The wallet's
+    // `proxy.onRequest` listener re-decides general clearnet for each new request,
+    // so changing the toggle does not require a browser relaunch.
     let clearnet = if tor_clearnet {
         format!("return \"SOCKS5 {socks_addr}\";")
     } else {

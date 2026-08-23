@@ -14,7 +14,7 @@ pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, OptionalFileStat, XiteSettings};
 pub use piecefield::Piecefield;
 pub use piecemap::{build_piecemap, hash_bigfile, parse_piecemap, BigfileHash};
-pub use xite::{FileEntry, SignOpts, Xite};
+pub use xite::{FileEntry, PreparedChildSign, PreparedRootSign, SignOpts, Xite};
 pub use storage::XiteStorage;
 
 #[cfg(test)]
@@ -59,6 +59,24 @@ mod tests {
         // Write it -> no longer needed.
         xite.storage.write("a.txt", b"hello").unwrap();
         assert!(xite.files_needed().is_empty());
+    }
+
+    #[test]
+    fn set_content_rejects_signed_malformed_file_metadata() {
+        let priv_hex = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let (address, content_bytes) =
+            signed_content(priv_hex, json!({ "gate.bin": {} }));
+
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(
+            Address::parse(address).unwrap(),
+            XiteStorage::new(dir.path()),
+        );
+        let error = xite.set_content(&content_bytes).unwrap_err();
+
+        assert!(error.to_string().contains("size must be a nonnegative integer"));
+        assert!(xite.content.is_none(), "invalid content must not be adopted");
+        assert!(!xite.storage.exists("content.json"), "invalid content must not be committed");
     }
 
     #[test]
@@ -221,7 +239,7 @@ mod tests {
         xite.storage.write("new.jpg", b"NEW").unwrap();
         let content = serde_json::to_vec(&json!({
             "optional": ".*jpg",
-            "files_optional": { "gone.jpg": { "size": 3, "sha512": "aa" } },
+            "files_optional": { "gone.jpg": { "size": 3, "sha512": "aa".repeat(32) } },
         }))
         .unwrap();
         xite.storage.write("content.json", &content).unwrap();
@@ -237,7 +255,7 @@ mod tests {
         .unwrap();
         let kept = xite.content.clone().unwrap();
         let optional = kept["files_optional"].as_object().unwrap();
-        assert_eq!(optional["gone.jpg"], json!({ "size": 3, "sha512": "aa" }));
+        assert_eq!(optional["gone.jpg"], json!({ "size": 3, "sha512": "aa".repeat(32) }));
         assert_eq!(optional["new.jpg"]["sha512"], XiteStorage::hash_bytes(b"NEW"));
         assert!(kept["files"].as_object().unwrap().is_empty());
 

@@ -11,8 +11,8 @@ use epix_ui::pool::{
     PoolAdmissionRefresh, PoolAppendConfirmation, PoolRecordId,
 };
 use epix_ui::state::{
-    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxSignedProgress, EdxWant,
-    PushJob, XiteEntry,
+    AppState, EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxPushProgress,
+    EdxSignedProgress, EdxWant, UpdatePayload, XiteEntry,
 };
 use epix_xite::XiteStorage;
 use serde_json::{json, Value};
@@ -171,14 +171,19 @@ impl EdxFetcher for PausingPush {
     async fn push_update(
         &self,
         _: PeerAddr,
-        _: PushJob<'_>,
-        _: Arc<AtomicBool>,
-    ) -> Result<(), EdxPushError> {
+        _: &str,
+        _: &str,
+        _: Arc<Vec<u8>>,
+        _: f64,
+        _: Arc<UpdatePayload>,
+        _: Arc<Vec<String>>,
+        _: Arc<EdxPushProgress>,
+    ) -> Result<bool, EdxPushError> {
         self.entered.store(true, Ordering::Release);
         while !self.release.load(Ordering::Acquire) {
             tokio::task::yield_now().await;
         }
-        Ok(())
+        Ok(true)
     }
 
     async fn fetch_files(

@@ -250,7 +250,7 @@ fn split(data: &[u8]) -> Vec<Vec<u8>> {
     if data.is_empty() {
         return vec![Vec::new()];
     }
-    data.chunks(CHUNK_SIZE).map(|c| c.to_vec()).collect()
+    data.chunks(CHUNK_SIZE).map(<[u8]>::to_vec).collect()
 }
 
 /// Frozen data-map wire format: `mode(1) ‖ count(u32 LE) ‖

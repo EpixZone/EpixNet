@@ -46,7 +46,7 @@ async fn loading_a_xite_registers_its_files_into_the_edx_store() {
         .unwrap(),
     );
     let state = AppState::new("test");
-    state.set_edx_store(store.clone()).await;
+    state.set_edx_store(store.clone()).await.unwrap();
 
     // Register the xite pointing at the on-disk dir with no loaded content,
     // so load_content_from_disk actually reads + verifies it.

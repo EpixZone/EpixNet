@@ -1028,8 +1028,17 @@ impl Swarm {
         let mut report = FetchReport::default();
         let mut remaining = needed.clone();
 
-        // Ensure the sparse object exists before writing slices.
-        self.store.ensure_sparse(self.obj, epix_blob::Ns::Plain, self.size, now)?;
+        // Ensure the sparse object exists before writing slices, keeping the
+        // namespace it was reserved under - a hardcoded Ns::Plain here reset
+        // an empty Ns::Shard reservation, so held ciphertext never counted
+        // toward the volunteer shard budget.
+        let ns = self
+            .store
+            .object_ns(self.obj)
+            .ok()
+            .flatten()
+            .unwrap_or(epix_blob::Ns::Plain);
+        self.store.ensure_sparse(self.obj, ns, self.size, now)?;
         if remaining.is_empty() {
             return Ok(report);
         }

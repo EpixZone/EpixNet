@@ -17,3 +17,6 @@ libloading = "0.9"
 # Download the pinned epix-iptproxy release asset for the build target. rustls,
 # not native-tls, to match the rest of the tree (no OpenSSL on cross builds).
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
+# Verify downloaded release assets against the pinned digests in
+# iptproxy.sha256 before linking them into the build.
+sha2 = "0.10"

@@ -50,6 +50,32 @@ impl ObjId {
         Self(*blake3::hash(data).as_bytes())
     }
 
+    /// Stream a file into its plain BLAKE3 object id.
+    ///
+    /// The returned size is the number of bytes actually hashed. Memory use
+    /// stays fixed, including for multi-gigabyte files.
+    pub fn of_file(path: &std::path::Path) -> std::io::Result<(Self, u64)> {
+        use std::io::Read as _;
+
+        let mut file = std::fs::File::open(path)?;
+        let mut hasher = blake3::Hasher::new();
+        let mut size = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
+        loop {
+            let read = match file.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(read) => read,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            };
+            hasher.update(&buffer[..read]);
+            size = size.checked_add(read as u64).ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "file size exceeds u64")
+            })?;
+        }
+        Ok((Self(*hasher.finalize().as_bytes()), size))
+    }
+
     pub fn from_hex(s: &str) -> Option<Self> {
         if s.len() != 64 {
             return None;
@@ -113,5 +139,42 @@ mod tests {
         let s = id.to_string();
         assert_eq!(ObjId::from_hex(&s), Some(id));
         assert_eq!(ObjId::from_hex("zz"), None);
+    }
+
+    #[test]
+    fn objid_of_file_hashes_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("empty.bin");
+        std::fs::write(&path, []).unwrap();
+
+        assert_eq!(ObjId::of_file(&path).unwrap(), (ObjId::of(b""), 0));
+    }
+
+    #[test]
+    fn objid_of_file_hashes_small_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("small.bin");
+        let data = b"stream the exact BLAKE3 bytes";
+        std::fs::write(&path, data).unwrap();
+
+        assert_eq!(
+            ObjId::of_file(&path).unwrap(),
+            (ObjId::of(data), data.len() as u64)
+        );
+    }
+
+    #[test]
+    fn objid_of_file_hashes_multiple_buffers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.bin");
+        let data: Vec<u8> = (0usize..(1024 * 1024 + 123))
+            .map(|index| (index.wrapping_mul(31) % 251) as u8)
+            .collect();
+        std::fs::write(&path, &data).unwrap();
+
+        assert_eq!(
+            ObjId::of_file(&path).unwrap(),
+            (ObjId::of(&data), data.len() as u64)
+        );
     }
 }

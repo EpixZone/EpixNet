@@ -100,7 +100,7 @@ impl MetaInfo {
     pub fn verify_piece(&self, index: usize, data: &[u8]) -> bool {
         match self.piece_hashes.get(index) {
             Some(want) => {
-                let got = Sha1::digest(data);
+                let got = Sha1::digest(data); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
                 got.as_slice() == want
             }
             None => false,
@@ -125,7 +125,7 @@ impl MetaInfo {
     pub fn parse(bytes: &[u8], expected: Option<[u8; 20]>) -> Result<MetaInfo, MetaError> {
         let (root, info_span) = bencode::decode_torrent(bytes)?;
         let (start, end) = info_span.ok_or(MetaError::NoInfo)?;
-        let info_hash: [u8; 20] = Sha1::digest(&bytes[start..end]).into();
+        let info_hash: [u8; 20] = Sha1::digest(&bytes[start..end]).into(); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
         if let Some(exp) = expected {
             if exp != info_hash {
                 return Err(MetaError::HashMismatch);
@@ -246,8 +246,8 @@ mod tests {
 
     /// Build a minimal single-file .torrent with two 4-byte pieces.
     fn build_torrent() -> (Vec<u8>, [u8; 20]) {
-        let piece_a: [u8; 20] = Sha1::digest(b"aaaa").into();
-        let piece_b: [u8; 20] = Sha1::digest(b"bb").into();
+        let piece_a: [u8; 20] = Sha1::digest(b"aaaa").into(); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
+        let piece_b: [u8; 20] = Sha1::digest(b"bb").into(); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
         let mut pieces = Vec::new();
         pieces.extend_from_slice(&piece_a);
         pieces.extend_from_slice(&piece_b);
@@ -258,7 +258,7 @@ mod tests {
             ("pieces", Value::Bytes(pieces)),
         ]);
         let info_bytes = encode(&info);
-        let info_hash: [u8; 20] = Sha1::digest(&info_bytes).into();
+        let info_hash: [u8; 20] = Sha1::digest(&info_bytes).into(); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
         let root = Value::Dict(BTreeMap::from([(b"info".to_vec(), info)]));
         (encode(&root), info_hash)
     }
@@ -310,7 +310,7 @@ mod tests {
             ("pieces", Value::Bytes(vec![0u8; 40])),
         ]);
         let info_bytes = encode(&info);
-        let hash: [u8; 20] = Sha1::digest(&info_bytes).into();
+        let hash: [u8; 20] = Sha1::digest(&info_bytes).into(); // NOSONAR - BitTorrent v1 (BEP 3) mandates SHA-1 for infohash/piece hashes; interop, not a crypto choice.
 
         let mi = MetaInfo::from_info_dict(&info_bytes, hash).unwrap();
         assert_eq!(mi.info_hash, hash);

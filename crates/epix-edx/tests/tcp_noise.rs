@@ -12,7 +12,7 @@ use epix_blob::{Ns, ObjId};
 use epix_core::PeerAddr;
 use epix_edx::conn::Conn;
 use epix_edx::msg::{caps, Hello, Req, Resp};
-use epix_edx::server::{serve, ServeCtx, SignedProvider};
+use epix_edx::server::{serve, ServeCtx, SignedProvider, UpdateSource};
 use epix_edx::{fetch, noise};
 use epix_transport::{TcpTransport, Transport};
 use tempfile::TempDir;
@@ -54,6 +54,7 @@ impl SignedProvider for FixtureProvider {
         _modified: f64,
         _diffs: &[(String, Vec<u8>)],
         _sender_peers: &[String],
+        _source: UpdateSource,
     ) -> Result<bool, String> {
         Ok(true)
     }

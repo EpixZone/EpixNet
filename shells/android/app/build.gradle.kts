@@ -95,7 +95,7 @@ android {
 // Stage the Epix Wallet WebExtension (the forked Keplr's Firefox build) into
 // assets so MainActivity can installBuiltIn it. The wallet build is pinned by
 // shells/wallet-ext.rev (an epix-wallet commit); this stages that build's
-// immutable wallet-<rev> release, matching the desktop build (build.rs). It
+// versioned wallet-<rev> release, matching the desktop build (build.rs). It
 // prefers the repo staging dir shells/wallet-ext when that already holds the
 // pinned rev (populated by build.rs or a local wallet build), else downloads
 // the release. A pin bump re-stages; an unchanged pin reuses the staged copy.

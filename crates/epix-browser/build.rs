@@ -22,8 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
-/// The epix-wallet release-download base. Each wallet build is published as an
-/// immutable `wallet-<rev>` release (see the wallet repo's
+/// The epix-wallet release-download base. Each wallet build is published as a
+/// versioned `wallet-<rev>` release (see the wallet repo's
 /// `.github/workflows/build-dist.yml`); `wallet_dist_url` appends the pinned rev.
 const WALLET_RELEASE_BASE: &str =
     "https://github.com/EpixZone/epix-wallet/releases/download";
@@ -34,6 +34,49 @@ const WALLET_DIST_ASSET: &str = "epix-wallet-firefox.zip";
 /// The download URL for the wallet build pinned at `rev`.
 fn wallet_dist_url(rev: &str) -> String {
     format!("{WALLET_RELEASE_BASE}/wallet-{rev}/{WALLET_DIST_ASSET}")
+}
+
+/// Check the downloaded wallet archive against the sha256 pinned in
+/// `shells/wallet-ext.sha256` for `WALLET_DIST_ASSET`.
+fn verify_wallet_sha256(bytes: &[u8]) -> Result<(), Box<dyn std::error::Error>> {
+    use sha2::Digest;
+
+    let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR")?);
+    // Beside wallet-ext.rev, at the repo root (this crate lives two levels
+    // below it, same as the rev lookup above).
+    let pins = manifest.join("../../shells/wallet-ext.sha256");
+    println!("cargo:rerun-if-changed={}", pins.display());
+    let pinned = std::fs::read_to_string(&pins).unwrap_or_default();
+    let expected = pinned
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?, parts.next()?))
+        })
+        .find(|(_, name)| *name == WALLET_DIST_ASSET)
+        .map(|(digest, _)| digest.to_ascii_lowercase());
+    let Some(expected) = expected else {
+        return Err(format!(
+            "no pinned sha256 for {WALLET_DIST_ASSET} in {}; add `sha256sum \
+             {WALLET_DIST_ASSET}` output there when bumping wallet-ext.rev",
+            pins.display()
+        )
+        .into());
+    };
+    let digest = sha2::Sha256::digest(bytes);
+    let mut actual = String::with_capacity(64);
+    for b in digest.iter() {
+        actual.push_str(&format!("{b:02x}"));
+    }
+    if actual != expected {
+        return Err(format!(
+            "downloaded {WALLET_DIST_ASSET} does not match the digest pinned in {}: \
+             expected {expected}, got {actual}",
+            pins.display()
+        )
+        .into());
+    }
+    Ok(())
 }
 
 fn main() {
@@ -154,6 +197,11 @@ fn download_wallet(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Err
         .send()?
         .error_for_status()?
         .bytes()?;
+    // The archive becomes a packaged browser extension: verify it against the
+    // digest pinned beside the rev (shells/wallet-ext.sha256, sha256sum
+    // format, updated together with wallet-ext.rev) before extracting.
+    // Fails closed when no digest is pinned.
+    verify_wallet_sha256(bytes.as_ref())?;
     let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes.as_ref()))?;
     // Extract next to the final destination, then move files in, so a failed
     // download never leaves a half-staged directory that a later build would

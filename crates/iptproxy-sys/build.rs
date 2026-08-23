@@ -121,15 +121,67 @@ fn resolve(rev: &str, target: &str, asset: &str, manifest: &Path, out_dir: &Path
     if vendored.is_file() {
         return Some(vendored);
     }
+    // Network-sourced copies (cached from an earlier build, or freshly
+    // downloaded) must match the digest pinned in iptproxy.sha256 before they
+    // are linked into the build. Operator-provided copies (IPTPROXY_LIB_DIR,
+    // vendored prebuilt/) are trusted as local inputs.
     let cached = out_dir.join(asset);
     if cached.is_file() {
+        verify_pinned_sha256(&cached, asset, manifest);
         return Some(cached);
     }
     if rev.is_empty() {
         return None;
     }
     let url = format!("{RELEASE_BASE}/{rev}/{asset}");
-    download(&url, &cached).ok().map(|()| cached)
+    download(&url, &cached).ok().map(|()| {
+        verify_pinned_sha256(&cached, asset, manifest);
+        cached
+    })
+}
+
+/// Panic unless `file` matches the digest recorded for `asset` in
+/// `iptproxy.sha256` (sha256sum format, updated together with iptproxy.rev).
+/// Fails closed: an asset with no recorded digest refuses to build rather
+/// than linking unverified downloaded code.
+fn verify_pinned_sha256(file: &Path, asset: &str, manifest: &Path) {
+    use sha2::Digest;
+
+    let pins = manifest.join("iptproxy.sha256");
+    println!("cargo:rerun-if-changed={}", pins.display());
+    let pinned = std::fs::read_to_string(&pins).unwrap_or_default();
+    let expected = pinned
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            Some((parts.next()?, parts.next()?))
+        })
+        .find(|(_, name)| *name == asset)
+        .map(|(digest, _)| digest.to_ascii_lowercase());
+    let Some(expected) = expected else {
+        panic!(
+            "no pinned sha256 for {asset} in {}; add `sha256sum {asset}` output              there when bumping iptproxy.rev",
+            pins.display()
+        );
+    };
+    let bytes = std::fs::read(file).expect("read downloaded iptproxy asset");
+    let digest = sha2::Sha256::digest(&bytes);
+    let actual = hex_digest(&digest);
+    if actual != expected {
+        let _ = std::fs::remove_file(file);
+        panic!(
+            "downloaded {asset} does not match the digest pinned in {}:              expected {expected}, got {actual}",
+            pins.display()
+        );
+    }
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        out.push_str(&format!("{b:02x}"));
+    }
+    out
 }
 
 fn download(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {

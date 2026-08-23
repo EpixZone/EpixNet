@@ -1106,7 +1106,7 @@ impl AppState {
         let ids: BTreeSet<PoolRecordId> = record_ids.iter().copied().collect();
         let rules = self.pool_rules_for(address).await;
         let storage = self.xite_storage(address).await.ok_or("unknown xite")?;
-        for path in storage.list_files() {
+        for path in storage.list_files().map_err(|e| e.to_string())? {
             if exclude_path == Some(path.as_str()) {
                 continue;
             }
@@ -1780,7 +1780,17 @@ impl AppState {
         let path = inner_path.to_string();
         tokio::spawn(async move {
             let _ = this
-                .publish_to(&addr, &path, POOL_REFLOOD_LIMIT, false, Default::default(), None)
+                .publish_to(
+                    &addr,
+                    &path,
+                    crate::state::UpdatePayload::default(),
+                    crate::state::PublishOptions {
+                        limit: POOL_REFLOOD_LIMIT,
+                        exhaustive: false,
+                        expected_modified: None,
+                        progress: None,
+                    },
+                )
                 .await;
         });
         Ok(true)
@@ -1853,7 +1863,7 @@ impl AppState {
             return;
         };
         let current_epoch = pool::epoch_now(now_ms());
-        let files = storage.list_files();
+        let files = storage.list_files().unwrap_or_default();
         for rule in &rules {
             let Some(keep_from) = retention_keep_from_for_rule(rule, current_epoch) else {
                 continue;
