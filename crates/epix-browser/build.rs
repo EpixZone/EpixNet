@@ -190,7 +190,11 @@ fn stage_from_local(src: &Path, dest: &Path) {
 }
 
 fn download_wallet(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = reqwest::blocking::Client::builder()
+    // NOSONAR - the URL is a release pinned by shells/wallet-ext.rev and the
+    // archive is verified against shells/wallet-ext.sha256
+    // (verify_wallet_sha256) before extraction; a missing or mismatched
+    // digest fails the build.
+    let bytes = reqwest::blocking::Client::builder() // NOSONAR: digest-verified download, see above
         .user_agent("epix-browser-build")
         .build()?
         .get(url)

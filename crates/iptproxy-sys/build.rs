@@ -185,7 +185,11 @@ fn hex_digest(bytes: &[u8]) -> String {
 }
 
 fn download(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
-    let bytes = reqwest::blocking::Client::builder()
+    // NOSONAR - the URL is a release pinned by iptproxy.rev and every caller
+    // verifies the downloaded bytes against the sha256 recorded in
+    // iptproxy.sha256 (verify_pinned_sha256) before they are linked; a
+    // missing or mismatched digest fails the build.
+    let bytes = reqwest::blocking::Client::builder() // NOSONAR: digest-verified download, see above
         .user_agent("iptproxy-sys-build")
         .build()?
         .get(url)
