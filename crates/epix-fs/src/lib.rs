@@ -441,13 +441,32 @@ pub fn replace_file_write_through(source: &Path, destination: &Path) -> io::Resu
 
 #[cfg(unix)]
 pub fn install_file_write_through(source: &Path, destination: &Path) -> io::Result<()> {
-    std::fs::hard_link(source, destination)?;
     let parent = destination
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "destination has no parent"))?;
-    std::fs::File::open(parent)?.sync_all()?;
-    std::fs::remove_file(source)?;
-    std::fs::File::open(parent)?.sync_all()
+    match std::fs::hard_link(source, destination) {
+        Ok(()) => {
+            std::fs::File::open(parent)?.sync_all()?;
+            std::fs::remove_file(source)?;
+            std::fs::File::open(parent)?.sync_all()
+        }
+        // Android SELinux denies linkat for app domains outright, so the
+        // link-then-unlink install can never work there. A rename with
+        // NOREPLACE keeps the contract (an existing destination is never
+        // replaced, surfacing AlreadyExists) without a hard link.
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => {
+            rustix::fs::renameat_with(
+                rustix::fs::CWD,
+                source,
+                rustix::fs::CWD,
+                destination,
+                rustix::fs::RenameFlags::NOREPLACE,
+            )
+            .map_err(io::Error::from)?;
+            std::fs::File::open(parent)?.sync_all()
+        }
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(not(any(unix, windows)))]
