@@ -38585,7 +38585,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
         let data = b"an optional file's contents";
-        let privatekey = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let privatekey = &epix_crypt::new_seed();
         let addr = &epix_crypt::privatekey_to_address(privatekey).unwrap();
         let mut content = json!({
             "address": addr,
@@ -39338,7 +39338,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
         let big = vec![7u8; 2 * 1024 * 1024 + 5]; // just over 2 MB
-        let privatekey = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+        let privatekey = &epix_crypt::new_seed();
         let addr = &epix_crypt::privatekey_to_address(privatekey).unwrap();
         let mut content = json!({
             "address": addr,
