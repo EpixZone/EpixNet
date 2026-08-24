@@ -10,7 +10,6 @@
 //! this crate's exported types (proc-macro mode - no UDL).
 
 use epix_node::{boot, AppState, NodeOptions, RunningNode};
-extern "C" { #[link_name = "dup2"] fn libc_dup2(oldfd: i32, newfd: i32) -> i32; }
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
@@ -125,15 +124,6 @@ impl EpixNode {
         // the map and no dots render (the mobile shells used to pass None here).
         const GEOIP_CITY_GZ: &[u8] =
             include_bytes!("../../epix-server/assets/dbip-city-lite.mmdb.gz");
-        // DEBUG (local): trace + log capture
-        unsafe { std::env::set_var("EPIX_TRACE_CLONE", "1") };
-        let dbg_dir = std::path::PathBuf::from(&config.data_dir);
-        if let Ok(f) = std::fs::File::create(dbg_dir.join("native-stderr.log")) {
-            use std::os::unix::io::AsRawFd;
-            let fd = f.as_raw_fd();
-            unsafe { libc_dup2(fd, 2) };
-            std::mem::forget(f);
-        }
         let opts = NodeOptions {
             data_root: config.data_dir.into(),
             target: config.target,
@@ -141,7 +131,7 @@ impl EpixNode {
             tor_mode: config.tor_mode,
             open_browser: false,
             geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
-            log_file: Some(dbg_dir.join("epix.log")),
+            log_file: None,
             version: config.version,
             rev: env!("EPIX_GIT_REV").to_string(),
         };

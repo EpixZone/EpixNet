@@ -12429,23 +12429,30 @@ impl AppState {
         // bumps the generation, so a booting page's first query almost always
         // crossed a bump, and apps iterate the expected rows and died on the
         // error object (the frozen loading overlay).
-        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(45);
+        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut last_ok: Option<Vec<Value>> = None;
         loop {
             let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
-            let _activation = self.xite_activation_gate.clone().read_owned().await;
-            let _tree = self
-                .tree_mutation_lock(&receipt.canonical)
-                .lock_owned()
-                .await;
-            let after = self
-                .xites
-                .read()
-                .await
-                .get(address)
-                .and_then(|xite| self.current_db_query_receipt(address, xite));
+            // Linearize the recheck only: holding the activation read and the
+            // tree lock through the retry sleeps starved every writer (a
+            // pending siteDelete most visibly) while pages retried their boot
+            // queries against the post-clone churn.
+            let after = {
+                let _activation = self.xite_activation_gate.clone().read_owned().await;
+                let _tree = self
+                    .tree_mutation_lock(&receipt.canonical)
+                    .lock_owned()
+                    .await;
+                self.xites
+                    .read()
+                    .await
+                    .get(address)
+                    .and_then(|xite| self.current_db_query_receipt(address, xite))
+            };
             match after {
                 Some(after) if Self::same_db_query_receipt(&receipt, &after) => {
                     match result {
+                        Ok(rows) => return Ok(rows),
                         // The rebuild drops and recreates tables under a
                         // stable handle: a query in that window fails with a
                         // transient sqlite error. Retrying is the answer for
@@ -12472,10 +12479,17 @@ impl AppState {
                             .await;
                             return Err(error);
                         }
-                        ok => return ok,
+                        Err(error) => return Err(error),
                     }
                 }
                 Some(after) if std::time::Instant::now() < retry_until => {
+                    // Keep the freshest successful read: if the database
+                    // never sits still inside the budget, a consistent
+                    // slightly-stale snapshot beats an error that kills the
+                    // page (apps iterate the rows they expect).
+                    if let Ok(rows) = result {
+                        last_ok = Some(rows);
+                    }
                     receipt = after;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
@@ -12495,8 +12509,18 @@ impl AppState {
                     }
                 }
                 _ => {
+                    if let Some(rows) = last_ok {
+                        self.log(
+                            "INFO",
+                            format!(
+                                "dbQuery for {address}: database kept changing past the budget, serving the last consistent read"
+                            ),
+                        )
+                        .await;
+                        return Ok(rows);
+                    }
                     self.log(
-                        "DEBUG",
+                        "INFO",
                         format!("dbQuery gave up for {address}: authority changed past the deadline"),
                     )
                     .await;

@@ -3190,7 +3190,7 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
             // error object instead - a frozen page whose cause never reached
             // any log. Name every errored command here.
             ctx.state
-                .log("DEBUG", format!("ws {cmd} -> error: {error}"))
+                .log("INFO", format!("ws {cmd} -> error: {error}"))
                 .await;
             json!({"cmd": "response", "to": id, "result": { "error": error }}).to_string()
         }
