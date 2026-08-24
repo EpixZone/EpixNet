@@ -42669,14 +42669,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_file_without_b3_still_blocks_child_availability() {
+    async fn required_file_without_b3_does_not_block_child_availability() {
+        // A pre-EDX entry (no b3, no files_shard descriptor) can never arrive
+        // over EDX, so waiting on it would park the child forever and erase
+        // every user signed before the b3 rollout. The manifest commits and
+        // the legacy file stays absent until a verified diff lands it or the
+        // owner re-signs.
         let (_dir, state, xite, storage, child, _posts, author_key) = inline_merge_fixture().await;
-        let previous = storage.read(&child).unwrap();
         let body = b"legacy required bytes";
-        let file_path = child
-            .strip_suffix("content.json")
-            .map(|dir| format!("{dir}legacy.bin"))
-            .unwrap();
         let mut next = json!({
             "address": xite.clone(),
             "inner_path": child.clone(),
@@ -42707,16 +42707,11 @@ mod tests {
             )
             .await;
         assert!(
-            result.is_err(),
-            "unfetchable required file received an availability ACK"
+            result.is_ok(),
+            "an unfetchable legacy file must not block the child commit: {result:?}"
         );
-        assert_eq!(storage.read(&child).unwrap(), previous);
-        assert_eq!(state.pending_child_relays.lock().unwrap().len(), 1);
-
-        storage.write(&file_path, body).unwrap();
-        state.retry_pending_child_relays().await;
-        assert!(state.pending_child_relays.lock().unwrap().is_empty());
         assert_eq!(storage.read(&child).unwrap(), next_bytes);
+        assert!(state.pending_child_relays.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
