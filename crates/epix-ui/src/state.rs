@@ -12445,13 +12445,46 @@ impl AppState {
                 .and_then(|xite| self.current_db_query_receipt(address, xite));
             match after {
                 Some(after) if Self::same_db_query_receipt(&receipt, &after) => {
-                    return result;
+                    match result {
+                        // The rebuild drops and recreates tables under a
+                        // stable handle: a query in that window fails with a
+                        // transient sqlite error. Retrying is the answer for
+                        // those exactly as for a swapped handle.
+                        Err(error)
+                            if std::time::Instant::now() < retry_until
+                                && (error.contains("locked")
+                                    || error.contains("busy")
+                                    || error.contains("no such table")
+                                    || error.contains("no such column")) =>
+                        {
+                            self.log(
+                                "DEBUG",
+                                format!("dbQuery transient error for {address}, retrying: {error}"),
+                            )
+                            .await;
+                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                        }
+                        Err(error) => {
+                            self.log(
+                                "DEBUG",
+                                format!("dbQuery error for {address}: {error}"),
+                            )
+                            .await;
+                            return Err(error);
+                        }
+                        ok => return ok,
+                    }
                 }
                 Some(after) if std::time::Instant::now() < retry_until => {
                     receipt = after;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
                 _ => {
+                    self.log(
+                        "DEBUG",
+                        format!("dbQuery gave up for {address}: authority changed past the deadline"),
+                    )
+                    .await;
                     return Err("database authority changed while query ran".into());
                 }
             }
