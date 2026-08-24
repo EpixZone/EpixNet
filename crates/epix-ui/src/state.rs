@@ -25842,17 +25842,31 @@ impl AppState {
                 {
                     return false;
                 }
-                self.commit_child_candidate(
-                    &finish.keys[0],
-                    &finish.xite,
-                    &finish.inner_path,
-                    bytes,
-                    finish.child_files.as_deref().unwrap_or_default(),
-                    &finish.transaction,
-                    &mut finish.payload,
-                )
-                .await
-                .is_ok()
+                match self
+                    .commit_child_candidate(
+                        &finish.keys[0],
+                        &finish.xite,
+                        &finish.inner_path,
+                        bytes,
+                        finish.child_files.as_deref().unwrap_or_default(),
+                        &finish.transaction,
+                        &mut finish.payload,
+                    )
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(error) => {
+                        self.log(
+                            "WARN",
+                            format!(
+                                "Child commit {}/{} failed; deferring: {error}",
+                                finish.keys[0], finish.inner_path
+                            ),
+                        )
+                        .await;
+                        false
+                    }
+                }
             }
             (Some(_), _, _) => false,
             (None, _, None) => true,
