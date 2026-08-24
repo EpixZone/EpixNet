@@ -157,6 +157,13 @@ pub struct UpdatePayload {
     /// delivery receipt, not merely a manifest receipt. Runtime-only. This is
     /// derived from the authenticated Hello and is never serialized itself.
     pub require_merge_delivery: bool,
+    /// Runtime-only, set by the clone's child-manifest pass: verify and stage
+    /// the manifest but do NOT pull its required files inline. The caller
+    /// batches every deferred child's files in one fetch over the clone's
+    /// proven peers instead of paying a per-child session each. A deferral is
+    /// then a normal outcome ([`InboundUpdate::Deferred`]), not an error.
+    /// Never set on live pushes: their availability receipts stay honest.
+    pub defer_required_fetch: bool,
 }
 
 impl UpdatePayload {
@@ -194,6 +201,7 @@ impl UpdatePayload {
             merge_deltas: self.merge_deltas.clone(),
             merge_objects: HashMap::new(),
             require_merge_delivery: false,
+            defer_required_fetch: false,
         }
     }
 
@@ -4118,6 +4126,12 @@ pub struct AppState {
     /// staged here until required files verify. A count cap and global retained
     /// payload-byte cap bound peer-driven memory use.
     pending_child_relays: std::sync::Mutex<HashMap<String, PendingChildRelay>>,
+    /// Canonicals whose clone/user-content sync is running. Inbound child
+    /// updates for them stage-and-defer instead of fetching inline, so a
+    /// push cannot hold a child's manifest guard across a slow network pull
+    /// while the sync's level pass needs that guard. The sync's batch fetch
+    /// plus promote pass completes whatever was parked.
+    active_child_syncs: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Xite addresses with an update pass (periodic resync or `siteUpdate`)
     /// currently running, mapped to the phase it is in
     /// ([`UPDATE_PHASE_CHECKING`] -> [`UPDATE_PHASE_UPDATING`]), bracketed by
@@ -4280,6 +4294,11 @@ pub enum InboundUpdate {
     Applied,
     /// We already have this version (or newer) - sender recorded as a peer.
     NotChanged,
+    /// Child manifest verified and staged, required files not yet fetched.
+    /// Only returned when the caller opted in via
+    /// [`UpdatePayload::defer_required_fetch`]; the pending relay completes it
+    /// once the files land (the caller's batch fetch, or the periodic retry).
+    Deferred,
 }
 
 /// A pending Bigfile upload (created by `bigfileUploadInit`, consumed by the
@@ -4942,6 +4961,7 @@ impl AppState {
             xite_activation_gate: Arc::new(tokio::sync::RwLock::new(())),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
+            active_child_syncs: std::sync::Mutex::new(std::collections::HashSet::new()),
             xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -11357,6 +11377,97 @@ impl AppState {
         self.clear_pending_child_state(pending_key, &pending).await;
         self.announce_promoted_child(&canonical, &pending, relay_payload).await;
         true
+    }
+
+    /// The clone's batched completion for children staged with
+    /// [`UpdatePayload::defer_required_fetch`]: every pending child of `key`
+    /// contributes its still-missing fetchable files, plus its staged `files`
+    /// entries merged into one map so a single EDX batch resolves ids across
+    /// children. Legacy no-b3 paths are excluded exactly as the commit gates
+    /// exclude them. Shard (`files_shard`) entries are NOT merged: their
+    /// decryption salt is per-manifest, so encrypted children keep the
+    /// per-child promote path.
+    pub async fn deferred_child_batch(
+        &self,
+        key: &str,
+    ) -> (Vec<epix_xite::FileEntry>, Value) {
+        let storage = {
+            let xites = self.xites.read().await;
+            self.resolve_xite(&xites, key).map(|xite| xite.storage.clone())
+        };
+        let relays: Vec<PendingChildRelay> = self
+            .pending_child_relays
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|relay| relay.keys.iter().any(|k| k == key))
+            .cloned()
+            .collect();
+        let mut files = Vec::new();
+        let mut merged_files = serde_json::Map::new();
+        for relay in relays {
+            let Some(raw) = relay
+                .staged_bytes
+                .as_deref()
+                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            else {
+                continue;
+            };
+            if raw.get("files_shard").and_then(Value::as_object).is_some_and(|m| !m.is_empty())
+                || raw.get("edx_salt").is_some()
+            {
+                continue;
+            }
+            let unfetchable = Self::unfetchable_child_paths(&relay.inner_path, Some(&raw));
+            let staged = Self::staged_child_edx_content(&relay.inner_path, &raw);
+            if let Some(map) = staged.get("files").and_then(Value::as_object) {
+                for (path, entry) in map {
+                    merged_files.insert(path.clone(), entry.clone());
+                }
+            }
+            for file in &relay.files {
+                if unfetchable.contains(&file.inner_path) {
+                    continue;
+                }
+                if storage
+                    .as_ref()
+                    .is_some_and(|storage| storage.verify(&file.inner_path, &file.sha512))
+                {
+                    continue;
+                }
+                files.push(file.clone());
+            }
+        }
+        (files, json!({ "files": merged_files }))
+    }
+
+    /// One promote pass over the pending child relays. Public for the clone
+    /// path: run right after the batched file fetch so deferred children
+    /// commit immediately instead of waiting for the periodic retry.
+    pub async fn promote_deferred_children(self: &Arc<Self>) {
+        self.retry_pending_child_relays().await;
+    }
+
+    /// Mark `key`'s user-content sync active (see `active_child_syncs`).
+    /// Idempotent; always pair with [`Self::end_child_sync`].
+    pub async fn begin_child_sync(&self, key: &str) {
+        let canonical = self.canonical_key(key).await;
+        let mut active = self.active_child_syncs.lock().unwrap();
+        active.insert(canonical);
+        active.insert(key.to_string());
+    }
+
+    /// End the marker set by [`Self::begin_child_sync`].
+    pub async fn end_child_sync(&self, key: &str) {
+        let canonical = self.canonical_key(key).await;
+        let mut active = self.active_child_syncs.lock().unwrap();
+        active.remove(&canonical);
+        active.remove(key);
+    }
+
+    fn child_sync_active(&self, keys: &[String], canonical: &str) -> bool {
+        let active = self.active_child_syncs.lock().unwrap();
+        active.contains(canonical) || keys.iter().any(|key| active.contains(key))
     }
 
     async fn retry_pending_child_relays(self: &Arc<Self>) {
@@ -24270,6 +24381,7 @@ impl AppState {
             merge_deltas,
             merge_objects: HashMap::new(),
             require_merge_delivery: false,
+            defer_required_fetch: false,
         };
         let result = self
             .publish_to(
@@ -25196,7 +25308,23 @@ impl AppState {
             keys.swap(0, pos);
         }
         let key = keys[0].clone();
-        let update_guard = self.acquire_manifest_guard(&lock_address, inner_path).await?;
+        let update_guard = if payload.defer_required_fetch {
+            // A clone's level apply must not queue behind a push that is mid
+            // inline-fetch for this same child: whoever holds the guard is
+            // already landing it, and the pending-relay machinery (or the
+            // next resync) owns whatever is left. Give up quickly instead.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.acquire_manifest_guard(&lock_address, inner_path),
+            )
+            .await
+            {
+                Ok(guard) => guard?,
+                Err(_) => return Ok(InboundUpdate::Deferred),
+            }
+        } else {
+            self.acquire_manifest_guard(&lock_address, inner_path).await?
+        };
         // Only accept pushes for xites we voluntarily downloaded. The version
         // to beat is the root's in-memory clock, or - for an include / user
         // content.json - the on-disk child's own `modified`.
@@ -25558,6 +25686,17 @@ impl AppState {
         let inner = inner_path.to_string();
         let root_bytes = if is_root && !committed_inline { Some(bytes) } else { None };
         let is_child = child_files.is_some();
+        let mut payload = payload;
+        if is_child && !payload.defer_required_fetch {
+            let canonical = canonical_address(xite.content.as_ref(), &key);
+            if self.child_sync_active(&keys, &canonical) {
+                // The xite's clone/user-content sync is mid-flight: an inline
+                // pull here would hold this child's manifest guard across a
+                // network fetch while the sync's level pass waits on it.
+                // Stage instead; the sync's batch + promote completes it.
+                payload.defer_required_fetch = true;
+            }
+        }
         let finish = InboundFinish {
             keys,
             xite,
@@ -25574,9 +25713,19 @@ impl AppState {
             transaction,
         };
         if is_child {
+            // A merge-delta push still needs an honest delivery receipt: the
+            // payload was parked, not handled, so answer Err exactly as an
+            // incomplete inline pull would - the sender retries, and the
+            // pending relay usually commits before it does.
+            let deferred_ok = finish.payload.defer_required_fetch
+                && !finish.payload.require_merge_delivery;
             let ready = self.finish_inbound_update(finish).await;
             return if ready {
                 Ok(InboundUpdate::Applied)
+            } else if deferred_ok {
+                // The clone's batch pass owns the file fetch; a staged child
+                // waiting on it is a normal outcome, not a failed delivery.
+                Ok(InboundUpdate::Deferred)
             } else {
                 Err(format!(
                     "Child update {inner_path} is not yet fully available"
@@ -26005,20 +26154,22 @@ impl AppState {
             Self::unfetchable_child_paths(&finish.inner_path, child_content.as_ref());
         let mut arrived = self.apply_inbound_diffs(&finish, &key).await;
         let mut needed = Self::inbound_files_needed(&finish);
-        self.fetch_inbound_live_source(
-            &finish,
-            staged_for_fetch.as_ref(),
-            &mut needed,
-            &mut arrived,
-        )
-        .await;
-        self.fetch_inbound_fallback(
-            &finish,
-            staged_for_fetch.as_ref(),
-            &mut needed,
-            &mut arrived,
-        )
-        .await;
+        if !finish.payload.defer_required_fetch {
+            self.fetch_inbound_live_source(
+                &finish,
+                staged_for_fetch.as_ref(),
+                &mut needed,
+                &mut arrived,
+            )
+            .await;
+            self.fetch_inbound_fallback(
+                &finish,
+                staged_for_fetch.as_ref(),
+                &mut needed,
+                &mut arrived,
+            )
+            .await;
+        }
         let mut missing_child = finish
             .child_files
             .as_ref()
@@ -34523,6 +34674,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -40929,6 +41081,7 @@ mod tests {
             merge_deltas: HashMap::from([("posts.json".to_string(), record_delta(record))]),
             merge_objects: HashMap::new(),
             require_merge_delivery: true,
+            defer_required_fetch: false,
         };
 
         // Both updates carry the content.json version already on disk. Before
@@ -41168,6 +41321,7 @@ mod tests {
                         record_delta(record))]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41451,6 +41605,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::from([("posts.json".to_string(), object)]),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41471,6 +41626,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::from([("not-declared.json".to_string(), object)]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41491,6 +41647,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), bytes.clone())]),
                     merge_objects: HashMap::from([("posts.json".to_string(), object)]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41517,6 +41674,7 @@ mod tests {
                         },
                     )]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41552,6 +41710,7 @@ mod tests {
                         ),
                     ]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41582,6 +41741,7 @@ mod tests {
                         },
                     )]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41604,6 +41764,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::from([("posts.json".to_string(), object)]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41636,6 +41797,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), Vec::new())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41668,6 +41830,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), Vec::new())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41699,6 +41862,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41761,6 +41925,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41809,6 +41974,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), delta.clone())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41841,6 +42007,7 @@ mod tests {
                         },
                     )]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41872,6 +42039,7 @@ mod tests {
                 vec![0x42; DELTA_BYTES])]),
             merge_objects: HashMap::new(),
             require_merge_delivery: true,
+            defer_required_fetch: false,
         };
         let entries = MAX_PENDING_CHILD_RELAY_BYTES / ENTRY_BYTES + 4;
         for i in 0..entries {
@@ -42023,6 +42191,7 @@ mod tests {
                     )]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42669,6 +42838,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deferred_child_stages_without_inline_fetch_and_promotes_when_files_land() {
+        // The clone's level pass sets defer_required_fetch: the child manifest
+        // verifies and parks with no inline file fetch and no error, and a
+        // promote pass commits it once the batched fetch lands its files.
+        let (_dir, state, xite, storage, child, _posts, author_key) = inline_merge_fixture().await;
+        let previous = storage.read(&child).unwrap();
+        let body = b"batched user bytes";
+        let file_path = child
+            .strip_suffix("content.json")
+            .map(|dir| format!("{dir}batched.bin"))
+            .unwrap();
+        let mut next = json!({
+            "address": xite.clone(),
+            "inner_path": child.clone(),
+            "modified": 43.0,
+            "files": {
+                "batched.bin": {
+                    "size": body.len(),
+                    "sha512": XiteStorage::hash_bytes(body),
+                    "b3": epix_blob::ObjId::of(body).to_string(),
+                }
+            },
+        });
+        epix_content::sign(&mut next, &author_key).unwrap();
+        let next_bytes = serde_json::to_vec(&next).unwrap();
+
+        let result = state
+            .apply_inbound_update(
+                &xite,
+                &child,
+                Some(next_bytes.clone()),
+                Some(43.0),
+                None,
+                None,
+                UpdatePayload {
+                    defer_required_fetch: true,
+                    ..UpdatePayload::default()
+                },
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(InboundUpdate::Deferred)),
+            "a deferred child must stage without an error: {result:?}"
+        );
+        assert_eq!(storage.read(&child).unwrap(), previous);
+        assert_eq!(state.pending_child_relays.lock().unwrap().len(), 1);
+        let (needed, staged) = state.deferred_child_batch(&xite).await;
+        assert_eq!(
+            needed.iter().map(|f| f.inner_path.as_str()).collect::<Vec<_>>(),
+            vec![file_path.as_str()],
+        );
+        assert!(staged["files"][&file_path]["b3"].is_string());
+
+        storage.write(&file_path, body).unwrap();
+        state.promote_deferred_children().await;
+        assert!(state.pending_child_relays.lock().unwrap().is_empty());
+        assert_eq!(storage.read(&child).unwrap(), next_bytes);
+    }
+
+    #[tokio::test]
     async fn required_file_without_b3_does_not_block_child_availability() {
         // A pre-EDX entry (no b3, no files_shard descriptor) can never arrive
         // over EDX, so waiting on it would park the child forever and erase
@@ -42758,6 +42988,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42871,6 +43102,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42998,6 +43230,7 @@ mod tests {
                 record_delta(record.clone()))]),
             merge_objects: HashMap::new(),
             require_merge_delivery: true,
+            defer_required_fetch: false,
         };
 
         let first = state

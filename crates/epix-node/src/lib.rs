@@ -1261,14 +1261,27 @@ async fn apply_fetched_child_manifest(
             modified,
             None,
             None,
-            epix_ui::state::UpdatePayload::default(),
+            epix_ui::state::UpdatePayload {
+                // The level loop must not stall on one child's slow file
+                // fetch: stage the manifest, batch the files afterwards.
+                defer_required_fetch: true,
+                ..epix_ui::state::UpdatePayload::default()
+            },
             peer_fallbacks.clone(),
         )
     })
     .await
 }
 
-const CHILD_MANIFEST_PAGE_SIZE: usize = 4;
+// One page = one GetSigned session round. Applies no longer pull files
+// inline (defer_required_fetch), so a page is cheap to consume and a whole
+// level should ride a single round instead of serial sessions of 4.
+const CHILD_MANIFEST_PAGE_SIZE: usize = 64;
+// Straggler bounds for one level's manifest fetch: keep waiting while items
+// stream, but once the level is at least GRACE old and the stream has been
+// IDLE-quiet, hand the leftovers to the periodic resync.
+const CHILD_MANIFEST_FETCH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
+const CHILD_MANIFEST_FETCH_IDLE: std::time::Duration = std::time::Duration::from_secs(15);
 const CHILD_MANIFEST_LIMIT: usize = 100_000;
 const CHILD_DATA_PAGE_SIZE: usize = 32;
 const CHILD_APPLY_CONCURRENCY: usize = 4;
@@ -1456,16 +1469,43 @@ async fn fetch_child_manifest_candidates(
     let delivery_failures = Arc::new(std::sync::Mutex::new(HashSet::new()));
     let callback_delivered = delivered.clone();
     let callback_failures = delivery_failures.clone();
+    let progress_mark = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let callback_progress = progress_mark.clone();
     let on_item: epix_ui::state::EdxSignedProgress = Arc::new(move |path: &str, bytes: &[u8]| {
         if !callback_delivered.lock().unwrap().insert(path.to_string()) {
             return;
         }
+        // Progress = a NEW manifest: duplicate re-deliveries from extra peers
+        // must not keep the idle-abort from ever firing.
+        *callback_progress.lock().unwrap() = std::time::Instant::now();
         if let Err(error) = tx.try_send((path.to_string(), bytes.to_vec())) {
             let (failed_path, _) = error.into_inner();
             callback_failures.lock().unwrap().insert(failed_path);
         }
     });
-    let fetch = state.edx_fetch_signed_many(address, wants, peers.to_vec(), Some(on_item));
+    // A path no reachable peer serves must not hold the whole level hostage
+    // for the fetcher's full background patience: once the stream has been
+    // quiet past the idle window (after a cold-session grace), abandon the
+    // stragglers - everything streamed so far is already applied, and the
+    // periodic resync retries the rest without blocking first paint.
+    let fetch_inner = state.edx_fetch_signed_many(address, wants, peers.to_vec(), Some(on_item));
+    let fetch = async {
+        let started = std::time::Instant::now();
+        tokio::pin!(fetch_inner);
+        loop {
+            tokio::select! {
+                fetched = &mut fetch_inner => break fetched,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    let idle = progress_mark.lock().unwrap().elapsed();
+                    if started.elapsed() >= CHILD_MANIFEST_FETCH_GRACE
+                        && idle >= CHILD_MANIFEST_FETCH_IDLE
+                    {
+                        break None;
+                    }
+                }
+            }
+        }
+    };
     let consumer_state = state.clone();
     let consumer_address = address.to_string();
     let consumer_peers = peers.to_vec();
@@ -1552,6 +1592,9 @@ async fn apply_child_manifest_results(
                 current.push(path);
             }
             Some((Ok(epix_ui::state::InboundUpdate::NotChanged), _)) => current.push(path),
+            // Staged for the post-level batch fetch: not on disk yet, and not
+            // a failure - the pending relay commits it once its files land.
+            Some((Ok(epix_ui::state::InboundUpdate::Deferred), _)) => {}
             Some((Err(error), legacy)) => {
                 report_child_manifest_failure(state, address, &path, &error, &legacy).await;
                 if has_old_disk {
@@ -1796,6 +1839,7 @@ async fn fetch_child_data_page(
     address: &str,
     peers: &[PeerAddr],
     page: Vec<epix_xite::FileEntry>,
+    staged: Option<&serde_json::Value>,
 ) -> (Vec<String>, Vec<epix_xite::FileEntry>) {
     use std::collections::HashSet;
 
@@ -1819,7 +1863,7 @@ async fn fetch_child_data_page(
                 callback_failures.lock().unwrap().insert(error.into_inner());
             }
         });
-    let fetch = state.edx_first(address, page, peers.to_vec(), None, None, Some(on_file));
+    let fetch = state.edx_first(address, page, peers.to_vec(), staged, None, Some(on_file));
     let ingest_state = state.clone();
     let ingest_address = address.to_string();
     let ingest = async move {
@@ -1865,6 +1909,7 @@ async fn fetch_child_data_files(
     address: &str,
     peers: &[PeerAddr],
     needed: Vec<epix_xite::FileEntry>,
+    staged: Option<&serde_json::Value>,
 ) -> Vec<String> {
     let total = needed.len();
     state
@@ -1891,10 +1936,16 @@ async fn fetch_child_data_files(
             announced = true;
         }
         let (mut page_arrived, page_unavailable) =
-            fetch_child_data_page(xite, state, address, peers, page).await;
+            fetch_child_data_page(xite, state, address, peers, page, staged).await;
         arrived.append(&mut page_arrived);
-        for file in page_unavailable {
-            unavailable.record(state, address, file.inner_path).await;
+        // A staged (deferred-children) batch is a store prefetch: its files
+        // cannot materialize until the promote pass commits their manifests,
+        // so every one of them "misses" here by design. Reporting them as
+        // failed would light the dashboard's failure pill for a normal clone.
+        if staged.is_none() {
+            for file in page_unavailable {
+                unavailable.record(state, address, file.inner_path).await;
+            }
         }
     }
     if unavailable.count > 0 {
@@ -2069,7 +2120,7 @@ async fn sync_declared_child_data(
     let Some(state) = progress else {
         return arrived;
     };
-    let mut data_arrived = fetch_child_data_files(xite, state, address, peers, needed).await;
+    let mut data_arrived = fetch_child_data_files(xite, state, address, peers, needed, None).await;
     arrived.append(&mut data_arrived);
     arrived
 }
@@ -2099,13 +2150,53 @@ async fn sync_included_content(
     let ordered = order_child_manifest_paths(paths, feed_order);
     prewarm_child_signers(&ordered, t0).await;
 
+    // While the levels run, inbound pushes for this xite's children defer
+    // instead of fetching inline (see active_child_syncs): a push holding a
+    // child's manifest guard across a slow pull would stall the level pass.
+    if let Some(state) = progress {
+        state.begin_child_sync(address).await;
+    }
     let (child_files, arrived) =
         sync_child_manifest_levels(xite, &peers, progress, address, ordered, t0).await;
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
     fetch_changed_child_merges(progress, address, &arrived, &peers).await;
     let arrived =
         sync_declared_child_data(xite, progress, address, &peers, child_files, arrived).await;
+    sync_deferred_children(xite, progress, address, &peers, t0).await;
+    if let Some(state) = progress {
+        state.end_child_sync(address).await;
+    }
     (0, arrived)
+}
+
+/// Complete the children the level pass staged with `defer_required_fetch`:
+/// pull every still-missing file in ONE batch over the proven clone peers,
+/// then promote the pending relays so the manifests commit now instead of on
+/// the periodic retry. Files the batch could not land stay pending; the
+/// retry pass keeps working on them as before.
+async fn sync_deferred_children(
+    xite: &Xite,
+    progress: Option<&Arc<AppState>>,
+    address: &str,
+    peers: &[PeerAddr],
+    t0: std::time::Instant,
+) {
+    let Some(state) = progress else {
+        return;
+    };
+    let (needed, staged) = state.deferred_child_batch(address).await;
+    if !needed.is_empty() {
+        trace_clone!(
+            t0,
+            "deferred child batch START, {} file(s)",
+            needed.len()
+        );
+        let landed =
+            fetch_child_data_files(xite, state, address, peers, needed, Some(&staged)).await;
+        trace_clone!(t0, "deferred child batch done, {} landed", landed.len());
+    }
+    state.promote_deferred_children().await;
+    trace_clone!(t0, "deferred children promoted");
 }
 
 /// Every non-root `content.json` under `root` (per-user / included content

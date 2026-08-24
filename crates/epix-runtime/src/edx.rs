@@ -1125,6 +1125,7 @@ impl SignedProvider for AppStateProvider {
             merge_deltas: decoded.deltas,
             merge_objects: decoded.objects,
             require_merge_delivery,
+            defer_required_fetch: false,
         };
         let sender_peers: Vec<PeerAddr> =
             sender_peers.iter().filter_map(|s| PeerAddr::parse(s).ok()).take(5).collect();
@@ -1165,6 +1166,9 @@ impl SignedProvider for AppStateProvider {
         {
             Ok(InboundUpdate::Applied) => Ok(true),
             Ok(InboundUpdate::NotChanged) => Ok(false),
+            // Live pushes never set defer_required_fetch, so a deferral here
+            // is unreachable; answer like NotChanged rather than panic.
+            Ok(InboundUpdate::Deferred) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -8248,6 +8252,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 }),
                 Arc::new(Vec::new()),
                 progress.clone(),
@@ -8443,6 +8448,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), delta.clone())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 }),
                 Arc::new(Vec::new()),
                 progress.clone(),
@@ -8650,6 +8656,7 @@ mod tests {
             merge_deltas: HashMap::from([("posts.json".to_string(), delta)]),
             merge_objects: HashMap::new(),
             require_merge_delivery: false,
+            defer_required_fetch: false,
         };
 
         let progress = Arc::new(epix_ui::state::EdxPushProgress::default());
