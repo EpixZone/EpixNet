@@ -3345,6 +3345,12 @@ pub const UPDATE_PHASE_CHECKING: &str = "checking";
 /// "Updating..." pill (and its "N left" file countdown) belongs to.
 pub const UPDATE_PHASE_UPDATING: &str = "updating";
 
+/// The xite is being removed: locks, durable removal intent, directory
+/// deletion, and Store ownership handover, which on a synced xite takes
+/// visible seconds. The dashboard shows "Deleting…" so a slow removal reads
+/// as working, not ignored.
+pub const UPDATE_PHASE_DELETING: &str = "deleting";
+
 /// How an update pass ended, as the dashboard's row pill renders it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -28506,16 +28512,35 @@ impl AppState {
     }
 
     pub async fn remove_xite(&self, address: &str) -> bool {
+        // Removal takes visible time (locks, durable intent, directory
+        // deletion, Store ownership handover) and can only be reported while
+        // the row still exists: phase first, so every dashboard shows
+        // "Deleting…" for the duration instead of a row that ignores clicks.
+        self.xite_updates_in_flight
+            .lock()
+            .unwrap()
+            .insert(address.to_string(), UPDATE_PHASE_DELETING);
+        self.push_xite_info_event(address, UPDATE_PHASE_DELETING).await;
         let state = self.owned_state();
-        let address = address.to_string();
-        match tokio::spawn(async move { state.remove_xite_owned(&address).await }).await {
-            Ok(removed) => removed,
-            Err(error) => {
-                self.log("ERROR", format!("Xite removal completion failed: {error}"))
-                    .await;
-                false
-            }
+        let owned_address = address.to_string();
+        let removed =
+            match tokio::spawn(async move { state.remove_xite_owned(&owned_address).await }).await
+            {
+                Ok(removed) => removed,
+                Err(error) => {
+                    self.log("ERROR", format!("Xite removal completion failed: {error}"))
+                        .await;
+                    false
+                }
+            };
+        self.end_xite_update(address);
+        if !removed {
+            // The row survives a failed removal: retire its pill quietly (the
+            // caller's command reply carries the error) so it does not read
+            // as deleting forever.
+            self.push_update_result(address, UpdateOutcome::NoChange).await;
         }
+        removed
     }
 
     async fn remove_xite_owned(&self, address: &str) -> bool {
