@@ -1293,8 +1293,8 @@ const CHILD_MANIFEST_PAGE_SIZE: usize = 64;
 // Straggler bounds for one level's manifest fetch: keep waiting while items
 // stream, but once the level is at least GRACE old and the stream has been
 // IDLE-quiet, hand the leftovers to the periodic resync.
-const CHILD_MANIFEST_FETCH_GRACE: std::time::Duration = std::time::Duration::from_secs(30);
-const CHILD_MANIFEST_FETCH_IDLE: std::time::Duration = std::time::Duration::from_secs(15);
+const CHILD_MANIFEST_FETCH_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
+const CHILD_MANIFEST_FETCH_IDLE: std::time::Duration = std::time::Duration::from_secs(6);
 const CHILD_MANIFEST_LIMIT: usize = 100_000;
 const CHILD_DATA_PAGE_SIZE: usize = 32;
 const CHILD_APPLY_CONCURRENCY: usize = 4;
@@ -2199,20 +2199,27 @@ async fn sync_included_content(
     };
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
     // The merge sweep is best-effort freshness, not correctness: committed
-    // children's merge files ride the declared-data batch below, and
-    // deferred children carry their merge payloads into the promote. An
-    // unbounded hang inside one union fetch (observed live: the whole pass
-    // frozen after "all levels done") must not hold the posts hostage.
-    if tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        fetch_changed_child_merges(progress, address, &arrived, &peers),
-    )
-    .await
-    .is_err()
-    {
-        trace_clone!(t0, "merge sweep timed out, continuing");
+    // children's merge files ride the declared-data batch below, deferred
+    // children carry their merge payloads into the promote, and the periodic
+    // anti-entropy pass (resync_merge_files) unions records on its own
+    // schedule. When manifests just arrived, the sweep re-fetches what this
+    // pass already carries - and its union fetch can hang (observed live:
+    // 10 seconds of a 26 second clone burned on a sweep that delivered
+    // nothing). Run it only on quiet passes, still bounded.
+    if arrived.is_empty() {
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_changed_child_merges(progress, address, &arrived, &peers),
+        )
+        .await
+        .is_err()
+        {
+            trace_clone!(t0, "merge sweep timed out, continuing");
+        } else {
+            trace_clone!(t0, "merge sweep done");
+        }
     } else {
-        trace_clone!(t0, "merge sweep done");
+        trace_clone!(t0, "merge sweep skipped, {} fresh manifest(s)", arrived.len());
     }
     let arrived =
         sync_declared_child_data(xite, progress, address, &peers, child_files, arrived).await;
