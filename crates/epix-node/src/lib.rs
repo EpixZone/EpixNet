@@ -2201,9 +2201,25 @@ async fn sync_included_content(
         (child_files, arrived)
     };
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
-    fetch_changed_child_merges(progress, address, &arrived, &peers).await;
+    // The merge sweep is best-effort freshness, not correctness: committed
+    // children's merge files ride the declared-data batch below, and
+    // deferred children carry their merge payloads into the promote. An
+    // unbounded hang inside one union fetch (observed live: the whole pass
+    // frozen after "all levels done") must not hold the posts hostage.
+    if tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        fetch_changed_child_merges(progress, address, &arrived, &peers),
+    )
+    .await
+    .is_err()
+    {
+        trace_clone!(t0, "merge sweep timed out, continuing");
+    } else {
+        trace_clone!(t0, "merge sweep done");
+    }
     let arrived =
         sync_declared_child_data(xite, progress, address, &peers, child_files, arrived).await;
+    trace_clone!(t0, "declared data done");
     sync_deferred_children(xite, progress, address, &peers, t0).await;
     if let Some(state) = progress {
         state.end_child_sync(address).await;
