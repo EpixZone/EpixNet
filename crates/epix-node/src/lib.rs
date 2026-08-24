@@ -2166,17 +2166,33 @@ async fn sync_included_content(
         return (0, Vec::new());
     }
     let swarm = prioritize_child_peer(peers, live_peer.as_ref());
+    let ordered = order_child_manifest_paths(paths, feed_order);
     // Deterministic fast path: the live peer just answered listModified over
     // a warm link and (as a full seeder) holds every manifest and object, so
     // the whole pass rides that ONE link - no widen windows, no dials into
     // junk swarm peers, no sweep across dead circuits. The variance between
     // a 10-second and a 3-minute pass was exactly those extra dials. The
     // full swarm is the fallback when the single peer serves nothing.
+    //
+    // Above SWARM_FANOUT_CHILDREN children the pass is bandwidth-bound, not
+    // dial-latency-bound, so the extra dials pay for themselves: spread the
+    // levels and the batch across the whole swarm instead.
+    const SWARM_FANOUT_CHILDREN: usize = 40;
+    let single_live = live_peer.is_some() && ordered.len() <= SWARM_FANOUT_CHILDREN;
     let peers = match &live_peer {
-        Some(live) => vec![live.clone()],
-        None => swarm.clone(),
+        Some(live) if single_live => vec![live.clone()],
+        _ => {
+            if live_peer.is_some() {
+                trace_clone!(
+                    t0,
+                    "{} children, fanning out over {} swarm peer(s)",
+                    ordered.len(),
+                    swarm.len()
+                );
+            }
+            swarm.clone()
+        }
     };
-    let ordered = order_child_manifest_paths(paths, feed_order);
     prewarm_child_signers(&ordered, t0).await;
 
     // While the levels run, inbound pushes for this xite's children defer
@@ -2189,7 +2205,7 @@ async fn sync_included_content(
         sync_child_manifest_levels(xite, &peers, progress, address, ordered.clone(), t0).await;
     let (child_files, arrived) = if arrived.is_empty()
         && child_files.is_empty()
-        && live_peer.is_some()
+        && single_live
         && swarm.len() > 1
     {
         trace_clone!(t0, "live-peer pass served nothing, retrying over the swarm");
