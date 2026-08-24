@@ -1606,76 +1606,70 @@ fn read_regular_xite_file_bounded(
 }
 
 #[cfg(unix)]
+fn open_promotion_directory(directory: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // Open the directory directly instead of walking down from "/". Promotion
+    // paths live under the configured data dir, whose ancestry is trusted
+    // configuration, and sandboxed platforms refuse to open their upper
+    // directories at all: on Android, SELinux denies apps read on "/", so a
+    // walk from "/" failed every child promotion with EACCES even though the
+    // data dir itself was fully accessible.
+    match rustix::fs::open(directory, flags, Mode::empty()) {
+        Ok(opened) => return Ok(std::fs::File::from(opened)),
+        Err(error)
+            if create && std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    // A missing component: durably create it under its nearest existing
+    // ancestor. Recursing on the parent opens only the directories that are
+    // actually being created into, never the ancestry above them.
+    let parent = directory.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "promotion path has no parent")
+    })?;
+    let name = directory.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "promotion path has no final name",
+        )
+    })?;
+    let parent = open_promotion_directory(parent, true)?;
+    match rustix::fs::mkdirat(&parent, name, Mode::from_bits_truncate(0o755)) {
+        Ok(()) => parent.sync_all()?,
+        Err(error)
+            if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    rustix::fs::openat(&parent, name, flags, Mode::empty())
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
 fn unix_absolute_parent_for_promotion(
     path: &Path,
     create: bool,
 ) -> Result<(std::fs::File, std::ffi::OsString), String> {
-    use rustix::fs::{Mode, OFlags};
-
     if !path.is_absolute() {
         return Err(format!("promotion path is not absolute: {}", path.display()));
     }
-    let mut components = path.components().collect::<Vec<_>>();
-    let Some(std::path::Component::Normal(name)) = components.pop() else {
+    if path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(format!("unsafe promotion path: {}", path.display()));
+    }
+    let Some(std::path::Component::Normal(name)) = path.components().next_back() else {
         return Err(format!("promotion path has no final name: {}", path.display()));
     };
-    let mut directory = rustix::fs::open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(std::fs::File::from)
-    .map_err(std::io::Error::from)
-    .map_err(|error| error.to_string())?;
-    for component in components {
-        match component {
-            std::path::Component::RootDir => continue,
-            std::path::Component::Normal(part) => {
-                let opened = rustix::fs::openat(
-                    &directory,
-                    part,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                );
-                match opened {
-                    Ok(next) => directory = std::fs::File::from(next),
-                    Err(error)
-                        if create
-                            && std::io::Error::from(error).kind()
-                                == std::io::ErrorKind::NotFound =>
-                    {
-                        match rustix::fs::mkdirat(
-                            &directory,
-                            part,
-                            Mode::from_bits_truncate(0o755),
-                        ) {
-                            Ok(()) => directory
-                                .sync_all()
-                                .map_err(|sync_error| sync_error.to_string())?,
-                            Err(error)
-                                if std::io::Error::from(error).kind()
-                                    == std::io::ErrorKind::AlreadyExists => {}
-                            Err(error) => return Err(std::io::Error::from(error).to_string()),
-                        }
-                        directory = rustix::fs::openat(
-                            &directory,
-                            part,
-                            OFlags::RDONLY
-                                | OFlags::DIRECTORY
-                                | OFlags::NOFOLLOW
-                                | OFlags::CLOEXEC,
-                            Mode::empty(),
-                        )
-                        .map(std::fs::File::from)
-                        .map_err(std::io::Error::from)
-                        .map_err(|open_error| open_error.to_string())?;
-                    }
-                    Err(error) => return Err(std::io::Error::from(error).to_string()),
-                }
-            }
-            _ => return Err(format!("unsafe promotion path: {}", path.display())),
-        }
-    }
+    let Some(parent_path) = path.parent() else {
+        return Err(format!("promotion path has no parent: {}", path.display()));
+    };
+    let directory =
+        open_promotion_directory(parent_path, create).map_err(|error| error.to_string())?;
     Ok((directory, name.to_os_string()))
 }
 
