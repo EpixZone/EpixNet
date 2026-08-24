@@ -12479,7 +12479,6 @@ impl AppState {
                             .await;
                             return Err(error);
                         }
-                        Err(error) => return Err(error),
                     }
                 }
                 Some(after) if std::time::Instant::now() < retry_until => {

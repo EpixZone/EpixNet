@@ -1405,11 +1405,11 @@ async fn report_child_manifest_failure(
             format!("Could not expose {inner_path}: {detail}"),
         )
         .await;
-    state.push_clone_event(
-        address,
-        serde_json::json!(["file_failed", inner_path]),
-        serde_json::json!({ "error": detail }),
-    );
+    // Log only: a per-child hiccup is retried by the resync (and legacy
+    // no-b3 files can never arrive), while a `file_failed` clone event paints
+    // the loading screen red mid-download - "download failed" over a clone
+    // that is succeeding. Red stays reserved for the core set.
+    let _ = address;
 }
 
 type ChildManifestResult = (Result<epix_ui::state::InboundUpdate, String>, Vec<String>);
@@ -1837,13 +1837,10 @@ async fn report_unavailable_child_files(
         counted_path_sample(files.count, &files.sample)
     );
     state.log("WARNING", format!("{address}: {error}")).await;
-    for inner_path in &files.sample {
-        state.push_clone_event(
-            address,
-            serde_json::json!(["file_failed", inner_path]),
-            serde_json::json!({ "error": error }),
-        );
-    }
+    // Log only, same reasoning as report_child_manifest_failure: user content
+    // is best-effort streaming, and most of these are legacy files that can
+    // never arrive until their owner re-signs. Painting the loading screen
+    // red for them misreported every clone of a xite with legacy users.
 }
 
 async fn fetch_child_data_page(
