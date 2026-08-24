@@ -2359,6 +2359,22 @@ async fn fetch_content(
 /// yet served, resolve it on-chain, clone it, and add it as a served xite keyed
 /// by its bech32 address (the name is display metadata), so typing any
 /// `talk.epix` opens it live.
+/// One running on-demand clone: when it started (for staleness), its task
+/// handle (so a stale one can be killed), and its token (see
+/// `in_flight_token`).
+struct InflightClone {
+    token: u64,
+    started: std::time::Instant,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+/// A clone that has held its slot this long without ever registering the
+/// xite is treated as wedged: it is aborted and a fresh attempt takes over.
+/// A healthy clone registers within seconds (the entry is created before any
+/// network work), so only a stuck task or one whose xite was deleted out
+/// from under it can trip this.
+const STALE_CLONE_STEAL: std::time::Duration = std::time::Duration::from_secs(90);
+
 struct OnDemand {
     state: Arc<AppState>,
     data_root: PathBuf,
@@ -2367,8 +2383,15 @@ struct OnDemand {
     /// caller is an HTTP request future, and a browser that gives up on the
     /// blocked request must not cancel the clone mid-download.
     me: std::sync::Weak<OnDemand>,
-    /// Names currently being cloned, so concurrent requests coalesce.
-    in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Clones currently running, so concurrent requests coalesce - and so a
+    /// wedged one can be recognized and replaced instead of squatting its
+    /// address forever (the delete-then-redownload hang: the fresh attempt
+    /// waited eternally on a stuck predecessor's slot).
+    in_flight: tokio::sync::Mutex<std::collections::HashMap<String, InflightClone>>,
+    /// Distinguishes an entry from its replacement after a steal, so a stuck
+    /// task that finally dies cannot remove the slot of the clone that took
+    /// over from it.
+    in_flight_token: std::sync::atomic::AtomicU64,
     /// Whether Tor is expected to come up (mode != Disable). Gates the
     /// cold-start wait in `await_tor_ready`. Set once, after the Tor mode is
     /// resolved in `serve`.
@@ -2418,14 +2441,47 @@ impl epix_ui::OnDemandResolver for OnDemand {
         // epix1… address run twice in parallel, interleaving two independent
         // progress streams on the loading screen - the N/M file counter
         // visibly bounced and each stream's completion reset the bar.
-        {
+        let served = self.state.has_xite(&address).await;
+        let token = {
             let mut inflight = self.in_flight.lock().await;
-            if inflight.contains(&address) {
-                drop(inflight);
-                return self.wait_for_inflight(&address).await;
+            if let Some(entry) = inflight.get(&address) {
+                if served || entry.started.elapsed() < STALE_CLONE_STEAL {
+                    // A live clone is working on it (it registers the xite
+                    // within seconds, and re-registration after a delete
+                    // restarts the clock via a fresh entry): coalesce.
+                    drop(inflight);
+                    return self.wait_for_inflight(&address).await;
+                }
+                // Wedged before it ever registered the xite, or the xite was
+                // deleted out from under it: kill it and take the slot. This
+                // is the delete-then-redownload hang.
+                self.state
+                    .log(
+                        "WARNING",
+                        format!(
+                            "Replacing a stuck clone of {address} ({}s old)",
+                            entry.started.elapsed().as_secs()
+                        ),
+                    )
+                    .await;
+                if let Some(abort) = &entry.abort {
+                    abort.abort();
+                }
+                inflight.remove(&address);
             }
-            inflight.insert(address.clone());
-        }
+            let token = self
+                .in_flight_token
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            inflight.insert(
+                address.clone(),
+                InflightClone {
+                    token,
+                    started: std::time::Instant::now(),
+                    abort: None,
+                },
+            );
+            token
+        };
         // Run the clone on its OWN task. This future belongs to the HTTP
         // request that hit the missing xite; a browser that times out or
         // retries that request drops the future, and an inline clone died
@@ -2439,7 +2495,7 @@ impl epix_ui::OnDemandResolver for OnDemand {
         };
         let spawn_host = host.to_string();
         let spawn_address = address.clone();
-        tokio::spawn(async move {
+        let handle = tokio::spawn(async move {
             let result = this.do_ensure(&spawn_host, &spawn_address).await;
             if let Err(error) = result {
                 this.state
@@ -2449,8 +2505,20 @@ impl epix_ui::OnDemandResolver for OnDemand {
                     )
                     .await;
             }
-            this.in_flight.lock().await.remove(&spawn_address);
+            // Only clear OUR slot: a stolen entry belongs to the replacement.
+            let mut inflight = this.in_flight.lock().await;
+            if inflight.get(&spawn_address).is_some_and(|entry| entry.token == token) {
+                inflight.remove(&spawn_address);
+            }
         });
+        {
+            let mut inflight = self.in_flight.lock().await;
+            if let Some(entry) = inflight.get_mut(&address) {
+                if entry.token == token {
+                    entry.abort = Some(handle.abort_handle());
+                }
+            }
+        }
         self.wait_for_inflight(&address).await
     }
 
@@ -2613,7 +2681,7 @@ impl OnDemand {
             if self.state.has_xite(address).await {
                 return Ok(());
             }
-            if !self.in_flight.lock().await.contains(address) {
+            if !self.in_flight.lock().await.contains_key(address) {
                 break; // the working clone finished (or failed)
             }
         }
@@ -2901,7 +2969,8 @@ async fn serve(
         data_root: opts.data_root.clone(),
         trackers: trackers.clone(),
         me: me.clone(),
-        in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        in_flight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        in_flight_token: std::sync::atomic::AtomicU64::new(0),
         tor_expected: std::sync::atomic::AtomicBool::new(false),
         tor_always: std::sync::atomic::AtomicBool::new(false),
     });
