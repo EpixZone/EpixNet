@@ -12352,7 +12352,7 @@ impl AppState {
         // an in-progress rebuild/clone (bounded) before running.
         let canonical = self.canonical_key(address).await;
         let waited = std::time::Instant::now();
-        while waited.elapsed() < std::time::Duration::from_secs(20) {
+        while waited.elapsed() < std::time::Duration::from_secs(45) {
             let busy = self.is_cloning(&canonical)
                 || self.is_cloning(address)
                 || self.db_rebuilds_in_flight.lock().unwrap().contains(&canonical);
@@ -12429,7 +12429,7 @@ impl AppState {
         // bumps the generation, so a booting page's first query almost always
         // crossed a bump, and apps iterate the expected rows and died on the
         // error object (the frozen loading overlay).
-        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(45);
         loop {
             let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
             let _activation = self.xite_activation_gate.clone().read_owned().await;
@@ -12478,6 +12478,21 @@ impl AppState {
                 Some(after) if std::time::Instant::now() < retry_until => {
                     receipt = after;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                None if std::time::Instant::now() < retry_until => {
+                    // The database can be briefly absent mid-churn (a delete
+                    // and redownload swapping the xite under the session).
+                    // Keep waiting for a fresh handle inside the same budget.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if let Some(fresh) = self
+                        .xites
+                        .read()
+                        .await
+                        .get(address)
+                        .and_then(|xite| self.current_db_query_receipt(address, xite))
+                    {
+                        receipt = fresh;
+                    }
                 }
                 _ => {
                     self.log(
