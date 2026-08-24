@@ -10576,6 +10576,43 @@ impl AppState {
             .collect()
     }
 
+    /// Required paths in a child manifest that can never arrive over EDX:
+    /// the signed entry has neither a `b3` object id nor a `files_shard`
+    /// descriptor (a pre-EDX signature). Availability must not wait on
+    /// them, or every child signed before the b3 rollout stays uncommitted
+    /// forever. Like the pre-staging clone path, the manifest commits and
+    /// the legacy file stays absent until a verified diff lands it or the
+    /// owner re-signs.
+    fn unfetchable_child_paths(
+        inner_path: &str,
+        content: Option<&Value>,
+    ) -> std::collections::HashSet<String> {
+        let Some(content) = content else {
+            return Default::default();
+        };
+        let dir = inner_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        content
+            .get("files")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|files| files.iter())
+            .filter(|(path, info)| {
+                info.get("b3").and_then(Value::as_str).is_none()
+                    && content
+                        .get("files_shard")
+                        .and_then(|shards| shards.get(path.as_str()))
+                        .is_none()
+            })
+            .map(|(path, _)| {
+                if dir.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{dir}/{path}")
+                }
+            })
+            .collect()
+    }
+
     /// Present a staged child manifest's relative `files` entries as the
     /// xite-relative paths expected by the EDX materializer. The signed child
     /// itself stays off disk until these objects verify.
@@ -10745,7 +10782,10 @@ impl AppState {
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             });
-        let missing = Self::missing_child_files(storage, &pending.files, transaction);
+        let unfetchable =
+            Self::unfetchable_child_paths(&pending.inner_path, staged_content.as_ref());
+        let mut missing = Self::missing_child_files(storage, &pending.files, transaction);
+        missing.retain(|path| !unfetchable.contains(path));
         if missing.is_empty() {
             return true;
         }
@@ -10775,7 +10815,9 @@ impl AppState {
                 None,
             )
             .await;
-        Self::missing_child_files(storage, &pending.files, transaction).is_empty()
+        Self::missing_child_files(storage, &pending.files, transaction)
+            .iter()
+            .all(|path| unfetchable.contains(path))
     }
 
     async fn commit_child_candidate(
@@ -10890,7 +10932,14 @@ impl AppState {
                 .await;
             let previous_declarations =
                 self.verified_object_declarations_for(&lease.canonical);
-            if !Self::missing_child_files(&xite.storage, files, transaction).is_empty() {
+            let unfetchable = Self::unfetchable_child_paths(
+                inner_path,
+                serde_json::from_slice::<Value>(bytes).ok().as_ref(),
+            );
+            if !Self::missing_child_files(&xite.storage, files, transaction)
+                .iter()
+                .all(|path| unfetchable.contains(path))
+            {
                 return Err("child candidate lost a required file before commit".into());
             }
             let mut commit_xite = Xite::new(xite.address.clone(), xite.storage.clone());
@@ -11118,7 +11167,14 @@ impl AppState {
             if epix_blob::ObjId::of(&stored) != lease.digest {
                 return None;
             }
-            if !Self::missing_child_files(storage, &pending.files, transaction).is_empty() {
+            let unfetchable = Self::unfetchable_child_paths(
+                &pending.inner_path,
+                serde_json::from_slice::<Value>(&stored).ok().as_ref(),
+            );
+            if !Self::missing_child_files(storage, &pending.files, transaction)
+                .iter()
+                .all(|path| unfetchable.contains(path))
+            {
                 return None;
             }
             return Some(relay_payload);
@@ -25920,7 +25976,19 @@ impl AppState {
     async fn finish_inbound_update(self: &Arc<Self>, mut finish: InboundFinish) -> bool {
         let key = finish.keys[0].clone();
         let canonical = canonical_address(finish.xite.content.as_ref(), &key);
-        let (_, staged_for_fetch) = Self::inbound_staged_content(&finish);
+        let (child_content, staged_for_fetch) = Self::inbound_staged_content(&finish);
+        let child_content = child_content.or_else(|| {
+            finish.child_files.is_some().then(|| {
+                finish
+                    .xite
+                    .storage
+                    .read(&finish.inner_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            }).flatten()
+        });
+        let unfetchable =
+            Self::unfetchable_child_paths(&finish.inner_path, child_content.as_ref());
         let mut arrived = self.apply_inbound_diffs(&finish, &key).await;
         let mut needed = Self::inbound_files_needed(&finish);
         self.fetch_inbound_live_source(
@@ -25937,13 +26005,14 @@ impl AppState {
             &mut arrived,
         )
         .await;
-        let missing_child = finish
+        let mut missing_child = finish
             .child_files
             .as_ref()
             .map(|files| {
                 Self::missing_child_files(&finish.xite.storage, files, &finish.transaction)
             })
             .unwrap_or_default();
+        missing_child.retain(|path| !unfetchable.contains(path));
         let committed = self.commit_inbound_manifest(&mut finish, &missing_child).await;
         let relay_ready = committed;
         let merge_failed = false;
