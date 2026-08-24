@@ -4132,6 +4132,11 @@ pub struct AppState {
     /// staged here until required files verify. A count cap and global retained
     /// payload-byte cap bound peer-driven memory use.
     pending_child_relays: std::sync::Mutex<HashMap<String, PendingChildRelay>>,
+    /// Canonicals whose site database is being rebuilt right now. `db_query`
+    /// waits (bounded) while its target is here: a query racing the rebuild
+    /// answered with "database is locked" style errors, which froze app boot
+    /// chains that expected rows (EpixTalk's loading overlay, stuck forever).
+    db_rebuilds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Canonicals whose clone/user-content sync is running. Inbound child
     /// updates for them stage-and-defer instead of fetching inline, so a
     /// push cannot hold a child's manifest guard across a slow network pull
@@ -4967,6 +4972,7 @@ impl AppState {
             xite_activation_gate: Arc::new(tokio::sync::RwLock::new(())),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
+            db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             active_child_syncs: std::sync::Mutex::new(std::collections::HashSet::new()),
             xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -12340,6 +12346,21 @@ impl AppState {
 
     pub async fn db_query(&self, address: &str, query: &str, params: &Value,
     ) -> Result<Vec<Value>, String> {
+        // A query racing a clone or db rebuild answered with transient errors
+        // ("database is locked", missing tables), and app boot chains that
+        // expected rows died on them - the frozen loading overlay. Wait out
+        // an in-progress rebuild/clone (bounded) before running.
+        let canonical = self.canonical_key(address).await;
+        let waited = std::time::Instant::now();
+        while waited.elapsed() < std::time::Duration::from_secs(20) {
+            let busy = self.is_cloning(&canonical)
+                || self.is_cloning(address)
+                || self.db_rebuilds_in_flight.lock().unwrap().contains(&canonical);
+            if !busy {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
         let mut receipt = self
             .xites
             .read()
@@ -28173,6 +28194,14 @@ impl AppState {
                 xite.content.clone(),
             )
         };
+        self.db_rebuilds_in_flight.lock().unwrap().insert(canonical.clone());
+        struct RebuildMark<'a>(&'a AppState, String);
+        impl Drop for RebuildMark<'_> {
+            fn drop(&mut self) {
+                self.0.db_rebuilds_in_flight.lock().unwrap().remove(&self.1);
+            }
+        }
+        let _mark = RebuildMark(self, canonical.clone());
         let Ok(_manifest) = self.acquire_manifest_mutex(&canonical, "content.json").await else {
             return false;
         };
