@@ -11406,39 +11406,53 @@ impl AppState {
         let mut files = Vec::new();
         let mut merged_files = serde_json::Map::new();
         for relay in relays {
-            let Some(raw) = relay
-                .staged_bytes
-                .as_deref()
-                .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())
+            let Some((entries, mut missing)) =
+                Self::deferred_relay_contribution(&relay, storage.as_ref())
             else {
                 continue;
             };
-            if raw.get("files_shard").and_then(Value::as_object).is_some_and(|m| !m.is_empty())
-                || raw.get("edx_salt").is_some()
-            {
-                continue;
-            }
-            let unfetchable = Self::unfetchable_child_paths(&relay.inner_path, Some(&raw));
-            let staged = Self::staged_child_edx_content(&relay.inner_path, &raw);
-            if let Some(map) = staged.get("files").and_then(Value::as_object) {
-                for (path, entry) in map {
-                    merged_files.insert(path.clone(), entry.clone());
-                }
-            }
-            for file in &relay.files {
-                if unfetchable.contains(&file.inner_path) {
-                    continue;
-                }
-                if storage
-                    .as_ref()
-                    .is_some_and(|storage| storage.verify(&file.inner_path, &file.sha512))
-                {
-                    continue;
-                }
-                files.push(file.clone());
-            }
+            merged_files.extend(entries);
+            files.append(&mut missing);
         }
         (files, json!({ "files": merged_files }))
+    }
+
+    /// One relay's contribution to [`Self::deferred_child_batch`]: `None` for
+    /// a relay the batch cannot carry (no staged bytes, or an encrypted child
+    /// whose decryption salt is per-manifest), else its staged `files`
+    /// entries plus its still-missing fetchable files.
+    fn deferred_relay_contribution(
+        relay: &PendingChildRelay,
+        storage: Option<&XiteStorage>,
+    ) -> Option<(serde_json::Map<String, Value>, Vec<epix_xite::FileEntry>)> {
+        let raw = relay
+            .staged_bytes
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())?;
+        let has_shards = raw
+            .get("files_shard")
+            .and_then(Value::as_object)
+            .is_some_and(|shards| !shards.is_empty());
+        if has_shards || raw.get("edx_salt").is_some() {
+            return None;
+        }
+        let unfetchable = Self::unfetchable_child_paths(&relay.inner_path, Some(&raw));
+        let staged = Self::staged_child_edx_content(&relay.inner_path, &raw);
+        let entries = staged
+            .get("files")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let missing = relay
+            .files
+            .iter()
+            .filter(|file| !unfetchable.contains(&file.inner_path))
+            .filter(|file| {
+                !storage.is_some_and(|storage| storage.verify(&file.inner_path, &file.sha512))
+            })
+            .cloned()
+            .collect();
+        Some((entries, missing))
     }
 
     /// One promote pass over the pending child relays. Public for the clone

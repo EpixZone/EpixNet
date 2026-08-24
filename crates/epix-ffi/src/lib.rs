@@ -87,7 +87,7 @@ impl EpixNode {
         // content took minutes because the runtime, not the network, was the
         // bottleneck. Scale with the device, floor of 4.
         let workers = std::thread::available_parallelism()
-            .map(|n| n.get())
+            .map(std::num::NonZeroUsize::get)
             .unwrap_or(4)
             .clamp(4, 8);
         let rt = tokio::runtime::Builder::new_multi_thread()
