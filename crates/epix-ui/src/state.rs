@@ -12406,7 +12406,7 @@ impl AppState {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             }
         }
-        let receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
+        let mut receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
         #[cfg(test)]
         let pause = DB_QUERY_AFTER_RECEIPT_PAUSE
             .lock()
@@ -12423,24 +12423,39 @@ impl AppState {
         // the boundary that stops a visitor from writing files via ATTACH.
         // The SQL can be arbitrarily expensive. Run it detached from mutation
         // locks, then linearize only its result against the exact handle and
-        // authority generation. A concurrent swap makes the rows unusable.
-        let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
-        let _activation = self.xite_activation_gate.clone().read_owned().await;
-        let _tree = self
-            .tree_mutation_lock(&receipt.canonical)
-            .lock_owned()
-            .await;
-        let still_current = self
-            .xites
-            .read()
-            .await
-            .get(address)
-            .and_then(|xite| self.current_db_query_receipt(address, xite))
-            .is_some_and(|after| Self::same_db_query_receipt(&receipt, &after));
-        if !still_current {
-            return Err("database authority changed while query ran".into());
+        // authority generation. A concurrent swap makes the rows unusable -
+        // but the answer to unusable rows is RERUNNING the query on the fresh
+        // handle, not an error: right after a clone every landed user file
+        // bumps the generation, so a booting page's first query almost always
+        // crossed a bump, and apps iterate the expected rows and died on the
+        // error object (the frozen loading overlay).
+        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
+            let _activation = self.xite_activation_gate.clone().read_owned().await;
+            let _tree = self
+                .tree_mutation_lock(&receipt.canonical)
+                .lock_owned()
+                .await;
+            let after = self
+                .xites
+                .read()
+                .await
+                .get(address)
+                .and_then(|xite| self.current_db_query_receipt(address, xite));
+            match after {
+                Some(after) if Self::same_db_query_receipt(&receipt, &after) => {
+                    return result;
+                }
+                Some(after) if std::time::Instant::now() < retry_until => {
+                    receipt = after;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                _ => {
+                    return Err("database authority changed while query ran".into());
+                }
+            }
         }
-        result
     }
 
     /// Every served xite's dbschema-declared feeds, with the xite's title:
