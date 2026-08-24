@@ -48,48 +48,50 @@ fn open_xite_root(root: &Path, create: bool) -> std::io::Result<std::fs::File> {
     } else {
         std::env::current_dir()?.join(root)
     };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut directory = rustix::fs::open("/", flags, Mode::empty())
-        .map(std::fs::File::from)
-        .map_err(std::io::Error::from)?;
-    for component in root.components() {
-        match component {
-            Component::RootDir => continue,
-            Component::Normal(name) => {
-                match rustix::fs::openat(&directory, name, flags, Mode::empty()) {
-                    Ok(next) => directory = std::fs::File::from(next),
-                    Err(error)
-                        if create
-                            && std::io::Error::from(error).kind()
-                                == std::io::ErrorKind::NotFound =>
-                    {
-                        match rustix::fs::mkdirat(
-                            &directory,
-                            name,
-                            Mode::from_bits_truncate(0o755),
-                        ) {
-                            Ok(()) => directory.sync_all()?,
-                            Err(error)
-                                if std::io::Error::from(error).kind()
-                                    == std::io::ErrorKind::AlreadyExists => {}
-                            Err(error) => return Err(std::io::Error::from(error)),
-                        }
-                        directory = rustix::fs::openat(&directory, name, flags, Mode::empty())
-                            .map(std::fs::File::from)
-                            .map_err(std::io::Error::from)?;
-                    }
-                    Err(error) => return Err(std::io::Error::from(error)),
-                }
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "xite storage root is not a canonical absolute path",
-                ));
-            }
-        }
+    if root
+        .components()
+        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "xite storage root is not a canonical absolute path",
+        ));
     }
-    Ok(directory)
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // Open the configured root directly instead of walking down from "/".
+    // The root's ancestry is trusted configuration (see above), and sandboxed
+    // platforms refuse to open their upper directories at all: on Android,
+    // SELinux denies apps read on "/", so a walk from "/" made every storage
+    // read and durable write fail with EACCES even though the data dir
+    // itself was fully accessible.
+    match rustix::fs::open(&root, flags, Mode::empty()) {
+        Ok(directory) => return Ok(std::fs::File::from(directory)),
+        Err(error)
+            if create && std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    // A missing root component: durably create it under its nearest existing
+    // ancestor. Recursing on the parent opens only the directories that are
+    // actually being created into, never the ancestry above them.
+    let parent = root.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "xite storage root has no parent")
+    })?;
+    let name = root.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "xite storage root is not a canonical absolute path",
+        )
+    })?;
+    let directory = open_xite_root(parent, true)?;
+    match rustix::fs::mkdirat(&directory, name, Mode::from_bits_truncate(0o755)) {
+        Ok(()) => directory.sync_all()?,
+        Err(error)
+            if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    rustix::fs::openat(&directory, name, flags, Mode::empty())
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
 }
 
 #[cfg(unix)]

@@ -2345,6 +2345,7 @@ dependencies = [
 name = "epix-fs"
 version = "0.1.0"
 dependencies = [
+ "rustix",
  "windows-sys 0.61.2",
 ]
 

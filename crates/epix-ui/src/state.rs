@@ -1606,76 +1606,70 @@ fn read_regular_xite_file_bounded(
 }
 
 #[cfg(unix)]
+fn open_promotion_directory(directory: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // Open the directory directly instead of walking down from "/". Promotion
+    // paths live under the configured data dir, whose ancestry is trusted
+    // configuration, and sandboxed platforms refuse to open their upper
+    // directories at all: on Android, SELinux denies apps read on "/", so a
+    // walk from "/" failed every child promotion with EACCES even though the
+    // data dir itself was fully accessible.
+    match rustix::fs::open(directory, flags, Mode::empty()) {
+        Ok(opened) => return Ok(std::fs::File::from(opened)),
+        Err(error)
+            if create && std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    // A missing component: durably create it under its nearest existing
+    // ancestor. Recursing on the parent opens only the directories that are
+    // actually being created into, never the ancestry above them.
+    let parent = directory.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "promotion path has no parent")
+    })?;
+    let name = directory.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "promotion path has no final name",
+        )
+    })?;
+    let parent = open_promotion_directory(parent, true)?;
+    match rustix::fs::mkdirat(&parent, name, Mode::from_bits_truncate(0o755)) {
+        Ok(()) => parent.sync_all()?,
+        Err(error)
+            if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    rustix::fs::openat(&parent, name, flags, Mode::empty())
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
 fn unix_absolute_parent_for_promotion(
     path: &Path,
     create: bool,
 ) -> Result<(std::fs::File, std::ffi::OsString), String> {
-    use rustix::fs::{Mode, OFlags};
-
     if !path.is_absolute() {
         return Err(format!("promotion path is not absolute: {}", path.display()));
     }
-    let mut components = path.components().collect::<Vec<_>>();
-    let Some(std::path::Component::Normal(name)) = components.pop() else {
+    if path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(format!("unsafe promotion path: {}", path.display()));
+    }
+    let Some(std::path::Component::Normal(name)) = path.components().next_back() else {
         return Err(format!("promotion path has no final name: {}", path.display()));
     };
-    let mut directory = rustix::fs::open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(std::fs::File::from)
-    .map_err(std::io::Error::from)
-    .map_err(|error| error.to_string())?;
-    for component in components {
-        match component {
-            std::path::Component::RootDir => continue,
-            std::path::Component::Normal(part) => {
-                let opened = rustix::fs::openat(
-                    &directory,
-                    part,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                );
-                match opened {
-                    Ok(next) => directory = std::fs::File::from(next),
-                    Err(error)
-                        if create
-                            && std::io::Error::from(error).kind()
-                                == std::io::ErrorKind::NotFound =>
-                    {
-                        match rustix::fs::mkdirat(
-                            &directory,
-                            part,
-                            Mode::from_bits_truncate(0o755),
-                        ) {
-                            Ok(()) => directory
-                                .sync_all()
-                                .map_err(|sync_error| sync_error.to_string())?,
-                            Err(error)
-                                if std::io::Error::from(error).kind()
-                                    == std::io::ErrorKind::AlreadyExists => {}
-                            Err(error) => return Err(std::io::Error::from(error).to_string()),
-                        }
-                        directory = rustix::fs::openat(
-                            &directory,
-                            part,
-                            OFlags::RDONLY
-                                | OFlags::DIRECTORY
-                                | OFlags::NOFOLLOW
-                                | OFlags::CLOEXEC,
-                            Mode::empty(),
-                        )
-                        .map(std::fs::File::from)
-                        .map_err(std::io::Error::from)
-                        .map_err(|open_error| open_error.to_string())?;
-                    }
-                    Err(error) => return Err(std::io::Error::from(error).to_string()),
-                }
-            }
-            _ => return Err(format!("unsafe promotion path: {}", path.display())),
-        }
-    }
+    let Some(parent_path) = path.parent() else {
+        return Err(format!("promotion path has no parent: {}", path.display()));
+    };
+    let directory =
+        open_promotion_directory(parent_path, create).map_err(|error| error.to_string())?;
     Ok((directory, name.to_os_string()))
 }
 
@@ -10582,6 +10576,43 @@ impl AppState {
             .collect()
     }
 
+    /// Required paths in a child manifest that can never arrive over EDX:
+    /// the signed entry has neither a `b3` object id nor a `files_shard`
+    /// descriptor (a pre-EDX signature). Availability must not wait on
+    /// them, or every child signed before the b3 rollout stays uncommitted
+    /// forever. Like the pre-staging clone path, the manifest commits and
+    /// the legacy file stays absent until a verified diff lands it or the
+    /// owner re-signs.
+    fn unfetchable_child_paths(
+        inner_path: &str,
+        content: Option<&Value>,
+    ) -> std::collections::HashSet<String> {
+        let Some(content) = content else {
+            return Default::default();
+        };
+        let dir = inner_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        content
+            .get("files")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|files| files.iter())
+            .filter(|(path, info)| {
+                info.get("b3").and_then(Value::as_str).is_none()
+                    && content
+                        .get("files_shard")
+                        .and_then(|shards| shards.get(path.as_str()))
+                        .is_none()
+            })
+            .map(|(path, _)| {
+                if dir.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{dir}/{path}")
+                }
+            })
+            .collect()
+    }
+
     /// Present a staged child manifest's relative `files` entries as the
     /// xite-relative paths expected by the EDX materializer. The signed child
     /// itself stays off disk until these objects verify.
@@ -10751,7 +10782,10 @@ impl AppState {
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             });
-        let missing = Self::missing_child_files(storage, &pending.files, transaction);
+        let unfetchable =
+            Self::unfetchable_child_paths(&pending.inner_path, staged_content.as_ref());
+        let mut missing = Self::missing_child_files(storage, &pending.files, transaction);
+        missing.retain(|path| !unfetchable.contains(path));
         if missing.is_empty() {
             return true;
         }
@@ -10781,7 +10815,9 @@ impl AppState {
                 None,
             )
             .await;
-        Self::missing_child_files(storage, &pending.files, transaction).is_empty()
+        Self::missing_child_files(storage, &pending.files, transaction)
+            .iter()
+            .all(|path| unfetchable.contains(path))
     }
 
     async fn commit_child_candidate(
@@ -10896,7 +10932,14 @@ impl AppState {
                 .await;
             let previous_declarations =
                 self.verified_object_declarations_for(&lease.canonical);
-            if !Self::missing_child_files(&xite.storage, files, transaction).is_empty() {
+            let unfetchable = Self::unfetchable_child_paths(
+                inner_path,
+                serde_json::from_slice::<Value>(bytes).ok().as_ref(),
+            );
+            if !Self::missing_child_files(&xite.storage, files, transaction)
+                .iter()
+                .all(|path| unfetchable.contains(path))
+            {
                 return Err("child candidate lost a required file before commit".into());
             }
             let mut commit_xite = Xite::new(xite.address.clone(), xite.storage.clone());
@@ -11124,7 +11167,14 @@ impl AppState {
             if epix_blob::ObjId::of(&stored) != lease.digest {
                 return None;
             }
-            if !Self::missing_child_files(storage, &pending.files, transaction).is_empty() {
+            let unfetchable = Self::unfetchable_child_paths(
+                &pending.inner_path,
+                serde_json::from_slice::<Value>(&stored).ok().as_ref(),
+            );
+            if !Self::missing_child_files(storage, &pending.files, transaction)
+                .iter()
+                .all(|path| unfetchable.contains(path))
+            {
                 return None;
             }
             return Some(relay_payload);
@@ -25792,17 +25842,31 @@ impl AppState {
                 {
                     return false;
                 }
-                self.commit_child_candidate(
-                    &finish.keys[0],
-                    &finish.xite,
-                    &finish.inner_path,
-                    bytes,
-                    finish.child_files.as_deref().unwrap_or_default(),
-                    &finish.transaction,
-                    &mut finish.payload,
-                )
-                .await
-                .is_ok()
+                match self
+                    .commit_child_candidate(
+                        &finish.keys[0],
+                        &finish.xite,
+                        &finish.inner_path,
+                        bytes,
+                        finish.child_files.as_deref().unwrap_or_default(),
+                        &finish.transaction,
+                        &mut finish.payload,
+                    )
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(error) => {
+                        self.log(
+                            "WARN",
+                            format!(
+                                "Child commit {}/{} failed; deferring: {error}",
+                                finish.keys[0], finish.inner_path
+                            ),
+                        )
+                        .await;
+                        false
+                    }
+                }
             }
             (Some(_), _, _) => false,
             (None, _, None) => true,
@@ -25926,7 +25990,19 @@ impl AppState {
     async fn finish_inbound_update(self: &Arc<Self>, mut finish: InboundFinish) -> bool {
         let key = finish.keys[0].clone();
         let canonical = canonical_address(finish.xite.content.as_ref(), &key);
-        let (_, staged_for_fetch) = Self::inbound_staged_content(&finish);
+        let (child_content, staged_for_fetch) = Self::inbound_staged_content(&finish);
+        let child_content = child_content.or_else(|| {
+            finish.child_files.is_some().then(|| {
+                finish
+                    .xite
+                    .storage
+                    .read(&finish.inner_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            }).flatten()
+        });
+        let unfetchable =
+            Self::unfetchable_child_paths(&finish.inner_path, child_content.as_ref());
         let mut arrived = self.apply_inbound_diffs(&finish, &key).await;
         let mut needed = Self::inbound_files_needed(&finish);
         self.fetch_inbound_live_source(
@@ -25943,13 +26019,14 @@ impl AppState {
             &mut arrived,
         )
         .await;
-        let missing_child = finish
+        let mut missing_child = finish
             .child_files
             .as_ref()
             .map(|files| {
                 Self::missing_child_files(&finish.xite.storage, files, &finish.transaction)
             })
             .unwrap_or_default();
+        missing_child.retain(|path| !unfetchable.contains(path));
         let committed = self.commit_inbound_manifest(&mut finish, &missing_child).await;
         let relay_ready = committed;
         let merge_failed = false;
@@ -42592,14 +42669,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_file_without_b3_still_blocks_child_availability() {
+    async fn required_file_without_b3_does_not_block_child_availability() {
+        // A pre-EDX entry (no b3, no files_shard descriptor) can never arrive
+        // over EDX, so waiting on it would park the child forever and erase
+        // every user signed before the b3 rollout. The manifest commits and
+        // the legacy file stays absent until a verified diff lands it or the
+        // owner re-signs.
         let (_dir, state, xite, storage, child, _posts, author_key) = inline_merge_fixture().await;
-        let previous = storage.read(&child).unwrap();
         let body = b"legacy required bytes";
-        let file_path = child
-            .strip_suffix("content.json")
-            .map(|dir| format!("{dir}legacy.bin"))
-            .unwrap();
         let mut next = json!({
             "address": xite.clone(),
             "inner_path": child.clone(),
@@ -42630,16 +42707,11 @@ mod tests {
             )
             .await;
         assert!(
-            result.is_err(),
-            "unfetchable required file received an availability ACK"
+            result.is_ok(),
+            "an unfetchable legacy file must not block the child commit: {result:?}"
         );
-        assert_eq!(storage.read(&child).unwrap(), previous);
-        assert_eq!(state.pending_child_relays.lock().unwrap().len(), 1);
-
-        storage.write(&file_path, body).unwrap();
-        state.retry_pending_child_relays().await;
-        assert!(state.pending_child_relays.lock().unwrap().is_empty());
         assert_eq!(storage.read(&child).unwrap(), next_bytes);
+        assert!(state.pending_child_relays.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

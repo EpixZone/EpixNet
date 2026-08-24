@@ -6,3 +6,6 @@ description = "Small platform filesystem primitives with explicit durability sem
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1", features = ["fs"] }
