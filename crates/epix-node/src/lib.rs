@@ -2168,7 +2168,17 @@ async fn sync_included_content(
     if paths.is_empty() {
         return (0, Vec::new());
     }
-    let peers = prioritize_child_peer(peers, live_peer.as_ref());
+    let swarm = prioritize_child_peer(peers, live_peer.as_ref());
+    // Deterministic fast path: the live peer just answered listModified over
+    // a warm link and (as a full seeder) holds every manifest and object, so
+    // the whole pass rides that ONE link - no widen windows, no dials into
+    // junk swarm peers, no sweep across dead circuits. The variance between
+    // a 10-second and a 3-minute pass was exactly those extra dials. The
+    // full swarm is the fallback when the single peer serves nothing.
+    let peers = match &live_peer {
+        Some(live) => vec![live.clone()],
+        None => swarm.clone(),
+    };
     let ordered = order_child_manifest_paths(paths, feed_order);
     prewarm_child_signers(&ordered, t0).await;
 
@@ -2179,7 +2189,17 @@ async fn sync_included_content(
         state.begin_child_sync(address).await;
     }
     let (child_files, arrived) =
-        sync_child_manifest_levels(xite, &peers, progress, address, ordered, t0).await;
+        sync_child_manifest_levels(xite, &peers, progress, address, ordered.clone(), t0).await;
+    let (child_files, arrived) = if arrived.is_empty()
+        && child_files.is_empty()
+        && live_peer.is_some()
+        && swarm.len() > 1
+    {
+        trace_clone!(t0, "live-peer pass served nothing, retrying over the swarm");
+        sync_child_manifest_levels(xite, &swarm, progress, address, ordered, t0).await
+    } else {
+        (child_files, arrived)
+    };
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
     fetch_changed_child_merges(progress, address, &arrived, &peers).await;
     let arrived =
