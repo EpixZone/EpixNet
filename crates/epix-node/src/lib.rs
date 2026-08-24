@@ -1225,9 +1225,22 @@ async fn clone_xite_with_progress(
     finish_clone_first_paint(progress, address, peer_count);
 
     trace_clone!(t0, "CORE SET COMPLETE (first paint)");
-    let (bytes_recv, user_files) = sync_clone_children(&mut xite, progress, address, t0).await;
-    trace_clone!(t0, "clone DONE, {} user file(s) arrived", user_files.len());
-    Ok((xite.content.clone(), bytes_recv, user_files))
+    // User content streams in on its own task through the same entry the
+    // periodic resync uses: the page is already served, each post ingests
+    // and pushes its event as it lands, and a slow (or wedged) user fetch
+    // can never hold the clone open or die with it. The clone itself is
+    // done at first paint.
+    if let Some(state) = progress {
+        let state = state.clone();
+        let spawn_address = address.to_string();
+        tokio::spawn(async move {
+            state.sync_user_content(&spawn_address).await;
+        });
+    } else {
+        let _ = sync_clone_children(&mut xite, progress, address, t0).await;
+    }
+    trace_clone!(t0, "clone DONE, user content streaming in the background");
+    Ok((xite.content.clone(), 0, Vec::new()))
 }
 
 /// The peer set to use for the included-content pass: the live registry when a
@@ -1964,8 +1977,17 @@ fn start_child_list_probes(
         let state = progress.cloned();
         let address = address.to_string();
         probes.spawn(async move {
+            // A probe that can hang (a Tor circuit that neither answers nor
+            // errors) must not stall the whole user-content pass; observed
+            // live on Android. The listing race only needs ONE answer.
             let list = match state {
-                Some(state) => fetch_list_modified(&state, &peer, &address).await,
+                Some(state) => tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    fetch_list_modified(&state, &peer, &address),
+                )
+                .await
+                .ok()
+                .flatten(),
                 None => None,
             };
             (peer, list)
@@ -2305,6 +2327,10 @@ struct OnDemand {
     state: Arc<AppState>,
     data_root: PathBuf,
     trackers: Vec<epix_xite::Tracker>,
+    /// Self-handle so `ensure` can detach the clone onto its own task: the
+    /// caller is an HTTP request future, and a browser that gives up on the
+    /// blocked request must not cancel the clone mid-download.
+    me: std::sync::Weak<OnDemand>,
     /// Names currently being cloned, so concurrent requests coalesce.
     in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
     /// Whether Tor is expected to come up (mode != Disable). Gates the
@@ -2364,9 +2390,32 @@ impl epix_ui::OnDemandResolver for OnDemand {
             }
             inflight.insert(address.clone());
         }
-        let result = self.do_ensure(host, &address).await;
-        self.in_flight.lock().await.remove(&address);
-        result
+        // Run the clone on its OWN task. This future belongs to the HTTP
+        // request that hit the missing xite; a browser that times out or
+        // retries that request drops the future, and an inline clone died
+        // with it mid-download (leaving the in-flight entry stuck, so every
+        // later attempt waited on a corpse). Detached, the clone always runs
+        // to completion and clears its slot; this caller just waits for the
+        // xite to register, which is safe to cancel.
+        let Some(this) = self.me.upgrade() else {
+            self.in_flight.lock().await.remove(&address);
+            return Err("node is shutting down".into());
+        };
+        let spawn_host = host.to_string();
+        let spawn_address = address.clone();
+        tokio::spawn(async move {
+            let result = this.do_ensure(&spawn_host, &spawn_address).await;
+            if let Err(error) = result {
+                this.state
+                    .log(
+                        "WARNING",
+                        format!("On-demand clone of {spawn_host} failed: {error}"),
+                    )
+                    .await;
+            }
+            this.in_flight.lock().await.remove(&spawn_address);
+        });
+        self.wait_for_inflight(&address).await
     }
 
     async fn resolve(&self, host: &str) -> Option<String> {
@@ -2811,10 +2860,11 @@ async fn serve(
 
     // On-demand resolve + clone: typing any `talk.epix` in the browser clones
     // and serves it live.
-    let on_demand = Arc::new(OnDemand {
+    let on_demand = Arc::new_cyclic(|me| OnDemand {
         state: state.clone(),
         data_root: opts.data_root.clone(),
         trackers: trackers.clone(),
+        me: me.clone(),
         in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
         tor_expected: std::sync::atomic::AtomicBool::new(false),
         tor_always: std::sync::atomic::AtomicBool::new(false),
