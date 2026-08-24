@@ -23689,13 +23689,25 @@ impl AppState {
         if content_paths.is_empty() || !self.is_serving(address).await {
             return;
         }
-        let mut peers = self.connectable_peers(address, 8).await;
+        // Hint peers FIRST: the caller passes the live link that just served
+        // the manifests, warm and proven. The registry's top slots are often
+        // squatted by junk announce peers (dead onions, BitTorrent ports)
+        // whose failed dials cost 15-40s each - appending the hints only when
+        // room was left meant the one known-good peer was never dialed at
+        // all, and a fresh clone's merge fetch ground through the junk for
+        // minutes (observed live: 94 failed dials before any merge data).
+        let mut peers: Vec<PeerAddr> = Vec::new();
         for p in hint_peers {
+            if !peers.contains(p) {
+                peers.push(p.clone());
+            }
+        }
+        for p in self.connectable_peers(address, 8).await {
             if peers.len() >= 8 {
                 break;
             }
-            if !peers.contains(p) {
-                peers.push(p.clone());
+            if !peers.contains(&p) {
+                peers.push(p);
             }
         }
         if peers.is_empty() {
