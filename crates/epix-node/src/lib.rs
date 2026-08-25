@@ -1225,9 +1225,22 @@ async fn clone_xite_with_progress(
     finish_clone_first_paint(progress, address, peer_count);
 
     trace_clone!(t0, "CORE SET COMPLETE (first paint)");
-    let (bytes_recv, user_files) = sync_clone_children(&mut xite, progress, address, t0).await;
-    trace_clone!(t0, "clone DONE, {} user file(s) arrived", user_files.len());
-    Ok((xite.content.clone(), bytes_recv, user_files))
+    // User content streams in on its own task through the same entry the
+    // periodic resync uses: the page is already served, each post ingests
+    // and pushes its event as it lands, and a slow (or wedged) user fetch
+    // can never hold the clone open or die with it. The clone itself is
+    // done at first paint.
+    if let Some(state) = progress {
+        let state = state.clone();
+        let spawn_address = address.to_string();
+        tokio::spawn(async move {
+            state.sync_user_content(&spawn_address).await;
+        });
+    } else {
+        let _ = sync_clone_children(&mut xite, progress, address, t0).await;
+    }
+    trace_clone!(t0, "clone DONE, user content streaming in the background");
+    Ok((xite.content.clone(), 0, Vec::new()))
 }
 
 /// The peer set to use for the included-content pass: the live registry when a
@@ -1261,14 +1274,27 @@ async fn apply_fetched_child_manifest(
             modified,
             None,
             None,
-            epix_ui::state::UpdatePayload::default(),
+            epix_ui::state::UpdatePayload {
+                // The level loop must not stall on one child's slow file
+                // fetch: stage the manifest, batch the files afterwards.
+                defer_required_fetch: true,
+                ..epix_ui::state::UpdatePayload::default()
+            },
             peer_fallbacks.clone(),
         )
     })
     .await
 }
 
-const CHILD_MANIFEST_PAGE_SIZE: usize = 4;
+// One page = one GetSigned session round. Applies no longer pull files
+// inline (defer_required_fetch), so a page is cheap to consume and a whole
+// level should ride a single round instead of serial sessions of 4.
+const CHILD_MANIFEST_PAGE_SIZE: usize = 64;
+// Straggler bounds for one level's manifest fetch: keep waiting while items
+// stream, but once the level is at least GRACE old and the stream has been
+// IDLE-quiet, hand the leftovers to the periodic resync.
+const CHILD_MANIFEST_FETCH_GRACE: std::time::Duration = std::time::Duration::from_secs(12);
+const CHILD_MANIFEST_FETCH_IDLE: std::time::Duration = std::time::Duration::from_secs(6);
 const CHILD_MANIFEST_LIMIT: usize = 100_000;
 const CHILD_DATA_PAGE_SIZE: usize = 32;
 const CHILD_APPLY_CONCURRENCY: usize = 4;
@@ -1379,11 +1405,11 @@ async fn report_child_manifest_failure(
             format!("Could not expose {inner_path}: {detail}"),
         )
         .await;
-    state.push_clone_event(
-        address,
-        serde_json::json!(["file_failed", inner_path]),
-        serde_json::json!({ "error": detail }),
-    );
+    // Log only: a per-child hiccup is retried by the resync (and legacy
+    // no-b3 files can never arrive), while a `file_failed` clone event paints
+    // the loading screen red mid-download - "download failed" over a clone
+    // that is succeeding. Red stays reserved for the core set.
+    let _ = address;
 }
 
 type ChildManifestResult = (Result<epix_ui::state::InboundUpdate, String>, Vec<String>);
@@ -1456,16 +1482,43 @@ async fn fetch_child_manifest_candidates(
     let delivery_failures = Arc::new(std::sync::Mutex::new(HashSet::new()));
     let callback_delivered = delivered.clone();
     let callback_failures = delivery_failures.clone();
+    let progress_mark = Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+    let callback_progress = progress_mark.clone();
     let on_item: epix_ui::state::EdxSignedProgress = Arc::new(move |path: &str, bytes: &[u8]| {
         if !callback_delivered.lock().unwrap().insert(path.to_string()) {
             return;
         }
+        // Progress = a NEW manifest: duplicate re-deliveries from extra peers
+        // must not keep the idle-abort from ever firing.
+        *callback_progress.lock().unwrap() = std::time::Instant::now();
         if let Err(error) = tx.try_send((path.to_string(), bytes.to_vec())) {
             let (failed_path, _) = error.into_inner();
             callback_failures.lock().unwrap().insert(failed_path);
         }
     });
-    let fetch = state.edx_fetch_signed_many(address, wants, peers.to_vec(), Some(on_item));
+    // A path no reachable peer serves must not hold the whole level hostage
+    // for the fetcher's full background patience: once the stream has been
+    // quiet past the idle window (after a cold-session grace), abandon the
+    // stragglers - everything streamed so far is already applied, and the
+    // periodic resync retries the rest without blocking first paint.
+    let fetch_inner = state.edx_fetch_signed_many(address, wants, peers.to_vec(), Some(on_item));
+    let fetch = async {
+        let started = std::time::Instant::now();
+        tokio::pin!(fetch_inner);
+        loop {
+            tokio::select! {
+                fetched = &mut fetch_inner => break fetched,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {
+                    let idle = progress_mark.lock().unwrap().elapsed();
+                    if started.elapsed() >= CHILD_MANIFEST_FETCH_GRACE
+                        && idle >= CHILD_MANIFEST_FETCH_IDLE
+                    {
+                        break None;
+                    }
+                }
+            }
+        }
+    };
     let consumer_state = state.clone();
     let consumer_address = address.to_string();
     let consumer_peers = peers.to_vec();
@@ -1552,6 +1605,9 @@ async fn apply_child_manifest_results(
                 current.push(path);
             }
             Some((Ok(epix_ui::state::InboundUpdate::NotChanged), _)) => current.push(path),
+            // Staged for the post-level batch fetch: not on disk yet, and not
+            // a failure - the pending relay commits it once its files land.
+            Some((Ok(epix_ui::state::InboundUpdate::Deferred), _)) => {}
             Some((Err(error), legacy)) => {
                 report_child_manifest_failure(state, address, &path, &error, &legacy).await;
                 if has_old_disk {
@@ -1781,13 +1837,10 @@ async fn report_unavailable_child_files(
         counted_path_sample(files.count, &files.sample)
     );
     state.log("WARNING", format!("{address}: {error}")).await;
-    for inner_path in &files.sample {
-        state.push_clone_event(
-            address,
-            serde_json::json!(["file_failed", inner_path]),
-            serde_json::json!({ "error": error }),
-        );
-    }
+    // Log only, same reasoning as report_child_manifest_failure: user content
+    // is best-effort streaming, and most of these are legacy files that can
+    // never arrive until their owner re-signs. Painting the loading screen
+    // red for them misreported every clone of a xite with legacy users.
 }
 
 async fn fetch_child_data_page(
@@ -1796,6 +1849,7 @@ async fn fetch_child_data_page(
     address: &str,
     peers: &[PeerAddr],
     page: Vec<epix_xite::FileEntry>,
+    staged: Option<&serde_json::Value>,
 ) -> (Vec<String>, Vec<epix_xite::FileEntry>) {
     use std::collections::HashSet;
 
@@ -1819,7 +1873,7 @@ async fn fetch_child_data_page(
                 callback_failures.lock().unwrap().insert(error.into_inner());
             }
         });
-    let fetch = state.edx_first(address, page, peers.to_vec(), None, None, Some(on_file));
+    let fetch = state.edx_first(address, page, peers.to_vec(), staged, None, Some(on_file));
     let ingest_state = state.clone();
     let ingest_address = address.to_string();
     let ingest = async move {
@@ -1865,6 +1919,7 @@ async fn fetch_child_data_files(
     address: &str,
     peers: &[PeerAddr],
     needed: Vec<epix_xite::FileEntry>,
+    staged: Option<&serde_json::Value>,
 ) -> Vec<String> {
     let total = needed.len();
     state
@@ -1891,10 +1946,16 @@ async fn fetch_child_data_files(
             announced = true;
         }
         let (mut page_arrived, page_unavailable) =
-            fetch_child_data_page(xite, state, address, peers, page).await;
+            fetch_child_data_page(xite, state, address, peers, page, staged).await;
         arrived.append(&mut page_arrived);
-        for file in page_unavailable {
-            unavailable.record(state, address, file.inner_path).await;
+        // A staged (deferred-children) batch is a store prefetch: its files
+        // cannot materialize until the promote pass commits their manifests,
+        // so every one of them "misses" here by design. Reporting them as
+        // failed would light the dashboard's failure pill for a normal clone.
+        if staged.is_none() {
+            for file in page_unavailable {
+                unavailable.record(state, address, file.inner_path).await;
+            }
         }
     }
     if unavailable.count > 0 {
@@ -1913,8 +1974,17 @@ fn start_child_list_probes(
         let state = progress.cloned();
         let address = address.to_string();
         probes.spawn(async move {
+            // A probe that can hang (a Tor circuit that neither answers nor
+            // errors) must not stall the whole user-content pass; observed
+            // live on Android. The listing race only needs ONE answer.
             let list = match state {
-                Some(state) => fetch_list_modified(&state, &peer, &address).await,
+                Some(state) => tokio::time::timeout(
+                    std::time::Duration::from_secs(20),
+                    fetch_list_modified(&state, &peer, &address),
+                )
+                .await
+                .ok()
+                .flatten(),
                 None => None,
             };
             (peer, list)
@@ -2069,7 +2139,7 @@ async fn sync_declared_child_data(
     let Some(state) = progress else {
         return arrived;
     };
-    let mut data_arrived = fetch_child_data_files(xite, state, address, peers, needed).await;
+    let mut data_arrived = fetch_child_data_files(xite, state, address, peers, needed, None).await;
     arrived.append(&mut data_arrived);
     arrived
 }
@@ -2095,17 +2165,116 @@ async fn sync_included_content(
     if paths.is_empty() {
         return (0, Vec::new());
     }
-    let peers = prioritize_child_peer(peers, live_peer.as_ref());
+    let swarm = prioritize_child_peer(peers, live_peer.as_ref());
     let ordered = order_child_manifest_paths(paths, feed_order);
+    // Deterministic fast path: the live peer just answered listModified over
+    // a warm link and (as a full seeder) holds every manifest and object, so
+    // the whole pass rides that ONE link - no widen windows, no dials into
+    // junk swarm peers, no sweep across dead circuits. The variance between
+    // a 10-second and a 3-minute pass was exactly those extra dials. The
+    // full swarm is the fallback when the single peer serves nothing.
+    //
+    // Above SWARM_FANOUT_CHILDREN children the pass is bandwidth-bound, not
+    // dial-latency-bound, so the extra dials pay for themselves: spread the
+    // levels and the batch across the whole swarm instead.
+    const SWARM_FANOUT_CHILDREN: usize = 40;
+    let single_live = live_peer.is_some() && ordered.len() <= SWARM_FANOUT_CHILDREN;
+    let peers = match &live_peer {
+        Some(live) if single_live => vec![live.clone()],
+        _ => {
+            if live_peer.is_some() {
+                trace_clone!(
+                    t0,
+                    "{} children, fanning out over {} swarm peer(s)",
+                    ordered.len(),
+                    swarm.len()
+                );
+            }
+            swarm.clone()
+        }
+    };
     prewarm_child_signers(&ordered, t0).await;
 
+    // While the levels run, inbound pushes for this xite's children defer
+    // instead of fetching inline (see active_child_syncs): a push holding a
+    // child's manifest guard across a slow pull would stall the level pass.
+    if let Some(state) = progress {
+        state.begin_child_sync(address).await;
+    }
     let (child_files, arrived) =
-        sync_child_manifest_levels(xite, &peers, progress, address, ordered, t0).await;
+        sync_child_manifest_levels(xite, &peers, progress, address, ordered.clone(), t0).await;
+    let (child_files, arrived) = if arrived.is_empty()
+        && child_files.is_empty()
+        && single_live
+        && swarm.len() > 1
+    {
+        trace_clone!(t0, "live-peer pass served nothing, retrying over the swarm");
+        sync_child_manifest_levels(xite, &swarm, progress, address, ordered, t0).await
+    } else {
+        (child_files, arrived)
+    };
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
-    fetch_changed_child_merges(progress, address, &arrived, &peers).await;
+    // The merge sweep is best-effort freshness, not correctness: committed
+    // children's merge files ride the declared-data batch below, deferred
+    // children carry their merge payloads into the promote, and the periodic
+    // anti-entropy pass (resync_merge_files) unions records on its own
+    // schedule. When manifests just arrived, the sweep re-fetches what this
+    // pass already carries - and its union fetch can hang (observed live:
+    // 10 seconds of a 26 second clone burned on a sweep that delivered
+    // nothing). Run it only on quiet passes, still bounded.
+    if arrived.is_empty() {
+        if tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            fetch_changed_child_merges(progress, address, &arrived, &peers),
+        )
+        .await
+        .is_err()
+        {
+            trace_clone!(t0, "merge sweep timed out, continuing");
+        } else {
+            trace_clone!(t0, "merge sweep done");
+        }
+    } else {
+        trace_clone!(t0, "merge sweep skipped, {} fresh manifest(s)", arrived.len());
+    }
     let arrived =
         sync_declared_child_data(xite, progress, address, &peers, child_files, arrived).await;
+    trace_clone!(t0, "declared data done");
+    sync_deferred_children(xite, progress, address, &peers, t0).await;
+    if let Some(state) = progress {
+        state.end_child_sync(address).await;
+    }
     (0, arrived)
+}
+
+/// Complete the children the level pass staged with `defer_required_fetch`:
+/// pull every still-missing file in ONE batch over the proven clone peers,
+/// then promote the pending relays so the manifests commit now instead of on
+/// the periodic retry. Files the batch could not land stay pending; the
+/// retry pass keeps working on them as before.
+async fn sync_deferred_children(
+    xite: &Xite,
+    progress: Option<&Arc<AppState>>,
+    address: &str,
+    peers: &[PeerAddr],
+    t0: std::time::Instant,
+) {
+    let Some(state) = progress else {
+        return;
+    };
+    let (needed, staged) = state.deferred_child_batch(address).await;
+    if !needed.is_empty() {
+        trace_clone!(
+            t0,
+            "deferred child batch START, {} file(s)",
+            needed.len()
+        );
+        let landed =
+            fetch_child_data_files(xite, state, address, peers, needed, Some(&staged)).await;
+        trace_clone!(t0, "deferred child batch done, {} landed", landed.len());
+    }
+    state.promote_deferred_children().await;
+    trace_clone!(t0, "deferred children promoted");
 }
 
 /// Every non-root `content.json` under `root` (per-user / included content
@@ -2210,12 +2379,39 @@ async fn fetch_content(
 /// yet served, resolve it on-chain, clone it, and add it as a served xite keyed
 /// by its bech32 address (the name is display metadata), so typing any
 /// `talk.epix` opens it live.
+/// One running on-demand clone: when it started (for staleness), its task
+/// handle (so a stale one can be killed), and its token (see
+/// `in_flight_token`).
+struct InflightClone {
+    token: u64,
+    started: std::time::Instant,
+    abort: Option<tokio::task::AbortHandle>,
+}
+
+/// A clone that has held its slot this long without ever registering the
+/// xite is treated as wedged: it is aborted and a fresh attempt takes over.
+/// A healthy clone registers within seconds (the entry is created before any
+/// network work), so only a stuck task or one whose xite was deleted out
+/// from under it can trip this.
+const STALE_CLONE_STEAL: std::time::Duration = std::time::Duration::from_secs(90);
+
 struct OnDemand {
     state: Arc<AppState>,
     data_root: PathBuf,
     trackers: Vec<epix_xite::Tracker>,
-    /// Names currently being cloned, so concurrent requests coalesce.
-    in_flight: tokio::sync::Mutex<std::collections::HashSet<String>>,
+    /// Self-handle so `ensure` can detach the clone onto its own task: the
+    /// caller is an HTTP request future, and a browser that gives up on the
+    /// blocked request must not cancel the clone mid-download.
+    me: std::sync::Weak<OnDemand>,
+    /// Clones currently running, so concurrent requests coalesce - and so a
+    /// wedged one can be recognized and replaced instead of squatting its
+    /// address forever (the delete-then-redownload hang: the fresh attempt
+    /// waited eternally on a stuck predecessor's slot).
+    in_flight: tokio::sync::Mutex<std::collections::HashMap<String, InflightClone>>,
+    /// Distinguishes an entry from its replacement after a steal, so a stuck
+    /// task that finally dies cannot remove the slot of the clone that took
+    /// over from it.
+    in_flight_token: std::sync::atomic::AtomicU64,
     /// Whether Tor is expected to come up (mode != Disable). Gates the
     /// cold-start wait in `await_tor_ready`. Set once, after the Tor mode is
     /// resolved in `serve`.
@@ -2265,17 +2461,51 @@ impl epix_ui::OnDemandResolver for OnDemand {
         // epix1… address run twice in parallel, interleaving two independent
         // progress streams on the loading screen - the N/M file counter
         // visibly bounced and each stream's completion reset the bar.
+        let served = self.state.has_xite(&address).await;
+        let Some(token) = self.claim_clone_slot(&address, served).await else {
+            // A live clone is working on it (it registers the xite within
+            // seconds, and re-registration after a delete restarts the clock
+            // via a fresh entry): coalesce.
+            return self.wait_for_inflight(&address).await;
+        };
+        // Run the clone on its OWN task. This future belongs to the HTTP
+        // request that hit the missing xite; a browser that times out or
+        // retries that request drops the future, and an inline clone died
+        // with it mid-download (leaving the in-flight entry stuck, so every
+        // later attempt waited on a corpse). Detached, the clone always runs
+        // to completion and clears its slot; this caller just waits for the
+        // xite to register, which is safe to cancel.
+        let Some(this) = self.me.upgrade() else {
+            self.in_flight.lock().await.remove(&address);
+            return Err("node is shutting down".into());
+        };
+        let spawn_host = host.to_string();
+        let spawn_address = address.clone();
+        let handle = tokio::spawn(async move {
+            let result = this.do_ensure(&spawn_host, &spawn_address).await;
+            if let Err(error) = result {
+                this.state
+                    .log(
+                        "WARNING",
+                        format!("On-demand clone of {spawn_host} failed: {error}"),
+                    )
+                    .await;
+            }
+            // Only clear OUR slot: a stolen entry belongs to the replacement.
+            let mut inflight = this.in_flight.lock().await;
+            if inflight.get(&spawn_address).is_some_and(|entry| entry.token == token) {
+                inflight.remove(&spawn_address);
+            }
+        });
         {
             let mut inflight = self.in_flight.lock().await;
-            if inflight.contains(&address) {
-                drop(inflight);
-                return self.wait_for_inflight(&address).await;
+            if let Some(entry) = inflight.get_mut(&address) {
+                if entry.token == token {
+                    entry.abort = Some(handle.abort_handle());
+                }
             }
-            inflight.insert(address.clone());
         }
-        let result = self.do_ensure(host, &address).await;
-        self.in_flight.lock().await.remove(&address);
-        result
+        self.wait_for_inflight(&address).await
     }
 
     async fn resolve(&self, host: &str) -> Option<String> {
@@ -2372,6 +2602,46 @@ impl epix_ui::ContentSyncer for OnDemand {
 }
 
 impl OnDemand {
+    /// Claim the in-flight slot for `address`, stealing it from a wedged
+    /// predecessor (one that never registered its xite inside
+    /// `STALE_CLONE_STEAL`, or whose xite was deleted out from under it -
+    /// the delete-then-redownload hang). Returns the claim token, or `None`
+    /// when a live clone already owns the slot and the caller should
+    /// coalesce onto it.
+    async fn claim_clone_slot(&self, address: &str, served: bool) -> Option<u64> {
+        let mut inflight = self.in_flight.lock().await;
+        if let Some(entry) = inflight.get(address) {
+            if served || entry.started.elapsed() < STALE_CLONE_STEAL {
+                return None;
+            }
+            self.state
+                .log(
+                    "WARNING",
+                    format!(
+                        "Replacing a stuck clone of {address} ({}s old)",
+                        entry.started.elapsed().as_secs()
+                    ),
+                )
+                .await;
+            if let Some(abort) = &entry.abort {
+                abort.abort();
+            }
+            inflight.remove(address);
+        }
+        let token = self
+            .in_flight_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inflight.insert(
+            address.to_string(),
+            InflightClone {
+                token,
+                started: std::time::Instant::now(),
+                abort: None,
+            },
+        );
+        Some(token)
+    }
+
     /// Block (bounded) until the in-process Tor transport is installed, so a
     /// cold-start clone of an onion-seeded xite dials through Tor instead of
     /// the plain TCP transport the node holds until Arti finishes bootstrapping.
@@ -2437,7 +2707,7 @@ impl OnDemand {
             if self.state.has_xite(address).await {
                 return Ok(());
             }
-            if !self.in_flight.lock().await.contains(address) {
+            if !self.in_flight.lock().await.contains_key(address) {
                 break; // the working clone finished (or failed)
             }
         }
@@ -2720,11 +2990,13 @@ async fn serve(
 
     // On-demand resolve + clone: typing any `talk.epix` in the browser clones
     // and serves it live.
-    let on_demand = Arc::new(OnDemand {
+    let on_demand = Arc::new_cyclic(|me| OnDemand {
         state: state.clone(),
         data_root: opts.data_root.clone(),
         trackers: trackers.clone(),
-        in_flight: tokio::sync::Mutex::new(std::collections::HashSet::new()),
+        me: me.clone(),
+        in_flight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+        in_flight_token: std::sync::atomic::AtomicU64::new(0),
         tor_expected: std::sync::atomic::AtomicBool::new(false),
         tor_always: std::sync::atomic::AtomicBool::new(false),
     });

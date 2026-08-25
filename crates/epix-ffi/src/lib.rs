@@ -81,9 +81,18 @@ impl EpixNode {
     /// Create an idle node. Call [`EpixNode::start`] to boot it.
     #[uniffi::constructor]
     pub fn new() -> Arc<Self> {
+        // Two workers starved the whole node on phones: the embedded I2P
+        // router keeps one busy with tunnel crypto, leaving a single thread
+        // to run every fetch, timer, and commit - a fresh clone's user
+        // content took minutes because the runtime, not the network, was the
+        // bottleneck. Scale with the device, floor of 4.
+        let workers = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .unwrap_or(4)
+            .clamp(4, 8);
         let rt = tokio::runtime::Builder::new_multi_thread()
             .enable_all()
-            .worker_threads(2)
+            .worker_threads(workers)
             .build()
             .expect("build tokio runtime");
         Arc::new(Self {

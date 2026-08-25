@@ -146,6 +146,9 @@ class MainActivity : AppCompatActivity() {
         setContentView(container)
 
         runtime = GeckoRuntime.getDefault(this)
+        // DEBUG (local): page console + JS errors to logcat, DevTools socket
+        runtime.settings.consoleOutputEnabled = true
+        runtime.settings.remoteDebuggingEnabled = true
         installWallet()
         newTab(GeckoSession().apply { open(runtime) })
         // The page, not the address bar, starts focused - otherwise the

@@ -1125,6 +1125,7 @@ impl SignedProvider for AppStateProvider {
             merge_deltas: decoded.deltas,
             merge_objects: decoded.objects,
             require_merge_delivery,
+            defer_required_fetch: false,
         };
         let sender_peers: Vec<PeerAddr> =
             sender_peers.iter().filter_map(|s| PeerAddr::parse(s).ok()).take(5).collect();
@@ -1165,6 +1166,9 @@ impl SignedProvider for AppStateProvider {
         {
             Ok(InboundUpdate::Applied) => Ok(true),
             Ok(InboundUpdate::NotChanged) => Ok(false),
+            // Live pushes never set defer_required_fetch, so a deferral here
+            // is unreachable; answer like NotChanged rather than panic.
+            Ok(InboundUpdate::Deferred) => Ok(false),
             Err(e) => Err(e),
         }
     }
@@ -1611,6 +1615,11 @@ impl LinkActivityState {
 #[derive(Default)]
 struct LinkPool {
     conns: Mutex<HashMap<LinkKey, PooledLink>>,
+    /// Recent dial FAILURES, so back-to-back passes (a clone's merge sweep,
+    /// the union fetch per merge file) do not re-dial the same dead peer and
+    /// pay its 15-40s timeout again for every file. Success clears the entry;
+    /// a failed peer becomes dialable again after [`LINK_NEGATIVE_TTL`].
+    failed: Mutex<HashMap<LinkKey, std::time::Instant>>,
     /// One dial in flight per peer and lane. Looking the cache up and then
     /// dialing is a check-then-act: the announce, PEX and updates loops run on
     /// their own timers and land on the same contact together, so each would
@@ -1670,6 +1679,11 @@ type LaneResult =
 /// row. Short RPCs are seconds apart when active, so re-dialing after a quiet
 /// stretch costs one handshake.
 const LINK_POOL_IDLE: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// How long a failed dial keeps its peer+lane out of new dial attempts. Long
+/// enough to cover one sync pass's fan-out over many files; short enough that
+/// a recovered peer is retried on the next periodic pass.
+const LINK_NEGATIVE_TTL: std::time::Duration = std::time::Duration::from_secs(45);
 
 impl LinkPool {
     /// A live pooled link for `peer`, or None. A closed one is dropped so the
@@ -1742,6 +1756,13 @@ impl LinkPool {
         if let Some(hit) = self.live(peer, lane) {
             return Ok(hit);
         }
+        {
+            let mut failed = self.failed.lock().expect("link pool");
+            failed.retain(|_, at| at.elapsed() < LINK_NEGATIVE_TTL);
+            if failed.contains_key(&(peer.clone(), lane)) {
+                return Err("recent dial failure (negative cache)".to_string());
+            }
+        }
         let gate = self.dial_gate(peer, lane);
         let Ok(_held) = gate.try_lock() else {
             // Another caller is dialing this very peer and lane. Wait it out
@@ -1754,7 +1775,17 @@ impl LinkPool {
         if let Some(hit) = self.live(peer, lane) {
             return Ok(hit);
         }
-        let opened = dial().await?;
+        let opened = match dial().await {
+            Ok(opened) => opened,
+            Err(error) => {
+                self.failed
+                    .lock()
+                    .expect("link pool")
+                    .insert((peer.clone(), lane), std::time::Instant::now());
+                return Err(error);
+            }
+        };
+        self.failed.lock().expect("link pool").remove(&(peer.clone(), lane));
         let link = (
             opened.0.clone(),
             opened.1.clone(),
@@ -8248,6 +8279,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 }),
                 Arc::new(Vec::new()),
                 progress.clone(),
@@ -8443,6 +8475,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), delta.clone())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 }),
                 Arc::new(Vec::new()),
                 progress.clone(),
@@ -8650,6 +8683,7 @@ mod tests {
             merge_deltas: HashMap::from([("posts.json".to_string(), delta)]),
             merge_objects: HashMap::new(),
             require_merge_delivery: false,
+            defer_required_fetch: false,
         };
 
         let progress = Arc::new(epix_ui::state::EdxPushProgress::default());
