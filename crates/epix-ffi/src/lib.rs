@@ -10,6 +10,7 @@
 //! this crate's exported types (proc-macro mode - no UDL).
 
 use epix_node::{boot, AppState, NodeOptions, RunningNode};
+extern "C" { #[link_name = "dup2"] fn libc_dup2(oldfd: i32, newfd: i32) -> i32; }
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
@@ -124,6 +125,17 @@ impl EpixNode {
         // the map and no dots render (the mobile shells used to pass None here).
         const GEOIP_CITY_GZ: &[u8] =
             include_bytes!("../../epix-server/assets/dbip-city-lite.mmdb.gz");
+        // Capture native output next to the node's data: mirror this
+        // process's stderr (panics, native library output) into
+        // native-stderr.log. The file must stay open for the process
+        // lifetime - stderr writes through it from here on - so ownership of
+        // the descriptor is released instead of letting drop close it.
+        unsafe { std::env::set_var("EPIX_TRACE_CLONE", "1") };
+        let log_dir = std::path::PathBuf::from(&config.data_dir);
+        if let Ok(file) = std::fs::File::create(log_dir.join("native-stderr.log")) {
+            use std::os::unix::io::IntoRawFd;
+            unsafe { libc_dup2(file.into_raw_fd(), 2) };
+        }
         let opts = NodeOptions {
             data_root: config.data_dir.into(),
             target: config.target,
@@ -131,7 +143,7 @@ impl EpixNode {
             tor_mode: config.tor_mode,
             open_browser: false,
             geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
-            log_file: None,
+            log_file: Some(log_dir.join("epix.log")),
             version: config.version,
             rev: env!("EPIX_GIT_REV").to_string(),
         };
