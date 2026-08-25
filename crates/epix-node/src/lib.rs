@@ -2462,45 +2462,11 @@ impl epix_ui::OnDemandResolver for OnDemand {
         // progress streams on the loading screen - the N/M file counter
         // visibly bounced and each stream's completion reset the bar.
         let served = self.state.has_xite(&address).await;
-        let token = {
-            let mut inflight = self.in_flight.lock().await;
-            if let Some(entry) = inflight.get(&address) {
-                if served || entry.started.elapsed() < STALE_CLONE_STEAL {
-                    // A live clone is working on it (it registers the xite
-                    // within seconds, and re-registration after a delete
-                    // restarts the clock via a fresh entry): coalesce.
-                    drop(inflight);
-                    return self.wait_for_inflight(&address).await;
-                }
-                // Wedged before it ever registered the xite, or the xite was
-                // deleted out from under it: kill it and take the slot. This
-                // is the delete-then-redownload hang.
-                self.state
-                    .log(
-                        "WARNING",
-                        format!(
-                            "Replacing a stuck clone of {address} ({}s old)",
-                            entry.started.elapsed().as_secs()
-                        ),
-                    )
-                    .await;
-                if let Some(abort) = &entry.abort {
-                    abort.abort();
-                }
-                inflight.remove(&address);
-            }
-            let token = self
-                .in_flight_token
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            inflight.insert(
-                address.clone(),
-                InflightClone {
-                    token,
-                    started: std::time::Instant::now(),
-                    abort: None,
-                },
-            );
-            token
+        let Some(token) = self.claim_clone_slot(&address, served).await else {
+            // A live clone is working on it (it registers the xite within
+            // seconds, and re-registration after a delete restarts the clock
+            // via a fresh entry): coalesce.
+            return self.wait_for_inflight(&address).await;
         };
         // Run the clone on its OWN task. This future belongs to the HTTP
         // request that hit the missing xite; a browser that times out or
@@ -2636,6 +2602,46 @@ impl epix_ui::ContentSyncer for OnDemand {
 }
 
 impl OnDemand {
+    /// Claim the in-flight slot for `address`, stealing it from a wedged
+    /// predecessor (one that never registered its xite inside
+    /// `STALE_CLONE_STEAL`, or whose xite was deleted out from under it -
+    /// the delete-then-redownload hang). Returns the claim token, or `None`
+    /// when a live clone already owns the slot and the caller should
+    /// coalesce onto it.
+    async fn claim_clone_slot(&self, address: &str, served: bool) -> Option<u64> {
+        let mut inflight = self.in_flight.lock().await;
+        if let Some(entry) = inflight.get(address) {
+            if served || entry.started.elapsed() < STALE_CLONE_STEAL {
+                return None;
+            }
+            self.state
+                .log(
+                    "WARNING",
+                    format!(
+                        "Replacing a stuck clone of {address} ({}s old)",
+                        entry.started.elapsed().as_secs()
+                    ),
+                )
+                .await;
+            if let Some(abort) = &entry.abort {
+                abort.abort();
+            }
+            inflight.remove(address);
+        }
+        let token = self
+            .in_flight_token
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        inflight.insert(
+            address.to_string(),
+            InflightClone {
+                token,
+                started: std::time::Instant::now(),
+                abort: None,
+            },
+        );
+        Some(token)
+    }
+
     /// Block (bounded) until the in-process Tor transport is installed, so a
     /// cold-start clone of an onion-seeded xite dials through Tor instead of
     /// the plain TCP transport the node holds until Arti finishes bootstrapping.

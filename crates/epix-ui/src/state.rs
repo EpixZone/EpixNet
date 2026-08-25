@@ -12344,12 +12344,9 @@ impl AppState {
             && left.merger == right.merger
     }
 
-    pub async fn db_query(&self, address: &str, query: &str, params: &Value,
-    ) -> Result<Vec<Value>, String> {
-        // A query racing a clone or db rebuild answered with transient errors
-        // ("database is locked", missing tables), and app boot chains that
-        // expected rows died on them - the frozen loading overlay. Wait out
-        // an in-progress rebuild/clone (bounded) before running.
+    /// Bounded wait for an in-progress clone or db rebuild on `address` to
+    /// finish before querying (see `db_query`).
+    async fn await_db_quiet(&self, address: &str) {
         let canonical = self.canonical_key(address).await;
         let waited = std::time::Instant::now();
         while waited.elapsed() < std::time::Duration::from_secs(45) {
@@ -12361,50 +12358,147 @@ impl AppState {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        let mut receipt = self
-            .xites
+    }
+
+    /// The current query receipt for `address`, if it has a database.
+    async fn current_receipt_for(&self, address: &str) -> Option<DbQueryReceipt> {
+        self.xites
             .read()
             .await
             .get(address)
-            .and_then(|xite| self.current_db_query_receipt(address, xite));
-        if receipt.is_none() {
-            // Lazy build, matching EpixNet's openDb: a dbQuery that arrives
-            // before the db exists (a page served progressively mid-clone)
-            // creates the schema and returns real (if still empty) rows.
-            // Xites crash on an error here - their query callbacks iterate
-            // the result - and their boot never recovers
-            // EpixNet's needFile, WAIT for the schema (bounded) instead of
-            // erroring - unless the root content.json is already known and
-            // declares no dbschema.json, in which case a db will never exist.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let (exists, declared) = {
-                    let xites = self.xites.read().await;
-                    match xites.get(address) {
-                        Some(x) => (
-                            x.storage.exists("dbschema.json"),
-                            x.content.as_ref().map(|c| {
-                                c.get("files").and_then(|f| f.get("dbschema.json")).is_some()
-                            }),
-                        ),
-                        None => (false, Some(false)),
-                    }
-                };
-                if exists {
-                    self.rebuild_xite_db(address).await;
-                    receipt = self
-                        .xites
-                        .read()
-                        .await
-                        .get(address)
-                        .and_then(|xite| self.current_db_query_receipt(address, xite));
-                    break;
+            .and_then(|xite| self.current_db_query_receipt(address, xite))
+    }
+
+    /// Lazy build, matching EpixNet's openDb: a dbQuery that arrives before
+    /// the db exists (a page served progressively mid-clone) creates the
+    /// schema and returns real (if still empty) rows. Xites crash on an
+    /// error here - their query callbacks iterate the result - and their
+    /// boot never recovers EpixNet's needFile, WAIT for the schema (bounded)
+    /// instead of erroring - unless the root content.json is already known
+    /// and declares no dbschema.json, in which case a db will never exist.
+    async fn lazy_build_db_receipt(&self, address: &str) -> Option<DbQueryReceipt> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (exists, declared) = {
+                let xites = self.xites.read().await;
+                match xites.get(address) {
+                    Some(x) => (
+                        x.storage.exists("dbschema.json"),
+                        x.content.as_ref().map(|c| {
+                            c.get("files").and_then(|f| f.get("dbschema.json")).is_some()
+                        }),
+                    ),
+                    None => (false, Some(false)),
                 }
-                if declared == Some(false) || std::time::Instant::now() >= deadline {
-                    break;
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            };
+            if exists {
+                self.rebuild_xite_db(address).await;
+                return self.current_receipt_for(address).await;
             }
+            if declared == Some(false) || std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    }
+
+    fn is_transient_db_error(error: &str) -> bool {
+        error.contains("locked")
+            || error.contains("busy")
+            || error.contains("no such table")
+            || error.contains("no such column")
+    }
+
+    /// Re-derive the receipt under the activation and tree locks - the
+    /// linearization point for a detached query's result. The locks are
+    /// scoped to this instant: holding them through the retry sleeps starved
+    /// every writer (a pending siteDelete most visibly) while pages retried
+    /// their boot queries against the post-clone churn.
+    async fn recheck_db_query_receipt(
+        &self,
+        address: &str,
+        canonical: &str,
+    ) -> Option<DbQueryReceipt> {
+        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        let _tree = self.tree_mutation_lock(canonical).lock_owned().await;
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .and_then(|xite| self.current_db_query_receipt(address, xite))
+    }
+
+    /// Handle a query result whose receipt held stable across the recheck.
+    /// `Some` is the final answer; `None` means a transient sqlite error was
+    /// slept off and the query should rerun (the rebuild drops and recreates
+    /// tables under a stable handle, so a query in that window fails with a
+    /// transient error - retrying is the answer exactly as for a swapped
+    /// handle).
+    async fn settle_stable_db_result(
+        &self,
+        address: &str,
+        result: Result<Vec<Value>, String>,
+        retry_until: std::time::Instant,
+    ) -> Option<Result<Vec<Value>, String>> {
+        match result {
+            Ok(rows) => Some(Ok(rows)),
+            Err(error)
+                if std::time::Instant::now() < retry_until
+                    && Self::is_transient_db_error(&error) =>
+            {
+                self.log(
+                    "DEBUG",
+                    format!("dbQuery transient error for {address}, retrying: {error}"),
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                None
+            }
+            Err(error) => {
+                self.log("DEBUG", format!("dbQuery error for {address}: {error}"))
+                    .await;
+                Some(Err(error))
+            }
+        }
+    }
+
+    /// The retry budget ran out while the database kept changing: serve the
+    /// last consistent read if one landed (a slightly-stale snapshot beats
+    /// an error that kills the page - apps iterate the rows they expect),
+    /// else give up.
+    async fn db_query_budget_exhausted(
+        &self,
+        address: &str,
+        last_ok: Option<Vec<Value>>,
+    ) -> Result<Vec<Value>, String> {
+        if let Some(rows) = last_ok {
+            self.log(
+                "INFO",
+                format!(
+                    "dbQuery for {address}: database kept changing past the budget, serving the last consistent read"
+                ),
+            )
+            .await;
+            return Ok(rows);
+        }
+        self.log(
+            "INFO",
+            format!("dbQuery gave up for {address}: authority changed past the deadline"),
+        )
+        .await;
+        Err("database authority changed while query ran".into())
+    }
+
+    pub async fn db_query(&self, address: &str, query: &str, params: &Value,
+    ) -> Result<Vec<Value>, String> {
+        // A query racing a clone or db rebuild answered with transient errors
+        // ("database is locked", missing tables), and app boot chains that
+        // expected rows died on them - the frozen loading overlay. Wait out
+        // an in-progress rebuild/clone (bounded) before running.
+        self.await_db_quiet(address).await;
+        let mut receipt = self.current_receipt_for(address).await;
+        if receipt.is_none() {
+            receipt = self.lazy_build_db_receipt(address).await;
         }
         let mut receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
         #[cfg(test)]
@@ -12433,55 +12527,20 @@ impl AppState {
         let mut last_ok: Option<Vec<Value>> = None;
         loop {
             let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
-            // Linearize the recheck only: holding the activation read and the
-            // tree lock through the retry sleeps starved every writer (a
-            // pending siteDelete most visibly) while pages retried their boot
-            // queries against the post-clone churn.
-            let after = {
-                let _activation = self.xite_activation_gate.clone().read_owned().await;
-                let _tree = self
-                    .tree_mutation_lock(&receipt.canonical)
-                    .lock_owned()
-                    .await;
-                self.xites
-                    .read()
-                    .await
-                    .get(address)
-                    .and_then(|xite| self.current_db_query_receipt(address, xite))
-            };
+            let after = self
+                .recheck_db_query_receipt(address, &receipt.canonical)
+                .await;
+            let within_budget = std::time::Instant::now() < retry_until;
             match after {
                 Some(after) if Self::same_db_query_receipt(&receipt, &after) => {
-                    match result {
-                        Ok(rows) => return Ok(rows),
-                        // The rebuild drops and recreates tables under a
-                        // stable handle: a query in that window fails with a
-                        // transient sqlite error. Retrying is the answer for
-                        // those exactly as for a swapped handle.
-                        Err(error)
-                            if std::time::Instant::now() < retry_until
-                                && (error.contains("locked")
-                                    || error.contains("busy")
-                                    || error.contains("no such table")
-                                    || error.contains("no such column")) =>
-                        {
-                            self.log(
-                                "DEBUG",
-                                format!("dbQuery transient error for {address}, retrying: {error}"),
-                            )
-                            .await;
-                            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                        }
-                        Err(error) => {
-                            self.log(
-                                "DEBUG",
-                                format!("dbQuery error for {address}: {error}"),
-                            )
-                            .await;
-                            return Err(error);
-                        }
+                    if let Some(done) = self
+                        .settle_stable_db_result(address, result, retry_until)
+                        .await
+                    {
+                        return done;
                     }
                 }
-                Some(after) if std::time::Instant::now() < retry_until => {
+                Some(after) if within_budget => {
                     // Keep the freshest successful read: if the database
                     // never sits still inside the budget, a consistent
                     // slightly-stale snapshot beats an error that kills the
@@ -12492,39 +12551,16 @@ impl AppState {
                     receipt = after;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
-                None if std::time::Instant::now() < retry_until => {
+                None if within_budget => {
                     // The database can be briefly absent mid-churn (a delete
                     // and redownload swapping the xite under the session).
                     // Keep waiting for a fresh handle inside the same budget.
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    if let Some(fresh) = self
-                        .xites
-                        .read()
-                        .await
-                        .get(address)
-                        .and_then(|xite| self.current_db_query_receipt(address, xite))
-                    {
+                    if let Some(fresh) = self.current_receipt_for(address).await {
                         receipt = fresh;
                     }
                 }
-                _ => {
-                    if let Some(rows) = last_ok {
-                        self.log(
-                            "INFO",
-                            format!(
-                                "dbQuery for {address}: database kept changing past the budget, serving the last consistent read"
-                            ),
-                        )
-                        .await;
-                        return Ok(rows);
-                    }
-                    self.log(
-                        "INFO",
-                        format!("dbQuery gave up for {address}: authority changed past the deadline"),
-                    )
-                    .await;
-                    return Err("database authority changed while query ran".into());
-                }
+                _ => return self.db_query_budget_exhausted(address, last_ok).await,
             }
         }
     }
