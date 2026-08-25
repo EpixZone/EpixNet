@@ -9832,10 +9832,11 @@ impl AppState {
                 return false;
             }
         };
-        let accepted_db_snapshot = match Self::db_snapshot_from_authority(
+        let accepted_db_snapshot = match Self::db_snapshot_from_authority_staged(
             canonical,
             storage,
             &VerifiedDbAuthority::from(&verified_index),
+            Some(transaction),
         )
         .await
         {
@@ -19424,6 +19425,22 @@ impl AppState {
         storage: &XiteStorage,
         authority: &VerifiedDbAuthority,
     ) -> Result<AcceptedDbSnapshot, String> {
+        Self::db_snapshot_from_authority_staged(canonical, storage, authority, None).await
+    }
+
+    /// Like [`Self::db_snapshot_from_authority`], but during a root commit
+    /// whose transaction stages files, a declared input that is still staged
+    /// (fetched and verified, not yet promoted into the live tree) is read
+    /// from the stage root. The live tree holds the PREVIOUS version of a
+    /// changed file at this point, so reading it failed the size/digest
+    /// checks against the new authority and the whole commit - the update
+    /// then re-failed identically on every retry.
+    async fn db_snapshot_from_authority_staged(
+        canonical: &str,
+        storage: &XiteStorage,
+        authority: &VerifiedDbAuthority,
+        staged: Option<&ManifestTransaction>,
+    ) -> Result<AcceptedDbSnapshot, String> {
         let manifests = &authority.manifests;
         let paths = Self::db_paths_from_manifests(manifests)?;
         let mut values = std::collections::BTreeMap::new();
@@ -19520,9 +19537,24 @@ impl AppState {
         let xid_map = Self::resolve_xid_names_checked(names).await?;
         let now = epix_core::now_ms();
         for (full, input) in inputs {
-            if !storage.exists(&full) {
+            let staged_source = staged.and_then(|transaction| {
+                if !transaction.lease.stages_files() {
+                    return None;
+                }
+                transaction.lease.staged_file(&full).map(|file| {
+                    (
+                        XiteStorage::new(transaction.lease.stage_root.clone()),
+                        file.staged_inner,
+                    )
+                })
+            });
+            if staged_source.is_none() && !storage.exists(&full) {
                 continue;
             }
+            let (read_storage, read_path) = match &staged_source {
+                Some((stage, inner)) => (stage, inner.as_str()),
+                None => (storage, full.as_str()),
+            };
             if let AcceptedDbInput::Merged(declaration) = input {
                 let exact_contents = Self::db_declaration_authority_contents(
                     &declaration,
@@ -19535,9 +19567,10 @@ impl AppState {
                     &xid_map,
                 )?;
                 let limit = max_size.unwrap_or(MAX_DB_INPUT_BYTES).min(MAX_DB_INPUT_BYTES);
-                let bytes = read_regular_xite_file_bounded(storage, &full, limit).map_err(
-                    |error| format!("could not read verified merge database input {full}: {error}"),
-                )?;
+                let bytes = read_regular_xite_file_bounded(read_storage, read_path, limit)
+                    .map_err(|error| {
+                        format!("could not read verified merge database input {full}: {error}")
+                    })?;
                 let raw = serde_json::from_slice::<Value>(&bytes)
                     .map_err(|error| format!("merge database input is not JSON ({full}): {error}"))?;
                 let empty = epix_content::make_container(Vec::new());
@@ -19559,7 +19592,7 @@ impl AppState {
                     "database input exceeds {MAX_DB_INPUT_BYTES} bytes: {full}"
                 ));
             }
-            let bytes = read_regular_xite_file_bounded(storage, &full, MAX_DB_INPUT_BYTES)
+            let bytes = read_regular_xite_file_bounded(read_storage, read_path, MAX_DB_INPUT_BYTES)
                 .map_err(|error| {
                     format!("could not read verified database input {full}: {error}")
                 })?;
@@ -33506,6 +33539,85 @@ mod tests {
         // Committed pending entries are gone: another pass is a no-op.
         state.retry_pending_updates().await;
         assert_eq!(storage.read("content.json").unwrap(), v2);
+    }
+
+    #[tokio::test]
+    async fn staged_root_update_with_changed_db_input_commits() {
+        // A resync stages a changed .json data file (a database input) in the
+        // transaction's stage root; the live tree still holds the previous
+        // version until the promotion. The commit's db snapshot must read the
+        // staged copy - reading the live file failed its size check against
+        // the new manifest and the update re-failed on every retry (the
+        // "cannot download the new blog post" wedge).
+        let dir = tempdir().unwrap();
+        let key = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&key).unwrap();
+        let storage = XiteStorage::new(dir.path());
+
+        let old_data = br#"{"post":[]}"#.to_vec();
+        let new_data = br#"{"post":[{"post_id":1,"title":"new"}]}"#.to_vec();
+        assert_ne!(old_data.len(), new_data.len());
+        let mut v1_content = json!({
+            "address": addr, "modified": 100.0, "title": "V1",
+            "files": { "data/data.json": {
+                "size": old_data.len(),
+                "sha512": XiteStorage::hash_bytes(&old_data),
+            } },
+        });
+        epix_content::sign(&mut v1_content, &key).unwrap();
+        let v1 = serde_json::to_vec(&v1_content).unwrap();
+        storage.write("content.json", &v1).unwrap();
+        storage.write("data/data.json", &old_data).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                &addr,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(v1_content),
+                },
+            )
+            .await;
+
+        let mut v2_content = json!({
+            "address": addr, "modified": 200.0, "title": "V2",
+            "files": { "data/data.json": {
+                "size": new_data.len(),
+                "sha512": XiteStorage::hash_bytes(&new_data),
+            } },
+        });
+        epix_content::sign(&mut v2_content, &key).unwrap();
+        let v2 = serde_json::to_vec(&v2_content).unwrap();
+        let keys = vec![addr.clone()];
+        let guard = state.merge_path_lock(&addr, "content.json").lock_owned().await;
+        let transaction =
+            AppState::bind_manifest_transaction(&storage, &addr, "content.json", &v2, guard)
+                .unwrap();
+        let staged_inner = transaction
+            .lease
+            .register_staged(&storage, "data/data.json", None)
+            .unwrap();
+        XiteStorage::new(transaction.lease.stage_root.clone())
+            .write(&staged_inner, &new_data)
+            .unwrap();
+
+        assert!(
+            state
+                .finalize_root_update(RootFinalize {
+                    keys: &keys,
+                    canonical: &addr,
+                    storage: &storage,
+                    content: v2_content,
+                    bytes: &v2,
+                    failed: &[],
+                    transaction: &transaction,
+                })
+                .await
+        );
+        drop(transaction);
+        assert_eq!(storage.read("content.json").unwrap(), v2);
+        assert_eq!(storage.read("data/data.json").unwrap(), new_data);
+        assert_eq!(state.xite_info(&addr).await["content"]["title"], "V2");
     }
 
     #[tokio::test]
