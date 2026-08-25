@@ -904,6 +904,15 @@ enum AcceptedDbInput {
     Merged(VerifiedFileDeclaration),
 }
 
+/// Where one declared database input is read from: the live tree, or the
+/// commit transaction's stage root when the file is staged there. `full` is
+/// the declared inner path, kept for error messages either way.
+struct DbInputSource<'a> {
+    storage: &'a XiteStorage,
+    path: &'a str,
+    full: &'a str,
+}
+
 #[derive(Clone)]
 struct DbQueryReceipt {
     db: Database,
@@ -19444,86 +19453,15 @@ impl AppState {
         let manifests = &authority.manifests;
         let paths = Self::db_paths_from_manifests(manifests)?;
         let mut values = std::collections::BTreeMap::new();
-        let mut ordered = manifests.iter().collect::<Vec<_>>();
-        ordered.sort_by(|left, right| {
-            left.inner_path
-                .split('/')
-                .count()
-                .cmp(&right.inner_path.split('/').count())
-                .then(left.inner_path.cmp(&right.inner_path))
-        });
-        let manifest_paths = ordered
-            .iter()
-            .map(|manifest| manifest.inner_path.as_str())
-            .collect::<std::collections::HashSet<_>>();
+        for manifest in manifests {
+            values.insert(manifest.inner_path.clone(), manifest.content.clone());
+        }
         let contents = manifests
             .iter()
             .map(|manifest| (manifest.inner_path.clone(), manifest.content.clone()))
             .collect::<HashMap<_, _>>();
-        let mut inputs = std::collections::BTreeMap::new();
-        for manifest in ordered {
-            values.insert(manifest.inner_path.clone(), manifest.content.clone());
-            let directory = manifest
-                .inner_path
-                .strip_suffix("content.json")
-                .ok_or_else(|| format!("invalid manifest path: {}", manifest.inner_path))?;
-            for section in ["files", "files_optional"] {
-                let Some(entries) = manifest.content.get(section).and_then(Value::as_object) else {
-                    continue;
-                };
-                for (relative, entry) in entries {
-                    let full = format!("{directory}{relative}");
-                    if full.ends_with(".json") && !manifest_paths.contains(full.as_str()) {
-                        inputs.insert(full, AcceptedDbInput::Immutable(entry.clone()));
-                    }
-                }
-            }
-            let chain = authority
-                .manifest_chains
-                .get(&manifest.inner_path)
-                .ok_or_else(|| format!("verified chain is missing for {}", manifest.inner_path))?;
-            let Some(merged) = manifest
-                .content
-                .get("files_merged")
-                .and_then(Value::as_object)
-            else {
-                continue;
-            };
-            let governing_directory = manifest
-                .inner_path
-                .strip_suffix("/content.json")
-                .unwrap_or("");
-            for (relative, entry) in merged {
-                let full = format!("{directory}{relative}");
-                if !full.ends_with(".json") || manifest_paths.contains(full.as_str()) {
-                    continue;
-                }
-                inputs.insert(
-                    full,
-                    AcceptedDbInput::Merged(VerifiedFileDeclaration {
-                        governing: manifest.inner_path.clone(),
-                        authority_chain: chain.clone(),
-                        entry: entry.clone(),
-                        directory: governing_directory.to_string(),
-                        relative_path: relative.clone(),
-                        optional: false,
-                    }),
-                );
-            }
-        }
-        let mut names = Vec::new();
-        for input in inputs.values() {
-            if let AcceptedDbInput::Merged(declaration) = input {
-                let exact_contents = Self::db_declaration_authority_contents(
-                    declaration,
-                    &contents,
-                )?;
-                names.extend(Self::merge_authority_xid_names(
-                    declaration,
-                    &exact_contents,
-                )?);
-            }
-        }
+        let inputs = Self::collect_db_inputs(authority)?;
+        let names = Self::merge_input_xid_names(&inputs, &contents)?;
         #[cfg(test)]
         {
             let mut fail = DB_SNAPSHOT_XID_FAIL_ONCE
@@ -19537,17 +19475,7 @@ impl AppState {
         let xid_map = Self::resolve_xid_names_checked(names).await?;
         let now = epix_core::now_ms();
         for (full, input) in inputs {
-            let staged_source = staged.and_then(|transaction| {
-                if !transaction.lease.stages_files() {
-                    return None;
-                }
-                transaction.lease.staged_file(&full).map(|file| {
-                    (
-                        XiteStorage::new(transaction.lease.stage_root.clone()),
-                        file.staged_inner,
-                    )
-                })
-            });
+            let staged_source = Self::staged_db_input_source(staged, &full);
             if staged_source.is_none() && !storage.exists(&full) {
                 continue;
             }
@@ -19555,71 +19483,205 @@ impl AppState {
                 Some((stage, inner)) => (stage, inner.as_str()),
                 None => (storage, full.as_str()),
             };
-            if let AcceptedDbInput::Merged(declaration) = input {
-                let exact_contents = Self::db_declaration_authority_contents(
-                    &declaration,
-                    &contents,
-                )?;
-                let (signers, max_size) = Self::merge_authority_rules(
+            let source = DbInputSource { storage: read_storage, path: read_path, full: &full };
+            let value = match input {
+                AcceptedDbInput::Merged(declaration) => Self::merged_db_value(
                     canonical,
                     &declaration,
-                    &exact_contents,
+                    &contents,
                     &xid_map,
-                )?;
-                let limit = max_size.unwrap_or(MAX_DB_INPUT_BYTES).min(MAX_DB_INPUT_BYTES);
-                let bytes = read_regular_xite_file_bounded(read_storage, read_path, limit)
-                    .map_err(|error| {
-                        format!("could not read verified merge database input {full}: {error}")
-                    })?;
-                let raw = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|error| format!("merge database input is not JSON ({full}): {error}"))?;
-                let empty = epix_content::make_container(Vec::new());
-                values.insert(
-                    full,
-                    epix_content::merge_orset(&empty, &raw, &signers, now),
-                );
-                continue;
-            }
-            let AcceptedDbInput::Immutable(entry) = input else {
-                unreachable!("merged input handled above")
+                    &source,
+                    now,
+                )?,
+                AcceptedDbInput::Immutable(entry) => Self::immutable_db_value(&entry, &source)?,
             };
-            let expected_size = entry
-                .get("size")
-                .and_then(epix_content::verify::exact_nonnegative_size)
-                .ok_or_else(|| format!("database input has invalid size: {full}"))?;
-            if expected_size as u64 > MAX_DB_INPUT_BYTES {
-                return Err(format!(
-                    "database input exceeds {MAX_DB_INPUT_BYTES} bytes: {full}"
-                ));
-            }
-            let bytes = read_regular_xite_file_bounded(read_storage, read_path, MAX_DB_INPUT_BYTES)
-                .map_err(|error| {
-                    format!("could not read verified database input {full}: {error}")
-                })?;
-            if bytes.len() as i64 != expected_size {
-                return Err(format!("database input size mismatch: {full}"));
-            }
-            let expected_sha = entry.get("sha512").and_then(Value::as_str);
-            let expected_b3 = entry
-                .get("b3")
-                .and_then(Value::as_str)
-                .and_then(epix_blob::ObjId::from_hex);
-            if expected_sha.is_none() && expected_b3.is_none() {
-                return Err(format!("database input has no verified digest: {full}"));
-            }
-            if expected_sha.is_some_and(|expected| XiteStorage::hash_bytes(&bytes) != expected)
-                || expected_b3.is_some_and(|expected| epix_blob::ObjId::of(&bytes) != expected)
-            {
-                return Err(format!("database input digest mismatch: {full}"));
-            }
-            let value = serde_json::from_slice::<Value>(&bytes)
-                .map_err(|error| format!("database input is not JSON ({full}): {error}"))?;
             values.insert(full, value);
         }
         Ok(AcceptedDbSnapshot {
             paths,
             values: values.into_iter().collect(),
         })
+    }
+
+    /// Every declared .json data file the snapshot reads, keyed by inner
+    /// path, walked parent-first so a child redeclaring a path wins.
+    fn collect_db_inputs(
+        authority: &VerifiedDbAuthority,
+    ) -> Result<std::collections::BTreeMap<String, AcceptedDbInput>, String> {
+        let mut ordered = authority.manifests.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            left.inner_path
+                .split('/')
+                .count()
+                .cmp(&right.inner_path.split('/').count())
+                .then(left.inner_path.cmp(&right.inner_path))
+        });
+        let manifest_paths = ordered
+            .iter()
+            .map(|manifest| manifest.inner_path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut inputs = std::collections::BTreeMap::new();
+        for manifest in ordered {
+            let directory = manifest
+                .inner_path
+                .strip_suffix("content.json")
+                .ok_or_else(|| format!("invalid manifest path: {}", manifest.inner_path))?;
+            Self::collect_immutable_db_inputs(manifest, directory, &manifest_paths, &mut inputs);
+            let chain = authority
+                .manifest_chains
+                .get(&manifest.inner_path)
+                .ok_or_else(|| format!("verified chain is missing for {}", manifest.inner_path))?;
+            Self::collect_merged_db_inputs(manifest, chain, directory, &manifest_paths, &mut inputs);
+        }
+        Ok(inputs)
+    }
+
+    fn collect_immutable_db_inputs(
+        manifest: &VerifiedManifestUnit,
+        directory: &str,
+        manifest_paths: &std::collections::HashSet<&str>,
+        inputs: &mut std::collections::BTreeMap<String, AcceptedDbInput>,
+    ) {
+        for section in ["files", "files_optional"] {
+            let Some(entries) = manifest.content.get(section).and_then(Value::as_object) else {
+                continue;
+            };
+            for (relative, entry) in entries {
+                let full = format!("{directory}{relative}");
+                if full.ends_with(".json") && !manifest_paths.contains(full.as_str()) {
+                    inputs.insert(full, AcceptedDbInput::Immutable(entry.clone()));
+                }
+            }
+        }
+    }
+
+    fn collect_merged_db_inputs(
+        manifest: &VerifiedManifestUnit,
+        chain: &[String],
+        directory: &str,
+        manifest_paths: &std::collections::HashSet<&str>,
+        inputs: &mut std::collections::BTreeMap<String, AcceptedDbInput>,
+    ) {
+        let Some(merged) = manifest.content.get("files_merged").and_then(Value::as_object)
+        else {
+            return;
+        };
+        let governing_directory = manifest
+            .inner_path
+            .strip_suffix("/content.json")
+            .unwrap_or("");
+        for (relative, entry) in merged {
+            let full = format!("{directory}{relative}");
+            if !full.ends_with(".json") || manifest_paths.contains(full.as_str()) {
+                continue;
+            }
+            inputs.insert(
+                full,
+                AcceptedDbInput::Merged(VerifiedFileDeclaration {
+                    governing: manifest.inner_path.clone(),
+                    authority_chain: chain.to_vec(),
+                    entry: entry.clone(),
+                    directory: governing_directory.to_string(),
+                    relative_path: relative.clone(),
+                    optional: false,
+                }),
+            );
+        }
+    }
+
+    /// The xID names every merged input's authority chain references, for one
+    /// checked resolve pass before the inputs are read.
+    fn merge_input_xid_names(
+        inputs: &std::collections::BTreeMap<String, AcceptedDbInput>,
+        contents: &HashMap<String, Value>,
+    ) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for input in inputs.values() {
+            if let AcceptedDbInput::Merged(declaration) = input {
+                let exact_contents =
+                    Self::db_declaration_authority_contents(declaration, contents)?;
+                names.extend(Self::merge_authority_xid_names(declaration, &exact_contents)?);
+            }
+        }
+        Ok(names)
+    }
+
+    /// During a root commit whose transaction stages files, a declared input
+    /// that is still staged (fetched and verified, not yet promoted into the
+    /// live tree) is read from the stage root - the live tree holds the
+    /// previous version at that point.
+    fn staged_db_input_source(
+        staged: Option<&ManifestTransaction>,
+        full: &str,
+    ) -> Option<(XiteStorage, String)> {
+        let transaction = staged?;
+        if !transaction.lease.stages_files() {
+            return None;
+        }
+        transaction.lease.staged_file(full).map(|file| {
+            (
+                XiteStorage::new(transaction.lease.stage_root.clone()),
+                file.staged_inner,
+            )
+        })
+    }
+
+    fn merged_db_value(
+        canonical: &str,
+        declaration: &VerifiedFileDeclaration,
+        contents: &HashMap<String, Value>,
+        xid_map: &HashMap<String, Vec<String>>,
+        source: &DbInputSource<'_>,
+        now: i64,
+    ) -> Result<Value, String> {
+        let exact_contents = Self::db_declaration_authority_contents(declaration, contents)?;
+        let (signers, max_size) =
+            Self::merge_authority_rules(canonical, declaration, &exact_contents, xid_map)?;
+        let limit = max_size.unwrap_or(MAX_DB_INPUT_BYTES).min(MAX_DB_INPUT_BYTES);
+        let full = source.full;
+        let bytes = read_regular_xite_file_bounded(source.storage, source.path, limit)
+            .map_err(|error| {
+                format!("could not read verified merge database input {full}: {error}")
+            })?;
+        let raw = serde_json::from_slice::<Value>(&bytes)
+            .map_err(|error| format!("merge database input is not JSON ({full}): {error}"))?;
+        let empty = epix_content::make_container(Vec::new());
+        Ok(epix_content::merge_orset(&empty, &raw, &signers, now))
+    }
+
+    fn immutable_db_value(entry: &Value, source: &DbInputSource<'_>) -> Result<Value, String> {
+        let full = source.full;
+        let expected_size = entry
+            .get("size")
+            .and_then(epix_content::verify::exact_nonnegative_size)
+            .ok_or_else(|| format!("database input has invalid size: {full}"))?;
+        if expected_size as u64 > MAX_DB_INPUT_BYTES {
+            return Err(format!(
+                "database input exceeds {MAX_DB_INPUT_BYTES} bytes: {full}"
+            ));
+        }
+        let bytes = read_regular_xite_file_bounded(source.storage, source.path, MAX_DB_INPUT_BYTES)
+            .map_err(|error| {
+                format!("could not read verified database input {full}: {error}")
+            })?;
+        if bytes.len() as i64 != expected_size {
+            return Err(format!("database input size mismatch: {full}"));
+        }
+        let expected_sha = entry.get("sha512").and_then(Value::as_str);
+        let expected_b3 = entry
+            .get("b3")
+            .and_then(Value::as_str)
+            .and_then(epix_blob::ObjId::from_hex);
+        if expected_sha.is_none() && expected_b3.is_none() {
+            return Err(format!("database input has no verified digest: {full}"));
+        }
+        if expected_sha.is_some_and(|expected| XiteStorage::hash_bytes(&bytes) != expected)
+            || expected_b3.is_some_and(|expected| epix_blob::ObjId::of(&bytes) != expected)
+        {
+            return Err(format!("database input digest mismatch: {full}"));
+        }
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|error| format!("database input is not JSON ({full}): {error}"))
     }
 
     fn db_declaration_authority_contents(
