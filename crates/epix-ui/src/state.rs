@@ -685,14 +685,14 @@ struct PromotionRecoveryBatch {
 struct PromotionRecoveryVerifyContext<'a> {
     canonical: &'a str,
     contents: &'a HashMap<String, Value>,
-    xid_map: &'a HashMap<String, Vec<String>>,
+    xid_map: &'a epix_content::XidMap,
     files: &'a HashMap<String, Vec<u8>>,
 }
 
 struct VerifiedAuthorityContext<'a> {
     canonical: &'a str,
     contents: &'a HashMap<String, Value>,
-    xid_map: &'a HashMap<String, Vec<String>>,
+    xid_map: &'a epix_content::XidMap,
     storage: Option<&'a XiteStorage>,
     staged: Option<&'a ManifestLease>,
 }
@@ -706,8 +706,8 @@ impl epix_content::verify::VerifyContext for VerifiedAuthorityContext<'_> {
         self.contents.get(inner_path).cloned()
     }
 
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map.get(name).cloned().unwrap_or_default()
+    fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
+        self.xid_map.get(name).cloned()
     }
 
     fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
@@ -727,13 +727,27 @@ impl epix_content::verify::VerifyContext for PromotionRecoveryVerifyContext<'_> 
         self.contents.get(inner_path).cloned()
     }
 
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map.get(name).cloned().unwrap_or_default()
+    fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
+        self.xid_map.get(name).cloned()
     }
 
     fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
         self.files.get(inner_path).cloned()
     }
+}
+
+/// The chain's identity records in the shape verification consumes.
+fn chain_xid_identities(
+    identities: Vec<epix_chain::Identity>,
+) -> Vec<epix_content::XidIdentity> {
+    identities
+        .into_iter()
+        .map(|identity| epix_content::XidIdentity {
+            address: identity.address,
+            active: identity.active,
+            revoked_at_time: identity.revoked_at_time,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -827,7 +841,7 @@ struct VerifiedMergeAuthority {
     authority_chain: Vec<String>,
     accepted_contents: HashMap<String, Value>,
     declaration: Value,
-    xid_map: HashMap<String, Vec<String>>,
+    xid_map: epix_content::XidMap,
     signers: Vec<String>,
     max_size: Option<u64>,
 }
@@ -839,7 +853,7 @@ struct VerifiedChildAuthority {
     governing_parent: String,
     parent_chain: Vec<String>,
     accepted_contents: HashMap<String, Value>,
-    xid_map: HashMap<String, Vec<String>>,
+    xid_map: epix_content::XidMap,
 }
 
 struct VerifiedSignedManifestAuthority {
@@ -848,7 +862,7 @@ struct VerifiedSignedManifestAuthority {
     governing: String,
     authority_chain: Vec<String>,
     accepted_contents: HashMap<String, Value>,
-    xid_map: HashMap<String, Vec<String>>,
+    xid_map: epix_content::XidMap,
 }
 
 #[derive(Clone)]
@@ -2189,8 +2203,10 @@ async fn verified_parent_still_authorizes(
             verification_files.insert(inner_path, bytes);
         }
     }
-    let mut xid_map = HashMap::new();
-    for name in epix_content::verify::content_xid_names(parent, &plan.governing) {
+    let mut xid_names = epix_content::verify::content_xid_names(parent, &plan.governing);
+    xid_names.extend(epix_content::verify::chain_cert_xid_name(parent, &content));
+    let mut xid_map = epix_content::XidMap::new();
+    for name in xid_names {
         let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
         #[cfg(test)]
         {
@@ -2202,10 +2218,11 @@ async fn verified_parent_still_authorizes(
                 return Err(format!("injected recovery signer resolution failure: {name}"));
             }
         }
-        let signers = epix_chain::xid_signers::resolve_checked(label, tld).await
+        let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
+            .await
             .map_err(|error| format!("could not resolve recovery signer {name}: {error}"))?;
-        if !signers.is_empty() {
-            xid_map.insert(name, signers);
+        if !identities.is_empty() {
+            xid_map.insert(name, chain_xid_identities(identities));
         }
     }
     let context = PromotionRecoveryVerifyContext {
@@ -10948,6 +10965,12 @@ impl AppState {
             &parent_content,
             inner_path,
         ));
+        if let Ok(child) = serde_json::from_slice::<Value>(bytes) {
+            xid_names.extend(epix_content::verify::chain_cert_xid_name(
+                &parent_content,
+                &child,
+            ));
+        }
         let xid_map = Self::resolve_xid_names(xid_names).await;
         let store = self.edx_store().await;
         if store.is_none()
@@ -18880,7 +18903,7 @@ impl AppState {
     /// (the caller falls back to the generic rules).
     async fn user_content_rules(&self, address: &str, inner_path: &str) -> Option<Value> {
         let authority = self
-            .verified_child_authority(address, inner_path)
+            .verified_child_authority(address, inner_path, None)
             .await
             .ok()?;
         let storage = authority.storage.clone();
@@ -19293,10 +19316,23 @@ impl AppState {
                     .iter()
                     .find(|manifest| manifest.inner_path == parent)
                 {
-                    Some(manifest) => Self::resolve_xid_names(
-                        epix_content::verify::content_xid_names(&manifest.content, &child),
-                    )
-                    .await,
+                    Some(manifest) => {
+                        let mut names = epix_content::verify::content_xid_names(
+                            &manifest.content,
+                            &child,
+                        );
+                        if let Some(child_content) = storage
+                            .read(&child)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        {
+                            names.extend(epix_content::verify::chain_cert_xid_name(
+                                &manifest.content,
+                                &child_content,
+                            ));
+                        }
+                        Self::resolve_xid_names(names).await
+                    }
                     None => HashMap::new(),
                 },
                 None => HashMap::new(),
@@ -19630,7 +19666,7 @@ impl AppState {
         canonical: &str,
         declaration: &VerifiedFileDeclaration,
         contents: &HashMap<String, Value>,
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
         source: &DbInputSource<'_>,
         now: i64,
     ) -> Result<Value, String> {
@@ -19990,7 +20026,7 @@ impl AppState {
         canonical: &str,
         declaration: &VerifiedFileDeclaration,
         contents: &HashMap<String, Value>,
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> Result<(Vec<String>, Option<u64>), String> {
         let content = contents
             .get(&declaration.governing)
@@ -20024,20 +20060,22 @@ impl AppState {
 
     async fn resolve_xid_names_checked(
         mut names: Vec<String>,
-    ) -> Result<HashMap<String, Vec<String>>, String> {
+    ) -> Result<epix_content::XidMap, String> {
         names.sort();
         names.dedup();
-        let mut xid_map = HashMap::new();
+        let mut xid_map = epix_content::XidMap::new();
         for name in names {
             let (label, tld) = name
                 .rsplit_once('.')
                 .unwrap_or((name.as_str(), "epix"));
-            let mut signers = epix_chain::xid_signers::resolve_checked(label, tld)
-                .await
-                .map_err(|error| error.to_string())?;
-            signers.sort();
-            signers.dedup();
-            xid_map.insert(name, signers);
+            let mut identities = chain_xid_identities(
+                epix_chain::xid_signers::resolve_identities_checked(label, tld)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            identities.sort_by(|a, b| a.address.cmp(&b.address));
+            identities.dedup_by(|a, b| a.address == b.address);
+            xid_map.insert(name, identities);
         }
         Ok(xid_map)
     }
@@ -20084,6 +20122,15 @@ impl AppState {
                 parent_content,
                 child,
             ));
+            // A chain member carrying a chain-delegated cert (a user
+            // content.json governing merge files) re-verifies against the
+            // cert name's linked identities, so resolve that name too.
+            if let Some(child_content) = contents.get(child) {
+                names.extend(epix_content::verify::chain_cert_xid_name(
+                    parent_content,
+                    child_content,
+                ));
+            }
         }
         Ok(names)
     }
@@ -20261,10 +20308,15 @@ impl AppState {
         Ok(current)
     }
 
+    /// `child_content` is the child manifest about to verify under this
+    /// authority (an incoming update, or a local sign candidate), when the
+    /// caller has it: its chain-delegated cert name resolves into the xid map
+    /// so the cert check can run. Rules-only callers pass `None`.
     async fn verified_child_authority(
         &self,
         address: &str,
         child_path: &str,
+        child_content: Option<&Value>,
     ) -> Result<VerifiedChildAuthority, String> {
         let (storage, canonical) = {
             let xites = self.xites.read().await;
@@ -20296,6 +20348,9 @@ impl AppState {
             .get(&governing_parent)
             .ok_or_else(|| format!("verified parent disappeared for {child_path}"))?;
         names.extend(epix_content::verify::content_xid_names(parent, child_path));
+        if let Some(child_content) = child_content {
+            names.extend(epix_content::verify::chain_cert_xid_name(parent, child_content));
+        }
         drop(_tree);
         let xid_map = Self::resolve_xid_names_checked(names).await?;
         Ok(VerifiedChildAuthority {
@@ -20450,6 +20505,7 @@ impl AppState {
             let content: Value =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             let mut xid_names = epix_content::verify::content_xid_names(&parent, inner_path);
+            xid_names.extend(epix_content::verify::chain_cert_xid_name(&parent, &content));
             xid_names.sort();
             xid_names.dedup();
             children.push(RehomeChildSnapshot {
@@ -20503,15 +20559,17 @@ impl AppState {
 
     async fn resolve_xid_names(
         mut names: Vec<String>,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> epix_content::XidMap {
         names.sort();
         names.dedup();
-        let mut xid_map = HashMap::new();
+        let mut xid_map = epix_content::XidMap::new();
         for name in names {
             let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-            let signers = epix_chain::xid_signers::resolve(label, tld).await;
-            if !signers.is_empty() {
-                xid_map.insert(name, signers);
+            let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
+                .await
+                .unwrap_or_default();
+            if !identities.is_empty() {
+                xid_map.insert(name, chain_xid_identities(identities));
             }
         }
         xid_map
@@ -20519,7 +20577,7 @@ impl AppState {
 
     async fn resolve_rehome_xids(
         snapshot: &RehomeChainSnapshot,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> epix_content::XidMap {
         Self::resolve_xid_names(
             snapshot
                 .children
@@ -20546,7 +20604,7 @@ impl AppState {
         canonical: &str,
         storage: &XiteStorage,
         authority_chain: &[String],
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> Result<(Value, HashMap<String, Value>), String> {
         let address = Address::parse(canonical.to_string()).map_err(|e| e.to_string())?;
         let mut xite = Xite::new(address, storage.clone());
@@ -20596,7 +20654,7 @@ impl AppState {
 
     fn verify_rehome_chain_locked(
         candidate: &ObjectDeclarationCandidate,
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> Result<PathBuf, String> {
         if candidate.kind != ObjectDeclarationKind::File {
             return Err("only plain file declarations can be rehomed".into());
@@ -22308,7 +22366,7 @@ impl AppState {
         inner_path: &str,
         content: &Value,
         accepted_contents: &HashMap<String, Value>,
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> (Vec<String>, HashMap<String, Option<u64>>) {
         let context = VerifiedAuthorityContext {
             canonical,
@@ -24224,6 +24282,31 @@ impl AppState {
         .map_err(|error| format!("Child signing completion failed: {error}"))?
     }
 
+    /// What the signed result will carry as its cert: the stored content, with
+    /// the user's own cert id on top when the node signs as them (`own_cert`,
+    /// i.e. no explicit private key was passed). Only a resolution hint, so
+    /// the chain cert name can be resolved before signing; the authoritative
+    /// cert check runs at verify.
+    async fn child_cert_hint(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        storage: &XiteStorage,
+        own_cert: bool,
+    ) -> Value {
+        let mut hint = storage
+            .read(content_inner_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| json!({}));
+        if own_cert {
+            if let Some(id) = self.user.read().await.cert_user_id(address) {
+                hint["cert_user_id"] = json!(id);
+            }
+        }
+        hint
+    }
+
     async fn sign_user_content_owned(
         &self,
         address: &str,
@@ -24241,8 +24324,11 @@ impl AppState {
                 xite.content.clone(),
             )
         };
+        let cert_hint = self
+            .child_cert_hint(address, content_inner_path, &storage, privatekey.is_none())
+            .await;
         let authority = self
-            .verified_child_authority(address, content_inner_path)
+            .verified_child_authority(address, content_inner_path, Some(&cert_hint))
             .await?;
         if authority.canonical != canonical || authority.storage.root() != storage.root() {
             return Err("child signing authority belongs to another xite".into());
@@ -25425,7 +25511,7 @@ impl AppState {
         {
             return Err("current merge transaction belongs to another xite".into());
         }
-        let authority = self.verified_child_authority(key, inner_path).await?;
+        let authority = self.verified_child_authority(key, inner_path, None).await?;
         if authority.canonical != canonical || authority.storage.root() != view.storage.root() {
             return Err("current merge authority belongs to another xite".into());
         }
@@ -25828,7 +25914,10 @@ impl AppState {
                     return Err(format!("File {inner_path} invalid: Invalid cert!"));
                 }
             }
-            let authority = match self.verified_child_authority(&key, inner_path).await {
+            let authority = match self
+                .verified_child_authority(&key, inner_path, Some(&new))
+                .await
+            {
                 Ok(authority) => authority,
                 Err(error) => {
                     self.updates_in_flight.lock().unwrap().remove(&uri);

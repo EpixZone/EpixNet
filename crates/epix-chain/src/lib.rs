@@ -136,6 +136,7 @@ pub type Result<T> = std::result::Result<T, ChainError>;
 /// and cache the result. A rarely-changing mapping that would otherwise cost
 /// one RPC per user per resync cycle.
 pub mod xid_signers {
+    use crate::Identity;
     use std::collections::HashMap;
     use std::future::Future;
     use std::sync::RwLock;
@@ -145,22 +146,24 @@ pub mod xid_signers {
     const TTL: Duration = Duration::from_secs(30 * 60);
 
     struct Entry {
-        signers: Vec<String>,
+        identities: Vec<Identity>,
         at: Instant,
     }
 
     static CACHE: RwLock<Option<HashMap<String, Entry>>> = RwLock::new(None);
 
-    fn cached(key: &str) -> Option<Vec<String>> {
+    fn cached(key: &str) -> Option<Vec<Identity>> {
         let guard = CACHE.read().ok()?;
         let map = guard.as_ref()?;
         let entry = map.get(key)?;
-        (entry.at.elapsed() < TTL).then(|| entry.signers.clone())
+        (entry.at.elapsed() < TTL).then(|| entry.identities.clone())
     }
 
-    fn store(key: String, signers: Vec<String>) {
+    fn store(key: String, identities: Vec<Identity>) {
         if let Ok(mut guard) = CACHE.write() {
-            guard.get_or_insert_with(HashMap::new).insert(key, Entry { signers, at: Instant::now() });
+            guard
+                .get_or_insert_with(HashMap::new)
+                .insert(key, Entry { identities, at: Instant::now() });
         }
     }
 
@@ -171,40 +174,52 @@ pub mod xid_signers {
         }
     }
 
-    async fn resolve_checked_with<F, Fut>(
+    async fn resolve_identities_checked_with<F, Fut>(
         name: &str,
         tld: &str,
         fetch: F,
-    ) -> super::Result<Vec<String>>
+    ) -> super::Result<Vec<Identity>>
     where
         F: FnOnce() -> Fut,
-        Fut: Future<Output = super::Result<Vec<String>>>,
+        Fut: Future<Output = super::Result<Vec<Identity>>>,
     {
         let key = format!("{name}.{tld}");
         if let Some(hit) = cached(&key) {
             return Ok(hit);
         }
-        let signers = fetch().await?;
-        store(key, signers.clone());
-        Ok(signers)
+        let identities = fetch().await?;
+        store(key, identities.clone());
+        Ok(identities)
+    }
+
+    /// Resolve `name.tld` to its full linked identity records - address plus
+    /// active/revocation state. Chain-delegated cert verification needs the
+    /// revocation data, not just the address list.
+    ///
+    /// The checked form preserves chain lookup failures so callers can
+    /// distinguish an authoritative empty identity list from an RPC, proof,
+    /// malformed-response, or not-found error. Only successful resolutions
+    /// enter the cache.
+    pub async fn resolve_identities_checked(
+        name: &str,
+        tld: &str,
+    ) -> super::Result<Vec<Identity>> {
+        resolve_identities_checked_with(name, tld, || async {
+            Ok(super::shared_resolver().resolve(name, tld).await?.identities)
+        })
+        .await
     }
 
     /// Resolve every identity address allowed to sign `name.tld` user content.
     ///
-    /// Unlike [`resolve`], this checked form preserves chain lookup failures so
-    /// callers can distinguish an authoritative empty identity list from an
-    /// RPC, proof, malformed-response, or not-found error. Only successful
-    /// resolutions enter the signer cache.
+    /// Unlike [`resolve`], this checked form preserves chain lookup failures
+    /// (see [`resolve_identities_checked`]).
     pub async fn resolve_checked(name: &str, tld: &str) -> super::Result<Vec<String>> {
-        resolve_checked_with(name, tld, || async {
-            let domain = super::shared_resolver().resolve(name, tld).await?;
-            Ok(domain
-                .identities
-                .iter()
-                .map(|identity| identity.address.clone())
-                .collect())
-        })
-        .await
+        Ok(resolve_identities_checked(name, tld)
+            .await?
+            .into_iter()
+            .map(|identity| identity.address)
+            .collect())
     }
 
     /// The addresses that may sign for `name.tld`'s user content: its linked
@@ -221,58 +236,69 @@ pub mod xid_signers {
         use crate::ChainError;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
+        fn identity(address: &str) -> Identity {
+            Identity {
+                address: address.to_string(),
+                label: String::new(),
+                active: true,
+                revoked_at: 0,
+                revoked_at_time: 0,
+            }
+        }
+
         #[tokio::test]
         async fn checked_resolution_does_not_cache_failures() {
             clear();
             let attempts = AtomicUsize::new(0);
 
-            let error = resolve_checked_with("retryable", "test", || async {
+            let error = resolve_identities_checked_with("retryable", "test", || async {
                 attempts.fetch_add(1, Ordering::Relaxed);
                 Err(ChainError::Rpc("offline".into()))
             })
             .await;
             assert!(matches!(error, Err(ChainError::Rpc(message)) if message == "offline"));
 
-            let signers = resolve_checked_with("retryable", "test", || async {
+            let identities = resolve_identities_checked_with("retryable", "test", || async {
                 attempts.fetch_add(1, Ordering::Relaxed);
-                Ok(vec!["epix1signer".to_string()])
+                Ok(vec![identity("epix1signer")])
             })
             .await
             .unwrap();
-            assert_eq!(signers, ["epix1signer"]);
+            assert_eq!(identities, [identity("epix1signer")]);
             assert_eq!(attempts.load(Ordering::Relaxed), 2);
 
-            let cached = resolve_checked_with("retryable", "test", || async {
+            let cached = resolve_identities_checked_with("retryable", "test", || async {
                 attempts.fetch_add(1, Ordering::Relaxed);
                 Err(ChainError::Malformed("must not run".into()))
             })
             .await
             .unwrap();
-            assert_eq!(cached, signers);
+            assert_eq!(cached, identities);
             assert_eq!(attempts.load(Ordering::Relaxed), 2);
             clear();
         }
 
         #[tokio::test]
         async fn checked_resolution_preserves_chain_error_kinds() {
-            let rpc = resolve_checked_with("rpc", "test", || async {
+            let rpc = resolve_identities_checked_with("rpc", "test", || async {
                 Err(ChainError::Rpc("down".into()))
             })
             .await;
             assert!(matches!(rpc, Err(ChainError::Rpc(_))));
 
-            let proof =
-                resolve_checked_with("proof", "test", || async { Err(ChainError::MerkleInvalid) })
-                    .await;
+            let proof = resolve_identities_checked_with("proof", "test", || async {
+                Err(ChainError::MerkleInvalid)
+            })
+            .await;
             assert!(matches!(proof, Err(ChainError::MerkleInvalid)));
 
-            let malformed = resolve_checked_with("malformed", "test", || async {
+            let malformed = resolve_identities_checked_with("malformed", "test", || async {
                 Err(ChainError::Malformed("bad response".into()))
             })
             .await;
             assert!(matches!(malformed, Err(ChainError::Malformed(_))));
 
-            let missing = resolve_checked_with("missing", "test", || async {
+            let missing = resolve_identities_checked_with("missing", "test", || async {
                 Err(ChainError::NotFound("missing.test".into()))
             })
             .await;

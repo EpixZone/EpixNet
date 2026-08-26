@@ -1216,7 +1216,7 @@ if (window.getComputedStyle(document.body).transform) {
         }
       }
       message = e.data;
-      if (!message.cmd) {
+      if (!message || typeof message !== "object" || !message.cmd) {
         this.log("Invalid message:", message);
         return false;
       }
