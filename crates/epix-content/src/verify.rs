@@ -1827,14 +1827,44 @@ mod tests {
         }
     }
 
+    /// A fresh keypair as (private key, address).
+    fn new_identity() -> (String, String) {
+        let secret = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&secret).unwrap();
+        (secret, address)
+    }
+
+    /// The `data/users/content.json` -> parent map every user-content fixture
+    /// loads.
+    fn loaded_parent(parent: Value) -> std::collections::HashMap<String, Value> {
+        let mut loaded = std::collections::HashMap::new();
+        loaded.insert("data/users/content.json".to_string(), parent);
+        loaded
+    }
+
+    /// The single-parent Ctx these tests verify against.
+    fn user_ctx(loaded: std::collections::HashMap<String, Value>) -> Ctx {
+        Ctx { address: "1Site".into(), loaded, limit: i64::MAX }
+    }
+
+    /// Assert a rejection and the reason for it. The reason is matched, never
+    /// formatted into the panic message: these fixtures are built from signing
+    /// keys, so echoing values derived from them into test output is what the
+    /// cleartext-logging scanners flag.
+    fn assert_rejected(result: Result<(), VerifyError>, expected: &str) {
+        let error = result.expect_err("expected verification to reject this content");
+        assert!(error.0.contains(expected), "rejected, but not for {expected:?}");
+    }
+
     /// A signed user content.json in a chain-cert xite (`cert_signers`
     /// `["chain"]`), in a dir named `dir` (the user's auth address, or the
-    /// xID name), with the cert made by `cert_pk` over `subject_addr`.
+    /// xID name), with the cert made by `cert_signer` over `subject_addr` and
+    /// the content itself signed by `dir_signer`.
     fn chain_cert_fixture(
         dir: &str,
-        cert_pk: &str,
+        cert_signer: &str,
         subject_addr: &str,
-        sign_pk: &str,
+        dir_signer: &str,
         modified: f64,
     ) -> (String, Value, Vec<u8>, std::collections::HashMap<String, Value>) {
         let parent = json!({
@@ -1846,170 +1876,152 @@ mod tests {
         });
         let inner = format!("data/users/{dir}/content.json");
         let cert_sign =
-            epix_crypt::sign_keccak(&format!("{subject_addr}#xid/alice"), cert_pk).unwrap();
+            epix_crypt::sign_keccak(&format!("{subject_addr}#xid/alice"), cert_signer).unwrap();
         let content = json!({
             "address": "1Site", "inner_path": inner, "modified": modified, "files": {},
             "cert_user_id": "alice@xid.epix", "cert_auth_type": "xid", "cert_sign": cert_sign,
         });
-        let (content, bytes) = sign_content(content, sign_pk);
-        let mut loaded = std::collections::HashMap::new();
-        loaded.insert("data/users/content.json".to_string(), parent);
-        (inner, content, bytes, loaded)
+        let (content, bytes) = sign_content(content, dir_signer);
+        (inner, content, bytes, loaded_parent(parent))
+    }
+
+    /// Build a chain-cert fixture and verify it against `identities`.
+    fn verify_chain_cert(
+        dir: &str,
+        cert_signer: &str,
+        subject_addr: &str,
+        dir_signer: &str,
+        modified: f64,
+        identities: XidMap,
+    ) -> Result<(), VerifyError> {
+        let (inner, content, bytes, loaded) =
+            chain_cert_fixture(dir, cert_signer, subject_addr, dir_signer, modified);
+        let ctx = ChainCtx { inner: user_ctx(loaded), identities };
+        verify_content_file(&inner, &content, bytes.len() as i64, &ctx)
     }
 
     fn active_identity(address: &str) -> XidIdentity {
         XidIdentity { address: address.to_string(), active: true, revoked_at_time: 0 }
     }
 
+    /// `name` resolving to a single active identity, the common chain answer.
+    fn linked_to(address: &str) -> XidMap {
+        XidMap::from([("alice.epix".to_string(), vec![active_identity(address)])])
+    }
+
     #[test]
     fn chain_cert_verified_against_linked_identity() {
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture(&user, &user_pk, &user, &user_pk, 100.0);
-        let identities =
-            XidMap::from([("alice.epix".to_string(), vec![active_identity(&user)])]);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities,
-        };
-        assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
+        let (user_key, user) = new_identity();
+        assert!(
+            verify_chain_cert(&user, &user_key, &user, &user_key, 100.0, linked_to(&user)).is_ok()
+        );
     }
 
     #[test]
     fn chain_cert_forged_identity_rejected() {
         // An attacker in their own raw-address dir self-signs a cert claiming
-        // alice@xid.epix. The signature is internally consistent (recovers to
-        // the attacker), but the attacker is not a linked identity of the
+        // alice@xid.epix. The signature is internally consistent (it recovers
+        // to the attacker), but the attacker is not a linked identity of the
         // name, so the cert is rejected.
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
-        let attacker_pk = epix_crypt::new_seed();
-        let attacker = epix_crypt::privatekey_to_address(&attacker_pk).unwrap();
-        let identities =
-            XidMap::from([("alice.epix".to_string(), vec![active_identity(&user)])]);
-
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture(&attacker, &attacker_pk, &attacker, &attacker_pk, 100.0);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities: identities.clone(),
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("not linked to xID"), "{}", e.0);
+        let (user_key, user) = new_identity();
+        let (attacker_key, attacker) = new_identity();
+        assert_rejected(
+            verify_chain_cert(
+                &attacker,
+                &attacker_key,
+                &attacker,
+                &attacker_key,
+                100.0,
+                linked_to(&user),
+            ),
+            "not linked to xID",
+        );
 
         // A cert_sign over the dir's own address but made by a different key
         // recovers to a third address and is rejected as a mismatch.
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture(&user, &attacker_pk, &user, &user_pk, 100.0);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities,
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("signature mismatch"), "{}", e.0);
+        assert_rejected(
+            verify_chain_cert(&user, &attacker_key, &user, &user_key, 100.0, linked_to(&user)),
+            "signature mismatch",
+        );
     }
 
     #[test]
     fn chain_cert_revoked_identity_temporal_check() {
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
-        let revoked = XidIdentity {
-            address: user.clone(),
-            active: false,
-            revoked_at_time: 1000,
+        let (user_key, user) = new_identity();
+        let revoked = |revoked_at_time: u64| {
+            XidMap::from([(
+                "alice.epix".to_string(),
+                vec![XidIdentity {
+                    address: user.clone(),
+                    active: false,
+                    revoked_at_time,
+                }],
+            )])
         };
-        let identities = XidMap::from([("alice.epix".to_string(), vec![revoked])]);
 
         // Modified before revoked_at_time + grace (60s): still accepted.
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture(&user, &user_pk, &user, &user_pk, 1059.0);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities: identities.clone(),
-        };
-        assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
-
+        assert!(
+            verify_chain_cert(&user, &user_key, &user, &user_key, 1059.0, revoked(1000)).is_ok()
+        );
         // Modified at the cutoff: rejected.
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture(&user, &user_pk, &user, &user_pk, 1060.0);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities: identities.clone(),
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("was revoked at"), "{}", e.0);
-
+        assert_rejected(
+            verify_chain_cert(&user, &user_key, &user, &user_key, 1060.0, revoked(1000)),
+            "was revoked at",
+        );
         // Revoked with no usable timestamp: rejected outright.
-        let no_time = XidIdentity { address: user.clone(), active: false, revoked_at_time: 0 };
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture(&user, &user_pk, &user, &user_pk, 100.0);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities: XidMap::from([("alice.epix".to_string(), vec![no_time])]),
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("has been revoked"), "{}", e.0);
+        assert_rejected(
+            verify_chain_cert(&user, &user_key, &user, &user_key, 100.0, revoked(0)),
+            "has been revoked",
+        );
     }
 
     #[test]
     fn chain_cert_unresolvable_name_fails_closed() {
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture(&user, &user_pk, &user, &user_pk, 100.0);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities: XidMap::new(),
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("not found on chain"), "{}", e.0);
+        let (user_key, user) = new_identity();
+        assert_rejected(
+            verify_chain_cert(&user, &user_key, &user, &user_key, 100.0, XidMap::new()),
+            "not found on chain",
+        );
     }
 
     #[test]
     fn chain_cert_missing_cert_sign_rejected() {
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let (user_key, user) = new_identity();
         let (inner, mut content, _, loaded) =
-            chain_cert_fixture(&user, &user_pk, &user, &user_pk, 100.0);
+            chain_cert_fixture(&user, &user_key, &user, &user_key, 100.0);
         content.as_object_mut().unwrap().remove("cert_sign");
         content.as_object_mut().unwrap().remove("signs");
-        let (content, bytes) = sign_content(content, &user_pk);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities: XidMap::from([("alice.epix".to_string(), vec![active_identity(&user)])]),
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("Missing cert_sign"), "{}", e.0);
+        let (content, bytes) = sign_content(content, &user_key);
+        let ctx = ChainCtx { inner: user_ctx(loaded), identities: linked_to(&user) };
+        assert_rejected(
+            verify_content_file(&inner, &content, bytes.len() as i64, &ctx),
+            "Missing cert_sign",
+        );
     }
 
     #[test]
     fn chain_cert_in_xid_named_dir_matches_a_linked_identity() {
         // The dir is named by the xID itself; any linked identity whose key
         // made the cert_sign satisfies the cert (Python's candidate loop).
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture("alice.epix", &user_pk, &user, &user_pk, 100.0);
-        let identities =
-            XidMap::from([("alice.epix".to_string(), vec![active_identity(&user)])]);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities: identities.clone(),
-        };
-        assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
+        let (user_key, user) = new_identity();
+        assert!(
+            verify_chain_cert("alice.epix", &user_key, &user, &user_key, 100.0, linked_to(&user))
+                .is_ok()
+        );
 
         // A cert_sign from a key that is not any linked identity fails.
-        let stranger_pk = epix_crypt::new_seed();
-        let stranger = epix_crypt::privatekey_to_address(&stranger_pk).unwrap();
-        let (inner, content, bytes, loaded) =
-            chain_cert_fixture("alice.epix", &stranger_pk, &stranger, &user_pk, 100.0);
-        let ctx = ChainCtx {
-            inner: Ctx { address: "1Site".into(), loaded, limit: i64::MAX },
-            identities,
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("No linked identity matches"), "{}", e.0);
+        let (stranger_key, stranger) = new_identity();
+        assert_rejected(
+            verify_chain_cert(
+                "alice.epix",
+                &stranger_key,
+                &stranger,
+                &user_key,
+                100.0,
+                linked_to(&user),
+            ),
+            "No linked identity matches",
+        );
     }
 
     #[test]
@@ -2030,94 +2042,90 @@ mod tests {
         assert_eq!(chain_cert_xid_name(&parent, &json!({})), None);
     }
 
+    /// A parent whose `user_contents` carries exactly `permissions`, plus any
+    /// extra `user_contents` keys.
+    fn ban_parent(permissions: Value, extra: Value) -> std::collections::HashMap<String, Value> {
+        let mut user_contents = json!({ "cert_signers": {}, "permissions": permissions });
+        if let Some(extra) = extra.as_object() {
+            let target = user_contents.as_object_mut().unwrap();
+            for (key, value) in extra {
+                target.insert(key.clone(), value.clone());
+            }
+        }
+        loaded_parent(json!({
+            "address": "1Site", "inner_path": "data/users/content.json", "modified": 1,
+            "user_contents": user_contents,
+        }))
+    }
+
+    /// Content in `inner`, signed by `signer`, optionally carrying a cert id.
+    fn user_content(inner: &str, signer: &str, cert_user_id: Option<&str>) -> (Value, Vec<u8>) {
+        let mut content =
+            json!({ "address": "1Site", "inner_path": inner, "modified": 100, "files": {} });
+        if let Some(id) = cert_user_id {
+            let object = content.as_object_mut().unwrap();
+            object.insert("cert_user_id".into(), json!(id));
+            object.insert("cert_auth_type".into(), json!("xid"));
+        }
+        sign_content(content, signer)
+    }
+
     #[test]
     fn banned_user_loses_the_self_signer() {
         // permissions[user] == false: the user's own signature no longer
         // verifies anywhere (the ban is part of the owner-signed parent, so
         // every node enforces it).
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let (user_key, user) = new_identity();
         let inner = format!("data/users/{user}/content.json");
-        let make_parent = |permissions: Value| {
-            let parent = json!({
-                "address": "1Site", "inner_path": "data/users/content.json", "modified": 1,
-                "user_contents": { "cert_signers": {}, "permissions": permissions },
-            });
-            let mut loaded = std::collections::HashMap::new();
-            loaded.insert("data/users/content.json".to_string(), parent);
-            loaded
-        };
-        let (content, bytes) = sign_content(
-            json!({ "address": "1Site", "inner_path": inner, "modified": 100, "files": {} }),
-            &user_pk,
-        );
+        let (content, bytes) = user_content(&inner, &user_key, None);
 
         // Banned by raw auth address.
-        let ctx = Ctx {
-            address: "1Site".into(),
-            loaded: make_parent(json!({ user.clone(): false })),
-            limit: i64::MAX,
-        };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("Valid signs: 0/1"), "{}", e.0);
+        let ctx = user_ctx(ban_parent(json!({ user.clone(): false }), json!({})));
+        assert_rejected(
+            verify_content_file(&inner, &content, bytes.len() as i64, &ctx),
+            "Valid signs: 0/1",
+        );
 
         // The same user without the ban entry verifies.
-        let ctx = Ctx { address: "1Site".into(), loaded: make_parent(json!({})), limit: i64::MAX };
+        let ctx = user_ctx(ban_parent(json!({}), json!({})));
         assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
     }
 
     #[test]
     fn banned_by_cert_user_id() {
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
+        let (user_key, user) = new_identity();
         let inner = format!("data/users/{user}/content.json");
-        let parent = json!({
-            "address": "1Site", "inner_path": "data/users/content.json", "modified": 1,
-            "user_contents": {
-                "cert_signers": {},
-                "permissions": { "alice@xid.epix": false },
-            },
-        });
-        let mut loaded = std::collections::HashMap::new();
-        loaded.insert("data/users/content.json".to_string(), parent);
-        let make = |cert_user_id: &str| {
-            sign_content(
-                json!({
-                    "address": "1Site", "inner_path": inner, "modified": 100, "files": {},
-                    "cert_user_id": cert_user_id, "cert_auth_type": "xid",
-                }),
-                &user_pk,
-            )
-        };
+        let banned = || ban_parent(json!({ "alice@xid.epix": false }), json!({}));
 
         // The banned cert id cannot push, even from a raw-address dir.
-        let (content, bytes) = make("alice@xid.epix");
-        let ctx = Ctx { address: "1Site".into(), loaded: loaded.clone(), limit: i64::MAX };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("Valid signs: 0/1"), "{}", e.0);
+        let (content, bytes) = user_content(&inner, &user_key, Some("alice@xid.epix"));
+        let ctx = user_ctx(banned());
+        assert_rejected(
+            verify_content_file(&inner, &content, bytes.len() as i64, &ctx),
+            "Valid signs: 0/1",
+        );
 
         // A different cert id in the same dir layout is unaffected.
-        let (content, bytes) = make("bob@xid.epix");
-        let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+        let (content, bytes) = user_content(&inner, &user_key, Some("bob@xid.epix"));
+        let ctx = user_ctx(banned());
         assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
     }
 
     #[test]
     fn null_permission_rule_zeroes_the_write_quota() {
-        let (inner, content, bytes, loaded) = user_content_fixture(
-            json!({ "permission_rules": { ".*": null } }),
-            json!({}),
+        let (inner, content, bytes, loaded) =
+            user_content_fixture(json!({ "permission_rules": { ".*": null } }), json!({}));
+        assert_rejected(
+            verify_content_file(&inner, &content, bytes.len() as i64, &user_ctx(loaded)),
+            "Include too large",
         );
-        let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("Include too large"), "{}", e.0);
 
         // The same content under a real quota verifies.
         let (inner, content, bytes, loaded) = user_content_fixture(
             json!({ "permission_rules": { ".*": { "max_size": 100000 } } }),
             json!({}),
         );
-        let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
+        let ctx = user_ctx(loaded);
         assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
     }
 
@@ -2126,38 +2134,26 @@ mod tests {
         // Moderation tombstones: the ban removes the user's self-signer, but
         // an admin granted through permission_rules signers can still re-sign
         // the dir's content.json (e.g. to blank a spammer's posts).
-        let user_pk = epix_crypt::new_seed();
-        let user = epix_crypt::privatekey_to_address(&user_pk).unwrap();
-        let admin_pk = epix_crypt::new_seed();
-        let admin = epix_crypt::privatekey_to_address(&admin_pk).unwrap();
+        let (user_key, user) = new_identity();
+        let (admin_key, admin) = new_identity();
         let inner = format!("data/users/{user}/content.json");
-        let parent = json!({
-            "address": "1Site", "inner_path": "data/users/content.json", "modified": 1,
-            "user_contents": {
-                "cert_signers": {},
-                "permissions": { user.clone(): false },
-                "permission_rules": {
-                    ".*": { "signers": [admin], "max_size": 100000 },
-                },
-            },
-        });
-        let mut loaded = std::collections::HashMap::new();
-        loaded.insert("data/users/content.json".to_string(), parent);
-        let make = |pk: &str| {
-            sign_content(
-                json!({ "address": "1Site", "inner_path": inner, "modified": 100, "files": {} }),
-                pk,
+        let parent = || {
+            ban_parent(
+                json!({ user.clone(): false }),
+                json!({ "permission_rules": { ".*": { "signers": [admin], "max_size": 100000 } } }),
             )
         };
 
-        let (content, bytes) = make(&admin_pk);
-        let ctx = Ctx { address: "1Site".into(), loaded: loaded.clone(), limit: i64::MAX };
+        let (content, bytes) = user_content(&inner, &admin_key, None);
+        let ctx = user_ctx(parent());
         assert!(verify_content_file(&inner, &content, bytes.len() as i64, &ctx).is_ok());
 
         // The banned user still cannot sign despite the merged rule quota.
-        let (content, bytes) = make(&user_pk);
-        let ctx = Ctx { address: "1Site".into(), loaded, limit: i64::MAX };
-        let e = verify_content_file(&inner, &content, bytes.len() as i64, &ctx).unwrap_err();
-        assert!(e.0.contains("Valid signs: 0/1"), "{}", e.0);
+        let (content, bytes) = user_content(&inner, &user_key, None);
+        let ctx = user_ctx(parent());
+        assert_rejected(
+            verify_content_file(&inner, &content, bytes.len() as i64, &ctx),
+            "Valid signs: 0/1",
+        );
     }
 }
