@@ -24282,6 +24282,31 @@ impl AppState {
         .map_err(|error| format!("Child signing completion failed: {error}"))?
     }
 
+    /// What the signed result will carry as its cert: the stored content, with
+    /// the user's own cert id on top when the node signs as them (`own_cert`,
+    /// i.e. no explicit private key was passed). Only a resolution hint, so
+    /// the chain cert name can be resolved before signing; the authoritative
+    /// cert check runs at verify.
+    async fn child_cert_hint(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        storage: &XiteStorage,
+        own_cert: bool,
+    ) -> Value {
+        let mut hint = storage
+            .read(content_inner_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| json!({}));
+        if own_cert {
+            if let Some(id) = self.user.read().await.cert_user_id(address) {
+                hint["cert_user_id"] = json!(id);
+            }
+        }
+        hint
+    }
+
     async fn sign_user_content_owned(
         &self,
         address: &str,
@@ -24299,19 +24324,9 @@ impl AppState {
                 xite.content.clone(),
             )
         };
-        // What the signed result will carry as its cert: the stored content,
-        // with the user's own cert on top when signing extends it below. Only
-        // a resolution hint - the authoritative cert check runs at verify.
-        let mut cert_hint = storage
-            .read(content_inner_path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-            .unwrap_or_else(|| json!({}));
-        if privatekey.is_none() {
-            if let Some(id) = self.user.read().await.cert_user_id(address) {
-                cert_hint["cert_user_id"] = json!(id);
-            }
-        }
+        let cert_hint = self
+            .child_cert_hint(address, content_inner_path, &storage, privatekey.is_none())
+            .await;
         let authority = self
             .verified_child_authority(address, content_inner_path, Some(&cert_hint))
             .await?;
