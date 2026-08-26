@@ -51,12 +51,6 @@ impl VerifyContext for ChildCtx<'_> {
         }
         None
     }
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map
-            .get(name)
-            .map(|ids| epix_content::verify::xid_identity_addresses(ids))
-            .unwrap_or_default()
-    }
     fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
         self.xid_map.get(name).cloned()
     }
@@ -117,13 +111,6 @@ impl VerifyContext for VerifiedWalkCtx<'_> {
 
     fn loaded_content(&self, inner_path: &str) -> Option<Value> {
         self.verified.get(inner_path).cloned()
-    }
-
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map
-            .get(name)
-            .map(|ids| epix_content::verify::xid_identity_addresses(ids))
-            .unwrap_or_default()
     }
 
     fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {

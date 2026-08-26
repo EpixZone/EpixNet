@@ -109,9 +109,16 @@ pub trait VerifyContext {
     /// sign for it (owner + identities). EpixTalk-style user_contents dirs are
     /// named by the user's xID and the content is signed by the identity that
     /// xID belongs to, so a signer given as an xID name must be resolved to
-    /// match the signature. The node pre-resolves these; default is empty.
-    fn resolve_xid(&self, _name: &str) -> Vec<String> {
-        Vec::new()
+    /// match the signature. The node pre-resolves these.
+    ///
+    /// Derived from [`resolve_xid_identities`](Self::resolve_xid_identities),
+    /// so a context that serves identity records gets this for free and an
+    /// unresolved name stays empty. Override only to answer with addresses a
+    /// context holds without the surrounding identity records.
+    fn resolve_xid(&self, name: &str) -> Vec<String> {
+        self.resolve_xid_identities(name)
+            .map(|identities| xid_identity_addresses(&identities))
+            .unwrap_or_default()
     }
     /// Full identity records for an xID name (chain-cert verification needs
     /// each linked address with its active flag and revocation time, not just
@@ -1818,9 +1825,6 @@ mod tests {
         }
         fn loaded_content(&self, inner_path: &str) -> Option<Value> {
             self.inner.loaded_content(inner_path)
-        }
-        fn resolve_xid(&self, name: &str) -> Vec<String> {
-            self.identities.get(name).map(|ids| xid_identity_addresses(ids)).unwrap_or_default()
         }
         fn resolve_xid_identities(&self, name: &str) -> Option<Vec<XidIdentity>> {
             self.identities.get(name).cloned()

@@ -706,13 +706,6 @@ impl epix_content::verify::VerifyContext for VerifiedAuthorityContext<'_> {
         self.contents.get(inner_path).cloned()
     }
 
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map
-            .get(name)
-            .map(|ids| epix_content::verify::xid_identity_addresses(ids))
-            .unwrap_or_default()
-    }
-
     fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
         self.xid_map.get(name).cloned()
     }
@@ -732,13 +725,6 @@ impl epix_content::verify::VerifyContext for PromotionRecoveryVerifyContext<'_> 
 
     fn loaded_content(&self, inner_path: &str) -> Option<Value> {
         self.contents.get(inner_path).cloned()
-    }
-
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map
-            .get(name)
-            .map(|ids| epix_content::verify::xid_identity_addresses(ids))
-            .unwrap_or_default()
     }
 
     fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
