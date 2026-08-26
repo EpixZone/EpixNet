@@ -1682,7 +1682,12 @@ async fn verify_current_child_manifests(
             let _ = xite.skip_next_stored_manifest(walk, &path);
             continue;
         };
-        let xid_map = resolve_user_signers(&parent, &path).await;
+        let child: Option<serde_json::Value> = xite
+            .storage()
+            .read(&path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+        let xid_map = resolve_user_signers(&parent, &path, child.as_ref()).await;
         match xite.verify_next_stored_manifest(walk, &path, &xid_map) {
             Ok(Some(manifest)) => {
                 files.extend(manifest.files());
@@ -2312,22 +2317,43 @@ fn user_dir_name(inner_path: &str) -> Option<&str> {
     }
 }
 
-/// Resolve every xID name that verifying `inner_path` may need to the chain
-/// addresses allowed to sign it: the user directory's own name (EpixTalk
+/// Resolve every xID name that verifying `inner_path` may need to its
+/// chain-linked identity records: the user directory's own name (EpixTalk
 /// stores each user's posts under their xID and signs with the identity that
 async fn resolve_user_signers(
     parent: &serde_json::Value,
     inner_path: &str,
-) -> std::collections::HashMap<String, Vec<String>> {
-    let mut map = std::collections::HashMap::new();
-    for name in epix_content::verify::content_xid_names(parent, inner_path) {
+    child: Option<&serde_json::Value>,
+) -> epix_content::XidMap {
+    let mut names = epix_content::verify::content_xid_names(parent, inner_path);
+    // A chain-delegated cert on the child itself must resolve too, so the
+    // cert check can match its signer against the name's linked identities.
+    if let Some(child) = child {
+        names.extend(epix_content::verify::chain_cert_xid_name(parent, child));
+    }
+    let mut map = epix_content::XidMap::new();
+    for name in names {
         let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-        let signers = epix_chain::xid_signers::resolve(label, tld).await;
-        if !signers.is_empty() {
-            map.insert(name, signers);
+        let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
+            .await
+            .unwrap_or_default();
+        if !identities.is_empty() {
+            map.insert(name, chain_xid_identities(identities));
         }
     }
     map
+}
+
+/// The chain's identity records in the shape verification consumes.
+fn chain_xid_identities(identities: Vec<epix_chain::Identity>) -> Vec<epix_content::XidIdentity> {
+    identities
+        .into_iter()
+        .map(|identity| epix_content::XidIdentity {
+            address: identity.address,
+            active: identity.active,
+            revoked_at_time: identity.revoked_at_time,
+        })
+        .collect()
 }
 
 /// Ask a peer for its signed files changed since 0 (EDX `ListSigned`): the
@@ -3438,7 +3464,11 @@ mod tests {
         );
         let xid_map = std::collections::HashMap::from([(
             "admin.epix".to_string(),
-            vec![admin],
+            vec![epix_content::XidIdentity {
+                address: admin,
+                active: true,
+                revoked_at_time: 0,
+            }],
         )]);
         let verified = xite
             .verify_next_stored_manifest(&mut walk, "deep/path/content.json", &xid_map)
