@@ -90,10 +90,10 @@ async fn run() {
     let mut announces = client_tp.recv_announces().await;
     let out_events = client_tp.out_link_events();
     let desc = timeout(Duration::from_secs(15), async {
-        loop {
-            let ann = announces.recv().await.expect("client announce recv");
-            break ann.destination.lock().await.desc;
-        }
+        let ann = announces.recv().await.expect("client announce recv");
+        // Bound so the guard drops before `ann` does.
+        let desc = ann.destination.lock().await.desc;
+        desc
     })
     .await
     .expect("client learns server destination");
