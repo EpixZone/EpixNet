@@ -2161,7 +2161,7 @@ dependencies = [
  "reqwest",
  "rustls",
  "serde_json",
- "sha2 0.10.9",
+ "sha2 0.11.0",
  "tao",
  "tempfile",
  "tokio",
@@ -4092,7 +4092,7 @@ version = "0.1.0"
 dependencies = [
  "libloading 0.9.0",
  "reqwest",
- "sha2 0.10.9",
+ "sha2 0.11.0",
 ]
 
 [[package]]

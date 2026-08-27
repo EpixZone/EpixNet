@@ -65,7 +65,7 @@ epix-build = { path = "../epix-build" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 # Verify the downloaded wallet archive against shells/wallet-ext.sha256
 # before extracting it into the packaged extension.
-sha2 = "0.10"
+sha2 = "0.11"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Windows: embed packaging/windows/app.ico in the exe (Explorer, taskbar).
