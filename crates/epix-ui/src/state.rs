@@ -27408,6 +27408,70 @@ impl AppState {
     /// - Retry passes notify only on completion (with the xite re-checked to
     ///   still exist - a deleted xite's empty missing-list must not toast
     ///   "Downloaded"); the toggle's own pass already reported any failure.
+    /// Warm every served xite's in-memory database in the background. Xite
+    /// dbs live only in RAM (see the startup note on `rebuild_merger_dbs`),
+    /// so after a restart the dashboard's first feedQuery used to trigger
+    /// every rebuild lazily - racing the 10s per-feed deadline and the
+    /// post-boot update churn, which left the feed empty until a later
+    /// file_done event asked again. Warming right after restore runs the
+    /// rebuilds before the network loops contend for the per-xite locks.
+    pub fn spawn_db_warmup(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut seen = std::collections::HashSet::new();
+            let candidates: Vec<String> = {
+                let xites = state.xites.read().await;
+                xites
+                    .iter()
+                    .filter(|(_, xite)| xite.storage.exists("dbschema.json"))
+                    .filter_map(|(key, xite)| {
+                        seen.insert(canonical_address(xite.content.as_ref(), key))
+                            .then(|| key.clone())
+                    })
+                    .collect()
+            };
+            let mut warmed = 0usize;
+            let mut skipped = 0usize;
+            for address in &candidates {
+                // A db already present (a merger rebuild may have filled it)
+                // needs no warm-up.
+                if state.current_receipt_for(address).await.is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                let one = std::time::Instant::now();
+                let built = state.rebuild_xite_db(address).await;
+                warmed += usize::from(built);
+                // A slow or refused rebuild is the feed-latency signal this
+                // warm-up exists to surface - name the xite so it can be
+                // chased instead of averaged away.
+                if !built || one.elapsed() > std::time::Duration::from_secs(2) {
+                    state
+                        .log(
+                            "INFO",
+                            format!(
+                                "Db warm-up for {address}: {} in {:.1}s",
+                                if built { "rebuilt" } else { "not rebuilt" },
+                                one.elapsed().as_secs_f32()
+                            ),
+                        )
+                        .await;
+                }
+            }
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "Db warm-up: {warmed} rebuilt, {skipped} already present, {} total in {:.1}s",
+                        candidates.len(),
+                        started.elapsed().as_secs_f32()
+                    ),
+                )
+                .await;
+        });
+    }
+
     pub fn spawn_optional_retry_loop(self: &Arc<Self>) {
         let state = self.clone();
         tokio::spawn(async move {

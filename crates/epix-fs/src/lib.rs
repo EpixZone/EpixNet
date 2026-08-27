@@ -22,6 +22,43 @@ fn checked_relative_path(path: &Path) -> io::Result<()> {
 static WINDOWS_TEMP_SEQUENCE: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
 
+/// Encode `path` as a NUL-terminated verbatim (`\\?\`) wide string for raw
+/// Win32 calls. std's own fs wrappers convert long paths to verbatim form
+/// internally, but a path handed straight to e.g. `MoveFileExW` is subject to
+/// the 260-char MAX_PATH limit and fails with `ERROR_PATH_NOT_FOUND` (3) —
+/// the staged-promotion tree (three 64-char hash directories) crosses that
+/// limit routinely. Verbatim paths skip separator normalization, so forward
+/// slashes are rewritten here.
+#[cfg(windows)]
+pub fn verbatim_wide_null(path: &Path) -> io::Result<Vec<u16>> {
+    use std::os::windows::ffi::OsStrExt;
+
+    const SEP: u16 = b'\\' as u16;
+    let absolute = std::path::absolute(path)?;
+    let mut wide: Vec<u16> = absolute.as_os_str().encode_wide().collect();
+    for unit in &mut wide {
+        if *unit == b'/' as u16 {
+            *unit = SEP;
+        }
+    }
+    let mut prefixed = if wide.starts_with(&[SEP, SEP, b'?' as u16, SEP])
+        || wide.starts_with(&[SEP, b'?' as u16, b'?' as u16, SEP])
+    {
+        wide
+    } else if wide.starts_with(&[SEP, SEP]) {
+        // UNC share: \\server\share -> \\?\UNC\server\share
+        let mut p: Vec<u16> = "\\\\?\\UNC\\".encode_utf16().collect();
+        p.extend_from_slice(&wide[2..]);
+        p
+    } else {
+        let mut p: Vec<u16> = "\\\\?\\".encode_utf16().collect();
+        p.extend_from_slice(&wide);
+        p
+    };
+    prefixed.push(0);
+    Ok(prefixed)
+}
+
 #[cfg(windows)]
 fn pin_windows_directory(path: &Path) -> io::Result<std::fs::File> {
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
@@ -190,7 +227,6 @@ pub fn list_regular_files_beneath(root: &Path, max_entries: usize) -> io::Result
 
 #[cfg(windows)]
 fn move_file_write_through(source: &Path, destination: &Path, replace: bool) -> io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
         MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
     };
@@ -208,16 +244,8 @@ fn move_file_write_through(source: &Path, destination: &Path, replace: bool) -> 
         pin_windows_parent(destination)?
     };
 
-    let source = source
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = destination
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
+    let source = verbatim_wide_null(source)?;
+    let destination = verbatim_wide_null(destination)?;
     let flags = MOVEFILE_WRITE_THROUGH
         | if replace {
             MOVEFILE_REPLACE_EXISTING
