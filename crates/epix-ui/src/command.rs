@@ -2653,6 +2653,7 @@ impl WsCommand for FeedQuery {
         // All followed feeds run concurrently, each under its own deadline:
         // one sick xite (db mid-churn, schema outlived by the follow's SQL)
         // must not serialize-stall the merged view every other xite feeds.
+        let query_started = std::time::Instant::now();
         let results =
             futures_util::future::join_all(queries.iter().map(|(xite, name, full)| async move {
                 let res = tokio::time::timeout(
@@ -2665,8 +2666,10 @@ impl WsCommand for FeedQuery {
             .await;
 
         let mut rows: Vec<Value> = Vec::new();
+        let mut answered = 0usize;
         for (xite, name, res) in results {
             let Ok(Ok(res)) = res else { continue };
+            answered += 1;
             for mut row in res {
                 let Some(obj) = row.as_object_mut() else { continue };
                 // Normalize + sanity-check date_added (ms -> s; drop future items).
@@ -2689,6 +2692,22 @@ impl WsCommand for FeedQuery {
             let db = b["date_added"].as_f64().unwrap_or(0.0);
             db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Boot-latency instrumentation: an empty or partial merged feed right
+        // after start is the symptom users report; name which followed feeds
+        // answered so the stall (db not ready, query timeout, no follows) is
+        // attributable from the log.
+        s.state
+            .log(
+                "DEBUG",
+                format!(
+                    "feedQuery: {} row(s) from {} feed(s) across {num_xites} followed xite(s) ({} answered) in {:.1}s",
+                    rows.len(),
+                    queries.len(),
+                    answered,
+                    query_started.elapsed().as_secs_f32()
+                ),
+            )
+            .await;
         // No global cap: `limit` applies per feed query (in build_feed_query),
         // like EpixNet - a global truncate would let one busy feed crowd every
         // other xite out of the merged view.

@@ -2981,6 +2981,10 @@ async fn serve(
     // that all restored xites are registered, or merger pages show nothing
     // until some merger action happens to trigger a rebuild.
     state.rebuild_merger_dbs().await;
+    // Per-xite dbs are just as boot-empty: warm them in the background so
+    // the dashboard's first feedQuery finds real rows instead of racing
+    // every lazy rebuild against its 10s per-feed deadline.
+    state.spawn_db_warmup();
 
     let transport: Arc<dyn Transport> = Arc::new(TcpTransport);
     state.set_transport(transport.clone()).await;
