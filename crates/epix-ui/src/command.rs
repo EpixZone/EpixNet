@@ -65,6 +65,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteList",
     "sitePause",
     "siteRecoverPrivatekey",
+    "siteSignMessage",
     "siteReload",
     "siteResume",
     "siteSetAutodownloadBigfileLimit",
@@ -531,6 +532,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(AesDecrypt),
         Arc::new(EcdsaVerify),
         Arc::new(EcdsaSign),
+        Arc::new(SiteSignMessage),
         Arc::new(RecordSign),
         // Chain: Vrf randomness + XidResolver.
         Arc::new(VrfGetBeacon),
@@ -2363,6 +2365,34 @@ impl WsCommand for EcdsaSign {
             }
         };
         Ok(Value::from(epix_crypt::sign(data, &privatekey)?))
+    }
+}
+
+/// `siteSignMessage(message)` - sign an arbitrary message with the BOUND
+/// XITE's own private key, proving control of the xite address itself.
+///
+/// This is how a xite owner answers an ownership challenge (a directory
+/// listing claim, say) without their key ever being typed, pasted, or passed
+/// on a command line where a shell would record it. The key never leaves the
+/// node: only the signature comes back.
+///
+/// Admin-gated on purpose. Signing as the xite is exactly the authority that
+/// signs its content, so an ordinary page must never be able to ask for it.
+struct SiteSignMessage;
+#[async_trait]
+impl WsCommand for SiteSignMessage {
+    fn name(&self) -> &'static str {
+        "siteSignMessage"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let message = arg_str(p, "message", 0).ok_or("siteSignMessage: message required")?;
+        let address = s.address()?.to_string();
+        let key = s
+            .state
+            .xite_privatekey(&address)
+            .await
+            .ok_or("No stored private key for this xite on this node")?;
+        Ok(Value::from(epix_crypt::sign(message, &key)?))
     }
 }
 

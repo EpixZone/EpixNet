@@ -22,6 +22,7 @@ pub fn is_action(name: &str) -> bool {
             | "siteList"
             | "siteDelete"
             | "siteDownload"
+            | "siteSignMessage"
             | "dbRebuild"
             | "dbQuery"
             | "importBundle"
@@ -43,6 +44,41 @@ pub async fn run(action: &str, args: &[String], data_root: &std::path::Path, ver
             1
         }
     }
+}
+
+/// Read one line from stdin with a prompt on stderr, so the value itself can
+/// still be piped or redirected.
+fn prompt_line(prompt: &str) -> Result<String, String> {
+    use std::io::{BufRead, Write};
+    eprint!("{prompt}");
+    std::io::stderr().flush().ok();
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line).map_err(|error| error.to_string())?;
+    Ok(line.trim().to_string())
+}
+
+/// Like [`prompt_line`], with terminal echo off while typing so the secret
+/// never appears on screen. Falls back to a visible read when stdin is not a
+/// terminal (a pipe), which is still better than an argument: nothing is
+/// recorded in shell history or exposed through `ps`.
+fn prompt_secret(prompt: &str) -> Result<String, String> {
+    let echo_off = std::process::Command::new("stty")
+        .arg("-echo")
+        .stdin(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false);
+    let read = prompt_line(prompt);
+    if echo_off {
+        let _ = std::process::Command::new("stty")
+            .arg("echo")
+            .stdin(std::process::Stdio::inherit())
+            .stderr(std::process::Stdio::null())
+            .status();
+        eprintln!();
+    }
+    read
 }
 
 async fn dispatch(
@@ -287,6 +323,46 @@ async fn dispatch(
                     }
                 }
             }
+            Ok(())
+        }
+
+        // Sign an arbitrary message AS THE XITE, proving control of its
+        // address (answering an ownership challenge, say). Resolution order
+        // keeps the key out of reach: a running node signs with the key it
+        // already holds, then this data dir's stored key, and only if neither
+        // has it does it ask - on stdin, never as an argument, because
+        // arguments land in shell history and are visible in `ps`.
+        "siteSignMessage" => {
+            let [address, rest @ ..] = args else {
+                return Err("usage: siteSignMessage <address> [message]".into());
+            };
+            let message = match rest.first() {
+                Some(m) if !m.is_empty() => m.clone(),
+                _ => prompt_line("Message to sign: ")?,
+            };
+            let params = serde_json::json!({ "message": message });
+            match admin_call(data_root, "siteSignMessage", Some(address), params).await {
+                Ok(Some(reply)) => {
+                    println!("{}", reply.as_str().unwrap_or_default());
+                    return Ok(());
+                }
+                Ok(None) => {
+                    let state = open_state(data_root, version).await;
+                    if let Some(key) = state.xite_privatekey(address).await {
+                        println!("{}", epix_crypt::sign(&message, &key).map_err(|e| e.to_string())?);
+                        return Ok(());
+                    }
+                }
+                // Node is up but holds no key for this xite: ask for one.
+                Err(_) => {}
+            }
+            let key = prompt_secret(
+                "Xite private key (hidden, not saved to shell history): ",
+            )?;
+            if key.is_empty() {
+                return Err("no private key given".into());
+            }
+            println!("{}", epix_crypt::sign(&message, &key).map_err(|e| e.to_string())?);
             Ok(())
         }
 
