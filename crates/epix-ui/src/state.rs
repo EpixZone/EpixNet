@@ -8132,6 +8132,7 @@ impl AppState {
         // many timeouts and the dashboard's per-tracker stats would trickle in.
         let mut set = tokio::task::JoinSet::new();
         let mut skipped = 0;
+        let mut seeded = false;
         for tracker in trackers.iter().cloned() {
             if tracker_gated(&tracker, tor_on, &tor_st, i2p_on) {
                 self.mark_tracker_gated(&tracker).await;
@@ -8141,6 +8142,7 @@ impl AppState {
                 skipped += 1;
                 continue;
             }
+            seeded |= self.mark_tracker_announcing(&tracker).await;
             let sender = sender.clone();
             let key = key.clone();
             let advert = advert.clone();
@@ -8159,6 +8161,12 @@ impl AppState {
                 .unwrap_or_else(|_| Err("announce timed out".into()));
                 (tracker, result, started.elapsed())
             });
+        }
+        // New trackers entered the stats as "announcing": push right away so
+        // the dashboard lists what this pass is trying instead of waiting up
+        // to 75s for the slowest announce to resolve.
+        if seeded {
+            self.push_announcer_info(&key).await;
         }
         let all = self.absorb_announce_results(set, &key).await;
         self.add_peers(address, all.clone()).await;
@@ -8288,6 +8296,32 @@ impl AppState {
         backoff.retain(|_, &mut (_, tried)| now - tried < STALE_SECS);
     }
 
+    /// Seed a stats entry for a tracker this pass is about to try, so the
+    /// dashboard can list it before its announce resolves. Only a tracker
+    /// with no entry yet gets the "announcing" status: one with a verdict
+    /// keeps showing that verdict while the retry is in flight. Returns
+    /// whether a new entry was created.
+    async fn mark_tracker_announcing(&self, tracker: &epix_xite::Tracker) -> bool {
+        let key = tracker_stat_key(tracker);
+        let now = now_secs();
+        let mut stats = self.tracker_stats.write().await;
+        if let Some(entry) = stats.get_mut(&key) {
+            // A gated entry whose overlay came back up is being tried now.
+            let gated = entry.get("status").and_then(|s| s.as_str()) == Some("gated");
+            if gated {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("status".into(), json!("announcing"));
+                }
+            }
+            return gated;
+        }
+        stats.insert(
+            key,
+            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": now }),
+        );
+        true
+    }
+
     /// Mark a tracker skipped because its overlay is down (Tor off for an
     /// onion announcer, no I2P transport for an i2p one) so the dashboard can
     /// exclude it from the working-tracker denominator instead of counting it
@@ -8334,6 +8368,23 @@ impl AppState {
                 .await
                 .iter()
                 .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) != Some("gated"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
+
+    /// [`Self::announcer_stats`] including overlay-gated entries, so the
+    /// dashboard's health drawer can list every tracker the node plans to
+    /// try once its overlay comes up. Served only to a caller that asks
+    /// (`announcerStats {planned: true}`): the shipped dashboard counts
+    /// every returned entry in its health ratio, so gated rows must never
+    /// reach it unrequested.
+    pub async fn announcer_stats_planned(&self) -> Value {
+        Value::Object(
+            self.tracker_stats
+                .read()
+                .await
+                .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         )
@@ -8645,6 +8696,10 @@ impl AppState {
         // The dashboard shows the Tor state live (serverChanged).
         if changed {
             self.push_server_info().await;
+            // A Tor state move changes which trackers are dialable. Wake the
+            // announce loop so onion trackers gated during boot get tried
+            // seconds after Tor comes up, not at the next periodic pass.
+            self.trackers_changed.notify_one();
         }
     }
 
@@ -16650,6 +16705,9 @@ impl AppState {
         };
         if changed {
             self.push_server_info().await;
+            // Same rule as set_tor_status: an I2P reachability move regates
+            // i2p trackers, so the announce loop should run early.
+            self.trackers_changed.notify_one();
         }
     }
 

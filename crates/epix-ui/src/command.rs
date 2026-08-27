@@ -1090,14 +1090,27 @@ impl WsCommand for ServerInfo {
 }
 
 /// `announcerStats` - per-tracker announce status for the dashboard.
+/// `{planned: true}` also includes overlay-gated trackers (waiting on
+/// Tor/I2P), so the health drawer can list everything the node will try.
+/// The default answer stays gated-free: dashboards that predate the flag
+/// count every returned entry in their health ratio.
 struct AnnouncerStats;
 #[async_trait]
 impl WsCommand for AnnouncerStats {
     fn name(&self) -> &'static str {
         "announcerStats"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(s.state.announcer_stats().await)
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let planned = p
+            .get("planned")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if planned {
+            Ok(s.state.announcer_stats_planned().await)
+        } else {
+            Ok(s.state.announcer_stats().await)
+        }
     }
 }
 
