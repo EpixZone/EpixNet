@@ -2182,6 +2182,17 @@ impl Xite {
             let Ok(path) = self.storage.path(path) else {
                 return Ok(false);
             };
+            // Already adopted as this exact file, and revalidate has just
+            // re-proven it. `of_file` below hashes the whole file only to
+            // rediscover an id we are holding right here, so on a node with a
+            // large xite that is a second full read of the tree at every
+            // startup - on top of revalidate's. Skip straight to the claim.
+            // Any doubt (different path, incomplete, not extern) answers
+            // false and falls through to the full check.
+            if store.is_extern_at(id, &path).unwrap_or(false) {
+                store.claim_manifest(id).map_err(Error::Io)?;
+                return Ok(true);
+            }
             let Ok((actual, actual_size)) = epix_blob::ObjId::of_file(&path) else {
                 return Ok(false);
             };
