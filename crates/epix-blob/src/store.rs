@@ -1091,6 +1091,25 @@ impl Store {
         Ok(self.get_record(id)?.map(|r| matches!(r.loc, Loc::Extern)).unwrap_or(false))
     }
 
+    /// Whether `id` is already adopted as a complete extern whose bytes are
+    /// exactly the file at `path`.
+    ///
+    /// Registration otherwise rediscovers an object's id by hashing the whole
+    /// file, which is a second full read of the tree on top of revalidate's.
+    /// An extern that survived revalidate has just been proven, so a caller
+    /// that already knows the id it wants can ask this instead of hashing.
+    /// Anything short of an exact match answers `false`, leaving the caller
+    /// on its original path.
+    pub fn is_extern_at(&self, id: ObjId, path: &std::path::Path) -> io::Result<bool> {
+        let Some(rec) = self.get_record(id)? else { return Ok(false) };
+        if !matches!(rec.loc, Loc::Extern) || !rec.is_complete() {
+            return Ok(false);
+        }
+        let Some(rel) = self.extern_rel(id)? else { return Ok(false) };
+        let Ok(want) = self.rel_of(path) else { return Ok(false) };
+        Ok(normalized_extern_key(&rel)? == normalized_extern_key(&want)?)
+    }
+
     /// (size, complete) for an indexed object, `None` if unknown.
     pub fn info(&self, id: ObjId) -> io::Result<Option<(u64, bool)>> {
         Ok(self.get_record(id)?.map(|r| (r.size, r.is_complete())))
@@ -5930,6 +5949,39 @@ mod tests {
             !store.revalidate(id).unwrap().is_complete(size),
             "a modified extern of the same length was trusted"
         );
+    }
+
+    /// `is_extern_at` is what lets registration skip rehashing a file just to
+    /// rediscover an id it already holds. It must be exact: the right object
+    /// at the right path only.
+    #[test]
+    fn is_extern_at_answers_only_for_the_exact_adopted_file() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let store = rooted_store(&store_dir, &tree);
+        let bytes = test_data(120_000);
+        let (id, _, _) = slice_for(&bytes, &[0..bytes.len() as u64]);
+        let path = tree.path().join("site/asset.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(store.adopt_extern(id, Ns::Plain, &path, 1).unwrap());
+
+        assert!(store.is_extern_at(id, &path).unwrap(), "the adopted file");
+
+        let other = tree.path().join("site/copy.bin");
+        std::fs::write(&other, &bytes).unwrap();
+        assert!(
+            !store.is_extern_at(id, &other).unwrap(),
+            "same bytes at a different path is not the adopted file"
+        );
+
+        let (unknown, _, _) = slice_for(&test_data(64), &[0..64]);
+        assert!(!store.is_extern_at(unknown, &path).unwrap(), "unknown object");
+
+        // Outside the xite root: must not read through to arbitrary paths.
+        let outside = store_dir.path().join("elsewhere.bin");
+        std::fs::write(&outside, &bytes).unwrap();
+        assert!(!store.is_extern_at(id, &outside).unwrap(), "outside the root");
     }
 
     #[test]
