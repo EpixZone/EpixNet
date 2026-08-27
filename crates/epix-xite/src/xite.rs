@@ -2678,11 +2678,17 @@ mod tests {
         let mut swapped = movie.clone();
         swapped[0] = 1;
         storage.write("video/movie.bin", &swapped).unwrap();
-        let f = std::fs::File::options()
-            .append(true)
-            .open(storage.path("video/movie.bin").unwrap())
-            .unwrap();
-        f.set_modified(mtime).unwrap();
+        // The touch handle must not stay open across a sign: the Windows read
+        // path denies write sharing, so a held append handle fails the read.
+        let touch = |time: std::time::SystemTime| {
+            std::fs::File::options()
+                .append(true)
+                .open(storage.path("video/movie.bin").unwrap())
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        touch(mtime);
         xite.sign(&pk, 1001.0).unwrap();
         let second = xite.content.clone().unwrap();
         assert_eq!(
@@ -2702,7 +2708,7 @@ mod tests {
         );
 
         // Now touch the mtime: a normal sign re-reads changed files by itself.
-        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        touch(std::time::SystemTime::now() + std::time::Duration::from_secs(5));
         xite.sign(&pk, 1003.0).unwrap();
         let third = xite.content.clone().unwrap();
         assert_ne!(

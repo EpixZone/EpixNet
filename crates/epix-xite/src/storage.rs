@@ -204,7 +204,6 @@ fn list_regular_files_beneath(root: &Path, max_entries: usize) -> std::io::Resul
 
 #[cfg(windows)]
 fn create_directory_durable(directory: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
     if directory.is_dir() {
@@ -223,16 +222,10 @@ fn create_directory_durable(directory: &Path) -> std::io::Result<()> {
         std::process::id()
     ));
     std::fs::create_dir(&temporary)?;
-    let source = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = directory
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
+    // Raw MoveFileExW paths are MAX_PATH-limited; the verbatim form keeps
+    // deep staging trees working.
+    let source = epix_fs::verbatim_wide_null(&temporary)?;
+    let destination = epix_fs::verbatim_wide_null(directory)?;
     let result = unsafe {
         MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH)
     };
@@ -449,12 +442,12 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
         let directory = std::fs::OpenOptions::new()
             .read(true)
-            .share_mode(FILE_SHARE_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let metadata = directory.metadata()?;
@@ -550,6 +543,7 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
         ));
         let temporary_path = current.join(&temporary_name);
         let mut file = match std::fs::OpenOptions::new()
+            .write(true)
             .access_mode(FILE_GENERIC_WRITE | DELETE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -1125,6 +1119,29 @@ mod tests {
             .filter(|f| f.ends_with(".epixtmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    /// The staging tree nests three 64-char hash directories, which pushes
+    /// absolute paths past Windows' 260-char MAX_PATH. Every durable
+    /// operation must survive that depth (raw Win32 calls need verbatim
+    /// paths; std converts its own).
+    #[test]
+    fn durable_write_survives_paths_past_max_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir
+            .path()
+            .join("a".repeat(64))
+            .join("b".repeat(64))
+            .join("c".repeat(64));
+        let storage = XiteStorage::new(&deep);
+        let inner = "backups/replaced/data/users/someone.epix/content.json";
+        assert!(deep.join(inner).as_os_str().len() > 260, "test path must exceed MAX_PATH");
+
+        storage.write_atomic_durable(inner, b"deep v1").unwrap();
+        storage.write_atomic_durable(inner, b"deep v2").unwrap();
+        assert_eq!(storage.read(inner).unwrap(), b"deep v2");
+        storage.delete(inner).unwrap();
+        assert!(!storage.exists(inner));
     }
 
     #[test]
