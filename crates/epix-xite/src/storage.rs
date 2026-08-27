@@ -48,48 +48,50 @@ fn open_xite_root(root: &Path, create: bool) -> std::io::Result<std::fs::File> {
     } else {
         std::env::current_dir()?.join(root)
     };
-    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
-    let mut directory = rustix::fs::open("/", flags, Mode::empty())
-        .map(std::fs::File::from)
-        .map_err(std::io::Error::from)?;
-    for component in root.components() {
-        match component {
-            Component::RootDir => continue,
-            Component::Normal(name) => {
-                match rustix::fs::openat(&directory, name, flags, Mode::empty()) {
-                    Ok(next) => directory = std::fs::File::from(next),
-                    Err(error)
-                        if create
-                            && std::io::Error::from(error).kind()
-                                == std::io::ErrorKind::NotFound =>
-                    {
-                        match rustix::fs::mkdirat(
-                            &directory,
-                            name,
-                            Mode::from_bits_truncate(0o755),
-                        ) {
-                            Ok(()) => directory.sync_all()?,
-                            Err(error)
-                                if std::io::Error::from(error).kind()
-                                    == std::io::ErrorKind::AlreadyExists => {}
-                            Err(error) => return Err(std::io::Error::from(error)),
-                        }
-                        directory = rustix::fs::openat(&directory, name, flags, Mode::empty())
-                            .map(std::fs::File::from)
-                            .map_err(std::io::Error::from)?;
-                    }
-                    Err(error) => return Err(std::io::Error::from(error)),
-                }
-            }
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "xite storage root is not a canonical absolute path",
-                ));
-            }
-        }
+    if root
+        .components()
+        .any(|c| !matches!(c, Component::RootDir | Component::Normal(_)))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "xite storage root is not a canonical absolute path",
+        ));
     }
-    Ok(directory)
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // Open the configured root directly instead of walking down from "/".
+    // The root's ancestry is trusted configuration (see above), and sandboxed
+    // platforms refuse to open their upper directories at all: on Android,
+    // SELinux denies apps read on "/", so a walk from "/" made every storage
+    // read and durable write fail with EACCES even though the data dir
+    // itself was fully accessible.
+    match rustix::fs::open(&root, flags, Mode::empty()) {
+        Ok(directory) => return Ok(std::fs::File::from(directory)),
+        Err(error)
+            if create && std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    // A missing root component: durably create it under its nearest existing
+    // ancestor. Recursing on the parent opens only the directories that are
+    // actually being created into, never the ancestry above them.
+    let parent = root.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "xite storage root has no parent")
+    })?;
+    let name = root.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "xite storage root is not a canonical absolute path",
+        )
+    })?;
+    let directory = open_xite_root(parent, true)?;
+    match rustix::fs::mkdirat(&directory, name, Mode::from_bits_truncate(0o755)) {
+        Ok(()) => directory.sync_all()?,
+        Err(error)
+            if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    rustix::fs::openat(&directory, name, flags, Mode::empty())
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
 }
 
 #[cfg(unix)]
@@ -202,7 +204,6 @@ fn list_regular_files_beneath(root: &Path, max_entries: usize) -> std::io::Resul
 
 #[cfg(windows)]
 fn create_directory_durable(directory: &Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{MoveFileExW, MOVEFILE_WRITE_THROUGH};
 
     if directory.is_dir() {
@@ -221,16 +222,10 @@ fn create_directory_durable(directory: &Path) -> std::io::Result<()> {
         std::process::id()
     ));
     std::fs::create_dir(&temporary)?;
-    let source = temporary
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
-    let destination = directory
-        .as_os_str()
-        .encode_wide()
-        .chain(Some(0))
-        .collect::<Vec<_>>();
+    // Raw MoveFileExW paths are MAX_PATH-limited; the verbatim form keeps
+    // deep staging trees working.
+    let source = epix_fs::verbatim_wide_null(&temporary)?;
+    let destination = epix_fs::verbatim_wide_null(directory)?;
     let result = unsafe {
         MoveFileExW(source.as_ptr(), destination.as_ptr(), MOVEFILE_WRITE_THROUGH)
     };
@@ -447,12 +442,12 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
         use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS,
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE,
         };
 
         let directory = std::fs::OpenOptions::new()
             .read(true)
-            .share_mode(FILE_SHARE_READ)
+            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)?;
         let metadata = directory.metadata()?;
@@ -548,6 +543,7 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
         ));
         let temporary_path = current.join(&temporary_name);
         let mut file = match std::fs::OpenOptions::new()
+            .write(true)
             .access_mode(FILE_GENERIC_WRITE | DELETE)
             .share_mode(FILE_SHARE_READ | FILE_SHARE_DELETE)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -1127,6 +1123,29 @@ mod tests {
             .filter(|f| f.ends_with(".epixtmp"))
             .collect();
         assert!(leftovers.is_empty(), "temp files left behind: {leftovers:?}");
+    }
+
+    /// The staging tree nests three 64-char hash directories, which pushes
+    /// absolute paths past Windows' 260-char MAX_PATH. Every durable
+    /// operation must survive that depth (raw Win32 calls need verbatim
+    /// paths; std converts its own).
+    #[test]
+    fn durable_write_survives_paths_past_max_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let deep = dir
+            .path()
+            .join("a".repeat(64))
+            .join("b".repeat(64))
+            .join("c".repeat(64));
+        let storage = XiteStorage::new(&deep);
+        let inner = "backups/replaced/data/users/someone.epix/content.json";
+        assert!(deep.join(inner).as_os_str().len() > 260, "test path must exceed MAX_PATH");
+
+        storage.write_atomic_durable(inner, b"deep v1").unwrap();
+        storage.write_atomic_durable(inner, b"deep v2").unwrap();
+        assert_eq!(storage.read(inner).unwrap(), b"deep v2");
+        storage.delete(inner).unwrap();
+        assert!(!storage.exists(inner));
     }
 
     #[test]

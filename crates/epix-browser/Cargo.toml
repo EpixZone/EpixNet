@@ -36,7 +36,7 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 # best-effort - the launcher falls back to no-tray when the host can't show one.
 tray-icon = "0.24"
 muda = "0.19"
-tao = "0.36"
+tao = "0.37"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Windows: register the native-messaging host via the registry; console
@@ -65,7 +65,7 @@ epix-build = { path = "../epix-build" }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 # Verify the downloaded wallet archive against shells/wallet-ext.sha256
 # before extracting it into the packaged extension.
-sha2 = "0.10"
+sha2 = "0.11"
 zip = { version = "8", default-features = false, features = ["deflate"] }
 
 # Windows: embed packaging/windows/app.ico in the exe (Explorer, taskbar).

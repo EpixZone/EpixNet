@@ -80,11 +80,63 @@
       this.ws.onerror = this.onErrorWebsocket;
       this.ws.onclose = this.onCloseWebsocket;
       this.connected = false;
+      this.startKeepalive();
       return this.message_queue = [];
+    };
+
+    // A socket can die without ever firing onclose (the node suspended, the
+    // process paused): sends vanish, callbacks never fire, and a page mid-boot
+    // freezes forever. Actively ping the node (cheap: the handler answers in
+    // microseconds); two missed pongs mean the connection is dead-open, so
+    // close it and let the normal reconnect path recover - reconnection
+    // already re-announces wrapperOpenedWebsocket, which re-runs page boot.
+    EpixWebsocket.prototype.startKeepalive = function () {
+      var _this = this;
+      if (this.keepalive_timer) {
+        clearInterval(this.keepalive_timer);
+      }
+      this.last_pong_time = Date.now();
+      return this.keepalive_timer = setInterval(function () {
+        if (!_this.connected) {
+          return;
+        }
+        if (Date.now() - _this.last_pong_time > 45000) {
+          _this.log("No pong for 45s: connection is dead, closing it");
+          return _this.forceClose();
+        }
+        var id = _this.next_message_id;
+        _this.next_message_id += 1;
+        _this.send({ "cmd": "ping", "params": {}, "id": id }, function () {
+          delete _this.waiting_cb[id];
+          _this.last_pong_time = Date.now();
+        });
+      }, 20000);
+    };
+
+    // Close a dead-open socket. If the engine never delivers onclose for it,
+    // run the close handler once ourselves so the reconnect timer starts.
+    EpixWebsocket.prototype.forceClose = function () {
+      var _this = this;
+      if (this.force_closing) {
+        return;
+      }
+      this.force_closing = true;
+      try {
+        this.ws.close();
+      } catch (err) { }
+      return setTimeout(function () {
+        _this.force_closing = false;
+        if (_this.connected) {
+          _this.connected = false;
+          _this.onCloseWebsocket(null);
+        }
+      }, 8000);
     };
 
     EpixWebsocket.prototype.onMessage = function (e) {
       var cmd, message;
+      // Any inbound traffic proves the connection is alive.
+      this.last_pong_time = Date.now();
       message = JSON.parse(e.data);
       cmd = message.cmd;
       if (cmd === "response") {
@@ -1164,7 +1216,7 @@ if (window.getComputedStyle(document.body).transform) {
         }
       }
       message = e.data;
-      if (!message.cmd) {
+      if (!message || typeof message !== "object" || !message.cmd) {
         this.log("Invalid message:", message);
         return false;
       }

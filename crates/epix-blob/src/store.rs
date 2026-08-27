@@ -43,6 +43,18 @@ const META: TableDefinition<&str, u64> = TableDefinition::new("meta");
 /// [`StoreConfig::xite_root`] (`<address>/<inner_path>`). Relative, not
 /// absolute, so relocating the data directory does not orphan every object.
 const EXTERN: TableDefinition<&[u8], &str> = TableDefinition::new("extern");
+/// The `(len, mtime)` an extern object's file had when its bytes were last
+/// verified end to end against the stored outboard.
+///
+/// Without this, revalidating an extern object re-read and re-hashed every
+/// byte of it. Startup registers every served xite, so a node holding a large
+/// xite re-hashed the whole tree on every boot - 234 GB of media took tens of
+/// minutes, during which the global activation gate stayed write-held and
+/// every `dbQuery` on every xite blocked, so app pages hung on their loading
+/// screen. Same idea as EXTERN itself: purely local, never signed or
+/// transmitted, so it can be discarded without affecting correctness. A
+/// missing or non-matching stamp simply falls back to full verification.
+const EXTERN_STAMP: TableDefinition<&[u8], &[u8]> = TableDefinition::new("extern_stamp");
 /// Object IDs with this Store's one persistent accepted-manifest reference.
 /// Multiple manifests that declare the same ID share this single owner.
 const MANIFEST_OWNERS: TableDefinition<&[u8], u8> =
@@ -554,6 +566,7 @@ impl Store {
             // Make sure OBJECTS and EXTERN exist even in an empty store.
             txn.open_table(OBJECTS).map_err(db_err)?;
             txn.open_table(EXTERN).map_err(db_err)?;
+            txn.open_table(EXTERN_STAMP).map_err(db_err)?;
         }
         txn.commit().map_err(db_err)?;
         cleanup_unindexed_sparse_files(&root.join("sparse"), &db)?;
@@ -795,7 +808,71 @@ impl Store {
                 table.remove(id.0.as_slice()).map_err(db_err)?;
             }
         }
+        Self::clear_extern_stamp_in(txn, id)
+    }
+
+    /// Drop `id`'s verification stamp inside `txn`.
+    ///
+    /// Every write to [`EXTERN`] must call this. The stamp describes the file
+    /// that WAS verified, so repointing an object at another path - or
+    /// dropping the mapping - must not leave behind a stamp that a later
+    /// revalidate could read as proof about the new file. Only a completed
+    /// end-to-end verification writes a stamp back, so the cost of clearing
+    /// one unnecessarily is a single re-verification.
+    fn clear_extern_stamp_in(txn: &redb::WriteTransaction, id: ObjId) -> io::Result<()> {
+        txn.open_table(EXTERN_STAMP)
+            .map_err(db_err)?
+            .remove(id.0.as_slice())
+            .map_err(db_err)?;
         Ok(())
+    }
+
+    /// The `(len, mtime)` pair identifying a file version, as stored in
+    /// [`EXTERN_STAMP`]. `None` when the filesystem cannot report an mtime,
+    /// which simply means this object keeps verifying the slow way.
+    fn extern_stamp_bytes(meta: &fs::Metadata) -> Option<[u8; 20]> {
+        let modified = meta.modified().ok()?;
+        let (secs, nanos) = match modified.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (d.as_secs() as i64, d.subsec_nanos()),
+            // Pre-epoch mtimes are legal; encode them as a negative offset
+            // rather than discarding the stamp.
+            Err(e) => {
+                let d = e.duration();
+                (-(d.as_secs() as i64), d.subsec_nanos())
+            }
+        };
+        let mut out = [0u8; 20];
+        out[..8].copy_from_slice(&meta.len().to_le_bytes());
+        out[8..16].copy_from_slice(&secs.to_le_bytes());
+        out[16..].copy_from_slice(&nanos.to_le_bytes());
+        Some(out)
+    }
+
+    /// Whether `meta` matches the stamp recorded for `id`. False whenever the
+    /// stamp is absent, malformed, or different - all of which mean "verify
+    /// the bytes", never "assume good".
+    fn extern_stamp_matches(&self, id: ObjId, meta: &fs::Metadata) -> bool {
+        let Some(current) = Self::extern_stamp_bytes(meta) else { return false };
+        let Ok(txn) = self.db.begin_read() else { return false };
+        let Ok(table) = txn.open_table(EXTERN_STAMP) else { return false };
+        matches!(
+            table.get(id.0.as_slice()),
+            Ok(Some(stored)) if stored.value() == current
+        )
+    }
+
+    /// Record that `id`'s bytes verified against the file described by
+    /// `meta`. Best effort: a failure here only costs a re-verification.
+    fn record_extern_stamp(&self, id: ObjId, meta: &fs::Metadata) {
+        let Some(stamp) = Self::extern_stamp_bytes(meta) else { return };
+        let Ok(txn) = self.db.begin_write() else { return };
+        {
+            let Ok(mut table) = txn.open_table(EXTERN_STAMP) else { return };
+            if table.insert(id.0.as_slice(), stamp.as_slice()).is_err() {
+                return;
+            }
+        }
+        let _ = txn.commit();
     }
 
     /// An owner marker is meaningful only while its object record exists.
@@ -1012,6 +1089,25 @@ impl Store {
     /// skip a materialize that has already happened.
     pub fn is_extern(&self, id: ObjId) -> io::Result<bool> {
         Ok(self.get_record(id)?.map(|r| matches!(r.loc, Loc::Extern)).unwrap_or(false))
+    }
+
+    /// Whether `id` is already adopted as a complete extern whose bytes are
+    /// exactly the file at `path`.
+    ///
+    /// Registration otherwise rediscovers an object's id by hashing the whole
+    /// file, which is a second full read of the tree on top of revalidate's.
+    /// An extern that survived revalidate has just been proven, so a caller
+    /// that already knows the id it wants can ask this instead of hashing.
+    /// Anything short of an exact match answers `false`, leaving the caller
+    /// on its original path.
+    pub fn is_extern_at(&self, id: ObjId, path: &std::path::Path) -> io::Result<bool> {
+        let Some(rec) = self.get_record(id)? else { return Ok(false) };
+        if !matches!(rec.loc, Loc::Extern) || !rec.is_complete() {
+            return Ok(false);
+        }
+        let Some(rel) = self.extern_rel(id)? else { return Ok(false) };
+        let Ok(want) = self.rel_of(path) else { return Ok(false) };
+        Ok(normalized_extern_key(&rel)? == normalized_extern_key(&want)?)
     }
 
     /// (size, complete) for an indexed object, `None` if unknown.
@@ -1925,6 +2021,7 @@ impl Store {
                 io::Error::new(io::ErrorKind::InvalidInput, "non-UTF-8 extern path")
             })?;
             externs.insert(id.0.as_slice(), new_rel).map_err(db_err)?;
+            Self::clear_extern_stamp_in(&txn, id)?;
         }
         txn.commit().map_err(db_err)?;
         Ok(ExternRelocation::Relocated)
@@ -2484,6 +2581,7 @@ impl Store {
 
             objects.remove(id.0.as_slice()).map_err(db_err)?;
             externs.remove(id.0.as_slice()).map_err(db_err)?;
+            Self::clear_extern_stamp_in(&txn, id)?;
             Self::clear_owner_markers_in(&txn, id)?;
         }
         txn.commit().map_err(db_err)?;
@@ -3008,6 +3106,7 @@ impl Store {
                 }
             }
             externs.insert(id.0.as_slice(), rel).map_err(db_err)?;
+            Self::clear_extern_stamp_in(&txn, id)?;
         }
         txn.commit().map_err(db_err)?;
         // Same race, sparse flavor (adopt vs a concurrent ensure_sparse): the
@@ -4416,8 +4515,17 @@ impl Store {
             Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(false),
             Err(error) => return Err(error),
         };
-        if file.metadata()?.len() != rec.size {
+        let meta = file.metadata()?;
+        if meta.len() != rec.size {
             return Ok(false);
+        }
+        // Unchanged since we last verified it end to end: the bytes were
+        // proven then and neither length nor mtime has moved since, so
+        // re-reading the whole file would prove the same thing again. This is
+        // what keeps startup registration from re-hashing an entire xite
+        // tree; anything that does not match still gets the full check below.
+        if self.extern_stamp_matches(id, &meta) {
+            return Ok(true);
         }
         let all = GroupBits::complete(rec.size);
         let want = all.to_chunk_ranges_clamped(rec.size);
@@ -4441,6 +4549,7 @@ impl Store {
             Err(error) => return Err(error),
         };
         if valid_existing {
+            self.record_extern_stamp(id, &meta);
             return Ok(true);
         }
 
@@ -4452,6 +4561,7 @@ impl Store {
             return Ok(false);
         }
         self.install_outboard_atomic(id, &rebuilt.data)?;
+        self.record_extern_stamp(id, &meta);
         Ok(true)
     }
 
@@ -4892,6 +5002,15 @@ fn copy_regular_file_beneath(
                 format!("materialized bytes do not hash to {expected_id}"),
             ));
         }
+        let verify_existing_and_drop_temporary = |directory: &File| -> io::Result<OutboardBytes> {
+            let installed = open_regular_beneath(root, relative)?;
+            let outboard = verify_open_file_complete(installed, expected_size, expected_id)?;
+            rustix::fs::unlinkat(directory, &temporary_name, AtFlags::empty())
+                .map_err(io::Error::from)?;
+            directory.sync_all()?;
+            Ok(outboard)
+        };
+        let mut moved = false;
         match rustix::fs::linkat(
             &directory,
             &temporary_name,
@@ -4903,18 +5022,37 @@ fn copy_regular_file_beneath(
             Err(error)
                 if io::Error::from(error).kind() == io::ErrorKind::AlreadyExists =>
             {
-                let installed = open_regular_beneath(root, relative)?;
-                let outboard =
-                    verify_open_file_complete(installed, expected_size, expected_id)?;
-                rustix::fs::unlinkat(&directory, &temporary_name, AtFlags::empty())
-                    .map_err(io::Error::from)?;
-                directory.sync_all()?;
-                return Ok(outboard);
+                return verify_existing_and_drop_temporary(&directory);
+            }
+            // Android SELinux denies linkat for app domains outright. A
+            // rename with NOREPLACE installs the temporary with the same
+            // never-replace contract, it just cannot keep the temporary
+            // name alive through the swap (nothing needs it afterwards).
+            Err(error)
+                if io::Error::from(error).kind() == io::ErrorKind::PermissionDenied =>
+            {
+                match rustix::fs::renameat_with(
+                    &directory,
+                    &temporary_name,
+                    &directory,
+                    &final_name,
+                    rustix::fs::RenameFlags::NOREPLACE,
+                ) {
+                    Ok(()) => moved = true,
+                    Err(error)
+                        if io::Error::from(error).kind() == io::ErrorKind::AlreadyExists =>
+                    {
+                        return verify_existing_and_drop_temporary(&directory);
+                    }
+                    Err(error) => return Err(io::Error::from(error)),
+                }
             }
             Err(error) => return Err(io::Error::from(error)),
         }
-        rustix::fs::unlinkat(&directory, &temporary_name, AtFlags::empty())
-            .map_err(io::Error::from)?;
+        if !moved {
+            rustix::fs::unlinkat(&directory, &temporary_name, AtFlags::empty())
+                .map_err(io::Error::from)?;
+        }
         directory.sync_all()?;
         let installed = open_regular_beneath(root, relative)?;
         verify_open_file_complete(installed, expected_size, expected_id)
@@ -5630,6 +5768,7 @@ fn u8_to_ns(v: u8) -> Ns {
 mod tests {
     use super::*;
 
+
     fn test_data(n: usize) -> Vec<u8> {
         (0..n).map(|i| (i.wrapping_mul(31) % 251) as u8).collect()
     }
@@ -5754,6 +5893,95 @@ mod tests {
         assert_eq!(store.get_record(id).unwrap().unwrap().refcount, 1);
         assert!(store.manifest_owned_ids().unwrap().contains(&id));
         assert_eq!(store.read_bytes(id, 4).unwrap(), bytes);
+    }
+
+    /// Revalidating an unchanged extern object must not re-read its bytes.
+    /// Startup revalidates every object of every served xite, so re-reading
+    /// them made a node holding a large xite spend tens of minutes hashing
+    /// its tree on every boot while the activation gate stayed write-held.
+    ///
+    /// Asserted by making the bytes unreadable: a revalidate that still
+    /// answers `true` with the file unreadable can only have skipped the
+    /// read. The mtime is restored first, because the point is that an
+    /// UNCHANGED file is trusted.
+    #[test]
+    fn revalidate_skips_rereading_an_unchanged_extern() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let store = rooted_store(&store_dir, &tree);
+        let bytes = test_data(120_000);
+        let (id, size, _) = slice_for(&bytes, &[0..bytes.len() as u64]);
+        let path = tree.path().join("site/asset.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(store.adopt_extern(id, Ns::Plain, &path, 1).unwrap());
+
+        // First pass reads the bytes and records the stamp.
+        assert!(store.revalidate(id).unwrap().is_complete(size));
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        // Corrupt the bytes but put the mtime back, so the file looks
+        // untouched. Answering "complete" is only possible without reading.
+        let mut altered = bytes.clone();
+        altered[0] ^= 0xff;
+        std::fs::write(&path, &altered).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert_eq!(std::fs::metadata(&path).unwrap().len(), size);
+        assert!(
+            store.revalidate(id).unwrap().is_complete(size),
+            "an unchanged extern was re-read instead of trusting its stamp"
+        );
+
+        // Move only the mtime. Same length, same (corrupt) bytes - the stamp
+        // no longer matches, so the real check must run and reject it.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !store.revalidate(id).unwrap().is_complete(size),
+            "a modified extern of the same length was trusted"
+        );
+    }
+
+    /// `is_extern_at` is what lets registration skip rehashing a file just to
+    /// rediscover an id it already holds. It must be exact: the right object
+    /// at the right path only.
+    #[test]
+    fn is_extern_at_answers_only_for_the_exact_adopted_file() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let store = rooted_store(&store_dir, &tree);
+        let bytes = test_data(120_000);
+        let (id, _, _) = slice_for(&bytes, &[0..bytes.len() as u64]);
+        let path = tree.path().join("site/asset.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(store.adopt_extern(id, Ns::Plain, &path, 1).unwrap());
+
+        assert!(store.is_extern_at(id, &path).unwrap(), "the adopted file");
+
+        let other = tree.path().join("site/copy.bin");
+        std::fs::write(&other, &bytes).unwrap();
+        assert!(
+            !store.is_extern_at(id, &other).unwrap(),
+            "same bytes at a different path is not the adopted file"
+        );
+
+        let (unknown, _, _) = slice_for(&test_data(64), &[0..64]);
+        assert!(!store.is_extern_at(unknown, &path).unwrap(), "unknown object");
+
+        // Outside the xite root: must not read through to arbitrary paths.
+        let outside = store_dir.path().join("elsewhere.bin");
+        std::fs::write(&outside, &bytes).unwrap();
+        assert!(!store.is_extern_at(id, &outside).unwrap(), "outside the root");
     }
 
     #[test]

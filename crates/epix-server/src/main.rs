@@ -56,7 +56,8 @@ async fn main() {
             println!("       epix-server <action> [args...]");
             println!();
             println!("Actions: siteCreate, siteSign, sitePublish, siteVerify, siteList,");
-            println!("         siteDelete, siteDownload, dbRebuild, dbQuery, importBundle,");
+            println!("         siteDelete, siteDownload, siteSignMessage, dbRebuild, dbQuery,");
+            println!("         importBundle,");
             println!("         cryptSign, cryptVerify, cryptGetPrivatekey,");
             println!("         cryptPrivatekeyToAddress, peerPing, siteCmd");
             println!();

@@ -65,6 +65,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteList",
     "sitePause",
     "siteRecoverPrivatekey",
+    "siteSignMessage",
     "siteReload",
     "siteResume",
     "siteSetAutodownloadBigfileLimit",
@@ -531,6 +532,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(AesDecrypt),
         Arc::new(EcdsaVerify),
         Arc::new(EcdsaSign),
+        Arc::new(SiteSignMessage),
         Arc::new(RecordSign),
         // Chain: Vrf randomness + XidResolver.
         Arc::new(VrfGetBeacon),
@@ -1088,14 +1090,27 @@ impl WsCommand for ServerInfo {
 }
 
 /// `announcerStats` - per-tracker announce status for the dashboard.
+/// `{planned: true}` also includes overlay-gated trackers (waiting on
+/// Tor/I2P), so the health drawer can list everything the node will try.
+/// The default answer stays gated-free: dashboards that predate the flag
+/// count every returned entry in their health ratio.
 struct AnnouncerStats;
 #[async_trait]
 impl WsCommand for AnnouncerStats {
     fn name(&self) -> &'static str {
         "announcerStats"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(s.state.announcer_stats().await)
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let planned = p
+            .get("planned")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if planned {
+            Ok(s.state.announcer_stats_planned().await)
+        } else {
+            Ok(s.state.announcer_stats().await)
+        }
     }
 }
 
@@ -2366,6 +2381,34 @@ impl WsCommand for EcdsaSign {
     }
 }
 
+/// `siteSignMessage(message)` - sign an arbitrary message with the BOUND
+/// XITE's own private key, proving control of the xite address itself.
+///
+/// This is how a xite owner answers an ownership challenge (a directory
+/// listing claim, say) without their key ever being typed, pasted, or passed
+/// on a command line where a shell would record it. The key never leaves the
+/// node: only the signature comes back.
+///
+/// Admin-gated on purpose. Signing as the xite is exactly the authority that
+/// signs its content, so an ordinary page must never be able to ask for it.
+struct SiteSignMessage;
+#[async_trait]
+impl WsCommand for SiteSignMessage {
+    fn name(&self) -> &'static str {
+        "siteSignMessage"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let message = arg_str(p, "message", 0).ok_or("siteSignMessage: message required")?;
+        let address = s.address()?.to_string();
+        let key = s
+            .state
+            .xite_privatekey(&address)
+            .await
+            .ok_or("No stored private key for this xite on this node")?;
+        Ok(Value::from(epix_crypt::sign(message, &key)?))
+    }
+}
+
 /// `recordSign(record)` - sign one merge-file post record (a `posts.json`
 /// entry) with the current user's CERT-AWARE auth key, over the canonical
 /// record payload. Returns the record with `sign` embedded. Canonicalization
@@ -2603,7 +2646,7 @@ impl WsCommand for FeedQuery {
         let (limit, day_limit) = feed_limits(p);
         let follows = s.state.all_follows().await;
 
-        let mut rows: Vec<Value> = Vec::new();
+        let mut queries: Vec<(&String, &String, String)> = Vec::new();
         let mut num_xites = 0;
         for (xite, feeds) in &follows {
             let Some(feeds) = feeds.as_object() else { continue };
@@ -2617,22 +2660,43 @@ impl WsCommand for FeedQuery {
                 if !is_safe_feed_sql(&full) {
                     continue;
                 }
-                let Ok(res) = s.state.db_query(xite, &full, &Value::Null).await else { continue };
-                for mut row in res {
-                    let Some(obj) = row.as_object_mut() else { continue };
-                    // Normalize + sanity-check date_added (ms -> s; drop future items).
-                    let Some(mut date) = obj.get("date_added").and_then(|v| v.as_f64()) else { continue };
-                    if date > 1e12 {
-                        date /= 1000.0;
-                    }
-                    if date > now_secs() + 120.0 {
-                        continue;
-                    }
-                    obj.insert("date_added".into(), json!(date));
-                    obj.insert("site".into(), json!(xite));
-                    obj.insert("feed_name".into(), json!(name));
-                    rows.push(row);
+                queries.push((xite, name, full));
+            }
+        }
+        // All followed feeds run concurrently, each under its own deadline:
+        // one sick xite (db mid-churn, schema outlived by the follow's SQL)
+        // must not serialize-stall the merged view every other xite feeds.
+        let query_started = std::time::Instant::now();
+        let results =
+            futures_util::future::join_all(queries.iter().map(|(xite, name, full)| async move {
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    s.state.db_query(xite, full, &Value::Null),
+                )
+                .await;
+                (*xite, *name, res)
+            }))
+            .await;
+
+        let mut rows: Vec<Value> = Vec::new();
+        let mut answered = 0usize;
+        for (xite, name, res) in results {
+            let Ok(Ok(res)) = res else { continue };
+            answered += 1;
+            for mut row in res {
+                let Some(obj) = row.as_object_mut() else { continue };
+                // Normalize + sanity-check date_added (ms -> s; drop future items).
+                let Some(mut date) = obj.get("date_added").and_then(|v| v.as_f64()) else { continue };
+                if date > 1e12 {
+                    date /= 1000.0;
                 }
+                if date > now_secs() + 120.0 {
+                    continue;
+                }
+                obj.insert("date_added".into(), json!(date));
+                obj.insert("site".into(), json!(xite));
+                obj.insert("feed_name".into(), json!(name));
+                rows.push(row);
             }
         }
 
@@ -2645,6 +2709,22 @@ impl WsCommand for FeedQuery {
             let db = b["date_added"].as_f64().unwrap_or(0.0);
             db.partial_cmp(&da).unwrap_or(std::cmp::Ordering::Equal)
         });
+        // Boot-latency instrumentation: an empty or partial merged feed right
+        // after start is the symptom users report; name which followed feeds
+        // answered so the stall (db not ready, query timeout, no follows) is
+        // attributable from the log.
+        s.state
+            .log(
+                "DEBUG",
+                format!(
+                    "feedQuery: {} row(s) from {} feed(s) across {num_xites} followed xite(s) ({} answered) in {:.1}s",
+                    rows.len(),
+                    queries.len(),
+                    answered,
+                    query_started.elapsed().as_secs_f32()
+                ),
+            )
+            .await;
         // No global cap: `limit` applies per feed query (in build_feed_query),
         // like EpixNet - a global truncate would let one busy feed crowd every
         // other xite out of the merged view.

@@ -157,6 +157,13 @@ pub struct UpdatePayload {
     /// delivery receipt, not merely a manifest receipt. Runtime-only. This is
     /// derived from the authenticated Hello and is never serialized itself.
     pub require_merge_delivery: bool,
+    /// Runtime-only, set by the clone's child-manifest pass: verify and stage
+    /// the manifest but do NOT pull its required files inline. The caller
+    /// batches every deferred child's files in one fetch over the clone's
+    /// proven peers instead of paying a per-child session each. A deferral is
+    /// then a normal outcome ([`InboundUpdate::Deferred`]), not an error.
+    /// Never set on live pushes: their availability receipts stay honest.
+    pub defer_required_fetch: bool,
 }
 
 impl UpdatePayload {
@@ -194,6 +201,7 @@ impl UpdatePayload {
             merge_deltas: self.merge_deltas.clone(),
             merge_objects: HashMap::new(),
             require_merge_delivery: false,
+            defer_required_fetch: false,
         }
     }
 
@@ -677,14 +685,14 @@ struct PromotionRecoveryBatch {
 struct PromotionRecoveryVerifyContext<'a> {
     canonical: &'a str,
     contents: &'a HashMap<String, Value>,
-    xid_map: &'a HashMap<String, Vec<String>>,
+    xid_map: &'a epix_content::XidMap,
     files: &'a HashMap<String, Vec<u8>>,
 }
 
 struct VerifiedAuthorityContext<'a> {
     canonical: &'a str,
     contents: &'a HashMap<String, Value>,
-    xid_map: &'a HashMap<String, Vec<String>>,
+    xid_map: &'a epix_content::XidMap,
     storage: Option<&'a XiteStorage>,
     staged: Option<&'a ManifestLease>,
 }
@@ -698,8 +706,8 @@ impl epix_content::verify::VerifyContext for VerifiedAuthorityContext<'_> {
         self.contents.get(inner_path).cloned()
     }
 
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map.get(name).cloned().unwrap_or_default()
+    fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
+        self.xid_map.get(name).cloned()
     }
 
     fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
@@ -719,13 +727,27 @@ impl epix_content::verify::VerifyContext for PromotionRecoveryVerifyContext<'_> 
         self.contents.get(inner_path).cloned()
     }
 
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map.get(name).cloned().unwrap_or_default()
+    fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
+        self.xid_map.get(name).cloned()
     }
 
     fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
         self.files.get(inner_path).cloned()
     }
+}
+
+/// The chain's identity records in the shape verification consumes.
+fn chain_xid_identities(
+    identities: Vec<epix_chain::Identity>,
+) -> Vec<epix_content::XidIdentity> {
+    identities
+        .into_iter()
+        .map(|identity| epix_content::XidIdentity {
+            address: identity.address,
+            active: identity.active,
+            revoked_at_time: identity.revoked_at_time,
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -819,7 +841,7 @@ struct VerifiedMergeAuthority {
     authority_chain: Vec<String>,
     accepted_contents: HashMap<String, Value>,
     declaration: Value,
-    xid_map: HashMap<String, Vec<String>>,
+    xid_map: epix_content::XidMap,
     signers: Vec<String>,
     max_size: Option<u64>,
 }
@@ -831,7 +853,7 @@ struct VerifiedChildAuthority {
     governing_parent: String,
     parent_chain: Vec<String>,
     accepted_contents: HashMap<String, Value>,
-    xid_map: HashMap<String, Vec<String>>,
+    xid_map: epix_content::XidMap,
 }
 
 struct VerifiedSignedManifestAuthority {
@@ -840,7 +862,7 @@ struct VerifiedSignedManifestAuthority {
     governing: String,
     authority_chain: Vec<String>,
     accepted_contents: HashMap<String, Value>,
-    xid_map: HashMap<String, Vec<String>>,
+    xid_map: epix_content::XidMap,
 }
 
 #[derive(Clone)]
@@ -894,6 +916,15 @@ struct AcceptedDbSnapshot {
 enum AcceptedDbInput {
     Immutable(Value),
     Merged(VerifiedFileDeclaration),
+}
+
+/// Where one declared database input is read from: the live tree, or the
+/// commit transaction's stage root when the file is staged there. `full` is
+/// the declared inner path, kept for error messages either way.
+struct DbInputSource<'a> {
+    storage: &'a XiteStorage,
+    path: &'a str,
+    full: &'a str,
 }
 
 #[derive(Clone)]
@@ -1606,76 +1637,70 @@ fn read_regular_xite_file_bounded(
 }
 
 #[cfg(unix)]
+fn open_promotion_directory(directory: &Path, create: bool) -> std::io::Result<std::fs::File> {
+    use rustix::fs::{Mode, OFlags};
+
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    // Open the directory directly instead of walking down from "/". Promotion
+    // paths live under the configured data dir, whose ancestry is trusted
+    // configuration, and sandboxed platforms refuse to open their upper
+    // directories at all: on Android, SELinux denies apps read on "/", so a
+    // walk from "/" failed every child promotion with EACCES even though the
+    // data dir itself was fully accessible.
+    match rustix::fs::open(directory, flags, Mode::empty()) {
+        Ok(opened) => return Ok(std::fs::File::from(opened)),
+        Err(error)
+            if create && std::io::Error::from(error).kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    // A missing component: durably create it under its nearest existing
+    // ancestor. Recursing on the parent opens only the directories that are
+    // actually being created into, never the ancestry above them.
+    let parent = directory.parent().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "promotion path has no parent")
+    })?;
+    let name = directory.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "promotion path has no final name",
+        )
+    })?;
+    let parent = open_promotion_directory(parent, true)?;
+    match rustix::fs::mkdirat(&parent, name, Mode::from_bits_truncate(0o755)) {
+        Ok(()) => parent.sync_all()?,
+        Err(error)
+            if std::io::Error::from(error).kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => return Err(std::io::Error::from(error)),
+    }
+    rustix::fs::openat(&parent, name, flags, Mode::empty())
+        .map(std::fs::File::from)
+        .map_err(std::io::Error::from)
+}
+
+#[cfg(unix)]
 fn unix_absolute_parent_for_promotion(
     path: &Path,
     create: bool,
 ) -> Result<(std::fs::File, std::ffi::OsString), String> {
-    use rustix::fs::{Mode, OFlags};
-
     if !path.is_absolute() {
         return Err(format!("promotion path is not absolute: {}", path.display()));
     }
-    let mut components = path.components().collect::<Vec<_>>();
-    let Some(std::path::Component::Normal(name)) = components.pop() else {
+    if path.components().any(|component| {
+        !matches!(
+            component,
+            std::path::Component::RootDir | std::path::Component::Normal(_)
+        )
+    }) {
+        return Err(format!("unsafe promotion path: {}", path.display()));
+    }
+    let Some(std::path::Component::Normal(name)) = path.components().next_back() else {
         return Err(format!("promotion path has no final name: {}", path.display()));
     };
-    let mut directory = rustix::fs::open(
-        "/",
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map(std::fs::File::from)
-    .map_err(std::io::Error::from)
-    .map_err(|error| error.to_string())?;
-    for component in components {
-        match component {
-            std::path::Component::RootDir => continue,
-            std::path::Component::Normal(part) => {
-                let opened = rustix::fs::openat(
-                    &directory,
-                    part,
-                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                    Mode::empty(),
-                );
-                match opened {
-                    Ok(next) => directory = std::fs::File::from(next),
-                    Err(error)
-                        if create
-                            && std::io::Error::from(error).kind()
-                                == std::io::ErrorKind::NotFound =>
-                    {
-                        match rustix::fs::mkdirat(
-                            &directory,
-                            part,
-                            Mode::from_bits_truncate(0o755),
-                        ) {
-                            Ok(()) => directory
-                                .sync_all()
-                                .map_err(|sync_error| sync_error.to_string())?,
-                            Err(error)
-                                if std::io::Error::from(error).kind()
-                                    == std::io::ErrorKind::AlreadyExists => {}
-                            Err(error) => return Err(std::io::Error::from(error).to_string()),
-                        }
-                        directory = rustix::fs::openat(
-                            &directory,
-                            part,
-                            OFlags::RDONLY
-                                | OFlags::DIRECTORY
-                                | OFlags::NOFOLLOW
-                                | OFlags::CLOEXEC,
-                            Mode::empty(),
-                        )
-                        .map(std::fs::File::from)
-                        .map_err(std::io::Error::from)
-                        .map_err(|open_error| open_error.to_string())?;
-                    }
-                    Err(error) => return Err(std::io::Error::from(error).to_string()),
-                }
-            }
-            _ => return Err(format!("unsafe promotion path: {}", path.display())),
-        }
-    }
+    let Some(parent_path) = path.parent() else {
+        return Err(format!("promotion path has no parent: {}", path.display()));
+    };
+    let directory =
+        open_promotion_directory(parent_path, create).map_err(|error| error.to_string())?;
     Ok((directory, name.to_os_string()))
 }
 
@@ -2178,8 +2203,10 @@ async fn verified_parent_still_authorizes(
             verification_files.insert(inner_path, bytes);
         }
     }
-    let mut xid_map = HashMap::new();
-    for name in epix_content::verify::content_xid_names(parent, &plan.governing) {
+    let mut xid_names = epix_content::verify::content_xid_names(parent, &plan.governing);
+    xid_names.extend(epix_content::verify::chain_cert_xid_name(parent, &content));
+    let mut xid_map = epix_content::XidMap::new();
+    for name in xid_names {
         let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
         #[cfg(test)]
         {
@@ -2191,10 +2218,11 @@ async fn verified_parent_still_authorizes(
                 return Err(format!("injected recovery signer resolution failure: {name}"));
             }
         }
-        let signers = epix_chain::xid_signers::resolve_checked(label, tld).await
+        let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
+            .await
             .map_err(|error| format!("could not resolve recovery signer {name}: {error}"))?;
-        if !signers.is_empty() {
-            xid_map.insert(name, signers);
+        if !identities.is_empty() {
+            xid_map.insert(name, chain_xid_identities(identities));
         }
     }
     let context = PromotionRecoveryVerifyContext {
@@ -3343,6 +3371,12 @@ pub const UPDATE_PHASE_CHECKING: &str = "checking";
 /// "Updating..." pill (and its "N left" file countdown) belongs to.
 pub const UPDATE_PHASE_UPDATING: &str = "updating";
 
+/// The xite is being removed: locks, durable removal intent, directory
+/// deletion, and Store ownership handover, which on a synced xite takes
+/// visible seconds. The dashboard shows "Deleting…" so a slow removal reads
+/// as working, not ignored.
+pub const UPDATE_PHASE_DELETING: &str = "deleting";
+
 /// How an update pass ended, as the dashboard's row pill renders it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum UpdateOutcome {
@@ -4154,6 +4188,17 @@ pub struct AppState {
     /// staged here until required files verify. A count cap and global retained
     /// payload-byte cap bound peer-driven memory use.
     pending_child_relays: std::sync::Mutex<HashMap<String, PendingChildRelay>>,
+    /// Canonicals whose site database is being rebuilt right now. `db_query`
+    /// waits (bounded) while its target is here: a query racing the rebuild
+    /// answered with "database is locked" style errors, which froze app boot
+    /// chains that expected rows (EpixTalk's loading overlay, stuck forever).
+    db_rebuilds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Canonicals whose clone/user-content sync is running. Inbound child
+    /// updates for them stage-and-defer instead of fetching inline, so a
+    /// push cannot hold a child's manifest guard across a slow network pull
+    /// while the sync's level pass needs that guard. The sync's batch fetch
+    /// plus promote pass completes whatever was parked.
+    active_child_syncs: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Xite addresses with an update pass (periodic resync or `siteUpdate`)
     /// currently running, mapped to the phase it is in
     /// ([`UPDATE_PHASE_CHECKING`] -> [`UPDATE_PHASE_UPDATING`]), bracketed by
@@ -4319,6 +4364,11 @@ pub enum InboundUpdate {
     Applied,
     /// We already have this version (or newer) - sender recorded as a peer.
     NotChanged,
+    /// Child manifest verified and staged, required files not yet fetched.
+    /// Only returned when the caller opted in via
+    /// [`UpdatePayload::defer_required_fetch`]; the pending relay completes it
+    /// once the files land (the caller's batch fetch, or the periodic retry).
+    Deferred,
 }
 
 /// A pending Bigfile upload (created by `bigfileUploadInit`, consumed by the
@@ -5020,6 +5070,8 @@ impl AppState {
             xite_activation_gate: Arc::new(tokio::sync::RwLock::new(())),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
+            db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            active_child_syncs: std::sync::Mutex::new(std::collections::HashSet::new()),
             xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -8213,6 +8265,7 @@ impl AppState {
         // many timeouts and the dashboard's per-tracker stats would trickle in.
         let mut set = tokio::task::JoinSet::new();
         let mut skipped = 0;
+        let mut seeded = false;
         for tracker in trackers.iter().cloned() {
             if tracker_gated(&tracker, tor_on, &tor_st, i2p_on) {
                 self.mark_tracker_gated(&tracker).await;
@@ -8222,6 +8275,7 @@ impl AppState {
                 skipped += 1;
                 continue;
             }
+            seeded |= self.mark_tracker_announcing(&tracker).await;
             let sender = sender.clone();
             let key = key.clone();
             let advert = advert.clone();
@@ -8240,6 +8294,12 @@ impl AppState {
                 .unwrap_or_else(|_| Err("announce timed out".into()));
                 (tracker, result, started.elapsed())
             });
+        }
+        // New trackers entered the stats as "announcing": push right away so
+        // the dashboard lists what this pass is trying instead of waiting up
+        // to 75s for the slowest announce to resolve.
+        if seeded {
+            self.push_announcer_info(&key).await;
         }
         let all = self.absorb_announce_results(set, &key).await;
         self.add_peers(address, all.clone()).await;
@@ -8369,6 +8429,32 @@ impl AppState {
         backoff.retain(|_, &mut (_, tried)| now - tried < STALE_SECS);
     }
 
+    /// Seed a stats entry for a tracker this pass is about to try, so the
+    /// dashboard can list it before its announce resolves. Only a tracker
+    /// with no entry yet gets the "announcing" status: one with a verdict
+    /// keeps showing that verdict while the retry is in flight. Returns
+    /// whether a new entry was created.
+    async fn mark_tracker_announcing(&self, tracker: &epix_xite::Tracker) -> bool {
+        let key = tracker_stat_key(tracker);
+        let now = now_secs();
+        let mut stats = self.tracker_stats.write().await;
+        if let Some(entry) = stats.get_mut(&key) {
+            // A gated entry whose overlay came back up is being tried now.
+            let gated = entry.get("status").and_then(|s| s.as_str()) == Some("gated");
+            if gated {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("status".into(), json!("announcing"));
+                }
+            }
+            return gated;
+        }
+        stats.insert(
+            key,
+            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": now }),
+        );
+        true
+    }
+
     /// Mark a tracker skipped because its overlay is down (Tor off for an
     /// onion announcer, no I2P transport for an i2p one) so the dashboard can
     /// exclude it from the working-tracker denominator instead of counting it
@@ -8415,6 +8501,23 @@ impl AppState {
                 .await
                 .iter()
                 .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) != Some("gated"))
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        )
+    }
+
+    /// [`Self::announcer_stats`] including overlay-gated entries, so the
+    /// dashboard's health drawer can list every tracker the node plans to
+    /// try once its overlay comes up. Served only to a caller that asks
+    /// (`announcerStats {planned: true}`): the shipped dashboard counts
+    /// every returned entry in its health ratio, so gated rows must never
+    /// reach it unrequested.
+    pub async fn announcer_stats_planned(&self) -> Value {
+        Value::Object(
+            self.tracker_stats
+                .read()
+                .await
+                .iter()
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         )
@@ -8726,6 +8829,10 @@ impl AppState {
         // The dashboard shows the Tor state live (serverChanged).
         if changed {
             self.push_server_info().await;
+            // A Tor state move changes which trackers are dialable. Wake the
+            // announce loop so onion trackers gated during boot get tried
+            // seconds after Tor comes up, not at the next periodic pass.
+            self.trackers_changed.notify_one();
         }
     }
 
@@ -9949,10 +10056,11 @@ impl AppState {
                 return false;
             }
         };
-        let accepted_db_snapshot = match Self::db_snapshot_from_authority(
+        let accepted_db_snapshot = match Self::db_snapshot_from_authority_staged(
             canonical,
             storage,
             &VerifiedDbAuthority::from(&verified_index),
+            Some(transaction),
         )
         .await
         {
@@ -10732,6 +10840,43 @@ impl AppState {
             .collect()
     }
 
+    /// Required paths in a child manifest that can never arrive over EDX:
+    /// the signed entry has neither a `b3` object id nor a `files_shard`
+    /// descriptor (a pre-EDX signature). Availability must not wait on
+    /// them, or every child signed before the b3 rollout stays uncommitted
+    /// forever. Like the pre-staging clone path, the manifest commits and
+    /// the legacy file stays absent until a verified diff lands it or the
+    /// owner re-signs.
+    fn unfetchable_child_paths(
+        inner_path: &str,
+        content: Option<&Value>,
+    ) -> std::collections::HashSet<String> {
+        let Some(content) = content else {
+            return Default::default();
+        };
+        let dir = inner_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+        content
+            .get("files")
+            .and_then(Value::as_object)
+            .into_iter()
+            .flat_map(|files| files.iter())
+            .filter(|(path, info)| {
+                info.get("b3").and_then(Value::as_str).is_none()
+                    && content
+                        .get("files_shard")
+                        .and_then(|shards| shards.get(path.as_str()))
+                        .is_none()
+            })
+            .map(|(path, _)| {
+                if dir.is_empty() {
+                    path.clone()
+                } else {
+                    format!("{dir}/{path}")
+                }
+            })
+            .collect()
+    }
+
     /// Present a staged child manifest's relative `files` entries as the
     /// xite-relative paths expected by the EDX materializer. The signed child
     /// itself stays off disk until these objects verify.
@@ -10901,7 +11046,10 @@ impl AppState {
                     .ok()
                     .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             });
-        let missing = Self::missing_child_files(storage, &pending.files, transaction);
+        let unfetchable =
+            Self::unfetchable_child_paths(&pending.inner_path, staged_content.as_ref());
+        let mut missing = Self::missing_child_files(storage, &pending.files, transaction);
+        missing.retain(|path| !unfetchable.contains(path));
         if missing.is_empty() {
             return true;
         }
@@ -10931,7 +11079,9 @@ impl AppState {
                 None,
             )
             .await;
-        Self::missing_child_files(storage, &pending.files, transaction).is_empty()
+        Self::missing_child_files(storage, &pending.files, transaction)
+            .iter()
+            .all(|path| unfetchable.contains(path))
     }
 
     async fn commit_child_candidate(
@@ -11020,6 +11170,12 @@ impl AppState {
             &parent_content,
             inner_path,
         ));
+        if let Ok(child) = serde_json::from_slice::<Value>(bytes) {
+            xid_names.extend(epix_content::verify::chain_cert_xid_name(
+                &parent_content,
+                &child,
+            ));
+        }
         let xid_map = Self::resolve_xid_names(xid_names).await;
         let store = self.edx_store().await;
         if store.is_none()
@@ -11046,7 +11202,14 @@ impl AppState {
                 .await;
             let previous_declarations =
                 self.verified_object_declarations_for(&lease.canonical);
-            if !Self::missing_child_files(&xite.storage, files, transaction).is_empty() {
+            let unfetchable = Self::unfetchable_child_paths(
+                inner_path,
+                serde_json::from_slice::<Value>(bytes).ok().as_ref(),
+            );
+            if !Self::missing_child_files(&xite.storage, files, transaction)
+                .iter()
+                .all(|path| unfetchable.contains(path))
+            {
                 return Err("child candidate lost a required file before commit".into());
             }
             let mut commit_xite = Xite::new(xite.address.clone(), xite.storage.clone());
@@ -11274,7 +11437,14 @@ impl AppState {
             if epix_blob::ObjId::of(&stored) != lease.digest {
                 return None;
             }
-            if !Self::missing_child_files(storage, &pending.files, transaction).is_empty() {
+            let unfetchable = Self::unfetchable_child_paths(
+                &pending.inner_path,
+                serde_json::from_slice::<Value>(&stored).ok().as_ref(),
+            );
+            if !Self::missing_child_files(storage, &pending.files, transaction)
+                .iter()
+                .all(|path| unfetchable.contains(path))
+            {
                 return None;
             }
             return Some(relay_payload);
@@ -11457,6 +11627,111 @@ impl AppState {
         self.clear_pending_child_state(pending_key, &pending).await;
         self.announce_promoted_child(&canonical, &pending, relay_payload).await;
         true
+    }
+
+    /// The clone's batched completion for children staged with
+    /// [`UpdatePayload::defer_required_fetch`]: every pending child of `key`
+    /// contributes its still-missing fetchable files, plus its staged `files`
+    /// entries merged into one map so a single EDX batch resolves ids across
+    /// children. Legacy no-b3 paths are excluded exactly as the commit gates
+    /// exclude them. Shard (`files_shard`) entries are NOT merged: their
+    /// decryption salt is per-manifest, so encrypted children keep the
+    /// per-child promote path.
+    pub async fn deferred_child_batch(
+        &self,
+        key: &str,
+    ) -> (Vec<epix_xite::FileEntry>, Value) {
+        let storage = {
+            let xites = self.xites.read().await;
+            self.resolve_xite(&xites, key).map(|xite| xite.storage.clone())
+        };
+        let relays: Vec<PendingChildRelay> = self
+            .pending_child_relays
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|relay| relay.keys.iter().any(|k| k == key))
+            .cloned()
+            .collect();
+        let mut files = Vec::new();
+        let mut merged_files = serde_json::Map::new();
+        for relay in relays {
+            let Some((entries, mut missing)) =
+                Self::deferred_relay_contribution(&relay, storage.as_ref())
+            else {
+                continue;
+            };
+            merged_files.extend(entries);
+            files.append(&mut missing);
+        }
+        (files, json!({ "files": merged_files }))
+    }
+
+    /// One relay's contribution to [`Self::deferred_child_batch`]: `None` for
+    /// a relay the batch cannot carry (no staged bytes, or an encrypted child
+    /// whose decryption salt is per-manifest), else its staged `files`
+    /// entries plus its still-missing fetchable files.
+    fn deferred_relay_contribution(
+        relay: &PendingChildRelay,
+        storage: Option<&XiteStorage>,
+    ) -> Option<(serde_json::Map<String, Value>, Vec<epix_xite::FileEntry>)> {
+        let raw = relay
+            .staged_bytes
+            .as_deref()
+            .and_then(|bytes| serde_json::from_slice::<Value>(bytes).ok())?;
+        let has_shards = raw
+            .get("files_shard")
+            .and_then(Value::as_object)
+            .is_some_and(|shards| !shards.is_empty());
+        if has_shards || raw.get("edx_salt").is_some() {
+            return None;
+        }
+        let unfetchable = Self::unfetchable_child_paths(&relay.inner_path, Some(&raw));
+        let staged = Self::staged_child_edx_content(&relay.inner_path, &raw);
+        let entries = staged
+            .get("files")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        let missing = relay
+            .files
+            .iter()
+            .filter(|file| !unfetchable.contains(&file.inner_path))
+            .filter(|file| {
+                !storage.is_some_and(|storage| storage.verify(&file.inner_path, &file.sha512))
+            })
+            .cloned()
+            .collect();
+        Some((entries, missing))
+    }
+
+    /// One promote pass over the pending child relays. Public for the clone
+    /// path: run right after the batched file fetch so deferred children
+    /// commit immediately instead of waiting for the periodic retry.
+    pub async fn promote_deferred_children(self: &Arc<Self>) {
+        self.retry_pending_child_relays().await;
+    }
+
+    /// Mark `key`'s user-content sync active (see `active_child_syncs`).
+    /// Idempotent; always pair with [`Self::end_child_sync`].
+    pub async fn begin_child_sync(&self, key: &str) {
+        let canonical = self.canonical_key(key).await;
+        let mut active = self.active_child_syncs.lock().unwrap();
+        active.insert(canonical);
+        active.insert(key.to_string());
+    }
+
+    /// End the marker set by [`Self::begin_child_sync`].
+    pub async fn end_child_sync(&self, key: &str) {
+        let canonical = self.canonical_key(key).await;
+        let mut active = self.active_child_syncs.lock().unwrap();
+        active.remove(&canonical);
+        active.remove(key);
+    }
+
+    fn child_sync_active(&self, keys: &[String], canonical: &str) -> bool {
+        let active = self.active_child_syncs.lock().unwrap();
+        active.contains(canonical) || keys.iter().any(|key| active.contains(key))
     }
 
     async fn retry_pending_child_relays(self: &Arc<Self>) {
@@ -12307,54 +12582,195 @@ impl AppState {
             && left.merger == right.merger
     }
 
-    pub async fn db_query(&self, address: &str, query: &str, params: &Value,
-    ) -> Result<Vec<Value>, String> {
-        let mut receipt = self
-            .xites
+    /// Bounded wait for an in-progress clone or db rebuild on `address` to
+    /// finish before querying (see `db_query`).
+    async fn await_db_quiet(&self, address: &str) {
+        let canonical = self.canonical_key(address).await;
+        let waited = std::time::Instant::now();
+        while waited.elapsed() < std::time::Duration::from_secs(45) {
+            let busy = self.is_cloning(&canonical)
+                || self.is_cloning(address)
+                || self.db_rebuilds_in_flight.lock().unwrap().contains(&canonical);
+            if !busy {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+    }
+
+    /// The current query receipt for `address`, if it has a database.
+    async fn current_receipt_for(&self, address: &str) -> Option<DbQueryReceipt> {
+        self.xites
             .read()
             .await
             .get(address)
-            .and_then(|xite| self.current_db_query_receipt(address, xite));
-        if receipt.is_none() {
-            // Lazy build, matching EpixNet's openDb: a dbQuery that arrives
-            // before the db exists (a page served progressively mid-clone)
-            // creates the schema and returns real (if still empty) rows.
-            // Xites crash on an error here - their query callbacks iterate
-            // the result - and their boot never recovers
-            // EpixNet's needFile, WAIT for the schema (bounded) instead of
-            // erroring - unless the root content.json is already known and
-            // declares no dbschema.json, in which case a db will never exist.
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                let (exists, declared) = {
-                    let xites = self.xites.read().await;
-                    match xites.get(address) {
-                        Some(x) => (
-                            x.storage.exists("dbschema.json"),
-                            x.content.as_ref().map(|c| {
-                                c.get("files").and_then(|f| f.get("dbschema.json")).is_some()
-                            }),
-                        ),
-                        None => (false, Some(false)),
-                    }
-                };
-                if exists {
-                    self.rebuild_xite_db(address).await;
-                    receipt = self
-                        .xites
-                        .read()
-                        .await
-                        .get(address)
-                        .and_then(|xite| self.current_db_query_receipt(address, xite));
-                    break;
+            .and_then(|xite| self.current_db_query_receipt(address, xite))
+    }
+
+    /// Lazy build, matching EpixNet's openDb: a dbQuery that arrives before
+    /// the db exists (a page served progressively mid-clone) creates the
+    /// schema and returns real (if still empty) rows. Xites crash on an
+    /// error here - their query callbacks iterate the result - and their
+    /// boot never recovers EpixNet's needFile, WAIT for the schema (bounded)
+    /// instead of erroring - unless the root content.json is already known
+    /// and declares no dbschema.json, in which case a db will never exist.
+    async fn lazy_build_db_receipt(&self, address: &str) -> Option<DbQueryReceipt> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (exists, declared) = {
+                let xites = self.xites.read().await;
+                match xites.get(address) {
+                    Some(x) => (
+                        x.storage.exists("dbschema.json"),
+                        x.content.as_ref().map(|c| {
+                            c.get("files").and_then(|f| f.get("dbschema.json")).is_some()
+                        }),
+                    ),
+                    None => (false, Some(false)),
                 }
-                if declared == Some(false) || std::time::Instant::now() >= deadline {
-                    break;
+            };
+            if exists {
+                self.rebuild_xite_db(address).await;
+                return self.current_receipt_for(address).await;
+            }
+            if declared == Some(false) || std::time::Instant::now() >= deadline {
+                return None;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        }
+    }
+
+    fn is_transient_db_error(error: &str) -> bool {
+        error.contains("locked")
+            || error.contains("busy")
+            || error.contains("no such table")
+            || error.contains("no such column")
+    }
+
+    /// The error names a table/column the schema doesn't have. Transient only
+    /// inside a rebuild's drop-and-recreate window - on a settled database the
+    /// name will never appear, no matter how long the retry loop waits.
+    fn is_missing_schema_error(error: &str) -> bool {
+        error.contains("no such table") || error.contains("no such column")
+    }
+
+    /// A clone or db rebuild is redoing `address`'s schema right now (the
+    /// same busy signal `await_db_quiet` polls).
+    async fn db_rebuild_or_clone_in_flight(&self, address: &str) -> bool {
+        let canonical = self.canonical_key(address).await;
+        self.is_cloning(&canonical)
+            || self.is_cloning(address)
+            || self.db_rebuilds_in_flight.lock().unwrap().contains(&canonical)
+    }
+
+    /// Re-derive the receipt under the activation and tree locks - the
+    /// linearization point for a detached query's result. The locks are
+    /// scoped to this instant: holding them through the retry sleeps starved
+    /// every writer (a pending siteDelete most visibly) while pages retried
+    /// their boot queries against the post-clone churn.
+    async fn recheck_db_query_receipt(
+        &self,
+        address: &str,
+        canonical: &str,
+    ) -> Option<DbQueryReceipt> {
+        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        let _tree = self.tree_mutation_lock(canonical).lock_owned().await;
+        self.xites
+            .read()
+            .await
+            .get(address)
+            .and_then(|xite| self.current_db_query_receipt(address, xite))
+    }
+
+    /// Handle a query result whose receipt held stable across the recheck.
+    /// `Some` is the final answer; `None` means a transient sqlite error was
+    /// slept off and the query should rerun (the rebuild drops and recreates
+    /// tables under a stable handle, so a query in that window fails with a
+    /// transient error - retrying is the answer exactly as for a swapped
+    /// handle).
+    async fn settle_stable_db_result(
+        &self,
+        address: &str,
+        result: Result<Vec<Value>, String>,
+        retry_until: std::time::Instant,
+    ) -> Option<Result<Vec<Value>, String>> {
+        match result {
+            Ok(rows) => Some(Ok(rows)),
+            Err(error)
+                if std::time::Instant::now() < retry_until
+                    && Self::is_transient_db_error(&error) =>
+            {
+                // A missing table/column heals only while a clone or rebuild
+                // is redoing the schema. The receipt held stable across the
+                // recheck and a finished rebuild bumps db_generation, so on a
+                // quiet database the name is permanently absent (e.g. a feed
+                // follow whose SQL outlived the xite's schema) - answer now
+                // instead of burning the whole retry budget on it.
+                if Self::is_missing_schema_error(&error)
+                    && !self.db_rebuild_or_clone_in_flight(address).await
+                {
+                    self.log(
+                        "DEBUG",
+                        format!("dbQuery error for {address} (schema settled, not retrying): {error}"),
+                    )
+                    .await;
+                    return Some(Err(error));
                 }
-                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                self.log(
+                    "DEBUG",
+                    format!("dbQuery transient error for {address}, retrying: {error}"),
+                )
+                .await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                None
+            }
+            Err(error) => {
+                self.log("DEBUG", format!("dbQuery error for {address}: {error}"))
+                    .await;
+                Some(Err(error))
             }
         }
-        let receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
+    }
+
+    /// The retry budget ran out while the database kept changing: serve the
+    /// last consistent read if one landed (a slightly-stale snapshot beats
+    /// an error that kills the page - apps iterate the rows they expect),
+    /// else give up.
+    async fn db_query_budget_exhausted(
+        &self,
+        address: &str,
+        last_ok: Option<Vec<Value>>,
+    ) -> Result<Vec<Value>, String> {
+        if let Some(rows) = last_ok {
+            self.log(
+                "INFO",
+                format!(
+                    "dbQuery for {address}: database kept changing past the budget, serving the last consistent read"
+                ),
+            )
+            .await;
+            return Ok(rows);
+        }
+        self.log(
+            "INFO",
+            format!("dbQuery gave up for {address}: authority changed past the deadline"),
+        )
+        .await;
+        Err("database authority changed while query ran".into())
+    }
+
+    pub async fn db_query(&self, address: &str, query: &str, params: &Value,
+    ) -> Result<Vec<Value>, String> {
+        // A query racing a clone or db rebuild answered with transient errors
+        // ("database is locked", missing tables), and app boot chains that
+        // expected rows died on them - the frozen loading overlay. Wait out
+        // an in-progress rebuild/clone (bounded) before running.
+        self.await_db_quiet(address).await;
+        let mut receipt = self.current_receipt_for(address).await;
+        if receipt.is_none() {
+            receipt = self.lazy_build_db_receipt(address).await;
+        }
+        let mut receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
         #[cfg(test)]
         let pause = DB_QUERY_AFTER_RECEIPT_PAUSE
             .lock()
@@ -12371,24 +12787,52 @@ impl AppState {
         // the boundary that stops a visitor from writing files via ATTACH.
         // The SQL can be arbitrarily expensive. Run it detached from mutation
         // locks, then linearize only its result against the exact handle and
-        // authority generation. A concurrent swap makes the rows unusable.
-        let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
-        let _activation = self.xite_activation_gate.clone().read_owned().await;
-        let _tree = self
-            .tree_mutation_lock(&receipt.canonical)
-            .lock_owned()
-            .await;
-        let still_current = self
-            .xites
-            .read()
-            .await
-            .get(address)
-            .and_then(|xite| self.current_db_query_receipt(address, xite))
-            .is_some_and(|after| Self::same_db_query_receipt(&receipt, &after));
-        if !still_current {
-            return Err("database authority changed while query ran".into());
+        // authority generation. A concurrent swap makes the rows unusable -
+        // but the answer to unusable rows is RERUNNING the query on the fresh
+        // handle, not an error: right after a clone every landed user file
+        // bumps the generation, so a booting page's first query almost always
+        // crossed a bump, and apps iterate the expected rows and died on the
+        // error object (the frozen loading overlay).
+        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(60);
+        let mut last_ok: Option<Vec<Value>> = None;
+        loop {
+            let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
+            let after = self
+                .recheck_db_query_receipt(address, &receipt.canonical)
+                .await;
+            let within_budget = std::time::Instant::now() < retry_until;
+            match after {
+                Some(after) if Self::same_db_query_receipt(&receipt, &after) => {
+                    if let Some(done) = self
+                        .settle_stable_db_result(address, result, retry_until)
+                        .await
+                    {
+                        return done;
+                    }
+                }
+                Some(after) if within_budget => {
+                    // Keep the freshest successful read: if the database
+                    // never sits still inside the budget, a consistent
+                    // slightly-stale snapshot beats an error that kills the
+                    // page (apps iterate the rows they expect).
+                    if let Ok(rows) = result {
+                        last_ok = Some(rows);
+                    }
+                    receipt = after;
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                }
+                None if within_budget => {
+                    // The database can be briefly absent mid-churn (a delete
+                    // and redownload swapping the xite under the session).
+                    // Keep waiting for a fresh handle inside the same budget.
+                    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    if let Some(fresh) = self.current_receipt_for(address).await {
+                        receipt = fresh;
+                    }
+                }
+                _ => return self.db_query_budget_exhausted(address, last_ok).await,
+            }
         }
-        result
     }
 
     /// Every served xite's dbschema-declared feeds, with the xite's title:
@@ -16518,6 +16962,9 @@ impl AppState {
         };
         if changed {
             self.push_server_info().await;
+            // Same rule as set_tor_status: an I2P reachability move regates
+            // i2p trackers, so the announce loop should run early.
+            self.trackers_changed.notify_one();
         }
     }
 
@@ -18838,7 +19285,7 @@ impl AppState {
     /// (the caller falls back to the generic rules).
     async fn user_content_rules(&self, address: &str, inner_path: &str) -> Option<Value> {
         let authority = self
-            .verified_child_authority(address, inner_path)
+            .verified_child_authority(address, inner_path, None)
             .await
             .ok()?;
         let storage = authority.storage.clone();
@@ -19251,10 +19698,23 @@ impl AppState {
                     .iter()
                     .find(|manifest| manifest.inner_path == parent)
                 {
-                    Some(manifest) => Self::resolve_xid_names(
-                        epix_content::verify::content_xid_names(&manifest.content, &child),
-                    )
-                    .await,
+                    Some(manifest) => {
+                        let mut names = epix_content::verify::content_xid_names(
+                            &manifest.content,
+                            &child,
+                        );
+                        if let Some(child_content) = storage
+                            .read(&child)
+                            .ok()
+                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                        {
+                            names.extend(epix_content::verify::chain_cert_xid_name(
+                                &manifest.content,
+                                &child_content,
+                            ));
+                        }
+                        Self::resolve_xid_names(names).await
+                    }
                     None => HashMap::new(),
                 },
                 None => HashMap::new(),
@@ -19392,89 +19852,34 @@ impl AppState {
         storage: &XiteStorage,
         authority: &VerifiedDbAuthority,
     ) -> Result<AcceptedDbSnapshot, String> {
+        Self::db_snapshot_from_authority_staged(canonical, storage, authority, None).await
+    }
+
+    /// Like [`Self::db_snapshot_from_authority`], but during a root commit
+    /// whose transaction stages files, a declared input that is still staged
+    /// (fetched and verified, not yet promoted into the live tree) is read
+    /// from the stage root. The live tree holds the PREVIOUS version of a
+    /// changed file at this point, so reading it failed the size/digest
+    /// checks against the new authority and the whole commit - the update
+    /// then re-failed identically on every retry.
+    async fn db_snapshot_from_authority_staged(
+        canonical: &str,
+        storage: &XiteStorage,
+        authority: &VerifiedDbAuthority,
+        staged: Option<&ManifestTransaction>,
+    ) -> Result<AcceptedDbSnapshot, String> {
         let manifests = &authority.manifests;
         let paths = Self::db_paths_from_manifests(manifests)?;
         let mut values = std::collections::BTreeMap::new();
-        let mut ordered = manifests.iter().collect::<Vec<_>>();
-        ordered.sort_by(|left, right| {
-            left.inner_path
-                .split('/')
-                .count()
-                .cmp(&right.inner_path.split('/').count())
-                .then(left.inner_path.cmp(&right.inner_path))
-        });
-        let manifest_paths = ordered
-            .iter()
-            .map(|manifest| manifest.inner_path.as_str())
-            .collect::<std::collections::HashSet<_>>();
+        for manifest in manifests {
+            values.insert(manifest.inner_path.clone(), manifest.content.clone());
+        }
         let contents = manifests
             .iter()
             .map(|manifest| (manifest.inner_path.clone(), manifest.content.clone()))
             .collect::<HashMap<_, _>>();
-        let mut inputs = std::collections::BTreeMap::new();
-        for manifest in ordered {
-            values.insert(manifest.inner_path.clone(), manifest.content.clone());
-            let directory = manifest
-                .inner_path
-                .strip_suffix("content.json")
-                .ok_or_else(|| format!("invalid manifest path: {}", manifest.inner_path))?;
-            for section in ["files", "files_optional"] {
-                let Some(entries) = manifest.content.get(section).and_then(Value::as_object) else {
-                    continue;
-                };
-                for (relative, entry) in entries {
-                    let full = format!("{directory}{relative}");
-                    if full.ends_with(".json") && !manifest_paths.contains(full.as_str()) {
-                        inputs.insert(full, AcceptedDbInput::Immutable(entry.clone()));
-                    }
-                }
-            }
-            let chain = authority
-                .manifest_chains
-                .get(&manifest.inner_path)
-                .ok_or_else(|| format!("verified chain is missing for {}", manifest.inner_path))?;
-            let Some(merged) = manifest
-                .content
-                .get("files_merged")
-                .and_then(Value::as_object)
-            else {
-                continue;
-            };
-            let governing_directory = manifest
-                .inner_path
-                .strip_suffix("/content.json")
-                .unwrap_or("");
-            for (relative, entry) in merged {
-                let full = format!("{directory}{relative}");
-                if !full.ends_with(".json") || manifest_paths.contains(full.as_str()) {
-                    continue;
-                }
-                inputs.insert(
-                    full,
-                    AcceptedDbInput::Merged(VerifiedFileDeclaration {
-                        governing: manifest.inner_path.clone(),
-                        authority_chain: chain.clone(),
-                        entry: entry.clone(),
-                        directory: governing_directory.to_string(),
-                        relative_path: relative.clone(),
-                        optional: false,
-                    }),
-                );
-            }
-        }
-        let mut names = Vec::new();
-        for input in inputs.values() {
-            if let AcceptedDbInput::Merged(declaration) = input {
-                let exact_contents = Self::db_declaration_authority_contents(
-                    declaration,
-                    &contents,
-                )?;
-                names.extend(Self::merge_authority_xid_names(
-                    declaration,
-                    &exact_contents,
-                )?);
-            }
-        }
+        let inputs = Self::collect_db_inputs(authority)?;
+        let names = Self::merge_input_xid_names(&inputs, &contents)?;
         #[cfg(test)]
         {
             let mut fail = DB_SNAPSHOT_XID_FAIL_ONCE
@@ -19488,73 +19893,213 @@ impl AppState {
         let xid_map = Self::resolve_xid_names_checked(names).await?;
         let now = epix_core::now_ms();
         for (full, input) in inputs {
-            if !storage.exists(&full) {
+            let staged_source = Self::staged_db_input_source(staged, &full);
+            if staged_source.is_none() && !storage.exists(&full) {
                 continue;
             }
-            if let AcceptedDbInput::Merged(declaration) = input {
-                let exact_contents = Self::db_declaration_authority_contents(
-                    &declaration,
-                    &contents,
-                )?;
-                let (signers, max_size) = Self::merge_authority_rules(
+            let (read_storage, read_path) = match &staged_source {
+                Some((stage, inner)) => (stage, inner.as_str()),
+                None => (storage, full.as_str()),
+            };
+            let source = DbInputSource { storage: read_storage, path: read_path, full: &full };
+            let value = match input {
+                AcceptedDbInput::Merged(declaration) => Self::merged_db_value(
                     canonical,
                     &declaration,
-                    &exact_contents,
+                    &contents,
                     &xid_map,
-                )?;
-                let limit = max_size.unwrap_or(MAX_DB_INPUT_BYTES).min(MAX_DB_INPUT_BYTES);
-                let bytes = read_regular_xite_file_bounded(storage, &full, limit).map_err(
-                    |error| format!("could not read verified merge database input {full}: {error}"),
-                )?;
-                let raw = serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|error| format!("merge database input is not JSON ({full}): {error}"))?;
-                let empty = epix_content::make_container(Vec::new());
-                values.insert(
-                    full,
-                    epix_content::merge_orset(&empty, &raw, &signers, now),
-                );
-                continue;
-            }
-            let AcceptedDbInput::Immutable(entry) = input else {
-                unreachable!("merged input handled above")
+                    &source,
+                    now,
+                )?,
+                AcceptedDbInput::Immutable(entry) => Self::immutable_db_value(&entry, &source)?,
             };
-            let expected_size = entry
-                .get("size")
-                .and_then(epix_content::verify::exact_nonnegative_size)
-                .ok_or_else(|| format!("database input has invalid size: {full}"))?;
-            if expected_size as u64 > MAX_DB_INPUT_BYTES {
-                return Err(format!(
-                    "database input exceeds {MAX_DB_INPUT_BYTES} bytes: {full}"
-                ));
-            }
-            let bytes = read_regular_xite_file_bounded(storage, &full, MAX_DB_INPUT_BYTES)
-                .map_err(|error| {
-                    format!("could not read verified database input {full}: {error}")
-                })?;
-            if bytes.len() as i64 != expected_size {
-                return Err(format!("database input size mismatch: {full}"));
-            }
-            let expected_sha = entry.get("sha512").and_then(Value::as_str);
-            let expected_b3 = entry
-                .get("b3")
-                .and_then(Value::as_str)
-                .and_then(epix_blob::ObjId::from_hex);
-            if expected_sha.is_none() && expected_b3.is_none() {
-                return Err(format!("database input has no verified digest: {full}"));
-            }
-            if expected_sha.is_some_and(|expected| XiteStorage::hash_bytes(&bytes) != expected)
-                || expected_b3.is_some_and(|expected| epix_blob::ObjId::of(&bytes) != expected)
-            {
-                return Err(format!("database input digest mismatch: {full}"));
-            }
-            let value = serde_json::from_slice::<Value>(&bytes)
-                .map_err(|error| format!("database input is not JSON ({full}): {error}"))?;
             values.insert(full, value);
         }
         Ok(AcceptedDbSnapshot {
             paths,
             values: values.into_iter().collect(),
         })
+    }
+
+    /// Every declared .json data file the snapshot reads, keyed by inner
+    /// path, walked parent-first so a child redeclaring a path wins.
+    fn collect_db_inputs(
+        authority: &VerifiedDbAuthority,
+    ) -> Result<std::collections::BTreeMap<String, AcceptedDbInput>, String> {
+        let mut ordered = authority.manifests.iter().collect::<Vec<_>>();
+        ordered.sort_by(|left, right| {
+            left.inner_path
+                .split('/')
+                .count()
+                .cmp(&right.inner_path.split('/').count())
+                .then(left.inner_path.cmp(&right.inner_path))
+        });
+        let manifest_paths = ordered
+            .iter()
+            .map(|manifest| manifest.inner_path.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let mut inputs = std::collections::BTreeMap::new();
+        for manifest in ordered {
+            let directory = manifest
+                .inner_path
+                .strip_suffix("content.json")
+                .ok_or_else(|| format!("invalid manifest path: {}", manifest.inner_path))?;
+            Self::collect_immutable_db_inputs(manifest, directory, &manifest_paths, &mut inputs);
+            let chain = authority
+                .manifest_chains
+                .get(&manifest.inner_path)
+                .ok_or_else(|| format!("verified chain is missing for {}", manifest.inner_path))?;
+            Self::collect_merged_db_inputs(manifest, chain, directory, &manifest_paths, &mut inputs);
+        }
+        Ok(inputs)
+    }
+
+    fn collect_immutable_db_inputs(
+        manifest: &VerifiedManifestUnit,
+        directory: &str,
+        manifest_paths: &std::collections::HashSet<&str>,
+        inputs: &mut std::collections::BTreeMap<String, AcceptedDbInput>,
+    ) {
+        for section in ["files", "files_optional"] {
+            let Some(entries) = manifest.content.get(section).and_then(Value::as_object) else {
+                continue;
+            };
+            for (relative, entry) in entries {
+                let full = format!("{directory}{relative}");
+                if full.ends_with(".json") && !manifest_paths.contains(full.as_str()) {
+                    inputs.insert(full, AcceptedDbInput::Immutable(entry.clone()));
+                }
+            }
+        }
+    }
+
+    fn collect_merged_db_inputs(
+        manifest: &VerifiedManifestUnit,
+        chain: &[String],
+        directory: &str,
+        manifest_paths: &std::collections::HashSet<&str>,
+        inputs: &mut std::collections::BTreeMap<String, AcceptedDbInput>,
+    ) {
+        let Some(merged) = manifest.content.get("files_merged").and_then(Value::as_object)
+        else {
+            return;
+        };
+        let governing_directory = manifest
+            .inner_path
+            .strip_suffix("/content.json")
+            .unwrap_or("");
+        for (relative, entry) in merged {
+            let full = format!("{directory}{relative}");
+            if !full.ends_with(".json") || manifest_paths.contains(full.as_str()) {
+                continue;
+            }
+            inputs.insert(
+                full,
+                AcceptedDbInput::Merged(VerifiedFileDeclaration {
+                    governing: manifest.inner_path.clone(),
+                    authority_chain: chain.to_vec(),
+                    entry: entry.clone(),
+                    directory: governing_directory.to_string(),
+                    relative_path: relative.clone(),
+                    optional: false,
+                }),
+            );
+        }
+    }
+
+    /// The xID names every merged input's authority chain references, for one
+    /// checked resolve pass before the inputs are read.
+    fn merge_input_xid_names(
+        inputs: &std::collections::BTreeMap<String, AcceptedDbInput>,
+        contents: &HashMap<String, Value>,
+    ) -> Result<Vec<String>, String> {
+        let mut names = Vec::new();
+        for input in inputs.values() {
+            if let AcceptedDbInput::Merged(declaration) = input {
+                let exact_contents =
+                    Self::db_declaration_authority_contents(declaration, contents)?;
+                names.extend(Self::merge_authority_xid_names(declaration, &exact_contents)?);
+            }
+        }
+        Ok(names)
+    }
+
+    /// During a root commit whose transaction stages files, a declared input
+    /// that is still staged (fetched and verified, not yet promoted into the
+    /// live tree) is read from the stage root - the live tree holds the
+    /// previous version at that point.
+    fn staged_db_input_source(
+        staged: Option<&ManifestTransaction>,
+        full: &str,
+    ) -> Option<(XiteStorage, String)> {
+        let transaction = staged?;
+        if !transaction.lease.stages_files() {
+            return None;
+        }
+        transaction.lease.staged_file(full).map(|file| {
+            (
+                XiteStorage::new(transaction.lease.stage_root.clone()),
+                file.staged_inner,
+            )
+        })
+    }
+
+    fn merged_db_value(
+        canonical: &str,
+        declaration: &VerifiedFileDeclaration,
+        contents: &HashMap<String, Value>,
+        xid_map: &epix_content::XidMap,
+        source: &DbInputSource<'_>,
+        now: i64,
+    ) -> Result<Value, String> {
+        let exact_contents = Self::db_declaration_authority_contents(declaration, contents)?;
+        let (signers, max_size) =
+            Self::merge_authority_rules(canonical, declaration, &exact_contents, xid_map)?;
+        let limit = max_size.unwrap_or(MAX_DB_INPUT_BYTES).min(MAX_DB_INPUT_BYTES);
+        let full = source.full;
+        let bytes = read_regular_xite_file_bounded(source.storage, source.path, limit)
+            .map_err(|error| {
+                format!("could not read verified merge database input {full}: {error}")
+            })?;
+        let raw = serde_json::from_slice::<Value>(&bytes)
+            .map_err(|error| format!("merge database input is not JSON ({full}): {error}"))?;
+        let empty = epix_content::make_container(Vec::new());
+        Ok(epix_content::merge_orset(&empty, &raw, &signers, now))
+    }
+
+    fn immutable_db_value(entry: &Value, source: &DbInputSource<'_>) -> Result<Value, String> {
+        let full = source.full;
+        let expected_size = entry
+            .get("size")
+            .and_then(epix_content::verify::exact_nonnegative_size)
+            .ok_or_else(|| format!("database input has invalid size: {full}"))?;
+        if expected_size as u64 > MAX_DB_INPUT_BYTES {
+            return Err(format!(
+                "database input exceeds {MAX_DB_INPUT_BYTES} bytes: {full}"
+            ));
+        }
+        let bytes = read_regular_xite_file_bounded(source.storage, source.path, MAX_DB_INPUT_BYTES)
+            .map_err(|error| {
+                format!("could not read verified database input {full}: {error}")
+            })?;
+        if bytes.len() as i64 != expected_size {
+            return Err(format!("database input size mismatch: {full}"));
+        }
+        let expected_sha = entry.get("sha512").and_then(Value::as_str);
+        let expected_b3 = entry
+            .get("b3")
+            .and_then(Value::as_str)
+            .and_then(epix_blob::ObjId::from_hex);
+        if expected_sha.is_none() && expected_b3.is_none() {
+            return Err(format!("database input has no verified digest: {full}"));
+        }
+        if expected_sha.is_some_and(|expected| XiteStorage::hash_bytes(&bytes) != expected)
+            || expected_b3.is_some_and(|expected| epix_blob::ObjId::of(&bytes) != expected)
+        {
+            return Err(format!("database input digest mismatch: {full}"));
+        }
+        serde_json::from_slice::<Value>(&bytes)
+            .map_err(|error| format!("database input is not JSON ({full}): {error}"))
     }
 
     fn db_declaration_authority_contents(
@@ -19863,7 +20408,7 @@ impl AppState {
         canonical: &str,
         declaration: &VerifiedFileDeclaration,
         contents: &HashMap<String, Value>,
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> Result<(Vec<String>, Option<u64>), String> {
         let content = contents
             .get(&declaration.governing)
@@ -19897,20 +20442,22 @@ impl AppState {
 
     async fn resolve_xid_names_checked(
         mut names: Vec<String>,
-    ) -> Result<HashMap<String, Vec<String>>, String> {
+    ) -> Result<epix_content::XidMap, String> {
         names.sort();
         names.dedup();
-        let mut xid_map = HashMap::new();
+        let mut xid_map = epix_content::XidMap::new();
         for name in names {
             let (label, tld) = name
                 .rsplit_once('.')
                 .unwrap_or((name.as_str(), "epix"));
-            let mut signers = epix_chain::xid_signers::resolve_checked(label, tld)
-                .await
-                .map_err(|error| error.to_string())?;
-            signers.sort();
-            signers.dedup();
-            xid_map.insert(name, signers);
+            let mut identities = chain_xid_identities(
+                epix_chain::xid_signers::resolve_identities_checked(label, tld)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            identities.sort_by(|a, b| a.address.cmp(&b.address));
+            identities.dedup_by(|a, b| a.address == b.address);
+            xid_map.insert(name, identities);
         }
         Ok(xid_map)
     }
@@ -19957,6 +20504,15 @@ impl AppState {
                 parent_content,
                 child,
             ));
+            // A chain member carrying a chain-delegated cert (a user
+            // content.json governing merge files) re-verifies against the
+            // cert name's linked identities, so resolve that name too.
+            if let Some(child_content) = contents.get(child) {
+                names.extend(epix_content::verify::chain_cert_xid_name(
+                    parent_content,
+                    child_content,
+                ));
+            }
         }
         Ok(names)
     }
@@ -20134,10 +20690,15 @@ impl AppState {
         Ok(current)
     }
 
+    /// `child_content` is the child manifest about to verify under this
+    /// authority (an incoming update, or a local sign candidate), when the
+    /// caller has it: its chain-delegated cert name resolves into the xid map
+    /// so the cert check can run. Rules-only callers pass `None`.
     async fn verified_child_authority(
         &self,
         address: &str,
         child_path: &str,
+        child_content: Option<&Value>,
     ) -> Result<VerifiedChildAuthority, String> {
         let (storage, canonical) = {
             let xites = self.xites.read().await;
@@ -20169,6 +20730,9 @@ impl AppState {
             .get(&governing_parent)
             .ok_or_else(|| format!("verified parent disappeared for {child_path}"))?;
         names.extend(epix_content::verify::content_xid_names(parent, child_path));
+        if let Some(child_content) = child_content {
+            names.extend(epix_content::verify::chain_cert_xid_name(parent, child_content));
+        }
         drop(_tree);
         let xid_map = Self::resolve_xid_names_checked(names).await?;
         Ok(VerifiedChildAuthority {
@@ -20323,6 +20887,7 @@ impl AppState {
             let content: Value =
                 serde_json::from_slice(&bytes).map_err(|error| error.to_string())?;
             let mut xid_names = epix_content::verify::content_xid_names(&parent, inner_path);
+            xid_names.extend(epix_content::verify::chain_cert_xid_name(&parent, &content));
             xid_names.sort();
             xid_names.dedup();
             children.push(RehomeChildSnapshot {
@@ -20376,15 +20941,17 @@ impl AppState {
 
     async fn resolve_xid_names(
         mut names: Vec<String>,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> epix_content::XidMap {
         names.sort();
         names.dedup();
-        let mut xid_map = HashMap::new();
+        let mut xid_map = epix_content::XidMap::new();
         for name in names {
             let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-            let signers = epix_chain::xid_signers::resolve(label, tld).await;
-            if !signers.is_empty() {
-                xid_map.insert(name, signers);
+            let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
+                .await
+                .unwrap_or_default();
+            if !identities.is_empty() {
+                xid_map.insert(name, chain_xid_identities(identities));
             }
         }
         xid_map
@@ -20392,7 +20959,7 @@ impl AppState {
 
     async fn resolve_rehome_xids(
         snapshot: &RehomeChainSnapshot,
-    ) -> HashMap<String, Vec<String>> {
+    ) -> epix_content::XidMap {
         Self::resolve_xid_names(
             snapshot
                 .children
@@ -20419,7 +20986,7 @@ impl AppState {
         canonical: &str,
         storage: &XiteStorage,
         authority_chain: &[String],
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> Result<(Value, HashMap<String, Value>), String> {
         let address = Address::parse(canonical.to_string()).map_err(|e| e.to_string())?;
         let mut xite = Xite::new(address, storage.clone());
@@ -20469,7 +21036,7 @@ impl AppState {
 
     fn verify_rehome_chain_locked(
         candidate: &ObjectDeclarationCandidate,
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> Result<PathBuf, String> {
         if candidate.kind != ObjectDeclarationKind::File {
             return Err("only plain file declarations can be rehomed".into());
@@ -22181,7 +22748,7 @@ impl AppState {
         inner_path: &str,
         content: &Value,
         accepted_contents: &HashMap<String, Value>,
-        xid_map: &HashMap<String, Vec<String>>,
+        xid_map: &epix_content::XidMap,
     ) -> (Vec<String>, HashMap<String, Option<u64>>) {
         let context = VerifiedAuthorityContext {
             canonical,
@@ -23806,13 +24373,25 @@ impl AppState {
         if content_paths.is_empty() || !self.is_serving(address).await {
             return;
         }
-        let mut peers = self.connectable_peers(address, 8).await;
+        // Hint peers FIRST: the caller passes the live link that just served
+        // the manifests, warm and proven. The registry's top slots are often
+        // squatted by junk announce peers (dead onions, BitTorrent ports)
+        // whose failed dials cost 15-40s each - appending the hints only when
+        // room was left meant the one known-good peer was never dialed at
+        // all, and a fresh clone's merge fetch ground through the junk for
+        // minutes (observed live: 94 failed dials before any merge data).
+        let mut peers: Vec<PeerAddr> = Vec::new();
         for p in hint_peers {
+            if !peers.contains(p) {
+                peers.push(p.clone());
+            }
+        }
+        for p in self.connectable_peers(address, 8).await {
             if peers.len() >= 8 {
                 break;
             }
-            if !peers.contains(p) {
-                peers.push(p.clone());
+            if !peers.contains(&p) {
+                peers.push(p);
             }
         }
         if peers.is_empty() {
@@ -24085,6 +24664,31 @@ impl AppState {
         .map_err(|error| format!("Child signing completion failed: {error}"))?
     }
 
+    /// What the signed result will carry as its cert: the stored content, with
+    /// the user's own cert id on top when the node signs as them (`own_cert`,
+    /// i.e. no explicit private key was passed). Only a resolution hint, so
+    /// the chain cert name can be resolved before signing; the authoritative
+    /// cert check runs at verify.
+    async fn child_cert_hint(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        storage: &XiteStorage,
+        own_cert: bool,
+    ) -> Value {
+        let mut hint = storage
+            .read(content_inner_path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .unwrap_or_else(|| json!({}));
+        if own_cert {
+            if let Some(id) = self.user.read().await.cert_user_id(address) {
+                hint["cert_user_id"] = json!(id);
+            }
+        }
+        hint
+    }
+
     async fn sign_user_content_owned(
         &self,
         address: &str,
@@ -24102,8 +24706,11 @@ impl AppState {
                 xite.content.clone(),
             )
         };
+        let cert_hint = self
+            .child_cert_hint(address, content_inner_path, &storage, privatekey.is_none())
+            .await;
         let authority = self
-            .verified_child_authority(address, content_inner_path)
+            .verified_child_authority(address, content_inner_path, Some(&cert_hint))
             .await?;
         if authority.canonical != canonical || authority.storage.root() != storage.root() {
             return Err("child signing authority belongs to another xite".into());
@@ -24512,6 +25119,7 @@ impl AppState {
             merge_deltas,
             merge_objects: HashMap::new(),
             require_merge_delivery: false,
+            defer_required_fetch: false,
         };
         let result = self
             .publish_to(
@@ -25348,7 +25956,7 @@ impl AppState {
         {
             return Err("current merge transaction belongs to another xite".into());
         }
-        let authority = self.verified_child_authority(key, inner_path).await?;
+        let authority = self.verified_child_authority(key, inner_path, None).await?;
         if authority.canonical != canonical || authority.storage.root() != view.storage.root() {
             return Err("current merge authority belongs to another xite".into());
         }
@@ -25501,7 +26109,23 @@ impl AppState {
             keys.swap(0, pos);
         }
         let key = keys[0].clone();
-        let update_guard = self.acquire_manifest_guard(&lock_address, inner_path).await?;
+        let update_guard = if payload.defer_required_fetch {
+            // A clone's level apply must not queue behind a push that is mid
+            // inline-fetch for this same child: whoever holds the guard is
+            // already landing it, and the pending-relay machinery (or the
+            // next resync) owns whatever is left. Give up quickly instead.
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                self.acquire_manifest_guard(&lock_address, inner_path),
+            )
+            .await
+            {
+                Ok(guard) => guard?,
+                Err(_) => return Ok(InboundUpdate::Deferred),
+            }
+        } else {
+            self.acquire_manifest_guard(&lock_address, inner_path).await?
+        };
         // Only accept pushes for xites we voluntarily downloaded. The version
         // to beat is the root's in-memory clock, or - for an include / user
         // content.json - the on-disk child's own `modified`.
@@ -25735,7 +26359,10 @@ impl AppState {
                     return Err(format!("File {inner_path} invalid: Invalid cert!"));
                 }
             }
-            let authority = match self.verified_child_authority(&key, inner_path).await {
+            let authority = match self
+                .verified_child_authority(&key, inner_path, Some(&new))
+                .await
+            {
                 Ok(authority) => authority,
                 Err(error) => {
                     self.updates_in_flight.lock().unwrap().remove(&uri);
@@ -25863,6 +26490,17 @@ impl AppState {
         let inner = inner_path.to_string();
         let root_bytes = if is_root && !committed_inline { Some(bytes) } else { None };
         let is_child = child_files.is_some();
+        let mut payload = payload;
+        if is_child && !payload.defer_required_fetch {
+            let canonical = canonical_address(xite.content.as_ref(), &key);
+            if self.child_sync_active(&keys, &canonical) {
+                // The xite's clone/user-content sync is mid-flight: an inline
+                // pull here would hold this child's manifest guard across a
+                // network fetch while the sync's level pass waits on it.
+                // Stage instead; the sync's batch + promote completes it.
+                payload.defer_required_fetch = true;
+            }
+        }
         let finish = InboundFinish {
             keys,
             xite,
@@ -25879,9 +26517,19 @@ impl AppState {
             transaction,
         };
         if is_child {
+            // A merge-delta push still needs an honest delivery receipt: the
+            // payload was parked, not handled, so answer Err exactly as an
+            // incomplete inline pull would - the sender retries, and the
+            // pending relay usually commits before it does.
+            let deferred_ok = finish.payload.defer_required_fetch
+                && !finish.payload.require_merge_delivery;
             let ready = self.finish_inbound_update(finish).await;
             return if ready {
                 Ok(InboundUpdate::Applied)
+            } else if deferred_ok {
+                // The clone's batch pass owns the file fetch; a staged child
+                // waiting on it is a normal outcome, not a failed delivery.
+                Ok(InboundUpdate::Deferred)
             } else {
                 Err(format!(
                     "Child update {inner_path} is not yet fully available"
@@ -26147,17 +26795,31 @@ impl AppState {
                 {
                     return false;
                 }
-                self.commit_child_candidate(
-                    &finish.keys[0],
-                    &finish.xite,
-                    &finish.inner_path,
-                    bytes,
-                    finish.child_files.as_deref().unwrap_or_default(),
-                    &finish.transaction,
-                    &mut finish.payload,
-                )
-                .await
-                .is_ok()
+                match self
+                    .commit_child_candidate(
+                        &finish.keys[0],
+                        &finish.xite,
+                        &finish.inner_path,
+                        bytes,
+                        finish.child_files.as_deref().unwrap_or_default(),
+                        &finish.transaction,
+                        &mut finish.payload,
+                    )
+                    .await
+                {
+                    Ok(_) => true,
+                    Err(error) => {
+                        self.log(
+                            "WARN",
+                            format!(
+                                "Child commit {}/{} failed; deferring: {error}",
+                                finish.keys[0], finish.inner_path
+                            ),
+                        )
+                        .await;
+                        false
+                    }
+                }
             }
             (Some(_), _, _) => false,
             (None, _, None) => true,
@@ -26281,30 +26943,45 @@ impl AppState {
     async fn finish_inbound_update(self: &Arc<Self>, mut finish: InboundFinish) -> bool {
         let key = finish.keys[0].clone();
         let canonical = canonical_address(finish.xite.content.as_ref(), &key);
-        let (_, staged_for_fetch) = Self::inbound_staged_content(&finish);
+        let (child_content, staged_for_fetch) = Self::inbound_staged_content(&finish);
+        let child_content = child_content.or_else(|| {
+            finish.child_files.is_some().then(|| {
+                finish
+                    .xite
+                    .storage
+                    .read(&finish.inner_path)
+                    .ok()
+                    .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            }).flatten()
+        });
+        let unfetchable =
+            Self::unfetchable_child_paths(&finish.inner_path, child_content.as_ref());
         let mut arrived = self.apply_inbound_diffs(&finish, &key).await;
         let mut needed = Self::inbound_files_needed(&finish);
-        self.fetch_inbound_live_source(
-            &finish,
-            staged_for_fetch.as_ref(),
-            &mut needed,
-            &mut arrived,
-        )
-        .await;
-        self.fetch_inbound_fallback(
-            &finish,
-            staged_for_fetch.as_ref(),
-            &mut needed,
-            &mut arrived,
-        )
-        .await;
-        let missing_child = finish
+        if !finish.payload.defer_required_fetch {
+            self.fetch_inbound_live_source(
+                &finish,
+                staged_for_fetch.as_ref(),
+                &mut needed,
+                &mut arrived,
+            )
+            .await;
+            self.fetch_inbound_fallback(
+                &finish,
+                staged_for_fetch.as_ref(),
+                &mut needed,
+                &mut arrived,
+            )
+            .await;
+        }
+        let mut missing_child = finish
             .child_files
             .as_ref()
             .map(|files| {
                 Self::missing_child_files(&finish.xite.storage, files, &finish.transaction)
             })
             .unwrap_or_default();
+        missing_child.retain(|path| !unfetchable.contains(path));
         let committed = self.commit_inbound_manifest(&mut finish, &missing_child).await;
         let relay_ready = committed;
         let merge_failed = false;
@@ -27144,6 +27821,70 @@ impl AppState {
     /// - Retry passes notify only on completion (with the xite re-checked to
     ///   still exist - a deleted xite's empty missing-list must not toast
     ///   "Downloaded"); the toggle's own pass already reported any failure.
+    /// Warm every served xite's in-memory database in the background. Xite
+    /// dbs live only in RAM (see the startup note on `rebuild_merger_dbs`),
+    /// so after a restart the dashboard's first feedQuery used to trigger
+    /// every rebuild lazily - racing the 10s per-feed deadline and the
+    /// post-boot update churn, which left the feed empty until a later
+    /// file_done event asked again. Warming right after restore runs the
+    /// rebuilds before the network loops contend for the per-xite locks.
+    pub fn spawn_db_warmup(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let started = std::time::Instant::now();
+            let mut seen = std::collections::HashSet::new();
+            let candidates: Vec<String> = {
+                let xites = state.xites.read().await;
+                xites
+                    .iter()
+                    .filter(|(_, xite)| xite.storage.exists("dbschema.json"))
+                    .filter_map(|(key, xite)| {
+                        seen.insert(canonical_address(xite.content.as_ref(), key))
+                            .then(|| key.clone())
+                    })
+                    .collect()
+            };
+            let mut warmed = 0usize;
+            let mut skipped = 0usize;
+            for address in &candidates {
+                // A db already present (a merger rebuild may have filled it)
+                // needs no warm-up.
+                if state.current_receipt_for(address).await.is_some() {
+                    skipped += 1;
+                    continue;
+                }
+                let one = std::time::Instant::now();
+                let built = state.rebuild_xite_db(address).await;
+                warmed += usize::from(built);
+                // A slow or refused rebuild is the feed-latency signal this
+                // warm-up exists to surface - name the xite so it can be
+                // chased instead of averaged away.
+                if !built || one.elapsed() > std::time::Duration::from_secs(2) {
+                    state
+                        .log(
+                            "INFO",
+                            format!(
+                                "Db warm-up for {address}: {} in {:.1}s",
+                                if built { "rebuilt" } else { "not rebuilt" },
+                                one.elapsed().as_secs_f32()
+                            ),
+                        )
+                        .await;
+                }
+            }
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "Db warm-up: {warmed} rebuilt, {skipped} already present, {} total in {:.1}s",
+                        candidates.len(),
+                        started.elapsed().as_secs_f32()
+                    ),
+                )
+                .await;
+        });
+    }
+
     pub fn spawn_optional_retry_loop(self: &Arc<Self>) {
         let state = self.clone();
         tokio::spawn(async move {
@@ -28268,6 +29009,14 @@ impl AppState {
                 xite.content.clone(),
             )
         };
+        self.db_rebuilds_in_flight.lock().unwrap().insert(canonical.clone());
+        struct RebuildMark<'a>(&'a AppState, String);
+        impl Drop for RebuildMark<'_> {
+            fn drop(&mut self) {
+                self.0.db_rebuilds_in_flight.lock().unwrap().remove(&self.1);
+            }
+        }
+        let _mark = RebuildMark(self, canonical.clone());
         let Ok(_manifest) = self.acquire_manifest_mutex(&canonical, "content.json").await else {
             return false;
         };
@@ -28607,16 +29356,35 @@ impl AppState {
     }
 
     pub async fn remove_xite(&self, address: &str) -> bool {
+        // Removal takes visible time (locks, durable intent, directory
+        // deletion, Store ownership handover) and can only be reported while
+        // the row still exists: phase first, so every dashboard shows
+        // "Deleting…" for the duration instead of a row that ignores clicks.
+        self.xite_updates_in_flight
+            .lock()
+            .unwrap()
+            .insert(address.to_string(), UPDATE_PHASE_DELETING);
+        self.push_xite_info_event(address, UPDATE_PHASE_DELETING).await;
         let state = self.owned_state();
-        let address = address.to_string();
-        match tokio::spawn(async move { state.remove_xite_owned(&address).await }).await {
-            Ok(removed) => removed,
-            Err(error) => {
-                self.log("ERROR", format!("Xite removal completion failed: {error}"))
-                    .await;
-                false
-            }
+        let owned_address = address.to_string();
+        let removed =
+            match tokio::spawn(async move { state.remove_xite_owned(&owned_address).await }).await
+            {
+                Ok(removed) => removed,
+                Err(error) => {
+                    self.log("ERROR", format!("Xite removal completion failed: {error}"))
+                        .await;
+                    false
+                }
+            };
+        self.end_xite_update(address);
+        if !removed {
+            // The row survives a failed removal: retire its pill quietly (the
+            // caller's command reply carries the error) so it does not read
+            // as deleting forever.
+            self.push_update_result(address, UpdateOutcome::NoChange).await;
         }
+        removed
     }
 
     async fn remove_xite_owned(&self, address: &str) -> bool {
@@ -33540,6 +34308,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn staged_root_update_with_changed_db_input_commits() {
+        // A resync stages a changed .json data file (a database input) in the
+        // transaction's stage root; the live tree still holds the previous
+        // version until the promotion. The commit's db snapshot must read the
+        // staged copy - reading the live file failed its size check against
+        // the new manifest and the update re-failed on every retry (the
+        // "cannot download the new blog post" wedge).
+        let dir = tempdir().unwrap();
+        let key = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&key).unwrap();
+        let storage = XiteStorage::new(dir.path());
+
+        let old_data = br#"{"post":[]}"#.to_vec();
+        let new_data = br#"{"post":[{"post_id":1,"title":"new"}]}"#.to_vec();
+        assert_ne!(old_data.len(), new_data.len());
+        let mut v1_content = json!({
+            "address": addr, "modified": 100.0, "title": "V1",
+            "files": { "data/data.json": {
+                "size": old_data.len(),
+                "sha512": XiteStorage::hash_bytes(&old_data),
+            } },
+        });
+        epix_content::sign(&mut v1_content, &key).unwrap();
+        let v1 = serde_json::to_vec(&v1_content).unwrap();
+        storage.write("content.json", &v1).unwrap();
+        storage.write("data/data.json", &old_data).unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                &addr,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(v1_content),
+                },
+            )
+            .await;
+
+        let mut v2_content = json!({
+            "address": addr, "modified": 200.0, "title": "V2",
+            "files": { "data/data.json": {
+                "size": new_data.len(),
+                "sha512": XiteStorage::hash_bytes(&new_data),
+            } },
+        });
+        epix_content::sign(&mut v2_content, &key).unwrap();
+        let v2 = serde_json::to_vec(&v2_content).unwrap();
+        let keys = vec![addr.clone()];
+        let guard = state.merge_path_lock(&addr, "content.json").lock_owned().await;
+        let transaction =
+            AppState::bind_manifest_transaction(&storage, &addr, "content.json", &v2, guard)
+                .unwrap();
+        let staged_inner = transaction
+            .lease
+            .register_staged(&storage, "data/data.json", None)
+            .unwrap();
+        XiteStorage::new(transaction.lease.stage_root.clone())
+            .write(&staged_inner, &new_data)
+            .unwrap();
+
+        assert!(
+            state
+                .finalize_root_update(RootFinalize {
+                    keys: &keys,
+                    canonical: &addr,
+                    storage: &storage,
+                    content: v2_content,
+                    bytes: &v2,
+                    failed: &[],
+                    transaction: &transaction,
+                })
+                .await
+        );
+        drop(transaction);
+        assert_eq!(storage.read("content.json").unwrap(), v2);
+        assert_eq!(storage.read("data/data.json").unwrap(), new_data);
+        assert_eq!(state.xite_info(&addr).await["content"]["title"], "V2");
+    }
+
+    #[tokio::test]
     async fn stale_cloned_root_retry_cannot_commit_after_guarded_newer_version() {
         let dir = tempdir().unwrap();
         let key = epix_crypt::new_seed();
@@ -34949,6 +35796,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41461,6 +42309,7 @@ mod tests {
             merge_deltas: HashMap::from([("posts.json".to_string(), record_delta(record))]),
             merge_objects: HashMap::new(),
             require_merge_delivery: true,
+            defer_required_fetch: false,
         };
 
         // Both updates carry the content.json version already on disk. Before
@@ -41700,6 +42549,7 @@ mod tests {
                         record_delta(record))]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -41983,6 +42833,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::from([("posts.json".to_string(), object)]),
                     require_merge_delivery: false,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42003,6 +42854,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::from([("not-declared.json".to_string(), object)]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42023,6 +42875,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), bytes.clone())]),
                     merge_objects: HashMap::from([("posts.json".to_string(), object)]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42049,6 +42902,7 @@ mod tests {
                         },
                     )]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42084,6 +42938,7 @@ mod tests {
                         ),
                     ]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42114,6 +42969,7 @@ mod tests {
                         },
                     )]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42136,6 +42992,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::from([("posts.json".to_string(), object)]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42168,6 +43025,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), Vec::new())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42200,6 +43058,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), Vec::new())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42231,6 +43090,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42293,6 +43153,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42341,6 +43202,7 @@ mod tests {
                     merge_deltas: HashMap::from([("posts.json".to_string(), delta.clone())]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42373,6 +43235,7 @@ mod tests {
                         },
                     )]),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -42404,6 +43267,7 @@ mod tests {
                 vec![0x42; DELTA_BYTES])]),
             merge_objects: HashMap::new(),
             require_merge_delivery: true,
+            defer_required_fetch: false,
         };
         let entries = MAX_PENDING_CHILD_RELAY_BYTES / ENTRY_BYTES + 4;
         for i in 0..entries {
@@ -42555,6 +43419,7 @@ mod tests {
                     )]),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -43201,14 +44066,75 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn required_file_without_b3_still_blocks_child_availability() {
+    async fn deferred_child_stages_without_inline_fetch_and_promotes_when_files_land() {
+        // The clone's level pass sets defer_required_fetch: the child manifest
+        // verifies and parks with no inline file fetch and no error, and a
+        // promote pass commits it once the batched fetch lands its files.
         let (_dir, state, xite, storage, child, _posts, author_key) = inline_merge_fixture().await;
         let previous = storage.read(&child).unwrap();
-        let body = b"legacy required bytes";
+        let body = b"batched user bytes";
         let file_path = child
             .strip_suffix("content.json")
-            .map(|dir| format!("{dir}legacy.bin"))
+            .map(|dir| format!("{dir}batched.bin"))
             .unwrap();
+        let mut next = json!({
+            "address": xite.clone(),
+            "inner_path": child.clone(),
+            "modified": 43.0,
+            "files": {
+                "batched.bin": {
+                    "size": body.len(),
+                    "sha512": XiteStorage::hash_bytes(body),
+                    "b3": epix_blob::ObjId::of(body).to_string(),
+                }
+            },
+        });
+        epix_content::sign(&mut next, &author_key).unwrap();
+        let next_bytes = serde_json::to_vec(&next).unwrap();
+
+        let result = state
+            .apply_inbound_update(
+                &xite,
+                &child,
+                Some(next_bytes.clone()),
+                Some(43.0),
+                None,
+                None,
+                UpdatePayload {
+                    defer_required_fetch: true,
+                    ..UpdatePayload::default()
+                },
+                Vec::new(),
+            )
+            .await;
+        assert!(
+            matches!(result, Ok(InboundUpdate::Deferred)),
+            "a deferred child must stage without an error: {result:?}"
+        );
+        assert_eq!(storage.read(&child).unwrap(), previous);
+        assert_eq!(state.pending_child_relays.lock().unwrap().len(), 1);
+        let (needed, staged) = state.deferred_child_batch(&xite).await;
+        assert_eq!(
+            needed.iter().map(|f| f.inner_path.as_str()).collect::<Vec<_>>(),
+            vec![file_path.as_str()],
+        );
+        assert!(staged["files"][&file_path]["b3"].is_string());
+
+        storage.write(&file_path, body).unwrap();
+        state.promote_deferred_children().await;
+        assert!(state.pending_child_relays.lock().unwrap().is_empty());
+        assert_eq!(storage.read(&child).unwrap(), next_bytes);
+    }
+
+    #[tokio::test]
+    async fn required_file_without_b3_does_not_block_child_availability() {
+        // A pre-EDX entry (no b3, no files_shard descriptor) can never arrive
+        // over EDX, so waiting on it would park the child forever and erase
+        // every user signed before the b3 rollout. The manifest commits and
+        // the legacy file stays absent until a verified diff lands it or the
+        // owner re-signs.
+        let (_dir, state, xite, storage, child, _posts, author_key) = inline_merge_fixture().await;
+        let body = b"legacy required bytes";
         let mut next = json!({
             "address": xite.clone(),
             "inner_path": child.clone(),
@@ -43239,16 +44165,11 @@ mod tests {
             )
             .await;
         assert!(
-            result.is_err(),
-            "unfetchable required file received an availability ACK"
+            result.is_ok(),
+            "an unfetchable legacy file must not block the child commit: {result:?}"
         );
-        assert_eq!(storage.read(&child).unwrap(), previous);
-        assert_eq!(state.pending_child_relays.lock().unwrap().len(), 1);
-
-        storage.write(&file_path, body).unwrap();
-        state.retry_pending_child_relays().await;
-        assert!(state.pending_child_relays.lock().unwrap().is_empty());
         assert_eq!(storage.read(&child).unwrap(), next_bytes);
+        assert!(state.pending_child_relays.lock().unwrap().is_empty());
     }
 
     #[tokio::test]
@@ -43295,6 +44216,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -43408,6 +44330,7 @@ mod tests {
                     merge_deltas: HashMap::new(),
                     merge_objects: HashMap::new(),
                     require_merge_delivery: true,
+                    defer_required_fetch: false,
                 },
                 Vec::new(),
             )
@@ -43535,6 +44458,7 @@ mod tests {
                 record_delta(record.clone()))]),
             merge_objects: HashMap::new(),
             require_merge_delivery: true,
+            defer_required_fetch: false,
         };
 
         let first = state

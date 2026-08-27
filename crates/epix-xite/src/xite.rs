@@ -36,7 +36,7 @@ struct ChildCtx<'a> {
     /// for this file") and the user-content pass could not run concurrently
     /// with the core download. Disk still wins when present.
     root: Option<&'a Value>,
-    xid_map: &'a std::collections::HashMap<String, Vec<String>>,
+    xid_map: &'a epix_content::verify::XidMap,
 }
 impl VerifyContext for ChildCtx<'_> {
     fn xite_address(&self) -> &str {
@@ -51,8 +51,8 @@ impl VerifyContext for ChildCtx<'_> {
         }
         None
     }
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map.get(name).cloned().unwrap_or_default()
+    fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
+        self.xid_map.get(name).cloned()
     }
     fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
         self.storage.read(inner_path).ok()
@@ -81,6 +81,10 @@ impl VerifyContext for FileOverlayCtx<'_> {
         self.base.resolve_xid(name)
     }
 
+    fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
+        self.base.resolve_xid_identities(name)
+    }
+
     fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
         self.files
             .get(inner_path)
@@ -97,7 +101,7 @@ struct VerifiedWalkCtx<'a> {
     address: &'a str,
     storage: &'a XiteStorage,
     verified: &'a std::collections::HashMap<String, Value>,
-    xid_map: &'a std::collections::HashMap<String, Vec<String>>,
+    xid_map: &'a epix_content::verify::XidMap,
 }
 
 impl VerifyContext for VerifiedWalkCtx<'_> {
@@ -109,8 +113,8 @@ impl VerifyContext for VerifiedWalkCtx<'_> {
         self.verified.get(inner_path).cloned()
     }
 
-    fn resolve_xid(&self, name: &str) -> Vec<String> {
-        self.xid_map.get(name).cloned().unwrap_or_default()
+    fn resolve_xid_identities(&self, name: &str) -> Option<Vec<epix_content::XidIdentity>> {
+        self.xid_map.get(name).cloned()
     }
 
     fn read_file(&self, inner_path: &str) -> Option<Vec<u8>> {
@@ -610,7 +614,7 @@ impl Xite {
         &self,
         inner_path: &str,
         content: &Value,
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Option<Value> {
         let ctx = ChildCtx {
             address: self.address.as_str().to_string(),
@@ -643,7 +647,7 @@ impl Xite {
         &self,
         inner_path: &str,
         bytes: &[u8],
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Result<Vec<FileEntry>> {
         let json: Value = serde_json::from_slice(bytes)?;
         let ctx = ChildCtx {
@@ -663,7 +667,7 @@ impl Xite {
         &self,
         inner_path: &str,
         bytes: &[u8],
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Result<PreparedArchiveUpdate> {
         let ctx = ChildCtx {
             address: self.address.as_str().to_string(),
@@ -740,7 +744,7 @@ impl Xite {
         &self,
         inner_path: &str,
         bytes: &[u8],
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Result<Vec<FileEntry>> {
         let prepared = self.prepare_child_archive_update(inner_path, bytes, xid_map)?;
         let targets = prepared.archive_targets.clone();
@@ -1104,7 +1108,7 @@ impl Xite {
         &self,
         walk: &mut VerifiedManifestWalk,
         expected_path: &str,
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Result<Option<VerifiedManifest>> {
         let Some(inner_path) = walk.pending.pop_front() else { return Ok(None) };
         if inner_path != expected_path {
@@ -1310,7 +1314,7 @@ impl Xite {
         &self,
         replay: &mut ArchiveReplay,
         expected_path: &str,
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Result<bool> {
         let Some(inner_path) = replay.pending.pop_front() else {
             return Ok(false);
@@ -1518,7 +1522,7 @@ impl Xite {
     pub fn valid_signers_for(
         &self,
         content_inner_path: &str,
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Vec<String> {
         let Ok(bytes) = self.storage.read(content_inner_path) else {
             return Vec::new();
@@ -1537,7 +1541,7 @@ impl Xite {
         &self,
         content_inner_path: &str,
         content: &Value,
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Vec<String> {
         let ctx = ChildCtx {
             address: self.address.as_str().to_string(),
@@ -2178,6 +2182,17 @@ impl Xite {
             let Ok(path) = self.storage.path(path) else {
                 return Ok(false);
             };
+            // Already adopted as this exact file, and revalidate has just
+            // re-proven it. `of_file` below hashes the whole file only to
+            // rediscover an id we are holding right here, so on a node with a
+            // large xite that is a second full read of the tree at every
+            // startup - on top of revalidate's. Skip straight to the claim.
+            // Any doubt (different path, incomplete, not extern) answers
+            // false and falls through to the full check.
+            if store.is_extern_at(id, &path).unwrap_or(false) {
+                store.claim_manifest(id).map_err(Error::Io)?;
+                return Ok(true);
+            }
             let Ok((actual, actual_size)) = epix_blob::ObjId::of_file(&path) else {
                 return Ok(false);
             };
@@ -2405,7 +2420,7 @@ impl Xite {
         privatekey: &str,
         modified: f64,
         extend: &serde_json::Map<String, Value>,
-        xid_map: &std::collections::HashMap<String, Vec<String>>,
+        xid_map: &epix_content::verify::XidMap,
     ) -> Result<Value> {
         let context = ChildCtx {
             address: self.address.as_str().to_string(),
@@ -2663,11 +2678,17 @@ mod tests {
         let mut swapped = movie.clone();
         swapped[0] = 1;
         storage.write("video/movie.bin", &swapped).unwrap();
-        let f = std::fs::File::options()
-            .append(true)
-            .open(storage.path("video/movie.bin").unwrap())
-            .unwrap();
-        f.set_modified(mtime).unwrap();
+        // The touch handle must not stay open across a sign: the Windows read
+        // path denies write sharing, so a held append handle fails the read.
+        let touch = |time: std::time::SystemTime| {
+            std::fs::File::options()
+                .append(true)
+                .open(storage.path("video/movie.bin").unwrap())
+                .unwrap()
+                .set_modified(time)
+                .unwrap();
+        };
+        touch(mtime);
         xite.sign(&pk, 1001.0).unwrap();
         let second = xite.content.clone().unwrap();
         assert_eq!(
@@ -2687,7 +2708,7 @@ mod tests {
         );
 
         // Now touch the mtime: a normal sign re-reads changed files by itself.
-        f.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+        touch(std::time::SystemTime::now() + std::time::Duration::from_secs(5));
         xite.sign(&pk, 1003.0).unwrap();
         let third = xite.content.clone().unwrap();
         assert_ne!(
@@ -3368,7 +3389,7 @@ mod tests {
             .unwrap();
         let xid_map = std::collections::HashMap::from([(
             "admin.epix".to_string(),
-            vec![admin],
+            vec![epix_content::XidIdentity { address: admin, active: true, revoked_at_time: 0 }],
         )]);
         let verified = xite
             .verify_next_stored_manifest(

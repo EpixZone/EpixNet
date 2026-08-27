@@ -28,18 +28,23 @@ pub use time::{now_ms, now_secs};
 pub const DEFAULT_TRACKERS: &[&str] = &[
     // Epix announcers (community nodes speaking the wire protocol), with
     // the transport named explicitly - a node can front its announcer over
-    // tcp, onion, or i2p.
-    "tcp://51.38.34.170:15441",
+    // tcp, onion, or i2p. Refreshed August 2026 from the live peer books of
+    // two long-running nodes: every entry below was seen serving many xites
+    // with a clean dial record; entries that had gone dead or flaky were
+    // dropped.
     "tcp://74.208.249.9:48333",
-    "tcp://111.237.115.101:15441",
     "tcp://145.223.69.23:26959",
     "tcp://161.97.147.133:15441",
-    "tcp://194.5.98.39:15441",
     // Reachable over Tor / I2P only; skipped automatically while that
     // overlay is off.
-    "onion://fzlzmxuz2bust72cuy5g4w6d62tx624xcjaupf2kp7ffuitbiniy2hqd.onion:15441",
     "onion://jszogollvhtyttpbcdhghuewsbojgdioixvoqphtyq5bqyvfkjx3k5qd.onion:48333",
-    "i2p://ashvjmdch2622mesfch2qsuc6kkzl2xbtgfltr7nqjs5qtrsfbva.b32.i2p:48333",
+    "onion://6m4j2es4wom2xyhlvj4vjmsdsabqascped5d7t7knz3w2ku5hqlywwid.onion:26552",
+    "onion://ve5xi4oastkihvn34dntqvbd55ta2dwsv5mtx7zuiqzahfjwi56shyqd.onion:26552",
+    "onion://4u4miojxhpnryc7yb5nkio6c4l2m54ie4qysknvhxaur5rr2ap27ojqd.onion:26552",
+    "onion://6db5d6ayif7vfvyrp77cys6f45jntvt7hm5segia2mtjt7zlcxlshwid.onion:26552",
+    "i2p://ijfzvdhzg6pz6lqasqhgi4cfcychg46xgr7j3srvpnjhbof3xsgq.b32.i2p:26552",
+    "i2p://jlzmm6lxhjpov2merkf2bjsvwyc2nr45ci5doh4pwao4ckvksaxa.b32.i2p:26552",
+    "i2p://37ltndlrjpye25fa7c5ss53eiokrpdd3i2y2a3yjjfbefngmsvaa.b32.i2p:26552",
     // Public BitTorrent trackers (hostname form - they survive IP churn).
     "udp://tracker.opentrackr.org:1337/announce",
     "udp://open.stealth.si:80/announce",

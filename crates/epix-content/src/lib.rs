@@ -27,7 +27,9 @@ pub use record::{
     derive_post_id, derive_post_id_keyed, record_signed_data, verify_record, RecordError,
     CLOCK_SKEW_BOUND_MS,
 };
-pub use verify::{verify_content_file, verify_content_structure, VerifyContext, VerifyError};
+pub use verify::{
+    verify_content_file, verify_content_structure, VerifyContext, VerifyError, XidIdentity, XidMap,
+};
 use epix_core::{Error, Result};
 use serde_json::Value;
 

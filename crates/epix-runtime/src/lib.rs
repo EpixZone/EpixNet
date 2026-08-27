@@ -480,13 +480,28 @@ async fn announce_loop(
         // from previous runs, plus the runtime-contributed list (Syncronite's
         // live bootstrap) - re-read every pass, like EpixNet's loadTrackersFile
         // in its announce loop.
-        let all = state.all_trackers(&trackers).await;
+        let all = std::sync::Arc::new(state.all_trackers(&trackers).await);
         if all.is_empty() {
             return;
         }
+        // Bounded-concurrent per-xite announces. Strictly serial passes made
+        // a cold start unusable: each xite's announce waits out its slowest
+        // tracker (75s ceiling), so a boot pass over dozens of xites with the
+        // usual dead trackers ground on for tens of minutes - during which
+        // the loop could not react to Tor coming up either. Four at a time
+        // keeps the dial pressure modest while cutting the pass to a quarter.
+        let gate = std::sync::Arc::new(tokio::sync::Semaphore::new(4));
+        let mut passes = tokio::task::JoinSet::new();
         for address in state.xite_addresses().await {
-            state.announce_to_trackers(&address, &all).await;
+            let state = state.clone();
+            let all = all.clone();
+            let gate = gate.clone();
+            passes.spawn(async move {
+                let Ok(_permit) = gate.acquire_owned().await else { return };
+                state.announce_to_trackers(&address, &all).await;
+            });
         }
+        while passes.join_next().await.is_some() {}
         // AnnounceBitTorrent: also announce to any configured HTTP(S) BT
         // trackers and fold their peers in.
         if let Some(bt) = state.config_get("bt_trackers").await.and_then(|v| v.as_array().cloned()) {

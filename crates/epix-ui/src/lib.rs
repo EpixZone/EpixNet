@@ -3326,6 +3326,12 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
         // `{"error": ...}`, which is what xite scripts and epixframe.js read
         // (a top-level `error` field is dropped by callback-mode ws.cmd).
         Err(error) => {
+            // Xite scripts often iterate an expected array and die on the
+            // error object instead - a frozen page whose cause never reached
+            // any log. Name every errored command here.
+            ctx.state
+                .log("INFO", format!("ws {cmd} -> error: {error}"))
+                .await;
             json!({"cmd": "response", "to": id, "result": { "error": error }}).to_string()
         }
     }
