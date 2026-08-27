@@ -12442,6 +12442,22 @@ impl AppState {
             || error.contains("no such column")
     }
 
+    /// The error names a table/column the schema doesn't have. Transient only
+    /// inside a rebuild's drop-and-recreate window - on a settled database the
+    /// name will never appear, no matter how long the retry loop waits.
+    fn is_missing_schema_error(error: &str) -> bool {
+        error.contains("no such table") || error.contains("no such column")
+    }
+
+    /// A clone or db rebuild is redoing `address`'s schema right now (the
+    /// same busy signal `await_db_quiet` polls).
+    async fn db_rebuild_or_clone_in_flight(&self, address: &str) -> bool {
+        let canonical = self.canonical_key(address).await;
+        self.is_cloning(&canonical)
+            || self.is_cloning(address)
+            || self.db_rebuilds_in_flight.lock().unwrap().contains(&canonical)
+    }
+
     /// Re-derive the receipt under the activation and tree locks - the
     /// linearization point for a detached query's result. The locks are
     /// scoped to this instant: holding them through the retry sleeps starved
@@ -12479,6 +12495,22 @@ impl AppState {
                 if std::time::Instant::now() < retry_until
                     && Self::is_transient_db_error(&error) =>
             {
+                // A missing table/column heals only while a clone or rebuild
+                // is redoing the schema. The receipt held stable across the
+                // recheck and a finished rebuild bumps db_generation, so on a
+                // quiet database the name is permanently absent (e.g. a feed
+                // follow whose SQL outlived the xite's schema) - answer now
+                // instead of burning the whole retry budget on it.
+                if Self::is_missing_schema_error(&error)
+                    && !self.db_rebuild_or_clone_in_flight(address).await
+                {
+                    self.log(
+                        "DEBUG",
+                        format!("dbQuery error for {address} (schema settled, not retrying): {error}"),
+                    )
+                    .await;
+                    return Some(Err(error));
+                }
                 self.log(
                     "DEBUG",
                     format!("dbQuery transient error for {address}, retrying: {error}"),

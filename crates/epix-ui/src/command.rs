@@ -2603,7 +2603,7 @@ impl WsCommand for FeedQuery {
         let (limit, day_limit) = feed_limits(p);
         let follows = s.state.all_follows().await;
 
-        let mut rows: Vec<Value> = Vec::new();
+        let mut queries: Vec<(&String, &String, String)> = Vec::new();
         let mut num_xites = 0;
         for (xite, feeds) in &follows {
             let Some(feeds) = feeds.as_object() else { continue };
@@ -2617,22 +2617,40 @@ impl WsCommand for FeedQuery {
                 if !is_safe_feed_sql(&full) {
                     continue;
                 }
-                let Ok(res) = s.state.db_query(xite, &full, &Value::Null).await else { continue };
-                for mut row in res {
-                    let Some(obj) = row.as_object_mut() else { continue };
-                    // Normalize + sanity-check date_added (ms -> s; drop future items).
-                    let Some(mut date) = obj.get("date_added").and_then(|v| v.as_f64()) else { continue };
-                    if date > 1e12 {
-                        date /= 1000.0;
-                    }
-                    if date > now_secs() + 120.0 {
-                        continue;
-                    }
-                    obj.insert("date_added".into(), json!(date));
-                    obj.insert("site".into(), json!(xite));
-                    obj.insert("feed_name".into(), json!(name));
-                    rows.push(row);
+                queries.push((xite, name, full));
+            }
+        }
+        // All followed feeds run concurrently, each under its own deadline:
+        // one sick xite (db mid-churn, schema outlived by the follow's SQL)
+        // must not serialize-stall the merged view every other xite feeds.
+        let results =
+            futures_util::future::join_all(queries.iter().map(|(xite, name, full)| async move {
+                let res = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    s.state.db_query(xite, full, &Value::Null),
+                )
+                .await;
+                (*xite, *name, res)
+            }))
+            .await;
+
+        let mut rows: Vec<Value> = Vec::new();
+        for (xite, name, res) in results {
+            let Ok(Ok(res)) = res else { continue };
+            for mut row in res {
+                let Some(obj) = row.as_object_mut() else { continue };
+                // Normalize + sanity-check date_added (ms -> s; drop future items).
+                let Some(mut date) = obj.get("date_added").and_then(|v| v.as_f64()) else { continue };
+                if date > 1e12 {
+                    date /= 1000.0;
                 }
+                if date > now_secs() + 120.0 {
+                    continue;
+                }
+                obj.insert("date_added".into(), json!(date));
+                obj.insert("site".into(), json!(xite));
+                obj.insert("feed_name".into(), json!(name));
+                rows.push(row);
             }
         }
 
