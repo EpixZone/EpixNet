@@ -102,7 +102,7 @@ weak-subjectivity window (`XID_WS_PERIOD_SECS`, default 7 days) still applies
 as the fail-closed backstop whenever the light client is disabled
 (`xid_lc_enabled=false`).
 
-Config: `xid_lc_enabled` (default true), `xid_lc_interval_secs` (default 900),
+Config: `xid_lc_enabled` (default true), `xid_lc_interval_secs` (default 3600),
 `xid_trusting_period_secs` (default 1209600), `EPIX_CMT_RPC_URL` (default
 `https://rpc.epix.zone`; routed through the same chain egress as every other
 chain fetch, so Tor-Always covers it).

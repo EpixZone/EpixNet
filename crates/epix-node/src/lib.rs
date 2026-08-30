@@ -2940,12 +2940,17 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
                 .await;
             return;
         }
+        // Hourly is deliberately lazy: the pin only needs to advance often
+        // enough to stay inside the 7-day weak-subjectivity window, and voting
+        // power cannot shift meaningfully in under the 21-day unbonding
+        // period. One advance is ~5 small JSON GETs to a single RPC, so this
+        // is ~120 requests/day - less than one web page load.
         let interval_secs = state
             .config_get("xid_lc_interval_secs")
             .await
             .and_then(|v| v.as_u64())
             .filter(|&s| s >= 60)
-            .unwrap_or(900);
+            .unwrap_or(3600);
         let mut cfg = epix_chain::LightClientConfig::new(data_root.join("xid_lc_state.json"));
         cfg.checkpoint_path = Some(data_root.join("xid_finality_checkpoint.json"));
         if let Some(secs) = state
