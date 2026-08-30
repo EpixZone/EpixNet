@@ -2916,6 +2916,7 @@ dependencies = [
  "epix-xite",
  "hex",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "windows-sys 0.61.2",

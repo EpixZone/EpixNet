@@ -2494,13 +2494,32 @@ impl Xite {
         // this directory's data.json files (`max_items`, with age/min
         // variants). Trim before hashing so the signed hashes reflect the
         // pruned data and the result passes the receiver's max_items check.
-        let pruned_files = match epix_content::verify::get_rules(inner_path, &content, context) {
-            Some(rules) => self.pruned_data_files(dir, &rules, modified)?,
+        let rules = epix_content::verify::get_rules(inner_path, &content, context);
+        let pruned_files = match &rules {
+            Some(rules) => self.pruned_data_files(dir, rules, modified)?,
             None => std::collections::BTreeMap::new(),
         };
         let map = content
             .as_object_mut()
             .ok_or_else(|| Error::Protocol("content.json is not a JSON object".into()))?;
+
+        // Sign-time cutover prune: drop declared merge files the owner's
+        // CURRENT rules no longer allow-list. The stale declaration would fail
+        // this signature's own verification ("Merge file not allowed") and
+        // strand the user - e.g. a legacy mail user still declaring
+        // messages.json after the pool cutover removed it from merge_files.
+        // The data file itself is untouched; only the dangling declaration
+        // goes, exactly what re-signing under the new rules must produce.
+        if let Some(declared) = map.get_mut("files_merged").and_then(|v| v.as_object_mut()) {
+            let allowed = rules
+                .as_ref()
+                .and_then(|r| r.get("merge_files"))
+                .and_then(|v| v.as_object());
+            declared.retain(|name, _| allowed.is_some_and(|a| a.contains_key(name)));
+            if declared.is_empty() {
+                map.remove("files_merged");
+            }
+        }
 
         // Hash this directory's files. Nested content.json files are their own
         // signed units; entries already declared optional keep their metadata
