@@ -206,8 +206,18 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ),
     ("Epix Chain Config", "xid_clear_cache", "Clear xID Cache", "", "button:xidClearCache"),
     // --- Channels (metadata-private mail / DMs / forum over the envelope pool)
-    ("Channels", "channel_enabled", "Enable metadata-private channels", "false", "bool"),
-    ("Channels", "channel_xite", "Channel xite address", "", "text"),
+    // ON by default with the official Epix Mail xite, so encrypted mail works
+    // out of the box. Both defaults MUST match the ChannelPlugin's code
+    // defaults (`config_bool("channel_enabled", true)` /
+    // `DEFAULT_CHANNEL_XITE`) - a test in epix-plugins pins the xite address.
+    ("Channels", "channel_enabled", "Enable metadata-private channels", "true", "bool"),
+    (
+        "Channels",
+        "channel_xite",
+        "Channel xite address (blank = the official Epix Mail xite)",
+        "epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa",
+        "text",
+    ),
     ("Channels", "channel_backfill_weeks", "Weeks of channel history to backfill (0 = all)", "4", "text"),
     ("Channels", "channel_send_jitter_max_secs", "Max random send delay (metadata privacy)", "0", "text"),
     ("Channels", "channel_burst_jitter_max_secs", "Max per-record gap for >8-recipient sends (metadata privacy)", "60", "text"),

@@ -37,6 +37,11 @@ const OUTBOX_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 
 /// The channel-specific state a running node holds — installed once at startup and
 /// retrieved by the `channel*` commands from the bound `AppState`.
+/// The official Epix Mail xite: the default channel xite when `channel_xite`
+/// is unset or blank, so metadata-private mail works out of the box. The
+/// Config page default MUST equal this (a schema test pins it).
+pub const DEFAULT_CHANNEL_XITE: &str = "epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa";
+
 pub struct ChannelState {
     pub db: Arc<ChannelDb>,
     pub engine: Arc<dyn Engine>,
@@ -1183,17 +1188,25 @@ async fn run_channel_indexer(
 }
 
 async fn run_channel_plugin(state: Arc<AppState>) {
-            if !state.config_bool("channel_enabled", false).await {
+            // ON by default: metadata-private mail is a core feature, not an
+            // opt-in. `channel_enabled=false` remains the explicit off switch.
+            if !state.config_bool("channel_enabled", true).await {
                 return;
             }
+            // Unset/blank falls back to the official Epix Mail xite, so mail
+            // works out of the box with zero configuration.
             let xite = state
                 .config_get("channel_xite")
                 .await
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default();
-            if xite.is_empty() {
-                state.log("INFO", "channel_enabled but channel_xite is unset; channels off").await;
-                return;
+                .and_then(|v| v.as_str().map(str::trim).map(String::from))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_CHANNEL_XITE.to_string());
+            // A fresh node may not have the channel xite yet (the user has
+            // never opened Epix Mail). Idle here until it appears - the moment
+            // the xite is registered (first visit / clone), channels come up
+            // without a restart. Costs one cheap lookup a minute meanwhile.
+            while !state.has_xite(&xite).await {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
             let Some(engine) = build_engine(&state).await else { return };
             let Some(db) = open_db(&state).await else {
@@ -3049,5 +3062,24 @@ mod multi_device_tests {
         );
         restarted_channel.db.ack_outbound(legacy_id).unwrap();
         assert!(!restarted_channel.db.outbound_pending(legacy_id).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod default_config_tests {
+    /// The Config page's Channels defaults must equal the plugin's code
+    /// defaults, or the UI advertises a state the node does not actually use.
+    #[test]
+    fn config_page_channel_defaults_match_plugin_defaults() {
+        let row = |key: &str| {
+            epix_ui::state::CONFIG_SCHEMA
+                .iter()
+                .find(|(_, k, _, _, _)| *k == key)
+                .unwrap_or_else(|| panic!("{key} missing from CONFIG_SCHEMA"))
+        };
+        let (_, _, _, enabled_default, _) = row("channel_enabled");
+        assert_eq!(*enabled_default, "true", "channels are ON by default");
+        let (_, _, _, xite_default, _) = row("channel_xite");
+        assert_eq!(*xite_default, super::DEFAULT_CHANNEL_XITE);
     }
 }
