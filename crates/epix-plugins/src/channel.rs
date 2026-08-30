@@ -1303,15 +1303,37 @@ impl WsCommand for ChannelSessionInfo {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let ms = channel_state(s)?;
-        let (has_identity, unread) = match identity_id(&ms) {
-            Ok(id) => (true, ms.db.unread_count(id).unwrap_or(0)),
-            Err(_) => (false, 0),
+        let unread = match identity_id(&ms) {
+            Ok(id) => ms.db.unread_count(id).unwrap_or(0),
+            Err(_) => 0,
+        };
+        // "Published" means this device's bundle is actually present in the
+        // xite's SYNCED user files - not merely that the node auto-initialized
+        // its local (private) identity at boot. Conflating the two made every
+        // visitor look enrolled, hiding onboarding's publish step. Joining the
+        // mail platform must stay an explicit, user-visible act: until the
+        // user publishes, nothing about them exists in shared data at all.
+        let key_bundle_published = match s.state.user_auth_address(&ms.xite).await {
+            Ok(auth) => {
+                let dir = norm_xid(&s.state.user_directory(&ms.xite, &auth).await);
+                read_published_bundle_files(&s.state, &ms.xite, ms.engine.as_ref())
+                    .await
+                    .get(&dir)
+                    .map(|devices| {
+                        devices.iter().any(|bundle| {
+                            bundle.get("auth").and_then(Value::as_str) == Some(auth.as_str())
+                                && ms.engine.verify_bundle(bundle)
+                        })
+                    })
+                    .unwrap_or(false)
+            }
+            Err(_) => false,
         };
         let (outbox_pending, outbox_error) = ms.db.outbox_status().map_err(|e| e.to_string())?;
         Ok(json!({
             "enabled": true,
             "xite": ms.xite,
-            "key_bundle_published": has_identity,
+            "key_bundle_published": key_bundle_published,
             "unread": unread,
             "outbox_pending": outbox_pending,
             "outbox_error": outbox_error,
