@@ -177,6 +177,27 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Epix Chain Config", "chain_rpc_url", "Chain RPC URL", "https://api.epix.zone", "text"),
     ("Epix Chain Config", "chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone", "text"),
     ("Epix Chain Config", "chain_block_explorer_url", "Block Explorer URL", "https://scan.epix.zone", "text"),
+    // Bootstrap sources for the xID finality light client: independent
+    // CometBFT RPC endpoints that must agree before a cold-booting node adopts
+    // a trust anchor. Add as many as you like (one per line); blank restores
+    // the built-in list. The default string MUST equal
+    // `epix_chain::DEFAULT_BOOTSTRAP_SOURCES` joined by newlines - a unit test
+    // below pins that, so the Config page never advertises different defaults
+    // than the node actually uses.
+    (
+        "Epix Chain Config",
+        "xid_bootstrap_rpcs",
+        "xID trust bootstrap RPCs (one per line; independent CometBFT endpoints; blank = built-in list)",
+        "https://rpc.epix.zone\nhttps://rpc-epix.onenov.xyz\nhttps://rpc-m.epix.vinjan-inc.com\nhttps://rpc-epix.dnsarz.net:443",
+        "textarea",
+    ),
+    (
+        "Epix Chain Config",
+        "xid_bootstrap_quorum",
+        "xID bootstrap quorum (how many of those RPCs must agree exactly)",
+        "2",
+        "text",
+    ),
     ("Epix Chain Config", "xid_clear_cache", "Clear xID Cache", "", "button:xidClearCache"),
     // --- Channels (metadata-private mail / DMs / forum over the envelope pool)
     ("Channels", "channel_enabled", "Enable metadata-private channels", "false", "bool"),
@@ -218,3 +239,37 @@ pub const CONFIG_RESTART_KEYS: &[&str] = &[
     "mesh_listen",
     "trackers",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::CONFIG_SCHEMA;
+
+    /// The Config page's advertised bootstrap defaults must be EXACTLY the
+    /// built-in list the node falls back to, or a user who never touches the
+    /// field sees endpoints the node does not actually use (and vice versa).
+    #[test]
+    fn bootstrap_rpc_default_matches_the_built_in_list() {
+        let (_, _, _, default, kind) = CONFIG_SCHEMA
+            .iter()
+            .find(|(_, key, _, _, _)| *key == "xid_bootstrap_rpcs")
+            .expect("xid_bootstrap_rpcs in schema");
+        assert_eq!(*kind, "textarea");
+        assert_eq!(
+            *default,
+            epix_chain::DEFAULT_BOOTSTRAP_SOURCES.join("\n"),
+            "schema default drifted from epix_chain::DEFAULT_BOOTSTRAP_SOURCES"
+        );
+    }
+
+    #[test]
+    fn bootstrap_quorum_default_matches_the_built_in() {
+        let (_, _, _, default, _) = CONFIG_SCHEMA
+            .iter()
+            .find(|(_, key, _, _, _)| *key == "xid_bootstrap_quorum")
+            .expect("xid_bootstrap_quorum in schema");
+        assert_eq!(
+            default.parse::<usize>().unwrap(),
+            epix_chain::DEFAULT_BOOTSTRAP_QUORUM
+        );
+    }
+}

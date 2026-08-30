@@ -29,10 +29,14 @@ use std::collections::{HashMap, HashSet};
 
 use ed25519_dalek::{Signature, VerifyingKey};
 
-/// Default power safety-buffer: require ≥80% of pinned voting power (not a bare
-/// 2/3), so a pinned set whose real power has partly migrated can't be cleared by
-/// exactly-2/3 between re-pins.
-pub const DEFAULT_MIN_POWER_BPS: u32 = 8000;
+/// Default power floor in basis points, set just over 2/3 to match the strict
+/// `power*3 > total*2` supermajority check. The light client ([`crate::lightclient`])
+/// keeps the pinned set tracking the LIVE set, so there is no stale-pin drift for
+/// a larger buffer to absorb — and a larger buffer costs real liveness: at 80%,
+/// two mid-sized validators in maintenance at once (~21% of stake on mainnet)
+/// stranded xID resolution while the chain kept finalizing. >2/3 makes xID
+/// finality available exactly whenever the chain itself is live.
+pub const DEFAULT_MIN_POWER_BPS: u32 = 6667;
 
 /// One pinned validator: its **consensus** ed25519 pubkey and voting power.
 #[derive(Clone, Debug)]
@@ -509,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn four_of_five_meets_80_percent() {
+    fn four_of_five_passes() {
         let (set, keys) = setup(&[1, 1, 1, 1, 1]);
         let b = bundle(&set, &keys, &[0, 1, 2, 3], HEIGHT, ROUND, BT, DIGEST);
         assert_eq!(verify_finality(&b, &set, &params()), Ok(HEIGHT));
@@ -526,12 +530,27 @@ mod tests {
     }
 
     #[test]
-    fn power_buffer_rejects_a_strict_two_thirds_pass() {
+    fn just_over_two_thirds_passes_at_default_floor() {
+        // The mainnet maintenance scenario the default floor must survive:
+        // ~21% of stake offline (two mid-sized validators at once) while the
+        // chain keeps finalizing. 700/1000 = 70% clears the strict 2/3 AND the
+        // default 6667-bps floor — resolution stays live.
         let (set, keys) = setup(&[100, 100, 100, 100, 600]);
         let b = bundle(&set, &keys, &[4, 0], HEIGHT, ROUND, BT, DIGEST); // 700/1000 = 70%
+        assert_eq!(verify_finality(&b, &set, &params()), Ok(HEIGHT));
+    }
+
+    #[test]
+    fn power_buffer_still_enforced_when_raised() {
+        // An operator can still demand a larger buffer: at 8000 bps the same
+        // 70% bundle is rejected. Locks in that min_power_bps stays honored.
+        let (set, keys) = setup(&[100, 100, 100, 100, 600]);
+        let b = bundle(&set, &keys, &[4, 0], HEIGHT, ROUND, BT, DIGEST); // 700/1000 = 70%
+        let mut p = params();
+        p.min_power_bps = 8000;
         assert!(matches!(
-            verify_finality(&b, &set, &params()),
-            Err(FinalityError::InsufficientPower { got: 700, total: 1000, .. })
+            verify_finality(&b, &set, &p),
+            Err(FinalityError::InsufficientPower { got: 700, total: 1000, need_bps: 8000 })
         ));
     }
 

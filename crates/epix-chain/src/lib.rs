@@ -10,6 +10,7 @@ mod checkpoint;
 mod finality;
 mod identity_snapshot;
 mod leaf;
+mod lightclient;
 mod merkle;
 mod resolver;
 mod types;
@@ -26,6 +27,11 @@ pub use identity_snapshot::{
     XidIdentityStatus,
 };
 pub use leaf::verify_and_parse_leaf;
+pub use lightclient::{
+    advance_trusted_set, Advance, LightClientConfig, DEFAULT_BOOTSTRAP_QUORUM,
+    DEFAULT_BOOTSTRAP_SOURCES, DEFAULT_CHAIN_ID, DEFAULT_CMT_RPC_URL,
+    DEFAULT_TRUSTING_PERIOD_SECS,
+};
 pub use resolver::{XidResolver, DEFAULT_RPC_URL};
 pub use types::{DomainSnapshot, Identity};
 pub use vrf::{combine_beacons, derive_random, Beacon, Vrf};
@@ -335,6 +341,35 @@ pub fn install_finality_pin(json: &[u8]) -> std::result::Result<usize, String> {
     set_pinned_validators(Some(pinned));
     set_verify_finality(true);
     Ok(n)
+}
+
+/// Replace the active pin with a light-client-verified NEWER set (see
+/// [`lightclient`]). Monotonic and fail-closed: the new pin must be for the
+/// same chain and a strictly higher height than the current one, and the
+/// durable checkpoint must accept the rebind (its supersede rules) BEFORE the
+/// in-memory set swaps — so a failure at any step leaves the previous trust
+/// root fully in force. A same-height call is an idempotent no-op.
+pub fn advance_finality_pin(new_pin: finality::PinnedSet) -> std::result::Result<(), String> {
+    let current = pinned_validators()
+        .ok_or_else(|| "cannot advance the finality pin: none installed".to_string())?;
+    if new_pin.chain_id != current.chain_id {
+        return Err(format!(
+            "cannot advance the finality pin across chains ({} -> {})",
+            current.chain_id, new_pin.chain_id
+        ));
+    }
+    if new_pin.pinned_at_height < current.pinned_at_height {
+        return Err(format!(
+            "refusing to roll the finality pin back ({} -> {})",
+            current.pinned_at_height, new_pin.pinned_at_height
+        ));
+    }
+    if new_pin.pinned_at_height == current.pinned_at_height {
+        return Ok(());
+    }
+    checkpoint::rebind(&new_pin)?;
+    set_pinned_validators(Some(new_pin));
+    Ok(())
 }
 
 /// Configure and restore the durable anti-rollback checkpoint used by every
