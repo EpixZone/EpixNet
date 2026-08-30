@@ -9,6 +9,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
 pub const DEFAULT_RPC_URL: &str = "https://api.epix.zone";
+type SnapshotCacheEntry = (DomainSnapshot, Instant, Option<(u64, String)>);
+type SnapshotCache = HashMap<String, SnapshotCacheEntry>;
 
 /// Resolves `.epix` names against the Epix chain, verifying every answer with a
 /// Merkle proof against a finalized state digest.
@@ -16,16 +18,25 @@ pub struct XidResolver {
     /// The HTTP client plus the SOCKS generation it was built for. Rebuilt when
     /// the proxy setting changes, so a client built direct before Tor came up
     /// (Always mode) does not keep sending over clearnet afterwards.
-    client: RwLock<(u64, reqwest::Client)>,
+    client: RwLock<Option<(u64, reqwest::Client)>>,
     rpc_url: String,
-    cache: RwLock<HashMap<String, (DomainSnapshot, Instant)>>,
+    /// Cached snapshot plus the accepted finality height it came from. A newer
+    /// checkpoint invalidates older snapshots immediately, independent of TTL.
+    /// `Some((height, digest))` exists only for pinned-validator verification.
+    /// Legacy cache entries use `None`, so enabling finality at height zero can
+    /// never reinterpret an old legacy snapshot as cryptographically verified.
+    cache: RwLock<SnapshotCache>,
     ttl: Duration,
     /// The last digest confirmed finalized, cached briefly. Every resolve
     /// checks its proof against the current attested + finalized digest; that
     /// digest is global chain state, identical for every name resolved in the
     /// same moment. Caching it turns a burst of N resolves from 3N HTTP calls
     /// (proof + digest + attestations, each) into N + 2.
-    digest: RwLock<Option<(String, Instant)>>,
+    /// `(digest, cached_at, verified_height)`. `Some(height)` records a digest
+    /// proven by pinned-validator signatures and durably checkpointed. `None`
+    /// records a legacy RPC boolean result. The cryptographic fast path also
+    /// confirms that the tuple still matches the process-wide checkpoint.
+    digest: RwLock<Option<(String, Instant, Option<u64>)>>,
 }
 
 /// How long a confirmed-finalized digest is reused. Short: the digest advances
@@ -33,12 +44,19 @@ pub struct XidResolver {
 /// long enough that one burst of resolves shares a single digest fetch.
 const DIGEST_TTL: Duration = Duration::from_secs(3);
 
+#[derive(Clone, Debug)]
+struct FinalityBinding {
+    digest: String,
+    /// `Some` only when pinned-validator signatures were verified and the exact
+    /// height and digest were durably checkpointed.
+    height: Option<u64>,
+}
+
 impl XidResolver {
     pub fn new(rpc_url: impl Into<String>) -> Self {
-        let gen = crate::socks_generation();
-        let client = crate::http_client(Duration::from_secs(15));
+        let client = crate::http_client(Duration::from_secs(15)).ok();
         Self {
-            client: RwLock::new((gen, client)),
+            client: RwLock::new(client),
             rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
             cache: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(30 * 60),
@@ -48,17 +66,19 @@ impl XidResolver {
 
     /// The HTTP client for the current SOCKS setting, rebuilding it if the proxy
     /// changed since it was last built.
-    async fn client(&self) -> reqwest::Client {
-        let gen = crate::socks_generation();
+    async fn client(&self) -> Result<reqwest::Client> {
+        let generation = crate::chain_route_snapshot()?.generation;
         {
             let cur = self.client.read().await;
-            if cur.0 == gen {
-                return cur.1.clone();
+            if let Some((cached_generation, client)) = cur.as_ref() {
+                if *cached_generation == generation {
+                    return Ok(client.clone());
             }
         }
-        let client = crate::http_client(Duration::from_secs(15));
-        *self.client.write().await = (gen, client.clone());
-        client
+        }
+        let (generation, client) = crate::http_client(Duration::from_secs(15))?;
+        *self.client.write().await = Some((generation, client.clone()));
+        Ok(client)
     }
 
     /// Override the positive-cache TTL (default 30 minutes).
@@ -80,21 +100,78 @@ impl XidResolver {
     /// to equal the current attested state digest, and require that digest to be
     /// finalized by validators. Any failure is an error (fail closed).
     pub async fn resolve(&self, name: &str, tld: &str) -> Result<DomainSnapshot> {
-        let key = format!("{name}.{tld}");
-        if let Some((snap, at)) = self.cache.read().await.get(&key) {
-            if at.elapsed() < self.ttl {
-                return Ok(snap.clone());
+        self.resolve_inner(name, tld, true)
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Resolve without reusing a cached domain snapshot. Security-sensitive
+    /// revocation checks use this path so the general 30-minute profile cache
+    /// cannot extend a revoked identity's authorization.
+    pub async fn resolve_fresh(&self, name: &str, tld: &str) -> Result<DomainSnapshot> {
+        self.resolve_inner(name, tld, false)
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Fresh security-sensitive resolution together with its exact finality
+    /// height and digest binding. Derived authorization caches use this instead
+    /// of sampling global state after the fact. Legacy mode returns `None`.
+    pub async fn resolve_fresh_bound(
+        &self,
+        name: &str,
+        tld: &str,
+    ) -> Result<(DomainSnapshot, Option<(u64, String)>)> {
+        self.resolve_inner(name, tld, false).await
+    }
+
+    async fn resolve_inner(
+        &self,
+        name: &str,
+        tld: &str,
+        use_snapshot_cache: bool,
+    ) -> Result<(DomainSnapshot, Option<(u64, String)>)> {
+        // A concurrent resolution can advance the checkpoint between our RPC
+        // fetch and snapshot publication. Retry once against the newer state
+        // instead of returning or caching the now-stale snapshot.
+        for _ in 0..2 {
+            match self.resolve_once(name, tld, use_snapshot_cache).await {
+                Err(ChainError::FinalityAdvanced) => continue,
+                result => return result,
             }
+        }
+        Err(ChainError::FinalityUnverified(
+            "xID finality advanced repeatedly while publishing the resolved snapshot".into(),
+        ))
+    }
+
+    async fn resolve_once(
+        &self,
+        name: &str,
+        tld: &str,
+        use_snapshot_cache: bool,
+    ) -> Result<(DomainSnapshot, Option<(u64, String)>)> {
+        let key = format!("{name}.{tld}");
+        if let Some(cached) = self.cached_snapshot(&key, use_snapshot_cache).await {
+            return Ok(cached);
         }
 
         let data = self
             .get_json(&format!("{}/xid/v1/resolve_with_proof/{tld}/{name}", self.rpc_url))
             .await?;
 
-        let domain = data
-            .get("domain")
-            .filter(|d| !d.is_null())
-            .ok_or_else(|| ChainError::NotFound(key.clone()))?;
+        // An unregistered name comes back as a gRPC-gateway error body (no proof
+        // and no domain). Report it as NotFound — a definite, negatively-cacheable
+        // answer — rather than Malformed, which reads as a transient chain fault
+        // (re-hit every lookup) and blurs "name available" with "chain broken".
+        if data.get("proof").is_none() && data.get("domain").is_none() {
+            let code = data.get("code").and_then(|v| v.as_i64());
+            let msg = data.get("message").and_then(|v| v.as_str()).unwrap_or("");
+            if code == Some(5) || msg.to_lowercase().contains("not found") {
+                return Err(ChainError::NotFound(key.clone()));
+            }
+        }
+
         let proof = data
             .get("proof")
             .ok_or_else(|| ChainError::Malformed("missing proof".into()))?;
@@ -112,39 +189,174 @@ impl XidResolver {
             .map(|a| a.iter().filter_map(|s| s.as_str().map(String::from)).collect())
             .unwrap_or_default();
 
-        // Step 1 - Merkle proof.
+        let verify = crate::verify_finality_enabled();
+
+        // Step 1 - LEAF BINDING. The Merkle proof only proves *a* leaf is in the
+        // tree; the returned data must actually BE that leaf. The chain serves the
+        // canonical `leaf_preimage` (hex); we hash it (== leaf_hash), bind the name,
+        // and parse the snapshot FROM it. When verification is on, the preimage is
+        // REQUIRED (an RPC can't downgrade by omitting it). Pre-upgrade chains omit
+        // it, so with verification off we fall back to the (unbound) domain payload.
+        let leaf_preimage: Option<Vec<u8>> = data
+            .get("leaf_preimage")
+            .and_then(|v| v.as_str())
+            .and_then(|s| hex::decode(s.trim()).ok());
+        let snapshot = match &leaf_preimage {
+            Some(pre) => crate::verify_and_parse_leaf(pre, leaf_hash, name, tld)?,
+            None if verify => {
+                return Err(ChainError::LeafBindingFailed(
+                    "leaf_preimage required when finality verification is enabled".into(),
+                ))
+            }
+            None => {
+                let domain = data
+                    .get("domain")
+                    .filter(|d| !d.is_null())
+                    .ok_or_else(|| ChainError::NotFound(key.clone()))?;
+                parse_domain(name, tld, domain)?
+            }
+        };
+
+        // Step 2 - Merkle inclusion proof over the (now name-bound) leaf.
         if !verify_proof(leaf_hash, leaf_index, &siblings, proof_root)? {
             return Err(ChainError::MerkleInvalid);
         }
 
-        // Step 2+3 - the proof root must equal a state digest that validators
-        // have finalized. The finalized digest is cached briefly (it is global
-        // chain state), so a burst of resolves shares one digest fetch. A
-        // proof that doesn't match the cached digest (its name changed since)
-        // forces a fresh fetch before we reject it, so caching never yields a
-        // false negative.
-        if !self.digest_matches(proof_root, false).await?
-            && !self.digest_matches(proof_root, true).await?
-        {
-            return Err(ChainError::DigestMismatch);
+        // Step 3 - the proof root must be a state digest validators finalized.
+        let binding = self.finality_binding(proof_root, verify).await?;
+
+        let binding = self
+            .publish_snapshot(key, snapshot.clone(), &binding)
+            .await?;
+        Ok((snapshot, binding))
+    }
+
+    async fn cached_snapshot(
+        &self,
+        key: &str,
+        use_snapshot_cache: bool,
+    ) -> Option<(DomainSnapshot, Option<(u64, String)>)> {
+        if !use_snapshot_cache {
+            return None;
+        }
+        let cache = self.cache.read().await;
+        let (snapshot, cached_at, binding) = cache.get(key)?;
+        let checkpoint_current =
+            snapshot_binding_current(binding.as_ref(), crate::verify_finality_enabled());
+        (cached_at.elapsed() < self.ttl && checkpoint_current)
+            .then(|| (snapshot.clone(), binding.clone()))
+    }
+
+    async fn finality_binding(&self, proof_root: &str, verify: bool) -> Result<FinalityBinding> {
+        if verify {
+            // Cryptographic: verify signed validator power over `proof_root`
+            // against the pinned set (no trust in any RPC boolean).
+            return self.verify_finality_gated(proof_root).await;
         }
 
-        let snapshot = parse_domain(name, tld, domain)?;
-        self.cache
-            .write()
-            .await
-            .insert(key, (snapshot.clone(), Instant::now()));
-        Ok(snapshot)
+        // Legacy: the digest is confirmed finalized via the RPC boolean,
+        // cached briefly (global chain state). A proof that doesn't match the
+        // cached digest forces a fresh fetch before we reject it.
+        match self.digest_matches(proof_root, false).await? {
+            Some(binding) => Ok(binding),
+            None => self
+                .digest_matches(proof_root, true)
+                .await?
+                .ok_or(ChainError::DigestMismatch),
+        }
+    }
+
+    async fn publish_snapshot(
+        &self,
+        key: String,
+        snapshot: DomainSnapshot,
+        binding: &FinalityBinding,
+    ) -> Result<Option<(u64, String)>> {
+        let mut cache = self.cache.write().await;
+        if let Some(height) = binding.height {
+            if !crate::xid_verified_binding_current(height, &binding.digest) {
+                return Err(ChainError::FinalityAdvanced);
+            }
+        }
+        // Store the height and digest that verified THIS snapshot. Reading newer
+        // global state here would mislabel a lower snapshot during a race.
+        let stored_binding = binding
+            .height
+            .map(|height| (height, binding.digest.clone()));
+        cache.insert(key, (snapshot, Instant::now(), stored_binding.clone()));
+        Ok(stored_binding)
+    }
+
+    /// Cryptographically verify that `digest` was signed by the required share of
+    /// PINNED validator voting power (replaces the RPC `finalized` boolean). The
+    /// last verified digest is memoized for [`DIGEST_TTL`] since it is global chain
+    /// state. Fails closed if no pin is installed.
+    async fn verify_finality_gated(&self, digest: &str) -> Result<FinalityBinding> {
+        if let Some((d, at, Some(height))) = self.digest.read().await.as_ref() {
+            // Only reuse a memo that is still the durable process-wide
+            // checkpoint. This prevents a lower-height result from being
+            // republished by a concurrent request after a higher result wins.
+            if d == digest
+                && at.elapsed() < DIGEST_TTL
+                && crate::xid_verified_binding_current(*height, d)
+            {
+                return Ok(FinalityBinding {
+                    digest: d.clone(),
+                    height: Some(*height),
+                });
+            }
+        }
+        let pinned = crate::pinned_validators()
+            .ok_or_else(|| ChainError::FinalityUnverified("no pinned validator set installed".into()))?;
+        let att = self
+            .get_json(&format!("{}/xid/v1/attestations?digest={digest}", self.rpc_url))
+            .await?;
+        let bundle = crate::parse_bundle(digest, &att)
+            .ok_or_else(|| ChainError::Malformed("attestation bundle malformed".into()))?;
+        let height = crate::checkpoint::verify_and_commit(&bundle, &pinned, crate::now_unix())
+            .map_err(ChainError::FinalityUnverified)?;
+        // A higher concurrent result may have advanced the global checkpoint
+        // after our commit. Never publish this memo unless it remains current.
+        if !crate::xid_verified_binding_current(height, digest) {
+            return Err(ChainError::FinalityAdvanced);
+        }
+        *self.digest.write().await = Some((digest.to_string(), Instant::now(), Some(height)));
+        Ok(FinalityBinding {
+            digest: digest.to_string(),
+            height: Some(height),
+        })
+    }
+
+    /// Verify and durably checkpoint one digest through the same pinned-
+    /// validator path used by proof-bound name resolution.
+    pub(crate) async fn verify_signed_digest(&self, digest: &str) -> Result<u64> {
+        self.verify_finality_gated(digest)
+            .await?
+            .height
+            .ok_or_else(|| {
+                ChainError::FinalityUnverified(
+                    "signed finality verification returned no checkpoint height".into(),
+                )
+            })
     }
 
     /// Whether `proof_root` equals the current attested + finalized state
     /// digest. `force_fresh` bypasses the short-lived digest cache and fetches
     /// (and re-verifies finalization of) a fresh digest.
-    async fn digest_matches(&self, proof_root: &str, force_fresh: bool) -> Result<bool> {
+    async fn digest_matches(
+        &self,
+        proof_root: &str,
+        force_fresh: bool,
+    ) -> Result<Option<FinalityBinding>> {
         if !force_fresh {
-            if let Some((digest, at)) = self.digest.read().await.as_ref() {
+            if let Some((digest, at, height)) = self.digest.read().await.as_ref() {
+                // The legacy path needs only RPC-level trust, so either memo kind
+                // (crypto- or RPC-verified) is acceptable here.
                 if at.elapsed() < DIGEST_TTL {
-                    return Ok(digest == proof_root);
+                    return Ok((digest == proof_root).then(|| FinalityBinding {
+                        digest: digest.clone(),
+                        height: *height,
+                    }));
                 }
             }
         }
@@ -159,15 +371,18 @@ impl XidResolver {
             return Err(ChainError::NotFinalized);
         }
         let matches = attested == proof_root;
-        *self.digest.write().await = Some((attested, Instant::now()));
-        Ok(matches)
+        *self.digest.write().await = Some((attested.clone(), Instant::now(), None));
+        Ok(matches.then_some(FinalityBinding {
+            digest: attested,
+            height: None,
+        }))
     }
 
     async fn get_json(&self, url: &str) -> Result<Value> {
         // Refuse to egress over clearnet before Tor is ready in Always mode.
         crate::chain_egress_ok()?;
         self.client()
-            .await
+            .await?
             .get(url)
             .send()
             .await
@@ -176,6 +391,10 @@ impl XidResolver {
             .await
             .map_err(|e| ChainError::Rpc(e.to_string()))
     }
+}
+
+fn snapshot_binding_current(binding: Option<&(u64, String)>, verification_enabled: bool) -> bool {
+    crate::xid_cache_binding_current(binding, verification_enabled)
 }
 
 fn parse_domain(name: &str, tld: &str, domain: &Value) -> Result<DomainSnapshot> {
@@ -269,4 +488,154 @@ fn str_field<'a>(v: &'a Value, key: &str) -> Result<&'a str> {
 fn u64_field(v: &Value, key: &str) -> Option<u64> {
     let f = v.get(key)?;
     f.as_u64().or_else(|| f.as_str().and_then(|s| s.parse().ok()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    const CHAIN: &str = "epix_1917-1";
+    const D1: &str = "1111111111111111111111111111111111111111111111111111111111111111";
+    const D2: &str = "2222222222222222222222222222222222222222222222222222222222222222";
+
+    fn snapshot() -> DomainSnapshot {
+        DomainSnapshot {
+            name: "alice".into(),
+            tld: "epix".into(),
+            owner: "epix1alice".into(),
+            content_root: String::new(),
+            identities: Vec::new(),
+            dns_records: Vec::new(),
+            avatar: String::new(),
+            bio: String::new(),
+        }
+    }
+
+    fn pinned_set() -> crate::finality::PinnedSet {
+        let validators = std::collections::HashMap::from([(
+            "epixvalcons1test".to_string(),
+            crate::finality::PinnedValidator {
+                pubkey: [1; 32],
+                voting_power: 1,
+            },
+        )]);
+        crate::finality::PinnedSet::new(validators, CHAIN, 1, 1).unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_higher_checkpoint_never_relabels_lower_snapshot() {
+        let _finality_guard = crate::finality_state_test_guard().await;
+        crate::checkpoint::reset_for_test();
+        let dir = tempfile::tempdir().unwrap();
+        crate::checkpoint::configure(dir.path().join("checkpoint.json"), &pinned_set()).unwrap();
+        crate::checkpoint::record_for_test(100, D1).unwrap();
+
+        let resolver = Arc::new(XidResolver::new("http://127.0.0.1:1"));
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+
+        // The lower request has already verified height 100. Race its cache
+        // publication against a second resolver accepting height 200.
+        let lower = {
+            let resolver = Arc::clone(&resolver);
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                resolver
+                    .publish_snapshot(
+                        "alice.epix".into(),
+                        snapshot(),
+                        &FinalityBinding {
+                            digest: D1.into(),
+                            height: Some(100),
+                        },
+                    )
+                    .await
+            })
+        };
+        let higher = {
+            let barrier = Arc::clone(&barrier);
+            tokio::spawn(async move {
+                barrier.wait().await;
+                crate::checkpoint::record_for_test(200, D2).unwrap();
+            })
+        };
+        higher.await.unwrap();
+        let lower_result = lower.await.unwrap();
+        assert_eq!(crate::xid_max_height(), 200);
+
+        let cache = resolver.cache.read().await;
+        match cache.get("alice.epix") {
+            Some((_, _, Some((height, digest)))) => {
+                // Publication linearized first. It retains its exact binding and
+                // is already invalid against the newer global checkpoint.
+                assert!(lower_result.is_ok());
+                assert_eq!(*height, 100);
+                assert_eq!(digest, D1);
+                assert_ne!(*height, crate::xid_max_height());
+            }
+            Some((_, _, None)) => panic!("verified snapshot was stored as a legacy entry"),
+            None => {
+                // The higher checkpoint linearized first, so publication failed
+                // and resolve_inner would retry the RPC fetch.
+                assert!(matches!(lower_result, Err(ChainError::FinalityAdvanced)));
+            }
+        }
+        drop(cache);
+        crate::checkpoint::reset_for_test();
+    }
+
+    #[test]
+    fn legacy_snapshot_never_becomes_verified_at_height_zero() {
+        assert!(snapshot_binding_current(None, false));
+        assert!(!snapshot_binding_current(None, true));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn proxy_publication_cannot_pair_new_route_with_cached_direct_generation() {
+        let _route_guard = crate::chain_route_test_guard().await;
+        crate::set_chain_require_tor(false);
+        crate::set_chain_socks(None);
+        let resolver = Arc::new(XidResolver::new("http://127.0.0.1:1"));
+        let direct_generation = resolver.client.read().await.as_ref().unwrap().0;
+
+        crate::set_chain_require_tor(true);
+        let (setter_entered_tx, setter_entered_rx) = std::sync::mpsc::channel();
+        let release_setter = Arc::new(std::sync::Barrier::new(2));
+        let setter_release = Arc::clone(&release_setter);
+        let setter = std::thread::spawn(move || {
+            crate::set_chain_socks_with_hook(Some("socks5h://127.0.0.1:43111".into()), || {
+                setter_entered_tx.send(()).unwrap();
+                setter_release.wait();
+            });
+        });
+        setter_entered_rx.recv().unwrap();
+
+        let (getter_entered_tx, getter_entered_rx) = std::sync::mpsc::channel();
+        let getter_resolver = Arc::clone(&resolver);
+        let getter = tokio::spawn(async move {
+            getter_entered_tx.send(()).unwrap();
+            getter_resolver.client().await
+        });
+        getter_entered_rx.recv().unwrap();
+        assert!(
+            crate::chain_route().try_read().is_err(),
+            "route readers must block while proxy and generation publish together"
+        );
+        release_setter.wait();
+        setter.join().unwrap();
+        getter.await.unwrap().unwrap();
+
+        let current_generation = crate::socks_generation();
+        let cached_generation = resolver.client.read().await.as_ref().unwrap().0;
+        assert_ne!(current_generation, direct_generation);
+        assert_eq!(cached_generation, current_generation);
+        assert_eq!(
+            crate::chain_socks().as_deref(),
+            Some("socks5h://127.0.0.1:43111")
+        );
+
+        crate::set_chain_socks(None);
+        crate::set_chain_require_tor(false);
+    }
 }

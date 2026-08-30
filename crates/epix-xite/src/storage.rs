@@ -846,6 +846,10 @@ impl XiteStorage {
     /// Strict durable atomic replacement. The old file is never truncated in
     /// place. The new sibling is fully written and synced before one atomic
     /// replace, and the replace is made durable before success is returned.
+    /// Callers whose transaction acknowledgement depends on the file surviving
+    /// a crash, such as the anonymous channel outbox, use this seam; a
+    /// transient rename failure is returned so the caller can retain and retry
+    /// its durable source record.
     pub fn write_atomic_durable(&self, inner_path: &str, bytes: &[u8]) -> Result<()> {
         self.path(inner_path)?;
         write_atomic_durable_beneath(&self.root, inner_path, bytes).map_err(Error::Io)
@@ -1162,5 +1166,19 @@ mod tests {
             .filter(|path| path.contains(".epix-durable-"))
             .collect::<Vec<_>>();
         assert!(leftovers.is_empty(), "durable temp files left behind: {leftovers:?}");
+    }
+
+    #[test]
+    fn durable_atomic_write_replaces_and_syncs_pool_shard() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = XiteStorage::new(dir.path());
+        s.write_atomic_durable("pool/w1/00.json", b"first").unwrap();
+        s.write_atomic_durable("pool/w1/00.json", b"second-complete")
+            .unwrap();
+        assert_eq!(s.read("pool/w1/00.json").unwrap(), b"second-complete");
+        assert!(
+            s.list_files().unwrap().iter().all(|path| !path.contains(".tmp")),
+            "the rename leaves no temporary shard"
+        );
     }
 }

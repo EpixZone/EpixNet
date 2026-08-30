@@ -671,6 +671,26 @@ fn verify_content_rules(
             }
         }
     }
+    // A declared `pool` directory holds anonymous, union-merged envelope shards
+    // (class epix-pool-1). No hashed / optional / merge file may live under it:
+    // such a file would make an envelope attributable (defeating the whole point)
+    // and would collide with the pool's own union-write path. Universal invariant.
+    let pool_dirs: Vec<String> =
+        crate::pool::pool_rules_of(content).into_iter().map(|r| r.dir).collect();
+    if !pool_dirs.is_empty() {
+        for node in ["files", "files_optional", "files_merged"] {
+            if let Some(files) = content.get(node).and_then(|v| v.as_object()) {
+                for path in files.keys() {
+                    if pool_dirs
+                        .iter()
+                        .any(|d| path == d || path.starts_with(&format!("{d}/")))
+                    {
+                        return err(format!("File under a pool directory: {path}"));
+                    }
+                }
+            }
+        }
+    }
     // Validate each aggregate even for a root manifest. Root files are not
     // constrained by include max_size rules, but clone progress and settings
     // store their totals in i64 and must never receive a signed overflowing

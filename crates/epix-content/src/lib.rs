@@ -7,6 +7,7 @@
 pub mod canonical;
 pub mod diff;
 pub mod merge;
+pub mod pool;
 pub mod record;
 pub mod verify;
 
@@ -15,6 +16,12 @@ pub use diff::{patch, DiffAction};
 pub use merge::{
     declared_merge_files, live_records, make_container, merge_local, merge_orset, records_of,
     RECORD_FORMAT,
+};
+pub use pool::{
+    all_shard_paths, epoch_now, is_under_pool_dir, make_pool_container, meets_pow, merge_pool,
+    parse_shard_path, pool_records_of, pool_rules_of, shard_path, shard_sub, solve_pow,
+    sync_shard_paths, verify_pool_record, week_of, PoolError, PoolRule, POOL_RECORDS_KEY,
+    POOL_RECORD_FORMAT,
 };
 pub use record::{
     derive_post_id, derive_post_id_keyed, record_signed_data, verify_record, RecordError,

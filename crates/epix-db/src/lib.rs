@@ -37,9 +37,17 @@ impl Database {
     }
 
     fn from_manager(mgr: SqliteConnectionManager, max_size: u32) -> Result<Self> {
-        // WAL + foreign keys on every checked-out connection.
-        let mgr =
-            mgr.with_init(|c| c.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;"));
+        // WAL + foreign keys on every checked-out connection. A busy_timeout is
+        // essential: with multiple pooled connections (and background indexers
+        // writing concurrently with the WS command path) SQLite serializes
+        // writers, and without a timeout the loser fails instantly with
+        // "database is locked" instead of briefly waiting for the writer to
+        // finish. 5s comfortably covers any single write transaction here.
+        let mgr = mgr.with_init(|c| {
+            c.execute_batch(
+                "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
+            )
+        });
         let pool = Pool::builder()
             .max_size(max_size)
             .build(mgr)
@@ -410,7 +418,7 @@ mod tests {
 
     #[test]
     fn dict_key_col_survives_import_cols_filter() {
-        // EpixMail's schema: conversations is a dict keyed by conv_id, with
+        // a channel schema: conversations is a dict keyed by conv_id, with
         // key_col storing the dict key and import_cols listing only the VALUE
         // fields (EpixNet filters values first, then adds the key). The key
         // column must land even though import_cols doesn't mention it.

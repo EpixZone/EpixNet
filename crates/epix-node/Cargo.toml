@@ -27,7 +27,7 @@ epix-runtime = { path = "../epix-runtime", default-features = false }
 # SOCKS proxy into the BT engine's HTTP client (mirrors the epix-chain wiring).
 # Absent from the iOS build, which never enables `bittorrent`.
 epix-bt = { path = "../epix-bt", optional = true }
-tokio = { version = "1", features = ["rt", "macros", "sync"] }
+tokio = { version = "1", features = ["rt", "macros", "sync", "time"] }
 serde_json = "1"
 async-trait = "0.1"
 # A process-wide tracing subscriber so arti's Tor bootstrap diagnostics (and
@@ -35,6 +35,13 @@ async-trait = "0.1"
 # they are dropped, which is why a stalled Tor bootstrap left "no logging
 # whatsoever" in the field.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+fslock-guard = "0.8"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security_Cryptography",
+] }
 
 [features]
 default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]

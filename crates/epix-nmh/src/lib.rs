@@ -99,9 +99,9 @@ impl Settings {
     }
 }
 
-/// Handle one request, returning the response value. `resolve` is async (chain
-/// lookup), so this returns a future.
-/// GET a loopback node endpoint with a hard timeout. Without one, a wrong or
+/// Handle one request, returning the response value. `resolve` is async, so
+/// this returns a future.
+/// Query a loopback node endpoint with a hard timeout. Without one, a wrong or
 /// half-open listener on the UI port - e.g. a stray standalone node holding the
 /// default port - makes the request hang forever. The host would then never
 /// return to read stdin, never see Firefox close the pipe, and never exit; so
@@ -114,6 +114,79 @@ async fn node_get(url: &str) -> reqwest::Result<reqwest::Response> {
         .timeout(std::time::Duration::from_secs(4))
         .send()
         .await
+}
+
+async fn node_resolve(ui_port: u16, token: &str, name: &str) -> Result<String, String> {
+    let url = format!("http://127.0.0.1:{ui_port}{}", epix_node::NMH_RESOLVE_PATH);
+    let nonce = epix_node::new_nmh_nonce()?;
+    let request_mac = epix_node::nmh_request_mac(token, &nonce, name)?;
+    let mut response = reqwest::Client::new()
+        .post(url)
+        .json(&json!({
+            "name": name,
+            "nonce": nonce,
+            "mac": request_mac,
+        }))
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("node resolve endpoint unavailable: {e}"))?;
+    let status = response.status();
+    // Enforce the size cap DURING the read, not after: a stale or hostile
+    // process squatting the loopback UI port could otherwise stream an
+    // unbounded body that `bytes()` buffers entirely into memory before any
+    // check. Reject an oversized Content-Length up front, then accumulate
+    // chunk-by-chunk and bail the instant the running total exceeds the cap.
+    const MAX_BODY: usize = 16 * 1024;
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_BODY as u64)
+    {
+        return Err("invalid node resolve response: body is too large".to_string());
+    }
+    let mut bytes: Vec<u8> = Vec::new();
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| format!("invalid node resolve response: {e}"))?
+    {
+        if bytes.len() + chunk.len() > MAX_BODY {
+            return Err("invalid node resolve response: body is too large".to_string());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    let body: Value = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("invalid node resolve response: {e}"))?;
+    let response_nonce = body
+        .get("nonce")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if response_nonce != nonce {
+        return Err("node resolve response authentication failed".to_string());
+    }
+    let address = body.get("address").and_then(Value::as_str);
+    let error = body.get("error").and_then(Value::as_str);
+    let response_mac = body.get("mac").and_then(Value::as_str).unwrap_or_default();
+    if !epix_node::nmh_response_mac_valid(
+        token,
+        &nonce,
+        name,
+        status.as_u16(),
+        address,
+        error,
+        response_mac,
+    ) {
+        return Err("node resolve response authentication failed".to_string());
+    }
+    if !status.is_success() {
+        return Err(error
+            .unwrap_or("node rejected the resolve request")
+            .to_string());
+    }
+    address
+        .filter(|address| !address.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| "node resolve response has no address".to_string())
 }
 
 pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
@@ -148,39 +221,28 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
             let name = req.get("name").and_then(|v| v.as_str()).unwrap_or("");
             let target = epix_node::parse_target(name);
             let (label, tld) = target.rsplit_once('.').unwrap_or((target.as_str(), "epix"));
-            if label.starts_with("epix1") {
-                return json!({ "address": label });
+            match epix_core::classify_label(label) {
+                epix_core::LabelClass::Address => return json!({ "address": label }),
+                epix_core::LabelClass::AddressShaped => {
+                    return json!({
+                        "error": format!(
+                            "{label} looks like a mistyped epix1 address (bad checksum)"
+                        )
+                    });
+                }
+                epix_core::LabelClass::Name => {}
             }
-            // The node's resolve cache first: the chain is only consulted when
-            // there is no entry for the name or the entry has expired.
             let full = format!("{label}.{tld}");
-            let cached = settings
-                .data_root()
-                .and_then(|root| epix_node::cached_resolution(root, &full));
-            if let Some((address, true)) = &cached {
-                return json!({ "address": address });
-            }
-            // If the node routes clearnet through Tor (always mode), resolve the
-            // name through Tor too, so this lookup doesn't leak the IP / name.
-            if node_is_tor_always(ui_port).await {
-                epix_chain::set_chain_socks(Some("socks5h://127.0.0.1:43111".into()));
-            }
-            let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
-            match resolver.resolve(label, tld).await {
-                Ok(d) => match d.xite_address() {
-                    Some(a) => {
-                        if let Some(root) = settings.data_root() {
-                            epix_node::write_resolve_cache(root, &full, &a.to_string());
-                        }
-                        json!({ "address": a.to_string() })
-                    }
-                    None => json!({ "error": format!("{label}.{tld} has no xite address") }),
-                },
-                // Chain unreachable: an expired cache entry still beats failing.
-                Err(e) => match cached {
-                    Some((address, _)) => json!({ "address": address }),
-                    None => json!({ "error": format!("resolve {label}.{tld}: {e}") }),
-                },
+            let Some(data_root) = settings.data_root() else {
+                return json!({ "error": "native-messaging data root is unavailable" });
+            };
+            let token = match epix_node::read_nmh_auth_token(data_root) {
+                Ok(token) => token,
+                Err(error) => return json!({ "error": error }),
+            };
+            match node_resolve(ui_port, &token, &full).await {
+                Ok(address) => json!({ "address": address }),
+                Err(error) => json!({ "error": format!("resolve {full}: {error}") }),
             }
         }
         // Backward compatibility for older wallet builds that still consult
@@ -209,15 +271,6 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
         }
         other => json!({ "error": format!("unknown command: {other}") }),
     }
-}
-
-/// Whether the node is in Tor-always mode (its status reports `tor_status ==
-/// "Always"`), meaning name resolution should also go through Tor.
-async fn node_is_tor_always(ui_port: u16) -> bool {
-    let url = format!("http://127.0.0.1:{ui_port}/EpixNet-Internal/Status");
-    let Ok(resp) = node_get(&url).await else { return false };
-    let Ok(v) = resp.json::<Value>().await else { return false };
-    v.get("tor_status").and_then(|s| s.as_str()) == Some("Always")
 }
 
 /// Read one native-messaging frame (4-byte LE length + JSON) from `r`. Returns
@@ -252,6 +305,63 @@ pub fn write_frame<W: Write>(w: &mut W, v: &Value) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn http_request_complete(request: &[u8]) -> bool {
+        let Some(header_end) = request.windows(4).position(|window| window == b"\r\n\r\n")
+        else {
+            return false;
+        };
+        let headers = String::from_utf8_lossy(&request[..header_end]);
+        let content_len = headers.lines().find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        });
+        content_len.is_some_and(|len| request.len() >= header_end + 4 + len)
+    }
+
+    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut request = Vec::new();
+        loop {
+            let mut chunk = [0u8; 4096];
+            let read = std::io::Read::read(stream, &mut chunk).unwrap();
+            assert!(read != 0, "request ended before its body arrived");
+            request.extend_from_slice(&chunk[..read]);
+            if http_request_complete(&request) {
+                return request;
+            }
+        }
+    }
+
+    async fn assert_oversized_response_rejected_before_end(response: Vec<u8>) {
+        let token = "77".repeat(32);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _ = read_http_request(&mut stream);
+            std::io::Write::write_all(&mut stream, &response).unwrap();
+            std::io::Write::flush(&mut stream).unwrap();
+            let _ = release_rx.recv_timeout(std::time::Duration::from_secs(5));
+        });
+
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            node_resolve(port, &token, "talk.epix"),
+        )
+        .await;
+        let _ = release_tx.send(());
+        server.join().unwrap();
+        assert_eq!(
+            result.expect("oversize must be rejected before the response ends"),
+            Err("invalid node resolve response: body is too large".to_string())
+        );
+    }
 
     #[test]
     fn frame_roundtrips() {
@@ -294,5 +404,142 @@ mod tests {
         let s = Settings::new(dir.path());
         let r = handle(&json!({ "cmd": "bogus" }), &s, 1).await;
         assert!(r["error"].as_str().unwrap().contains("unknown command"));
+    }
+
+    #[tokio::test]
+    async fn resolve_never_uses_an_unbound_cache_without_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::new(dir.path());
+        std::fs::write(
+            dir.path().join("resolve-cache.json"),
+            serde_json::to_vec(&json!({
+                "talk.epix": {
+                    "address": "epix1forged",
+                    "resolved_at": u64::MAX,
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let response = handle(
+            &json!({ "cmd": "resolve", "name": "talk.epix" }),
+            &settings,
+            1,
+        )
+        .await;
+        assert!(response.get("address").is_none());
+        assert!(response["error"]
+            .as_str()
+            .unwrap()
+            .contains("native-messaging token"));
+    }
+
+    #[tokio::test]
+    async fn dotted_epix1_brand_name_is_delegated_not_treated_as_an_address() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::new(dir.path());
+        let response = handle(
+            &json!({ "cmd": "resolve", "name": "epix1shop.epix" }),
+            &settings,
+            1,
+        )
+        .await;
+        assert!(response.get("address").is_none());
+        assert!(response.get("error").is_some());
+    }
+
+    #[tokio::test]
+    async fn checksum_valid_address_resolves_without_the_node() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::new(dir.path());
+        let address = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let response = handle(
+            &json!({ "cmd": "resolve", "name": format!("{address}.epix") }),
+            &settings,
+            1,
+        )
+        .await;
+        assert_eq!(response["address"], address);
+    }
+
+    #[tokio::test]
+    async fn address_shaped_bad_checksum_is_rejected_locally() {
+        let dir = tempfile::tempdir().unwrap();
+        let settings = Settings::new(dir.path());
+        let response = handle(
+            &json!({
+                "cmd": "resolve",
+                "name": "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6q.epix"
+            }),
+            &settings,
+            1,
+        )
+        .await;
+        assert!(response.get("address").is_none());
+        assert!(response["error"].as_str().unwrap().contains("bad checksum"));
+    }
+
+    #[tokio::test]
+    async fn stale_port_cannot_forge_a_response_or_receive_the_secret() {
+        let token = "66".repeat(32);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (request_tx, request_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            use std::io::Write as _;
+
+            let (mut stream, _) = listener.accept().unwrap();
+            let request = read_http_request(&mut stream);
+            let header_end = request
+                .windows(4)
+                .position(|window| window == b"\r\n\r\n")
+                .unwrap();
+            let request_body = &request[header_end + 4..];
+            let parsed: Value = serde_json::from_slice(request_body).unwrap();
+            let nonce = parsed["nonce"].as_str().unwrap();
+            let forged = json!({
+                "nonce": nonce,
+                "address": "epix1forged",
+                "mac": "00".repeat(32),
+            })
+            .to_string();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                forged.len(),
+                forged,
+            )
+            .unwrap();
+            stream.flush().unwrap();
+            request_tx.send(request).unwrap();
+        });
+
+        let error = node_resolve(port, &token, "talk.epix").await.unwrap_err();
+        assert!(error.contains("response authentication failed"));
+        let request = request_rx.recv().unwrap();
+        assert!(
+            !request
+                .windows(token.len())
+                .any(|window| window == token.as_bytes()),
+            "the raw native-messaging secret was sent to the stale listener"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn oversized_content_length_is_rejected_without_reading_the_body() {
+        assert_oversized_response_rejected_before_end(
+            b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 16385\r\nconnection: close\r\n\r\n".to_vec(),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn chunked_response_is_rejected_as_soon_as_it_crosses_the_limit() {
+        let mut response = b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n4000\r\n".to_vec();
+        response.extend(vec![b'x'; 16 * 1024]);
+        response.extend(b"\r\n1\r\ny\r\n");
+        assert_oversized_response_rejected_before_end(response).await;
     }
 }

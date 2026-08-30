@@ -2700,6 +2700,10 @@ impl WsCommand for FeedQuery {
             }
         }
 
+        // Fold in generic local (never-shared) feed sources — e.g. decrypted
+        // mail — computed and rendered only on this node (zero shared footprint).
+        rows.extend(s.state.local_feed_rows(limit as i64).await);
+
         rows.sort_by(|a, b| {
             let da = a["date_added"].as_f64().unwrap_or(0.0);
             let db = b["date_added"].as_f64().unwrap_or(0.0);
@@ -4197,6 +4201,52 @@ impl WsCommand for SiteblockGet {
     }
 }
 
+/// Reject SQL that could break out of a single SELECT (matches EpixNet's
+/// `is_safe_feed_sql`): no statement terminators/comments, no mutation/admin
+/// keywords in statement position.
+fn is_safe_feed_sql(sql: &str) -> bool {
+    if sql.is_empty()
+        || sql.contains(';')
+        || sql.contains("--")
+        || sql.contains("/*")
+        || sql.contains("*/")
+        || sql.contains('\0')
+    {
+        return false;
+    }
+    const FORBIDDEN: &[&str] = &[
+        "insert", "update", "delete", "drop", "attach", "detach", "pragma", "begin", "commit",
+        "rollback", "create", "alter", "vacuum", "reindex",
+    ];
+    let lower = sql.to_lowercase();
+    for tok in lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
+        if FORBIDDEN.contains(&tok) {
+            return false;
+        }
+    }
+    true
+}
+
+/// A command that always returns a fixed value (for stubs the xite tolerates).
+fn simple(name: &'static str, value: Value) -> SimpleCommand {
+    SimpleCommand { name, value }
+}
+
+struct SimpleCommand {
+    name: &'static str,
+    value: Value,
+}
+
+#[async_trait]
+impl WsCommand for SimpleCommand {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(self.value.clone())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5054,51 +5104,5 @@ mod tests {
         assert_eq!(rows[1]["title"], "Old");
         assert_eq!(rows[0]["site"], xite);
         assert_eq!(rows[0]["feed_name"], "posts");
-    }
-}
-
-/// Reject SQL that could break out of a single SELECT (matches EpixNet's
-/// `is_safe_feed_sql`): no statement terminators/comments, no mutation/admin
-/// keywords in statement position.
-fn is_safe_feed_sql(sql: &str) -> bool {
-    if sql.is_empty()
-        || sql.contains(';')
-        || sql.contains("--")
-        || sql.contains("/*")
-        || sql.contains("*/")
-        || sql.contains('\0')
-    {
-        return false;
-    }
-    const FORBIDDEN: &[&str] = &[
-        "insert", "update", "delete", "drop", "attach", "detach", "pragma", "begin", "commit",
-        "rollback", "create", "alter", "vacuum", "reindex",
-    ];
-    let lower = sql.to_lowercase();
-    for tok in lower.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if FORBIDDEN.contains(&tok) {
-            return false;
-        }
-    }
-    true
-}
-
-/// A command that always returns a fixed value (for stubs the xite tolerates).
-fn simple(name: &'static str, value: Value) -> SimpleCommand {
-    SimpleCommand { name, value }
-}
-
-struct SimpleCommand {
-    name: &'static str,
-    value: Value,
-}
-
-#[async_trait]
-impl WsCommand for SimpleCommand {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(self.value.clone())
     }
 }
