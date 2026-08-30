@@ -118,7 +118,7 @@ impl LightClientConfig {
             chain_id: DEFAULT_CHAIN_ID.to_string(),
             bootstrap_sources: DEFAULT_BOOTSTRAP_SOURCES
                 .iter()
-                .map(|s| s.to_string())
+                .map(ToString::to_string)
                 .collect(),
             bootstrap_quorum: DEFAULT_BOOTSTRAP_QUORUM,
             checkpoint_path: None,
