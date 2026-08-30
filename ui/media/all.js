@@ -74,13 +74,26 @@
     };
 
     EpixWebsocket.prototype.connect = function () {
+      var _this = this;
+      if (this.reconnect_timer) {
+        clearTimeout(this.reconnect_timer);
+        this.reconnect_timer = null;
+      }
       this.ws = new WebSocket(this.url);
-      this.ws.onmessage = this.onMessage;
+      // Refresh liveness on ANY inbound frame, before dispatching it. The
+      // dispatcher is replaceable (the wrapper installs its own onMessage), so
+      // the refresh has to live out here or it silently stops happening and
+      // only ping replies count as signs of life.
+      this.ws.onmessage = function (e) {
+        _this.last_pong_time = Date.now();
+        return _this.onMessage(e);
+      };
       this.ws.onopen = this.onOpenWebsocket;
       this.ws.onerror = this.onErrorWebsocket;
       this.ws.onclose = this.onCloseWebsocket;
       this.connected = false;
       this.startKeepalive();
+      this.watchVisibility();
       return this.message_queue = [];
     };
 
@@ -92,25 +105,87 @@
     // already re-announces wrapperOpenedWebsocket, which re-runs page boot.
     EpixWebsocket.prototype.startKeepalive = function () {
       var _this = this;
+      var interval = 20000;
       if (this.keepalive_timer) {
         clearInterval(this.keepalive_timer);
       }
       this.last_pong_time = Date.now();
+      this.last_tick_time = Date.now();
       return this.keepalive_timer = setInterval(function () {
+        var now = Date.now();
+        var since_tick = now - _this.last_tick_time;
+        _this.last_tick_time = now;
         if (!_this.connected) {
           return;
         }
-        if (Date.now() - _this.last_pong_time > 45000) {
+        // Silence only means the socket is dead if we were awake to hear it.
+        // A backgrounded tab has its timers throttled to roughly one wake-up a
+        // minute (and the machine can sleep with the tab in front), so a gap
+        // wider than the deadline proves the timer stalled, not the node. Both
+        // cases re-arm from now instead of killing a connection that is almost
+        // certainly fine - checkAlive() settles it for real, in seconds, the
+        // moment the tab is looked at again.
+        if (document.hidden || since_tick > interval * 2) {
+          _this.last_pong_time = now;
+        } else if (now - _this.last_pong_time > 45000) {
           _this.log("No pong for 45s: connection is dead, closing it");
           return _this.forceClose();
         }
-        var id = _this.next_message_id;
-        _this.next_message_id += 1;
-        _this.send({ "cmd": "ping", "params": {}, "id": id }, function () {
-          delete _this.waiting_cb[id];
-          _this.last_pong_time = Date.now();
-        });
-      }, 20000);
+        return _this.ping();
+      }, interval);
+    };
+
+    EpixWebsocket.prototype.ping = function () {
+      var _this = this;
+      var id = this.next_message_id;
+      this.next_message_id += 1;
+      return this.send({ "cmd": "ping", "params": {}, "id": id }, function () {
+        delete _this.waiting_cb[id];
+        _this.last_pong_time = Date.now();
+      });
+    };
+
+    // Returning to a backgrounded tab is the one moment the connection state is
+    // both unknown and about to matter, so settle it here rather than waiting
+    // for throttled timers to catch up: a socket that closed while we were away
+    // reconnects immediately instead of sitting dead behind a retry timer, and
+    // an open one has to answer a ping within the grace window.
+    EpixWebsocket.prototype.watchVisibility = function () {
+      var _this = this;
+      if (this.visibility_hooked) {
+        return;
+      }
+      this.visibility_hooked = true;
+      return document.addEventListener("visibilitychange", function () {
+        if (document.hidden) {
+          return;
+        }
+        return _this.checkAlive();
+      });
+    };
+
+    EpixWebsocket.prototype.checkAlive = function () {
+      var _this = this;
+      var state = this.ws ? this.ws.readyState : 3;
+      if (state === 2 || state === 3) {
+        if (!this.connected) {
+          this.log("Visible again on a closed socket: reconnecting now");
+          this.scheduleReconnect(0);
+        }
+        return;
+      }
+      if (state !== 1 || !this.connected) {
+        return;
+      }
+      this.last_pong_time = Date.now();
+      this.last_tick_time = Date.now();
+      this.ping();
+      return setTimeout(function () {
+        if (_this.connected && Date.now() - _this.last_pong_time > 9000) {
+          _this.log("No pong after returning to the tab: connection is dead, closing it");
+          _this.forceClose();
+        }
+      }, 10000);
     };
 
     // Close a dead-open socket. If the engine never delivers onclose for it,
@@ -121,12 +196,15 @@
         return;
       }
       this.force_closing = true;
+      var dead = this.ws;
       try {
-        this.ws.close();
+        dead.close();
       } catch (err) { }
       return setTimeout(function () {
         _this.force_closing = false;
-        if (_this.connected) {
+        // Only when nothing has replaced the dead socket meanwhile: a
+        // reconnect that already succeeded must not be torn down here.
+        if (_this.ws === dead && _this.connected) {
           _this.connected = false;
           _this.onCloseWebsocket(null);
         }
@@ -233,16 +311,25 @@
       if (e && e.code === 1000 && e.wasClean === false) {
         this.log("Server error, please reload the page", e.wasClean);
       } else {
-        setTimeout(((function (_this) {
-          return function () {
-            _this.log("Reconnecting...");
-            return _this.connect();
-          };
-        })(this)), reconnect);
+        this.scheduleReconnect(reconnect);
       }
       if (this.onClose != null) {
         return this.onClose(e);
       }
+    };
+
+    // One retry timer, replaceable: a close that lands while another retry is
+    // already pending must not leave two of them racing to open two sockets.
+    EpixWebsocket.prototype.scheduleReconnect = function (delay) {
+      var _this = this;
+      if (this.reconnect_timer) {
+        clearTimeout(this.reconnect_timer);
+      }
+      return this.reconnect_timer = setTimeout(function () {
+        _this.reconnect_timer = null;
+        _this.log("Reconnecting...");
+        return _this.connect();
+      }, delay);
     };
 
     return EpixWebsocket;
@@ -1804,6 +1891,15 @@ if (window.getComputedStyle(document.body).transform) {
       this.wrapperWsInited = false;
       return setTimeout(((function (_this) {
         return function () {
+          // The delay keeps a blip from flashing a banner, but a throttled
+          // background tab can fire it long after the socket already came
+          // back. Announcing a loss then is both wrong and sticky (the banner
+          // has no timeout), and it makes the following open report a recovery
+          // from an outage the user never saw. Reconnected means nothing to
+          // report.
+          if (_this.ws.connected) {
+            return;
+          }
           _this.sendInner({
             "cmd": "wrapperClosedWebsocket"
           });
