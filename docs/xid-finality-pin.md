@@ -8,10 +8,11 @@ lagging RPC cannot forge a resolution). Without a pin, startup fails closed.
 
 ## Merge blocker
 
-The chain upgrade that produces signed mainnet attestations is scheduled but is
-not live yet. A real `xid_pin.json` cannot be captured before that height. Do not
-merge or ship this branch until the post-upgrade pin has been captured, checked,
-and included in release packaging. Never fabricate a placeholder pin.
+The v0.7.2 attestation upgrade is LIVE on mainnet (executed at height 5360000;
+signed attestations verified being served). The remaining blocker is release
+packaging only: capture the bootstrap pin with `scripts/capture_xid_pin.py`,
+verify it against a second independent RPC, and include it in the release's
+default data dir before shipping. Never fabricate a placeholder pin.
 
 ## How the node turns it on
 
@@ -44,48 +45,53 @@ validate it, include it in release packaging, then merge.
 
 ## Capturing the pin (post-upgrade)
 
-Run against a mainnet REST endpoint a few blocks after v0.7.2 executes, at a
-height where every bonded validator has signed (so the pin covers the full
-voting power — the finality denominator). Requires `curl` and `jq`.
+Capture the FULL consensus validator set - not the attestation signers - with:
 
 ```bash
-API=https://api.epix.zone
-
-DIGEST=$(curl -s "$API/xid/v1/state_digest" | jq -r .digest)
-ATT=$(curl -s "$API/xid/v1/attestations?digest=$DIGEST")
-CHAIN_ID=$(curl -s "$API/cosmos/base/tendermint/v1beta1/node_info" | jq -r .default_node_info.network)
-NOW=$(date +%s)
-
-echo "$ATT" | jq \
-  --arg chain "$CHAIN_ID" \
-  --argjson t "$NOW" \
-  '{
-     chain_id: $chain,
-     pinned_at_height: (.height | tonumber),
-     pinned_at_unix: $t,
-     validators: [ .attestations[]
-       | select((.voting_power | tonumber) > 0)
-       | { valcons: .validator_cons_addr,
-           pubkey: .ed25519_pubkey,
-           voting_power: (.voting_power | tonumber) } ]
-   }' > xid_pin.json
-
-# Completeness check: the pinned power MUST equal the chain's total bonded power,
-# i.e. every bonded validator signed at this height. If it does not, a validator
-# missed the block — recapture at another height rather than pin a partial set
-# (a partial pin lowers the 2/3 denominator).
-PINNED=$(jq '[.validators[].voting_power] | add' xid_pin.json)
-TOTAL=$(echo "$ATT" | jq -r '.total_voting_power | tonumber')
-[ "$PINNED" = "$TOTAL" ] && echo "OK: pinned full bonded power ($PINNED)" \
-  || echo "WARN: pinned $PINNED of $TOTAL — recapture at a fully-signed height"
+python3 scripts/capture_xid_pin.py            # default RPC https://rpc.epix.zone
+python3 scripts/capture_xid_pin.py https://other-rpc.example   # cross-check
 ```
 
-Then place `xid_pin.json` where the node ships it (its data root, or the
-release's default data dir) and restart. Verify the boot log shows
-`resolution now requires >2/3 attestation`.
+The script reads a settled recent height from the CometBFT RPC, fetches
+`/validators` (every bonded validator, including any not currently signing
+vote extensions), derives each `valcons` as
+`bech32("epixvalcons", sha256(consensus_pubkey)[..20])`, and writes
+`xid_pin.json`.
 
-## Re-pinning (weak subjectivity)
+Why the full set and not the signers: the light client bootstraps by requiring
+the pin to EQUAL the validator set at the pin height (hash-bound to that
+header's `validators_hash`) - the trust splice. A signer-derived pin omits any
+validator that missed the block or has not upgraded its vote-extension
+signing, and then never matches. A non-signing validator in the pin only
+counts toward the >2/3 denominator; capture never has to wait for a
+fully-signed height.
 
-A pin has a validity window (`XID_WS_PERIOD_SECS`, default 7 days, kept below the
-chain's unbonding period). Ship a fresh `xid_pin.json` within that window as the
-validator set rotates, the same way any light client re-pins.
+The capture step is the ONE trusted operation (the pin is the root of trust):
+verify the output against a second independent RPC before shipping, and place
+it where the node reads it (its data root, or the release's default data
+dir). Verify the boot log shows `resolution now requires >2/3 attestation`.
+
+
+## Re-pinning is automatic: the light client
+
+The shipped pin is only the COLD-START ANCHOR. From it, the node's embedded
+CometBFT light client (`epix_chain::lightclient`, `spawn_xid_lightclient`)
+skip-verifies signed headers forward and republishes each verified validator
+set as the active pin - so the trusted set tracks the LIVE set, validator
+churn and maintenance never strand resolution, and no re-pin release is ever
+shipped. A node that connects at least once per trusting period (2/3 of the
+21-day unbonding period, ~14 days) never needs a new `xid_pin.json`; a
+year-old binary keeps working.
+
+Manual re-pinning remains only for a node offline LONGER than the trusting
+period (its anchor can no longer be extended - the node logs
+`light-client trust anchor ... older than the trusting period`): drop in a
+freshly captured `xid_pin.json` (procedure above) and restart. The static
+weak-subjectivity window (`XID_WS_PERIOD_SECS`, default 7 days) still applies
+as the fail-closed backstop whenever the light client is disabled
+(`xid_lc_enabled=false`).
+
+Config: `xid_lc_enabled` (default true), `xid_lc_interval_secs` (default 900),
+`xid_trusting_period_secs` (default 1209600), `EPIX_CMT_RPC_URL` (default
+`https://rpc.epix.zone`; routed through the same chain egress as every other
+chain fetch, so Tor-Always covers it).

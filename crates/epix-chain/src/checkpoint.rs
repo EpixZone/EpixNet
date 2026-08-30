@@ -253,6 +253,18 @@ pub(crate) fn configure(
     lock()?.configure(path.into(), pinned)
 }
 
+/// Rebind the already-configured checkpoint to a NEWER pin at the same path
+/// (the light-client advance path). Routes through [`CheckpointState::configure`],
+/// so the supersede rules apply unchanged: the new pin must be at a strictly
+/// higher pin height, not below the persisted verified height, and not older
+/// on the weak-subjectivity clock — anything else fails closed and the durable
+/// state is untouched. Errors if no checkpoint was configured yet.
+pub(crate) fn rebind(pinned: &PinnedSet) -> Result<(), String> {
+    let mut state = lock()?;
+    let path = state.configured_path()?.to_path_buf();
+    state.configure(path, pinned).map(|_| ())
+}
+
 pub(crate) fn height() -> u64 {
     CHECKPOINT.lock().map(|state| state.height()).unwrap_or(0)
 }

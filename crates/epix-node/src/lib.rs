@@ -2912,6 +2912,94 @@ fn initialize_xid_finality(data_root: &std::path::Path) -> Result<XidFinalityBoo
     }
 }
 
+/// Keep the xID finality pin tracking the LIVE validator set: a CometBFT light
+/// client (`epix_chain::lightclient`) skip-verifies signed headers from the
+/// shipped pin forward and republishes the verified set as the active pin. So
+/// validator churn/maintenance never strands resolution, and no re-pin release
+/// is ever needed while the node connects at least once per trusting period
+/// (~14 days). Fail-closed: any error leaves the current pin in force, and the
+/// loop simply retries — errors are expected while Tor is still bootstrapping
+/// in Tor-Always mode (chain egress is blocked until it is ready).
+fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::PathBuf) {
+    tokio::spawn(async move {
+        if !state.config_bool("xid_lc_enabled", true).await {
+            state
+                .log(
+                    "INFO",
+                    "xID finality: light client disabled (xid_lc_enabled=false); \
+                     the static pin will expire on its weak-subjectivity clock",
+                )
+                .await;
+            return;
+        }
+        let interval_secs = state
+            .config_get("xid_lc_interval_secs")
+            .await
+            .and_then(|v| v.as_u64())
+            .filter(|&s| s >= 60)
+            .unwrap_or(900);
+        let mut cfg = epix_chain::LightClientConfig::new(data_root.join("xid_lc_state.json"));
+        if let Some(secs) = state
+            .config_get("xid_trusting_period_secs")
+            .await
+            .and_then(|v| v.as_u64())
+            .filter(|&s| s >= 3600)
+        {
+            cfg.trusting_period_secs = secs;
+        }
+        loop {
+            let before = epix_chain::pinned_validators();
+            match epix_chain::advance_trusted_set(&cfg).await {
+                Ok(epix_chain::Advance::Advanced { height, validators }) => {
+                    let set_changed = match (&before, epix_chain::pinned_validators()) {
+                        (Some(old), Some(new)) => {
+                            old.validators.len() != new.validators.len()
+                                || old.total_power != new.total_power
+                                || new.validators.iter().any(|(valcons, v)| {
+                                    old.validators.get(valcons).map(|o| {
+                                        o.pubkey != v.pubkey || o.voting_power != v.voting_power
+                                    }) != Some(false)
+                                })
+                        }
+                        _ => true,
+                    };
+                    let level = if set_changed { "INFO" } else { "DEBUG" };
+                    state
+                        .log(
+                            level,
+                            format!(
+                                "xID finality: light client advanced the trusted set to \
+                                 {validators} validators at height {height}"
+                            ),
+                        )
+                        .await;
+                }
+                Ok(epix_chain::Advance::UpToDate { .. }) => {}
+                Ok(epix_chain::Advance::AnchorExpired { trusted_unix }) => {
+                    state
+                        .log(
+                            "WARN",
+                            format!(
+                                "xID finality: the light-client trust anchor (unix {trusted_unix}) \
+                                 is older than the trusting period; a fresh xid_pin.json is needed \
+                                 to resume verified resolution"
+                            ),
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    // Transient by default (RPC hiccup, Tor not up yet); the
+                    // active pin is untouched and the next tick retries.
+                    state
+                        .log("DEBUG", format!("xID finality: light client: {e}"))
+                        .await;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+        }
+    });
+}
+
 /// Wire up the [`AppState`], plugins, background runtime, and UI server for a
 /// launch target. Returns the server future + handle.
 async fn serve(
@@ -2944,6 +3032,7 @@ async fn serve(
                     ),
                 )
                 .await;
+            spawn_xid_lightclient(state.clone(), opts.data_root.clone());
         }
         XidFinalityBoot::InsecureLegacy => {
             state
