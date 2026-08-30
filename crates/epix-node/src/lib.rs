@@ -2961,14 +2961,28 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         {
             cfg.trusting_period_secs = secs;
         }
-        if let Some(sources) = state.config_get("xid_bootstrap_rpcs").await.and_then(|v| {
-            v.as_array().map(|list| {
-                list.iter()
-                    .filter_map(|s| s.as_str().map(String::from))
-                    .collect::<Vec<_>>()
-            })
-        }) {
-            cfg.bootstrap_sources = sources;
+        // The Config page stores the list as textarea text (one URL per line,
+        // commas also accepted, same as `trackers`); a JSON array works too.
+        // Blank keeps the built-in independent-operator defaults.
+        if let Some(value) = state.config_get("xid_bootstrap_rpcs").await {
+            let sources: Vec<String> = match &value {
+                serde_json::Value::Array(list) => list
+                    .iter()
+                    .filter_map(|s| s.as_str())
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+                other => other
+                    .as_str()
+                    .unwrap_or_default()
+                    .split([',', '\n'])
+                    .map(|s| s.trim().trim_end_matches('/').to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            };
+            if !sources.is_empty() {
+                cfg.bootstrap_sources = sources;
+            }
         }
         if let Some(quorum) = state
             .config_get("xid_bootstrap_quorum")
