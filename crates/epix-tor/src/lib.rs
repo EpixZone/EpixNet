@@ -215,13 +215,26 @@ fn install_crypto_provider() {
     });
 }
 
-/// Fraction of the guard sample that must be disabled for the sample to count
-/// as poisoned (see [`clear_poisoned_guard_state`]). At 85% of a full ~60-guard
-/// sample only a handful of usable guards remain; when those are also
-/// transiently down, arti rejects the whole sample and Tor is dead. A
-/// degraded-but-working sample keeps far more usable than that, so this fires
-/// only on near-total poison, not normal churn.
-const GUARD_POISON_DISABLED_RATIO: f64 = 0.85;
+/// Fraction of the judged guard population that must be disabled before the
+/// sample counts as poisoned (see [`clear_poisoned_guard_state`]).
+///
+/// Deliberately near-total, because a mostly-disabled confirmed set is NOT by
+/// itself a broken Tor. Measured on one node: a confirmed set 85.0% disabled
+/// (17/20, three usable) was carrying 13 live connections with both overlays
+/// reachable, while a set 93.3% disabled (42/45 - also three usable) belonged
+/// to a node whose onion dials were all failing. The shapes barely differ, so
+/// this file is a weak proxy for health and the threshold has to sit where it
+/// cannot fire on a sample that still works. Degraded-but-alive is the
+/// behavioural watchdog's job (it probes and then calls
+/// [`reset_guard_state`]); this cleaner only catches the sample arti would
+/// reject outright, which no probe can recover from because nothing resamples.
+///
+/// Erring toward keeping the sample is the safe direction: guard pinning is an
+/// anonymity property, and discarding it hands a fresh set of entry nodes a
+/// view of this client's traffic. A false negative costs reachability the
+/// watchdog can still repair; a false positive silently spends anonymity on
+/// every boot.
+const GUARD_POISON_DISABLED_RATIO: f64 = 0.95;
 
 /// Recover from a poisoned persisted guard sample.
 ///
@@ -236,30 +249,70 @@ const GUARD_POISON_DISABLED_RATIO: f64 = 0.85;
 /// It does not take ALL guards disabled to reach this. A real-world poison is
 /// ~95% disabled with the few survivors transiently unreachable, so arti
 /// rejects every guard while a strict all-disabled test never fires. Detect the
-/// broader condition - a non-empty sample that is overwhelmingly disabled - and
+/// broader condition - a population that is overwhelmingly disabled - and
 /// delete the file so bootstrap draws a fresh sample. It holds only resumable
 /// network state; onion-service keys live elsewhere (`hss/`, `keystore/`), so
 /// the node's onion address is unaffected. Any parse surprise (format change,
 /// missing fields) leaves the file alone.
+///
+/// The population judged is the CONFIRMED guards, not the whole sample. Arti
+/// builds circuits through guards it has confirmed, falling back to the
+/// unconfirmed remainder only to grow that set, so the confirmed guards are the
+/// ones whose health decides whether Tor works. Judging the whole sample hides
+/// the failure behind guards that were never used: an observed dead node sat at
+/// 43/60 disabled overall (0.72, under the threshold, so this never fired) while
+/// 42 of its 45 CONFIRMED guards were disabled (0.93) - three usable confirmed
+/// guards left, every onion dial failing, and the boot cleaner silent through
+/// every restart. Fall back to the whole sample when nothing is confirmed yet
+/// (a fresh node), which is also the shape the unit tests build.
 fn clear_poisoned_guard_state(state_dir: &Path) {
     let path = state_dir.join("state").join("guards.json");
     let Ok(bytes) = std::fs::read(&path) else { return };
     let Ok(v) = serde_json::from_slice::<serde_json::Value>(&bytes) else { return };
-    let Some(guards) = v.get("default").and_then(|s| s.get("guards")).and_then(|g| g.as_array())
-    else {
-        return;
-    };
+    let Some(default) = v.get("default") else { return };
+    let Some(guards) = default.get("guards").and_then(|g| g.as_array()) else { return };
     if guards.is_empty() {
         return;
     }
-    let disabled =
-        guards.iter().filter(|g| g.get("disabled").is_some_and(|d| !d.is_null())).count();
-    let poisoned = disabled as f64 >= guards.len() as f64 * GUARD_POISON_DISABLED_RATIO;
+    let is_disabled =
+        |g: &serde_json::Value| g.get("disabled").is_some_and(|d| !d.is_null());
+    // Identity of a guard entry / confirmed entry, for matching one against the
+    // other. Both carry the same `{ed25519, rsa}` id object.
+    let ident = |id: Option<&serde_json::Value>| {
+        id.and_then(|i| i.get("ed25519")).and_then(|v| v.as_str()).map(str::to_string)
+    };
+    let confirmed: std::collections::HashSet<String> = default
+        .get("confirmed")
+        .and_then(|c| c.as_array())
+        .map(|list| list.iter().filter_map(|c| ident(Some(c))).collect())
+        .unwrap_or_default();
+    // Judge the confirmed guards when arti has confirmed any we can match;
+    // otherwise the whole sample.
+    let judged: Vec<&serde_json::Value> = guards
+        .iter()
+        .filter(|g| ident(g.get("id")).is_some_and(|id| confirmed.contains(&id)))
+        .collect();
+    let (population, judged_label) = if judged.is_empty() {
+        (guards.iter().collect::<Vec<_>>(), "sampled")
+    } else {
+        (judged, "confirmed")
+    };
+    let disabled = population.iter().filter(|g| is_disabled(g)).count();
+    let poisoned = disabled as f64 >= population.len() as f64 * GUARD_POISON_DISABLED_RATIO;
     if poisoned && std::fs::remove_file(&path).is_ok() {
+        // Drop the circuit-timeout estimates with the sample, exactly as
+        // `reset_guard_state` does. They were measured through the guards being
+        // discarded, so keeping them starts the fresh sample on timings learned
+        // from failing circuits - and a too-tight timeout marks good circuits
+        // failed, which is how a sample gets disabled in the first place.
+        let timeouts = state_dir.join("state").join("circuit_timeouts.json");
+        match std::fs::remove_file(&timeouts) {
+            Ok(()) | Err(_) => {}
+        }
         tracing::warn!(
-            "tor: cleared poisoned guard state ({disabled}/{} sampled guards disabled); \
+            "tor: cleared poisoned guard state ({disabled}/{} {judged_label} guards disabled); \
              a fresh sample will be drawn",
-            guards.len()
+            population.len()
         );
     }
 }
@@ -745,20 +798,36 @@ mod tests {
     /// Write a guards.json into `<state>/state/` shaped like arti's, with the
     /// given per-guard `disabled` values (JSON `null` = healthy).
     fn write_guards(state_dir: &Path, disabled: &[serde_json::Value]) -> std::path::PathBuf {
+        write_guards_confirmed(state_dir, disabled, 0)
+    }
+
+    /// Like [`write_guards`], with the first `confirmed` guards listed in
+    /// `default.confirmed` (arti's real shape: a confirmed entry repeats the
+    /// guard's `{ed25519, rsa}` id). Ids are unique so the two lists can be
+    /// matched against each other.
+    fn write_guards_confirmed(
+        state_dir: &Path,
+        disabled: &[serde_json::Value],
+        confirmed: usize,
+    ) -> std::path::PathBuf {
         let dir = state_dir.join("state");
         std::fs::create_dir_all(&dir).unwrap();
+        let id = |i: usize| serde_json::json!({"ed25519": format!("id{i}"), "rsa": format!("r{i}")});
         let guards: Vec<serde_json::Value> = disabled
             .iter()
-            .map(|d| {
+            .enumerate()
+            .map(|(i, d)| {
                 serde_json::json!({
-                    "id": {"ed25519": "x", "rsa": "y"},
+                    "id": id(i),
                     "orports": ["192.0.2.1:443"],
                     "disabled": d,
                 })
             })
             .collect();
+        let confirmed: Vec<serde_json::Value> =
+            (0..confirmed.min(disabled.len())).map(id).collect();
         let doc = serde_json::json!({
-            "default": {"guards": guards, "confirmed": []},
+            "default": {"guards": guards, "confirmed": confirmed},
             "restricted": {"guards": [], "confirmed": []},
         });
         let path = dir.join("guards.json");
@@ -787,6 +856,62 @@ mod tests {
         let path = write_guards(dir.path(), &sample(60, 57));
         clear_poisoned_guard_state(dir.path());
         assert!(!path.exists(), "a 95%-disabled sample must be removed");
+    }
+
+    #[test]
+    fn poison_is_judged_on_the_confirmed_guards() {
+        // Judging the whole sample hides poison behind guards arti never used:
+        // 44/60 disabled overall is 0.73 and would be kept, but every one of
+        // those disabled guards is confirmed - 44 of 45, 0.98 - so the guards
+        // arti actually builds through are gone. The population choice, not the
+        // threshold, is what catches this.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_guards_confirmed(dir.path(), &sample(60, 44), 45);
+        clear_poisoned_guard_state(dir.path());
+        assert!(!path.exists(), "a confirmed set that is 98% disabled must be removed");
+    }
+
+    #[test]
+    fn a_degraded_but_working_confirmed_set_is_kept() {
+        // Measured on a live node: 17 of 20 confirmed guards disabled (0.85,
+        // three usable) while it carried 13 connections with Tor and I2P both
+        // reachable. A node whose onion dials were all failing measured 42/45
+        // (0.93, also three usable) - the shapes are nearly identical, so the
+        // threshold has to sit above the working one. Clearing here would spend
+        // the anonymity of guard pinning on a sample that was fine.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_guards_confirmed(dir.path(), &sample(20, 17), 20);
+        clear_poisoned_guard_state(dir.path());
+        assert!(path.exists(), "a confirmed set that still carries traffic must be kept");
+    }
+
+    #[test]
+    fn clearing_poison_also_drops_the_circuit_timeout_estimates() {
+        // They were measured through the guards being discarded; carrying them
+        // into the fresh sample starts it on timings learned from failing
+        // circuits.
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_guards_confirmed(dir.path(), &sample(60, 60), 45);
+        let timeouts = dir.path().join("state").join("circuit_timeouts.json");
+        std::fs::write(&timeouts, b"{}").unwrap();
+        clear_poisoned_guard_state(dir.path());
+        assert!(!path.exists(), "the poisoned sample goes");
+        assert!(!timeouts.exists(), "and so do the estimates measured through it");
+    }
+
+    #[test]
+    fn healthy_confirmed_guards_survive_a_mostly_disabled_sample() {
+        // The mirror case: the unconfirmed remainder has rotted, but every
+        // confirmed guard still works. Tor is fine - keep the sample, and keep
+        // the guard pinning that protects against traffic analysis.
+        let dir = tempfile::tempdir().unwrap();
+        let mut guards = sample(60, 0);
+        for g in guards.iter_mut().skip(10) {
+            *g = serde_json::json!({"type": "TooManyIndeterminateFailures"});
+        }
+        let path = write_guards_confirmed(dir.path(), &guards, 10);
+        clear_poisoned_guard_state(dir.path());
+        assert!(path.exists(), "healthy confirmed guards must not be thrown away");
     }
 
     #[test]

@@ -42,9 +42,15 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     (
         "Network",
         "tor",
-        "Tor (Always private routes all peer traffic over Tor/I2P only; restart EpixNet to apply)",
+        // "Enable" is easy to read as "I am anonymous now" - it is not. It
+        // routes .onion peers over Tor and dials every clearnet peer directly,
+        // from the real IP, which the trackers also see. Say so in the option
+        // itself: by the time someone reads a tooltip they have already chosen.
+        "Tor (Enable still reveals your IP to clearnet peers and trackers; \
+         Always private routes everything over Tor/I2P. Restart EpixNet to apply)",
         "enable",
-        "select:Disable=disable|Enable=enable|Always private (Tor/I2P only)=always",
+        "select:Disable=disable|Enable (clearnet peers see your IP)=enable|\
+         Always private (Tor/I2P only)=always",
     ),
     // Active only in a bridges-enabled build (Snowflake linked); otherwise shown
     // disabled with a coming-soon note, as before.
