@@ -2849,19 +2849,15 @@ impl OnDemand {
 /// Read the xID finality pin without silently treating an arbitrary I/O error as
 /// "not installed". A missing pin is accepted only through the explicit,
 /// pre-upgrade compatibility switch passed by the caller.
-fn read_xid_finality_pin(
-    pin_path: &std::path::Path,
-    allow_insecure_legacy: bool,
-) -> Result<Option<Vec<u8>>, String> {
+fn read_xid_finality_pin(pin_path: &std::path::Path) -> Result<Option<Vec<u8>>, String> {
     match std::fs::read(pin_path) {
         Ok(bytes) => Ok(Some(bytes)),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && allow_insecure_legacy => Ok(None),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(format!(
-            "required xID finality pin {} is missing. This branch must not ship or merge before the trusted post-upgrade pin is installed. For pre-upgrade development only, set {ALLOW_INSECURE_XID_LEGACY_ENV}=1 explicitly.",
-            pin_path.display()
-        )),
+        // No local pin is the NORMAL fresh-install state: the light client
+        // network-quorum-bootstraps trust on its own. A pin file remains
+        // supported as an explicit trusted anchor (stronger splice).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(format!(
-            "cannot read required xID finality pin {}: {e}. Refusing to downgrade to RPC-trusted resolution.",
+            "cannot read xID finality pin {}: {e}. Refusing to downgrade to RPC-trusted resolution.",
             pin_path.display()
         )),
     }
@@ -2873,6 +2869,10 @@ enum XidFinalityBoot {
         validator_count: usize,
         restored_height: Option<u64>,
     },
+    /// No local pin: verification is ON and fails closed until the light
+    /// client establishes trust from network-quorum agreement (seconds after
+    /// the first successful chain contact).
+    NetworkBootstrap,
     InsecureLegacy,
 }
 
@@ -2883,11 +2883,11 @@ fn initialize_xid_finality(data_root: &std::path::Path) -> Result<XidFinalityBoo
     let pin_path = data_root.join("xid_pin.json");
     let allow_insecure_legacy =
         std::env::var_os(ALLOW_INSECURE_XID_LEGACY_ENV).is_some_and(|value| value == "1");
-    match read_xid_finality_pin(&pin_path, allow_insecure_legacy)? {
+    match read_xid_finality_pin(&pin_path)? {
         Some(bytes) => {
             let validator_count = epix_chain::install_finality_pin(&bytes).map_err(|e| {
                 format!(
-                    "xID finality pin {} is present but invalid: {e}. Refusing to start with finality verification disabled; replace it with a trusted pin.",
+                    "xID finality pin {} is present but invalid: {e}. Refusing to start with finality verification disabled; replace it with a trusted pin (or delete it to network-bootstrap).",
                     pin_path.display()
                 )
             })?;
@@ -2904,10 +2904,18 @@ fn initialize_xid_finality(data_root: &std::path::Path) -> Result<XidFinalityBoo
                 restored_height: restored.map(|checkpoint| checkpoint.height),
             })
         }
-        None => {
+        None if allow_insecure_legacy => {
             epix_chain::set_pinned_validators(None);
             epix_chain::set_verify_finality(false);
             Ok(XidFinalityBoot::InsecureLegacy)
+        }
+        None => {
+            // Fail closed until the light client bootstraps: verification is
+            // ON with no pin, so every resolve refuses rather than trusting
+            // the RPC while trust is not yet established.
+            epix_chain::set_pinned_validators(None);
+            epix_chain::set_verify_finality(true);
+            Ok(XidFinalityBoot::NetworkBootstrap)
         }
     }
 }
@@ -2939,6 +2947,7 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             .filter(|&s| s >= 60)
             .unwrap_or(900);
         let mut cfg = epix_chain::LightClientConfig::new(data_root.join("xid_lc_state.json"));
+        cfg.checkpoint_path = Some(data_root.join("xid_finality_checkpoint.json"));
         if let Some(secs) = state
             .config_get("xid_trusting_period_secs")
             .await
@@ -2947,6 +2956,27 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         {
             cfg.trusting_period_secs = secs;
         }
+        if let Some(sources) = state.config_get("xid_bootstrap_rpcs").await.and_then(|v| {
+            v.as_array().map(|list| {
+                list.iter()
+                    .filter_map(|s| s.as_str().map(String::from))
+                    .collect::<Vec<_>>()
+            })
+        }) {
+            cfg.bootstrap_sources = sources;
+        }
+        if let Some(quorum) = state
+            .config_get("xid_bootstrap_quorum")
+            .await
+            .and_then(|v| v.as_u64())
+        {
+            cfg.bootstrap_quorum = (quorum as usize).max(1);
+        }
+        // Until first trust is established (fresh install, or back after a
+        // long offline stretch), retry quickly with backoff — a user opening
+        // the app should not wait 15 minutes for names to resolve. Once
+        // trusted, settle into the regular cadence.
+        let mut fast_retry_secs = 5u64;
         loop {
             let before = epix_chain::pinned_validators();
             match epix_chain::advance_trusted_set(&cfg).await {
@@ -2995,7 +3025,14 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
                         .await;
                 }
             }
-            tokio::time::sleep(std::time::Duration::from_secs(interval_secs)).await;
+            let delay = if epix_chain::pinned_validators().is_some() {
+                interval_secs
+            } else {
+                let delay = fast_retry_secs;
+                fast_retry_secs = (fast_retry_secs * 2).min(interval_secs);
+                delay
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
         }
     });
 }
@@ -3030,6 +3067,16 @@ async fn serve(
                     format!(
                         "xID finality: pinned {validator_count} validators; resolution now requires >2/3 attestation{checkpoint_note}"
                     ),
+                )
+                .await;
+            spawn_xid_lightclient(state.clone(), opts.data_root.clone());
+        }
+        XidFinalityBoot::NetworkBootstrap => {
+            state
+                .log(
+                    "INFO",
+                    "xID finality: no local pin; bootstrapping trust from network-quorum \
+                     agreement (resolution fails closed until it completes)",
                 )
                 .await;
             spawn_xid_lightclient(state.clone(), opts.data_root.clone());

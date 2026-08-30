@@ -43,6 +43,33 @@ use crate::finality::{PinnedSet, PinnedValidator};
 /// Tor-Always mode covers it and no new clearnet path is introduced.
 pub const DEFAULT_CMT_RPC_URL: &str = "https://rpc.epix.zone";
 
+/// The chain this client follows. A cold network bootstrap must know which
+/// chain it is looking for, or a quorum of endpoints for some OTHER chain
+/// would count as agreement.
+pub const DEFAULT_CHAIN_ID: &str = "epix_1916-1";
+
+/// Independent CometBFT RPC endpoints for the network-quorum cold bootstrap,
+/// run by DIFFERENT validator operators (from the cosmos/chain-registry).
+/// Forging a bootstrap requires simultaneously controlling a quorum of these
+/// AND holding >2/3 of some historical validator set's consensus keys — the
+/// chain, observed from several vantage points, stays the only source of
+/// truth. Overridable per-node (`xid_bootstrap_rpcs`).
+pub const DEFAULT_BOOTSTRAP_SOURCES: &[&str] = &[
+    "https://rpc.epix.zone",
+    "https://rpc-epix.onenov.xyz",
+    "https://rpc-m.epix.vinjan-inc.com",
+    "https://rpc-epix.dnsarz.net:443",
+];
+
+/// How many bootstrap sources must agree EXACTLY (same chain id, same header
+/// hash, same validator-set hashes at a common height) before their answer is
+/// adopted as a fresh trust anchor.
+pub const DEFAULT_BOOTSTRAP_QUORUM: usize = 2;
+
+/// A bootstrap header must be recent: every quorum source would have to
+/// collude to replay an old snapshot, and even then this bound rejects it.
+const BOOTSTRAP_MAX_HEADER_AGE_SECS: i64 = 3600;
+
 /// Trusting period: how stale a trusted header may be and still serve as a
 /// verification base. 2/3 of the chain's unbonding period (21 d), the standard
 /// light-client margin: within it, >1/3 of any trusted set is still bonded and
@@ -65,6 +92,16 @@ pub struct LightClientConfig {
     pub state_path: PathBuf,
     pub trusting_period_secs: u64,
     pub clock_drift_secs: u64,
+    /// The chain id a network bootstrap must find.
+    pub chain_id: String,
+    /// Independent endpoints for the network-quorum bootstrap; empty disables
+    /// network bootstrapping (a stale anchor then reports [`Advance::AnchorExpired`]).
+    pub bootstrap_sources: Vec<String>,
+    /// How many bootstrap sources must agree exactly.
+    pub bootstrap_quorum: usize,
+    /// Where the finality checkpoint lives, so a bootstrap on a node with NO
+    /// pin installed can configure it after publishing the first pin.
+    pub checkpoint_path: Option<PathBuf>,
 }
 
 impl LightClientConfig {
@@ -78,6 +115,13 @@ impl LightClientConfig {
             state_path,
             trusting_period_secs: DEFAULT_TRUSTING_PERIOD_SECS,
             clock_drift_secs: 30,
+            chain_id: DEFAULT_CHAIN_ID.to_string(),
+            bootstrap_sources: DEFAULT_BOOTSTRAP_SOURCES
+                .iter()
+                .map(|s| s.to_string())
+                .collect(),
+            bootstrap_quorum: DEFAULT_BOOTSTRAP_QUORUM,
+            checkpoint_path: None,
         }
     }
 }
@@ -89,9 +133,10 @@ pub enum Advance {
     Advanced { height: u64, validators: usize },
     /// Already at (or within one block of) the chain head; nothing to do.
     UpToDate { height: u64 },
-    /// The persisted trusted state (or the pin) is older than the trusting
-    /// period; advancing is impossible without a fresh anchor. The current pin
-    /// is left untouched (it fails closed on its own weak-subjectivity clock).
+    /// The trusted state is older than the trusting period and network
+    /// bootstrapping is disabled, so no fresh anchor can be established. The
+    /// current pin is left untouched (it fails closed on its own
+    /// weak-subjectivity clock).
     AnchorExpired { trusted_unix: i64 },
 }
 
@@ -374,29 +419,39 @@ async fn verify_forward(
 
 /// Run one advance cycle:
 ///
-/// 1. Load the persisted trusted state; if none, BOOTSTRAP from the installed
-///    pin — fetch the signed header + set at the pin height and require the
-///    set to EQUAL the pinned set (the trust splice).
+/// 1. Load the persisted trusted state. If it is missing or older than the
+///    trusting period, establish a fresh anchor: splice onto the installed pin
+///    when one matches the chain, else NETWORK-QUORUM bootstrap — several
+///    independent endpoints must agree exactly on the current chain before
+///    their answer is adopted ([`bootstrap_from_network`]).
 /// 2. Skip-verify from the trusted header to (near) the chain head.
-/// 3. Persist the new trusted state, then republish the pin:
-///    [`crate::advance_finality_pin`] swaps `PINNED_VALIDATORS` and rebinds
-///    the finality checkpoint, all fail-closed.
+/// 3. Persist the new trusted state, then publish the verified set as the
+///    active pin (fail-closed, monotonic).
 ///
 /// Any error leaves both the persisted state and the active pin untouched.
 pub async fn advance_trusted_set(cfg: &LightClientConfig) -> Result<Advance, String> {
-    let (trusted_sh, trusted_next_vals) = match read_trusted_state(&cfg.state_path)? {
-        Some(state) => (state.signed_header, state.next_validators),
-        None => bootstrap_from_pin(cfg).await?,
+    let anchor = match read_trusted_state(&cfg.state_path)? {
+        Some(state) => {
+            // A trusted header older than the trusting period cannot anchor
+            // skipping verification — re-anchor instead of going dark.
+            let trusted_unix = header_time_unix(&state.signed_header);
+            let age = crate::now_unix().saturating_sub(trusted_unix);
+            if age > cfg.trusting_period_secs as i64 {
+                match fresh_anchor(cfg).await {
+                    Ok(anchor) => anchor,
+                    Err(e) if cfg.bootstrap_sources.is_empty() => {
+                        let _ = e;
+                        return Ok(Advance::AnchorExpired { trusted_unix });
+                    }
+                    Err(e) => return Err(e),
+                }
+            } else {
+                (state.signed_header, state.next_validators)
+            }
+        }
+        None => fresh_anchor(cfg).await?,
     };
-
-    // A trusted header older than the trusting period cannot anchor skipping
-    // verification; report it rather than silently doing nothing. The pin's
-    // own weak-subjectivity check keeps failing closed as before.
-    let trusted_unix = header_time_unix(&trusted_sh);
-    let age = crate::now_unix().saturating_sub(trusted_unix);
-    if age > cfg.trusting_period_secs as i64 {
-        return Ok(Advance::AnchorExpired { trusted_unix });
-    }
+    let (trusted_sh, trusted_next_vals) = anchor;
 
     let head = fetch_latest_height(&cfg.rpc_url).await?;
     // Verify to head-2 so /validators at target+1 always exists.
@@ -436,8 +491,192 @@ pub async fn advance_trusted_set(cfg: &LightClientConfig) -> Result<Advance, Str
             next_validators: new_next_vals,
         },
     )?;
-    crate::advance_finality_pin(new_pin)?;
+    publish_pin(cfg, new_pin)?;
     Ok(Advance::Advanced { height, validators })
+}
+
+/// Publish a light-client-verified set as the active pin. With a pin already
+/// installed this is the monotonic [`crate::advance_finality_pin`] path; on a
+/// node that booted with NO pin (pure network bootstrap) it installs the first
+/// one and configures the durable checkpoint beside it.
+fn publish_pin(cfg: &LightClientConfig, new_pin: PinnedSet) -> Result<(), String> {
+    if crate::pinned_validators().is_some() {
+        return crate::advance_finality_pin(new_pin);
+    }
+    crate::set_pinned_validators(Some(new_pin));
+    crate::set_verify_finality(true);
+    if let Some(path) = &cfg.checkpoint_path {
+        crate::configure_finality_checkpoint(path).map_err(|e| {
+            // Roll back so a broken checkpoint cannot leave a pin active
+            // without its anti-rollback store.
+            crate::set_pinned_validators(None);
+            format!("light client: checkpoint configure after bootstrap: {e}")
+        })?;
+    }
+    Ok(())
+}
+
+/// Establish a fresh trust anchor. The installed pin is preferred (the trust
+/// splice is exact-set equality against a signed header); when there is no
+/// pin, or the splice cannot be completed, fall back to the network-quorum
+/// bootstrap.
+async fn fresh_anchor(
+    cfg: &LightClientConfig,
+) -> Result<(SignedHeader, Vec<TmValidatorInfo>), String> {
+    let pin_err = match crate::pinned_validators() {
+        Some(_) => match bootstrap_from_pin(cfg).await {
+            Ok(anchor) => return Ok(anchor),
+            Err(e) => e,
+        },
+        None => "no local pin".to_string(),
+    };
+    if cfg.bootstrap_sources.is_empty() {
+        return Err(format!(
+            "light client: cannot establish a trust anchor ({pin_err}) and network \
+             bootstrapping is disabled"
+        ));
+    }
+    bootstrap_from_network(cfg)
+        .await
+        .map_err(|e| format!("light client: pin splice failed ({pin_err}); {e}"))
+}
+
+/// Network-quorum cold bootstrap: the chain — observed from several
+/// independent vantage points — is the source of truth.
+///
+/// Fetch the current signed header from every configured source at a common
+/// recent height and require at least `bootstrap_quorum` of them to agree
+/// EXACTLY (chain id, header hash, validator-set hashes), with no rival group
+/// also reaching quorum. The validator sets are then fetched and hash-bound to
+/// the agreed header, so nothing about the set itself is taken on faith from
+/// any single endpoint.
+///
+/// Trust statement (honest): this is agreement-of-observers, not proof.
+/// Forging it requires controlling a quorum of the listed operators
+/// simultaneously AND holding >2/3 of a historical validator set's consensus
+/// keys to fabricate a plausible chain. Disagreement, staleness, or ambiguity
+/// fails closed and is retried later.
+async fn bootstrap_from_network(
+    cfg: &LightClientConfig,
+) -> Result<(SignedHeader, Vec<TmValidatorInfo>), String> {
+    // 1. Which sources answer, and how far along is each?
+    let mut reachable: Vec<(String, u64)> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for source in &cfg.bootstrap_sources {
+        match fetch_latest_height(source).await {
+            Ok(height) => reachable.push((source.clone(), height)),
+            Err(e) => failures.push(e),
+        }
+    }
+    if reachable.len() < cfg.bootstrap_quorum {
+        return Err(format!(
+            "network bootstrap: only {}/{} sources reachable (need {}): {}",
+            reachable.len(),
+            cfg.bootstrap_sources.len(),
+            cfg.bootstrap_quorum,
+            failures.join("; ")
+        ));
+    }
+
+    // 2. A settled common height every reachable source has.
+    let common = reachable
+        .iter()
+        .map(|(_, height)| *height)
+        .min()
+        .unwrap_or(0)
+        .saturating_sub(3);
+    if common == 0 {
+        return Err("network bootstrap: no common height".to_string());
+    }
+
+    // 3. Group the sources by what they claim that height IS.
+    let mut claims: Vec<(String, SignedHeader)> = Vec::new();
+    for (source, _) in &reachable {
+        match fetch_signed_header(source, common).await {
+            Ok(sh) => claims.push((source.clone(), sh)),
+            Err(e) => failures.push(e),
+        }
+    }
+    let agreed = agree_on_header(&claims, cfg.bootstrap_quorum, &cfg.chain_id)?;
+    let (agreed_source, agreed_sh) = agreed;
+
+    // 4. Freshness: every quorum source would have to collude to replay an old
+    // snapshot; reject one anyway.
+    let age = crate::now_unix().saturating_sub(header_time_unix(&agreed_sh));
+    if age.saturating_abs() > BOOTSTRAP_MAX_HEADER_AGE_SECS {
+        return Err(format!(
+            "network bootstrap: agreed header at height {common} is {age}s old; refusing a \
+             stale snapshot"
+        ));
+    }
+
+    // 5. Bind the validator sets to the agreed header by hash — after this,
+    // no single endpoint is trusted for the set contents.
+    let vals = fetch_validators(&agreed_source, common).await?;
+    let set = TmValidatorSet::without_proposer(vals.clone());
+    if set.hash() != agreed_sh.header.validators_hash {
+        return Err(format!(
+            "network bootstrap: validator set at {common} does not hash to the agreed header"
+        ));
+    }
+    let next_vals = fetch_validators(&agreed_source, common + 1).await?;
+    let next_set = TmValidatorSet::without_proposer(next_vals.clone());
+    if next_set.hash() != agreed_sh.header.next_validators_hash {
+        return Err(format!(
+            "network bootstrap: next validator set at {common} does not hash to the agreed header"
+        ));
+    }
+    Ok((agreed_sh, next_vals))
+}
+
+/// Pick the header a quorum of sources agrees on, failing closed on ambiguity.
+fn agree_on_header(
+    claims: &[(String, SignedHeader)],
+    quorum: usize,
+    expected_chain_id: &str,
+) -> Result<(String, SignedHeader), String> {
+    let quorum = quorum.max(1);
+    // Group by full header hash (covers chain id, height, time, app/valset
+    // hashes — every field of the header).
+    let mut groups: Vec<(tendermint::Hash, Vec<usize>)> = Vec::new();
+    for (index, (_, sh)) in claims.iter().enumerate() {
+        let hash = sh.header.hash();
+        match groups.iter_mut().find(|(h, _)| *h == hash) {
+            Some((_, members)) => members.push(index),
+            None => groups.push((hash, vec![index])),
+        }
+    }
+    groups.sort_by_key(|(_, members)| std::cmp::Reverse(members.len()));
+    let Some((_, winners)) = groups.first() else {
+        return Err("network bootstrap: no source returned a header".to_string());
+    };
+    if winners.len() < quorum {
+        return Err(format!(
+            "network bootstrap: strongest agreement is {}/{} sources (need {})",
+            winners.len(),
+            claims.len(),
+            quorum
+        ));
+    }
+    // A rival group also reaching quorum is a fork or an attack: fail closed.
+    if let Some((_, rival)) = groups.get(1) {
+        if rival.len() >= quorum {
+            return Err(format!(
+                "network bootstrap: AMBIGUOUS — two groups of sources ({} and {}) disagree on \
+                 the chain head; refusing to pick a side",
+                winners.len(),
+                rival.len()
+            ));
+        }
+    }
+    let (source, sh) = &claims[winners[0]];
+    if sh.header.chain_id.as_str() != expected_chain_id {
+        return Err(format!(
+            "network bootstrap: agreed chain id {} is not the expected {expected_chain_id}",
+            sh.header.chain_id
+        ));
+    }
+    Ok((source.clone(), sh.clone()))
 }
 
 /// First run: splice light-client trust onto the shipped pin. The header at
@@ -562,5 +801,87 @@ mod tests {
         )
         .unwrap();
         assert!(read_trusted_state(&path).is_err());
+    }
+
+    /// A real mainnet signed header (height 5373600, signatures trimmed —
+    /// agreement groups by HEADER hash only), so the quorum logic is exercised
+    /// offline against genuine wire data.
+    const REAL_SIGNED_HEADER: &str = r#"{"header":{"version":{"block":"11"},"chain_id":"epix_1916-1","height":"5373600","time":"2026-08-30T04:01:42.235486113Z","last_block_id":{"hash":"A5CBCC5FA7ABC1542BE1AD201AD83D5AE49E3F0802252615056BB70E533A4D26","parts":{"total":1,"hash":"0F2EB2188CBEB28103808CEEED3925EBAFDDFA1027A5485535DA74F5E000FA88"}},"last_commit_hash":"401E10A0552826AB5356A00BA2205C44B9DD0B9AA269B83CECD81F022AFFA635","data_hash":"F3F92C03CE895B95FFEC01DE7851A5A7FEE97B0F95F5FBE43C05D1A6C714FFEB","validators_hash":"E214F7AAA8D202A86C438C05AAF10BF188663D208D70F59533E3AFD9BED5C88B","next_validators_hash":"E214F7AAA8D202A86C438C05AAF10BF188663D208D70F59533E3AFD9BED5C88B","consensus_hash":"BE697DE122FE70FC144F90782F96407BFDE7D2048BB2FDADA8CA54544540F208","app_hash":"2B21C70D6481138168D84EE147E201EA6A564D0AB6857B56BB2CD02EE5B5CE9F","last_results_hash":"E081E63DEE838A4941FB539216F804F6A7BC2B385E29996B5D37EF9BAB74C59E","evidence_hash":"E3B0C44298FC1C149AFBF4C8996FB92427AE41E4649B934CA495991B7852B855","proposer_address":"F0F6A4F37C27DC7D52CFC0087B348CD615819E16"},"commit":{"height":"5373600","round":0,"block_id":{"hash":"9C1164970FF0B9A82CBAB7A7260C5F29E68340935CB31988DC9C2F26FDA6416D","parts":{"total":1,"hash":"DEABF33E521368EAAABDE296501E8F8C5EB084170465BC57235129A5D24D46A4"}},"signatures":[{"block_id_flag":2,"validator_address":"A380AC0C0EA0F020E782D18A3029D9C00990F53B","timestamp":"2026-08-30T04:01:47.940592259Z","signature":"gA0pWyIoeMatNsF9rT2h/6QMlvs+DtRuJIoB3++0YNTYh9OQ6IyYbLeKJKawzHLFl56ksuOcMJXjo4wr95h/Bg=="},{"block_id_flag":2,"validator_address":"F0F6A4F37C27DC7D52CFC0087B348CD615819E16","timestamp":"2026-08-30T04:01:47.971816144Z","signature":"+jIYIJlu/cVr53+UaJGrOGkspIBDXnJD4KxD/i+u9knLZjMz20DMT154OqLsvkaED9q4wZ0W6IDP5r6hoBy2Cg=="}]}}"#;
+
+    fn real_header() -> SignedHeader {
+        serde_json::from_str(REAL_SIGNED_HEADER).expect("fixture parses")
+    }
+
+    /// The same header with one hash byte flipped: a rival chain's claim.
+    fn forged_header() -> SignedHeader {
+        let mut v: serde_json::Value = serde_json::from_str(REAL_SIGNED_HEADER).unwrap();
+        v["header"]["app_hash"] = serde_json::json!(
+            "0000000000000000000000000000000000000000000000000000000000000000"
+        );
+        serde_json::from_value(v).unwrap()
+    }
+
+    fn claims(entries: &[(&str, SignedHeader)]) -> Vec<(String, SignedHeader)> {
+        entries
+            .iter()
+            .map(|(s, h)| (s.to_string(), h.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn quorum_agreement_adopts_the_majority_header() {
+        let c = claims(&[
+            ("a", real_header()),
+            ("b", real_header()),
+            ("evil", forged_header()),
+        ]);
+        let (source, sh) = agree_on_header(&c, 2, "epix_1916-1").expect("agreement");
+        assert_eq!(source, "a");
+        assert_eq!(sh.header.hash(), real_header().header.hash());
+    }
+
+    #[test]
+    fn below_quorum_fails_closed() {
+        let c = claims(&[("a", real_header()), ("evil", forged_header())]);
+        let err = agree_on_header(&c, 2, "epix_1916-1").unwrap_err();
+        assert!(err.contains("strongest agreement is 1/2"), "{err}");
+    }
+
+    #[test]
+    fn ambiguous_split_fails_closed() {
+        // Two groups both reaching quorum = a visible fork or an attack in
+        // progress; refusing to pick a side is the only safe answer.
+        let c = claims(&[
+            ("a", real_header()),
+            ("b", real_header()),
+            ("x", forged_header()),
+            ("y", forged_header()),
+        ]);
+        let err = agree_on_header(&c, 2, "epix_1916-1").unwrap_err();
+        assert!(err.contains("AMBIGUOUS"), "{err}");
+    }
+
+    #[test]
+    fn wrong_chain_id_fails_closed() {
+        let c = claims(&[("a", real_header()), ("b", real_header())]);
+        let err = agree_on_header(&c, 2, "epix_9999-9").unwrap_err();
+        assert!(err.contains("not the expected"), "{err}");
+    }
+
+    #[test]
+    fn no_pin_and_no_bootstrap_sources_is_an_error() {
+        // fresh_anchor with nothing to anchor from must refuse, not fabricate.
+        let dir = tempfile::tempdir().unwrap();
+        let mut cfg = LightClientConfig::new(dir.path().join("state.json"));
+        cfg.bootstrap_sources.clear();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        // Note: relies on no pin being installed in this test process.
+        if crate::pinned_validators().is_none() {
+            let err = rt.block_on(fresh_anchor(&cfg)).unwrap_err();
+            assert!(err.contains("network bootstrapping is disabled"), "{err}");
+        }
     }
 }

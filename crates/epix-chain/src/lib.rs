@@ -28,7 +28,8 @@ pub use identity_snapshot::{
 };
 pub use leaf::verify_and_parse_leaf;
 pub use lightclient::{
-    advance_trusted_set, Advance, LightClientConfig, DEFAULT_CMT_RPC_URL,
+    advance_trusted_set, Advance, LightClientConfig, DEFAULT_BOOTSTRAP_QUORUM,
+    DEFAULT_BOOTSTRAP_SOURCES, DEFAULT_CHAIN_ID, DEFAULT_CMT_RPC_URL,
     DEFAULT_TRUSTING_PERIOD_SECS,
 };
 pub use resolver::{XidResolver, DEFAULT_RPC_URL};

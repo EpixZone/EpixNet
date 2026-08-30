@@ -6,13 +6,12 @@ xID resolution to be a Merkle proof rooted at a state digest signed by more than
 two thirds of the pinned voting power, and fails closed otherwise (a malicious or
 lagging RPC cannot forge a resolution). Without a pin, startup fails closed.
 
-## Merge blocker
+## Status
 
 The v0.7.2 attestation upgrade is LIVE on mainnet (executed at height 5360000;
-signed attestations verified being served). The remaining blocker is release
-packaging only: capture the bootstrap pin with `scripts/capture_xid_pin.py`,
-verify it against a second independent RPC, and include it in the release's
-default data dir before shipping. Never fabricate a placeholder pin.
+signed attestations verified being served), and releases ship NOTHING: a node
+with no local pin network-bootstraps trust on its own (below). The pin file
+remains supported as an optional explicit anchor. Never fabricate one.
 
 ## How the node turns it on
 
@@ -21,11 +20,22 @@ At boot the node reads `xid_pin.json` from its data root:
 - present and valid: `install_finality_pin` loads it and enables verification
   (logged: `xID finality: pinned N validators; resolution now requires >2/3
   attestation`).
-- absent: startup fails closed. For pre-upgrade development only, an operator
-  can explicitly set `EPIX_XID_ALLOW_INSECURE_LEGACY=1`. This is logged as an
+- absent (the NORMAL fresh-install state): verification is ON and fails closed
+  while the light client establishes trust by **network-quorum bootstrap** -
+  it asks several independent CometBFT RPC operators (from the
+  cosmos/chain-registry: Epix, OneNov, Vinjan.Inc, dnsarz; override with
+  `xid_bootstrap_rpcs`, quorum with `xid_bootstrap_quorum`, default 2) for the
+  current chain head and requires EXACT agreement (chain id, header hash,
+  validator-set hashes) with no rival group also at quorum. The agreed set is
+  adopted as the trust anchor within seconds of first chain contact; the chain,
+  observed from several vantage points, is the only source of truth. Forging
+  this requires simultaneously controlling a quorum of those operators AND
+  holding >2/3 of a historical validator set's consensus keys.
+- for pre-upgrade development only, an operator can explicitly set
+  `EPIX_XID_ALLOW_INSECURE_LEGACY=1` (with no pin file). This is logged as an
   insecure compatibility mode and must not be set in an official release.
-- unreadable or invalid: startup fails closed, even when the compatibility
-  variable is set.
+- unreadable or invalid pin file: startup fails closed, even when the
+  compatibility variable is set.
 
 The node also restores `xid_finality_checkpoint.json` from the data root. It
 contains the highest accepted height and digest. Every newer checkpoint is
@@ -83,10 +93,11 @@ shipped. A node that connects at least once per trusting period (2/3 of the
 21-day unbonding period, ~14 days) never needs a new `xid_pin.json`; a
 year-old binary keeps working.
 
-Manual re-pinning remains only for a node offline LONGER than the trusting
-period (its anchor can no longer be extended - the node logs
-`light-client trust anchor ... older than the trusting period`): drop in a
-freshly captured `xid_pin.json` (procedure above) and restart. The static
+A node offline LONGER than the trusting period re-anchors AUTOMATICALLY the
+same way a fresh install does: network-quorum bootstrap. So "off for a year,
+start it, it works" holds with zero user action. Manual pinning
+(`xid_pin.json`, procedure above) remains only as an optional explicit anchor
+for operators who want to hand the node its trust root themselves. The static
 weak-subjectivity window (`XID_WS_PERIOD_SECS`, default 7 days) still applies
 as the fail-closed backstop whenever the light client is disabled
 (`xid_lc_enabled=false`).

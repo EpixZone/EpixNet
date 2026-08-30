@@ -200,12 +200,8 @@ async fn light_client_advances_live_pin_end_to_end() {
     epix_chain::configure_finality_checkpoint(dir.path().join("xid_finality_checkpoint.json"))
         .expect("configure checkpoint");
 
-    let cfg = epix_chain::LightClientConfig {
-        rpc_url: base.clone(),
-        state_path: dir.path().join("xid_lc_state.json"),
-        trusting_period_secs: epix_chain::DEFAULT_TRUSTING_PERIOD_SECS,
-        clock_drift_secs: 30,
-    };
+    let mut cfg = epix_chain::LightClientConfig::new(dir.path().join("xid_lc_state.json"));
+    cfg.rpc_url = base.clone();
 
     // First advance: bootstraps from the pin (trust splice), then verifies to head.
     let advance = epix_chain::advance_trusted_set(&cfg)
