@@ -25504,7 +25504,7 @@ impl AppState {
         });
     }
 
-    fn signed_fetch_timeout(peer: &PeerAddr) -> std::time::Duration {
+    pub(crate) fn signed_fetch_timeout(peer: &PeerAddr) -> std::time::Duration {
         peer.file_timeout()
     }
 
