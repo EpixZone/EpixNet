@@ -858,7 +858,7 @@ async fn retry_index_records(state: Arc<AppState>, ms: Arc<ChannelState>) {
             let state = state.clone();
             let ms = ms.clone();
             async move {
-                if !state.config_bool("channel_enabled", false).await {
+                if !state.config_bool("channel_enabled", true).await {
                     return true;
                 }
                 let all = state.pool_all_records(&ms.xite).await;
@@ -887,7 +887,7 @@ async fn retry_index_records(state: Arc<AppState>, ms: Arc<ChannelState>) {
             }
         })
         .await;
-        if !state.config_bool("channel_enabled", false).await {
+        if !state.config_bool("channel_enabled", true).await {
             return;
         }
     }
@@ -1158,7 +1158,7 @@ fn spawn_channel_sweep(state: Arc<AppState>, xite: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
-            if !state.config_bool("channel_enabled", false).await {
+            if !state.config_bool("channel_enabled", true).await {
                 continue;
             }
             state.resync_pool_shards_for(&xite).await;

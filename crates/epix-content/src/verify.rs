@@ -1017,7 +1017,7 @@ pub fn is_merge_manifest_alias(path: &str) -> bool {
 
 /// Anchored full-string regex match (`^pat$`), as EpixNet's `SafeRe.match` with
 /// the `^…$` wrapping used at the call sites.
-fn regex_full_match(pattern: &str, text: &str) -> bool {
+pub fn regex_full_match(pattern: &str, text: &str) -> bool {
     let anchored = format!("^(?:{pattern})$");
     regex::Regex::new(&anchored).map(|re| re.is_match(text)).unwrap_or(false)
 }
