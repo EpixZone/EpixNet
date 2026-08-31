@@ -138,6 +138,16 @@ pub trait PoolAdmission: Send + Sync {
 const POOL_SWEEP_PEERS: usize = 16;
 /// Distinct served copies to union per shard before moving on.
 const POOL_SWEEP_UNION: usize = 2;
+
+/// Outcome of one sweep fetch (see [`AppState::sweep_fetch_signed`]).
+enum SweepFetch {
+    /// The peer served the shard.
+    Got(Vec<u8>),
+    /// The peer answered but holds no such shard - a HEALTHY outcome.
+    NoFile,
+    /// Dial failure or timeout - skip this peer for the rest of the pass.
+    Unreachable,
+}
 /// Peers to flood a freshly appended record to.
 const POOL_PUSH_LIMIT: usize = 8;
 /// Peers to re-flood an inbound-merged record to (smaller, anti-storm).
@@ -1796,24 +1806,29 @@ impl AppState {
         Ok(true)
     }
 
-    /// Fetch one shard path from up to `POOL_SWEEP_UNION` peers and merge each
-    /// served copy locally.
-    async fn sweep_one_shard(
-        self: &Arc<Self>,
+    /// One sweep fetch, with the outcome the sweep needs to stay bounded:
+    /// "the peer answered but has no such shard" is a healthy peer and a
+    /// perfectly normal answer (most shards are empty), while a dial failure
+    /// or timeout means the peer is dead for this whole pass. The old
+    /// `fetch_signed_from` collapsed both into `None`, so a pass could not
+    /// skip dead peers and burned a full dial timeout on every one of them
+    /// for EVERY shard path - against a mostly-dead peer cache over Tor, one
+    /// "30-second" sweep pass took hours and never reached the later shards.
+    async fn sweep_fetch_signed(
+        &self,
+        peer: &epix_core::PeerAddr,
         address: &str,
-        path: &str,
-        peers: &[epix_core::PeerAddr],
-    ) {
-        let mut merged_from = 0usize;
-        for peer in peers {
-            if merged_from >= POOL_SWEEP_UNION {
-                break;
-            }
-            if let Some(bytes) = self.fetch_signed_from(peer, address, path).await {
-                if self.apply_inbound_pool_update(address, path, &bytes).await.unwrap_or(false) {
-                    merged_from += 1;
-                }
-            }
+        inner_path: &str,
+    ) -> SweepFetch {
+        match tokio::time::timeout(
+            Self::signed_fetch_timeout(peer),
+            self.edx_fetch_signed(peer.clone(), address, inner_path),
+        )
+        .await
+        {
+            Ok(Some(Ok(Some(bytes)))) => SweepFetch::Got(bytes),
+            Ok(Some(Ok(None))) => SweepFetch::NoFile,
+            _ => SweepFetch::Unreachable,
         }
     }
 
@@ -1829,10 +1844,24 @@ impl AppState {
             return;
         }
         let cur_week = pool::week_of(pool::epoch_now(now_ms()));
-        let peers = self.fetch_candidate_peers(address, POOL_SWEEP_PEERS).await;
-        if peers.is_empty() {
+        let candidates = self.fetch_candidate_peers(address, POOL_SWEEP_PEERS).await;
+        if candidates.is_empty() {
             return;
         }
+        let started = std::time::Instant::now();
+        // A peer proven dead is skipped for the REST of the pass: one dial
+        // timeout per dead candidate per pass, not one per shard path. Without
+        // this, a mostly-dead candidate list made a pass effectively unbounded
+        // and the sweep never reached the later shards - the node could send
+        // but never received (its own records arrive by push, not sweep).
+        let mut dead: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Every peer's outcome feeds the reputation registry after the pass,
+        // so dead candidates sink into backoff and live ones rise in the next
+        // pass's selection - the sweep's dials were previously invisible to it.
+        let mut outcomes: std::collections::HashMap<String, (epix_core::PeerAddr, bool)> =
+            std::collections::HashMap::new();
+        let mut merged_total = 0usize;
+        let mut paths_total = 0usize;
         for rule in &rules {
             for week in [cur_week - 1, cur_week] {
                 if week < rule.since_week {
@@ -1840,9 +1869,63 @@ impl AppState {
                 }
                 for sub in 0..rule.fanout {
                     let path = format!("{}/w{}/{:02x}.json", rule.dir, week, sub);
-                    self.sweep_one_shard(address, &path, &peers).await;
+                    paths_total += 1;
+                    let mut merged_from = 0usize;
+                    for peer in &candidates {
+                        if merged_from >= POOL_SWEEP_UNION {
+                            break;
+                        }
+                        let key = peer.to_string();
+                        if dead.contains(&key) {
+                            continue;
+                        }
+                        match self.sweep_fetch_signed(peer, address, &path).await {
+                            SweepFetch::Got(bytes) => {
+                                outcomes.insert(key, (peer.clone(), true));
+                                if self
+                                    .apply_inbound_pool_update(address, &path, &bytes)
+                                    .await
+                                    .unwrap_or(false)
+                                {
+                                    merged_from += 1;
+                                    merged_total += 1;
+                                }
+                            }
+                            SweepFetch::NoFile => {
+                                outcomes.insert(key, (peer.clone(), true));
+                            }
+                            SweepFetch::Unreachable => {
+                                dead.insert(key.clone());
+                                outcomes.entry(key).or_insert((peer.clone(), false));
+                            }
+                        }
+                    }
                 }
             }
+        }
+        self.note_edx_dials(address, outcomes.into_values().collect()).await;
+        let alive = candidates.len().saturating_sub(dead.len());
+        if alive == 0 {
+            self.log(
+                "WARNING",
+                format!(
+                    "pool sweep {address}: 0/{} candidate peers reachable; \
+                     inbound records cannot arrive until a peer answers",
+                    candidates.len()
+                ),
+            )
+            .await;
+        } else {
+            self.log(
+                "DEBUG",
+                format!(
+                    "pool sweep {address}: {alive}/{} peers reachable, \
+                     {merged_total} shard cop(ies) merged across {paths_total} path(s) in {:.1}s",
+                    candidates.len(),
+                    started.elapsed().as_secs_f64()
+                ),
+            )
+            .await;
         }
 
         // Reclaim disk: drop shards past the owner-set retention window.
@@ -1893,6 +1976,12 @@ impl AppState {
         if peers.is_empty() {
             return;
         }
+        // Same bounded-pass discipline as `resync_pool_shards_for`: a dead
+        // candidate costs one dial timeout for the whole backfill, not one per
+        // shard path (a historical backfill enumerates MANY paths).
+        let mut dead: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut outcomes: std::collections::HashMap<String, (epix_core::PeerAddr, bool)> =
+            std::collections::HashMap::new();
         for rule in &rules {
             let start_week = if max_weeks == 0 {
                 rule.since_week
@@ -1902,12 +1991,41 @@ impl AppState {
             for path in pool::sync_shard_paths(rule, cur_week) {
                 match pool::parse_shard_path(rule, &path) {
                     Some((week, _)) if week >= start_week => {
-                        self.sweep_one_shard(address, &path, &peers).await;
+                        let mut merged_from = 0usize;
+                        for peer in &peers {
+                            if merged_from >= POOL_SWEEP_UNION {
+                                break;
+                            }
+                            let key = peer.to_string();
+                            if dead.contains(&key) {
+                                continue;
+                            }
+                            match self.sweep_fetch_signed(peer, address, &path).await {
+                                SweepFetch::Got(bytes) => {
+                                    outcomes.insert(key, (peer.clone(), true));
+                                    if self
+                                        .apply_inbound_pool_update(address, &path, &bytes)
+                                        .await
+                                        .unwrap_or(false)
+                                    {
+                                        merged_from += 1;
+                                    }
+                                }
+                                SweepFetch::NoFile => {
+                                    outcomes.insert(key, (peer.clone(), true));
+                                }
+                                SweepFetch::Unreachable => {
+                                    dead.insert(key.clone());
+                                    outcomes.entry(key).or_insert((peer.clone(), false));
+                                }
+                            }
+                        }
                     }
                     _ => {}
                 }
             }
         }
+        self.note_edx_dials(address, outcomes.into_values().collect()).await;
     }
 
     /// Read every on-disk shard of `address` and return all records — the source
