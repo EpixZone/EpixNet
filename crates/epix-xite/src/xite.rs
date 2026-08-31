@@ -2540,7 +2540,7 @@ impl Xite {
         let ignore = path_pattern(map.get("ignore"));
         let optional = path_pattern(map.get("optional"));
         // Child units are not EDX-bundled, so the hashed bytes are dropped.
-        let (files, files_optional, _, _) = self.hash_unit_files(
+        let (mut files, mut files_optional, _, _) = self.hash_unit_files(
             dir,
             &declared_optional,
             &declared_merged,
@@ -2549,6 +2549,22 @@ impl Xite {
             None,
             Some(&pruned_files),
         )?;
+        // Sign-time cutover prune, the plain-file counterpart of the
+        // files_merged prune above: a leftover data file the owner's CURRENT
+        // rules no longer allow-list (e.g. a pre-ECX messages.json still on
+        // disk after the pool cutover dropped it from files_allowed) would be
+        // hashed into this signature and then fail its own verification with
+        // "File not allowed", leaving the user unable to publish anything -
+        // including the key bundle that gets them onto the new scheme. Declare
+        // only what the rules permit; the data file itself is left untouched.
+        if let Some(rules) = rules.as_ref() {
+            if let Some(pat) = rules.get("files_allowed").and_then(|v| v.as_str()) {
+                files.retain(|name, _| epix_content::verify::regex_full_match(pat, name));
+            }
+            if let Some(pat) = rules.get("files_allowed_optional").and_then(|v| v.as_str()) {
+                files_optional.retain(|name, _| epix_content::verify::regex_full_match(pat, name));
+            }
+        }
         map.insert("files".into(), Value::Object(files));
         Self::merge_files_optional(map, files_optional, declared_optional);
         if modified.fract() == 0.0 {
@@ -2657,6 +2673,76 @@ mod tests {
         assert!(
             bare.add_content("data/users/content.json", &include, &xid_map).is_err(),
             "an undeclared include must not verify"
+        );
+    }
+
+    /// A cutover that narrows `files_allowed` leaves legacy data files sitting
+    /// in user directories. Hashing one into the signature would fail the
+    /// signature's own verification ("File not allowed") and leave the user
+    /// unable to publish anything at all - including the key bundle that moves
+    /// them onto the new scheme. Declare only what the current rules permit;
+    /// the leftover file stays on disk.
+    #[test]
+    fn child_sign_drops_files_the_current_rules_no_longer_allow() {
+        let xite_key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&xite_key).unwrap();
+        let user_key = epix_crypt::new_seed();
+        let user = epix_crypt::privatekey_to_address(&user_key).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let mut xite = Xite::new(Address::parse(address.clone()).unwrap(), storage.clone());
+        xite.content = Some(json!({
+            "address": address,
+            "files": {},
+            "includes": { "data/users/content.json": { "signers": [], "signers_required": 1 } },
+        }));
+        storage
+            .write(
+                "data/users/content.json",
+                &signed(
+                    json!({
+                        "address": address,
+                        "inner_path": "data/users/content.json",
+                        "modified": 2,
+                        "files": {},
+                        "user_contents": {
+                            "permissions": {},
+                            "cert_signers": {},
+                            "permission_rules": {
+                                ".": { "files_allowed": "data\\.json", "max_size": 8192 }
+                            },
+                        },
+                    }),
+                    &xite_key,
+                ),
+            )
+            .unwrap();
+        // What the user is publishing now, next to the legacy file the cutover
+        // stopped allow-listing.
+        storage.write(&format!("data/users/{user}/data.json"), br#"{"v":3}"#).unwrap();
+        storage
+            .write(&format!("data/users/{user}/messages.json"), br#"{"post":[]}"#)
+            .unwrap();
+
+        let xid_map = std::collections::HashMap::new();
+        let content = xite
+            .sign_child(
+                &format!("data/users/{user}/content.json"),
+                &user_key,
+                10.0,
+                &serde_json::Map::new(),
+                &xid_map,
+            )
+            .expect("a leftover disallowed file must not block the signature");
+        let files = content["files"].as_object().unwrap();
+        assert!(files.contains_key("data.json"), "the allowed file is declared");
+        assert!(
+            !files.contains_key("messages.json"),
+            "the file the rules no longer allow is left out of the declaration"
+        );
+        assert!(
+            storage.exists(&format!("data/users/{user}/messages.json")),
+            "the data file itself is untouched on disk"
         );
     }
 
