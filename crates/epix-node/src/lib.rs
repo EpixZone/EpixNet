@@ -351,9 +351,13 @@ pub async fn boot(
     // Parse the startup network policy strictly, arm its egress gate, and only
     // then select the launch target. Tor-Always and offline mode use the cache
     // only. An uncached name is deferred instead of leaking before the runtime
-    // has established its final network policy.
+    // has established its final network policy. While finality trust is still
+    // network-bootstrapping, an unresolvable launch name is likewise deferred:
+    // the light client installs the quorum-bootstrapped pin only after `serve`
+    // starts, so failing boot on it would deadlock every fresh install.
     let (launch, startup_network_policy) = prepare_startup_launch_with(
         &opts,
+        matches!(xid_finality, XidFinalityBoot::NetworkBootstrap),
         arm_startup_network_policy,
         |data_root, target| async move { resolve_target(&data_root, &target).await },
     )
@@ -664,8 +668,16 @@ fn arm_startup_network_policy(policy: StartupNetworkPolicy) {
     }
 }
 
+/// Select the launch target under the armed startup network policy.
+/// `awaiting_network_trust` is true while xID finality verification is ON with
+/// no pin installed yet ([`XidFinalityBoot::NetworkBootstrap`]): in that state
+/// chain resolution fails closed by design, so a launch name that cannot be
+/// resolved is deferred to the on-demand resolver instead of failing boot —
+/// the light client that bootstraps the pin only runs once the node serves.
+/// A malformed target (address-shaped typo) still fails boot in every mode.
 async fn prepare_startup_launch_with<A, F, Fut>(
     opts: &NodeOptions,
+    awaiting_network_trust: bool,
     arm_policy: A,
     resolve: F,
 ) -> Result<(LaunchTarget, StartupNetworkPolicy), String>
@@ -686,9 +698,21 @@ where
         }?;
         return Ok((launch, policy));
     }
-    let (address, display, _from_cache) =
-        resolve(opts.data_root.clone(), opts.target.clone()).await?;
-    Ok((resolved_launch(opts, address, display)?, policy))
+    match resolve(opts.data_root.clone(), opts.target.clone()).await {
+        Ok((address, display, _from_cache)) => {
+            Ok((resolved_launch(opts, address, display)?, policy))
+        }
+        // No trust root yet, so this failure was inevitable, not a verdict on
+        // the name. Serve deferred; `launch_display` still rejects a target
+        // that is malformed in its own right.
+        Err(_) if awaiting_network_trust => Ok((
+            LaunchTarget::Deferred {
+                display: launch_display(&opts.target)?,
+            },
+            policy,
+        )),
+        Err(e) => Err(e),
+    }
 }
 
 /// Acquire and retain the requested UI listener. Only the default port falls
@@ -5514,6 +5538,7 @@ mod tests {
         let called_for_resolver = resolver_called.clone();
         let (launch, policy) = prepare_startup_launch_with(
             &opts,
+            false,
             move |policy| *armed_for_hook.lock().unwrap() = Some(policy),
             move |_data_root, _target| {
                 called_for_resolver.store(true, Ordering::SeqCst);
@@ -5532,6 +5557,89 @@ mod tests {
         assert_eq!(display, "uncached.epix");
     }
 
+    /// The v0.5.0 fresh-install deadlock: with no pin installed, chain
+    /// resolution fails closed BEFORE the light client that would bootstrap
+    /// the pin ever runs. Boot must defer the homepage, not die.
+    #[tokio::test]
+    async fn awaiting_network_trust_defers_unresolvable_launch_instead_of_failing_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let opts = NodeOptions::new(root, "dashboard.epix");
+
+        let (launch, policy) = prepare_startup_launch_with(
+            &opts,
+            true,
+            |_policy| {},
+            |_data_root, _target| async {
+                Err::<(String, String, bool), String>(
+                    "could not resolve dashboard.epix: finality not verified: \
+                     no pinned validator set installed"
+                        .into(),
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(policy, StartupNetworkPolicy::Direct);
+        let LaunchTarget::Deferred { display } = launch else {
+            panic!("an unresolvable launch during trust bootstrap must be deferred");
+        };
+        assert_eq!(display, "dashboard.epix");
+    }
+
+    /// The deferral never hides a malformed target: an address-shaped typo is
+    /// a phishing guard and still fails boot while trust is bootstrapping.
+    #[tokio::test]
+    async fn awaiting_network_trust_still_rejects_address_shaped_typo() {
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let typo = format!("{}q", &DASH[..DASH.len() - 1]);
+        let opts = NodeOptions::new(root, &typo);
+
+        let result = prepare_startup_launch_with(
+            &opts,
+            true,
+            |_policy| {},
+            |_data_root, _target| async {
+                Err::<(String, String, bool), String>("bad checksum".into())
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("an address-shaped typo must stop startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("bad checksum"), "{error}");
+    }
+
+    /// With a trust root installed, a resolve failure is a real verdict and
+    /// still stops boot exactly as before.
+    #[tokio::test]
+    async fn resolve_failure_with_trust_installed_still_fails_boot() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let opts = NodeOptions::new(root, "dashboard.epix");
+
+        let result = prepare_startup_launch_with(
+            &opts,
+            false,
+            |_policy| {},
+            |_data_root, _target| async {
+                Err::<(String, String, bool), String>("could not resolve dashboard.epix".into())
+            },
+        )
+        .await;
+        let error = match result {
+            Ok(_) => panic!("a resolve failure with trust installed must stop startup"),
+            Err(error) => error,
+        };
+
+        assert!(error.contains("could not resolve"), "{error}");
+    }
+
     #[tokio::test]
     async fn malformed_config_stops_before_route_or_resolver_egress() {
         use std::sync::atomic::{AtomicBool, Ordering};
@@ -5548,6 +5656,7 @@ mod tests {
         let called_for_resolver = resolver_called.clone();
         let result = prepare_startup_launch_with(
             &opts,
+            false,
             move |_policy| armed_for_hook.store(true, Ordering::SeqCst),
             move |_data_root, _target| {
                 called_for_resolver.store(true, Ordering::SeqCst);
