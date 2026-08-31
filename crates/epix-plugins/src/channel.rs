@@ -37,6 +37,11 @@ const OUTBOX_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 
 /// The channel-specific state a running node holds — installed once at startup and
 /// retrieved by the `channel*` commands from the bound `AppState`.
+/// The official Epix Mail xite: the default channel xite when `channel_xite`
+/// is unset or blank, so metadata-private mail works out of the box. The
+/// Config page default MUST equal this (a schema test pins it).
+pub const DEFAULT_CHANNEL_XITE: &str = "epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa";
+
 pub struct ChannelState {
     pub db: Arc<ChannelDb>,
     pub engine: Arc<dyn Engine>,
@@ -1183,17 +1188,25 @@ async fn run_channel_indexer(
 }
 
 async fn run_channel_plugin(state: Arc<AppState>) {
-            if !state.config_bool("channel_enabled", false).await {
+            // ON by default: metadata-private mail is a core feature, not an
+            // opt-in. `channel_enabled=false` remains the explicit off switch.
+            if !state.config_bool("channel_enabled", true).await {
                 return;
             }
+            // Unset/blank falls back to the official Epix Mail xite, so mail
+            // works out of the box with zero configuration.
             let xite = state
                 .config_get("channel_xite")
                 .await
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_default();
-            if xite.is_empty() {
-                state.log("INFO", "channel_enabled but channel_xite is unset; channels off").await;
-                return;
+                .and_then(|v| v.as_str().map(str::trim).map(String::from))
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| DEFAULT_CHANNEL_XITE.to_string());
+            // A fresh node may not have the channel xite yet (the user has
+            // never opened Epix Mail). Idle here until it appears - the moment
+            // the xite is registered (first visit / clone), channels come up
+            // without a restart. Costs one cheap lookup a minute meanwhile.
+            while !state.has_xite(&xite).await {
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             }
             let Some(engine) = build_engine(&state).await else { return };
             let Some(db) = open_db(&state).await else {
@@ -1228,6 +1241,32 @@ async fn run_channel_plugin(state: Arc<AppState>) {
                 let s = state.clone();
                 let m = ms.clone();
                 tokio::spawn(retry_index_records(s, m));
+            }
+            // Auto-import legacy (pre-ECX) mail once the plugin is up:
+            // idempotent, and it must run BEFORE any rule-driven cleanup can
+            // delete legacy messages.json files - otherwise a user who never
+            // opens settings silently loses their old mail on cutover.
+            {
+                let s = state.clone();
+                let m = ms.clone();
+                tokio::spawn(async move {
+                    match import_legacy_mail(&s, &m).await {
+                        Ok(report) if report.imported > 0 => {
+                            s.log(
+                                "INFO",
+                                format!(
+                                    "channels: imported {} legacy mail message(s) into the private index",
+                                    report.imported
+                                ),
+                            )
+                            .await;
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            s.log("DEBUG", format!("channels: legacy mail import: {e}")).await;
+                        }
+                    }
+                });
             }
 
             install_channel_rln(&state, &ms, &xite).await;
@@ -1282,6 +1321,57 @@ fn identity_id(ms: &ChannelState) -> Result<i64, String> {
         .ok_or_else(|| "no channel identity".to_string())
 }
 
+/// Whether OUR device's key bundle is committed in the xite's shared data:
+/// present in `data/users/<dir>/` (primary `data.json` or this device's slot),
+/// cryptographically valid, carrying our auth, AND hash-declared by the
+/// directory's signed `content.json`. The last clause is what separates
+/// "published" from "an unsigned local draft" - a failed half-publish must
+/// keep the onboarding publish step visible.
+async fn own_bundle_committed(
+    state: &Arc<AppState>,
+    xite: &str,
+    engine: &dyn Engine,
+    auth: &str,
+    dir: &str,
+) -> bool {
+    let content_path = format!("data/users/{dir}/content.json");
+    let Some(bytes) = state.read_xite_file(xite, &content_path).await else {
+        return false;
+    };
+    let Ok(content) = serde_json::from_slice::<Value>(&bytes) else {
+        return false;
+    };
+    let Some(files) = content.get("files").and_then(Value::as_object) else {
+        return false;
+    };
+    for (name, entry) in files {
+        if name != "data.json" && *name != device_bundle_file(auth) {
+            continue;
+        }
+        let Some(declared) = entry.get("sha512").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(file_bytes) = state.read_xite_file(xite, &format!("data/users/{dir}/{name}")).await
+        else {
+            continue;
+        };
+        use sha2::Digest as _;
+        let digest = hex::encode(sha2::Sha512::digest(&file_bytes));
+        if !digest.starts_with(declared) {
+            continue; // on-disk draft differs from the signed declaration
+        }
+        let Ok(bundle) = serde_json::from_slice::<Value>(&file_bytes) else {
+            continue;
+        };
+        if bundle.get("auth").and_then(Value::as_str) == Some(auth)
+            && engine.verify_bundle(&bundle)
+        {
+            return true;
+        }
+    }
+    false
+}
+
 struct ChannelSessionInfo;
 #[async_trait]
 impl WsCommand for ChannelSessionInfo {
@@ -1290,15 +1380,30 @@ impl WsCommand for ChannelSessionInfo {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let ms = channel_state(s)?;
-        let (has_identity, unread) = match identity_id(&ms) {
-            Ok(id) => (true, ms.db.unread_count(id).unwrap_or(0)),
-            Err(_) => (false, 0),
+        let unread = match identity_id(&ms) {
+            Ok(id) => ms.db.unread_count(id).unwrap_or(0),
+            Err(_) => 0,
+        };
+        // "Published" means this device's bundle is COMMITTED: written, valid,
+        // and hash-declared in the user's SIGNED content.json - not merely
+        // that the node auto-initialized its local (private) identity at boot,
+        // and not merely that an unsigned draft sits on disk (a publish that
+        // failed halfway through must keep offering the publish step, or the
+        // user is stranded with a bundle only their own node can see).
+        // Joining the mail platform stays an explicit, user-visible act:
+        // until the user publishes, nothing about them exists in shared data.
+        let key_bundle_published = match s.state.user_auth_address(&ms.xite).await {
+            Ok(auth) => {
+                let dir = norm_xid(&s.state.user_directory(&ms.xite, &auth).await);
+                own_bundle_committed(&s.state, &ms.xite, ms.engine.as_ref(), &auth, &dir).await
+            }
+            Err(_) => false,
         };
         let (outbox_pending, outbox_error) = ms.db.outbox_status().map_err(|e| e.to_string())?;
         Ok(json!({
             "enabled": true,
             "xite": ms.xite,
-            "key_bundle_published": has_identity,
+            "key_bundle_published": key_bundle_published,
             "unread": unread,
             "outbox_pending": outbox_pending,
             "outbox_error": outbox_error,
@@ -2526,6 +2631,54 @@ impl WsCommand for ChannelDeleteLocal {
     }
 }
 
+/// Import this identity's legacy (pre-ECX) mail from any `messages.json` still
+/// on disk into the private index. Idempotent: already-imported and undecryptable
+/// records are skipped, and nothing on the shared site is modified or removed.
+/// Runs automatically at plugin startup (see [`run_channel_plugin`]) so every
+/// legacy user sees their old mail with zero action, BEFORE any rule-driven
+/// cleanup can delete the legacy files out from under them; the WS command
+/// remains for an explicit re-run from the site's settings.
+async fn import_legacy_mail(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+) -> Result<epix_channel::legacy::LegacyImport, String> {
+    let (identity_id, _secret, my_xid, _auth) = channel_identity(state, ms).await?;
+    // The mail key (encrypt index 0) that decrypts legacy ECIES ciphertext
+    // sealed to me — the same key the old site used via eciesDecrypt.
+    let privkey = state.user_encrypt_privatekey(&ms.xite, 0).await?;
+
+    // Gather every user's legacy messages.json currently on disk. Reading is
+    // non-destructive.
+    let mut containers: Vec<Value> = Vec::new();
+    for path in state.list_xite_files(&ms.xite).await {
+        if path.starts_with("data/users/") && path.ends_with("/messages.json") {
+            if let Some(bytes) = state.read_xite_file(&ms.xite, &path).await {
+                if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
+                    containers.push(v);
+                }
+            }
+        }
+    }
+
+    // Decrypt + insert off the async runtime (one ECIES open per candidate).
+    let db = (*ms.db).clone();
+    let report = tokio::task::spawn_blocking(move || {
+        epix_channel::legacy::import_legacy_containers(&db, identity_id, &my_xid, &privkey, &containers)
+    })
+    .await
+    .map_err(|e| format!("legacy mail import task failed: {e}"))?;
+
+    // Refresh the badge if anything landed, and let the page reload threads.
+    if report.imported > 0 {
+        state.push_site_event(
+            &ms.xite,
+            "channelEvent",
+            json!({ "type": "migrated", "imported": report.imported }),
+        );
+    }
+    Ok(report)
+}
+
 struct ChannelMigrateLegacy;
 #[async_trait]
 impl WsCommand for ChannelMigrateLegacy {
@@ -2534,40 +2687,7 @@ impl WsCommand for ChannelMigrateLegacy {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let ms = channel_state(s)?;
-        let (identity_id, _secret, my_xid, _auth) = channel_identity(&s.state, &ms).await?;
-        // The mail key (encrypt index 0) that decrypts legacy ECIES ciphertext
-        // sealed to me — the same key the old site used via eciesDecrypt.
-        let privkey = s.state.user_encrypt_privatekey(&ms.xite, 0).await?;
-
-        // Gather every user's legacy messages.json currently on disk. Reading is
-        // non-destructive; nothing on the shared site is modified or removed.
-        let mut containers: Vec<Value> = Vec::new();
-        for path in s.state.list_xite_files(&ms.xite).await {
-            if path.starts_with("data/users/") && path.ends_with("/messages.json") {
-                if let Some(bytes) = s.state.read_xite_file(&ms.xite, &path).await {
-                    if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
-                        containers.push(v);
-                    }
-                }
-            }
-        }
-
-        // Decrypt + insert off the async runtime (one ECIES open per candidate).
-        let db = (*ms.db).clone();
-        let report = tokio::task::spawn_blocking(move || {
-            epix_channel::legacy::import_legacy_containers(&db, identity_id, &my_xid, &privkey, &containers)
-        })
-        .await
-        .map_err(|e| format!("channelMigrateLegacy task failed: {e}"))?;
-
-        // Refresh the badge if anything landed, and let the page reload threads.
-        if report.imported > 0 {
-            s.state.push_site_event(
-                &ms.xite,
-                "channelEvent",
-                json!({ "type": "migrated", "imported": report.imported }),
-            );
-        }
+        let report = import_legacy_mail(&s.state, &ms).await?;
         Ok(json!({
             "imported": report.imported,
             "skipped": report.skipped,
@@ -3049,5 +3169,24 @@ mod multi_device_tests {
         );
         restarted_channel.db.ack_outbound(legacy_id).unwrap();
         assert!(!restarted_channel.db.outbound_pending(legacy_id).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod default_config_tests {
+    /// The Config page's Channels defaults must equal the plugin's code
+    /// defaults, or the UI advertises a state the node does not actually use.
+    #[test]
+    fn config_page_channel_defaults_match_plugin_defaults() {
+        let row = |key: &str| {
+            epix_ui::state::CONFIG_SCHEMA
+                .iter()
+                .find(|(_, k, _, _, _)| *k == key)
+                .unwrap_or_else(|| panic!("{key} missing from CONFIG_SCHEMA"))
+        };
+        let (_, _, _, enabled_default, _) = row("channel_enabled");
+        assert_eq!(*enabled_default, "true", "channels are ON by default");
+        let (_, _, _, xite_default, _) = row("channel_xite");
+        assert_eq!(*xite_default, super::DEFAULT_CHANNEL_XITE);
     }
 }
