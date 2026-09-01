@@ -1896,10 +1896,27 @@ impl AppState {
         }
         let started = std::time::Instant::now();
         let total = candidates.len();
+        let (due, skipped) = self.due_sweep_paths(address, &rules, cur_week);
+        let mut pass = SweepPass::new(candidates);
+        pass.sweep_paths(self, address, due, true).await;
+        self.log_sweep_pass(address, total, &pass, skipped, started.elapsed()).await;
+
+        // Reclaim disk: drop shards past the owner-set retention window.
+        self.prune_expired_pool_shards(address).await;
+    }
+
+    /// The current + previous week's shard paths split into those due for a
+    /// sweep and a count of those still cooling off (see `pool_shard_due`).
+    fn due_sweep_paths(
+        &self,
+        address: &str,
+        rules: &[PoolRule],
+        cur_week: i64,
+    ) -> (Vec<String>, usize) {
         let now = now_ms();
         let mut due = Vec::new();
         let mut skipped = 0usize;
-        for rule in &rules {
+        for rule in rules {
             for week in [cur_week - 1, cur_week] {
                 if week < rule.since_week {
                     continue;
@@ -1914,12 +1931,7 @@ impl AppState {
                 }
             }
         }
-        let mut pass = SweepPass::new(candidates);
-        pass.sweep_paths(self, address, due, true).await;
-        self.log_sweep_pass(address, total, &pass, skipped, started.elapsed()).await;
-
-        // Reclaim disk: drop shards past the owner-set retention window.
-        self.prune_expired_pool_shards(address).await;
+        (due, skipped)
     }
 
     /// Whether this shard path is due for a sweep, per its quiet-backoff.
