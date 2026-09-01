@@ -4037,6 +4037,15 @@ pub struct AppState {
     /// [`Self::subscribe_pool_deltas`] and filters by address. Decoupled so the
     /// pool machinery has no knowledge of its consumers.
     pub(crate) pool_events: tokio::sync::broadcast::Sender<crate::pool::PoolDelta>,
+    /// Per-shard sweep backoff, keyed by "address\0inner_path": how many
+    /// consecutive sweeps found nothing new there, and the earliest time to ask
+    /// again. Most shard paths are permanently empty (a pool fans out over 16
+    /// sub-shards per week, and a quiet week fills one or two), so re-fetching
+    /// every path every pass spends the whole budget re-learning "still
+    /// nothing". A path that yields something resets to hot; one that stays
+    /// quiet cools off exponentially. Records also arrive by push, so the sweep
+    /// is anti-entropy backup and can afford to be lazy about cold shards.
+    pub(crate) pool_sweep_backoff: std::sync::Mutex<HashMap<String, (u32, i64)>>,
     /// Optional RLN admission hook for `rln_required` pools, installed by the
     /// node at startup. Kept as a trait object so the arkworks proving stack
     /// stays out of this crate (see [`crate::pool::PoolAdmission`]).
@@ -5027,6 +5036,7 @@ impl AppState {
             edx_fetcher: RwLock::new(None),
             pool_rules: RwLock::new(HashMap::new()),
             pool_shard_locks: std::sync::Mutex::new(HashMap::new()),
+            pool_sweep_backoff: std::sync::Mutex::new(HashMap::new()),
             pool_events: tokio::sync::broadcast::channel(1024).0,
             pool_admission: RwLock::new(None),
             capabilities: std::sync::RwLock::new(HashMap::new()),
