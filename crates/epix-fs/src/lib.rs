@@ -422,9 +422,10 @@ pub fn remove_file_write_through(path: &Path) -> io::Result<()> {
                             "durable-delete tombstone is not a regular file",
                         ));
                     }
-                    let mut permissions = metadata.permissions();
-                    permissions.set_readonly(false);
-                    std::fs::set_permissions(&tombstone, permissions)?;
+                    // Clear exactly FILE_ATTRIBUTE_READONLY rather than the
+                    // POSIX-mode-shaped set_readonly(false), which asks for
+                    // write for owner, group AND other.
+                    clear_readonly_attribute(&tombstone)?;
                     std::fs::remove_file(&tombstone)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -448,9 +449,7 @@ pub fn remove_file_write_through(path: &Path) -> io::Result<()> {
 
     if let Ok(metadata) = std::fs::symlink_metadata(&tombstone) {
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 && metadata.is_file() {
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            let _ = std::fs::set_permissions(&tombstone, permissions);
+            let _ = clear_readonly_attribute(&tombstone);
             let _ = std::fs::remove_file(&tombstone);
         }
     }
