@@ -179,7 +179,18 @@ impl SweepPass {
     /// session spreads its requests over whichever links answer, passes repeat,
     /// and records also arrive by push, so convergence is unaffected while the
     /// cost drops by more than an order of magnitude.
-    async fn sweep_paths(&mut self, state: &Arc<AppState>, address: &str, paths: Vec<String>) {
+    /// `cool_quiet` records the quiet-backoff for paths that yielded nothing.
+    /// Only the PERIODIC sweep does that: a historical backfill legitimately
+    /// finds most of its (old, already-synced) paths empty, and letting it
+    /// write backoff cooled every current-week shard at startup - which is
+    /// exactly the hot set the periodic sweep exists to watch.
+    async fn sweep_paths(
+        &mut self,
+        state: &Arc<AppState>,
+        address: &str,
+        paths: Vec<String>,
+        cool_quiet: bool,
+    ) {
         if paths.is_empty() || self.candidates.is_empty() {
             return;
         }
@@ -202,7 +213,9 @@ impl SweepPass {
             if merged {
                 self.merged += 1;
             }
-            state.note_pool_sweep_result(address, path, merged);
+            if cool_quiet || merged {
+                state.note_pool_sweep_result(address, path, merged);
+            }
         }
     }
 }
@@ -1902,7 +1915,7 @@ impl AppState {
             }
         }
         let mut pass = SweepPass::new(candidates);
-        pass.sweep_paths(self, address, due).await;
+        pass.sweep_paths(self, address, due, true).await;
         self.log_sweep_pass(address, total, &pass, skipped, started.elapsed()).await;
 
         // Reclaim disk: drop shards past the owner-set retention window.
@@ -2038,7 +2051,7 @@ impl AppState {
             }
         }
         let mut pass = SweepPass::new(peers);
-        pass.sweep_paths(self, address, paths).await;
+        pass.sweep_paths(self, address, paths, false).await;
     }
 
     /// Read every on-disk shard of `address` and return all records — the source
