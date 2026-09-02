@@ -896,6 +896,12 @@ struct VerifiedXiteIndex {
     /// rejected: the index is INCOMPLETE, not wrong. A non-empty list marks the
     /// xite for [`AppState::retry_deferred_xid_xites`] once trust arrives.
     deferred: Vec<String>,
+    /// True when at least one verdict in this index used the DURABLE identity
+    /// cache (chain unreachable, answer proven in an earlier session). The
+    /// index is complete and serves - but the xite is marked for the same
+    /// retry, so every cached verdict is re-proven live once the chain
+    /// answers.
+    stale: bool,
 }
 
 /// The outcome of resolving a verification pass's xID names: the map the
@@ -905,6 +911,10 @@ struct VerifiedXiteIndex {
 struct XidResolution {
     map: epix_content::XidMap,
     deferred: Vec<String>,
+    /// True when at least one name was answered from the durable cache
+    /// instead of a live chain lookup - the caller's verdicts are then
+    /// provisional and must be re-proven once the chain is reachable.
+    stale: bool,
 }
 
 #[derive(Clone)]
@@ -20013,6 +20023,7 @@ impl AppState {
         let mut manifest_chains =
             HashMap::from([("content.json".to_string(), Vec::new())]);
         let mut deferred: Vec<String> = Vec::new();
+        let mut stale = false;
         Self::append_object_declarations(
             accounting_key,
             canonical,
@@ -20053,6 +20064,7 @@ impl AppState {
                 },
                 None => XidResolution::default(),
             };
+            stale |= resolution.stale;
             // Verify with whatever resolved. An unresolved name only matters
             // if it actually changed the outcome, so do NOT pre-empt a child
             // that verifies fine without it - a transient miss on some
@@ -20128,6 +20140,7 @@ impl AppState {
             manifests,
             manifest_chains,
             deferred,
+            stale,
         })
     }
 
@@ -20171,9 +20184,12 @@ impl AppState {
         // Recorded on install rather than at the walk so a later good pass
         // clears the mark by itself - no separate invalidation to forget.
         if let Ok(mut pending) = self.xid_deferred_xites.lock() {
-            if index.deferred.is_empty() {
+            if index.deferred.is_empty() && !index.stale {
                 pending.remove(canonical);
             } else {
+                // Deferred (incomplete) or stale (complete but proven from
+                // the durable cache): either way the retry must re-run this
+                // xite against the LIVE chain.
                 pending.insert(canonical.to_string());
             }
         }
@@ -21348,12 +21364,14 @@ impl AppState {
         let mut out = XidResolution::default();
         for name in names {
             let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-            match epix_chain::xid_signers::resolve_identities_checked(label, tld).await {
-                Ok(identities) if !identities.is_empty() => {
-                    out.map.insert(name, chain_xid_identities(identities));
+            match epix_chain::xid_signers::resolve_identities_or_cached(label, tld).await {
+                Ok((identities, from_cache)) => {
+                    out.stale |= from_cache;
+                    if !identities.is_empty() {
+                        out.map.insert(name, chain_xid_identities(identities));
+                    }
+                    // Empty and live: the chain says there is nothing to link.
                 }
-                // Resolved, and the chain says there is nothing to link.
-                Ok(_) => {}
                 Err(error) if error.is_authoritative() => {}
                 Err(_) => out.deferred.push(name),
             }

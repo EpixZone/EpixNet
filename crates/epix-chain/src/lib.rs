@@ -474,6 +474,122 @@ pub fn parse_finality_pin(json: &[u8]) -> std::result::Result<finality::PinnedSe
     finality::PinnedSet::new(validators, chain_id, unix, height)
 }
 
+/// Serialize a pin to the exact JSON [`install_finality_pin`] parses, so a
+/// light-client-verified set can persist across restarts and re-anchor trust
+/// at boot with no network. Validators are sorted by valcons for a stable
+/// file.
+pub fn finality_pin_json(pin: &finality::PinnedSet) -> Vec<u8> {
+    let mut validators: Vec<_> = pin.validators.iter().collect();
+    validators.sort_by(|a, b| a.0.cmp(b.0));
+    let validators: Vec<serde_json::Value> = validators
+        .into_iter()
+        .map(|(valcons, validator)| {
+            serde_json::json!({
+                "valcons": valcons,
+                "pubkey": hex::encode(validator.pubkey),
+                "voting_power": validator.voting_power,
+            })
+        })
+        .collect();
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "chain_id": pin.chain_id,
+        "pinned_at_height": pin.pinned_at_height,
+        "pinned_at_unix": pin.pinned_at_unix,
+        "validators": validators,
+    }))
+    .unwrap_or_default()
+}
+
+/// Whether a durable cache entry proven at `height` may still be used as a
+/// FALLBACK when the chain cannot be asked: verification must be on, the pin
+/// inside its weak-subjectivity window, and the entry at or below the durable
+/// checkpoint (an entry "from the future" was never proven by this trust
+/// lineage). Unlike [`finality_checkpoint_matches`] this is monotonic - it
+/// accepts entries proven at superseded checkpoints, trading bounded
+/// staleness (a revocation that landed after the entry was stored) for
+/// boot-time availability. Never use it to gate a LIVE resolution.
+pub fn finality_checkpoint_covers(height: u64) -> bool {
+    let checkpoint_height = checkpoint::height();
+    verify_finality_enabled()
+        && finality_pin_floor_at(now_unix()).is_some()
+        && height > 0
+        && height <= checkpoint_height
+}
+
+#[cfg(test)]
+mod boot_trust_tests {
+    use super::*;
+
+    /// Guards the boot re-anchor path: the pin the light client persists must
+    /// parse back into the identical trust root, or a restart silently loses
+    /// trust it had.
+    #[test]
+    fn finality_pin_json_roundtrips_through_parse() {
+        let mut validators = std::collections::HashMap::new();
+        validators.insert(
+            "epixvalcons1aaa".to_string(),
+            finality::PinnedValidator { pubkey: [7u8; 32], voting_power: 10 },
+        );
+        validators.insert(
+            "epixvalcons1bbb".to_string(),
+            finality::PinnedValidator { pubkey: [9u8; 32], voting_power: 20 },
+        );
+        let pin =
+            finality::PinnedSet::new(validators, "epix_1917-1", 1_790_000_000, 42).unwrap();
+        let parsed = parse_finality_pin(&finality_pin_json(&pin)).unwrap();
+        assert_eq!(parsed.chain_id, pin.chain_id);
+        assert_eq!(parsed.pinned_at_height, 42);
+        assert_eq!(parsed.pinned_at_unix, 1_790_000_000);
+        assert_eq!(parsed.total_power, 30);
+        assert_eq!(parsed.validators.len(), 2);
+        assert_eq!(parsed.validators["epixvalcons1aaa"].pubkey, [7u8; 32]);
+        assert_eq!(parsed.validators["epixvalcons1bbb"].voting_power, 20);
+    }
+
+    /// The durable-cache gate: nothing is covered without verification, a
+    /// pin, and a checkpoint - and nothing past the checkpoint is EVER
+    /// covered (an entry "from the future" was not proven by this lineage).
+    #[tokio::test]
+    async fn checkpoint_covers_gates_the_durable_cache() {
+        let _guard = finality_state_test_guard().await;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_pinned_validators(None);
+                set_verify_finality(false);
+            }
+        }
+        let _reset = Reset;
+
+        set_pinned_validators(None);
+        set_verify_finality(false);
+        assert!(!finality_checkpoint_covers(1), "verification off: no coverage");
+        set_verify_finality(true);
+        assert!(!finality_checkpoint_covers(1), "no pin: no coverage");
+
+        // A pin captured "now", so the weak-subjectivity window is open.
+        let mut validators = std::collections::HashMap::new();
+        validators.insert(
+            "epixvalcons1cover".to_string(),
+            finality::PinnedValidator { pubkey: [1u8; 32], voting_power: 1 },
+        );
+        let pin =
+            finality::PinnedSet::new(validators, "epix_1917-1", now_unix(), 42).unwrap();
+        install_finality_pin(&finality_pin_json(&pin)).unwrap();
+        // NOTE: the checkpoint path is a process-global that refuses to move;
+        // this is the only test in the crate that configures it.
+        let dir = tempfile::tempdir().unwrap();
+        configure_finality_checkpoint(dir.path().join("xid_finality_checkpoint.json"))
+            .unwrap();
+
+        // The floor checkpoint sits at the pin height.
+        assert!(finality_checkpoint_covers(42), "at the checkpoint: covered");
+        assert!(finality_checkpoint_covers(1), "older than the checkpoint: covered");
+        assert!(!finality_checkpoint_covers(43), "future of the checkpoint: never");
+        assert!(!finality_checkpoint_covers(0), "height 0 is not a proof");
+    }
+}
+
 #[cfg(test)]
 mod chain_error_tests {
     use super::*;
@@ -841,6 +957,9 @@ pub mod xid_signers {
     }
 
     fn store(key: String, identities: Vec<Identity>, finality_binding: Option<(u64, String)>) {
+        if let Some(binding) = &finality_binding {
+            durable_store(&key, &identities, binding);
+        }
         if let Ok(mut guard) = CACHE.write() {
             guard.get_or_insert_with(HashMap::new).insert(
                 key,
@@ -853,8 +972,92 @@ pub mod xid_signers {
         }
     }
 
-    /// Drop every cached signer resolution (see [`super::clear_xid_caches`]).
+    /// Where finality-proven resolutions persist across restarts, so a boot
+    /// before any network exists can still verify user content it verified
+    /// last session (see [`resolve_identities_or_cached`]). Unset = no
+    /// durable cache (tests, embedded uses).
+    static DURABLE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    static DURABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One durable entry: the identities plus the finality binding they were
+    /// proven against, so reads can gate on the trust lineage.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct DurableEntry {
+        identities: Vec<Identity>,
+        height: u64,
+        digest: String,
+    }
+
+    /// Set once at boot, before anything resolves.
+    pub fn set_durable_cache_path(path: std::path::PathBuf) {
+        let _ = DURABLE_PATH.set(path);
+    }
+
+    fn durable_store(key: &str, identities: &[Identity], binding: &(u64, String)) {
+        let Some(path) = DURABLE_PATH.get() else { return };
+        let Ok(_guard) = DURABLE_LOCK.lock() else { return };
+        let mut map: HashMap<String, DurableEntry> = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        map.insert(
+            key.to_string(),
+            DurableEntry {
+                identities: identities.to_vec(),
+                height: binding.0,
+                digest: binding.1.clone(),
+            },
+        );
+        if let Ok(bytes) = serde_json::to_vec(&map) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    fn durable_cached(key: &str) -> Option<Vec<Identity>> {
+        let path = DURABLE_PATH.get()?;
+        let _guard = DURABLE_LOCK.lock().ok()?;
+        let map: HashMap<String, DurableEntry> =
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let entry = map.get(key)?;
+        crate::finality_checkpoint_covers(entry.height).then(|| entry.identities.clone())
+    }
+
+    /// [`resolve_identities_checked`], with a durable-cache FALLBACK for
+    /// non-authoritative failures: when the chain cannot be asked (boot
+    /// before Tor, an RPC outage, an offline mesh node), an identity list
+    /// this node chain-proved earlier - still covered by the pinned trust
+    /// lineage - answers instead. The bool is true when the answer came from
+    /// the cache: the caller must treat the verdict as provisional and
+    /// re-verify once the chain is reachable (staleness, not forgery, is the
+    /// residual risk - a revocation landed after the entry was stored keeps
+    /// being honored until then). An authoritative answer (the name really
+    /// does not exist) is never masked by the cache.
+    pub async fn resolve_identities_or_cached(
+        name: &str,
+        tld: &str,
+    ) -> super::Result<(Vec<Identity>, bool)> {
+        match resolve_identities_checked(name, tld).await {
+            Ok(identities) => Ok((identities, false)),
+            Err(error) if error.is_authoritative() => Err(error),
+            Err(error) => match durable_cached(&format!("{name}.{tld}")) {
+                Some(identities) => Ok((identities, true)),
+                None => Err(error),
+            },
+        }
+    }
+
+    /// Drop every cached signer resolution (see [`super::clear_xid_caches`]),
+    /// the durable file included - a trust change invalidates everything it
+    /// proved.
     pub fn clear() {
+        if let Some(path) = DURABLE_PATH.get() {
+            if let Ok(_guard) = DURABLE_LOCK.lock() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         if let Ok(mut guard) = CACHE.write() {
             *guard = None;
         }

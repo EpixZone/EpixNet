@@ -347,6 +347,13 @@ pub async fn boot(
     // Install the finality root of trust and restore its anti-rollback
     // checkpoint before reading a launch cache entry or contacting chain RPC.
     let xid_finality = initialize_xid_finality(&opts.data_root)?;
+    // Durable identity cache: finality-proven name->identity resolutions
+    // persist here so the NEXT boot can verify user content before any
+    // network exists (gated on the restored trust lineage; see
+    // `xid_signers::resolve_identities_or_cached`).
+    epix_chain::xid_signers::set_durable_cache_path(
+        opts.data_root.join("xid-identity-cache.json"),
+    );
 
     // Parse the startup network policy strictly, arm its egress gate, and only
     // then select the launch target. Tor-Always and offline mode use the cache
@@ -357,7 +364,7 @@ pub async fn boot(
     // starts, so failing boot on it would deadlock every fresh install.
     let (launch, startup_network_policy) = prepare_startup_launch_with(
         &opts,
-        matches!(xid_finality, XidFinalityBoot::NetworkBootstrap),
+        matches!(xid_finality, XidFinalityBoot::NetworkBootstrap { .. }),
         arm_startup_network_policy,
         |data_root, target| async move { resolve_target(&data_root, &target).await },
     )
@@ -1914,9 +1921,19 @@ async fn verify_current_child_manifests(
             .read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let (xid_map, unresolved) = resolve_user_signers(&parent, &path, child.as_ref()).await;
+        let (xid_map, unresolved, stale) =
+            resolve_user_signers(&parent, &path, child.as_ref()).await;
         match xite.verify_next_stored_manifest(walk, &path, &xid_map) {
             Ok(Some(manifest)) => {
+                // Verified against CACHED identities: the verdict stands (the
+                // cache is chain-proven), but mark the xite so the retry
+                // re-verifies live once the chain answers - a revocation that
+                // landed after the cache entry must not be honored forever.
+                if stale {
+                    if let Some(state) = progress {
+                        state.mark_xid_deferred(xite.address.as_str());
+                    }
+                }
                 files.extend(manifest.files());
                 includes.extend(manifest.includes());
             }
@@ -2569,17 +2586,22 @@ fn user_dir_name(inner_path: &str) -> Option<&str> {
 /// chain-delegated cert name on the child), reporting whether any of them
 /// could not be ASKED about (as opposed to answered).
 ///
-/// The bool is true when at least one lookup failed non-authoritatively - a
-/// chain outage, a Tor hiccup mid-sync, a hostile proof. The caller must then
-/// withhold its verdict instead of verifying against a map it knows is
+/// The first bool is true when at least one lookup failed non-authoritatively
+/// - a chain outage, a Tor hiccup mid-sync, a hostile proof. The caller must
+/// then withhold its verdict instead of verifying against a map it knows is
 /// incomplete: doing that turns a temporary outage into
 /// "xID name 'x' not found on chain" and rejects the user permanently, even
 /// though the name is registered with active identities.
+///
+/// The second bool is true when at least one answer came from the DURABLE
+/// cache (chain unreachable, entry proven in an earlier session): verdicts
+/// built on it stand but are provisional - the caller marks the xite so the
+/// retry re-proves them live.
 async fn resolve_user_signers(
     parent: &serde_json::Value,
     inner_path: &str,
     child: Option<&serde_json::Value>,
-) -> (epix_content::XidMap, bool) {
+) -> (epix_content::XidMap, bool, bool) {
     let mut names = epix_content::verify::content_xid_names(parent, inner_path);
     // A chain-delegated cert on the child itself must resolve too, so the
     // cert check can match its signer against the name's linked identities.
@@ -2588,19 +2610,22 @@ async fn resolve_user_signers(
     }
     let mut map = epix_content::XidMap::new();
     let mut deferred = false;
+    let mut stale = false;
     for name in names {
         let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-        match epix_chain::xid_signers::resolve_identities_checked(label, tld).await {
-            Ok(identities) if !identities.is_empty() => {
-                map.insert(name, chain_xid_identities(identities));
+        match epix_chain::xid_signers::resolve_identities_or_cached(label, tld).await {
+            Ok((identities, from_cache)) => {
+                stale |= from_cache;
+                if !identities.is_empty() {
+                    map.insert(name, chain_xid_identities(identities));
+                }
+                // Empty and live: the chain answered - no identities linked.
             }
-            // The chain answered: no identities linked to this name.
-            Ok(_) => {}
             Err(error) if error.is_authoritative() => {}
             Err(_) => deferred = true,
         }
     }
-    (map, deferred)
+    (map, deferred, stale)
 }
 
 /// The chain's identity records in the shape verification consumes.
@@ -3221,10 +3246,17 @@ enum XidFinalityBoot {
         validator_count: usize,
         restored_height: Option<u64>,
     },
+    /// No operator pin, but the light client's persisted pin from a previous
+    /// run re-anchored trust at boot with no network.
+    RestoredFromLightClient {
+        validator_count: usize,
+        restored_height: Option<u64>,
+    },
     /// No local pin: verification is ON and fails closed until the light
     /// client establishes trust from network-quorum agreement (seconds after
-    /// the first successful chain contact).
-    NetworkBootstrap,
+    /// the first successful chain contact). `restore_warning` carries why a
+    /// persisted light-client pin could not be restored, for the boot log.
+    NetworkBootstrap { restore_warning: Option<String> },
     InsecureLegacy,
 }
 
@@ -3262,12 +3294,54 @@ fn initialize_xid_finality(data_root: &std::path::Path) -> Result<XidFinalityBoo
             Ok(XidFinalityBoot::InsecureLegacy)
         }
         None => {
+            // No operator pin - but a node that has run before has the light
+            // client's last VERIFIED set persisted (written on every advance).
+            // Re-anchoring from it needs no network, so cached resolutions
+            // can verify at boot instead of failing closed until Tor is up;
+            // the light client then advances it as usual once online. Its
+            // weak-subjectivity clock still applies: a pin older than the
+            // window fails resolution closed exactly like a stale xid_pin.
+            let auto_pin_path = data_root.join("xid_lc_pin.json");
+            let mut restore_warning = None;
+            match read_xid_finality_pin(&auto_pin_path) {
+                Ok(Some(bytes)) => match epix_chain::install_finality_pin(&bytes) {
+                    Ok(validator_count) => {
+                        let checkpoint_path = data_root.join("xid_finality_checkpoint.json");
+                        match epix_chain::configure_finality_checkpoint(&checkpoint_path) {
+                            Ok(restored) => {
+                                return Ok(XidFinalityBoot::RestoredFromLightClient {
+                                    validator_count,
+                                    restored_height: restored
+                                        .map(|checkpoint| checkpoint.height),
+                                });
+                            }
+                            Err(error) => {
+                                // Fail back to the network bootstrap rather
+                                // than bricking boot: unlike an operator pin,
+                                // this file is node-written state.
+                                epix_chain::set_pinned_validators(None);
+                                restore_warning = Some(format!(
+                                    "light-client pin restore: checkpoint: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        restore_warning =
+                            Some(format!("light-client pin restore: {error}"));
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    restore_warning = Some(format!("light-client pin restore: {error}"));
+                }
+            }
             // Fail closed until the light client bootstraps: verification is
             // ON with no pin, so every resolve refuses rather than trusting
             // the RPC while trust is not yet established.
             epix_chain::set_pinned_validators(None);
             epix_chain::set_verify_finality(true);
-            Ok(XidFinalityBoot::NetworkBootstrap)
+            Ok(XidFinalityBoot::NetworkBootstrap { restore_warning })
         }
     }
 }
@@ -3344,6 +3418,7 @@ async fn xid_lightclient_config(
 ) -> epix_chain::LightClientConfig {
     let mut cfg = epix_chain::LightClientConfig::new(data_root.join("xid_lc_state.json"));
     cfg.checkpoint_path = Some(data_root.join("xid_finality_checkpoint.json"));
+    cfg.auto_pin_path = Some(data_root.join("xid_lc_pin.json"));
     if let Some(secs) = state
         .config_get("xid_trusting_period_secs")
         .await
@@ -3490,7 +3565,33 @@ async fn serve(
                 .await;
             spawn_xid_lightclient(state.clone(), opts.data_root.clone());
         }
-        XidFinalityBoot::NetworkBootstrap => {
+        XidFinalityBoot::RestoredFromLightClient {
+            validator_count,
+            restored_height,
+        } => {
+            let checkpoint_note = restored_height
+                .map(|height| format!("; restored height {height}"))
+                .unwrap_or_default();
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "xID finality: re-anchored {validator_count} validators from the \
+                         light client's persisted pin (no network needed){checkpoint_note}"
+                    ),
+                )
+                .await;
+            spawn_xid_lightclient(state.clone(), opts.data_root.clone());
+        }
+        XidFinalityBoot::NetworkBootstrap { restore_warning } => {
+            if let Some(warning) = restore_warning {
+                state
+                    .log(
+                        "WARN",
+                        format!("xID finality: {warning}; falling back to network bootstrap"),
+                    )
+                    .await;
+            }
             state
                 .log(
                     "INFO",
