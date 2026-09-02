@@ -1090,6 +1090,41 @@ fn no_new_xites_html(requested: &str) -> String {
     )
 }
 
+/// The page shown when a name has not resolved yet. Unlike a bare 404 it
+/// behaves like the downloading screen: it keeps probing in the background
+/// (each probe re-enters the wrapper handler, which re-runs the resolve) and
+/// reloads the moment the name lands. It also links to the config page, so a
+/// user whose node needs a settings change (Tor mode, chain RPCs, offline
+/// policy) to resolve anything is not stranded on a dead end.
+fn resolve_retry_html(requested: &str) -> String {
+    let name = html_escape(requested);
+    // Probe every 6s; a non-404 answer means the resolve landed (the wrapper
+    // now serves), so swap this page for the real one. Network errors (node
+    // restarting) are ignored and probed through.
+    const RETRY_SCRIPT: &str = "<script>(function(){var n=0;\
+        function probe(){fetch(location.href,{cache:'no-store'})\
+        .then(function(r){if(r.status!==404){location.reload();return;}again();})\
+        .catch(again);}\
+        function again(){n++;var el=document.getElementById('resolve-status');\
+        if(el){el.textContent='Still looking\\u2026 (attempt '+n+')';}\
+        setTimeout(probe,6000);}\
+        setTimeout(probe,6000);})();</script>";
+    status_page_html(
+        &format!("Looking up {name}"),
+        "Looking up this name",
+        &format!(
+            "<p style='color:#ABABB5;overflow-wrap:anywhere'>{name} has not resolved yet. \
+             This can take a while on a fresh start, while Tor bootstraps, or while the \
+             node reaches the Epix chain. This page retries automatically.</p>\
+             <p id='resolve-status' style='color:#6B6B76;font-size:13px'>Retrying\u{2026}</p>\
+             <p style='margin-top:32px'><a href='/Config' \
+             style='color:#8AB4F8;text-decoration:none'>Open settings</a> \
+             <span style='color:#6B6B76;font-size:13px'>&nbsp;if your connection setup \
+             needs a change</span></p>{RETRY_SCRIPT}"
+        ),
+    )
+}
+
 /// The dark full-page shell shared by the standalone status pages (blocked /
 /// new-xites-disabled): a centered heading with `body_html` (already-escaped
 /// markup) beneath it.
@@ -1249,17 +1284,37 @@ async fn render_wrapper(
                 let key = ctx.state.canonical_key(&requested).await;
                 if key == requested {
                     // A mistyped/forged address shape gets a clear message: it
-                    // was refused by policy, not "not found" on the chain.
-                    let msg = match requested
-                        .strip_suffix(".epix")
-                        .map(epix_core::classify_label)
-                    {
-                        Some(epix_core::LabelClass::AddressShaped) => format!(
-                            "{requested} looks like a mistyped epix1 address: the checksum does not match, so it will not be resolved as a name"
-                        ),
-                        _ => format!("could not resolve {requested}"),
-                    };
-                    return (StatusCode::NOT_FOUND, msg).into_response();
+                    // was refused by policy, not "not found" on the chain, and
+                    // retrying can never fix a bad checksum.
+                    if matches!(
+                        requested.strip_suffix(".epix").map(epix_core::classify_label),
+                        Some(epix_core::LabelClass::AddressShaped)
+                    ) {
+                        return (
+                            StatusCode::NOT_FOUND,
+                            [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                            status_page_html(
+                                "Mistyped address",
+                                "This looks like a mistyped address",
+                                &format!(
+                                    "<p style='color:#ABABB5;overflow-wrap:anywhere'>{} \
+                                     looks like an epix1 address, but its checksum does \
+                                     not match, so it will not be resolved as a name.</p>",
+                                    html_escape(&requested),
+                                ),
+                            ),
+                        )
+                            .into_response();
+                    }
+                    // Anything else may just be an outage (chain unreachable,
+                    // Tor still bootstrapping): serve the retrying page, like
+                    // the downloading screen, instead of a dead-end 404.
+                    return (
+                        StatusCode::NOT_FOUND,
+                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+                        resolve_retry_html(&requested),
+                    )
+                        .into_response();
                 }
                 address = key;
             }
