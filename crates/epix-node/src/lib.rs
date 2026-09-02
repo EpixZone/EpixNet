@@ -3280,7 +3280,18 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         loop {
             let before = epix_chain::pinned_validators();
             let outcome = epix_chain::advance_trusted_set(&cfg).await;
+            // A xite whose user content could not be xID-verified is waiting on
+            // exactly this: the trusted set going from nothing to something.
+            // Only that transition retries - not every tick, or an hourly
+            // UpToDate would re-index the whole deferred set forever.
+            let anchored_now = before.is_none() && epix_chain::pinned_validators().is_some();
             log_xid_lightclient_outcome(&state, before, outcome).await;
+            if anchored_now {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    state.retry_deferred_xid_xites().await;
+                });
+            }
             let delay = if epix_chain::pinned_validators().is_some() {
                 interval_secs
             } else {
@@ -3417,6 +3428,11 @@ async fn serve(
     startup_network_policy: StartupNetworkPolicy,
 ) -> Result<(UiServer, RunningNode), String> {
     let state = AppState::with_data_dir(&opts.version, &opts.data_root);
+    // Set BEFORE any xite is restored: a node that is offline by policy will
+    // never anchor chain trust, so a withheld xID verdict there is terminal
+    // rather than something to retry. Deciding this later (the chain route is
+    // configured well after restore_xites) would be too late for the boot pass.
+    state.set_offline_by_policy(startup_network_policy == StartupNetworkPolicy::Offline);
     state
         .initialize_security_tokens()
         .map_err(|error| format!("cannot initialize UI security tokens: {error}"))?;
@@ -3773,6 +3789,15 @@ async fn serve(
                     #[cfg(feature = "bittorrent")]
                     epix_bt::http::set_socks(Some("socks5h://127.0.0.1:43111".into()));
                     state.log("INFO", "Chain RPC now routed through Tor".to_string()).await;
+                    // Chain egress just opened. Every xite whose user content
+                    // could not be xID-verified during the Tor-bootstrap
+                    // window is still holding a withheld verdict; re-index
+                    // those now so a node that booted before Tor heals without
+                    // a restart. No-op when nothing was deferred.
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        state.retry_deferred_xid_xites().await;
+                    });
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;

@@ -890,6 +890,21 @@ struct VerifiedXiteIndex {
     declarations: Vec<ObjectDeclarationCandidate>,
     manifests: Vec<VerifiedManifestUnit>,
     manifest_chains: HashMap<String, Vec<String>>,
+    /// Children whose verdict was WITHHELD because an xID name they depend on
+    /// could not be resolved for a non-authoritative reason (chain unreachable,
+    /// hostile proof, trust not established yet). They are neither accepted nor
+    /// rejected: the index is INCOMPLETE, not wrong. A non-empty list marks the
+    /// xite for [`AppState::retry_deferred_xid_xites`] once trust arrives.
+    deferred: Vec<String>,
+}
+
+/// The outcome of resolving a verification pass's xID names: the map the
+/// verifier gets, plus the names whose absence is "could not ask" rather than
+/// "the chain said no" (see [`AppState::resolve_xid_names_deferrable`]).
+#[derive(Default)]
+struct XidResolution {
+    map: epix_content::XidMap,
+    deferred: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -3924,6 +3939,11 @@ fn retry_pending_allowed(tries: i64) -> bool {
 }
 
 /// Server-wide state shared across all HTTP/WebSocket handlers.
+/// Floor between [`AppState::retry_deferred_xid_xites`] passes. The Tor-egress
+/// and light-client triggers can fire seconds apart, and chain reachability can
+/// flap; without a floor that becomes a re-index loop.
+const XID_RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+
 pub struct AppState {
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
@@ -4193,6 +4213,23 @@ pub struct AppState {
     /// answered with "database is locked" style errors, which froze app boot
     /// chains that expected rows (EpixTalk's loading overlay, stuck forever).
     db_rebuilds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Canonicals whose last verified index WITHHELD a verdict on at least one
+    /// child because an xID name could not be resolved for a non-authoritative
+    /// reason (chain unreachable at boot, hostile proof, trust not up yet).
+    /// [`Self::retry_deferred_xid_xites`] re-indexes exactly these once trust
+    /// arrives; a later complete pass clears the entry from
+    /// [`Self::install_verified_xite_index`].
+    xid_deferred_xites: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Guards [`Self::retry_deferred_xid_xites`] so the Tor-egress and
+    /// light-client triggers - which can fire seconds apart - cannot both walk
+    /// the set at once.
+    xid_retry_in_flight: std::sync::atomic::AtomicBool,
+    /// When the last retry pass ran, so a flapping chain cannot hot-loop it.
+    xid_retry_last: std::sync::Mutex<Option<std::time::Instant>>,
+    /// True when this node is offline BY POLICY (`offline` config / mesh-only).
+    /// Such a node will never anchor chain trust, so deferral is terminal:
+    /// no retry is scheduled and the dashboard must not show a trust spinner.
+    offline_by_policy: std::sync::atomic::AtomicBool,
     /// Canonicals whose clone/user-content sync is running. Inbound child
     /// updates for them stage-and-defer instead of fetching inline, so a
     /// push cannot hold a child's manifest guard across a slow network pull
@@ -5071,6 +5108,10 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
             db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            xid_deferred_xites: std::sync::Mutex::new(std::collections::HashSet::new()),
+            xid_retry_in_flight: std::sync::atomic::AtomicBool::new(false),
+            xid_retry_last: std::sync::Mutex::new(None),
+            offline_by_policy: std::sync::atomic::AtomicBool::new(false),
             active_child_syncs: std::sync::Mutex::new(std::collections::HashSet::new()),
             xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -13410,6 +13451,168 @@ impl AppState {
         }
     }
 
+    /// Mark this node as offline BY POLICY (`offline` config / mesh-only), so
+    /// a withheld xID verdict is terminal instead of waiting for trust that
+    /// will never arrive. Set once at boot, before any xite is restored.
+    pub fn set_offline_by_policy(&self, offline: bool) {
+        self.offline_by_policy
+            .store(offline, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn offline_by_policy(&self) -> bool {
+        self.offline_by_policy
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Number of xites whose verified index is currently incomplete because an
+    /// xID lookup could not be answered. Surfaced in `serverInfo` so a node
+    /// that is silently serving partial content says so.
+    pub fn xid_deferred_count(&self) -> usize {
+        self.xid_deferred_xites.lock().map(|set| set.len()).unwrap_or(0)
+    }
+
+    /// Whether xID resolution is currently trustworthy, for `serverInfo`.
+    ///
+    /// `state` is what a UI should render:
+    /// - `legacy` - finality verification is off; nothing to establish.
+    /// - `offline_cache` - offline BY POLICY. Reported regardless of anchoring
+    ///   so a deliberately-offline node never shows an "establishing…" spinner
+    ///   for trust that is not coming.
+    /// - `anchored` - a pinned validator set is installed; resolution is
+    ///   verified end to end.
+    /// - `establishing` - verification is required and trust is not up yet
+    ///   (the normal state for the first seconds of a Tor-always boot).
+    ///
+    /// `deferred_xites` is how many xites are serving an incomplete index
+    /// because an xID lookup could not be answered - non-zero here is the
+    /// signal that user content is missing but recoverable.
+    pub fn xid_trust_status(&self) -> Value {
+        let required = epix_chain::verify_finality_enabled();
+        let pinned = epix_chain::pinned_validators();
+        let anchored = pinned.is_some();
+        let state = if !required {
+            "legacy"
+        } else if self.offline_by_policy() {
+            "offline_cache"
+        } else if anchored {
+            "anchored"
+        } else {
+            "establishing"
+        };
+        json!({
+            "required": required,
+            "anchored": anchored,
+            "state": state,
+            "validators": pinned.as_ref().map(|set| set.validators.len()).unwrap_or(0),
+            "height": epix_chain::xid_max_height(),
+            "deferred_xites": self.xid_deferred_count(),
+        })
+    }
+
+    /// Re-index the xites whose last pass WITHHELD a verdict on a child
+    /// because an xID name could not be resolved. Called when chain egress
+    /// opens or the trusted validator set first anchors, so a node that booted
+    /// before Tor heals without a restart.
+    ///
+    /// Returns how many xites were re-indexed. Deliberately targets only the
+    /// deferred set rather than [`Self::rebuild_all_dbs`]: nothing else needs
+    /// redoing, and this runs on a node that may serve dozens of xites.
+    ///
+    /// LOCKING: takes no AppState lock across its awaits. `rebuild_xite_db`
+    /// acquires the activation gate, the manifest mutex and the tree lock, and
+    /// re-enters `xid_deferred_xites` through `install_verified_xite_index` -
+    /// so the set is SNAPSHOTTED and its guard dropped before any await, and
+    /// this must never be called from a caller already holding those.
+    pub async fn retry_deferred_xid_xites(&self) -> usize {
+        use std::sync::atomic::Ordering;
+        // Offline by policy: trust is never coming, so a retry would just walk
+        // the same xites forever. The withheld verdicts stand until the
+        // operator brings the node online.
+        if self.offline_by_policy() {
+            return 0;
+        }
+        if self
+            .xid_retry_in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return 0; // another trigger is already walking the set
+        }
+        struct Guard<'a>(&'a std::sync::atomic::AtomicBool);
+        impl Drop for Guard<'_> {
+            fn drop(&mut self) {
+                self.0.store(false, std::sync::atomic::Ordering::Release);
+            }
+        }
+        let _guard = Guard(&self.xid_retry_in_flight);
+        // Floor between passes: the triggers can fire seconds apart, and a
+        // flapping chain must not turn this into a rebuild loop.
+        {
+            let mut last = match self.xid_retry_last.lock() {
+                Ok(last) => last,
+                Err(_) => return 0,
+            };
+            let now = std::time::Instant::now();
+            if last.is_some_and(|at| now.duration_since(at) < XID_RETRY_MIN_INTERVAL) {
+                return 0;
+            }
+            *last = Some(now);
+        }
+
+        let mut rebuilt = 0usize;
+        // Two passes: boot may still be registering xites while the first one
+        // runs, and a xite added afterwards would otherwise wait for the next
+        // trigger.
+        for _ in 0..2 {
+            let pending: std::collections::HashSet<String> = {
+                let Ok(set) = self.xid_deferred_xites.lock() else {
+                    return rebuilt;
+                };
+                set.clone() // guard MUST drop here: rebuild re-enters this lock
+            };
+            if pending.is_empty() {
+                break;
+            }
+            // The set is keyed by CANONICAL address; rebuild_xite_db keys off
+            // the serving entry, which for an alias is a different string.
+            let mut targets = Vec::new();
+            for address in self.xite_addresses().await {
+                let canonical = {
+                    let xites = self.xites.read().await;
+                    xites
+                        .get(&address)
+                        .map(|xite| canonical_address(xite.content.as_ref(), &address))
+                };
+                if canonical.is_some_and(|canonical| pending.contains(&canonical)) {
+                    targets.push(address);
+                }
+            }
+            if targets.is_empty() {
+                break;
+            }
+            for address in targets {
+                if self.rebuild_xite_db(&address).await {
+                    rebuilt += 1;
+                }
+            }
+        }
+        if rebuilt > 0 {
+            self.log(
+                "INFO",
+                format!(
+                    "xID trust: re-indexed {rebuilt} xite(s) whose user content \
+                     could not be verified while the chain was unreachable"
+                ),
+            )
+            .await;
+        }
+        // Trust state and the deferred count both moved; refresh any open
+        // dashboard over the serverChanged channel rather than making it wait
+        // for a reconnect.
+        self.push_server_info().await;
+        rebuilt
+    }
+
     /// The mute map (`auth_address -> info`).
     pub async fn mute_list(&self) -> Value {
         self.filters.read().await["mutes"].clone()
@@ -16193,7 +16396,11 @@ impl AppState {
             "ui_ip": "127.0.0.1",
             "ui_port": ui_port,
             "debug": false,
-            "offline": false,
+            // Was hardcoded false, which made the dashboard's "Offline mode"
+            // health rung unreachable: a node offline by policy showed
+            // "Checking…"/"Waiting for trackers…" forever instead of saying so.
+            "offline": self.offline_by_policy(),
+            "xid_trust": self.xid_trust_status(),
             "multiuser": multiuser,
             "multiuser_admin": multiuser_admin,
             "master_address": master_address,
@@ -19679,6 +19886,7 @@ impl AppState {
         }];
         let mut manifest_chains =
             HashMap::from([("content.json".to_string(), Vec::new())]);
+        let mut deferred: Vec<String> = Vec::new();
         Self::append_object_declarations(
             accounting_key,
             canonical,
@@ -19693,7 +19901,7 @@ impl AppState {
                 .next_stored_manifest_governing_path(&walk, &child)
                 .ok()
                 .flatten();
-            let xid_map = match governing.as_deref() {
+            let resolution = match governing.as_deref() {
                 Some(parent) => match manifests
                     .iter()
                     .find(|manifest| manifest.inner_path == parent)
@@ -19713,14 +19921,27 @@ impl AppState {
                                 &child_content,
                             ));
                         }
-                        Self::resolve_xid_names(names).await
+                        Self::resolve_xid_names_deferrable(names).await
                     }
-                    None => HashMap::new(),
+                    None => XidResolution::default(),
                 },
-                None => HashMap::new(),
+                None => XidResolution::default(),
             };
-            let verified = match xite.verify_next_stored_manifest(&mut walk, &child, &xid_map) {
+            // A name we could not ask about is not a name that does not exist.
+            // Verifying against a knowingly-incomplete map would manufacture
+            // "xID name 'x' not found on chain" and reject this child for the
+            // rest of the process; skipping records no verdict at all, so the
+            // retry pass can decide once trust is up.
+            if !resolution.deferred.is_empty() {
+                deferred.push(child.clone());
+                let _ = xite.skip_next_stored_manifest(&mut walk, &child);
+                continue;
+            }
+            let verified = match xite.verify_next_stored_manifest(&mut walk, &child, &resolution.map)
+            {
                 Ok(Some(verified)) => verified,
+                // Every name resolved authoritatively, so a failure here IS
+                // the chain's answer: reject permanently, as before.
                 Ok(None) | Err(_) => continue,
             };
             manifest_chains.insert(
@@ -19758,6 +19979,7 @@ impl AppState {
             declarations,
             manifests,
             manifest_chains,
+            deferred,
         })
     }
 
@@ -19796,6 +20018,17 @@ impl AppState {
     }
 
     fn install_verified_xite_index(&self, canonical: &str, index: VerifiedXiteIndex) {
+        // Every install site funnels through here, so this is the one place
+        // that has to know whether the index it is publishing was complete.
+        // Recorded on install rather than at the walk so a later good pass
+        // clears the mark by itself - no separate invalidation to forget.
+        if let Ok(mut pending) = self.xid_deferred_xites.lock() {
+            if index.deferred.is_empty() {
+                pending.remove(canonical);
+            } else {
+                pending.insert(canonical.to_string());
+            }
+        }
         self.replace_verified_manifest_chains(canonical, index.manifest_chains);
         self.replace_verified_manifest_contents(canonical, &index.manifests);
         self.replace_verified_object_paths(canonical, index.declarations);
@@ -20940,21 +21173,44 @@ impl AppState {
     }
 
     async fn resolve_xid_names(
-        mut names: Vec<String>,
+        names: Vec<String>,
     ) -> epix_content::XidMap {
+        Self::resolve_xid_names_deferrable(names).await.map
+    }
+
+    /// Resolve xID names for a verification pass, keeping the one distinction
+    /// the map itself cannot carry: whether an absent name is the chain's
+    /// answer or a failure to reach it.
+    ///
+    /// A name lands in `deferred` only when the lookup failed
+    /// NON-authoritatively (see [`epix_chain::ChainError::is_authoritative`]).
+    /// The caller must then decline to record a verdict for anything that
+    /// needed it, rather than verifying against a knowingly-incomplete map -
+    /// which manufactures a false "name not found on chain" and permanently
+    /// rejects the content.
+    ///
+    /// An authoritative miss (`NotFound`, or a resolved-but-empty identity
+    /// list) omits the name from the map and is NOT deferred, exactly as
+    /// before: the verifier must still reject it. Note the empty case stays
+    /// OMITTED rather than inserted as an empty vec - inserting would change
+    /// `resolve_xid`'s address list for dot-form signers elsewhere.
+    async fn resolve_xid_names_deferrable(mut names: Vec<String>) -> XidResolution {
         names.sort();
         names.dedup();
-        let mut xid_map = epix_content::XidMap::new();
+        let mut out = XidResolution::default();
         for name in names {
             let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-            let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
-                .await
-                .unwrap_or_default();
-            if !identities.is_empty() {
-                xid_map.insert(name, chain_xid_identities(identities));
+            match epix_chain::xid_signers::resolve_identities_checked(label, tld).await {
+                Ok(identities) if !identities.is_empty() => {
+                    out.map.insert(name, chain_xid_identities(identities));
+                }
+                // Resolved, and the chain says there is nothing to link.
+                Ok(_) => {}
+                Err(error) if error.is_authoritative() => {}
+                Err(_) => out.deferred.push(name),
             }
         }
-        xid_map
+        out
     }
 
     async fn resolve_rehome_xids(
@@ -39779,6 +40035,51 @@ mod tests {
         assert_eq!(fixture.storage_a.read("content.json").unwrap(), newer_bytes);
         assert_eq!(fixture.storage_a.read(".sign-cache.json").unwrap(), cache);
         assert_eq!(fixture.store.read_bytes(cache_id, 3).unwrap(), cache);
+    }
+
+    #[tokio::test]
+    async fn offline_by_policy_makes_deferral_terminal() {
+        // A LoRa/mesh node never anchors chain trust, so retrying forever
+        // would be a livelock. The withheld verdicts stand until it is
+        // brought online.
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        state.set_offline_by_policy(true);
+        state
+            .xid_deferred_xites
+            .lock()
+            .unwrap()
+            .insert("epix1deferred".to_string());
+        assert_eq!(state.retry_deferred_xid_xites().await, 0);
+        assert!(
+            state.xid_deferred_xites.lock().unwrap().contains("epix1deferred"),
+            "offline node must keep the mark, not clear it"
+        );
+    }
+
+    #[tokio::test]
+    async fn retry_is_single_flight_and_rate_limited() {
+        let root = tempdir().unwrap();
+        let state = Arc::new(AppState::with_data_dir("test", root.path()));
+        // Nothing deferred: both calls are no-ops, but the second must also be
+        // refused by the interval floor rather than walking again.
+        assert_eq!(state.retry_deferred_xid_xites().await, 0);
+        assert_eq!(state.retry_deferred_xid_xites().await, 0);
+        assert!(
+            state.xid_retry_last.lock().unwrap().is_some(),
+            "the first pass must record its timestamp"
+        );
+    }
+
+    #[test]
+    fn xid_trust_status_reports_offline_without_a_spinner() {
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        state.set_offline_by_policy(true);
+        let trust = state.xid_trust_status();
+        // Never "establishing" on a node that is offline on purpose.
+        assert_ne!(trust["state"], "establishing");
+        assert_eq!(trust["deferred_xites"], 0);
     }
 
     #[tokio::test]

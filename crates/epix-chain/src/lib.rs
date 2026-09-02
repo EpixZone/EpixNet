@@ -475,6 +475,49 @@ pub fn parse_finality_pin(json: &[u8]) -> std::result::Result<finality::PinnedSe
 }
 
 #[cfg(test)]
+mod chain_error_tests {
+    use super::*;
+
+    /// The whole point of the classifier: a boot-time outage and a genuinely
+    /// unregistered name must NOT be treated the same. The first defers (no
+    /// verdict recorded, retried when trust arrives); the second is the
+    /// chain's answer and rejects permanently.
+    #[test]
+    fn outage_defers_but_unregistered_rejects() {
+        let outage = ChainError::Rpc("Tor-always mode: chain RPC blocked".into());
+        let unregistered = ChainError::NotFound("nosuchname".into());
+        assert!(!outage.is_authoritative(), "an outage must never be a verdict");
+        assert!(unregistered.is_authoritative(), "the chain answered: reject");
+    }
+
+    /// Exhaustive by construction: every variant is listed, so a new one added
+    /// later fails to compile here until someone decides whether the chain
+    /// actually answered. Defaulting a new variant to "authoritative" would
+    /// let it permanently reject user content.
+    #[test]
+    fn only_not_found_is_authoritative() {
+        let cases = [
+            (ChainError::NotFound("x".into()), true),
+            (ChainError::Rpc("unreachable".into()), false),
+            (ChainError::MerkleInvalid, false),
+            (ChainError::DigestMismatch, false),
+            (ChainError::NotFinalized, false),
+            (ChainError::LeafBindingFailed("x".into()), false),
+            (ChainError::FinalityUnverified("x".into()), false),
+            (ChainError::FinalityAdvanced, false),
+            (ChainError::Malformed("x".into()), false),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                error.is_authoritative(),
+                expected,
+                "{error} classified wrong"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod pin_tests {
     use super::*;
 
@@ -735,6 +778,29 @@ pub enum ChainError {
     FinalityAdvanced,
     #[error("malformed chain response: {0}")]
     Malformed(String),
+}
+
+impl ChainError {
+    /// Whether this outcome is the chain's own answer about the name, as
+    /// opposed to a failure to ask it.
+    ///
+    /// Only [`ChainError::NotFound`] is authoritative: the chain was reached,
+    /// verified, and said the name does not exist. Everything else is an
+    /// outage (`Rpc`), a hostile or broken RPC (`MerkleInvalid`,
+    /// `DigestMismatch`, `LeafBindingFailed`, `Malformed`), or a trust state
+    /// that is not established yet (`NotFinalized`, `FinalityUnverified`,
+    /// `FinalityAdvanced`).
+    ///
+    /// Callers use this to decide whether a verification verdict may be
+    /// RECORDED. Treating an outage as "name not found" is how a node that
+    /// booted before Tor came up permanently rejected every user's content and
+    /// served an empty database for the rest of the process. Deferring instead
+    /// is both fail-closed (nothing unverified is admitted) and self-healing.
+    /// Non-authoritative deliberately includes the hostile-RPC errors: serving
+    /// a bad proof must not let anyone erase a user's content from a node.
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
 }
 
 pub type Result<T> = std::result::Result<T, ChainError>;
