@@ -3944,6 +3944,10 @@ fn retry_pending_allowed(tries: i64) -> bool {
 /// flap; without a floor that becomes a re-index loop.
 const XID_RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// Ceiling for the self-rearmed deferred-verification retry: a node whose
+/// chain stays unreachable re-checks every half hour, not every minute.
+const XID_RETRY_BACKOFF_MAX_SECS: u64 = 30 * 60;
+
 pub struct AppState {
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
@@ -4225,7 +4229,16 @@ pub struct AppState {
     /// the set at once.
     xid_retry_in_flight: std::sync::atomic::AtomicBool,
     /// When the last retry pass ran, so a flapping chain cannot hot-loop it.
-    xid_retry_last: std::sync::Mutex<Option<std::time::Instant>>,
+    /// Tokio time (not std) so tests can drive the floor with a paused clock.
+    xid_retry_last: std::sync::Mutex<Option<tokio::time::Instant>>,
+    /// Seconds until the self-rearmed follow-up when a pass leaves xites
+    /// deferred (chain still unreachable, trust not anchored yet). Doubles per
+    /// fruitless pass up to [`XID_RETRY_BACKOFF_MAX_SECS`]; any pass that
+    /// drains or shrinks the set resets it to the floor.
+    xid_retry_backoff_secs: std::sync::atomic::AtomicU64,
+    /// Guards the single armed follow-up timer so overlapping triggers cannot
+    /// stack sleeping tasks.
+    xid_retry_timer_armed: std::sync::atomic::AtomicBool,
     /// True when this node is offline BY POLICY (`offline` config / mesh-only).
     /// Such a node will never anchor chain trust, so deferral is terminal:
     /// no retry is scheduled and the dashboard must not show a trust spinner.
@@ -5111,6 +5124,10 @@ impl AppState {
             xid_deferred_xites: std::sync::Mutex::new(std::collections::HashSet::new()),
             xid_retry_in_flight: std::sync::atomic::AtomicBool::new(false),
             xid_retry_last: std::sync::Mutex::new(None),
+            xid_retry_backoff_secs: std::sync::atomic::AtomicU64::new(
+                XID_RETRY_MIN_INTERVAL.as_secs(),
+            ),
+            xid_retry_timer_armed: std::sync::atomic::AtomicBool::new(false),
             offline_by_policy: std::sync::atomic::AtomicBool::new(false),
             active_child_syncs: std::sync::Mutex::new(std::collections::HashSet::new()),
             xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
@@ -13467,6 +13484,15 @@ impl AppState {
     /// Number of xites whose verified index is currently incomplete because an
     /// xID lookup could not be answered. Surfaced in `serverInfo` so a node
     /// that is silently serving partial content says so.
+    /// Mark a xite as holding a withheld xID verdict, so the trust-anchored
+    /// retry re-indexes it. The sync path discovers deferrals too, and without
+    /// this it would have to wait for the next periodic resync tick.
+    pub fn mark_xid_deferred(&self, canonical: &str) {
+        if let Ok(mut set) = self.xid_deferred_xites.lock() {
+            set.insert(canonical.to_string());
+        }
+    }
+
     pub fn xid_deferred_count(&self) -> usize {
         self.xid_deferred_xites.lock().map(|set| set.len()).unwrap_or(0)
     }
@@ -13523,7 +13549,17 @@ impl AppState {
     /// re-enters `xid_deferred_xites` through `install_verified_xite_index` -
     /// so the set is SNAPSHOTTED and its guard dropped before any await, and
     /// this must never be called from a caller already holding those.
-    pub async fn retry_deferred_xid_xites(&self) -> usize {
+    pub async fn retry_deferred_xid_xites(self: &Arc<Self>) -> usize {
+        let deferred_before = self.xid_deferred_count();
+        let rebuilt = self.retry_deferred_xid_xites_pass().await;
+        self.rearm_deferred_xid_retry(deferred_before).await;
+        rebuilt
+    }
+
+    /// One retry pass, no follow-up scheduling. Split from
+    /// [`Self::retry_deferred_xid_xites`] so the rearm timer can run passes
+    /// in a loop without async recursion.
+    async fn retry_deferred_xid_xites_pass(&self) -> usize {
         use std::sync::atomic::Ordering;
         // Offline by policy: trust is never coming, so a retry would just walk
         // the same xites forever. The withheld verdicts stand until the
@@ -13536,7 +13572,10 @@ impl AppState {
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
-            return 0; // another trigger is already walking the set
+            // Another trigger is walking the set right now. Its own tail
+            // re-arms a follow-up whenever anything stays deferred, so this
+            // trigger is safe to drop rather than queue.
+            return 0;
         }
         struct Guard<'a>(&'a std::sync::atomic::AtomicBool);
         impl Drop for Guard<'_> {
@@ -13546,17 +13585,32 @@ impl AppState {
         }
         let _guard = Guard(&self.xid_retry_in_flight);
         // Floor between passes: the triggers can fire seconds apart, and a
-        // flapping chain must not turn this into a rebuild loop.
-        {
-            let mut last = match self.xid_retry_last.lock() {
-                Ok(last) => last,
-                Err(_) => return 0,
+        // flapping chain must not turn this into a rebuild loop. Waiting out
+        // the remainder instead of returning matters: the light-client-anchor
+        // trigger lands seconds after the Tor-egress one, and it is usually
+        // the one that can finally resolve names - swallowing it would strand
+        // the deferred set until the next validator-set change.
+        loop {
+            let wait = {
+                let mut last = match self.xid_retry_last.lock() {
+                    Ok(last) => last,
+                    Err(_) => return 0,
+                };
+                let now = tokio::time::Instant::now();
+                match *last {
+                    Some(at) if now.duration_since(at) < XID_RETRY_MIN_INTERVAL => {
+                        Some(XID_RETRY_MIN_INTERVAL - now.duration_since(at))
+                    }
+                    _ => {
+                        *last = Some(now);
+                        None
+                    }
+                }
             };
-            let now = std::time::Instant::now();
-            if last.is_some_and(|at| now.duration_since(at) < XID_RETRY_MIN_INTERVAL) {
-                return 0;
+            match wait {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => break,
             }
-            *last = Some(now);
         }
 
         let mut rebuilt = 0usize;
@@ -13591,7 +13645,10 @@ impl AppState {
                 break;
             }
             for address in targets {
-                if self.rebuild_xite_db(&address).await {
+                // Forced: the deferred verdicts live inside the installed
+                // index, so rebuilding from it would just launder the outage
+                // into a "clean" pass. Only a fresh walk can replace them.
+                if self.rebuild_xite_db_reverify(&address).await {
                     rebuilt += 1;
                 }
             }
@@ -13611,6 +13668,75 @@ impl AppState {
         // for a reconnect.
         self.push_server_info().await;
         rebuilt
+    }
+
+    /// Next follow-up delay after a pass that started with `deferred_before`
+    /// xites deferred, or `None` when no follow-up is needed (set drained, or
+    /// offline by policy). Progress resets the backoff to the floor; a
+    /// fruitless pass doubles it up to [`XID_RETRY_BACKOFF_MAX_SECS`].
+    fn next_deferred_retry_backoff(&self, deferred_before: usize) -> Option<u64> {
+        use std::sync::atomic::Ordering;
+        let deferred_now = self.xid_deferred_count();
+        if deferred_now == 0 || self.offline_by_policy() {
+            self.xid_retry_backoff_secs
+                .store(XID_RETRY_MIN_INTERVAL.as_secs(), Ordering::Release);
+            return None;
+        }
+        if deferred_now < deferred_before {
+            // Progress: something resolved, so the chain is answering.
+            // Restart from the floor for whatever is left.
+            self.xid_retry_backoff_secs
+                .store(XID_RETRY_MIN_INTERVAL.as_secs(), Ordering::Release);
+            Some(XID_RETRY_MIN_INTERVAL.as_secs())
+        } else {
+            let current = self.xid_retry_backoff_secs.load(Ordering::Acquire);
+            self.xid_retry_backoff_secs
+                .store(current.saturating_mul(2).min(XID_RETRY_BACKOFF_MAX_SECS), Ordering::Release);
+            Some(current)
+        }
+    }
+
+    /// After a retry pass, keep the healing loop alive on its own: while
+    /// anything is still deferred, ONE background task keeps re-running the
+    /// pass with exponential backoff. Healing must not depend on the
+    /// Tor/light-client triggers firing at exactly the right moment - on a
+    /// node whose chain RPCs are down for an hour, no trigger ever re-fires,
+    /// and without this the deferred set would strand until restart.
+    async fn rearm_deferred_xid_retry(self: &Arc<Self>, deferred_before: usize) {
+        use std::sync::atomic::Ordering;
+        let Some(mut backoff) = self.next_deferred_retry_backoff(deferred_before) else {
+            return;
+        };
+        if self
+            .xid_retry_timer_armed
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return; // the follow-up loop is already running
+        }
+        self.log(
+            "DEBUG",
+            format!(
+                "xID trust: {} xite(s) still deferred; retrying in {backoff}s",
+                self.xid_deferred_count()
+            ),
+        )
+        .await;
+        let state = Arc::clone(self);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+                let before = state.xid_deferred_count();
+                state.retry_deferred_xid_xites_pass().await;
+                match state.next_deferred_retry_backoff(before) {
+                    Some(next) => backoff = next,
+                    None => break,
+                }
+            }
+            state
+                .xid_retry_timer_armed
+                .store(false, std::sync::atomic::Ordering::Release);
+        });
     }
 
     /// The mute map (`auth_address -> info`).
@@ -19927,22 +20053,44 @@ impl AppState {
                 },
                 None => XidResolution::default(),
             };
-            // A name we could not ask about is not a name that does not exist.
-            // Verifying against a knowingly-incomplete map would manufacture
-            // "xID name 'x' not found on chain" and reject this child for the
-            // rest of the process; skipping records no verdict at all, so the
-            // retry pass can decide once trust is up.
-            if !resolution.deferred.is_empty() {
-                deferred.push(child.clone());
-                let _ = xite.skip_next_stored_manifest(&mut walk, &child);
-                continue;
-            }
+            // Verify with whatever resolved. An unresolved name only matters
+            // if it actually changed the outcome, so do NOT pre-empt a child
+            // that verifies fine without it - a transient miss on some
+            // unrelated signer name must not withhold content that is
+            // otherwise provably good.
             let verified = match xite.verify_next_stored_manifest(&mut walk, &child, &resolution.map)
             {
                 Ok(Some(verified)) => verified,
-                // Every name resolved authoritatively, so a failure here IS
-                // the chain's answer: reject permanently, as before.
-                Ok(None) | Err(_) => continue,
+                Ok(None) => continue,
+                Err(error) => {
+                    // Failed, and at least one name could not be looked up:
+                    // the failure may be nothing but that outage, so record no
+                    // verdict and let the retry decide once trust is up.
+                    // With every name authoritatively resolved, this IS the
+                    // chain's answer and the child stays rejected, as before.
+                    if !resolution.deferred.is_empty() {
+                        self.log(
+                            "DEBUG",
+                            format!(
+                                "xID: withholding verdict on {canonical} {child}; \
+                                 unresolved: {:?}",
+                                resolution.deferred
+                            ),
+                        )
+                        .await;
+                        deferred.push(child.clone());
+                    } else {
+                        self.log(
+                            "DEBUG",
+                            format!(
+                                "xID: {canonical} {child} rejected with every name \
+                                 resolved: {error}"
+                            ),
+                        )
+                        .await;
+                    }
+                    continue;
+                }
             };
             manifest_chains.insert(
                 verified.inner_path().to_string(),
@@ -29249,6 +29397,21 @@ impl AppState {
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
     /// Returns false if the xite isn't served here.
     pub async fn rebuild_xite_db(&self, address: &str) -> bool {
+        self.rebuild_xite_db_with(address, false).await
+    }
+
+    /// [`Self::rebuild_xite_db`], but re-runs the verification walk even when
+    /// an authority is already installed. The deferred-verification retry
+    /// needs this: a xite deferred during a chain outage has its partial
+    /// index INSTALLED (so it keeps serving what did verify), and the normal
+    /// rebuild would reuse exactly that index without ever re-asking the
+    /// chain. If the fresh walk itself fails, the installed authority is the
+    /// fallback - a transient storage or chain error must not empty the DB.
+    pub async fn rebuild_xite_db_reverify(&self, address: &str) -> bool {
+        self.rebuild_xite_db_with(address, true).await
+    }
+
+    async fn rebuild_xite_db_with(&self, address: &str, force_reverify: bool) -> bool {
         let filter_epoch = self.db_filter_epoch();
         let muted = self.muted_authors().await;
         if self.db_filter_epoch() != filter_epoch {
@@ -29287,9 +29450,48 @@ impl AppState {
                 return false;
             }
         }
-        let (accepted_db_paths, accepted_db_snapshot) = match self
-            .accepted_db_authority_for_root_locked(&canonical, content.as_ref())
-        {
+        // Forced mode walks FIRST: the installed authority may carry verdicts
+        // deferred during a chain outage, and only a fresh walk can replace
+        // them now that the chain is reachable. A fresh walk whose root no
+        // longer matches the managed root is discarded the same way the
+        // non-forced walk branch would discard it.
+        let fresh_index = if force_reverify && content.is_some() {
+            match self.verified_xite_index(address, &canonical, &storage).await {
+                Ok(index)
+                    if index
+                        .manifests
+                        .iter()
+                        .find(|manifest| manifest.inner_path == "content.json")
+                        .map(|manifest| &manifest.content)
+                        == content.as_ref() =>
+                {
+                    Some(index)
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let (accepted_db_paths, accepted_db_snapshot) = if let Some(index) = fresh_index {
+            let Ok(snapshot) = Self::db_snapshot_from_authority(
+                &canonical,
+                &storage,
+                &VerifiedDbAuthority::from(&index),
+            )
+            .await
+            else {
+                return false;
+            };
+            self.install_verified_xite_index(&canonical, index);
+            if let Some(store) = self.edx_store().await {
+                for warning in self.reconcile_manifest_object_owners(&store) {
+                    self.log("WARN", format!("db rebuild ownership reconcile: {warning}"))
+                        .await;
+                }
+            }
+            (snapshot.paths.clone(), Some(snapshot))
+        } else {
+            match self.accepted_db_authority_for_root_locked(&canonical, content.as_ref()) {
             Ok(authority) => {
                 let Ok(snapshot) = Self::db_snapshot_from_authority(
                     &canonical,
@@ -29303,7 +29505,14 @@ impl AppState {
                 (snapshot.paths.clone(), Some(snapshot))
             }
             Err(_) if content.is_some() => {
-                match self.verified_xite_index(address, &canonical, &storage).await {
+                // In forced mode the fresh walk above already failed; do not
+                // walk twice, just fall through to the own-draft/empty tails.
+                let walked = if force_reverify {
+                    Err("re-verification walk already failed".to_string())
+                } else {
+                    self.verified_xite_index(address, &canonical, &storage).await
+                };
+                match walked {
                     Ok(index) => {
                         if index
                             .manifests
@@ -29351,6 +29560,7 @@ impl AppState {
                 }
             }
             Err(_) => (Vec::new(), None),
+            }
         };
         let epoch = self.verified_index_epoch(&canonical);
         let source_epoch = self.db_source_epoch(&canonical);
@@ -40043,7 +40253,7 @@ mod tests {
         // would be a livelock. The withheld verdicts stand until it is
         // brought online.
         let root = tempdir().unwrap();
-        let state = AppState::with_data_dir("test", root.path());
+        let state = Arc::new(AppState::with_data_dir("test", root.path()));
         state.set_offline_by_policy(true);
         state
             .xid_deferred_xites
@@ -40055,19 +40265,30 @@ mod tests {
             state.xid_deferred_xites.lock().unwrap().contains("epix1deferred"),
             "offline node must keep the mark, not clear it"
         );
+        assert!(
+            !state.xid_retry_timer_armed.load(std::sync::atomic::Ordering::Acquire),
+            "offline node must not arm a follow-up timer"
+        );
     }
 
-    #[tokio::test]
-    async fn retry_is_single_flight_and_rate_limited() {
+    #[tokio::test(start_paused = true)]
+    async fn retry_waits_out_the_floor_instead_of_dropping_the_trigger() {
         let root = tempdir().unwrap();
         let state = Arc::new(AppState::with_data_dir("test", root.path()));
-        // Nothing deferred: both calls are no-ops, but the second must also be
-        // refused by the interval floor rather than walking again.
-        assert_eq!(state.retry_deferred_xid_xites().await, 0);
+        // Nothing deferred: both calls are no-op walks. The second trigger
+        // lands inside the interval floor and must WAIT it out, not vanish -
+        // the light-client-anchor trigger arrives seconds after the
+        // Tor-egress one and is usually the pass that can finally resolve.
         assert_eq!(state.retry_deferred_xid_xites().await, 0);
         assert!(
             state.xid_retry_last.lock().unwrap().is_some(),
             "the first pass must record its timestamp"
+        );
+        let before = tokio::time::Instant::now();
+        assert_eq!(state.retry_deferred_xid_xites().await, 0);
+        assert!(
+            before.elapsed() >= XID_RETRY_MIN_INTERVAL,
+            "second trigger must sleep through the floor and then run"
         );
     }
 

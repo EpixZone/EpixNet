@@ -1914,13 +1914,33 @@ async fn verify_current_child_manifests(
             .read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let xid_map = resolve_user_signers(&parent, &path, child.as_ref()).await;
+        let (xid_map, unresolved) = resolve_user_signers(&parent, &path, child.as_ref()).await;
         match xite.verify_next_stored_manifest(walk, &path, &xid_map) {
             Ok(Some(manifest)) => {
                 files.extend(manifest.files());
                 includes.extend(manifest.includes());
             }
             Ok(None) => {}
+            // Verified with whatever resolved, so an unresolved name only
+            // matters when it could explain the failure. If one could not be
+            // looked up, record NO verdict and mark the xite for the
+            // trust-anchored retry: rejecting here is what turned a Tor-window
+            // outage into a permanent "xID name 'x' not found on chain" for a
+            // name that is registered and active.
+            Err(error) if unresolved => {
+                if let Some(state) = progress {
+                    state.mark_xid_deferred(xite.address.as_str());
+                    state
+                        .log(
+                            "DEBUG",
+                            format!(
+                                "Stored child {path}: xID lookup unavailable, \
+                                 deferring verification ({error})"
+                            ),
+                        )
+                        .await;
+                }
+            }
             Err(error) => {
                 if let Some(state) = progress {
                     state
@@ -2545,13 +2565,21 @@ fn user_dir_name(inner_path: &str) -> Option<&str> {
 }
 
 /// Resolve every xID name that verifying `inner_path` may need to its
-/// chain-linked identity records: the user directory's own name (EpixTalk
-/// stores each user's posts under their xID and signs with the identity that
+/// chain-linked identity records (the user directory's own name plus any
+/// chain-delegated cert name on the child), reporting whether any of them
+/// could not be ASKED about (as opposed to answered).
+///
+/// The bool is true when at least one lookup failed non-authoritatively - a
+/// chain outage, a Tor hiccup mid-sync, a hostile proof. The caller must then
+/// withhold its verdict instead of verifying against a map it knows is
+/// incomplete: doing that turns a temporary outage into
+/// "xID name 'x' not found on chain" and rejects the user permanently, even
+/// though the name is registered with active identities.
 async fn resolve_user_signers(
     parent: &serde_json::Value,
     inner_path: &str,
     child: Option<&serde_json::Value>,
-) -> epix_content::XidMap {
+) -> (epix_content::XidMap, bool) {
     let mut names = epix_content::verify::content_xid_names(parent, inner_path);
     // A chain-delegated cert on the child itself must resolve too, so the
     // cert check can match its signer against the name's linked identities.
@@ -2559,16 +2587,20 @@ async fn resolve_user_signers(
         names.extend(epix_content::verify::chain_cert_xid_name(parent, child));
     }
     let mut map = epix_content::XidMap::new();
+    let mut deferred = false;
     for name in names {
         let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-        let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
-            .await
-            .unwrap_or_default();
-        if !identities.is_empty() {
-            map.insert(name, chain_xid_identities(identities));
+        match epix_chain::xid_signers::resolve_identities_checked(label, tld).await {
+            Ok(identities) if !identities.is_empty() => {
+                map.insert(name, chain_xid_identities(identities));
+            }
+            // The chain answered: no identities linked to this name.
+            Ok(_) => {}
+            Err(error) if error.is_authoritative() => {}
+            Err(_) => deferred = true,
         }
     }
-    map
+    (map, deferred)
 }
 
 /// The chain's identity records in the shape verification consumes.
