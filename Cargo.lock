@@ -2959,6 +2959,7 @@ dependencies = [
  "hex",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
+ "rand_core 0.6.4",
  "rln",
  "thiserror 2.0.20",
  "zerokit_utils",

@@ -21010,14 +21010,23 @@ impl AppState {
             let (label, tld) = name
                 .rsplit_once('.')
                 .unwrap_or((name.as_str(), "epix"));
-            let mut identities = chain_xid_identities(
-                epix_chain::xid_signers::resolve_identities_checked(label, tld)
-                    .await
-                    .map_err(|error| error.to_string())?,
-            );
-            identities.sort_by(|a, b| a.address.cmp(&b.address));
-            identities.dedup_by(|a, b| a.address == b.address);
-            xid_map.insert(name, identities);
+            // Cache-backed like every other verification path: a transient
+            // chain failure (or one malformed RPC answer) must not scrap an
+            // entire xite's DB when this node already holds a
+            // checkpoint-covered proof for the name.
+            match epix_chain::xid_signers::resolve_identities_or_cached(label, tld).await {
+                Ok((identities, _from_cache)) => {
+                    let mut identities = chain_xid_identities(identities);
+                    identities.sort_by(|a, b| a.address.cmp(&b.address));
+                    identities.dedup_by(|a, b| a.address == b.address);
+                    xid_map.insert(name, identities);
+                }
+                // The chain's answer: the name does not exist. That signer is
+                // simply unauthorized - the same as the walk's semantics -
+                // not a reason to fail the whole snapshot.
+                Err(error) if error.is_authoritative() => {}
+                Err(error) => return Err(format!("resolve {name}: {error}")),
+            }
         }
         Ok(xid_map)
     }
@@ -29608,8 +29617,25 @@ impl AppState {
 
     /// Rebuild a xite's database from its files on disk (`dbReload`/`dbRebuild`).
     /// Returns false if the xite isn't served here.
+    ///
+    /// One retry: an attempt can lose a BENIGN race against a concurrent
+    /// index install (the boot db warm-up vs restore's own install bumps the
+    /// verified-index epoch between this rebuild's snapshot and its final
+    /// consistency re-check). The abort is correct - the other writer won -
+    /// but with no retry the xite then serves with NO database until some
+    /// unrelated mutation rebuilds it, which the dashboard experiences as a
+    /// feed that never fills. The second attempt runs against the state the
+    /// first one lost to.
     pub async fn rebuild_xite_db(&self, address: &str) -> bool {
-        self.rebuild_xite_db_with(address, false).await
+        for attempt in 0..2 {
+            if self.rebuild_xite_db_with(address, false).await {
+                return true;
+            }
+            if attempt == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        false
     }
 
     /// [`Self::rebuild_xite_db`], but re-runs the verification walk even when
@@ -29620,7 +29646,15 @@ impl AppState {
     /// chain. If the fresh walk itself fails, the installed authority is the
     /// fallback - a transient storage or chain error must not empty the DB.
     pub async fn rebuild_xite_db_reverify(&self, address: &str) -> bool {
-        self.rebuild_xite_db_with(address, true).await
+        for attempt in 0..2 {
+            if self.rebuild_xite_db_with(address, true).await {
+                return true;
+            }
+            if attempt == 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+        false
     }
 
     /// Run the verification walk and keep the result only when its root
@@ -29633,11 +29667,10 @@ impl AppState {
         canonical: &str,
         storage: &XiteStorage,
         content: Option<&Value>,
-    ) -> Result<Option<VerifiedXiteIndex>, ()> {
+    ) -> Result<Option<VerifiedXiteIndex>, String> {
         let index = self
             .verified_xite_index(address, canonical, storage)
-            .await
-            .map_err(|_| ())?;
+            .await?;
         let matches = index
             .manifests
             .iter()
@@ -29659,13 +29692,23 @@ impl AppState {
         storage: &XiteStorage,
         index: VerifiedXiteIndex,
     ) -> Option<AcceptedDbSnapshot> {
-        let snapshot = Self::db_snapshot_from_authority(
+        let snapshot = match Self::db_snapshot_from_authority(
             canonical,
             storage,
             &VerifiedDbAuthority::from(&index),
         )
         .await
-        .ok()?;
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                self.log(
+                    "DEBUG",
+                    format!("db rebuild {canonical}: walked-index snapshot failed: {error}"),
+                )
+                .await;
+                return None;
+            }
+        };
         self.install_verified_xite_index(canonical, index);
         if let Some(store) = self.edx_store().await {
             for warning in self.reconcile_manifest_object_owners(&store) {
@@ -29714,10 +29757,17 @@ impl AppState {
         }
         match self.accepted_db_authority_for_root_locked(canonical, content) {
             Ok(authority) => {
-                let snapshot = Self::db_snapshot_from_authority(canonical, storage, &authority)
-                    .await
-                    .ok()?;
-                Some((snapshot.paths.clone(), Some(snapshot)))
+                match Self::db_snapshot_from_authority(canonical, storage, &authority).await {
+                    Ok(snapshot) => Some((snapshot.paths.clone(), Some(snapshot))),
+                    Err(error) => {
+                        self.log(
+                            "DEBUG",
+                            format!("db rebuild {address}: authority snapshot failed: {error}"),
+                        )
+                        .await;
+                        None
+                    }
+                }
             }
             Err(_) if content.is_some() => {
                 if force_reverify {
@@ -29732,8 +29782,24 @@ impl AppState {
                         Some((snapshot.paths.clone(), Some(snapshot)))
                     }
                     // Walk succeeded but the root moved: abort, as before.
-                    Ok(None) => None,
-                    Err(()) => Some(Self::draft_or_empty_db_paths(content, own)),
+                    Ok(None) => {
+                        self.log(
+                            "DEBUG",
+                            format!(
+                                "db rebuild {address}: walked root does not match the managed root"
+                            ),
+                        )
+                        .await;
+                        None
+                    }
+                    Err(walk_error) => {
+                        self.log(
+                            "DEBUG",
+                            format!("db rebuild {address}: walk failed ({walk_error}), using draft/empty paths"),
+                        )
+                        .await;
+                        Some(Self::draft_or_empty_db_paths(content, own))
+                    }
                 }
             }
             Err(_) => Some((Vec::new(), None)),
@@ -29776,6 +29842,11 @@ impl AppState {
                 || canonical_address(current.content.as_ref(), address) != canonical
                 || current.content != content
             {
+                self.log(
+                    "DEBUG",
+                    format!("db rebuild {address}: refused, xite changed while acquiring locks"),
+                )
+                .await;
                 return false;
             }
         }
@@ -29804,6 +29875,14 @@ impl AppState {
             )
             .await
         else {
+            self.log(
+                "DEBUG",
+                format!(
+                    "db rebuild {address}: refused, no usable authority/snapshot \
+                     (walk aborted or a declared file failed its size/digest check)"
+                ),
+            )
+            .await;
             return false;
         };
         let epoch = self.verified_index_epoch(&canonical);
@@ -29833,6 +29912,11 @@ impl AppState {
                 || self.db_source_epoch(&canonical) != source_epoch
                 || self.db_filter_epoch() != filter_epoch
             {
+                self.log(
+                    "DEBUG",
+                    format!("db rebuild {address}: refused, state moved during the build"),
+                )
+                .await;
                 return false;
             }
             match built {

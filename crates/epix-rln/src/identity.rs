@@ -18,7 +18,7 @@ impl RlnIdentity {
     /// produces the same identity.
     pub fn from_seed(seed: &[u8]) -> Self {
         Self {
-            keys: IdentityKeys::generate_seeded::<PoseidonHash, rand_chacha::ChaCha20Rng>(seed),
+            keys: IdentityKeys::generate_seeded::<PoseidonHash, crate::SeededChaCha>(seed),
         }
     }
 

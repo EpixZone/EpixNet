@@ -10,7 +10,10 @@
 //! EpixNet workspace.
 
 use epix_rln::{external_nullifier, message_signal, rate_commitment, RLN_TREE_DEPTH};
-use rand::rngs::OsRng;
+// rand 0.9+ dropped rngs::OsRng; seed the crate's bridge RNG from OS entropy
+// instead (rln's generate() speaks the rand_core 0.6 traits the bridge has).
+use epix_rln::SeededChaCha;
+use rand_core06::SeedableRng;
 use rln::prelude::{compute_id_secret, Fr, IdentityKeys, PoseidonHash, RLNBuilder, RLNWitnessInput};
 use zerokit_utils::merkle_tree::{FullMerkleConfig, FullMerkleTree, ZerokitMerkleTree};
 
@@ -18,7 +21,8 @@ use zerokit_utils::merkle_tree::{FullMerkleConfig, FullMerkleTree, ZerokitMerkle
 fn rln_prove_verify_and_recover_on_double_signal() {
     // 1. An identity: the anonymous member. Its commitment is public; its secret
     //    is what a double-signal will leak.
-    let id = IdentityKeys::generate::<PoseidonHash, _>(&mut OsRng);
+    let mut rng = SeededChaCha::from_seed(rand::random::<[u8; 32]>());
+    let id = IdentityKeys::generate::<PoseidonHash, _>(&mut rng);
 
     // A per-user allowance of a single message per epoch, bound into the leaf.
     let limit = Fr::from(1u64);

@@ -4,7 +4,9 @@
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
 use hkdf::Hkdf;
-use hmac::{Hmac, Mac};
+// hmac 0.13 moved `new_from_slice` from the `Mac` trait to `KeyInit`;
+// aliased because chacha20poly1305 re-exports its own `KeyInit` above.
+use hmac::{Hmac, KeyInit as HmacKeyInit, Mac};
 use sha2::Sha256;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -17,7 +19,8 @@ pub fn kdf(context: &str, salt: &[u8], ikm: &[u8], out: &mut [u8]) {
 
 /// HMAC-SHA256 over `data` under a 32-byte key.
 pub fn mac(key: &[u8; 32], data: &[u8]) -> [u8; 32] {
-    let mut m = <HmacSha256 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
+    let mut m =
+        <HmacSha256 as HmacKeyInit>::new_from_slice(key).expect("HMAC accepts any key length");
     m.update(data);
     m.finalize().into_bytes().into()
 }
