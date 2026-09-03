@@ -193,14 +193,14 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     (
         "Epix Chain Config",
         "xid_bootstrap_rpcs",
-        "xID trust bootstrap RPCs (one per line; independent CometBFT endpoints; blank = built-in list)",
+        "RPCs (one per line)",
         "https://rpc.epix.zone\nhttps://rpc-epix.onenov.xyz\nhttps://rpc-m.epix.vinjan-inc.com\nhttps://rpc-epix.dnsarz.net:443",
         "textarea",
     ),
     (
         "Epix Chain Config",
         "xid_bootstrap_quorum",
-        "xID bootstrap quorum (how many of those RPCs must agree exactly)",
+        "RPC quorum",
         "2",
         "text",
     ),
