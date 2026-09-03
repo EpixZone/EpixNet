@@ -422,9 +422,10 @@ pub fn remove_file_write_through(path: &Path) -> io::Result<()> {
                             "durable-delete tombstone is not a regular file",
                         ));
                     }
-                    let mut permissions = metadata.permissions();
-                    permissions.set_readonly(false);
-                    std::fs::set_permissions(&tombstone, permissions)?;
+                    // Clear exactly FILE_ATTRIBUTE_READONLY rather than the
+                    // POSIX-mode-shaped set_readonly(false), which asks for
+                    // write for owner, group AND other.
+                    clear_readonly_attribute(&tombstone)?;
                     std::fs::remove_file(&tombstone)?;
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -448,9 +449,7 @@ pub fn remove_file_write_through(path: &Path) -> io::Result<()> {
 
     if let Ok(metadata) = std::fs::symlink_metadata(&tombstone) {
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT == 0 && metadata.is_file() {
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            let _ = std::fs::set_permissions(&tombstone, permissions);
+            let _ = clear_readonly_attribute(&tombstone);
             let _ = std::fs::remove_file(&tombstone);
         }
     }
@@ -507,4 +506,38 @@ pub fn replace_file_write_through(source: &Path, destination: &Path) -> io::Resu
 pub fn install_file_write_through(source: &Path, destination: &Path) -> io::Result<()> {
     std::fs::hard_link(source, destination)?;
     std::fs::remove_file(source)
+}
+
+/// Clear the Windows read-only attribute on `path` so a delete can proceed.
+///
+/// The std route for this is `Permissions::set_readonly(false)` +
+/// `fs::set_permissions`, but that API is defined in terms of the POSIX mode
+/// word: it grants write to owner, group AND other. On Windows the extra bits
+/// are meaningless (the call only clears `FILE_ATTRIBUTE_READONLY`), yet it
+/// reads as a request for loose permissions - both to a human and to a scanner.
+/// Clearing exactly the one attribute says what is meant and widens nothing.
+///
+/// Only the read-only bit is touched; every other attribute (hidden, system,
+/// archive) is preserved. A verbatim path is used so the staged-promotion tree
+/// does not trip MAX_PATH, exactly as [`verbatim_wide_null`] documents.
+#[cfg(windows)]
+pub fn clear_readonly_attribute(path: &Path) -> io::Result<()> {
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+        INVALID_FILE_ATTRIBUTES,
+    };
+
+    let wide = verbatim_wide_null(path)?;
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes & FILE_ATTRIBUTE_READONLY == 0 {
+        return Ok(()); // already writable: nothing to change
+    }
+    let cleared = attributes & !FILE_ATTRIBUTE_READONLY;
+    if unsafe { SetFileAttributesW(wide.as_ptr(), cleared) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }

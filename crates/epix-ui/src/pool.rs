@@ -136,92 +136,87 @@ pub trait PoolAdmission: Send + Sync {
 
 /// Peers to fetch from in an anti-entropy sweep.
 const POOL_SWEEP_PEERS: usize = 16;
-/// Distinct served copies to union per shard before moving on.
-const POOL_SWEEP_UNION: usize = 2;
 
-/// Outcome of one sweep fetch (see [`AppState::sweep_fetch_signed`]).
-enum SweepFetch {
-    /// The peer served the shard.
-    Got(Vec<u8>),
-    /// The peer answered but holds no such shard - a HEALTHY outcome.
-    NoFile,
-    /// Dial failure or timeout - skip this peer for the rest of the pass.
-    Unreachable,
-}
+/// Quiet-shard backoff: first miss waits this long, doubling per consecutive
+/// quiet pass up to [`POOL_SWEEP_QUIET_CAP_MS`]. Small enough that a shard that
+/// starts receiving is back in the hot set within a couple of minutes.
+const POOL_SWEEP_QUIET_BASE_MS: i64 = 60_000;
+/// Ceiling for the quiet backoff: even a shard that has never held anything is
+/// re-checked at least this often.
+const POOL_SWEEP_QUIET_CAP_MS: i64 = 30 * 60_000;
 
-/// One bounded sweep pass over pool shard paths, shared by the periodic sweep
-/// and the historical backfill.
-///
-/// A peer proven unreachable is skipped for the REST of the pass, so a dead
-/// candidate costs one dial timeout per pass - not one per shard path, which
-/// against a mostly-dead candidate list made a pass effectively unbounded and
-/// starved the later shards (a node that can send but never receives). Every
-/// dial outcome is remembered and fed to the reputation registry at
-/// [`SweepPass::finish`], so dead candidates sink into backoff and live peers
-/// rise in the next pass's selection.
+/// One sweep pass over pool shard paths, shared by the periodic sweep and the
+/// historical backfill. The whole path list goes out in ONE dial session, so a
+/// pass costs one dial per peer rather than one per (peer, path); the session
+/// itself reports every dial outcome to the peer reputation registry, so dead
+/// candidates still sink into backoff without this type accounting for them.
 struct SweepPass {
     candidates: Vec<epix_core::PeerAddr>,
-    dead: std::collections::HashSet<String>,
-    outcomes: std::collections::HashMap<String, (epix_core::PeerAddr, bool)>,
+    /// Paths some peer actually served (whether or not they held anything new).
+    served: usize,
+    /// Paths whose served copy contributed records we did not already have.
     merged: usize,
+    /// Paths requested this pass.
     paths: usize,
 }
 
 impl SweepPass {
     fn new(candidates: Vec<epix_core::PeerAddr>) -> Self {
-        Self {
-            candidates,
-            dead: std::collections::HashSet::new(),
-            outcomes: std::collections::HashMap::new(),
-            merged: 0,
-            paths: 0,
+        Self { candidates, served: 0, merged: 0, paths: 0 }
+    }
+
+    /// Fetch EVERY due path in ONE dial session and merge what comes back.
+    ///
+    /// The session dials the candidates once and pulls the whole path list
+    /// across the live links in parallel ([`AppState::edx_fetch_signed_many`]),
+    /// so a pass costs one dial per peer instead of one per (peer, path). The
+    /// per-path loop it replaces asked every reachable peer for every path
+    /// whenever a shard was empty everywhere - the normal case - which on a
+    /// Tor node measured ~350 round trips and 5-7 MINUTES per pass, running
+    /// back to back forever and starving page traffic of circuits.
+    ///
+    /// One copy per path rather than a [`POOL_SWEEP_UNION`]-wide union: the
+    /// session spreads its requests over whichever links answer, passes repeat,
+    /// and records also arrive by push, so convergence is unaffected while the
+    /// cost drops by more than an order of magnitude.
+    /// `cool_quiet` records the quiet-backoff for paths that yielded nothing.
+    /// Only the PERIODIC sweep does that: a historical backfill legitimately
+    /// finds most of its (old, already-synced) paths empty, and letting it
+    /// write backoff cooled every current-week shard at startup - which is
+    /// exactly the hot set the periodic sweep exists to watch.
+    async fn sweep_paths(
+        &mut self,
+        state: &Arc<AppState>,
+        address: &str,
+        paths: Vec<String>,
+        cool_quiet: bool,
+    ) {
+        if paths.is_empty() || self.candidates.is_empty() {
+            return;
         }
-    }
-
-    fn alive(&self) -> usize {
-        self.candidates.len().saturating_sub(self.dead.len())
-    }
-
-    /// Fetch `path` from live candidates until [`POOL_SWEEP_UNION`] served
-    /// copies merged, recording every dial outcome.
-    async fn sweep_path(&mut self, state: &Arc<AppState>, address: &str, path: &str) {
-        self.paths += 1;
-        let mut merged_from = 0usize;
-        for i in 0..self.candidates.len() {
-            if merged_from >= POOL_SWEEP_UNION {
-                break;
-            }
-            let peer = self.candidates[i].clone();
-            let key = peer.to_string();
-            if self.dead.contains(&key) {
-                continue;
-            }
-            match state.sweep_fetch_signed(&peer, address, path).await {
-                SweepFetch::Got(bytes) => {
-                    self.outcomes.insert(key, (peer, true));
-                    if state
-                        .apply_inbound_pool_update(address, path, &bytes)
+        self.paths += paths.len();
+        let served = state
+            .edx_fetch_signed_many(address, paths.clone(), self.candidates.clone(), None)
+            .await
+            .unwrap_or_default();
+        for path in &paths {
+            let merged = match served.get(path) {
+                Some(bytes) => {
+                    self.served += 1;
+                    state
+                        .apply_inbound_pool_update(address, path, bytes)
                         .await
                         .unwrap_or(false)
-                    {
-                        merged_from += 1;
-                        self.merged += 1;
-                    }
                 }
-                SweepFetch::NoFile => {
-                    self.outcomes.insert(key, (peer, true));
-                }
-                SweepFetch::Unreachable => {
-                    self.dead.insert(key.clone());
-                    self.outcomes.entry(key).or_insert((peer, false));
-                }
+                None => false,
+            };
+            if merged {
+                self.merged += 1;
+            }
+            if cool_quiet || merged {
+                state.note_pool_sweep_result(address, path, merged);
             }
         }
-    }
-
-    /// Feed the pass's dial outcomes to the peer reputation registry.
-    async fn finish(self, state: &AppState, address: &str) {
-        state.note_edx_dials(address, self.outcomes.into_values().collect()).await;
     }
 }
 /// Peers to flood a freshly appended record to.
@@ -1882,31 +1877,6 @@ impl AppState {
         Ok(true)
     }
 
-    /// One sweep fetch, with the outcome the sweep needs to stay bounded:
-    /// "the peer answered but has no such shard" is a healthy peer and a
-    /// perfectly normal answer (most shards are empty), while a dial failure
-    /// or timeout means the peer is dead for this whole pass. The old
-    /// `fetch_signed_from` collapsed both into `None`, so a pass could not
-    /// skip dead peers and burned a full dial timeout on every one of them
-    /// for EVERY shard path - against a mostly-dead peer cache over Tor, one
-    /// "30-second" sweep pass took hours and never reached the later shards.
-    async fn sweep_fetch_signed(
-        &self,
-        peer: &epix_core::PeerAddr,
-        address: &str,
-        inner_path: &str,
-    ) -> SweepFetch {
-        match tokio::time::timeout(
-            Self::signed_fetch_timeout(peer),
-            self.edx_fetch_signed(peer.clone(), address, inner_path),
-        )
-        .await
-        {
-            Ok(Some(Ok(Some(bytes)))) => SweepFetch::Got(bytes),
-            Ok(Some(Ok(None))) => SweepFetch::NoFile,
-            _ => SweepFetch::Unreachable,
-        }
-    }
 
     /// Anti-entropy sweep of the current + previous week's shards (mirrors
     /// [`AppState::resync_merge_files_for`], enumerating shard paths from the
@@ -1926,24 +1896,70 @@ impl AppState {
         }
         let started = std::time::Instant::now();
         let total = candidates.len();
+        let (due, skipped) = self.due_sweep_paths(address, &rules, cur_week);
         let mut pass = SweepPass::new(candidates);
-        for rule in &rules {
+        pass.sweep_paths(self, address, due, true).await;
+        self.log_sweep_pass(address, total, &pass, skipped, started.elapsed()).await;
+
+        // Reclaim disk: drop shards past the owner-set retention window.
+        self.prune_expired_pool_shards(address).await;
+    }
+
+    /// The current + previous week's shard paths split into those due for a
+    /// sweep and a count of those still cooling off (see `pool_shard_due`).
+    fn due_sweep_paths(
+        &self,
+        address: &str,
+        rules: &[PoolRule],
+        cur_week: i64,
+    ) -> (Vec<String>, usize) {
+        let now = now_ms();
+        let mut due = Vec::new();
+        let mut skipped = 0usize;
+        for rule in rules {
             for week in [cur_week - 1, cur_week] {
                 if week < rule.since_week {
                     continue;
                 }
                 for sub in 0..rule.fanout {
                     let path = format!("{}/w{}/{:02x}.json", rule.dir, week, sub);
-                    pass.sweep_path(self, address, &path).await;
+                    if self.pool_shard_due(address, &path, now) {
+                        due.push(path);
+                    } else {
+                        skipped += 1;
+                    }
                 }
             }
         }
-        let (alive, merged, paths) = (pass.alive(), pass.merged, pass.paths);
-        pass.finish(self, address).await;
-        self.log_sweep_pass(address, alive, total, merged, paths, started.elapsed()).await;
+        (due, skipped)
+    }
 
-        // Reclaim disk: drop shards past the owner-set retention window.
-        self.prune_expired_pool_shards(address).await;
+    /// Whether this shard path is due for a sweep, per its quiet-backoff.
+    /// Cold shards (nothing new for several passes) are asked for far less
+    /// often than the one or two that are actually receiving records.
+    fn pool_shard_due(&self, address: &str, path: &str, now_ms: i64) -> bool {
+        let key = format!("{address}\0{path}");
+        self.pool_sweep_backoff
+            .lock()
+            .map(|map| map.get(&key).is_none_or(|(_, next)| now_ms >= *next))
+            .unwrap_or(true)
+    }
+
+    /// Record what a swept path yielded: anything new makes it hot again, a
+    /// quiet pass cools it (exponential, capped at [`POOL_SWEEP_QUIET_CAP_MS`]).
+    pub(crate) fn note_pool_sweep_result(&self, address: &str, path: &str, merged: bool) {
+        let key = format!("{address}\0{path}");
+        let Ok(mut map) = self.pool_sweep_backoff.lock() else { return };
+        if merged {
+            map.remove(&key);
+            return;
+        }
+        let entry = map.entry(key).or_insert((0, 0));
+        entry.0 = entry.0.saturating_add(1);
+        let delay = POOL_SWEEP_QUIET_BASE_MS
+            .saturating_mul(1i64 << entry.0.min(6))
+            .min(POOL_SWEEP_QUIET_CAP_MS);
+        entry.1 = now_ms().saturating_add(delay);
     }
 
     /// One log line per sweep pass, and a WARNING when nothing answered - a
@@ -1952,18 +1968,21 @@ impl AppState {
     async fn log_sweep_pass(
         &self,
         address: &str,
-        alive: usize,
-        total: usize,
-        merged: usize,
-        paths: usize,
+        peers: usize,
+        pass: &SweepPass,
+        skipped: usize,
         took: std::time::Duration,
     ) {
-        if alive == 0 {
+        let (served, merged, paths) = (pass.served, pass.merged, pass.paths);
+        // A pass that asked for shards and got NOTHING back from any peer is
+        // the mute-sweep signal: inbound records cannot arrive, and nothing
+        // else surfaces it (this node can still send, so it feels fine).
+        if paths > 0 && served == 0 {
             self.log(
                 "WARNING",
                 format!(
-                    "pool sweep {address}: 0/{total} candidate peers reachable; \
-                     inbound records cannot arrive until a peer answers"
+                    "pool sweep {address}: no peer served any of {paths} shard path(s) \
+                     across {peers} candidate(s); inbound records cannot arrive"
                 ),
             )
             .await;
@@ -1971,8 +1990,8 @@ impl AppState {
             self.log(
                 "DEBUG",
                 format!(
-                    "pool sweep {address}: {alive}/{total} peers reachable, \
-                     {merged} shard cop(ies) merged across {paths} path(s) in {:.1}s",
+                    "pool sweep {address}: {served}/{paths} path(s) served, {merged} merged, \
+                     {skipped} quiet path(s) skipped, {peers} candidate(s) in {:.1}s",
                     took.as_secs_f64()
                 ),
             )
@@ -2024,10 +2043,12 @@ impl AppState {
         if peers.is_empty() {
             return;
         }
-        // Same bounded-pass discipline as `resync_pool_shards_for`: a dead
-        // candidate costs one dial timeout for the whole backfill, not one per
-        // shard path (a historical backfill enumerates MANY paths).
-        let mut pass = SweepPass::new(peers);
+        // One dial session for the whole history, like the periodic sweep - a
+        // backfill enumerates far more paths, so per-path dialing hurt most
+        // here. Order is preserved (`sync_shard_paths` is newest-first when the
+        // descriptor asks for it), and the quiet-backoff is deliberately NOT
+        // consulted: a backfill is the explicit "fetch history now" request.
+        let mut paths = Vec::new();
         for rule in &rules {
             let start_week = if max_weeks == 0 {
                 rule.since_week
@@ -2035,15 +2056,14 @@ impl AppState {
                 (cur_week - max_weeks as i64 + 1).max(rule.since_week)
             };
             for path in pool::sync_shard_paths(rule, cur_week) {
-                match pool::parse_shard_path(rule, &path) {
-                    Some((week, _)) if week >= start_week => {
-                        pass.sweep_path(self, address, &path).await;
-                    }
-                    _ => {}
+                if matches!(pool::parse_shard_path(rule, &path), Some((week, _)) if week >= start_week)
+                {
+                    paths.push(path);
                 }
             }
         }
-        pass.finish(self, address).await;
+        let mut pass = SweepPass::new(peers);
+        pass.sweep_paths(self, address, paths, false).await;
     }
 
     /// Read every on-disk shard of `address` and return all records — the source

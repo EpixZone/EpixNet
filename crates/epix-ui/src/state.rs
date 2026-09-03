@@ -1435,9 +1435,12 @@ fn remove_xite_directory_tree_path(path: &Path) -> Result<(), String> {
                 #[cfg(windows)]
                 {
                     if error.kind() == std::io::ErrorKind::PermissionDenied {
-                        let mut permissions = metadata.permissions();
-                        permissions.set_readonly(false);
-                        std::fs::set_permissions(&current, permissions).map_err(|set_error| {
+                        // Clear exactly FILE_ATTRIBUTE_READONLY. The std route
+                        // (`set_readonly(false)`) is specified in POSIX mode
+                        // terms and grants write to owner, group and other -
+                        // meaningless on Windows, but it reads as a request for
+                        // loose permissions.
+                        epix_fs::clear_readonly_attribute(&current).map_err(|set_error| {
                             format!(
                                 "could not make directory writable {}: {set_error}",
                                 current.display()
@@ -1784,9 +1787,8 @@ fn remove_internal_recovery_file(path: &Path) -> std::io::Result<()> {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err(error);
             }
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            std::fs::set_permissions(path, permissions)?;
+            // Clear exactly FILE_ATTRIBUTE_READONLY (see the note above).
+            epix_fs::clear_readonly_attribute(path)?;
             std::fs::remove_file(path)
         }
         Err(error) => Err(error),
@@ -4037,6 +4039,15 @@ pub struct AppState {
     /// [`Self::subscribe_pool_deltas`] and filters by address. Decoupled so the
     /// pool machinery has no knowledge of its consumers.
     pub(crate) pool_events: tokio::sync::broadcast::Sender<crate::pool::PoolDelta>,
+    /// Per-shard sweep backoff, keyed by "address\0inner_path": how many
+    /// consecutive sweeps found nothing new there, and the earliest time to ask
+    /// again. Most shard paths are permanently empty (a pool fans out over 16
+    /// sub-shards per week, and a quiet week fills one or two), so re-fetching
+    /// every path every pass spends the whole budget re-learning "still
+    /// nothing". A path that yields something resets to hot; one that stays
+    /// quiet cools off exponentially. Records also arrive by push, so the sweep
+    /// is anti-entropy backup and can afford to be lazy about cold shards.
+    pub(crate) pool_sweep_backoff: std::sync::Mutex<HashMap<String, (u32, i64)>>,
     /// Optional RLN admission hook for `rln_required` pools, installed by the
     /// node at startup. Kept as a trait object so the arkworks proving stack
     /// stays out of this crate (see [`crate::pool::PoolAdmission`]).
@@ -5027,6 +5038,7 @@ impl AppState {
             edx_fetcher: RwLock::new(None),
             pool_rules: RwLock::new(HashMap::new()),
             pool_shard_locks: std::sync::Mutex::new(HashMap::new()),
+            pool_sweep_backoff: std::sync::Mutex::new(HashMap::new()),
             pool_events: tokio::sync::broadcast::channel(1024).0,
             pool_admission: RwLock::new(None),
             capabilities: std::sync::RwLock::new(HashMap::new()),
@@ -36829,7 +36841,10 @@ mod tests {
         let fixture = shared_extern_fixture(false, true).await;
         let root = fixture.storage_a.root();
         let original_mode = std::fs::metadata(root).unwrap().permissions().mode();
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // 0o500, not 0o555: the test only needs the directory to be
+        // non-writable BY THIS PROCESS. Granting r-x to group and other is
+        // both unnecessary and the loose-permission pattern scanners flag.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = fixture
             .state
             .write_file(&fixture.address_a, "shared.bin", b"replacement")
@@ -36858,7 +36873,10 @@ mod tests {
         let fixture = shared_extern_fixture(false, true).await;
         let root = fixture.storage_a.root();
         let original_mode = std::fs::metadata(root).unwrap().permissions().mode();
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // 0o500, not 0o555: the test only needs the directory to be
+        // non-writable BY THIS PROCESS. Granting r-x to group and other is
+        // both unnecessary and the loose-permission pattern scanners flag.
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = fixture
             .state
             .delete_file(&fixture.address_a, "shared.bin", None)
