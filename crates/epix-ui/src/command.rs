@@ -2644,6 +2644,18 @@ impl WsCommand for FeedQuery {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let (limit, day_limit) = feed_limits(p);
+        // A restart's first feed query races the boot re-index: xite DBs are
+        // in-memory and rebuilt during restore, and the dashboard re-queries
+        // only when a NEW file lands - so answering early with an empty merge
+        // freezes an empty feed on screen. Hold the answer until the boot
+        // restore settles (bounded); commands run on their own tasks, so
+        // nothing else on the connection waits behind this.
+        let gate_started = std::time::Instant::now();
+        while s.state.boot_restore_pending()
+            && gate_started.elapsed() < std::time::Duration::from_secs(45)
+        {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
         let follows = s.state.all_follows().await;
 
         let mut queries: Vec<(&String, &String, String)> = Vec::new();

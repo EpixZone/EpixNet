@@ -3540,6 +3540,11 @@ async fn serve(
     // rather than something to retry. Deciding this later (the chain route is
     // configured well after restore_xites) would be too late for the boot pass.
     state.set_offline_by_policy(startup_network_policy == StartupNetworkPolicy::Offline);
+    // Armed before the UI can serve a page: the dashboard's first feedQuery
+    // otherwise races restore_xites, gets an honest-but-empty merge from
+    // half-built in-memory DBs, and freezes that empty feed on screen until
+    // some unrelated event re-queries. restore_xites clears it.
+    state.set_boot_restore_pending(true);
     state
         .initialize_security_tokens()
         .map_err(|error| format!("cannot initialize UI security tokens: {error}"))?;

@@ -4253,6 +4253,12 @@ pub struct AppState {
     /// Such a node will never anchor chain trust, so deferral is terminal:
     /// no retry is scheduled and the dashboard must not show a trust spinner.
     offline_by_policy: std::sync::atomic::AtomicBool,
+    /// True from the start of a real node boot until [`Self::restore_xites`]
+    /// has registered every xite (armed by the node runtime, not by embedded
+    /// or test uses). While pending, xite DBs are still being rebuilt from
+    /// their in-memory indexes, so an aggregate like `feedQuery` answering
+    /// "empty" would be a lie the dashboard then freezes on screen.
+    boot_restore_pending: std::sync::atomic::AtomicBool,
     /// Canonicals whose clone/user-content sync is running. Inbound child
     /// updates for them stage-and-defer instead of fetching inline, so a
     /// push cannot hold a child's manifest guard across a slow network pull
@@ -5139,6 +5145,7 @@ impl AppState {
             ),
             xid_retry_timer_armed: std::sync::atomic::AtomicBool::new(false),
             offline_by_policy: std::sync::atomic::AtomicBool::new(false),
+            boot_restore_pending: std::sync::atomic::AtomicBool::new(false),
             active_child_syncs: std::sync::Mutex::new(std::collections::HashSet::new()),
             xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -7024,6 +7031,14 @@ impl AppState {
     /// content.json is missing or fails verification. Returns how many were
     /// restored. Call once at startup before serving.
     pub async fn restore_xites(self: &Arc<Self>) -> usize {
+        let restored = self.restore_xites_inner().await;
+        // Whatever happened (registry missing, parse error, full restore),
+        // boot restore is now SETTLED: gated aggregates may answer.
+        self.set_boot_restore_pending(false);
+        restored
+    }
+
+    async fn restore_xites_inner(self: &Arc<Self>) -> usize {
         let (Some(path), Some(root)) = (&self.xites_path, &self.data_root) else { return 0;
         };
         let registry = self.xite_registry_lock.lock().await;
@@ -13489,6 +13504,19 @@ impl AppState {
     pub fn offline_by_policy(&self) -> bool {
         self.offline_by_policy
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Arm the boot-restore gate. The node runtime sets this before its UI
+    /// serves and [`Self::restore_xites`] clears it, so aggregates that would
+    /// otherwise race the boot re-index (feedQuery) know to hold their answer.
+    pub fn set_boot_restore_pending(&self, pending: bool) {
+        self.boot_restore_pending
+            .store(pending, std::sync::atomic::Ordering::Release);
+    }
+
+    pub fn boot_restore_pending(&self) -> bool {
+        self.boot_restore_pending
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Number of xites whose verified index is currently incomplete because an
