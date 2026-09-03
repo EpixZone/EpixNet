@@ -357,6 +357,38 @@ pub fn create_parent_directories_write_through(directory: &Path) -> io::Result<(
     Ok(())
 }
 
+/// Clear the Windows read-only ATTRIBUTE on `path`, leaving every other
+/// attribute untouched. Deliberately `SetFileAttributesW`, not
+/// `Permissions::set_readonly` - the attribute is the only thing that changes
+/// and no POSIX mode bits exist to loosen, which keeps security scanners from
+/// having to guess.
+#[cfg(windows)]
+pub fn clear_readonly_attribute(path: &Path) -> io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileAttributesW, SetFileAttributesW, FILE_ATTRIBUTE_READONLY,
+        INVALID_FILE_ATTRIBUTES,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is NUL-terminated and outlives both calls.
+    let attributes = unsafe { GetFileAttributesW(wide.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes & FILE_ATTRIBUTE_READONLY == 0 {
+        return Ok(());
+    }
+    if unsafe { SetFileAttributesW(wide.as_ptr(), attributes & !FILE_ATTRIBUTE_READONLY) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Make `path` durably absent without following a reparse point. Windows has
 /// no portable directory fsync. Moving the exact entry to a reserved sibling
 /// with `MOVEFILE_WRITE_THROUGH` makes the authoritative name removal durable.

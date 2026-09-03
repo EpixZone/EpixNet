@@ -1460,9 +1460,9 @@ fn remove_xite_directory_tree_path(path: &Path) -> Result<(), String> {
                 #[cfg(windows)]
                 {
                     if error.kind() == std::io::ErrorKind::PermissionDenied {
-                        let mut permissions = metadata.permissions();
-                        permissions.set_readonly(false);
-                        std::fs::set_permissions(&current, permissions).map_err(|set_error| {
+                        // Attribute-level: only the Windows read-only bit
+                        // clears, no permission set is ever loosened.
+                        epix_fs::clear_readonly_attribute(&current).map_err(|set_error| {
                             format!(
                                 "could not make directory writable {}: {set_error}",
                                 current.display()
@@ -1809,9 +1809,9 @@ fn remove_internal_recovery_file(path: &Path) -> std::io::Result<()> {
             if !metadata.is_file() || metadata.file_type().is_symlink() {
                 return Err(error);
             }
-            let mut permissions = metadata.permissions();
-            permissions.set_readonly(false);
-            std::fs::set_permissions(path, permissions)?;
+            // Attribute-level: only the Windows read-only bit clears, no
+            // permission set is ever loosened.
+            epix_fs::clear_readonly_attribute(path)?;
             std::fs::remove_file(path)
         }
         Err(error) => Err(error),
@@ -37341,7 +37341,7 @@ mod tests {
         let fixture = shared_extern_fixture(false, true).await;
         let root = fixture.storage_a.root();
         let original_mode = std::fs::metadata(root).unwrap().permissions().mode();
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = fixture
             .state
             .write_file(&fixture.address_a, "shared.bin", b"replacement")
@@ -37370,7 +37370,7 @@ mod tests {
         let fixture = shared_extern_fixture(false, true).await;
         let root = fixture.storage_a.root();
         let original_mode = std::fs::metadata(root).unwrap().permissions().mode();
-        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o555)).unwrap();
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o500)).unwrap();
         let result = fixture
             .state
             .delete_file(&fixture.address_a, "shared.bin", None)
