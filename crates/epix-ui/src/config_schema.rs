@@ -180,8 +180,23 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "select:Everything=DEBUG|Only important messages=INFO|Only errors=ERROR",
     ),
     // --- Epix Chain Config
-    ("Epix Chain Config", "chain_rpc_url", "Chain RPC URL", "https://api.epix.zone", "text"),
-    ("Epix Chain Config", "chain_evm_rpc_url", "Chain EVM RPC URL", "https://evmrpc.epix.zone", "text"),
+    // The chain endpoint lists are one-URL-per-line textareas; the node
+    // fails over to the next entry when one stops answering, and serves the
+    // live choice (plus the full lists) to xites via serverInfo.
+    (
+        "Epix Chain Config",
+        "chain_rpc_url",
+        "Chain RPC URLs",
+        "https://api.epix.zone",
+        "textarea",
+    ),
+    (
+        "Epix Chain Config",
+        "chain_evm_rpc_url",
+        "Chain EVM RPC URLs",
+        "https://evmrpc.epix.zone",
+        "textarea",
+    ),
     ("Epix Chain Config", "chain_block_explorer_url", "Block Explorer URL", "https://scan.epix.zone", "text"),
     // Bootstrap sources for the xID finality light client: independent
     // CometBFT RPC endpoints that must agree before a cold-booting node adopts

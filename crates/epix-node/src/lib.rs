@@ -3377,7 +3377,16 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             .and_then(|v| v.as_u64())
             .filter(|&s| s >= 60)
             .unwrap_or(3600);
-        let cfg = xid_lightclient_config(&state, &data_root).await;
+        let mut cfg = xid_lightclient_config(&state, &data_root).await;
+        // The advance rotates across the bootstrap RPCs on failure: the pin
+        // must keep advancing inside its weak-subjectivity window even when
+        // the first endpoint dies for good, and the sources list is exactly
+        // the set of independent operators fit for that job. The URL that
+        // answers stays first for the next cycle.
+        let mut rpc_candidates: Vec<String> = std::iter::once(cfg.rpc_url.clone())
+            .chain(cfg.bootstrap_sources.iter().cloned())
+            .collect();
+        rpc_candidates.dedup();
         // Until first trust is established (fresh install, or back after a
         // long offline stretch), retry quickly with backoff — a user opening
         // the app should not wait 15 minutes for names to resolve. Once
@@ -3385,7 +3394,24 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         let mut fast_retry_secs = 5u64;
         loop {
             let before = epix_chain::pinned_validators();
-            let outcome = epix_chain::advance_trusted_set(&cfg).await;
+            let mut outcome = Err("no chain RPC endpoints configured".to_string());
+            for (index, url) in rpc_candidates.iter().enumerate() {
+                cfg.rpc_url = url.clone();
+                outcome = epix_chain::advance_trusted_set(&cfg).await;
+                if outcome.is_ok() {
+                    if index != 0 {
+                        state
+                            .log(
+                                "INFO",
+                                format!("xID finality: light client rotated to {url}"),
+                            )
+                            .await;
+                        rpc_candidates.swap(0, index);
+                    }
+                    break;
+                }
+            }
+            let outcome = outcome;
             // A xite whose user content could not be xID-verified is waiting on
             // exactly this: the trusted set going from nothing to something.
             // Only that transition retries - not every tick, or an hourly
@@ -3545,6 +3571,9 @@ async fn serve(
     // half-built in-memory DBs, and freezes that empty feed on screen until
     // some unrelated event re-queries. restore_xites clears it.
     state.set_boot_restore_pending(true);
+    // Install the configured chain REST endpoints so the shared resolver
+    // fails over across them (and serverInfo hands xites the live one).
+    epix_chain::set_chain_rpc_urls(&state.chain_rpc_urls().await);
     state
         .initialize_security_tokens()
         .map_err(|error| format!("cannot initialize UI security tokens: {error}"))?;

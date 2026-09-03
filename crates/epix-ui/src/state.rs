@@ -38,6 +38,10 @@ pub const DEFAULT_VOLUNTEER_QUOTA: &str = "0";
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const DEFAULT_VOLUNTEER_QUOTA: &str = "2147483648"; // 2 GiB
 
+/// The default EVM JSON-RPC endpoint served to xites. The Config page's
+/// default MUST match (a config_schema test pins it).
+pub const DEFAULT_CHAIN_EVM_RPC_URL: &str = "https://evmrpc.epix.zone";
+
 /// What a boot-time registration pass actually did
 /// ([`AppState::edx_register_all_loaded`]).
 ///
@@ -6170,6 +6174,16 @@ impl AppState {
         // (or away from) the bridge instead of waiting for a node restart.
         if key == "tor_use_bridges" {
             self.tor_config_changed.notify_waiters();
+        }
+        // Chain endpoints apply live: the shared resolver re-reads the
+        // installed list per request, and open dashboards get the new
+        // endpoints pushed over serverChanged.
+        if key == "chain_rpc_url" {
+            epix_chain::set_chain_rpc_urls(&self.chain_rpc_urls().await);
+            self.push_server_info().await;
+        }
+        if key == "chain_evm_rpc_url" || key == "chain_block_explorer_url" {
+            self.push_server_info().await;
         }
     }
 
@@ -13448,13 +13462,67 @@ impl AppState {
         }
     }
 
-    /// The configured Epix chain RPC URL (Vrf / XidResolver), or the default.
-    pub async fn chain_rpc_url(&self) -> String {
-        self.config_get("chain_rpc_url")
+    /// The configured Epix chain REST endpoints (Vrf / XidResolver), most
+    /// preferred first; the built-in default when none are configured. The
+    /// Config page stores the list as textarea text (one per line, commas
+    /// also accepted); a JSON array or a legacy single-URL string parses too.
+    pub async fn chain_rpc_urls(&self) -> Vec<String> {
+        let configured = self
+            .config_get("chain_rpc_url")
             .await
-            .and_then(|v| v.as_str().map(str::to_string))
-            .filter(|s| !s.is_empty())
+            .map(|value| Self::parse_url_list(&value))
+            .unwrap_or_default();
+        if configured.is_empty() {
+            vec![epix_chain::DEFAULT_RPC_URL.to_string()]
+        } else {
+            configured
+        }
+    }
+
+    /// The configured EVM JSON-RPC endpoints for xites (served via
+    /// `serverInfo`; the node itself never calls these - the BROWSER does, so
+    /// failover across them is the xite's move, made possible by handing it
+    /// the whole list).
+    pub async fn chain_evm_rpc_urls(&self) -> Vec<String> {
+        let configured = self
+            .config_get("chain_evm_rpc_url")
+            .await
+            .map(|value| Self::parse_url_list(&value))
+            .unwrap_or_default();
+        if configured.is_empty() {
+            vec![DEFAULT_CHAIN_EVM_RPC_URL.to_string()]
+        } else {
+            configured
+        }
+    }
+
+    /// The single most-preferred chain REST URL (legacy callers).
+    pub async fn chain_rpc_url(&self) -> String {
+        self.chain_rpc_urls()
+            .await
+            .into_iter()
+            .next()
             .unwrap_or_else(|| epix_chain::DEFAULT_RPC_URL.to_string())
+    }
+
+    /// Parse a URL-list config value: a JSON array of strings, or text split
+    /// on newlines/commas. Entries are trimmed (trailing `/` dropped); blanks
+    /// are skipped.
+    fn parse_url_list(value: &Value) -> Vec<String> {
+        let clean = |s: &str| {
+            let s = s.trim().trim_end_matches('/');
+            (!s.is_empty()).then(|| s.to_string())
+        };
+        match value {
+            Value::Array(list) => {
+                list.iter().filter_map(|v| v.as_str()).filter_map(clean).collect()
+            }
+            Value::String(text) => text
+                .split(['\n', ','])
+                .filter_map(clean)
+                .collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The user's CryptMessage encryption public key (compressed SEC1) for a xite.
@@ -16540,6 +16608,24 @@ impl AppState {
         let ui_port = self.ui_port().await;
         let (epix_browser, browser_tor_clearnet) = self.browser_settings().await;
         let ui_restrict = self.ui_restrict().await;
+        let chain_rpc_urls = self.chain_rpc_urls().await;
+        // The process-wide sticky choice, kept live by the node's own chain
+        // traffic - but only when it is actually one of the configured URLs
+        // (an embedded UI that never installed the list falls back to the
+        // config's first entry).
+        let preferred = epix_chain::preferred_chain_rpc_url();
+        let chain_rpc_url = if chain_rpc_urls.iter().any(|url| url == &preferred) {
+            preferred
+        } else {
+            chain_rpc_urls.first().cloned().unwrap_or(preferred)
+        };
+        let chain_evm_rpc_urls = self.chain_evm_rpc_urls().await;
+        let chain_block_explorer_url = self
+            .config_get("chain_block_explorer_url")
+            .await
+            .and_then(|v| v.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "https://scan.epix.zone".to_string());
         json!({
             "version": self.version,
             "rev": rev,
@@ -16577,6 +16663,19 @@ impl AppState {
             // "Checking…"/"Waiting for trackers…" forever instead of saying so.
             "offline": self.offline_by_policy(),
             "xid_trust": self.xid_trust_status(),
+            // Chain endpoints for xites. The single fields carry the CURRENT
+            // live choice: for the REST URL that is the endpoint the node's
+            // own chain traffic last confirmed working (failed calls rotate
+            // it, so it stays fresh with zero health-check pings). The
+            // `_urls` lists carry every configured endpoint so a xite that
+            // sees its own timeout can rotate client-side - EVM calls are
+            // made by the BROWSER, which is the only place their failures
+            // are visible.
+            "chain_rpc_url": chain_rpc_url,
+            "chain_rpc_urls": chain_rpc_urls,
+            "chain_evm_rpc_url": chain_evm_rpc_urls.first().cloned().unwrap_or_default(),
+            "chain_evm_rpc_urls": chain_evm_rpc_urls,
+            "chain_block_explorer_url": chain_block_explorer_url,
             "multiuser": multiuser,
             "multiuser_admin": multiuser_admin,
             "master_address": master_address,
@@ -40354,6 +40453,49 @@ mod tests {
             before.elapsed() >= XID_RETRY_MIN_INTERVAL,
             "second trigger must sleep through the floor and then run"
         );
+    }
+
+    #[tokio::test]
+    async fn server_info_serves_chain_endpoints_with_the_full_lists() {
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        state
+            .config_set(
+                "chain_rpc_url",
+                json!("https://api1.example\n https://api2.example/ "),
+            )
+            .await;
+        state
+            .config_set(
+                "chain_evm_rpc_url",
+                json!("https://evm1.example, https://evm2.example"),
+            )
+            .await;
+        let info = state.server_info().await;
+        assert_eq!(
+            info["chain_rpc_urls"],
+            json!(["https://api1.example", "https://api2.example"])
+        );
+        assert_eq!(info["chain_rpc_url"], "https://api1.example");
+        assert_eq!(info["chain_evm_rpc_url"], "https://evm1.example");
+        assert_eq!(
+            info["chain_evm_rpc_urls"],
+            json!(["https://evm1.example", "https://evm2.example"])
+        );
+        assert_eq!(info["chain_block_explorer_url"], "https://scan.epix.zone");
+        // config_set installed the list process-wide; clear it so no other
+        // test observes this test's endpoints.
+        epix_chain::set_chain_rpc_urls(&[]);
+    }
+
+    #[tokio::test]
+    async fn server_info_chain_defaults_apply_when_nothing_is_configured() {
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        let info = state.server_info().await;
+        assert_eq!(info["chain_rpc_urls"], json!([epix_chain::DEFAULT_RPC_URL]));
+        assert_eq!(info["chain_evm_rpc_urls"], json!([DEFAULT_CHAIN_EVM_RPC_URL]));
+        assert_eq!(info["chain_evm_rpc_url"], DEFAULT_CHAIN_EVM_RPC_URL);
     }
 
     #[test]

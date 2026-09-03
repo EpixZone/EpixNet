@@ -47,7 +47,17 @@ use std::sync::OnceLock;
 pub fn shared_resolver() -> Arc<XidResolver> {
     static SHARED: OnceLock<Arc<XidResolver>> = OnceLock::new();
     SHARED
-        .get_or_init(|| Arc::new(XidResolver::new(resolver_rpc_url())))
+        .get_or_init(|| {
+            // The env override pins a single endpoint (devnet); otherwise the
+            // resolver follows the node-configured endpoint list LIVE (it is
+            // built lazily, possibly before the node loads its config, so the
+            // list is re-read per request rather than captured here).
+            let resolver = XidResolver::new(resolver_rpc_url());
+            Arc::new(match std::env::var("EPIX_XID_RPC_URL") {
+                Ok(url) if !url.trim().is_empty() => resolver,
+                _ => resolver.following_configured_endpoints(),
+            })
+        })
         .clone()
 }
 
@@ -106,6 +116,74 @@ impl ChainRoute {
         }
         Ok(())
     }
+}
+
+/// The node's configured chain REST endpoints, in preference order. Consumers
+/// with `follow_global` (the shared resolver) re-read this per request, so a
+/// Config change applies live with no rebuild. Empty = not configured; those
+/// consumers then use the endpoint they were constructed with.
+static CHAIN_RPC_URLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Install the configured chain REST endpoint list (first = most preferred).
+/// Entries are trimmed and trailing slashes dropped; blanks are skipped.
+pub fn set_chain_rpc_urls(urls: &[String]) {
+    let urls: Vec<String> = urls
+        .iter()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+    if let Ok(mut guard) = CHAIN_RPC_URLS.write() {
+        *guard = urls;
+    }
+}
+
+pub(crate) fn configured_chain_rpc_urls() -> Vec<String> {
+    CHAIN_RPC_URLS.read().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+/// The chain REST endpoint the process currently trusts to be live: the
+/// shared resolver's sticky choice, kept fresh by its own traffic - every
+/// failed call rotates it to the next configured endpoint. Serve THIS to
+/// xites that ask for "the" chain RPC.
+pub fn preferred_chain_rpc_url() -> String {
+    shared_resolver().preferred_endpoint()
+}
+
+/// Try `op` against each endpoint starting at the sticky `preferred` index;
+/// the first success becomes the new preference, so later calls start on the
+/// endpoint that actually answers. This is DELIBERATELY failure-driven, not a
+/// health-check timer: rotation costs nothing while everything works, needs
+/// no idle traffic (which matters over Tor), and reacts on the first real
+/// failure instead of at the next poll tick.
+pub(crate) async fn rotate_endpoints<T, F, Fut>(
+    endpoints: &[String],
+    preferred: &std::sync::atomic::AtomicUsize,
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use std::sync::atomic::Ordering;
+    if endpoints.is_empty() {
+        return Err(ChainError::Rpc("no chain RPC endpoints configured".into()));
+    }
+    let count = endpoints.len();
+    let start = preferred.load(Ordering::Relaxed) % count;
+    let mut last = None;
+    for offset in 0..count {
+        let index = (start + offset) % count;
+        match op(endpoints[index].clone()).await {
+            Ok(value) => {
+                if index != start {
+                    preferred.store(index, Ordering::Relaxed);
+                }
+                return Ok(value);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.expect("at least one endpoint was attempted"))
 }
 
 /// Proxy URL, Tor requirement, validation state, and cached-client generation
@@ -514,6 +592,86 @@ pub fn finality_checkpoint_covers(height: u64) -> bool {
         && finality_pin_floor_at(now_unix()).is_some()
         && height > 0
         && height <= checkpoint_height
+}
+
+#[cfg(test)]
+mod endpoint_rotation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn endpoints(names: &[&str]) -> Vec<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn rotates_to_the_next_endpoint_on_failure_and_stays_there() {
+        let list = endpoints(&["https://a", "https://b", "https://c"]);
+        let preferred = AtomicUsize::new(0);
+        let result = rotate_endpoints(&list, &preferred, |base| async move {
+            if base == "https://c" {
+                Ok(base)
+            } else {
+                Err(ChainError::Rpc(format!("{base} down")))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "https://c");
+        assert_eq!(
+            preferred.load(Ordering::Relaxed),
+            2,
+            "the endpoint that answered must become the preference"
+        );
+
+        // The NEXT call must start at the working endpoint, not retry the
+        // dead ones first.
+        let calls = std::sync::Mutex::new(Vec::new());
+        rotate_endpoints(&list, &preferred, |base| {
+            calls.lock().unwrap().push(base.clone());
+            async move { Ok::<_, ChainError>(base) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["https://c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn every_endpoint_down_returns_the_last_error() {
+        let list = endpoints(&["https://a", "https://b"]);
+        let preferred = AtomicUsize::new(0);
+        let error = rotate_endpoints::<serde_json::Value, _, _>(&list, &preferred, |base| {
+            async move { Err(ChainError::Rpc(format!("{base} down"))) }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ChainError::Rpc(message) if message == "https://b down"));
+    }
+
+    #[tokio::test]
+    async fn empty_endpoint_list_is_an_rpc_error_not_a_panic() {
+        let preferred = AtomicUsize::new(0);
+        let error = rotate_endpoints::<(), _, _>(&[], &preferred, |_| async move {
+            unreachable!("no endpoint to try")
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ChainError::Rpc(_)));
+    }
+
+    #[test]
+    fn configured_urls_are_cleaned_and_apply_live() {
+        set_chain_rpc_urls(&[
+            " https://one.example/ ".to_string(),
+            String::new(),
+            "https://two.example".to_string(),
+        ]);
+        assert_eq!(
+            configured_chain_rpc_urls(),
+            vec!["https://one.example".to_string(), "https://two.example".to_string()]
+        );
+        set_chain_rpc_urls(&[]);
+        assert!(configured_chain_rpc_urls().is_empty());
+    }
 }
 
 #[cfg(test)]

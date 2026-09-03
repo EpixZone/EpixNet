@@ -2458,7 +2458,7 @@ impl WsCommand for VrfGetBeacon {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let height = arg_u64(p, "height", 0).ok_or("vrfGetBeacon: height required")?;
-        let vrf = epix_chain::Vrf::new(s.state.chain_rpc_url().await);
+        let vrf = epix_chain::Vrf::new_multi(s.state.chain_rpc_urls().await);
         match vrf.beacon(height).await {
             Ok(b) => Ok(beacon_json(&b)),
             Err(e) => Ok(json!({ "error": e.to_string() })),
@@ -2474,7 +2474,7 @@ impl WsCommand for VrfLatestBeacon {
         "vrfLatestBeacon"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let vrf = epix_chain::Vrf::new(s.state.chain_rpc_url().await);
+        let vrf = epix_chain::Vrf::new_multi(s.state.chain_rpc_urls().await);
         match vrf.latest_beacon().await {
             Ok(b) => Ok(beacon_json(&b)),
             Err(e) => Ok(json!({ "error": e.to_string() })),
@@ -2492,7 +2492,7 @@ impl WsCommand for VrfMultiBlockBeacon {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let end = arg_u64(p, "end_height", 0).ok_or("vrfMultiBlockBeacon: end_height required")?;
         let blocks = arg_u64(p, "blocks", 1).unwrap_or(1);
-        let vrf = epix_chain::Vrf::new(s.state.chain_rpc_url().await);
+        let vrf = epix_chain::Vrf::new_multi(s.state.chain_rpc_urls().await);
         match vrf.multi_block_beacon(end, blocks).await {
             Ok(combined) => Ok(json!({ "beacon": combined })),
             Err(e) => Ok(json!({ "error": e.to_string() })),
@@ -2554,7 +2554,7 @@ impl WsCommand for XidResolveName {
                 "error": format!("{name}.{tld} looks like a mistyped epix1 address (bad checksum)")
             }));
         }
-        let resolver = epix_chain::XidResolver::new(s.state.chain_rpc_url().await);
+        let resolver = epix_chain::XidResolver::new_multi(s.state.chain_rpc_urls().await);
         match resolver.resolve(name, tld).await {
             Ok(snap) => Ok(serde_json::to_value(snap).unwrap_or(Value::Null)),
             Err(e) => Ok(json!({ "error": e.to_string() })),

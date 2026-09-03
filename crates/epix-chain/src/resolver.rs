@@ -19,7 +19,15 @@ pub struct XidResolver {
     /// the proxy setting changes, so a client built direct before Tor came up
     /// (Always mode) does not keep sending over clearnet afterwards.
     client: RwLock<Option<(u64, reqwest::Client)>>,
-    rpc_url: String,
+    /// Endpoint fallbacks, in preference order. Every request starts at
+    /// `preferred` and rotates to the next on failure (see
+    /// [`crate::rotate_endpoints`]).
+    rpc_urls: Vec<String>,
+    preferred: std::sync::atomic::AtomicUsize,
+    /// Re-read the node-configured endpoint list per request instead of
+    /// `rpc_urls` (the shared resolver: it may be built before config loads,
+    /// and a Config change must apply without a rebuild).
+    follow_configured: bool,
     /// Cached snapshot plus the accepted finality height it came from. A newer
     /// checkpoint invalidates older snapshots immediately, independent of TTL.
     /// `Some((height, digest))` exists only for pinned-validator verification.
@@ -54,14 +62,57 @@ struct FinalityBinding {
 
 impl XidResolver {
     pub fn new(rpc_url: impl Into<String>) -> Self {
+        Self::new_multi(vec![rpc_url.into()])
+    }
+
+    /// A resolver with endpoint FALLBACKS: requests start at the preferred
+    /// (initially first) URL and rotate to the next on failure, remembering
+    /// whichever answered.
+    pub fn new_multi(rpc_urls: Vec<String>) -> Self {
         let client = crate::http_client(Duration::from_secs(15)).ok();
+        let rpc_urls: Vec<String> = rpc_urls
+            .into_iter()
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty())
+            .collect();
         Self {
             client: RwLock::new(client),
-            rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
+            rpc_urls,
+            preferred: std::sync::atomic::AtomicUsize::new(0),
+            follow_configured: false,
             cache: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(30 * 60),
             digest: RwLock::new(None),
         }
+    }
+
+    /// Follow the node-configured endpoint list live (see the field note).
+    pub(crate) fn following_configured_endpoints(mut self) -> Self {
+        self.follow_configured = true;
+        self
+    }
+
+    /// The endpoints this request should try, in order of preference.
+    fn endpoints(&self) -> Vec<String> {
+        if self.follow_configured {
+            let configured = crate::configured_chain_rpc_urls();
+            if !configured.is_empty() {
+                return configured;
+            }
+        }
+        self.rpc_urls.clone()
+    }
+
+    /// The endpoint most recently confirmed working (or the most preferred
+    /// one before any traffic has flowed). What a xite asking for "the"
+    /// chain RPC should be handed.
+    pub fn preferred_endpoint(&self) -> String {
+        let endpoints = self.endpoints();
+        if endpoints.is_empty() {
+            return crate::DEFAULT_RPC_URL.to_string();
+        }
+        let index = self.preferred.load(std::sync::atomic::Ordering::Relaxed) % endpoints.len();
+        endpoints[index].clone()
     }
 
     /// The HTTP client for the current SOCKS setting, rebuilding it if the proxy
@@ -157,7 +208,7 @@ impl XidResolver {
         }
 
         let data = self
-            .get_json(&format!("{}/xid/v1/resolve_with_proof/{tld}/{name}", self.rpc_url))
+            .get_json(&format!("/xid/v1/resolve_with_proof/{tld}/{name}"))
             .await?;
 
         // An unregistered name comes back as a gRPC-gateway error body (no proof
@@ -309,7 +360,7 @@ impl XidResolver {
         let pinned = crate::pinned_validators()
             .ok_or_else(|| ChainError::FinalityUnverified("no pinned validator set installed".into()))?;
         let att = self
-            .get_json(&format!("{}/xid/v1/attestations?digest={digest}", self.rpc_url))
+            .get_json(&format!("/xid/v1/attestations?digest={digest}"))
             .await?;
         let bundle = crate::parse_bundle(digest, &att)
             .ok_or_else(|| ChainError::Malformed("attestation bundle malformed".into()))?;
@@ -362,10 +413,10 @@ impl XidResolver {
         }
         // Fetch the current digest and confirm validators finalized it.
         let digest_info =
-            self.get_json(&format!("{}/xid/v1/state_digest", self.rpc_url)).await?;
+            self.get_json("/xid/v1/state_digest").await?;
         let attested = str_field(&digest_info, "digest")?.to_string();
         let att = self
-            .get_json(&format!("{}/xid/v1/attestations?digest={attested}", self.rpc_url))
+            .get_json(&format!("/xid/v1/attestations?digest={attested}"))
             .await?;
         if !att.get("finalized").and_then(|v| v.as_bool()).unwrap_or(false) {
             return Err(ChainError::NotFinalized);
@@ -378,18 +429,29 @@ impl XidResolver {
         }))
     }
 
-    async fn get_json(&self, url: &str) -> Result<Value> {
+    /// GET `path` (endpoint-relative, starting with `/`) as JSON, rotating
+    /// across the configured endpoints on failure.
+    async fn get_json(&self, path: &str) -> Result<Value> {
         // Refuse to egress over clearnet before Tor is ready in Always mode.
+        // Checked ONCE, outside the rotation: this failure is local policy,
+        // not an endpoint's fault, so trying the others would be noise.
         crate::chain_egress_ok()?;
-        self.client()
-            .await?
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| ChainError::Rpc(e.to_string()))?
-            .json::<Value>()
-            .await
-            .map_err(|e| ChainError::Rpc(e.to_string()))
+        let client = self.client().await?;
+        crate::rotate_endpoints(&self.endpoints(), &self.preferred, |base| {
+            let client = client.clone();
+            let url = format!("{base}{path}");
+            async move {
+                client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| ChainError::Rpc(e.to_string()))?
+                    .json::<Value>()
+                    .await
+                    .map_err(|e| ChainError::Rpc(e.to_string()))
+            }
+        })
+        .await
     }
 }
 
