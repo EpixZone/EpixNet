@@ -1889,31 +1889,7 @@ async fn verify_current_child_manifests(
         return (files, includes);
     }
     for path in paths {
-        let governing = match xite.next_stored_manifest_governing_path(walk, &path) {
-            Ok(Some(governing)) => governing,
-            Ok(None) => {
-                let _ = xite.skip_next_stored_manifest(walk, &path);
-                continue;
-            }
-            Err(error) => {
-                if let Some(state) = progress {
-                    state
-                        .log(
-                            "WARNING",
-                            format!("Stored child {path} has no verified governing parent: {error}"),
-                        )
-                        .await;
-                }
-                let _ = xite.skip_next_stored_manifest(walk, &path);
-                continue;
-            }
-        };
-        let Ok(parent) = xite.storage().read(&governing) else {
-            let _ = xite.skip_next_stored_manifest(walk, &path);
-            continue;
-        };
-        let Ok(parent) = serde_json::from_slice::<serde_json::Value>(&parent) else {
-            let _ = xite.skip_next_stored_manifest(walk, &path);
+        let Some(parent) = stored_child_parent(xite, progress, walk, &path).await else {
             continue;
         };
         let child: Option<serde_json::Value> = xite
@@ -1938,39 +1914,86 @@ async fn verify_current_child_manifests(
                 includes.extend(manifest.includes());
             }
             Ok(None) => {}
-            // Verified with whatever resolved, so an unresolved name only
-            // matters when it could explain the failure. If one could not be
-            // looked up, record NO verdict and mark the xite for the
-            // trust-anchored retry: rejecting here is what turned a Tor-window
-            // outage into a permanent "xID name 'x' not found on chain" for a
-            // name that is registered and active.
-            Err(error) if unresolved => {
-                if let Some(state) = progress {
-                    state.mark_xid_deferred(xite.address.as_str());
-                    state
-                        .log(
-                            "DEBUG",
-                            format!(
-                                "Stored child {path}: xID lookup unavailable, \
-                                 deferring verification ({error})"
-                            ),
-                        )
-                        .await;
-                }
-            }
             Err(error) => {
-                if let Some(state) = progress {
-                    state
-                        .log(
-                            "WARNING",
-                            format!("Stored child {path} failed verification: {error}"),
-                        )
-                        .await;
-                }
+                log_child_verification_failure(xite, progress, &path, &error, unresolved).await;
             }
         }
     }
     (files, includes)
+}
+
+/// The verified governing parent of one stored child, parsed. `None` after
+/// SKIPPING the child in the walk: no verified governing parent, or the
+/// parent is unreadable/unparsable.
+async fn stored_child_parent(
+    xite: &Xite,
+    progress: Option<&Arc<AppState>>,
+    walk: &mut epix_xite::xite::VerifiedManifestWalk,
+    path: &str,
+) -> Option<serde_json::Value> {
+    let governing = match xite.next_stored_manifest_governing_path(walk, path) {
+        Ok(Some(governing)) => governing,
+        Ok(None) => {
+            let _ = xite.skip_next_stored_manifest(walk, path);
+            return None;
+        }
+        Err(error) => {
+            if let Some(state) = progress {
+                state
+                    .log(
+                        "WARNING",
+                        format!("Stored child {path} has no verified governing parent: {error}"),
+                    )
+                    .await;
+            }
+            let _ = xite.skip_next_stored_manifest(walk, path);
+            return None;
+        }
+    };
+    let parent: Option<serde_json::Value> = xite
+        .storage()
+        .read(&governing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if parent.is_none() {
+        let _ = xite.skip_next_stored_manifest(walk, path);
+    }
+    parent
+}
+
+/// Record one stored child's verification failure. Verified with whatever
+/// resolved, an unresolved name only matters when it could explain the
+/// failure: then record NO verdict and mark the xite for the trust-anchored
+/// retry - rejecting here is what turned a Tor-window outage into a permanent
+/// "xID name 'x' not found on chain" for a name that is registered and
+/// active. With every name resolved, the failure is the chain's answer.
+async fn log_child_verification_failure(
+    xite: &Xite,
+    progress: Option<&Arc<AppState>>,
+    path: &str,
+    error: &impl std::fmt::Display,
+    unresolved: bool,
+) {
+    let Some(state) = progress else { return };
+    if unresolved {
+        state.mark_xid_deferred(xite.address.as_str());
+        state
+            .log(
+                "DEBUG",
+                format!(
+                    "Stored child {path}: xID lookup unavailable, \
+                     deferring verification ({error})"
+                ),
+            )
+            .await;
+    } else {
+        state
+            .log(
+                "WARNING",
+                format!("Stored child {path} failed verification: {error}"),
+            )
+            .await;
+    }
 }
 
 async fn sync_child_manifest_levels(
@@ -3394,24 +3417,8 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         let mut fast_retry_secs = 5u64;
         loop {
             let before = epix_chain::pinned_validators();
-            let mut outcome = Err("no chain RPC endpoints configured".to_string());
-            for (index, url) in rpc_candidates.iter().enumerate() {
-                cfg.rpc_url = url.clone();
-                outcome = epix_chain::advance_trusted_set(&cfg).await;
-                if outcome.is_ok() {
-                    if index != 0 {
-                        state
-                            .log(
-                                "INFO",
-                                format!("xID finality: light client rotated to {url}"),
-                            )
-                            .await;
-                        rpc_candidates.swap(0, index);
-                    }
-                    break;
-                }
-            }
-            let outcome = outcome;
+            let outcome =
+                advance_with_rpc_rotation(&state, &mut cfg, &mut rpc_candidates).await;
             // A xite whose user content could not be xID-verified is waiting on
             // exactly this: the trusted set going from nothing to something.
             // Only that transition retries - not every tick, or an hourly
@@ -3509,6 +3516,35 @@ fn pinned_set_changed(old: &epix_chain::PinnedSet, new: &epix_chain::PinnedSet) 
 /// INFO, routine advances at DEBUG, an unextendable anchor at WARN, transient
 /// errors (RPC hiccup, Tor not up yet) at DEBUG — the active pin is untouched
 /// in every non-advanced case and the next tick retries.
+/// One light-client advance cycle, rotating across the candidate RPCs on
+/// failure. The URL that answers moves to the front, so the next cycle starts
+/// on the endpoint that actually works - the pin must keep advancing inside
+/// its weak-subjectivity window even when the primary endpoint dies for good.
+async fn advance_with_rpc_rotation(
+    state: &Arc<AppState>,
+    cfg: &mut epix_chain::LightClientConfig,
+    candidates: &mut [String],
+) -> Result<epix_chain::Advance, String> {
+    let mut outcome = Err("no chain RPC endpoints configured".to_string());
+    for index in 0..candidates.len() {
+        cfg.rpc_url = candidates[index].clone();
+        outcome = epix_chain::advance_trusted_set(cfg).await;
+        if outcome.is_ok() {
+            if index != 0 {
+                state
+                    .log(
+                        "INFO",
+                        format!("xID finality: light client rotated to {}", cfg.rpc_url),
+                    )
+                    .await;
+                candidates.swap(0, index);
+            }
+            break;
+        }
+    }
+    outcome
+}
+
 async fn log_xid_lightclient_outcome(
     state: &AppState,
     before: Option<epix_chain::PinnedSet>,

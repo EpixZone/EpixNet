@@ -7069,34 +7069,10 @@ impl AppState {
         };
         let registry = self.xite_registry_lock.lock().await;
         let root = root.join("data");
-        let mut map: serde_json::Map<String, Value> = match std::fs::read(path) {
-            Ok(bytes) => match serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes) {
-                Ok(map) => map,
-                Err(error) => {
-                    self.log(
-                        "ERROR",
-                        format!(
-                            "Could not parse served-xite registry {}: {error}",
-                            path.display()
-                        ),
-                    )
-                    .await;
-                    return 0;
-                }
-            },
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                serde_json::Map::new()
-            }
-            Err(error) => {
-                self.log(
-                    "ERROR",
-                    format!("Could not read served-xite registry {}: {error}", path.display()),
-                )
-                .await;
-                return 0;
-            }
+        let Some(mut map) = self.load_xite_registry(path).await else {
+            return 0;
         };
-        let mut intents = match self.read_xite_removal_intents() {
+        let intents = match self.read_xite_removal_intents() {
             Ok(intents) => intents,
             Err(error) => {
                 // A corrupt deletion journal is not permission to resurrect
@@ -7107,81 +7083,7 @@ impl AppState {
             }
         };
         if !intents.is_empty() {
-            let mut completed = std::collections::HashSet::new();
-            for (canonical, intent) in &intents {
-                map.remove(canonical);
-                let Ok(_) = Address::parse(canonical.clone()) else {
-                    self.log(
-                        "ERROR",
-                        format!("Refusing invalid xite-removal address {canonical}"),
-                    )
-                    .await;
-                    continue;
-                };
-                if let Err(error) = self.delete_user_xite_data(&intent.keys).await {
-                    self.log(
-                        "WARN",
-                        format!("Pending user cleanup for removed xite {canonical}: {error}"),
-                    )
-                    .await;
-                    continue;
-                }
-                if let Err(error) = self
-                    .delete_xite_persisted_metadata(canonical, &intent.keys)
-                    .await
-                {
-                    self.log(
-                        "WARN",
-                        format!("Pending metadata cleanup for removed xite {canonical}: {error}"),
-                    )
-                    .await;
-                    continue;
-                }
-                // A root that may still back an Extern Store row survives
-                // startup until set_edx_store has revalidated/internalized the
-                // exact object. Deleting it here would destroy the only copy
-                // before Store activation can preserve an independent owner.
-                if intent.store_cleanup_required || intent.owner_cleanup_required {
-                    continue;
-                }
-                let roots = match self.validated_removal_roots(canonical, intent) {
-                    Ok(roots) => roots,
-                    Err(error) => {
-                        self.log("ERROR", error).await;
-                        continue;
-                    }
-                };
-                let mut removed = true;
-                for directory in roots {
-                    if let Err(error) = remove_xite_directory_durable(&directory) {
-                        removed = false;
-                        self.log("WARN", format!("Pending xite removal: {error}"))
-                            .await;
-                    }
-                }
-                if removed {
-                    completed.insert(canonical.clone());
-                }
-            }
-            let registry_persisted = serde_json::to_vec_pretty(&Value::Object(map.clone()))
-                .map_err(|error| format!("could not encode served-xite registry: {error}"))
-                .and_then(|bytes| self.write_xite_registry_bytes(&bytes));
-            if let Err(error) = &registry_persisted {
-                self.log(
-                    "ERROR",
-                    format!("Could not persist interrupted xite removals: {error}"),
-                )
-                .await;
-            } else {
-                intents.retain(|canonical, _| !completed.contains(canonical));
-                if let Err(error) = self.write_xite_removal_intents(&intents) {
-                    self.log(
-                        "WARN",
-                        format!("Could not retire completed xite-removal intents: {error}"),
-                    )
-                    .await;
-                }
-            }
+            self.finish_boot_xite_removals(intents, &mut map).await;
         }
         drop(registry);
         if let Ok(pending) = self.read_xite_removal_intents() {
@@ -7199,6 +7101,134 @@ impl AppState {
             }
         }
         restored
+    }
+
+    /// Read and parse the served-xite registry. `None` = unreadable or
+    /// corrupt (already logged); a missing file is an empty registry.
+    async fn load_xite_registry(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<serde_json::Map<String, Value>> {
+        match std::fs::read(path) {
+            Ok(bytes) => match serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes) {
+                Ok(map) => Some(map),
+                Err(error) => {
+                    self.log(
+                        "ERROR",
+                        format!(
+                            "Could not parse served-xite registry {}: {error}",
+                            path.display()
+                        ),
+                    )
+                    .await;
+                    None
+                }
+            },
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Some(serde_json::Map::new())
+            }
+            Err(error) => {
+                self.log(
+                    "ERROR",
+                    format!("Could not read served-xite registry {}: {error}", path.display()),
+                )
+                .await;
+                None
+            }
+        }
+    }
+
+    /// Finish interrupted xite removals at boot: every intent's entry leaves
+    /// the registry regardless, fully-cleaned intents are retired, and
+    /// anything else stays journaled for the retry. Runs under the registry
+    /// mutex (the caller holds it).
+    async fn finish_boot_xite_removals(
+        &self,
+        mut intents: std::collections::BTreeMap<String, XiteRemovalIntent>,
+        map: &mut serde_json::Map<String, Value>,
+    ) {
+        let mut completed = std::collections::HashSet::new();
+        for (canonical, intent) in &intents {
+            map.remove(canonical);
+            if self.finish_one_boot_xite_removal(canonical, intent).await {
+                completed.insert(canonical.clone());
+            }
+        }
+        let registry_persisted = serde_json::to_vec_pretty(&Value::Object(map.clone()))
+            .map_err(|error| format!("could not encode served-xite registry: {error}"))
+            .and_then(|bytes| self.write_xite_registry_bytes(&bytes));
+        if let Err(error) = &registry_persisted {
+            self.log(
+                "ERROR",
+                format!("Could not persist interrupted xite removals: {error}"),
+            )
+            .await;
+        } else {
+            intents.retain(|canonical, _| !completed.contains(canonical));
+            if let Err(error) = self.write_xite_removal_intents(&intents) {
+                self.log(
+                    "WARN",
+                    format!("Could not retire completed xite-removal intents: {error}"),
+                )
+                .await;
+            }
+        }
+    }
+
+    /// One boot-time removal: user data, persisted metadata, then the tree -
+    /// each failure leaves the intent journaled and moves on. True = fully
+    /// removed.
+    async fn finish_one_boot_xite_removal(
+        &self,
+        canonical: &str,
+        intent: &XiteRemovalIntent,
+    ) -> bool {
+        if Address::parse(canonical.to_string()).is_err() {
+            self.log(
+                "ERROR",
+                format!("Refusing invalid xite-removal address {canonical}"),
+            )
+            .await;
+            return false;
+        }
+        if let Err(error) = self.delete_user_xite_data(&intent.keys).await {
+            self.log(
+                "WARN",
+                format!("Pending user cleanup for removed xite {canonical}: {error}"),
+            )
+            .await;
+            return false;
+        }
+        if let Err(error) = self.delete_xite_persisted_metadata(canonical, &intent.keys).await {
+            self.log(
+                "WARN",
+                format!("Pending metadata cleanup for removed xite {canonical}: {error}"),
+            )
+            .await;
+            return false;
+        }
+        // A root that may still back an Extern Store row survives startup
+        // until set_edx_store has revalidated/internalized the exact object.
+        // Deleting it here would destroy the only copy before Store
+        // activation can preserve an independent owner.
+        if intent.store_cleanup_required || intent.owner_cleanup_required {
+            return false;
+        }
+        let roots = match self.validated_removal_roots(canonical, intent) {
+            Ok(roots) => roots,
+            Err(error) => {
+                self.log("ERROR", error).await;
+                return false;
+            }
+        };
+        let mut removed = true;
+        for directory in roots {
+            if let Err(error) = remove_xite_directory_durable(&directory) {
+                removed = false;
+                self.log("WARN", format!("Pending xite removal: {error}")).await;
+            }
+        }
+        removed
     }
 
     /// Finish removal intents whose tree may still be the canonical backing
@@ -13708,27 +13738,8 @@ impl AppState {
         // trigger lands seconds after the Tor-egress one, and it is usually
         // the one that can finally resolve names - swallowing it would strand
         // the deferred set until the next validator-set change.
-        loop {
-            let wait = {
-                let mut last = match self.xid_retry_last.lock() {
-                    Ok(last) => last,
-                    Err(_) => return 0,
-                };
-                let now = tokio::time::Instant::now();
-                match *last {
-                    Some(at) if now.duration_since(at) < XID_RETRY_MIN_INTERVAL => {
-                        Some(XID_RETRY_MIN_INTERVAL - now.duration_since(at))
-                    }
-                    _ => {
-                        *last = Some(now);
-                        None
-                    }
-                }
-            };
-            match wait {
-                Some(wait) => tokio::time::sleep(wait).await,
-                None => break,
-            }
+        if !self.wait_out_xid_retry_floor().await {
+            return 0;
         }
 
         let mut rebuilt = 0usize;
@@ -13745,20 +13756,7 @@ impl AppState {
             if pending.is_empty() {
                 break;
             }
-            // The set is keyed by CANONICAL address; rebuild_xite_db keys off
-            // the serving entry, which for an alias is a different string.
-            let mut targets = Vec::new();
-            for address in self.xite_addresses().await {
-                let canonical = {
-                    let xites = self.xites.read().await;
-                    xites
-                        .get(&address)
-                        .map(|xite| canonical_address(xite.content.as_ref(), &address))
-                };
-                if canonical.is_some_and(|canonical| pending.contains(&canonical)) {
-                    targets.push(address);
-                }
-            }
+            let targets = self.deferred_xid_serving_addresses(&pending).await;
             if targets.is_empty() {
                 break;
             }
@@ -13786,6 +13784,55 @@ impl AppState {
         // for a reconnect.
         self.push_server_info().await;
         rebuilt
+    }
+
+    /// Sleep out whatever remains of [`XID_RETRY_MIN_INTERVAL`] since the
+    /// last pass, then claim the new pass's timestamp. False only when the
+    /// timestamp lock is poisoned (abort the pass).
+    async fn wait_out_xid_retry_floor(&self) -> bool {
+        loop {
+            let wait = {
+                let Ok(mut last) = self.xid_retry_last.lock() else {
+                    return false;
+                };
+                let now = tokio::time::Instant::now();
+                match *last {
+                    Some(at) if now.duration_since(at) < XID_RETRY_MIN_INTERVAL => {
+                        Some(XID_RETRY_MIN_INTERVAL - now.duration_since(at))
+                    }
+                    _ => {
+                        *last = Some(now);
+                        None
+                    }
+                }
+            };
+            match wait {
+                Some(wait) => tokio::time::sleep(wait).await,
+                None => return true,
+            }
+        }
+    }
+
+    /// The SERVING addresses of the deferred set: it is keyed by CANONICAL
+    /// address, while `rebuild_xite_db` keys off the serving entry, which for
+    /// an alias is a different string.
+    async fn deferred_xid_serving_addresses(
+        &self,
+        pending: &std::collections::HashSet<String>,
+    ) -> Vec<String> {
+        let mut targets = Vec::new();
+        for address in self.xite_addresses().await {
+            let canonical = {
+                let xites = self.xites.read().await;
+                xites
+                    .get(&address)
+                    .map(|xite| canonical_address(xite.content.as_ref(), &address))
+            };
+            if canonical.is_some_and(|canonical| pending.contains(&canonical)) {
+                targets.push(address);
+            }
+        }
+        targets
     }
 
     /// Next follow-up delay after a pass that started with `deferred_before`
@@ -20177,32 +20224,9 @@ impl AppState {
                 .next_stored_manifest_governing_path(&walk, &child)
                 .ok()
                 .flatten();
-            let resolution = match governing.as_deref() {
-                Some(parent) => match manifests
-                    .iter()
-                    .find(|manifest| manifest.inner_path == parent)
-                {
-                    Some(manifest) => {
-                        let mut names = epix_content::verify::content_xid_names(
-                            &manifest.content,
-                            &child,
-                        );
-                        if let Some(child_content) = storage
-                            .read(&child)
-                            .ok()
-                            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                        {
-                            names.extend(epix_content::verify::chain_cert_xid_name(
-                                &manifest.content,
-                                &child_content,
-                            ));
-                        }
-                        Self::resolve_xid_names_deferrable(names).await
-                    }
-                    None => XidResolution::default(),
-                },
-                None => XidResolution::default(),
-            };
+            let resolution =
+                Self::walk_child_resolution(storage, &manifests, governing.as_deref(), &child)
+                    .await;
             stale |= resolution.stale;
             // Verify with whatever resolved. An unresolved name only matters
             // if it actually changed the outcome, so do NOT pre-empt a child
@@ -21497,6 +21521,37 @@ impl AppState {
     /// before: the verifier must still reject it. Note the empty case stays
     /// OMITTED rather than inserted as an empty vec - inserting would change
     /// `resolve_xid`'s address list for dot-form signers elsewhere.
+    /// Resolve the xID names one walked child needs: the names its governing
+    /// parent's rules reference, plus a chain-delegated cert name on the
+    /// child itself. No governing parent (or one not yet verified) resolves
+    /// nothing - verification then fails on its own terms.
+    async fn walk_child_resolution(
+        storage: &XiteStorage,
+        manifests: &[VerifiedManifestUnit],
+        governing: Option<&str>,
+        child: &str,
+    ) -> XidResolution {
+        let Some(parent) = governing else {
+            return XidResolution::default();
+        };
+        let Some(manifest) = manifests.iter().find(|manifest| manifest.inner_path == parent)
+        else {
+            return XidResolution::default();
+        };
+        let mut names = epix_content::verify::content_xid_names(&manifest.content, child);
+        if let Some(child_content) = storage
+            .read(child)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        {
+            names.extend(epix_content::verify::chain_cert_xid_name(
+                &manifest.content,
+                &child_content,
+            ));
+        }
+        Self::resolve_xid_names_deferrable(names).await
+    }
+
     async fn resolve_xid_names_deferrable(mut names: Vec<String>) -> XidResolution {
         names.sort();
         names.dedup();
@@ -29568,6 +29623,123 @@ impl AppState {
         self.rebuild_xite_db_with(address, true).await
     }
 
+    /// Run the verification walk and keep the result only when its root
+    /// matches the managed root. `Ok(None)` = the walk succeeded but the root
+    /// changed underneath (the caller must abort, another writer won);
+    /// `Err(())` = the walk itself failed (the caller may fall back).
+    async fn walk_index_for_root(
+        &self,
+        address: &str,
+        canonical: &str,
+        storage: &XiteStorage,
+        content: Option<&Value>,
+    ) -> Result<Option<VerifiedXiteIndex>, ()> {
+        let index = self
+            .verified_xite_index(address, canonical, storage)
+            .await
+            .map_err(|_| ())?;
+        let matches = index
+            .manifests
+            .iter()
+            .find(|manifest| manifest.inner_path == "content.json")
+            .map(|manifest| &manifest.content)
+            == content;
+        Ok(matches.then_some(index))
+    }
+
+    /// Snapshot a freshly walked index, install it, and reconcile object
+    /// ownership. `None` = the snapshot failed and the rebuild must abort.
+    /// Every other install site pairs the index install with a
+    /// manifest-ownership transition; without it, objects the fresh index
+    /// newly declares hold no manifest reference and stay eviction-eligible
+    /// until some unrelated mutation reconciles.
+    async fn install_walked_index_snapshot(
+        &self,
+        canonical: &str,
+        storage: &XiteStorage,
+        index: VerifiedXiteIndex,
+    ) -> Option<AcceptedDbSnapshot> {
+        let snapshot = Self::db_snapshot_from_authority(
+            canonical,
+            storage,
+            &VerifiedDbAuthority::from(&index),
+        )
+        .await
+        .ok()?;
+        self.install_verified_xite_index(canonical, index);
+        if let Some(store) = self.edx_store().await {
+            for warning in self.reconcile_manifest_object_owners(&store) {
+                self.log("WARN", format!("db rebuild ownership reconcile: {warning}"))
+                    .await;
+            }
+        }
+        Some(snapshot)
+    }
+
+    /// The paths an unverifiable xite's DB is built from: the owner's local
+    /// draft paths, or nothing at all for a foreign xite.
+    fn draft_or_empty_db_paths(
+        content: Option<&Value>,
+        own: bool,
+    ) -> (Vec<String>, Option<AcceptedDbSnapshot>) {
+        if own {
+            (
+                content
+                    .and_then(|root| Self::local_draft_db_paths(root).ok())
+                    .unwrap_or_default(),
+                None,
+            )
+        } else {
+            (Vec::new(), None)
+        }
+    }
+
+    /// The accepted paths + value snapshot a rebuild feeds `build_xite_db`.
+    /// `None` = abort the rebuild (snapshot failure, or the root changed
+    /// underneath the walk).
+    #[allow(clippy::too_many_arguments)]
+    async fn rebuild_paths_and_snapshot(
+        &self,
+        address: &str,
+        canonical: &str,
+        storage: &XiteStorage,
+        content: Option<&Value>,
+        own: bool,
+        force_reverify: bool,
+        fresh_index: Option<VerifiedXiteIndex>,
+    ) -> Option<(Vec<String>, Option<AcceptedDbSnapshot>)> {
+        if let Some(index) = fresh_index {
+            let snapshot = self.install_walked_index_snapshot(canonical, storage, index).await?;
+            return Some((snapshot.paths.clone(), Some(snapshot)));
+        }
+        match self.accepted_db_authority_for_root_locked(canonical, content) {
+            Ok(authority) => {
+                let snapshot = Self::db_snapshot_from_authority(canonical, storage, &authority)
+                    .await
+                    .ok()?;
+                Some((snapshot.paths.clone(), Some(snapshot)))
+            }
+            Err(_) if content.is_some() => {
+                if force_reverify {
+                    // The forced fresh walk above already failed; do not walk
+                    // twice, fall straight to the own-draft/empty tails.
+                    return Some(Self::draft_or_empty_db_paths(content, own));
+                }
+                match self.walk_index_for_root(address, canonical, storage, content).await {
+                    Ok(Some(index)) => {
+                        let snapshot =
+                            self.install_walked_index_snapshot(canonical, storage, index).await?;
+                        Some((snapshot.paths.clone(), Some(snapshot)))
+                    }
+                    // Walk succeeded but the root moved: abort, as before.
+                    Ok(None) => None,
+                    Err(()) => Some(Self::draft_or_empty_db_paths(content, own)),
+                }
+            }
+            Err(_) => Some((Vec::new(), None)),
+        }
+    }
+
     async fn rebuild_xite_db_with(&self, address: &str, force_reverify: bool) -> bool {
         let filter_epoch = self.db_filter_epoch();
         let muted = self.muted_authors().await;
@@ -29613,111 +29785,26 @@ impl AppState {
         // longer matches the managed root is discarded the same way the
         // non-forced walk branch would discard it.
         let fresh_index = if force_reverify && content.is_some() {
-            match self.verified_xite_index(address, &canonical, &storage).await {
-                Ok(index)
-                    if index
-                        .manifests
-                        .iter()
-                        .find(|manifest| manifest.inner_path == "content.json")
-                        .map(|manifest| &manifest.content)
-                        == content.as_ref() =>
-                {
-                    Some(index)
-                }
-                _ => None,
-            }
+            self.walk_index_for_root(address, &canonical, &storage, content.as_ref())
+                .await
+                .ok()
+                .flatten()
         } else {
             None
         };
-        let (accepted_db_paths, accepted_db_snapshot) = if let Some(index) = fresh_index {
-            let Ok(snapshot) = Self::db_snapshot_from_authority(
+        let Some((accepted_db_paths, accepted_db_snapshot)) = self
+            .rebuild_paths_and_snapshot(
+                address,
                 &canonical,
                 &storage,
-                &VerifiedDbAuthority::from(&index),
+                content.as_ref(),
+                own,
+                force_reverify,
+                fresh_index,
             )
             .await
-            else {
-                return false;
-            };
-            self.install_verified_xite_index(&canonical, index);
-            if let Some(store) = self.edx_store().await {
-                for warning in self.reconcile_manifest_object_owners(&store) {
-                    self.log("WARN", format!("db rebuild ownership reconcile: {warning}"))
-                        .await;
-                }
-            }
-            (snapshot.paths.clone(), Some(snapshot))
-        } else {
-            match self.accepted_db_authority_for_root_locked(&canonical, content.as_ref()) {
-            Ok(authority) => {
-                let Ok(snapshot) = Self::db_snapshot_from_authority(
-                    &canonical,
-                    &storage,
-                    &authority,
-                )
-                .await
-                else {
-                    return false;
-                };
-                (snapshot.paths.clone(), Some(snapshot))
-            }
-            Err(_) if content.is_some() => {
-                // In forced mode the fresh walk above already failed; do not
-                // walk twice, just fall through to the own-draft/empty tails.
-                let walked = if force_reverify {
-                    Err("re-verification walk already failed".to_string())
-                } else {
-                    self.verified_xite_index(address, &canonical, &storage).await
-                };
-                match walked {
-                    Ok(index) => {
-                        if index
-                            .manifests
-                            .iter()
-                            .find(|manifest| manifest.inner_path == "content.json")
-                            .map(|manifest| &manifest.content)
-                            != content.as_ref()
-                        {
-                            return false;
-                        }
-                        let Ok(snapshot) = Self::db_snapshot_from_authority(
-                            &canonical,
-                            &storage,
-                            &VerifiedDbAuthority::from(&index),
-                        )
-                        .await
-                        else {
-                            return false;
-                        };
-                        self.install_verified_xite_index(&canonical, index);
-                        // Every other install site pairs the index install
-                        // with a manifest-ownership transition; without it,
-                        // objects the fresh index newly declares hold no
-                        // manifest reference and stay eviction-eligible until
-                        // some unrelated mutation reconciles.
-                        if let Some(store) = self.edx_store().await {
-                            for warning in self.reconcile_manifest_object_owners(&store) {
-                                self.log(
-                                    "WARN",
-                                    format!("db rebuild ownership reconcile: {warning}"),
-                                )
-                                .await;
-                            }
-                        }
-                        (snapshot.paths.clone(), Some(snapshot))
-                    }
-                    Err(_) if own => (
-                        content
-                            .as_ref()
-                            .and_then(|root| Self::local_draft_db_paths(root).ok())
-                            .unwrap_or_default(),
-                        None,
-                    ),
-                    Err(_) => (Vec::new(), None),
-                }
-            }
-            Err(_) => (Vec::new(), None),
-            }
+        else {
+            return false;
         };
         let epoch = self.verified_index_epoch(&canonical);
         let source_epoch = self.db_source_epoch(&canonical);
