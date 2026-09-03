@@ -40,9 +40,11 @@ mod identity;
 mod membership;
 mod nullifier;
 mod pool;
+mod seeded_rng;
 
 pub use engine::{Rln, Slot, Verified, MAX_UNITS_PER_PROOF};
 pub use identity::{commitment_of_secret, RlnIdentity};
+pub use seeded_rng::SeededChaCha;
 pub use membership::Membership;
 pub use nullifier::{NullifierId, NullifierLog, Observation, RecordId};
 pub use pool::{Admission, PoolGate};

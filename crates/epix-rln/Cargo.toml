@@ -13,7 +13,12 @@ rln = { version = "3", default-features = false }
 # membership tree, plus Poseidon.
 zerokit_utils = { version = "3", default-features = false }
 # Deterministic identity derivation (xID-anchored: same seed -> same identity).
+# The derived identities are pinned by tests/identity_golden.rs: any bump that
+# shifts the seeded output stream fails that known-answer test.
 rand_chacha = "0.10"
+# The trait generation the vendored rln + arkworks 0.5 sample through; the
+# seeded_rng bridge implements these over the modern ChaCha20Rng.
+rand_core06 = { package = "rand_core", version = "0.6" }
 thiserror = "2"
 # Hex encoding for the owner-signed membership roster (commitment <-> string).
 hex = "0.4"
