@@ -506,14 +506,16 @@ fn read_only_sparse_materializes_without_a_writable_reopen() {
     store.write_slice(id, &[0..120_000], &slice[..], 1).unwrap();
 
     let sparse = store_dir.path().join("sparse").join(id.to_string());
-    std::fs::set_permissions(&sparse, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // 0o400 rather than world-readable 0o444: the test only needs read-only;
+    // granting read to group/other is the loose-permission pattern scanners flag.
+    std::fs::set_permissions(&sparse, std::fs::Permissions::from_mode(0o400)).unwrap();
     let source_inode = std::fs::metadata(&sparse).unwrap().ino();
     let destination = tree.path().join("xite1").join("read-only.bin");
     store.materialize(id, &destination, 2).unwrap();
 
     let metadata = std::fs::metadata(&destination).unwrap();
     assert_eq!(metadata.ino(), source_inode, "same-filesystem materialize uses a hard link");
-    assert_eq!(metadata.permissions().mode() & 0o777, 0o444);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o400);
     assert_eq!(std::fs::read(&destination).unwrap(), data);
 }
 
@@ -530,7 +532,8 @@ fn read_only_extern_copy_is_synced_before_permissions_are_restored() {
     let owner = tree.path().join("xite1").join("owner.bin");
     std::fs::create_dir_all(owner.parent().unwrap()).unwrap();
     std::fs::write(&owner, &data).unwrap();
-    std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o444)).unwrap();
+    // 0o400 rather than 0o444: read-only for THIS process is all the test needs.
+    std::fs::set_permissions(&owner, std::fs::Permissions::from_mode(0o400)).unwrap();
     store.adopt_extern(id, Ns::Plain, &owner, 1).unwrap();
 
     let duplicate = tree.path().join("xite2").join("copy.bin");
@@ -539,7 +542,7 @@ fn read_only_extern_copy_is_synced_before_permissions_are_restored() {
     let source_metadata = std::fs::metadata(&owner).unwrap();
     let duplicate_metadata = std::fs::metadata(&duplicate).unwrap();
     assert_ne!(source_metadata.ino(), duplicate_metadata.ino(), "tree copies stay independent");
-    assert_eq!(duplicate_metadata.permissions().mode() & 0o777, 0o444);
+    assert_eq!(duplicate_metadata.permissions().mode() & 0o777, 0o400);
     assert_eq!(std::fs::read(&duplicate).unwrap(), data);
     assert_eq!(std::fs::read(&owner).unwrap(), data);
 }
