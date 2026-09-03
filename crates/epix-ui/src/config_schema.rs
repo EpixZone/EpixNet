@@ -193,7 +193,7 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     (
         "Epix Chain Config",
         "xid_bootstrap_rpcs",
-        "RPCs (one per line)",
+        "RPC Endpoints",
         "https://rpc.epix.zone\nhttps://rpc-epix.onenov.xyz\nhttps://rpc-m.epix.vinjan-inc.com\nhttps://rpc-epix.dnsarz.net:443",
         "textarea",
     ),
