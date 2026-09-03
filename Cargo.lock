@@ -2958,7 +2958,7 @@ version = "0.1.0"
 dependencies = [
  "hex",
  "rand 0.10.2",
- "rand_chacha 0.3.1",
+ "rand_chacha 0.10.0",
  "rln",
  "thiserror 2.0.20",
  "zerokit_utils",

@@ -13,7 +13,7 @@ rln = { version = "3", default-features = false }
 # membership tree, plus Poseidon.
 zerokit_utils = { version = "3", default-features = false }
 # Deterministic identity derivation (xID-anchored: same seed -> same identity).
-rand_chacha = "0.3"
+rand_chacha = "0.10"
 thiserror = "2"
 # Hex encoding for the owner-signed membership roster (commitment <-> string).
 hex = "0.4"
