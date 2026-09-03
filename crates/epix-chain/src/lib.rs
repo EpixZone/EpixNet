@@ -47,7 +47,17 @@ use std::sync::OnceLock;
 pub fn shared_resolver() -> Arc<XidResolver> {
     static SHARED: OnceLock<Arc<XidResolver>> = OnceLock::new();
     SHARED
-        .get_or_init(|| Arc::new(XidResolver::new(resolver_rpc_url())))
+        .get_or_init(|| {
+            // The env override pins a single endpoint (devnet); otherwise the
+            // resolver follows the node-configured endpoint list LIVE (it is
+            // built lazily, possibly before the node loads its config, so the
+            // list is re-read per request rather than captured here).
+            let resolver = XidResolver::new(resolver_rpc_url());
+            Arc::new(match std::env::var("EPIX_XID_RPC_URL") {
+                Ok(url) if !url.trim().is_empty() => resolver,
+                _ => resolver.following_configured_endpoints(),
+            })
+        })
         .clone()
 }
 
@@ -106,6 +116,74 @@ impl ChainRoute {
         }
         Ok(())
     }
+}
+
+/// The node's configured chain REST endpoints, in preference order. Consumers
+/// with `follow_global` (the shared resolver) re-read this per request, so a
+/// Config change applies live with no rebuild. Empty = not configured; those
+/// consumers then use the endpoint they were constructed with.
+static CHAIN_RPC_URLS: std::sync::RwLock<Vec<String>> = std::sync::RwLock::new(Vec::new());
+
+/// Install the configured chain REST endpoint list (first = most preferred).
+/// Entries are trimmed and trailing slashes dropped; blanks are skipped.
+pub fn set_chain_rpc_urls(urls: &[String]) {
+    let urls: Vec<String> = urls
+        .iter()
+        .map(|url| url.trim().trim_end_matches('/').to_string())
+        .filter(|url| !url.is_empty())
+        .collect();
+    if let Ok(mut guard) = CHAIN_RPC_URLS.write() {
+        *guard = urls;
+    }
+}
+
+pub(crate) fn configured_chain_rpc_urls() -> Vec<String> {
+    CHAIN_RPC_URLS.read().map(|guard| guard.clone()).unwrap_or_default()
+}
+
+/// The chain REST endpoint the process currently trusts to be live: the
+/// shared resolver's sticky choice, kept fresh by its own traffic - every
+/// failed call rotates it to the next configured endpoint. Serve THIS to
+/// xites that ask for "the" chain RPC.
+pub fn preferred_chain_rpc_url() -> String {
+    shared_resolver().preferred_endpoint()
+}
+
+/// Try `op` against each endpoint starting at the sticky `preferred` index;
+/// the first success becomes the new preference, so later calls start on the
+/// endpoint that actually answers. This is DELIBERATELY failure-driven, not a
+/// health-check timer: rotation costs nothing while everything works, needs
+/// no idle traffic (which matters over Tor), and reacts on the first real
+/// failure instead of at the next poll tick.
+pub(crate) async fn rotate_endpoints<T, F, Fut>(
+    endpoints: &[String],
+    preferred: &std::sync::atomic::AtomicUsize,
+    mut op: F,
+) -> Result<T>
+where
+    F: FnMut(String) -> Fut,
+    Fut: std::future::Future<Output = Result<T>>,
+{
+    use std::sync::atomic::Ordering;
+    if endpoints.is_empty() {
+        return Err(ChainError::Rpc("no chain RPC endpoints configured".into()));
+    }
+    let count = endpoints.len();
+    let start = preferred.load(Ordering::Relaxed) % count;
+    let mut last = None;
+    for offset in 0..count {
+        let index = (start + offset) % count;
+        match op(endpoints[index].clone()).await {
+            Ok(value) => {
+                if index != start {
+                    preferred.store(index, Ordering::Relaxed);
+                }
+                return Ok(value);
+            }
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.expect("at least one endpoint was attempted"))
 }
 
 /// Proxy URL, Tor requirement, validation state, and cached-client generation
@@ -474,6 +552,245 @@ pub fn parse_finality_pin(json: &[u8]) -> std::result::Result<finality::PinnedSe
     finality::PinnedSet::new(validators, chain_id, unix, height)
 }
 
+/// Serialize a pin to the exact JSON [`install_finality_pin`] parses, so a
+/// light-client-verified set can persist across restarts and re-anchor trust
+/// at boot with no network. Validators are sorted by valcons for a stable
+/// file.
+pub fn finality_pin_json(pin: &finality::PinnedSet) -> Vec<u8> {
+    let mut validators: Vec<_> = pin.validators.iter().collect();
+    validators.sort_by(|a, b| a.0.cmp(b.0));
+    let validators: Vec<serde_json::Value> = validators
+        .into_iter()
+        .map(|(valcons, validator)| {
+            serde_json::json!({
+                "valcons": valcons,
+                "pubkey": hex::encode(validator.pubkey),
+                "voting_power": validator.voting_power,
+            })
+        })
+        .collect();
+    serde_json::to_vec_pretty(&serde_json::json!({
+        "chain_id": pin.chain_id,
+        "pinned_at_height": pin.pinned_at_height,
+        "pinned_at_unix": pin.pinned_at_unix,
+        "validators": validators,
+    }))
+    .unwrap_or_default()
+}
+
+/// Whether a durable cache entry proven at `height` may still be used as a
+/// FALLBACK when the chain cannot be asked: verification must be on, the pin
+/// inside its weak-subjectivity window, and the entry at or below the durable
+/// checkpoint (an entry "from the future" was never proven by this trust
+/// lineage). Unlike [`finality_checkpoint_matches`] this is monotonic - it
+/// accepts entries proven at superseded checkpoints, trading bounded
+/// staleness (a revocation that landed after the entry was stored) for
+/// boot-time availability. Never use it to gate a LIVE resolution.
+pub fn finality_checkpoint_covers(height: u64) -> bool {
+    let checkpoint_height = checkpoint::height();
+    verify_finality_enabled()
+        && finality_pin_floor_at(now_unix()).is_some()
+        && height > 0
+        && height <= checkpoint_height
+}
+
+#[cfg(test)]
+mod endpoint_rotation_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    fn endpoints(names: &[&str]) -> Vec<String> {
+        names.iter().map(ToString::to_string).collect()
+    }
+
+    #[tokio::test]
+    async fn rotates_to_the_next_endpoint_on_failure_and_stays_there() {
+        let list = endpoints(&["https://a", "https://b", "https://c"]);
+        let preferred = AtomicUsize::new(0);
+        let result = rotate_endpoints(&list, &preferred, |base| async move {
+            if base == "https://c" {
+                Ok(base)
+            } else {
+                Err(ChainError::Rpc(format!("{base} down")))
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(result, "https://c");
+        assert_eq!(
+            preferred.load(Ordering::Relaxed),
+            2,
+            "the endpoint that answered must become the preference"
+        );
+
+        // The NEXT call must start at the working endpoint, not retry the
+        // dead ones first.
+        let calls = std::sync::Mutex::new(Vec::new());
+        rotate_endpoints(&list, &preferred, |base| {
+            calls.lock().unwrap().push(base.clone());
+            async move { Ok::<_, ChainError>(base) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(*calls.lock().unwrap(), vec!["https://c".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn every_endpoint_down_returns_the_last_error() {
+        let list = endpoints(&["https://a", "https://b"]);
+        let preferred = AtomicUsize::new(0);
+        let error = rotate_endpoints::<serde_json::Value, _, _>(&list, &preferred, |base| {
+            async move { Err(ChainError::Rpc(format!("{base} down"))) }
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ChainError::Rpc(message) if message == "https://b down"));
+    }
+
+    #[tokio::test]
+    async fn empty_endpoint_list_is_an_rpc_error_not_a_panic() {
+        let preferred = AtomicUsize::new(0);
+        let error = rotate_endpoints::<(), _, _>(&[], &preferred, |_| async move {
+            unreachable!("no endpoint to try")
+        })
+        .await
+        .unwrap_err();
+        assert!(matches!(error, ChainError::Rpc(_)));
+    }
+
+    #[test]
+    fn configured_urls_are_cleaned_and_apply_live() {
+        set_chain_rpc_urls(&[
+            " https://one.example/ ".to_string(),
+            String::new(),
+            "https://two.example".to_string(),
+        ]);
+        assert_eq!(
+            configured_chain_rpc_urls(),
+            vec!["https://one.example".to_string(), "https://two.example".to_string()]
+        );
+        set_chain_rpc_urls(&[]);
+        assert!(configured_chain_rpc_urls().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod boot_trust_tests {
+    use super::*;
+
+    /// Guards the boot re-anchor path: the pin the light client persists must
+    /// parse back into the identical trust root, or a restart silently loses
+    /// trust it had.
+    #[test]
+    fn finality_pin_json_roundtrips_through_parse() {
+        let mut validators = std::collections::HashMap::new();
+        validators.insert(
+            "epixvalcons1aaa".to_string(),
+            finality::PinnedValidator { pubkey: [7u8; 32], voting_power: 10 },
+        );
+        validators.insert(
+            "epixvalcons1bbb".to_string(),
+            finality::PinnedValidator { pubkey: [9u8; 32], voting_power: 20 },
+        );
+        let pin =
+            finality::PinnedSet::new(validators, "epix_1917-1", 1_790_000_000, 42).unwrap();
+        let parsed = parse_finality_pin(&finality_pin_json(&pin)).unwrap();
+        assert_eq!(parsed.chain_id, pin.chain_id);
+        assert_eq!(parsed.pinned_at_height, 42);
+        assert_eq!(parsed.pinned_at_unix, 1_790_000_000);
+        assert_eq!(parsed.total_power, 30);
+        assert_eq!(parsed.validators.len(), 2);
+        assert_eq!(parsed.validators["epixvalcons1aaa"].pubkey, [7u8; 32]);
+        assert_eq!(parsed.validators["epixvalcons1bbb"].voting_power, 20);
+    }
+
+    /// The durable-cache gate: nothing is covered without verification, a
+    /// pin, and a checkpoint - and nothing past the checkpoint is EVER
+    /// covered (an entry "from the future" was not proven by this lineage).
+    #[tokio::test]
+    async fn checkpoint_covers_gates_the_durable_cache() {
+        let _guard = finality_state_test_guard().await;
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                set_pinned_validators(None);
+                set_verify_finality(false);
+            }
+        }
+        let _reset = Reset;
+
+        set_pinned_validators(None);
+        set_verify_finality(false);
+        assert!(!finality_checkpoint_covers(1), "verification off: no coverage");
+        set_verify_finality(true);
+        assert!(!finality_checkpoint_covers(1), "no pin: no coverage");
+
+        // A pin captured "now", so the weak-subjectivity window is open.
+        let mut validators = std::collections::HashMap::new();
+        validators.insert(
+            "epixvalcons1cover".to_string(),
+            finality::PinnedValidator { pubkey: [1u8; 32], voting_power: 1 },
+        );
+        let pin =
+            finality::PinnedSet::new(validators, "epix_1917-1", now_unix(), 42).unwrap();
+        install_finality_pin(&finality_pin_json(&pin)).unwrap();
+        // NOTE: the checkpoint path is a process-global that refuses to move;
+        // this is the only test in the crate that configures it.
+        let dir = tempfile::tempdir().unwrap();
+        configure_finality_checkpoint(dir.path().join("xid_finality_checkpoint.json"))
+            .unwrap();
+
+        // The floor checkpoint sits at the pin height.
+        assert!(finality_checkpoint_covers(42), "at the checkpoint: covered");
+        assert!(finality_checkpoint_covers(1), "older than the checkpoint: covered");
+        assert!(!finality_checkpoint_covers(43), "future of the checkpoint: never");
+        assert!(!finality_checkpoint_covers(0), "height 0 is not a proof");
+    }
+}
+
+#[cfg(test)]
+mod chain_error_tests {
+    use super::*;
+
+    /// The whole point of the classifier: a boot-time outage and a genuinely
+    /// unregistered name must NOT be treated the same. The first defers (no
+    /// verdict recorded, retried when trust arrives); the second is the
+    /// chain's answer and rejects permanently.
+    #[test]
+    fn outage_defers_but_unregistered_rejects() {
+        let outage = ChainError::Rpc("Tor-always mode: chain RPC blocked".into());
+        let unregistered = ChainError::NotFound("nosuchname".into());
+        assert!(!outage.is_authoritative(), "an outage must never be a verdict");
+        assert!(unregistered.is_authoritative(), "the chain answered: reject");
+    }
+
+    /// Exhaustive by construction: every variant is listed, so a new one added
+    /// later fails to compile here until someone decides whether the chain
+    /// actually answered. Defaulting a new variant to "authoritative" would
+    /// let it permanently reject user content.
+    #[test]
+    fn only_not_found_is_authoritative() {
+        let cases = [
+            (ChainError::NotFound("x".into()), true),
+            (ChainError::Rpc("unreachable".into()), false),
+            (ChainError::MerkleInvalid, false),
+            (ChainError::DigestMismatch, false),
+            (ChainError::NotFinalized, false),
+            (ChainError::LeafBindingFailed("x".into()), false),
+            (ChainError::FinalityUnverified("x".into()), false),
+            (ChainError::FinalityAdvanced, false),
+            (ChainError::Malformed("x".into()), false),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(
+                error.is_authoritative(),
+                expected,
+                "{error} classified wrong"
+            );
+        }
+    }
+}
+
 #[cfg(test)]
 mod pin_tests {
     use super::*;
@@ -737,6 +1054,29 @@ pub enum ChainError {
     Malformed(String),
 }
 
+impl ChainError {
+    /// Whether this outcome is the chain's own answer about the name, as
+    /// opposed to a failure to ask it.
+    ///
+    /// Only [`ChainError::NotFound`] is authoritative: the chain was reached,
+    /// verified, and said the name does not exist. Everything else is an
+    /// outage (`Rpc`), a hostile or broken RPC (`MerkleInvalid`,
+    /// `DigestMismatch`, `LeafBindingFailed`, `Malformed`), or a trust state
+    /// that is not established yet (`NotFinalized`, `FinalityUnverified`,
+    /// `FinalityAdvanced`).
+    ///
+    /// Callers use this to decide whether a verification verdict may be
+    /// RECORDED. Treating an outage as "name not found" is how a node that
+    /// booted before Tor came up permanently rejected every user's content and
+    /// served an empty database for the rest of the process. Deferring instead
+    /// is both fail-closed (nothing unverified is admitted) and self-healing.
+    /// Non-authoritative deliberately includes the hostile-RPC errors: serving
+    /// a bad proof must not let anyone erase a user's content from a node.
+    pub fn is_authoritative(&self) -> bool {
+        matches!(self, Self::NotFound(_))
+    }
+}
+
 pub type Result<T> = std::result::Result<T, ChainError>;
 
 /// Cached resolution of an xID name to its linked identity addresses (the
@@ -775,6 +1115,9 @@ pub mod xid_signers {
     }
 
     fn store(key: String, identities: Vec<Identity>, finality_binding: Option<(u64, String)>) {
+        if let Some(binding) = &finality_binding {
+            durable_store(&key, &identities, binding);
+        }
         if let Ok(mut guard) = CACHE.write() {
             guard.get_or_insert_with(HashMap::new).insert(
                 key,
@@ -787,8 +1130,92 @@ pub mod xid_signers {
         }
     }
 
-    /// Drop every cached signer resolution (see [`super::clear_xid_caches`]).
+    /// Where finality-proven resolutions persist across restarts, so a boot
+    /// before any network exists can still verify user content it verified
+    /// last session (see [`resolve_identities_or_cached`]). Unset = no
+    /// durable cache (tests, embedded uses).
+    static DURABLE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    static DURABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One durable entry: the identities plus the finality binding they were
+    /// proven against, so reads can gate on the trust lineage.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct DurableEntry {
+        identities: Vec<Identity>,
+        height: u64,
+        digest: String,
+    }
+
+    /// Set once at boot, before anything resolves.
+    pub fn set_durable_cache_path(path: std::path::PathBuf) {
+        let _ = DURABLE_PATH.set(path);
+    }
+
+    fn durable_store(key: &str, identities: &[Identity], binding: &(u64, String)) {
+        let Some(path) = DURABLE_PATH.get() else { return };
+        let Ok(_guard) = DURABLE_LOCK.lock() else { return };
+        let mut map: HashMap<String, DurableEntry> = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        map.insert(
+            key.to_string(),
+            DurableEntry {
+                identities: identities.to_vec(),
+                height: binding.0,
+                digest: binding.1.clone(),
+            },
+        );
+        if let Ok(bytes) = serde_json::to_vec(&map) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    fn durable_cached(key: &str) -> Option<Vec<Identity>> {
+        let path = DURABLE_PATH.get()?;
+        let _guard = DURABLE_LOCK.lock().ok()?;
+        let map: HashMap<String, DurableEntry> =
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let entry = map.get(key)?;
+        crate::finality_checkpoint_covers(entry.height).then(|| entry.identities.clone())
+    }
+
+    /// [`resolve_identities_checked`], with a durable-cache FALLBACK for
+    /// non-authoritative failures: when the chain cannot be asked (boot
+    /// before Tor, an RPC outage, an offline mesh node), an identity list
+    /// this node chain-proved earlier - still covered by the pinned trust
+    /// lineage - answers instead. The bool is true when the answer came from
+    /// the cache: the caller must treat the verdict as provisional and
+    /// re-verify once the chain is reachable (staleness, not forgery, is the
+    /// residual risk - a revocation landed after the entry was stored keeps
+    /// being honored until then). An authoritative answer (the name really
+    /// does not exist) is never masked by the cache.
+    pub async fn resolve_identities_or_cached(
+        name: &str,
+        tld: &str,
+    ) -> super::Result<(Vec<Identity>, bool)> {
+        match resolve_identities_checked(name, tld).await {
+            Ok(identities) => Ok((identities, false)),
+            Err(error) if error.is_authoritative() => Err(error),
+            Err(error) => match durable_cached(&format!("{name}.{tld}")) {
+                Some(identities) => Ok((identities, true)),
+                None => Err(error),
+            },
+        }
+    }
+
+    /// Drop every cached signer resolution (see [`super::clear_xid_caches`]),
+    /// the durable file included - a trust change invalidates everything it
+    /// proved.
     pub fn clear() {
+        if let Some(path) = DURABLE_PATH.get() {
+            if let Ok(_guard) = DURABLE_LOCK.lock() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         if let Ok(mut guard) = CACHE.write() {
             *guard = None;
         }

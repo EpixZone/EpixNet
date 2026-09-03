@@ -347,6 +347,13 @@ pub async fn boot(
     // Install the finality root of trust and restore its anti-rollback
     // checkpoint before reading a launch cache entry or contacting chain RPC.
     let xid_finality = initialize_xid_finality(&opts.data_root)?;
+    // Durable identity cache: finality-proven name->identity resolutions
+    // persist here so the NEXT boot can verify user content before any
+    // network exists (gated on the restored trust lineage; see
+    // `xid_signers::resolve_identities_or_cached`).
+    epix_chain::xid_signers::set_durable_cache_path(
+        opts.data_root.join("xid-identity-cache.json"),
+    );
 
     // Parse the startup network policy strictly, arm its egress gate, and only
     // then select the launch target. Tor-Always and offline mode use the cache
@@ -357,7 +364,7 @@ pub async fn boot(
     // starts, so failing boot on it would deadlock every fresh install.
     let (launch, startup_network_policy) = prepare_startup_launch_with(
         &opts,
-        matches!(xid_finality, XidFinalityBoot::NetworkBootstrap),
+        matches!(xid_finality, XidFinalityBoot::NetworkBootstrap { .. }),
         arm_startup_network_policy,
         |data_root, target| async move { resolve_target(&data_root, &target).await },
     )
@@ -1882,31 +1889,7 @@ async fn verify_current_child_manifests(
         return (files, includes);
     }
     for path in paths {
-        let governing = match xite.next_stored_manifest_governing_path(walk, &path) {
-            Ok(Some(governing)) => governing,
-            Ok(None) => {
-                let _ = xite.skip_next_stored_manifest(walk, &path);
-                continue;
-            }
-            Err(error) => {
-                if let Some(state) = progress {
-                    state
-                        .log(
-                            "WARNING",
-                            format!("Stored child {path} has no verified governing parent: {error}"),
-                        )
-                        .await;
-                }
-                let _ = xite.skip_next_stored_manifest(walk, &path);
-                continue;
-            }
-        };
-        let Ok(parent) = xite.storage().read(&governing) else {
-            let _ = xite.skip_next_stored_manifest(walk, &path);
-            continue;
-        };
-        let Ok(parent) = serde_json::from_slice::<serde_json::Value>(&parent) else {
-            let _ = xite.skip_next_stored_manifest(walk, &path);
+        let Some(parent) = stored_child_parent(xite, progress, walk, &path).await else {
             continue;
         };
         let child: Option<serde_json::Value> = xite
@@ -1914,26 +1897,103 @@ async fn verify_current_child_manifests(
             .read(&path)
             .ok()
             .and_then(|bytes| serde_json::from_slice(&bytes).ok());
-        let xid_map = resolve_user_signers(&parent, &path, child.as_ref()).await;
+        let (xid_map, unresolved, stale) =
+            resolve_user_signers(&parent, &path, child.as_ref()).await;
         match xite.verify_next_stored_manifest(walk, &path, &xid_map) {
             Ok(Some(manifest)) => {
+                // Verified against CACHED identities: the verdict stands (the
+                // cache is chain-proven), but mark the xite so the retry
+                // re-verifies live once the chain answers - a revocation that
+                // landed after the cache entry must not be honored forever.
+                if stale {
+                    if let Some(state) = progress {
+                        state.mark_xid_deferred(xite.address.as_str());
+                    }
+                }
                 files.extend(manifest.files());
                 includes.extend(manifest.includes());
             }
             Ok(None) => {}
             Err(error) => {
-                if let Some(state) = progress {
-                    state
-                        .log(
-                            "WARNING",
-                            format!("Stored child {path} failed verification: {error}"),
-                        )
-                        .await;
-                }
+                log_child_verification_failure(xite, progress, &path, &error, unresolved).await;
             }
         }
     }
     (files, includes)
+}
+
+/// The verified governing parent of one stored child, parsed. `None` after
+/// SKIPPING the child in the walk: no verified governing parent, or the
+/// parent is unreadable/unparsable.
+async fn stored_child_parent(
+    xite: &Xite,
+    progress: Option<&Arc<AppState>>,
+    walk: &mut epix_xite::xite::VerifiedManifestWalk,
+    path: &str,
+) -> Option<serde_json::Value> {
+    let governing = match xite.next_stored_manifest_governing_path(walk, path) {
+        Ok(Some(governing)) => governing,
+        Ok(None) => {
+            let _ = xite.skip_next_stored_manifest(walk, path);
+            return None;
+        }
+        Err(error) => {
+            if let Some(state) = progress {
+                state
+                    .log(
+                        "WARNING",
+                        format!("Stored child {path} has no verified governing parent: {error}"),
+                    )
+                    .await;
+            }
+            let _ = xite.skip_next_stored_manifest(walk, path);
+            return None;
+        }
+    };
+    let parent: Option<serde_json::Value> = xite
+        .storage()
+        .read(&governing)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok());
+    if parent.is_none() {
+        let _ = xite.skip_next_stored_manifest(walk, path);
+    }
+    parent
+}
+
+/// Record one stored child's verification failure. Verified with whatever
+/// resolved, an unresolved name only matters when it could explain the
+/// failure: then record NO verdict and mark the xite for the trust-anchored
+/// retry - rejecting here is what turned a Tor-window outage into a permanent
+/// "xID name 'x' not found on chain" for a name that is registered and
+/// active. With every name resolved, the failure is the chain's answer.
+async fn log_child_verification_failure(
+    xite: &Xite,
+    progress: Option<&Arc<AppState>>,
+    path: &str,
+    error: &impl std::fmt::Display,
+    unresolved: bool,
+) {
+    let Some(state) = progress else { return };
+    if unresolved {
+        state.mark_xid_deferred(xite.address.as_str());
+        state
+            .log(
+                "DEBUG",
+                format!(
+                    "Stored child {path}: xID lookup unavailable, \
+                     deferring verification ({error})"
+                ),
+            )
+            .await;
+    } else {
+        state
+            .log(
+                "WARNING",
+                format!("Stored child {path} failed verification: {error}"),
+            )
+            .await;
+    }
 }
 
 async fn sync_child_manifest_levels(
@@ -2545,13 +2605,26 @@ fn user_dir_name(inner_path: &str) -> Option<&str> {
 }
 
 /// Resolve every xID name that verifying `inner_path` may need to its
-/// chain-linked identity records: the user directory's own name (EpixTalk
-/// stores each user's posts under their xID and signs with the identity that
+/// chain-linked identity records (the user directory's own name plus any
+/// chain-delegated cert name on the child), reporting whether any of them
+/// could not be ASKED about (as opposed to answered).
+///
+/// The first bool is true when at least one lookup failed non-authoritatively
+/// - a chain outage, a Tor hiccup mid-sync, a hostile proof. The caller must
+/// then withhold its verdict instead of verifying against a map it knows is
+/// incomplete: doing that turns a temporary outage into
+/// "xID name 'x' not found on chain" and rejects the user permanently, even
+/// though the name is registered with active identities.
+///
+/// The second bool is true when at least one answer came from the DURABLE
+/// cache (chain unreachable, entry proven in an earlier session): verdicts
+/// built on it stand but are provisional - the caller marks the xite so the
+/// retry re-proves them live.
 async fn resolve_user_signers(
     parent: &serde_json::Value,
     inner_path: &str,
     child: Option<&serde_json::Value>,
-) -> epix_content::XidMap {
+) -> (epix_content::XidMap, bool, bool) {
     let mut names = epix_content::verify::content_xid_names(parent, inner_path);
     // A chain-delegated cert on the child itself must resolve too, so the
     // cert check can match its signer against the name's linked identities.
@@ -2559,16 +2632,23 @@ async fn resolve_user_signers(
         names.extend(epix_content::verify::chain_cert_xid_name(parent, child));
     }
     let mut map = epix_content::XidMap::new();
+    let mut deferred = false;
+    let mut stale = false;
     for name in names {
         let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-        let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
-            .await
-            .unwrap_or_default();
-        if !identities.is_empty() {
-            map.insert(name, chain_xid_identities(identities));
+        match epix_chain::xid_signers::resolve_identities_or_cached(label, tld).await {
+            Ok((identities, from_cache)) => {
+                stale |= from_cache;
+                if !identities.is_empty() {
+                    map.insert(name, chain_xid_identities(identities));
+                }
+                // Empty and live: the chain answered - no identities linked.
+            }
+            Err(error) if error.is_authoritative() => {}
+            Err(_) => deferred = true,
         }
     }
-    map
+    (map, deferred, stale)
 }
 
 /// The chain's identity records in the shape verification consumes.
@@ -3189,10 +3269,17 @@ enum XidFinalityBoot {
         validator_count: usize,
         restored_height: Option<u64>,
     },
+    /// No operator pin, but the light client's persisted pin from a previous
+    /// run re-anchored trust at boot with no network.
+    RestoredFromLightClient {
+        validator_count: usize,
+        restored_height: Option<u64>,
+    },
     /// No local pin: verification is ON and fails closed until the light
     /// client establishes trust from network-quorum agreement (seconds after
-    /// the first successful chain contact).
-    NetworkBootstrap,
+    /// the first successful chain contact). `restore_warning` carries why a
+    /// persisted light-client pin could not be restored, for the boot log.
+    NetworkBootstrap { restore_warning: Option<String> },
     InsecureLegacy,
 }
 
@@ -3230,12 +3317,54 @@ fn initialize_xid_finality(data_root: &std::path::Path) -> Result<XidFinalityBoo
             Ok(XidFinalityBoot::InsecureLegacy)
         }
         None => {
+            // No operator pin - but a node that has run before has the light
+            // client's last VERIFIED set persisted (written on every advance).
+            // Re-anchoring from it needs no network, so cached resolutions
+            // can verify at boot instead of failing closed until Tor is up;
+            // the light client then advances it as usual once online. Its
+            // weak-subjectivity clock still applies: a pin older than the
+            // window fails resolution closed exactly like a stale xid_pin.
+            let auto_pin_path = data_root.join("xid_lc_pin.json");
+            let mut restore_warning = None;
+            match read_xid_finality_pin(&auto_pin_path) {
+                Ok(Some(bytes)) => match epix_chain::install_finality_pin(&bytes) {
+                    Ok(validator_count) => {
+                        let checkpoint_path = data_root.join("xid_finality_checkpoint.json");
+                        match epix_chain::configure_finality_checkpoint(&checkpoint_path) {
+                            Ok(restored) => {
+                                return Ok(XidFinalityBoot::RestoredFromLightClient {
+                                    validator_count,
+                                    restored_height: restored
+                                        .map(|checkpoint| checkpoint.height),
+                                });
+                            }
+                            Err(error) => {
+                                // Fail back to the network bootstrap rather
+                                // than bricking boot: unlike an operator pin,
+                                // this file is node-written state.
+                                epix_chain::set_pinned_validators(None);
+                                restore_warning = Some(format!(
+                                    "light-client pin restore: checkpoint: {error}"
+                                ));
+                            }
+                        }
+                    }
+                    Err(error) => {
+                        restore_warning =
+                            Some(format!("light-client pin restore: {error}"));
+                    }
+                },
+                Ok(None) => {}
+                Err(error) => {
+                    restore_warning = Some(format!("light-client pin restore: {error}"));
+                }
+            }
             // Fail closed until the light client bootstraps: verification is
             // ON with no pin, so every resolve refuses rather than trusting
             // the RPC while trust is not yet established.
             epix_chain::set_pinned_validators(None);
             epix_chain::set_verify_finality(true);
-            Ok(XidFinalityBoot::NetworkBootstrap)
+            Ok(XidFinalityBoot::NetworkBootstrap { restore_warning })
         }
     }
 }
@@ -3271,7 +3400,16 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             .and_then(|v| v.as_u64())
             .filter(|&s| s >= 60)
             .unwrap_or(3600);
-        let cfg = xid_lightclient_config(&state, &data_root).await;
+        let mut cfg = xid_lightclient_config(&state, &data_root).await;
+        // The advance rotates across the bootstrap RPCs on failure: the pin
+        // must keep advancing inside its weak-subjectivity window even when
+        // the first endpoint dies for good, and the sources list is exactly
+        // the set of independent operators fit for that job. The URL that
+        // answers stays first for the next cycle.
+        let mut rpc_candidates: Vec<String> = std::iter::once(cfg.rpc_url.clone())
+            .chain(cfg.bootstrap_sources.iter().cloned())
+            .collect();
+        rpc_candidates.dedup();
         // Until first trust is established (fresh install, or back after a
         // long offline stretch), retry quickly with backoff — a user opening
         // the app should not wait 15 minutes for names to resolve. Once
@@ -3279,8 +3417,20 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         let mut fast_retry_secs = 5u64;
         loop {
             let before = epix_chain::pinned_validators();
-            let outcome = epix_chain::advance_trusted_set(&cfg).await;
+            let outcome =
+                advance_with_rpc_rotation(&state, &mut cfg, &mut rpc_candidates).await;
+            // A xite whose user content could not be xID-verified is waiting on
+            // exactly this: the trusted set going from nothing to something.
+            // Only that transition retries - not every tick, or an hourly
+            // UpToDate would re-index the whole deferred set forever.
+            let anchored_now = before.is_none() && epix_chain::pinned_validators().is_some();
             log_xid_lightclient_outcome(&state, before, outcome).await;
+            if anchored_now {
+                let state = state.clone();
+                tokio::spawn(async move {
+                    state.retry_deferred_xid_xites().await;
+                });
+            }
             let delay = if epix_chain::pinned_validators().is_some() {
                 interval_secs
             } else {
@@ -3301,6 +3451,7 @@ async fn xid_lightclient_config(
 ) -> epix_chain::LightClientConfig {
     let mut cfg = epix_chain::LightClientConfig::new(data_root.join("xid_lc_state.json"));
     cfg.checkpoint_path = Some(data_root.join("xid_finality_checkpoint.json"));
+    cfg.auto_pin_path = Some(data_root.join("xid_lc_pin.json"));
     if let Some(secs) = state
         .config_get("xid_trusting_period_secs")
         .await
@@ -3365,6 +3516,35 @@ fn pinned_set_changed(old: &epix_chain::PinnedSet, new: &epix_chain::PinnedSet) 
 /// INFO, routine advances at DEBUG, an unextendable anchor at WARN, transient
 /// errors (RPC hiccup, Tor not up yet) at DEBUG — the active pin is untouched
 /// in every non-advanced case and the next tick retries.
+/// One light-client advance cycle, rotating across the candidate RPCs on
+/// failure. The URL that answers moves to the front, so the next cycle starts
+/// on the endpoint that actually works - the pin must keep advancing inside
+/// its weak-subjectivity window even when the primary endpoint dies for good.
+async fn advance_with_rpc_rotation(
+    state: &Arc<AppState>,
+    cfg: &mut epix_chain::LightClientConfig,
+    candidates: &mut [String],
+) -> Result<epix_chain::Advance, String> {
+    let mut outcome = Err("no chain RPC endpoints configured".to_string());
+    for index in 0..candidates.len() {
+        cfg.rpc_url = candidates[index].clone();
+        outcome = epix_chain::advance_trusted_set(cfg).await;
+        if outcome.is_ok() {
+            if index != 0 {
+                state
+                    .log(
+                        "INFO",
+                        format!("xID finality: light client rotated to {}", cfg.rpc_url),
+                    )
+                    .await;
+                candidates.swap(0, index);
+            }
+            break;
+        }
+    }
+    outcome
+}
+
 async fn log_xid_lightclient_outcome(
     state: &AppState,
     before: Option<epix_chain::PinnedSet>,
@@ -3417,6 +3597,19 @@ async fn serve(
     startup_network_policy: StartupNetworkPolicy,
 ) -> Result<(UiServer, RunningNode), String> {
     let state = AppState::with_data_dir(&opts.version, &opts.data_root);
+    // Set BEFORE any xite is restored: a node that is offline by policy will
+    // never anchor chain trust, so a withheld xID verdict there is terminal
+    // rather than something to retry. Deciding this later (the chain route is
+    // configured well after restore_xites) would be too late for the boot pass.
+    state.set_offline_by_policy(startup_network_policy == StartupNetworkPolicy::Offline);
+    // Armed before the UI can serve a page: the dashboard's first feedQuery
+    // otherwise races restore_xites, gets an honest-but-empty merge from
+    // half-built in-memory DBs, and freezes that empty feed on screen until
+    // some unrelated event re-queries. restore_xites clears it.
+    state.set_boot_restore_pending(true);
+    // Install the configured chain REST endpoints so the shared resolver
+    // fails over across them (and serverInfo hands xites the live one).
+    epix_chain::set_chain_rpc_urls(&state.chain_rpc_urls().await);
     state
         .initialize_security_tokens()
         .map_err(|error| format!("cannot initialize UI security tokens: {error}"))?;
@@ -3442,7 +3635,33 @@ async fn serve(
                 .await;
             spawn_xid_lightclient(state.clone(), opts.data_root.clone());
         }
-        XidFinalityBoot::NetworkBootstrap => {
+        XidFinalityBoot::RestoredFromLightClient {
+            validator_count,
+            restored_height,
+        } => {
+            let checkpoint_note = restored_height
+                .map(|height| format!("; restored height {height}"))
+                .unwrap_or_default();
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "xID finality: re-anchored {validator_count} validators from the \
+                         light client's persisted pin (no network needed){checkpoint_note}"
+                    ),
+                )
+                .await;
+            spawn_xid_lightclient(state.clone(), opts.data_root.clone());
+        }
+        XidFinalityBoot::NetworkBootstrap { restore_warning } => {
+            if let Some(warning) = restore_warning {
+                state
+                    .log(
+                        "WARN",
+                        format!("xID finality: {warning}; falling back to network bootstrap"),
+                    )
+                    .await;
+            }
             state
                 .log(
                     "INFO",
@@ -3773,6 +3992,15 @@ async fn serve(
                     #[cfg(feature = "bittorrent")]
                     epix_bt::http::set_socks(Some("socks5h://127.0.0.1:43111".into()));
                     state.log("INFO", "Chain RPC now routed through Tor".to_string()).await;
+                    // Chain egress just opened. Every xite whose user content
+                    // could not be xID-verified during the Tor-bootstrap
+                    // window is still holding a withheld verdict; re-index
+                    // those now so a node that booted before Tor heals without
+                    // a restart. No-op when nothing was deferred.
+                    let state = state.clone();
+                    tokio::spawn(async move {
+                        state.retry_deferred_xid_xites().await;
+                    });
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;

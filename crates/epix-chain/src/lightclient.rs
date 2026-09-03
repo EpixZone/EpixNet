@@ -102,6 +102,10 @@ pub struct LightClientConfig {
     /// Where the finality checkpoint lives, so a bootstrap on a node with NO
     /// pin installed can configure it after publishing the first pin.
     pub checkpoint_path: Option<PathBuf>,
+    /// Where each published pin persists (same JSON as `xid_pin.json`), so the
+    /// NEXT boot re-anchors trust from it instantly instead of failing closed
+    /// until the network is reachable. `None` disables persistence.
+    pub auto_pin_path: Option<PathBuf>,
 }
 
 impl LightClientConfig {
@@ -122,6 +126,7 @@ impl LightClientConfig {
                 .collect(),
             bootstrap_quorum: DEFAULT_BOOTSTRAP_QUORUM,
             checkpoint_path: None,
+            auto_pin_path: None,
         }
     }
 }
@@ -500,8 +505,14 @@ pub async fn advance_trusted_set(cfg: &LightClientConfig) -> Result<Advance, Str
 /// node that booted with NO pin (pure network bootstrap) it installs the first
 /// one and configures the durable checkpoint beside it.
 fn publish_pin(cfg: &LightClientConfig, new_pin: PinnedSet) -> Result<(), String> {
+    // Serialized before publishing consumes the pin; written only AFTER the
+    // publish is accepted, so a rejected (non-monotonic, cross-chain) set can
+    // never become the next boot's trust anchor.
+    let pin_json = cfg.auto_pin_path.as_ref().map(|_| crate::finality_pin_json(&new_pin));
     if crate::pinned_validators().is_some() {
-        return crate::advance_finality_pin(new_pin);
+        crate::advance_finality_pin(new_pin)?;
+        persist_auto_pin(cfg, pin_json);
+        return Ok(());
     }
     crate::set_pinned_validators(Some(new_pin));
     crate::set_verify_finality(true);
@@ -513,7 +524,24 @@ fn publish_pin(cfg: &LightClientConfig, new_pin: PinnedSet) -> Result<(), String
             format!("light client: checkpoint configure after bootstrap: {e}")
         })?;
     }
+    persist_auto_pin(cfg, pin_json);
     Ok(())
+}
+
+/// Write the just-published pin beside the trusted state. Best-effort: a full
+/// disk must not fail the advance that already succeeded - the next boot then
+/// simply network-bootstraps like today.
+fn persist_auto_pin(cfg: &LightClientConfig, pin_json: Option<Vec<u8>>) {
+    let (Some(path), Some(bytes)) = (&cfg.auto_pin_path, pin_json) else {
+        return;
+    };
+    if bytes.is_empty() {
+        return;
+    }
+    let tmp = path.with_extension("json.tmp");
+    if std::fs::write(&tmp, bytes).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
 }
 
 /// Establish a fresh trust anchor. The installed pin is preferred (the trust

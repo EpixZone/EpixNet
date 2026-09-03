@@ -69,17 +69,32 @@ pub struct Vrf {
     /// HTTP client + the SOCKS generation it was built for (rebuilt on change,
     /// so a direct client from before Tor came up doesn't keep sending direct).
     client: RwLock<Option<(u64, reqwest::Client)>>,
-    rpc_url: String,
+    /// Endpoint fallbacks, in preference order; requests rotate to the next
+    /// on failure and remember which one answered (see
+    /// [`crate::rotate_endpoints`]).
+    rpc_urls: Vec<String>,
+    preferred: std::sync::atomic::AtomicUsize,
     beacons: RwLock<HashMap<u64, (Beacon, Instant)>>,
     latest: RwLock<Option<(Beacon, Instant)>>,
 }
 
 impl Vrf {
     pub fn new(rpc_url: impl Into<String>) -> Self {
+        Self::new_multi(vec![rpc_url.into()])
+    }
+
+    /// A VRF client with endpoint fallbacks (first = most preferred).
+    pub fn new_multi(rpc_urls: Vec<String>) -> Self {
         let client = crate::http_client(Duration::from_secs(15)).ok();
+        let rpc_urls: Vec<String> = rpc_urls
+            .into_iter()
+            .map(|url| url.trim().trim_end_matches('/').to_string())
+            .filter(|url| !url.is_empty())
+            .collect();
         Self {
             client: RwLock::new(client),
-            rpc_url: rpc_url.into().trim_end_matches('/').to_string(),
+            rpc_urls,
+            preferred: std::sync::atomic::AtomicUsize::new(0),
             beacons: RwLock::new(HashMap::new()),
             latest: RwLock::new(None),
         }
@@ -109,7 +124,7 @@ impl Vrf {
             }
         }
         let data = self
-            .get_json(&format!("{}/vrf/v1/beacon/{height}", self.rpc_url))
+            .get_json(&format!("/vrf/v1/beacon/{height}"))
             .await?;
         let bd = data
             .get("beacon")
@@ -137,10 +152,7 @@ impl Vrf {
             }
         }
         let block = self
-            .get_json(&format!(
-                "{}/cosmos/base/tendermint/v1beta1/blocks/latest",
-                self.rpc_url
-            ))
+            .get_json("/cosmos/base/tendermint/v1beta1/blocks/latest")
             .await?;
         let height = block
             .get("block")
@@ -177,18 +189,28 @@ impl Vrf {
         Ok(combine_beacons(&hexes))
     }
 
-    async fn get_json(&self, url: &str) -> Result<Value> {
+    /// GET `path` (endpoint-relative, starting with `/`) as JSON, rotating
+    /// across the configured endpoints on failure.
+    async fn get_json(&self, path: &str) -> Result<Value> {
         // Refuse to egress over clearnet before Tor is ready in Always mode.
+        // Local policy, not an endpoint fault: checked once, outside rotation.
         crate::chain_egress_ok()?;
-        self.client()
-            .await?
-            .get(url)
-            .send()
-            .await
-            .map_err(|e| ChainError::Rpc(e.to_string()))?
-            .json::<Value>()
-            .await
-            .map_err(|e| ChainError::Rpc(e.to_string()))
+        let client = self.client().await?;
+        crate::rotate_endpoints(&self.rpc_urls, &self.preferred, |base| {
+            let client = client.clone();
+            let url = format!("{base}{path}");
+            async move {
+                client
+                    .get(url)
+                    .send()
+                    .await
+                    .map_err(|e| ChainError::Rpc(e.to_string()))?
+                    .json::<Value>()
+                    .await
+                    .map_err(|e| ChainError::Rpc(e.to_string()))
+            }
+        })
+        .await
     }
 }
 
