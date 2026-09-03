@@ -3424,6 +3424,7 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             // Only that transition retries - not every tick, or an hourly
             // UpToDate would re-index the whole deferred set forever.
             let anchored_now = before.is_none() && epix_chain::pinned_validators().is_some();
+            let advanced_ok = outcome.is_ok();
             log_xid_lightclient_outcome(&state, before, outcome).await;
             if anchored_now {
                 let state = state.clone();
@@ -3431,7 +3432,14 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
                     state.retry_deferred_xid_xites().await;
                 });
             }
-            let delay = if epix_chain::pinned_validators().is_some() {
+            // The lazy hourly cadence applies only after a SUCCESSFUL cycle.
+            // A failed one retries with backoff even when a pin is active:
+            // boot restores the pin before any network exists, so the first
+            // cycles routinely fail while Tor bootstraps - sleeping an hour
+            // on that failure would leave the trusted height stale (and the
+            // validator-set-change trigger unfired) for no reason.
+            let delay = if advanced_ok && epix_chain::pinned_validators().is_some() {
+                fast_retry_secs = 5;
                 interval_secs
             } else {
                 let delay = fast_retry_secs;
