@@ -1146,9 +1146,41 @@ pub mod xid_signers {
             }
         }
 
+        /// Pin the process-global finality state for one test and restore it
+        /// after. These tests assert that a cached entry IS served, and this
+        /// cache is gated on `xid_cache_binding_current` - so a concurrent test
+        /// that switches verification ON (the xid_identity negative-cache
+        /// tests do) turns every entry stored with no finality binding into a
+        /// cache MISS here, the closure marked "must not run" runs, and the
+        /// unwrap below panics. Sharing the crate-level lock serializes against
+        /// those tests instead of racing them.
+        struct SignerCacheTestState {
+            _finality: tokio::sync::MutexGuard<'static, ()>,
+            previous_verify: bool,
+        }
+
+        impl Drop for SignerCacheTestState {
+            fn drop(&mut self) {
+                crate::set_verify_finality(self.previous_verify);
+                clear();
+            }
+        }
+
+        async fn signer_cache_test_state() -> SignerCacheTestState {
+            let guard = crate::finality_state_test_guard().await;
+            let state = SignerCacheTestState {
+                _finality: guard,
+                previous_verify: crate::verify_finality_enabled(),
+            };
+            // Legacy (unverified) mode: bindings are None here by construction.
+            crate::set_verify_finality(false);
+            clear();
+            state
+        }
+
         #[tokio::test]
         async fn checked_resolution_does_not_cache_failures() {
-            clear();
+            let _state = signer_cache_test_state().await;
             let attempts = AtomicUsize::new(0);
 
             let error = resolve_identities_checked_with("retryable", "test", || async {
@@ -1180,6 +1212,7 @@ pub mod xid_signers {
 
         #[tokio::test]
         async fn checked_resolution_preserves_chain_error_kinds() {
+            let _state = signer_cache_test_state().await;
             let rpc = resolve_identities_checked_with("rpc", "test", || async {
                 Err(ChainError::Rpc("down".into()))
             })
