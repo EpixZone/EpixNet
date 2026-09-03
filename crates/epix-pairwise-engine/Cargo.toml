@@ -12,7 +12,7 @@ epix-crypt = { path = "../epix-crypt" }
 # one point type.
 curve25519-elligator2 = { version = "0.1.0-alpha.2", features = ["elligator2"] }
 chacha20poly1305 = "0.11"
-hkdf = "0.12"
+hkdf = "0.13"
 hmac = "0.13"
 sha2 = "0.10"
 serde = { version = "1", features = ["derive"] }
