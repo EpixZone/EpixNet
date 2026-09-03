@@ -2590,7 +2590,7 @@ version = "0.1.0"
 name = "epix-chain"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64 0.23.1",
  "bech32",
  "ed25519-dalek 3.0.0",
  "fslock-guard",
