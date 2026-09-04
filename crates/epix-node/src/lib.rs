@@ -2861,6 +2861,14 @@ impl Drop for ResolveSlot {
     }
 }
 
+/// How a wait for Tor ended (see [`OnDemand::poll_tor_bootstrap`]); the
+/// string is the last Tor status seen.
+enum TorWait {
+    Up,
+    Failed(String),
+    TimedOut(String),
+}
+
 /// How long an on-demand resolve keeps trying before its caller gives up.
 /// The status it publishes stays on screen either way; a Retry or a network
 /// change starts a fresh attempt.
@@ -3178,13 +3186,10 @@ impl OnDemand {
     /// (`waiting_tor` / `tor_skipped` events); `None` when there is none yet.
     async fn await_tor_ready(&self, address: Option<&str>) -> bool {
         use std::sync::atomic::Ordering;
-        if !self.tor_expected.load(Ordering::Relaxed) {
-            return true;
+        if !self.tor_expected.load(Ordering::Relaxed) || self.state.tor_status().await.0 {
+            return true; // no Tor coming, or already up: no wait
         }
         let always = self.tor_always.load(Ordering::Relaxed);
-        if self.state.tor_status().await.0 {
-            return true; // already up: no wait
-        }
         self.state
             .log(
                 "INFO",
@@ -3193,47 +3198,54 @@ impl OnDemand {
                     .to_string(),
             )
             .await;
-        let tell = |event: &str, status: &str| {
-            if let Some(address) = address {
-                self.state.push_clone_event(
-                    address,
-                    serde_json::json!([event, status]),
-                    serde_json::json!({ "tor_status": status }),
-                );
-            }
+        let status = match self.poll_tor_bootstrap(address).await {
+            TorWait::Up => return true,
+            TorWait::Failed(status) | TorWait::TimedOut(status) => status,
         };
+        // Tor failed or dragged past the cap: proceed over clearnet only when
+        // Always mode isn't forcing Tor. In Always mode, refuse rather than
+        // leak.
+        if !always {
+            self.tell_tor(address, "tor_skipped", &status);
+        }
+        !always
+    }
+
+    /// Tell a xite's loading screen about the Tor wait (`waiting_tor` /
+    /// `tor_skipped`), when there is a xite to tell.
+    fn tell_tor(&self, address: Option<&str>, event: &str, status: &str) {
+        let Some(address) = address else { return };
+        self.state.push_clone_event(
+            address,
+            serde_json::json!([event, status]),
+            serde_json::json!({ "tor_status": status }),
+        );
+    }
+
+    /// Poll Tor for up to ~2 minutes. Arti's cold bootstrap is ~10-40s, but a
+    /// slow link (or a Windows machine fetching a fresh consensus) can take
+    /// longer. The screen would otherwise sit on "Searching for peers" for the
+    /// whole bootstrap with nothing to show for it, so the wait is announced
+    /// every few seconds, not only on a status change: the first push usually
+    /// goes out before the page's socket has even opened, and a wrapper that
+    /// joins mid-wait must still hear about it.
+    async fn poll_tor_bootstrap(&self, address: Option<&str>) -> TorWait {
         let mut last_status = String::new();
-        // ~2 minutes. Arti's cold bootstrap is ~10-40s, but a slow link (or a
-        // Windows machine fetching a fresh consensus) can take longer.
         for tick in 0..240 {
             let (up, status) = self.state.tor_status().await;
             if up {
-                return true;
+                return TorWait::Up;
             }
-            // The screen would otherwise sit on "Searching for peers" for the
-            // whole bootstrap with nothing to show for it. Repeated every few
-            // seconds, not only on a change: the first push usually goes out
-            // before the page's socket has even opened, and a wrapper that
-            // joins mid-wait must still hear about it.
             if status != last_status || tick % 10 == 0 {
-                tell("waiting_tor", &status);
+                self.tell_tor(address, "waiting_tor", &status);
                 last_status = status.clone();
             }
             if status == "Failed" {
-                // Fall through to clearnet only when clearnet is allowed.
-                if !always {
-                    tell("tor_skipped", &status);
-                }
-                return !always;
+                return TorWait::Failed(status);
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
-        // Timed out: proceed over clearnet only when Always mode isn't forcing
-        // Tor. In Always mode, refuse rather than leak.
-        if !always {
-            tell("tor_skipped", &last_status);
-        }
-        !always
+        TorWait::TimedOut(last_status)
     }
 
     /// Wait for the clone another caller is already running for `address` to
@@ -3322,42 +3334,64 @@ impl OnDemand {
     /// answer with no proof behind it. Gives up after [`RESOLVE_BUDGET`]; the
     /// published status stays, and a Retry or a network change starts over.
     async fn resolve_with_status(&self, host: &str) -> Result<Resolved, String> {
-        use std::sync::atomic::Ordering;
         let (name, _tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         let is_name = epix_core::classify_label(name) == epix_core::LabelClass::Name;
         let needs_chain = is_name && needs_chain_resolve(&self.data_root, host);
         self.state.resolve_status_set(host, "resolving", None, None).await;
         if needs_chain {
-            // A name whose xite is already registered under a saved mapping
-            // (the shipped dashboard on a fresh install, a superseded cache
-            // entry) resumes its download from that address right away: the
-            // files are signed by the address either way, and the launch
-            // verifier confirms the name in the background. Waiting for the
-            // registry here would hold the first screen hostage to the RPCs.
-            if let Some((address, false)) = self.state.resolve_name_verified(host).await {
-                if self.state.has_xite(&address).await {
-                    self.state.resolve_status_resolved(host, &address, false).await;
-                    return Ok(Resolved { address, verified: false });
-                }
+            if let Some(resolved) = self.saved_mapping_for_registered(host).await {
+                return Ok(resolved);
             }
-            // In Always mode the chain query must ride Tor: wait for it, and
-            // never fall back to clearnet - this is the path a deferred launch
-            // name takes on first open.
-            if self.tor_always.load(Ordering::Relaxed) && !self.state.tor_status().await.0 {
-                self.state
-                    .resolve_status_set(host, "failed", Some("tor_required"), None)
-                    .await;
-                if !self.await_tor_ready(None).await {
-                    return Err(
-                        "Tor is not available and Always mode forbids clearnet, so this site \
-                         cannot be resolved right now"
-                            .to_string(),
-                    );
-                }
-                self.state.resolve_status_set(host, "resolving", None, None).await;
-            }
+            self.await_tor_for_resolve(host).await?;
             self.await_trust(host).await?;
         }
+        self.resolve_until_budget(host, needs_chain).await
+    }
+
+    /// A name whose xite is already registered under a saved mapping (the
+    /// shipped dashboard on a fresh install, a superseded cache entry) resumes
+    /// its download from that address right away: the files are signed by the
+    /// address either way, and the launch verifier confirms the name in the
+    /// background. Waiting for the registry here would hold the first screen
+    /// hostage to the RPCs.
+    async fn saved_mapping_for_registered(&self, host: &str) -> Option<Resolved> {
+        let (address, verified) = self.state.resolve_name_verified(host).await?;
+        if verified || !self.state.has_xite(&address).await {
+            return None;
+        }
+        self.state.resolve_status_resolved(host, &address, false).await;
+        Some(Resolved { address, verified: false })
+    }
+
+    /// In Always mode the chain query must ride Tor: wait for it, and never
+    /// fall back to clearnet - this is the path a deferred launch name takes
+    /// on first open.
+    async fn await_tor_for_resolve(&self, host: &str) -> Result<(), String> {
+        use std::sync::atomic::Ordering;
+        if !self.tor_always.load(Ordering::Relaxed) || self.state.tor_status().await.0 {
+            return Ok(());
+        }
+        self.state
+            .resolve_status_set(host, "failed", Some("tor_required"), None)
+            .await;
+        if !self.await_tor_ready(None).await {
+            return Err(
+                "Tor is not available and Always mode forbids clearnet, so this site \
+                 cannot be resolved right now"
+                    .to_string(),
+            );
+        }
+        self.state.resolve_status_set(host, "resolving", None, None).await;
+        Ok(())
+    }
+
+    /// The resolve attempts themselves, with backoff, until [`RESOLVE_BUDGET`]
+    /// runs out. A network change or a newly anchored pin wakes every sleeper.
+    async fn resolve_until_budget(
+        &self,
+        host: &str,
+        needs_chain: bool,
+    ) -> Result<Resolved, String> {
         let deadline = std::time::Instant::now() + RESOLVE_BUDGET;
         let mut backoff = std::time::Duration::from_secs(2);
         loop {
@@ -3378,7 +3412,6 @@ impl OnDemand {
             if !retry || std::time::Instant::now() >= deadline {
                 return Err(error.to_string());
             }
-            // A network change or a newly anchored pin wakes every sleeper.
             let nap = if reason == "not_found" { std::time::Duration::from_secs(30) } else { backoff };
             tokio::select! {
                 _ = tokio::time::sleep(nap) => {}
@@ -3829,14 +3862,11 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             .and_then(|v| v.as_u64())
             .filter(|&s| s >= 60)
             .unwrap_or(3600);
-        // The advance rotates across the bootstrap RPCs on failure: the pin
-        // must keep advancing inside its weak-subjectivity window even when
-        // the first endpoint dies for good, and the sources list is exactly
-        // the set of independent operators fit for that job. The URL that
-        // answers stays first for the next cycle. The list is re-read from
-        // config on every cycle: a user stuck on "checking the name registry"
-        // can change the RPC endpoints on the Config page and tap Retry, with
-        // no restart (which the phone apps cannot do anyway).
+        // The URL that answered last time goes first next cycle (see
+        // rpc_candidates_for). The list is re-read from config on every cycle:
+        // a user stuck on "checking the name registry" can change the RPC
+        // endpoints on the Config page and tap Retry, with no restart (which
+        // the phone apps cannot do anyway).
         let mut preferred: Option<String> = None;
         // Until first trust is established (fresh install, or back after a
         // long offline stretch), retry quickly with backoff — a user opening
@@ -3845,76 +3875,27 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         let mut fast_retry_secs = 5u64;
         loop {
             let mut cfg = xid_lightclient_config(&state, &data_root).await;
-            let mut rpc_candidates: Vec<String> = std::iter::once(cfg.rpc_url.clone())
-                .chain(cfg.bootstrap_sources.iter().cloned())
-                .collect();
-            rpc_candidates.dedup();
-            if let Some(index) = preferred
-                .as_ref()
-                .and_then(|url| rpc_candidates.iter().position(|candidate| candidate == url))
-            {
-                rpc_candidates.swap(0, index);
-            }
+            let mut rpc_candidates = rpc_candidates_for(&cfg, preferred.as_deref());
             let before = epix_chain::pinned_validators();
             let outcome =
                 advance_with_rpc_rotation(&state, &mut cfg, &mut rpc_candidates).await;
-            if outcome.is_ok() {
+            let advanced_ok = outcome.is_ok();
+            if advanced_ok {
                 // The rotation moved the URL that answered to the front.
                 preferred = rpc_candidates.first().cloned();
             }
+            record_light_client_outcome(&outcome);
             // A xite whose user content could not be xID-verified is waiting on
             // exactly this: the trusted set going from nothing to something.
             // Only that transition retries - not every tick, or an hourly
             // UpToDate would re-index the whole deferred set forever.
             let anchored_now = before.is_none() && epix_chain::pinned_validators().is_some();
-            let advanced_ok = outcome.is_ok();
-            match &outcome {
-                Ok(_) => {
-                    epix_chain::lc_status::set_last_error(None);
-                    epix_chain::lc_status::mark_success();
-                }
-                Err(error) => {
-                    epix_chain::lc_status::set_phase("failed");
-                    epix_chain::lc_status::set_last_error(Some(error.clone()));
-                }
-            }
             log_xid_lightclient_outcome(&state, before, outcome).await;
             if anchored_now {
-                let retry_state = state.clone();
-                tokio::spawn(async move {
-                    retry_state.retry_deferred_xid_xites().await;
-                });
-                // A deferred homepage (fresh install) can resolve now: start
-                // its download without waiting for the page to ask again, and
-                // wake every resolve parked on trust.
-                let launch = state.launch_status().await;
-                if launch.address.is_none() && !launch.display.is_empty() {
-                    let ensure_state = state.clone();
-                    let home = launch.display.clone();
-                    tokio::spawn(async move {
-                        ensure_state.ensure_xite(&home).await;
-                    });
-                }
-                epix_chain::wake_light_client();
+                on_trust_anchored(&state).await;
             }
-            // The lazy hourly cadence applies only after a SUCCESSFUL cycle.
-            // A failed one retries with backoff even when a pin is active:
-            // boot restores the pin before any network exists, so the first
-            // cycles routinely fail while Tor bootstraps - sleeping an hour
-            // on that failure would leave the trusted height stale (and the
-            // validator-set-change trigger unfired) for no reason.
-            let delay = if advanced_ok && epix_chain::pinned_validators().is_some() {
-                fast_retry_secs = 5;
-                interval_secs
-            } else {
-                let delay = fast_retry_secs;
-                // While something is waiting on trust (a fresh install's first
-                // page), never back off past half a minute: the wait is on
-                // screen, and a network that comes back should be noticed.
-                let cap = if state.parked_resolve_hosts().await.is_empty() { interval_secs } else { 30 };
-                fast_retry_secs = (fast_retry_secs * 2).min(cap);
-                delay.min(cap)
-            };
+            let delay =
+                light_client_delay(&state, advanced_ok, &mut fast_retry_secs, interval_secs).await;
             epix_chain::lc_status::set_next_retry_unix(now_secs() as i64 + delay as i64);
             // A network change (the shell, or the Retry button) wakes the loop
             // early and resets the backoff: the user just told us to try.
@@ -3926,6 +3907,86 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             }
         }
     });
+}
+
+/// The RPCs one light-client cycle rotates across: the configured primary
+/// plus the bootstrap sources (the set of independent operators fit for the
+/// job), with the URL that answered last time first. The pin must keep
+/// advancing inside its weak-subjectivity window even when the first
+/// endpoint dies for good.
+fn rpc_candidates_for(
+    cfg: &epix_chain::LightClientConfig,
+    preferred: Option<&str>,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = std::iter::once(cfg.rpc_url.clone())
+        .chain(cfg.bootstrap_sources.iter().cloned())
+        .collect();
+    candidates.dedup();
+    if let Some(index) =
+        preferred.and_then(|url| candidates.iter().position(|candidate| candidate == url))
+    {
+        candidates.swap(0, index);
+    }
+    candidates
+}
+
+/// Mirror one cycle's outcome into the status cell the UI reads.
+fn record_light_client_outcome(outcome: &Result<epix_chain::Advance, String>) {
+    match outcome {
+        Ok(_) => {
+            epix_chain::lc_status::set_last_error(None);
+            epix_chain::lc_status::mark_success();
+        }
+        Err(error) => {
+            epix_chain::lc_status::set_phase("failed");
+            epix_chain::lc_status::set_last_error(Some(error.clone()));
+        }
+    }
+}
+
+/// The trusted set just went from nothing to something: re-index the xites
+/// whose user content was withheld for lack of trust, start the download of
+/// a deferred homepage (a fresh install) without waiting for the page to ask
+/// again, and wake every resolve parked on trust.
+async fn on_trust_anchored(state: &Arc<AppState>) {
+    let retry_state = state.clone();
+    tokio::spawn(async move {
+        retry_state.retry_deferred_xid_xites().await;
+    });
+    let launch = state.launch_status().await;
+    if launch.address.is_none() && !launch.display.is_empty() {
+        let ensure_state = state.clone();
+        let home = launch.display.clone();
+        tokio::spawn(async move {
+            ensure_state.ensure_xite(&home).await;
+        });
+    }
+    epix_chain::wake_light_client();
+}
+
+/// How long to sleep before the next light-client cycle. The lazy hourly
+/// cadence applies only after a SUCCESSFUL cycle. A failed one retries with
+/// backoff even when a pin is active: boot restores the pin before any
+/// network exists, so the first cycles routinely fail while Tor bootstraps -
+/// sleeping an hour on that failure would leave the trusted height stale
+/// (and the validator-set-change trigger unfired) for no reason. While
+/// something is waiting on trust (a fresh install's first page), the backoff
+/// never passes half a minute: the wait is on screen, and a network that
+/// comes back should be noticed.
+async fn light_client_delay(
+    state: &AppState,
+    advanced_ok: bool,
+    fast_retry_secs: &mut u64,
+    interval_secs: u64,
+) -> u64 {
+    if advanced_ok && epix_chain::pinned_validators().is_some() {
+        *fast_retry_secs = 5;
+        return interval_secs;
+    }
+    let delay = *fast_retry_secs;
+    let cap = if state.parked_resolve_hosts().await.is_empty() { interval_secs } else { 30 };
+    *fast_retry_secs = (*fast_retry_secs * 2).min(cap);
+    delay.min(cap)
 }
 
 /// Build the light-client configuration from node config, falling back to the
