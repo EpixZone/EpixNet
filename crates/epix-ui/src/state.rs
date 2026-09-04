@@ -13515,11 +13515,28 @@ impl AppState {
         let existing_name = existing_cert.as_ref().map(|c| c.auth_user_name.clone());
 
         self.push_inject_script(xite_address, "$('#button-identity').text('Checking...')");
-        let (discovered, new_addr) = Self::discover_xid_names(
-            &auth_address,
-            &identity_addresses,
-            existing_name.as_deref())
-        .await;
+        // The discovery asks the chain once per identity. With the name
+        // registry unreachable that used to hang the picker on "Checking..."
+        // for an RPC timeout per identity per endpoint; a xite's first screen
+        // must not wait on that. Bound the whole lookup: past the budget the
+        // picker opens with the local choices only (None, New) and the names
+        // show up the next time it is opened with the registry back.
+        let (discovered, new_addr) = match tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            Self::discover_xid_names(&auth_address, &identity_addresses, existing_name.as_deref()),
+        )
+        .await
+        {
+            Ok(found) => found,
+            Err(_) => {
+                self.log(
+                    "INFO",
+                    "xID discovery did not answer within 8s; offering local choices only".to_string(),
+                )
+                .await;
+                (Vec::new(), None)
+            }
+        };
         self.push_inject_script(xite_address, "$('#button-identity').text('Change')");
 
         // No spare unlinked identity: mint one so "New" always has an address.

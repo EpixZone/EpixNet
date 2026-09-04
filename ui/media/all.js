@@ -2302,6 +2302,54 @@ if (window.getComputedStyle(document.body).transform) {
       });
     };
 
+    // A xite whose content lives in per-user files (forums, blogs, mail)
+    // opens the moment its own files are down, while the posts keep
+    // streaming in. Without a word about that, an empty first screen reads
+    // as broken. This pill covers the gap for every such xite, whatever its
+    // own scripts do: it shows from the first user-content file, counts
+    // them, and goes away 12s after the last one.
+    Wrapper.prototype.noteContentSync = function (xite_info) {
+      var _this = this;
+      var event = xite_info.event;
+      if (!event || (event[0] !== "file_done" && event[0] !== "file_added")) {
+        return;
+      }
+      if (typeof event[1] !== "string" || !/^data\//.test(event[1])) {
+        return;
+      }
+      if (this.loading.screen_visible) {
+        return; // the loading screen already says files are coming
+      }
+      if (!this.content_sync) {
+        this.content_sync = { files: 0, shown: false, timer: null };
+      }
+      if (event[0] === "file_done") {
+        this.content_sync.files += 1;
+      }
+      var files = this.content_sync.files;
+      var body = "Downloading content&hellip;";
+      if (files > 0) {
+        body += " " + files + (files === 1 ? " file" : " files");
+      }
+      var peers = xite_info.peers_serving || 0;
+      if (peers > 0) {
+        body += " from " + peers + (peers === 1 ? " peer" : " peers");
+      }
+      if (!this.content_sync.shown) {
+        this.notifications.add("sync", "info", body);
+        this.content_sync.shown = true;
+      } else {
+        $(".notification-sync .multiline").html(body);
+      }
+      if (this.content_sync.timer) {
+        clearTimeout(this.content_sync.timer);
+      }
+      this.content_sync.timer = setTimeout(function () {
+        _this.notifications.close($(".notification-sync"));
+        _this.content_sync = null;
+      }, 12000);
+    };
+
     Wrapper.prototype.onPageLoad = function (e) {
       var ref;
       this.log("onPageLoad");
@@ -2571,6 +2619,7 @@ if (window.getComputedStyle(document.body).transform) {
           this.loading.printLine("Tor couldn't start. Trying without it...");
           this.loading.endTorWait("Tor couldn't start. Trying without it...");
         }
+        this.noteContentSync(xite_info);
       }
       if (this.loading.screen_visible && !this.xite_info) {
         if (xite_info.peers > 1) {

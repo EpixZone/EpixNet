@@ -3205,14 +3205,17 @@ impl OnDemand {
         let mut last_status = String::new();
         // ~2 minutes. Arti's cold bootstrap is ~10-40s, but a slow link (or a
         // Windows machine fetching a fresh consensus) can take longer.
-        for _ in 0..240 {
+        for tick in 0..240 {
             let (up, status) = self.state.tor_status().await;
             if up {
                 return true;
             }
-            if status != last_status {
-                // The screen would otherwise sit on "Searching for peers" for
-                // the whole bootstrap with nothing to show for it.
+            // The screen would otherwise sit on "Searching for peers" for the
+            // whole bootstrap with nothing to show for it. Repeated every few
+            // seconds, not only on a change: the first push usually goes out
+            // before the page's socket has even opened, and a wrapper that
+            // joins mid-wait must still hear about it.
+            if status != last_status || tick % 10 == 0 {
                 tell("waiting_tor", &status);
                 last_status = status.clone();
             }
