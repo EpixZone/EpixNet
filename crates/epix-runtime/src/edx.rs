@@ -10290,7 +10290,10 @@ mod tests {
 
         // A leftover from a partial write is tightened too: the create-time
         // mode only applies to a file we create, so the rewrite still chmods.
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        // 0o640, not 0o644: still looser than the 0o600 the rewrite must
+        // restore (which is the behavior under test), without the
+        // world-readable bit scanners flag.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o640)).unwrap();
         write_key_file(&path, "cafebabe").unwrap();
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "an existing key file is tightened, not left readable");
