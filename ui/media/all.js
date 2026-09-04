@@ -780,6 +780,12 @@ if (window.getComputedStyle(document.body).transform) {
   Loading = (function () {
     function Loading(wrapper) {
       this.wrapper = wrapper;
+      this.watchdog_timer = null;
+      this.pre_stage = null;
+      this.tor_waiting = false;
+      this.progress_seen = false;
+      this.actions_el = null;
+      this.retry_cb = null;
       if (window.show_loadingscreen) {
         this.showScreen();
       }
@@ -827,10 +833,34 @@ if (window.getComputedStyle(document.body).transform) {
     // The centered stage ticker: previous action faded above, the current one
     // big in the middle with a live detail line, the next faded below.
     Loading.prototype.setStage = function (index, detail, is_error) {
-      var stages = Loading.STAGES;
       if (index < (this.stage_index || 0)) {
         return; // never step backwards (events can arrive out of order)
       }
+      if (this.pre_stage && index === (this.stage_index || 0)) {
+        // A pre-stage ("Connecting to Tor") stands in for this stage: keep
+        // its label and only refresh the detail line.
+        return this.renderStage(this.pre_stage, detail, "next: " + Loading.STAGES[index], is_error, "");
+      }
+      if (index !== this.stage_index) {
+        // A real stage replaces any pre-stage, and peers or files arriving
+        // means the Tor wait is over whether or not the node said so.
+        this.pre_stage = null;
+        this.tor_waiting = false;
+      }
+      this.stage_index = index;
+      return this.renderStageIndex(index, detail, is_error);
+    };
+
+    Loading.prototype.renderStageIndex = function (index, detail, is_error) {
+      var stages = Loading.STAGES;
+      return this.renderStage(stages[index], detail, index + 1 < stages.length ? "next: " + stages[index + 1] : "", is_error, index > 0 ? stages[index - 1] : "");
+    };
+
+    // Writes the ticker. The label only pops in when it changes. Nothing is
+    // named above the first stage (there is no earlier step), and "next:" is
+    // dropped while an error is showing.
+    Loading.prototype.renderStage = function (label, detail, next, is_error, prev) {
+      var current;
       if (!this.stage_el || this.stage_el.length === 0) {
         this.stage_el = $(
           "<div class='loading-stage'>" +
@@ -842,12 +872,11 @@ if (window.getComputedStyle(document.body).transform) {
         ).appendTo(".loadingscreen");
         $(".loadingscreen").addClass("staged");
       }
-      var current = this.stage_el.find(".stage-current");
-      if (index !== this.stage_index) {
-        this.stage_index = index;
-        this.stage_el.find(".stage-prev").text(index > 0 ? stages[index - 1] : "Connected");
-        current.text(stages[index]);
-        this.stage_el.find(".stage-next").text(index + 1 < stages.length ? "next: " + stages[index + 1] : "");
+      current = this.stage_el.find(".stage-current");
+      this.stage_el.find(".stage-prev").text(prev || "");
+      this.stage_el.find(".stage-next").text(is_error ? "" : (next || ""));
+      if (current.text() !== label) {
+        current.text(label);
         // Re-trigger the pop animation.
         current.removeClass("pop");
         void current[0].offsetWidth;
@@ -857,11 +886,267 @@ if (window.getComputedStyle(document.body).transform) {
       return this.stage_el.find(".stage-detail").text(detail || "");
     };
 
+    // A step before "Searching for peers": the name lookup in resolving mode,
+    // or the Tor wait. Same ticker, same element, so the page reload after a
+    // lookup does not visibly restart the screen.
+    Loading.prototype.setPreStage = function (label, detail, is_error) {
+      if (label !== this.pre_stage) {
+        this.printLine(label, is_error ? "error" : "normal");
+      }
+      this.pre_stage = label;
+      return this.renderStage(label, detail, "next: " + Loading.STAGES[this.stage_index || 0], is_error, "");
+    };
+
+    // Back to the numbered stage the pre-stage stood in for.
+    Loading.prototype.clearPreStage = function (detail) {
+      this.pre_stage = null;
+      this.stage_index = this.stage_index || 0;
+      return this.renderStageIndex(this.stage_index, detail, false);
+    };
+
+    // ["waiting_tor", status]: the clone is parked until Tor is up. The peer
+    // watchdog pauses meanwhile, since no peer can turn up before the wait
+    // ends.
+    Loading.prototype.setTorWait = function (status) {
+      var detail;
+      if (status === "Bootstrapping") {
+        detail = "The first start can take up to a minute.";
+      } else if (status === "Failed" || status === "Recovering") {
+        detail = "Tor couldn't start. Trying without it...";
+      } else {
+        return this.endTorWait(""); // OK, Always or Disabled: the wait is over
+      }
+      this.tor_waiting = true;
+      this.clearWatchdog();
+      return this.setPreStage("Connecting to Tor", detail);
+    };
+
+    Loading.prototype.endTorWait = function (detail) {
+      if (!this.tor_waiting) {
+        return;
+      }
+      this.tor_waiting = false;
+      this.clearPreStage(detail);
+      return this.startWatchdog();
+    };
+
+    // Thirty seconds with no peer and no Tor wait usually means the search is
+    // stuck (no network, a dead proxy). Say so and offer a reload; any peer or
+    // file event cancels it.
+    Loading.prototype.startWatchdog = function () {
+      var _this = this;
+      this.clearWatchdog();
+      if (window.resolving_host || this.progress_seen || !this.screen_visible) {
+        return;
+      }
+      return this.watchdog_timer = setTimeout(function () {
+        _this.watchdog_timer = null;
+        if (_this.progress_seen || _this.tor_waiting || !_this.screen_visible) {
+          return;
+        }
+        _this.setStage(_this.stage_index || 0, "Still looking for peers. Check your connection.");
+        return _this.showRetry();
+      }, 30000);
+    };
+
+    Loading.prototype.clearWatchdog = function () {
+      if (this.watchdog_timer) {
+        clearTimeout(this.watchdog_timer);
+        this.watchdog_timer = null;
+      }
+    };
+
+    // A peer or file event: the watchdog and any stale Retry are moot.
+    Loading.prototype.noteProgress = function () {
+      this.progress_seen = true;
+      this.clearWatchdog();
+      return this.hideRetry();
+    };
+
+    // One Retry button between the ticker and the console, 44px tall for
+    // touch. Without a callback it reloads the page, which requests the xite
+    // again from scratch; resolving mode passes the node's network retry.
+    Loading.prototype.showRetry = function (cb) {
+      var _this = this;
+      if (!this.screen_visible) {
+        return;
+      }
+      this.retry_cb = cb || function () {
+        return window.location.reload();
+      };
+      if (!this.actions_el || this.actions_el.length === 0) {
+        this.actions_el = $("<div class='loading-actions'><a href='#Retry' class='button button-retry'>Retry</a></div>");
+        this.actions_el.find(".button-retry").on("click", function () {
+          $(this).addClass("loading");
+          if (_this.retry_cb) {
+            _this.retry_cb();
+          }
+          return false;
+        });
+        this.actions_el.insertBefore(".loadingscreen .console");
+      }
+      this.actions_el.find(".button-retry").removeClass("loading");
+      return this.actions_el;
+    };
+
+    Loading.prototype.hideRetry = function () {
+      if (this.actions_el) {
+        this.actions_el.remove();
+        this.actions_el = null;
+      }
+      return this.retry_cb = null;
+    };
+
+    // Plain-language reason for a failed download, from the node's reason
+    // code. Null when the code is unknown, so the caller keeps its old text.
+    Loading.prototype.failureText = function (reason, tor_status) {
+      var text;
+      if (reason === "no_peers") {
+        text = "No one is sharing this xite right now.";
+        if (tor_status === "Failed") {
+          text += " Tor couldn't start, so only xites shared over the regular internet can load. Tor retries every 30 seconds.";
+        }
+        return text;
+      } else if (reason === "tor_unavailable") {
+        return "Tor isn't available and Always-Tor mode never uses the regular internet.";
+      } else if (reason === "offline") {
+        return "EpixNet is in offline mode.";
+      } else if (reason === "files_unavailable") {
+        return "The xite's files couldn't be downloaded from the peers found. Trying again may help.";
+      } else if (reason === "content_unverified") {
+        return "The xite's files didn't verify. Try again later.";
+      }
+      return null;
+    };
+
+    // Seconds spent in the current lookup state. The node's `since` is a
+    // unix time; it is used when it is sane (same device, usually), else a
+    // local clock from the first sighting of the state stands in.
+    Loading.prototype.stateElapsed = function (status) {
+      var now = Date.now() / 1000;
+      if (status.state !== this.resolve_state) {
+        this.resolve_state = status.state;
+        this.resolve_state_since = now;
+      }
+      if (typeof status.since === "number" && status.since > 0 && status.since <= now) {
+        return now - status.since;
+      }
+      return now - this.resolve_state_since;
+    };
+
+    // Resolving mode: the name is still being looked up, so the ticker shows
+    // the lookup steps in place of the peer stages. The texts live here; the
+    // node's own detail string is only a last resort, and always under a
+    // label.
+    Loading.prototype.showResolveStatus = function (status) {
+      var _this = this;
+      var host, state, reason, label, detail, is_error, retry;
+      host = window.resolving_host;
+      state = status.state;
+      reason = status.reason;
+      is_error = false;
+      retry = false;
+      var settings = false;
+      if (state === "waiting_network") {
+        label = "Connecting to the network";
+        detail = "Can't reach the Epix name servers. Check your internet connection, or change the servers in Connection settings.";
+        is_error = true;
+        retry = true;
+        settings = true;
+      } else if (state === "establishing_trust") {
+        label = "Checking the Epix name registry";
+        detail = "This takes a moment the first time.";
+        if (this.stateElapsed(status) >= 45) {
+          detail = "Still working. On a slow connection this can take a few minutes.";
+          if (typeof status.sources_total === "number") {
+            detail += " Reached " + (status.sources_reachable || 0) + " of " + status.sources_total + " name servers.";
+          }
+          detail += " If your connection is fine, the name servers may be down: you can change them in Connection settings.";
+          retry = true;
+          settings = true;
+        }
+      } else if (state === "failed") {
+        is_error = true;
+        retry = true;
+        if (reason === "not_found") {
+          label = "Not found";
+          detail = "No xite is registered under this name. Check the spelling, or open it by its epix1 address.";
+        } else if (reason === "offline_policy") {
+          label = "Offline mode";
+          detail = "EpixNet is in offline mode, so only xites already on this phone open. Turn it off in Connection settings.";
+        } else if (reason === "tor_required") {
+          label = "Connecting to Tor";
+          if (status.tor_status === "Failed") {
+            detail = "Tor couldn't connect. It retries every 30 seconds. You can switch off Always-Tor in Connection settings.";
+          } else {
+            detail = "Always-Tor mode never uses the regular internet.";
+            is_error = false;
+          }
+        } else if (reason === "mistyped_address") {
+          label = "Mistyped address";
+          detail = host + " looks like an epix1 address, but its checksum does not match.";
+          retry = false; // the checksum will not change on a retry
+        } else {
+          label = "Couldn't look up " + host;
+          detail = status.detail || "Trying again may help.";
+          settings = true;
+        }
+      } else {
+        // idle, resolving, or a state newer than this page
+        label = "Looking up " + host;
+        if (reason === "rpc_error") {
+          detail = "The Epix name service didn't answer. Trying again... (attempt " + (status.attempts || 1) + ")";
+          if ((status.attempts || 0) >= 3) {
+            detail += " You can change the name servers in Connection settings.";
+            retry = true;
+            settings = true;
+          }
+        } else if (reason === "bad_answer") {
+          detail = "Got a bad answer from a name server. Trying another one.";
+        } else {
+          detail = "";
+        }
+      }
+      this.setPreStage(label, detail, is_error);
+      if (retry) {
+        this.showRetry(function () {
+          return _this.wrapper.retryResolve();
+        });
+        return this.showSettingsAction(settings);
+      }
+      return this.hideRetry();
+    };
+
+    // A second, quieter action next to Retry: the Config page, where the
+    // name servers (RPC endpoints), Tor and offline mode live. Shown only
+    // when changing a setting could be the way out of the current state.
+    Loading.prototype.showSettingsAction = function (on) {
+      if (!this.actions_el) {
+        return;
+      }
+      var link = this.actions_el.find(".button-settings");
+      if (on && link.length === 0) {
+        this.actions_el.append("<a href='/Config' class='button button-settings'>Connection settings</a>");
+      } else if (!on) {
+        link.remove();
+      }
+      return this.actions_el;
+    };
+
     Loading.prototype.showScreen = function () {
       $(".loadingscreen").css("display", "block").addClassLater("ready");
       this.screen_visible = true;
-      this.printLine("&nbsp;&nbsp;&nbsp;Connecting...");
-      return this.setStage(0, "");
+      // The floating home button would only reload this same page while the
+      // homepage (or a name still resolving) is loading.
+      if (window.is_homepage || window.resolving_host) {
+        $(".fixbutton").addClass("fixbutton-hidden");
+      }
+      this.printLine("Connecting...");
+      if (window.resolving_host) {
+        return this.setPreStage("Looking up " + window.resolving_host, "");
+      }
+      this.setStage(0, "");
+      return this.startWatchdog();
     };
 
     Loading.prototype.showTooLarge = function (xite_info) {
@@ -913,6 +1198,8 @@ if (window.getComputedStyle(document.body).transform) {
 
     Loading.prototype.hideScreen = function () {
       this.log("hideScreen");
+      this.clearWatchdog();
+      $(".fixbutton").removeClass("fixbutton-hidden");
       if (!$(".loadingscreen").hasClass("done")) {
         if (this.screen_visible) {
           $(".loadingscreen").addClass("done").removeLater(2000);
@@ -1171,6 +1458,10 @@ if (window.getComputedStyle(document.body).transform) {
       this.ws.onMessage = this.onMessageWebsocket;
       this.ws.connect();
       this.ws_error = null;
+      this.ws_lost_timer = null;
+      this.resolve_poll_timer = null;
+      this.resolve_inflight = null;
+      this.resolve_done = false;
       this.next_cmd_message_id = -1;
       this.xite_info = null;
       this.server_info = null;
@@ -1553,19 +1844,30 @@ if (window.getComputedStyle(document.body).transform) {
       permission = message.params;
       return $.when(this.event_xite_info).done((function (_this) {
         return function () {
+          var grant;
           if (indexOf.call(_this.xite_info.settings.permissions, permission) >= 0) {
+            // Already granted: nothing was refused, so there is nothing for
+            // the page to re-sync. Deliberately no answer - the dashboard
+            // builds already out there run their grant callback as if the
+            // user had just tapped Grant, before their settings have loaded.
             return false;
           }
-          return _this.ws.cmd("permissionDetails", permission, function (permission_details) {
-            return _this.displayConfirm("This xite requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", function () {
-              return _this.ws.cmd("permissionAdd", permission, function (res) {
-                return _this.sendInner({
-                  "cmd": "response",
-                  "to": message.id,
-                  "result": res
-                });
+          grant = function () {
+            return _this.ws.cmd("permissionAdd", permission, function (res) {
+              return _this.sendInner({
+                "cmd": "response",
+                "to": message.id,
+                "result": res
               });
             });
+          };
+          if (permission === "ADMIN" && window.is_homepage) {
+            // The node's own control panel asking to manage the node: no
+            // "trust the developer" warning for that.
+            return _this.displayConfirm("The dashboard needs permission to manage this EpixNet node.", "Allow", grant);
+          }
+          return _this.ws.cmd("permissionDetails", permission, function (permission_details) {
+            return _this.displayConfirm("This xite requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", grant);
           });
         };
       })(this));
@@ -1834,6 +2136,21 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.onOpenWebsocket = function (e) {
+      if (this.ws_lost_timer) {
+        clearTimeout(this.ws_lost_timer);
+        this.ws_lost_timer = null;
+      }
+      if (this.ws_error) {
+        this.notifications.add("connection", "done", "Connected to EpixNet again.", 6000);
+        this.ws_error = null;
+      }
+      if (window.resolving_host) {
+        // Resolving mode: the socket is bound to nothing and there is no
+        // address to join, fetch or poll for. Only the name lookup is
+        // followed; the reload on "resolved" comes back through the normal
+        // path below.
+        return this.startResolvePoll();
+      }
       if (window.show_loadingscreen) {
         this.ws.cmd("channelJoin", {
           "channels": ["siteChanged", "serverChanged", "announcerChanged"]
@@ -1881,10 +2198,6 @@ if (window.getComputedStyle(document.body).transform) {
           }
         };
       })(this)), 2000);
-      if (this.ws_error) {
-        this.notifications.add("connection", "done", "Connection with <b>UiServer Websocket</b> recovered.", 6000);
-        return this.ws_error = null;
-      }
     };
 
     Wrapper.prototype.onCloseWebsocket = function (e) {
@@ -1908,16 +2221,142 @@ if (window.getComputedStyle(document.body).transform) {
           } else if (e && e.code === 1001 && e.wasClean === true) {
 
           } else if (!_this.ws_error) {
-            return _this.ws_error = _this.notifications.add("connection", "error", "Connection with <b>UiServer Websocket</b> was lost. Reconnecting...");
+            _this.ws_error = _this.notifications.add("connection", "error", "Reconnecting to EpixNet...");
+            // Thirty seconds is past any reconnect delay: by then the app
+            // itself is most likely gone, and only a restart brings it back.
+            if (_this.ws_lost_timer) {
+              clearTimeout(_this.ws_lost_timer);
+            }
+            _this.ws_lost_timer = setTimeout(function () {
+              _this.ws_lost_timer = null;
+              if (_this.ws.connected || !_this.ws_error) {
+                return;
+              }
+              return _this.ws_error = _this.notifications.add("connection", "error", "Reconnecting to EpixNet...<br>EpixNet isn't answering. Close and reopen the app.");
+            }, 30000);
+            return _this.ws_error;
           }
         };
       })(this)), 1000);
+    };
+
+    // Resolving mode: follow the node's name lookup once a second. One poll
+    // in flight at a time, and none while the socket is down, so a reconnect
+    // does not flush a backlog of stale polls.
+    Wrapper.prototype.startResolvePoll = function () {
+      var _this = this;
+      if (!this.resolve_poll_timer) {
+        this.resolve_poll_timer = setInterval(function () {
+          return _this.pollResolveStatus(false);
+        }, 1000);
+      }
+      return this.pollResolveStatus(true);
+    };
+
+    Wrapper.prototype.pollResolveStatus = function (force) {
+      var _this = this;
+      if (!this.ws.connected || this.resolve_done) {
+        return;
+      }
+      if (!force && this.resolve_inflight && Date.now() - this.resolve_inflight < 5000) {
+        return;
+      }
+      this.resolve_inflight = Date.now();
+      return this.ws.cmd("resolveStatus", {
+        host: window.resolving_host
+      }, function (status) {
+        _this.resolve_inflight = null;
+        return _this.setResolveStatus(status);
+      });
+    };
+
+    Wrapper.prototype.setResolveStatus = function (status) {
+      if (this.resolve_done) {
+        return;
+      }
+      if (!status || typeof status !== "object" || status.error) {
+        return this.log("resolveStatus returned nothing usable:", status);
+      }
+      if (status.state === "resolved") {
+        this.resolve_done = true;
+        if (this.resolve_poll_timer) {
+          clearInterval(this.resolve_poll_timer);
+          this.resolve_poll_timer = null;
+        }
+        this.log("Resolved " + window.resolving_host + " to " + status.address + ", reloading");
+        // Show the first real stage before reloading: the reloaded page
+        // starts on that same stage, so the ticker reads as continuing.
+        this.loading.hideRetry();
+        this.loading.clearPreStage("");
+        return window.location.replace(window.location.href);
+      }
+      return this.loading.showResolveStatus(status);
+    };
+
+    // The Retry button in resolving mode: wake the node's network side, then
+    // ask again right away instead of waiting for the next tick.
+    Wrapper.prototype.retryResolve = function () {
+      var _this = this;
+      return this.ws.cmd("networkRetry", [], function () {
+        return _this.pollResolveStatus(true);
+      });
+    };
+
+    // A xite whose content lives in per-user files (forums, blogs, mail)
+    // opens the moment its own files are down, while the posts keep
+    // streaming in. Without a word about that, an empty first screen reads
+    // as broken. This pill covers the gap for every such xite, whatever its
+    // own scripts do: it shows from the first user-content file, counts
+    // them, and goes away 12s after the last one.
+    Wrapper.prototype.noteContentSync = function (xite_info) {
+      var _this = this;
+      var event = xite_info.event;
+      if (!event || (event[0] !== "file_done" && event[0] !== "file_added")) {
+        return;
+      }
+      if (typeof event[1] !== "string" || !/^data\//.test(event[1])) {
+        return;
+      }
+      if (this.loading.screen_visible) {
+        return; // the loading screen already says files are coming
+      }
+      if (!this.content_sync) {
+        this.content_sync = { files: 0, shown: false, timer: null };
+      }
+      if (event[0] === "file_done") {
+        this.content_sync.files += 1;
+      }
+      var files = this.content_sync.files;
+      var body = "Downloading content&hellip;";
+      if (files > 0) {
+        body += " " + files + (files === 1 ? " file" : " files");
+      }
+      var peers = xite_info.peers_serving || 0;
+      if (peers > 0) {
+        body += " from " + peers + (peers === 1 ? " peer" : " peers");
+      }
+      if (!this.content_sync.shown) {
+        this.notifications.add("sync", "info", body);
+        this.content_sync.shown = true;
+      } else {
+        $(".notification-sync .multiline").html(body);
+      }
+      if (this.content_sync.timer) {
+        clearTimeout(this.content_sync.timer);
+      }
+      this.content_sync.timer = setTimeout(function () {
+        _this.notifications.close($(".notification-sync"));
+        _this.content_sync = null;
+      }, 12000);
     };
 
     Wrapper.prototype.onPageLoad = function (e) {
       var ref;
       this.log("onPageLoad");
       this.inner_loaded = true;
+      if (window.resolving_host) {
+        return; // the iframe is blank; there is no xite to ask about yet
+      }
       // The iframe often finishes AFTER the first siteInfo response has
       // already been handled (with inner_loaded still false, so the screen
       // was not hidden). Without this re-check the overlay only goes away on
@@ -2072,6 +2511,13 @@ if (window.getComputedStyle(document.body).transform) {
       return this.ws.cmd("siteInfo", params, (function (_this) {
         return function (xite_info) {
           var ref;
+          if (!xite_info || !xite_info.settings) {
+            // No xite behind this session (an unbound socket, or a xite that
+            // is gone): nothing to render, and throwing here would stop the
+            // rest of the boot.
+            _this.log("siteInfo returned nothing usable:", xite_info);
+            return;
+          }
           _this.address = xite_info.address;
           _this.setXiteInfo(xite_info);
           if (xite_info.settings.size > xite_info.size_limit * 1024 * 1024 && !_this.loading.screen_visible) {
@@ -2108,9 +2554,11 @@ if (window.getComputedStyle(document.body).transform) {
           };
           var needed_line = xite_info.bad_files + " files needed to load";
           if (xite_info.size_needed) needed_line = xite_info.bad_files + " files (" + fmtSize(xite_info.size_needed) + ") needed to load";
+          this.loading.noteProgress();
           this.loading.printLine(needed_line);
           this.loading.setStage(2, "0 / " + xite_info.bad_files + " files");
         } else if (xite_info.event[0] === "file_done") {
+          this.loading.noteProgress();
           this.loading.printLine(xite_info.event[1] + " downloaded");
           if (xite_info.started_task_num > 0 && xite_info.event[1] !== "content.json") {
             // peers_serving is how many peers the files are actually coming
@@ -2144,19 +2592,34 @@ if (window.getComputedStyle(document.body).transform) {
             this.loading.showTooLarge(xite_info);
           } else {
             this.loading.printLine(xite_info.event[1] + " download failed", "error");
-            // Only show "No peers found" after a file download has failed
-            if (xite_info.peers <= 1) {
+            // The node says why when it can. Older nodes only send the peer
+            // count, where one peer or fewer means there was nobody to
+            // fetch from.
+            var reason = xite_info.reason;
+            if (!reason && xite_info.peers <= 1) {
+              reason = "no_peers";
+            }
+            var detail = this.loading.failureText(reason, xite_info.tor_status);
+            if (reason === "no_peers") {
+              // Only show "No peers found" after a file download has failed
               this.xite_error = "No peers found";
               this.loading.printLine("No peers found");
-              this.loading.setStage(this.loading.stage_index || 0, "No peers found", true);
-            } else {
-              this.loading.setStage(this.loading.stage_index || 0, xite_info.event[1] + " download failed", true);
             }
+            this.loading.setStage(this.loading.stage_index || 0, detail || (xite_info.event[1] + " download failed"), true);
+            this.loading.clearWatchdog();
+            this.loading.showRetry();
           }
         } else if (xite_info.event[0] === "peers_added") {
+          this.loading.noteProgress();
           this.loading.printLine("Peers found: " + xite_info.peers);
           this.loading.setStage(1, "peers found: " + xite_info.peers);
+        } else if (xite_info.event[0] === "waiting_tor") {
+          this.loading.setTorWait(xite_info.tor_status || xite_info.event[1]);
+        } else if (xite_info.event[0] === "tor_skipped") {
+          this.loading.printLine("Tor couldn't start. Trying without it...");
+          this.loading.endTorWait("Tor couldn't start. Trying without it...");
         }
+        this.noteContentSync(xite_info);
       }
       if (this.loading.screen_visible && !this.xite_info) {
         if (xite_info.peers > 1) {
@@ -2305,7 +2768,14 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.updateProgress = function (xite_info) {
-      if (!xite_info || !(xite_info.started_task_num > 0)) {
+      // Every bound session hears the whole channel, so another xite's
+      // events arrive here too; only this page's address may move the bar.
+      // window.address covers the first seconds before siteInfo has answered.
+      var address = this.address || window.address;
+      if (!xite_info || !address || xite_info.address !== address) {
+        return;
+      }
+      if (!(xite_info.started_task_num > 0)) {
         // Events with no task info (peer additions, announces) say nothing
         // about download progress - leave the bar where it is.
         return;

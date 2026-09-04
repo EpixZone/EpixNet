@@ -2594,6 +2594,7 @@ dependencies = [
  "bech32",
  "ed25519-dalek 3.0.0",
  "fslock-guard",
+ "futures-util",
  "hex",
  "reqwest",
  "serde",

@@ -207,6 +207,15 @@ impl XidResolver {
             return Ok(cached);
         }
 
+        // Fail closed BEFORE any network I/O: with verification on and no
+        // usable pin the answer could not be verified anyway, and asking would
+        // leak the name to an RPC before any trust exists. The caller waits
+        // for the light client to anchor and retries. verify_finality_gated
+        // re-checks the pin later as the second line of defence.
+        if crate::verify_finality_enabled() && !crate::trust_usable() {
+            return Err(ChainError::TrustNotEstablished);
+        }
+
         let data = self
             .get_json(&format!("/xid/v1/resolve_with_proof/{tld}/{name}"))
             .await?;

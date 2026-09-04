@@ -33,8 +33,9 @@ pub use nmh_auth::{
     new_nmh_nonce, nmh_request_mac, nmh_request_mac_valid, nmh_response_mac, nmh_response_mac_valid,
 };
 pub use state::{
-    self_exe, AppState, ContentSyncer, OnDemandResolver, PeerFinder, UpdateOutcome, XiteEntry,
-    DEFAULT_SIZE_LIMIT_MB, UPDATE_PHASE_CHECKING, UPDATE_PHASE_UPDATING,
+    self_exe, AppState, ContentSyncer, LaunchStatus, OnDemandResolver, PeerFinder, ResolveStatus,
+    ResolvedHost, UpdateOutcome, XiteEntry, DASHBOARD_XITE_ADDRESS, DEFAULT_SIZE_LIMIT_MB,
+    UPDATE_PHASE_CHECKING, UPDATE_PHASE_UPDATING,
 };
 
 use axum::{
@@ -975,9 +976,13 @@ async fn serve_nmh_resolve(
         );
     }
     match ctx.state.resolve_on_demand(name).await {
-        Some(address) => {
-            signed_nmh_resolve_response(token, &request, StatusCode::OK, Some(&address), None)
-        }
+        Some(resolved) => signed_nmh_resolve_response(
+            token,
+            &request,
+            StatusCode::OK,
+            Some(&resolved.address),
+            None,
+        ),
         None => signed_nmh_resolve_response(
             token,
             &request,
@@ -1090,41 +1095,6 @@ fn no_new_xites_html(requested: &str) -> String {
     )
 }
 
-/// The page shown when a name has not resolved yet. Unlike a bare 404 it
-/// behaves like the downloading screen: it keeps probing in the background
-/// (each probe re-enters the wrapper handler, which re-runs the resolve) and
-/// reloads the moment the name lands. It also links to the config page, so a
-/// user whose node needs a settings change (Tor mode, chain RPCs, offline
-/// policy) to resolve anything is not stranded on a dead end.
-fn resolve_retry_html(requested: &str) -> String {
-    let name = html_escape(requested);
-    // Probe every 6s; a non-404 answer means the resolve landed (the wrapper
-    // now serves), so swap this page for the real one. Network errors (node
-    // restarting) are ignored and probed through.
-    const RETRY_SCRIPT: &str = "<script>(function(){var n=0;\
-        function probe(){fetch(location.href,{cache:'no-store'})\
-        .then(function(r){if(r.status!==404){location.reload();return;}again();})\
-        .catch(again);}\
-        function again(){n++;var el=document.getElementById('resolve-status');\
-        if(el){el.textContent='Still looking\\u2026 (attempt '+n+')';}\
-        setTimeout(probe,6000);}\
-        setTimeout(probe,6000);})();</script>";
-    status_page_html(
-        &format!("Looking up {name}"),
-        "Looking up this name",
-        &format!(
-            "<p style='color:#ABABB5;overflow-wrap:anywhere'>{name} has not resolved yet. \
-             This can take a while on a fresh start, while Tor bootstraps, or while the \
-             node reaches the Epix chain. This page retries automatically.</p>\
-             <p id='resolve-status' style='color:#6B6B76;font-size:13px'>Retrying\u{2026}</p>\
-             <p style='margin-top:32px'><a href='/Config' \
-             style='color:#8AB4F8;text-decoration:none'>Open settings</a> \
-             <span style='color:#6B6B76;font-size:13px'>&nbsp;if your connection setup \
-             needs a change</span></p>{RETRY_SCRIPT}"
-        ),
-    )
-}
-
 /// The dark full-page shell shared by the standalone status pages (blocked /
 /// new-xites-disabled): a centered heading with `body_html` (already-escaped
 /// markup) beneath it.
@@ -1211,6 +1181,10 @@ async fn render_wrapper(
     // the WS session) by the address.
     let mut address = ctx.state.canonical_key(&requested).await;
     let mut loading = false;
+    // Set when the name has no address yet: the wrapper is served in
+    // resolving mode (no xite identity, no inner document, polls
+    // resolveStatus and reloads itself once the name maps).
+    let mut resolving_host = String::new();
     let ready = |state: &Arc<AppState>, addr: String| {
         let state = state.clone();
         async move {
@@ -1257,30 +1231,37 @@ async fn render_wrapper(
                 state.ensure_xite(&target).await;
             })
         };
-        // A name resolves quickly (cache or one chain query) while the clone
-        // continues in the background; wait briefly so the wrapper can embed
-        // the bech32 identity (the WS session + events key off it).
+        // A name resolves quickly (cache hit, one fast chain query) while the
+        // clone continues in the background: give that a moment so the page
+        // lands on the address-keyed loading screen directly (the WS session
+        // and its events key off the bech32 identity). The instant the node
+        // reports it is waiting on something outside its control - the
+        // network, the name registry, Tor - stop waiting and serve the
+        // resolving screen instead: it explains the wait, shows progress, and
+        // reloads itself the moment the name lands.
         if !requested.starts_with("epix1") {
-            for _ in 0..60 {
-                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            for _ in 0..20 {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let key = ctx.state.canonical_key(&requested).await;
                 if key != requested {
                     address = key;
                     break;
                 }
+                if let Some(status) = ctx.state.resolve_status(&requested).await {
+                    if matches!(
+                        status.state.as_str(),
+                        "waiting_network" | "establishing_trust" | "failed"
+                    ) {
+                        break;
+                    }
+                }
                 if ensure.is_finished() {
                     break;
                 }
             }
-            // Still unresolved after the window. Only 404 when the resolve is
-            // actually done (finished without producing an address = the name
-            // doesn't exist). If it is still in flight - e.g. an Always-mode
-            // name whose resolve is parked until Tor bootstraps - fall through
-            // and serve the loading screen; the inner html request waits it out
-            // and the background ensure resolves + clones once Tor is up.
-            if address == requested && ensure.is_finished() {
+            if address == requested {
                 // Re-check once: the resolve may have landed just as the loop
-                // exited. Only 404 if it truly produced no address.
+                // exited.
                 let key = ctx.state.canonical_key(&requested).await;
                 if key == requested {
                     // A mistyped/forged address shape gets a clear message: it
@@ -1306,20 +1287,17 @@ async fn render_wrapper(
                         )
                             .into_response();
                     }
-                    // Anything else may just be an outage (chain unreachable,
-                    // Tor still bootstrapping): serve the retrying page, like
-                    // the downloading screen, instead of a dead-end 404.
-                    return (
-                        StatusCode::NOT_FOUND,
-                        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
-                        resolve_retry_html(&requested),
-                    )
-                        .into_response();
+                    // Not resolved yet, for whatever reason the node reports
+                    // (no network, trust still establishing, a name server
+                    // that did not answer, or not registered): the wrapper in
+                    // resolving mode shows it and keeps polling.
+                    resolving_host = requested.clone();
+                } else {
+                    address = key;
                 }
-                address = key;
             }
         }
-        loading = !ready(&ctx.state, address.clone()).await;
+        loading = !resolving_host.is_empty() || !ready(&ctx.state, address.clone()).await;
     }
     // Trust this Host as a WebSocket origin (the wrapper's own page will open
     // the WS from it).
@@ -1360,7 +1338,11 @@ async fn render_wrapper(
             .map(|d| d.trim().to_lowercase())
             .filter(|d| d.ends_with(".epix"))
         {
-            if ctx.state.resolve_for_serving(&domain).await == address {
+            // Local state only: a chain lookup here would hold every
+            // address-form page load for an RPC timeout when the network is
+            // down. An unverified (saved) mapping is enough to show the name;
+            // the address serves unchanged when nothing local maps it.
+            if ctx.state.canonical_key(&domain).await == address {
                 // Keep the directory the document asked for and its query; the
                 // implied index.html is dropped. Scheme-relative in host mode,
                 // so https carries.
@@ -1427,6 +1409,15 @@ async fn render_wrapper(
         (format!("/{node_home}"), format!("/{requested}/{inner_path}"))
     };
 
+    // In resolving mode the wrapper has no xite identity yet: its WebSocket
+    // binds to nothing, it loads no inner document, and it polls resolveStatus
+    // until the name maps. The home button is pointless on the homepage's own
+    // loading screen (it reloads the same page), so the wrapper hides it there.
+    let resolving = !resolving_host.is_empty();
+    let wrapper_identity = if resolving { String::new() } else { address.clone() };
+    let file_url = if resolving { "about:blank".to_string() } else { file_url };
+    let is_homepage = node_home == requested || node_home == address;
+
     // wrapper_key == the bech32 address for this single-user local node, so
     // the WS session and every command bind to the address, never the name.
     let themeclass = ctx.state.theme_class().await;
@@ -1475,13 +1466,15 @@ async fn render_wrapper(
         ("file_url", file_url),
         ("file_inner_path", inner_path.clone()),
         ("query_string", query_string),
-        ("address", address.clone()),
+        ("address", wrapper_identity.clone()),
         ("wrapper_nonce", nonce),
-        ("wrapper_key", address.clone()),
-        ("ajax_key", address.clone()),
+        ("wrapper_key", wrapper_identity.clone()),
+        ("ajax_key", wrapper_identity),
         ("postmessage_nonce_security", nonce_security.to_string()),
         ("permissions", json!(permissions).to_string()),
         ("show_loadingscreen", if loading { "true" } else { "false" }.into()),
+        ("resolving_host", resolving_host.clone()),
+        ("is_homepage", if is_homepage { "true" } else { "false" }.into()),
         ("sandbox_permissions", String::new()),
         ("server_url", String::new()),
         ("lang", lang),
@@ -3183,8 +3176,10 @@ async fn ws_upgrade(
     }
     // wrapper_key == xite address for this node. The wrapper embeds the bech32
     // address, but resolve a `.epix` name too (older wrappers, manual clients)
-    // so the session always binds to the address.
-    let xite = match q.wrapper_key.or(q.xite) {
+    // so the session always binds to the address. A wrapper in resolving mode
+    // (the name has no address yet) sends an empty key: that session binds to
+    // no xite at all, not to "".
+    let xite = match q.wrapper_key.or(q.xite).filter(|key| !key.is_empty()) {
         Some(key) => Some(ctx.state.canonical_key(&key).await),
         None => None,
     };

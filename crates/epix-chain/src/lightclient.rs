@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use futures_util::future::join_all;
 use tendermint::block::signed_header::SignedHeader;
 use tendermint::validator::{Info as TmValidatorInfo, Set as TmValidatorSet};
 use tendermint_light_client_verifier::options::Options;
@@ -37,6 +38,7 @@ use tendermint_light_client_verifier::types::{TrustedBlockState, UntrustedBlockS
 use tendermint_light_client_verifier::{ProdVerifier, Verdict, Verifier};
 
 use crate::finality::{PinnedSet, PinnedValidator};
+use crate::lc_status;
 
 /// Default CometBFT RPC the light client follows. Overridable per-node; routed
 /// through the same chain egress (socks/Tor) as every other chain fetch, so
@@ -79,6 +81,15 @@ pub const DEFAULT_TRUSTING_PERIOD_SECS: u64 = 14 * 24 * 3600;
 /// Max bisection steps before giving up on one advance attempt. 2^40 blocks is
 /// far beyond any real gap inside a trusting period.
 const MAX_BISECTION_STEPS: usize = 40;
+
+/// Total timeout for one CometBFT RPC request on the normal path.
+const RPC_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// Total timeout for the cold-bootstrap probes (`/status` and `/commit` on
+/// every source at once). Shorter than the normal one because a dead source
+/// holds up the whole step for this long; still long enough for a Tor round
+/// trip plus TLS.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// The consensus-address bech32 prefix attestations key validators by.
 const VALCONS_HRP: bech32::Hrp = bech32::Hrp::parse_unchecked("epixvalcons");
@@ -212,8 +223,19 @@ fn write_trusted_state(path: &Path, state: &TrustedStateFile) -> Result<(), Stri
 // ---- RPC fetch (reuses the crate's egress: socks/Tor route, fail-closed) ----
 
 async fn rpc_json(base: &str, path: &str) -> Result<serde_json::Value, String> {
+    rpc_json_with_timeout(base, path, RPC_TIMEOUT).await
+}
+
+/// `timeout` bounds the whole request (connect, TLS, body): the only knob the
+/// egress client has, and over a SOCKS route a connect timeout would only
+/// cover the hop to the proxy anyway.
+async fn rpc_json_with_timeout(
+    base: &str,
+    path: &str,
+    timeout: Duration,
+) -> Result<serde_json::Value, String> {
     crate::chain_egress_ok().map_err(|e| e.to_string())?;
-    let (_, client) = crate::http_client(Duration::from_secs(20)).map_err(|e| e.to_string())?;
+    let (_, client) = crate::http_client(timeout).map_err(|e| e.to_string())?;
     let url = format!("{base}{path}");
     let resp = client
         .get(&url)
@@ -226,7 +248,15 @@ async fn rpc_json(base: &str, path: &str) -> Result<serde_json::Value, String> {
 }
 
 async fn fetch_signed_header(base: &str, height: u64) -> Result<SignedHeader, String> {
-    let v = rpc_json(base, &format!("/commit?height={height}")).await?;
+    fetch_signed_header_with_timeout(base, height, RPC_TIMEOUT).await
+}
+
+async fn fetch_signed_header_with_timeout(
+    base: &str,
+    height: u64,
+    timeout: Duration,
+) -> Result<SignedHeader, String> {
+    let v = rpc_json_with_timeout(base, &format!("/commit?height={height}"), timeout).await?;
     serde_json::from_value(v["result"]["signed_header"].clone())
         .map_err(|e| format!("light client: signed header at {height}: {e}"))
 }
@@ -266,7 +296,11 @@ async fn fetch_validators(base: &str, height: u64) -> Result<Vec<TmValidatorInfo
 }
 
 async fn fetch_latest_height(base: &str) -> Result<u64, String> {
-    let v = rpc_json(base, "/status").await?;
+    fetch_latest_height_with_timeout(base, RPC_TIMEOUT).await
+}
+
+async fn fetch_latest_height_with_timeout(base: &str, timeout: Duration) -> Result<u64, String> {
+    let v = rpc_json_with_timeout(base, "/status", timeout).await?;
     v["result"]["sync_info"]["latest_block_height"]
         .as_str()
         .and_then(|s| s.parse().ok())
@@ -435,6 +469,11 @@ async fn verify_forward(
 ///
 /// Any error leaves both the persisted state and the active pin untouched.
 pub async fn advance_trusted_set(cfg: &LightClientConfig) -> Result<Advance, String> {
+    // Status is display data for the UI (serverInfo.xid_trust). A failure
+    // leaves the phase where it got to; the node loop marks it "failed" with
+    // the error and the next retry time.
+    lc_status::mark_attempt();
+    lc_status::set_phase("verifying");
     let anchor = match read_trusted_state(&cfg.state_path)? {
         Some(state) => {
             // A trusted header older than the trusting period cannot anchor
@@ -445,7 +484,10 @@ pub async fn advance_trusted_set(cfg: &LightClientConfig) -> Result<Advance, Str
                 match fresh_anchor(cfg).await {
                     Ok(anchor) => anchor,
                     Err(e) if cfg.bootstrap_sources.is_empty() => {
-                        let _ = e;
+                        // An Ok outcome, but not a working one: nothing will
+                        // re-anchor trust, so say so where the UI looks.
+                        lc_status::set_last_error(Some(e));
+                        lc_status::set_phase("failed");
                         return Ok(Advance::AnchorExpired { trusted_unix });
                     }
                     Err(e) => return Err(e),
@@ -457,12 +499,16 @@ pub async fn advance_trusted_set(cfg: &LightClientConfig) -> Result<Advance, Str
         None => fresh_anchor(cfg).await?,
     };
     let (trusted_sh, trusted_next_vals) = anchor;
+    // A network bootstrap moves the phase through probing/bootstrapping on
+    // its way here; from this point on it is header verification again.
+    lc_status::set_phase("verifying");
 
     let head = fetch_latest_height(&cfg.rpc_url).await?;
     // Verify to head-2 so /validators at target+1 always exists.
     let target = head.saturating_sub(2);
     let trusted_height = trusted_sh.header.height.value();
     if target <= trusted_height {
+        mark_anchored();
         return Ok(Advance::UpToDate {
             height: trusted_height,
         });
@@ -497,7 +543,14 @@ pub async fn advance_trusted_set(cfg: &LightClientConfig) -> Result<Advance, Str
         },
     )?;
     publish_pin(cfg, new_pin)?;
+    mark_anchored();
     Ok(Advance::Advanced { height, validators })
+}
+
+/// A cycle ended with a verified pin in force.
+fn mark_anchored() {
+    lc_status::mark_success();
+    lc_status::set_phase("anchored");
 }
 
 /// Publish a light-client-verified set as the active pin. With a pin already
@@ -587,15 +640,26 @@ async fn fresh_anchor(
 async fn bootstrap_from_network(
     cfg: &LightClientConfig,
 ) -> Result<(SignedHeader, Vec<TmValidatorInfo>), String> {
-    // 1. Which sources answer, and how far along is each?
+    // 1. Which sources answer, and how far along is each? All probes run at
+    // once (results come back in source order), so a hanging source costs
+    // one probe timeout for the step, not one per source in turn.
+    lc_status::set_phase("probing");
+    let probes = join_all(cfg.bootstrap_sources.iter().map(|source| async move {
+        (
+            source.clone(),
+            fetch_latest_height_with_timeout(source, PROBE_TIMEOUT).await,
+        )
+    }))
+    .await;
     let mut reachable: Vec<(String, u64)> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    for source in &cfg.bootstrap_sources {
-        match fetch_latest_height(source).await {
-            Ok(height) => reachable.push((source.clone(), height)),
+    for (source, probe) in probes {
+        match probe {
+            Ok(height) => reachable.push((source, height)),
             Err(e) => failures.push(e),
         }
     }
+    lc_status::set_sources(reachable.len() as u32, cfg.bootstrap_sources.len() as u32);
     if reachable.len() < cfg.bootstrap_quorum {
         return Err(format!(
             "network bootstrap: only {}/{} sources reachable (need {}): {}",
@@ -605,6 +669,7 @@ async fn bootstrap_from_network(
             failures.join("; ")
         ));
     }
+    lc_status::set_phase("bootstrapping");
 
     // 2. A settled common height every reachable source has.
     let common = reachable
@@ -617,11 +682,19 @@ async fn bootstrap_from_network(
         return Err("network bootstrap: no common height".to_string());
     }
 
-    // 3. Group the sources by what they claim that height IS.
+    // 3. Group the sources by what they claim that height IS. Fetched from
+    // every reachable source at once, like the probes.
+    let answers = join_all(reachable.iter().map(|(source, _)| async move {
+        (
+            source.clone(),
+            fetch_signed_header_with_timeout(source, common, PROBE_TIMEOUT).await,
+        )
+    }))
+    .await;
     let mut claims: Vec<(String, SignedHeader)> = Vec::new();
-    for (source, _) in &reachable {
-        match fetch_signed_header(source, common).await {
-            Ok(sh) => claims.push((source.clone(), sh)),
+    for (source, answer) in answers {
+        match answer {
+            Ok(sh) => claims.push((source, sh)),
             Err(e) => failures.push(e),
         }
     }

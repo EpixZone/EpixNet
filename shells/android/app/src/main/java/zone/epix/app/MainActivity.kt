@@ -125,6 +125,12 @@ class MainActivity : AppCompatActivity() {
     /// chrome while the node boots and the first page paints; removed on the
     /// first page stop. Mirrors the desktop toolbar spin (EpixNet PR #231).
     private var splashOverlay: View? = null
+    /// The frame around the page (GeckoView); the boot splash is put in here,
+    /// over the page area only, and put back for a boot retry.
+    private lateinit var pageFrame: FrameLayout
+    /// One-line notice under the address bar while the phone has no network.
+    private lateinit var offlineBanner: TextView
+    private var networkOnline = true
     /// Set once we ask the session to load the actual node page. The session
     /// opens at about:blank and fires an immediate page-stop for it; without
     /// this guard the splash would vanish before the real page even loads.
@@ -140,10 +146,9 @@ class MainActivity : AppCompatActivity() {
             buildBrowserChrome(),
             FrameLayout.LayoutParams(-1, -1),
         )
-        splashOverlay = buildSplash().also {
-            container.addView(it, FrameLayout.LayoutParams(-1, -1))
-        }
+        showSplash()
         setContentView(container)
+        watchConnectivity()
 
         runtime = GeckoRuntime.getDefault(this)
         // DEBUG (local): page console + JS errors to logcat, DevTools socket
@@ -156,33 +161,7 @@ class MainActivity : AppCompatActivity() {
         geckoView.requestFocus()
 
         // The xite to open: from an epix:// launch intent, else the dashboard.
-        val target = intentTarget(intent) ?: "dashboard.epix"
-
-        scope.launch {
-            // Apply the saved clearnet-through-Tor routing before the first page
-            // load, so clearnet requests are proxied from the start. Loopback
-            // (the dashboard and every .epix page) is exempt, so this is safe to
-            // set before the node is up.
-            applyClearnetRouting()
-            val display = bootNode(target)
-            // Load the dashboard even if boot reported a problem: the node
-            // serves its own loading/error wrapper on loopback, which is more
-            // useful than a blank page and lets the user retry.
-            currentDisplay = display ?: target
-            // Don't hand GeckoView the URL until loopback actually accepts
-            // (the desktop launcher's wait_for_port): a refused first
-            // connection renders as a silent blank page. The node now binds
-            // before start() returns, so this passes immediately - it guards
-            // the boot-failed path and anything else that delays the bind.
-            // From here the next page-stop is a real page, so let it drop the
-            // splash (about:blank already came and went).
-            nodePageRequested = true
-            if (awaitUiPort()) {
-                currentTab.session.loadUri(nodeUrl(currentDisplay))
-            } else {
-                currentTab.session.loadUri(errorPage())
-            }
-        }
+        bootAndOpen(intentTarget(intent) ?: "dashboard.epix")
 
         // Reflect the Tor state in the icon's badge, at the extension's cadence.
         scope.launch {
@@ -238,6 +217,15 @@ class MainActivity : AppCompatActivity() {
                 session: GeckoSession,
                 request: GeckoSession.NavigationDelegate.LoadRequest,
             ): GeckoResult<org.mozilla.geckoview.AllowOrDeny>? {
+                // The error page's "Try again": boot the node again in-process.
+                if (request.uri == RETRY_URI) {
+                    retryBoot()
+                    return GeckoResult.deny()
+                }
+                if (request.uri == RESET_URI) {
+                    resetConfigAndRetry()
+                    return GeckoResult.deny()
+                }
                 val rewritten = xiteRewrite(request.uri) ?: return null
                 session.loadUri(rewritten)
                 return GeckoResult.deny()
@@ -286,7 +274,7 @@ class MainActivity : AppCompatActivity() {
                     }
                     return null
                 }
-                return GeckoResult.fromValue(errorPage())
+                return GeckoResult.fromValue(errorPage(null))
             }
         }
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
@@ -660,6 +648,7 @@ class MainActivity : AppCompatActivity() {
         val visibility = if (hidden) View.GONE else View.VISIBLE
         topBar.visibility = visibility
         bottomBar.visibility = visibility
+        refreshOfflineBanner()
     }
 
     /** Hardware/gesture back navigates the page history first. */
@@ -697,7 +686,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         addressBar = EditText(this).apply {
-            hint = "Search or type a .epix name"
+            hint = "Type a xite name, or ? to search"
             setHintTextColor(COLOR_HINT)
             setTextColor(COLOR_TEXT)
             textSize = 14f
@@ -761,11 +750,29 @@ class MainActivity : AppCompatActivity() {
 
         topBar = bar
         root.addView(bar, LinearLayout.LayoutParams(-1, -2))
+        // One quiet line while the phone has no network. Xites already on the
+        // phone keep opening (the node serves them from disk); this only says
+        // why new ones and updates are waiting.
+        offlineBanner = TextView(this).apply {
+            text = "No internet connection"
+            textSize = 12f
+            setTextColor(COLOR_BOOT)
+            gravity = Gravity.CENTER
+            setPadding(dp(8), 0, dp(8), dp(6))
+            visibility = View.GONE
+        }
+        root.addView(offlineBanner, LinearLayout.LayoutParams(-1, -2))
         geckoView = GeckoView(this)
-        // Dark until the page's first paint; GeckoView otherwise flashes
-        // white while the node boots and the page loads.
-        geckoView.coverUntilFirstPaint(COLOR_CHROME_BG)
-        root.addView(geckoView, LinearLayout.LayoutParams(-1, 0, 1f))
+        // Painted in the page's own background until its first paint, so the
+        // boot splash, the cover and the node's loading screen all share one
+        // colour and nothing flashes between them.
+        geckoView.coverUntilFirstPaint(pageBackground())
+        // The splash sits over the page area only; the chrome stays visible
+        // around it, exactly as it will once the page is up.
+        pageFrame = FrameLayout(this).apply {
+            addView(geckoView, FrameLayout.LayoutParams(-1, -1))
+        }
+        root.addView(pageFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         bottomBar = buildToolbar()
         root.addView(bottomBar, LinearLayout.LayoutParams(-1, -2))
         return root
@@ -831,14 +838,19 @@ class MainActivity : AppCompatActivity() {
      * wait instead of a blank dark screen.
      */
     private fun buildSplash(): View {
+        val background = pageBackground()
         val overlay = FrameLayout(this).apply {
-            setBackgroundColor(COLOR_CHROME_BG)
-            // Swallow taps so the chrome behind the splash stays inert while it
-            // shows (e.g. the address bar can't be focused mid-boot).
+            setBackgroundColor(background)
+            // Swallow taps on the page area while it shows.
             isClickable = true
         }
         val mark = android.widget.ImageView(this).apply {
             setImageResource(R.drawable.epix_mark_white)
+            // The mark is white; on the light page background tint it to the
+            // page's ink colour.
+            if (background == COLOR_PAGE_LIGHT) {
+                imageTintList = android.content.res.ColorStateList.valueOf(COLOR_PAGE_DARK)
+            }
             scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
             // A steady continuous spin (compositor-driven), one turn every
             // 1.2s, for as long as the node is coming up.
@@ -859,6 +871,99 @@ class MainActivity : AppCompatActivity() {
         }
         overlay.addView(mark, FrameLayout.LayoutParams(dp(96), dp(96), Gravity.CENTER))
         return overlay
+    }
+
+    /** Put the loading splash over the page area. Idempotent. */
+    private fun showSplash() {
+        if (splashOverlay != null) return
+        splashOverlay = buildSplash().also {
+            pageFrame.addView(it, FrameLayout.LayoutParams(-1, -1))
+        }
+    }
+
+    /**
+     * The wrapper's page background for the saved theme (light unless the
+     * user picked dark in the node's settings), read straight from the node's
+     * users.json so the splash and the first-paint cover match the loading
+     * screen that follows them.
+     */
+    private fun pageBackground(): Int {
+        val dark = runCatching {
+            val settings = java.io.File(filesDir, "users.json").readText()
+            Regex("\"theme\"\\s*:\\s*\"dark\"").containsMatchIn(settings)
+        }.getOrDefault(false)
+        return if (dark) COLOR_PAGE_DARK else COLOR_PAGE_LIGHT
+    }
+
+    /**
+     * The error page's "Reset connection settings and try again". The settings
+     * page that would fix a bad settings file is served by the node, which is
+     * exactly what did not start, so the shell has to do this part: set the
+     * file aside (kept, never deleted) and boot with defaults. The node's
+     * error names the file, so this is the usual way out.
+     */
+    private fun resetConfigAndRetry() {
+        val config = java.io.File(filesDir, "private/config.json")
+        if (config.exists()) {
+            val aside = java.io.File(
+                filesDir,
+                "private/config.json.broken-${System.currentTimeMillis() / 1000}",
+            )
+            if (!config.renameTo(aside)) config.delete()
+        }
+        retryBoot()
+    }
+
+    /** Bring the splash back and boot again (the error page's "Try again"). */
+    private fun retryBoot() {
+        nodePageRequested = false
+        nodeLoadRetries = 0
+        showSplash()
+        bootAndOpen(currentDisplay.ifEmpty { "dashboard.epix" })
+    }
+
+    /**
+     * Show or hide the "No internet connection" line. Hidden with the rest of
+     * the chrome (scroll-away) and whenever the phone is online.
+     */
+    private fun refreshOfflineBanner() {
+        if (!::offlineBanner.isInitialized) return
+        offlineBanner.visibility = if (networkOnline || chromeHidden) View.GONE else View.VISIBLE
+    }
+
+    /**
+     * Track whether the phone has any network with internet access, for the
+     * offline line. The node itself keeps working either way: it serves what
+     * is on disk and retries the network on its own.
+     */
+    private fun watchConnectivity() {
+        val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as? android.net.ConnectivityManager
+            ?: return
+        fun hasInternet(caps: android.net.NetworkCapabilities?): Boolean =
+            caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
+        fun apply(online: Boolean) = runOnUiThread {
+            val cameBack = online && !networkOnline
+            networkOnline = online
+            refreshOfflineBanner()
+            // The node retries everything parked on the network right away
+            // (name registry check, a homepage waiting to resolve) instead of
+            // waiting out its backoff timers.
+            if (cameBack) {
+                scope.launch(Dispatchers.IO) { runCatching { node.networkChanged() } }
+            }
+        }
+        apply(hasInternet(cm.getNetworkCapabilities(cm.activeNetwork)))
+        runCatching {
+            cm.registerDefaultNetworkCallback(object : android.net.ConnectivityManager.NetworkCallback() {
+                override fun onAvailable(network: android.net.Network) = apply(true)
+                override fun onLost(network: android.net.Network) =
+                    apply(hasInternet(cm.getNetworkCapabilities(cm.activeNetwork)))
+                override fun onCapabilitiesChanged(
+                    network: android.net.Network,
+                    caps: android.net.NetworkCapabilities,
+                ) = apply(hasInternet(caps))
+            })
+        }.onFailure { android.util.Log.w("EpixNode", "connectivity callback unavailable", it) }
     }
 
     /** Fade the loading splash out and remove it. Idempotent. */
@@ -889,15 +994,22 @@ class MainActivity : AppCompatActivity() {
                 currentDisplay = host
                 nodeUrl(host)
             }
-            // Only explicit xite addresses go to the resolver: epix1... or
-            // something.epix. A bare word is a search, not an implied .epix.
+            // Explicit xite addresses go to the node: epix1... or something.epix.
             t.startsWith("epix1") || t.endsWith(".epix") -> {
                 currentDisplay = t
                 nodeUrl(t)
             }
             // Looks like a clearnet domain: browse it over https.
             t.contains('.') && !t.contains(' ') -> "https://$t"
-            // Everything else - bare words, phrases - searches DuckDuckGo.
+            // A single bare word is a xite name ("talk" -> talk.epix), as the
+            // README promises; a newcomer typing the name they were given
+            // should land on the xite, not on a web search over Tor. Phrases
+            // and a leading "?" search.
+            BARE_XITE_NAME.matches(t) -> {
+                currentDisplay = "$t.epix"
+                nodeUrl(currentDisplay)
+            }
+            // Everything else - phrases - searches DuckDuckGo.
             else -> searchUrl(t)
         }
         currentTab.session.loadUri(url)
@@ -912,6 +1024,9 @@ class MainActivity : AppCompatActivity() {
 
     /** Show `talk.epix/…` in the bar, not the local node plumbing. */
     private fun friendlyUrl(url: String): String {
+        // The shell's own inline pages (the error page) are data: URLs: a
+        // base64 blob in the address bar means nothing to anyone.
+        if (url.startsWith("data:")) return ""
         val prefix = "$NODE_BASE/"
         if (!url.startsWith(prefix)) return url
         val rest = url.removePrefix(prefix).trimEnd('/')
@@ -992,6 +1107,45 @@ class MainActivity : AppCompatActivity() {
         }.onFailure { android.util.Log.w("EpixNode", "MulticastLock unavailable; LAN discovery may not receive replies", it) }
     }
 
+    /**
+     * Boot the node and point the current tab at `target`. Also the "Try
+     * again" path of the error page, so it is safe to run more than once: the
+     * FFI start() runs again after a failed boot.
+     */
+    private fun bootAndOpen(target: String) {
+        scope.launch {
+            // Apply the saved clearnet-through-Tor routing before the first page
+            // load, so clearnet requests are proxied from the start. Loopback
+            // (the dashboard and every .epix page) is exempt, so this is safe to
+            // set before the node is up.
+            applyClearnetRouting()
+            val display = bootNode(target)
+            // Load the dashboard even if boot reported a problem: the node
+            // serves its own loading/error wrapper on loopback, which is more
+            // useful than a blank page and lets the user retry.
+            currentDisplay = display ?: target
+            // From here the next page-stop is a real page, so let it drop the
+            // splash (about:blank already came and went).
+            nodePageRequested = true
+            if (node.state() == NodeState.FAILED) {
+                // Nothing is listening: waiting for the port only added ~15s
+                // of spinner. Show what went wrong and offer a retry.
+                currentTab.session.loadUri(errorPage(node.lastError()))
+                return@launch
+            }
+            // Don't hand GeckoView the URL until loopback actually accepts
+            // (the desktop launcher's wait_for_port): a refused first
+            // connection renders as a silent blank page. The node binds
+            // before start() returns, so this passes immediately - it guards
+            // anything else that delays the bind.
+            if (awaitUiPort()) {
+                currentTab.session.loadUri(nodeUrl(currentDisplay))
+            } else {
+                currentTab.session.loadUri(errorPage(null))
+            }
+        }
+    }
+
     /** Boot the node off the main thread; return the display name to open. */
     private suspend fun bootNode(target: String): String? = withContext(Dispatchers.IO) {
         writeBrowserSettings()
@@ -1032,17 +1186,34 @@ class MainActivity : AppCompatActivity() {
         false
     }
 
-    /** An inline page for when the node stays unreachable - never a blank app. */
-    private fun errorPage(): String {
+    /**
+     * An inline page for when the node could not start or stays unreachable -
+     * never a blank app. Carries the node's own error text when there is one
+     * and a "Try again" that boots the node again without leaving the app.
+     */
+    private fun errorPage(error: String?): String {
+        val detail = error?.takeIf { it.isNotBlank() }?.let {
+            "<p style=\"font-family:monospace;font-size:13px;color:#94a3b8;text-align:left;" +
+                "overflow-wrap:anywhere;background:#1e293b;padding:12px;border-radius:8px\">" +
+                android.text.Html.escapeHtml(it) + "</p>"
+        } ?: ""
         val html = """
             <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
             <body style="background:#0b0e14;color:#cbd5e1;font-family:sans-serif;margin:0;
-                         display:flex;align-items:center;justify-content:center;height:100vh">
+                         display:flex;align-items:center;justify-content:center;min-height:100vh">
             <div style="text-align:center;padding:24px;max-width:26em">
               <h2 style="color:#e2e8f0">EpixNet could not start</h2>
-              <p>The embedded node is not answering. Close the app fully and
-                 reopen it; if this keeps happening, please report a bug at
-                 github.com/EpixZone/EpixNet.</p>
+              <p>The built-in node did not start. This is usually temporary.</p>
+              $detail
+              <p><a href="$RETRY_URI" style="display:inline-block;padding:12px 24px;background:#8a4bdb;
+                 color:#fff;border-radius:10px;text-decoration:none;font-weight:600">Try again</a></p>
+              <p style="font-size:14px"><a href="$RESET_URI" style="color:#a78bfa;text-decoration:none;
+                 display:inline-block;padding:10px 0">Reset connection settings and try again</a><br>
+                 <span style="font-size:13px;color:#64748b">Starts with default settings. Your current
+                 settings file is kept next to it, not deleted. You can change settings again from
+                 the dashboard menu once EpixNet is running.</span></p>
+              <p style="font-size:13px;color:#64748b">If this keeps happening, close the app fully and
+                 reopen it, or report a bug at github.com/EpixZone/EpixNet.</p>
             </div></body></html>
         """.trimIndent()
         return "data:text/html;base64," +
@@ -1062,6 +1233,9 @@ class MainActivity : AppCompatActivity() {
     private fun colorFor(st: TorStatus): Int = when {
         st.enabled -> if (torClearnet) COLOR_ROUTED else COLOR_READY
         st.status == "Bootstrapping" -> COLOR_BOOT
+        // A Tor that could not connect is a different thing from Tor being
+        // off: it is the usual reason a xite finds no peers.
+        st.status == "Failed" || st.status == "Recovering" -> COLOR_FAILED
         else -> COLOR_OFF
     }
 
@@ -1080,7 +1254,8 @@ class MainActivity : AppCompatActivity() {
                 st.enabled && torClearnet -> "Tor: on - clearnet routed through Tor"
                 st.enabled -> "Tor: ready - onion peers reachable"
                 st.status == "Bootstrapping" -> "Tor: connecting…"
-                st.status == "Failed" -> "Tor: failed to start"
+                st.status == "Failed" -> "Tor: couldn't connect, retrying every 30 seconds"
+                st.status == "Recovering" -> "Tor: reconnecting…"
                 else -> "Tor: off"
             }
 
@@ -1535,6 +1710,10 @@ class MainActivity : AppCompatActivity() {
         /// startActivityForResult request code for a page's file prompt.
         private const val FILE_PICK_REQUEST = 4001
         private const val NODE_BASE = "http://127.0.0.1:$UI_PORT"
+        // The error page's "Try again" and "Reset settings" links; intercepted
+        // in onLoadRequest.
+        private const val RETRY_URI = "epixshell://retry"
+        private const val RESET_URI = "epixshell://reset-config"
 
         // Must match the wallet manifest's gecko id and its native host name
         // (the desktop crates/epix-browser/src/ext.rs values).
@@ -1547,6 +1726,9 @@ class MainActivity : AppCompatActivity() {
 
         // A bare bech32 xite address used as a hostname
         private val XITE_ADDRESS = Regex("^epix1[a-z0-9]{20,}$")
+        // A single label typed into the address bar: a xite name without its
+        // .epix (letters, digits, hyphens; no dots, no spaces).
+        private val BARE_XITE_NAME = Regex("^[a-z0-9][a-z0-9-]{0,62}$", RegexOption.IGNORE_CASE)
 
         // Toolbar buttons dim to this when their action is unavailable.
         private const val DISABLED_ALPHA = 0.35f
@@ -1563,6 +1745,11 @@ class MainActivity : AppCompatActivity() {
         private val COLOR_HINT = Color.parseColor("#64748b")
         private val COLOR_OFF = Color.parseColor("#64748b")
         private val COLOR_BOOT = Color.parseColor("#f5c450")
+        private val COLOR_FAILED = Color.parseColor("#f87171")
+        // The wrapper's page backgrounds (ui/media/all.css --epix-bg): the
+        // loading screen paints these, so the splash does too.
+        private val COLOR_PAGE_LIGHT = Color.parseColor("#FEFEFE")
+        private val COLOR_PAGE_DARK = Color.parseColor("#151517")
         private val COLOR_READY = Color.parseColor("#a78bfa")
         private val COLOR_ROUTED = Color.parseColor("#4ade80")
     }

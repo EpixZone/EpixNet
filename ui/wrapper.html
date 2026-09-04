@@ -65,7 +65,7 @@ else if (window.opener && window.opener.location.toString()) {
 
 <!-- Loadingscreen -->
 <div class='loadingscreen'>
- <a href="/Config" class="loading-config">Config</a>
+ <a href="/Config" class="loading-config">Connection settings</a>
  <div class='loading-text console'>
  </div>
  <div class="flipper-container">
@@ -79,10 +79,18 @@ else if (window.opener && window.opener.location.toString()) {
 
 <!-- Xite info -->
 <script id="script_init" nonce="{script_nonce}">
+resolving_host = "{resolving_host}"
+is_homepage = {is_homepage}
 iframe_src = "{site_file_server}{file_url}{query_string}"
-console.log("Changing url from " + document.getElementById("inner-iframe").src + " to " + iframe_src)
-document.getElementById("inner-iframe").src = document.getElementById("inner-iframe").src  // Workaround for Firefox back button bug
-document.getElementById("inner-iframe").src = iframe_src
+if (resolving_host) {
+	// Resolving mode: there is no address yet, so the iframe stays blank until
+	// the name resolves and the page reloads itself.
+	console.log("Resolving " + resolving_host + ", leaving the iframe blank")
+} else {
+	console.log("Changing url from " + document.getElementById("inner-iframe").src + " to " + iframe_src)
+	document.getElementById("inner-iframe").src = document.getElementById("inner-iframe").src  // Workaround for Firefox back button bug
+	document.getElementById("inner-iframe").src = iframe_src
+}
 address = "{address}"
 wrapper_nonce = "{wrapper_nonce}"
 wrapper_key = "{wrapper_key}"

@@ -267,6 +267,12 @@ a {
 	font-size: 25px;
 }
 
+/* Hidden while the homepage (or a name still resolving) shows its loading
+   screen: the button would only reload the same page. */
+.fixbutton.fixbutton-hidden {
+	display: none;
+}
+
 .fixbutton-bg {
 	border-radius: 80px;
 	background-color: var(--epix-neutral-12);
@@ -884,6 +890,7 @@ a {
 .loading-stage .stage-next {
 	font-size: 12px;
 	line-height: 20px;
+	min-height: 20px;
 	color: var(--epix-text-low);
 }
 
@@ -906,6 +913,7 @@ a {
 	line-height: 20px;
 	min-height: 20px;
 	color: var(--epix-text-low);
+	overflow-wrap: anywhere;
 }
 
 @keyframes stage-pop {
@@ -955,6 +963,7 @@ a {
 .loadingscreen .console-line {
 	flex-shrink: 0;
 	max-width: 100%;
+	overflow-wrap: anywhere;
 }
 
 .loadingscreen .console-line:last-child {
@@ -998,6 +1007,38 @@ a {
 	padding: 10px 20px;
 }
 
+/* Retry row between the stage ticker and the console. Same flex order as the
+   console, so the DOM position (inserted just before it) decides. */
+.loading-actions {
+	order: 3;
+	margin: 0 0 18px;
+	width: 100%;
+	max-width: 560px;
+	display: flex;
+	justify-content: center;
+}
+
+.loading-actions .button {
+	min-height: 44px;
+	margin: 0;
+	padding: 12px 28px;
+	background-color: var(--epix-accent);
+	color: var(--epix-on-accent);
+	border-radius: var(--epix-radius-md);
+	font-size: 14px;
+	line-height: 20px;
+	text-transform: none;
+}
+
+/* The quieter second action (Connection settings) next to Retry */
+.loading-actions .button-settings {
+	margin-left: 12px;
+	background-color: transparent;
+	color: var(--epix-accent);
+	border: 1px solid var(--epix-accent);
+	box-sizing: border-box;
+}
+
 /* Dismissal: fade the whole screen out in place; pointer-events off so the
    invisible overlay never blocks the xite while waiting for removal */
 .loadingscreen.done {
@@ -1010,7 +1051,8 @@ a {
 
 .loadingscreen.done .console,
 .loadingscreen.done .flipper-container,
-.loadingscreen.done .loading-stage {
+.loadingscreen.done .loading-stage,
+.loadingscreen.done .loading-actions {
 	opacity: 0;
 	transform: none;
 	transition: opacity 0.3s ease;
