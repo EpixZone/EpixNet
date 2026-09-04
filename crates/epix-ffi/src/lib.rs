@@ -208,6 +208,15 @@ impl EpixNode {
         self.rt.block_on(async move { node.onion_address().await })
     }
 
+    /// The OS reported the network came back (or the user asked for a retry):
+    /// the node retries everything parked on it right away - the name
+    /// registry check, a homepage name waiting to resolve - instead of
+    /// waiting out its backoff timers. No-op before the node is up.
+    pub fn network_changed(&self) {
+        let Some(node) = self.inner.lock().unwrap().node.clone() else { return };
+        self.rt.spawn(async move { node.network_changed().await });
+    }
+
     /// `(tor_enabled, tor_status)` for the shell's status UI.
     pub fn tor_status(&self) -> TorStatus {
         match self.inner.lock().unwrap().node.clone() {
@@ -248,6 +257,7 @@ impl EpixNode {
         let full = format!("{label}.{tld}");
         self.rt
             .block_on(node.resolve_on_demand(&full))
+            .map(|resolved| resolved.address)
             .ok_or_else(|| EpixError::msg(format!("could not resolve {full}")))
     }
 }

@@ -102,8 +102,26 @@ pub trait OnDemandResolver: Send + Sync {
     /// Resolve `host` (a `.epix` name or an address) to a xite address WITHOUT
     /// cloning: the on-disk cache first, the chain on a miss. Used so a
     /// locked-down node can still follow an xID to a xite it already serves.
-    async fn resolve(&self, host: &str) -> Option<String>;
+    async fn resolve(&self, host: &str) -> Option<ResolvedHost>;
+
+    /// The network came back (the OS said so, or the user tapped Retry):
+    /// retry whatever was parked on it. Default: nothing to retry.
+    fn network_changed(&self) {}
 }
+
+/// A name-to-address answer and how much it is worth: `verified` means the
+/// chain confirmed it; an unverified answer is a saved mapping that may only
+/// serve a xite already on this node.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ResolvedHost {
+    pub address: String,
+    pub verified: bool,
+}
+
+/// The xite the shipped dashboard lives at. The one address the node knows by
+/// heart: served under `dashboard.epix` from the saved copy while the chain is
+/// unreachable, and the only xite granted ADMIN without a prompt.
+pub const DASHBOARD_XITE_ADDRESS: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 
 /// Extra peer discovery beyond the trackers - the runtime installs a DHT
 /// lookup here so announces and on-demand clones can find peers for rare
@@ -4375,6 +4393,13 @@ pub struct AppState {
     /// The launch xite (name or address) the node was started with - where the
     /// wrapper's corner home button and the admin pages' back link return to.
     launch_homepage: std::sync::Mutex<Option<String>>,
+    /// Where the homepage name points right now and whether that mapping is
+    /// chain-verified. Written by the node (boot, the background verifier);
+    /// read by serverInfo so the UI can say "showing the saved copy".
+    launch_status: RwLock<LaunchStatus>,
+    /// Per-host progress of on-demand name resolution, for the wrapper's
+    /// loading screen (`resolveStatus`). Keyed by the requested host.
+    resolve_status: RwLock<HashMap<String, ResolveStatus>>,
     /// The shared data root, laid out like Python EpixNet: node files under
     /// `private/`, per-xite dirs under `data/`. None for in-memory nodes.
     data_root: Option<PathBuf>,
@@ -4476,6 +4501,144 @@ pub struct BigfileUploadResult {
 
 fn empty_filters() -> Value {
     json!({ "mutes": {}, "siteblocks": {} })
+}
+
+/// Where the node's homepage name points and how much that is worth.
+#[derive(Clone, Debug, Default)]
+pub struct LaunchStatus {
+    pub display: String,
+    pub address: Option<String>,
+    pub verified: bool,
+}
+
+/// One host's progress through on-demand resolution (the wrapper's
+/// `resolveStatus` command). States: `idle`, `waiting_network`,
+/// `establishing_trust`, `resolving`, `resolved`, `failed`.
+#[derive(Clone, Debug)]
+pub struct ResolveStatus {
+    pub state: String,
+    pub reason: Option<String>,
+    pub detail: Option<String>,
+    pub address: Option<String>,
+    pub verified: bool,
+    pub attempts: u32,
+    pub since: u64,
+}
+
+/// The local name-to-address decision behind [`AppState::resolve_name_verified`],
+/// kept free of the process-wide finality flag so it can be tested in both
+/// modes. `entry` is the resolve-cache entry for the name, `served_display` the
+/// registered xite carrying the name as its display alias, `registered` whether
+/// an address is a served xite.
+fn select_name_mapping(
+    finality_required: bool,
+    entry: Option<&Value>,
+    binding_current: impl Fn(u64, &str) -> bool,
+    served_display: Option<&str>,
+    registered: impl Fn(&str) -> bool,
+) -> Option<(String, bool)> {
+    let entry_address = |entry: &Value| {
+        entry
+            .as_str()
+            .or_else(|| entry.get("address").and_then(Value::as_str))
+            .map(str::to_string)
+    };
+    if !finality_required {
+        if let Some(address) = served_display {
+            return Some((address.to_string(), true));
+        }
+        return entry.and_then(entry_address).map(|address| (address, true));
+    }
+    if let Some(entry) = entry {
+        let binding = entry
+            .get("finality_height")
+            .and_then(Value::as_u64)
+            .zip(entry.get("finality_digest").and_then(Value::as_str));
+        if let Some((height, digest)) = binding {
+            let address = entry_address(entry)?;
+            if binding_current(height, digest) {
+                return Some((address, true));
+            }
+            // Superseded by a newer checkpoint: this node's own earlier
+            // verified answer. It serves what is already here, nothing more.
+            return registered(&address).then_some((address, false));
+        }
+        // A legacy or unbound entry was written trusting the RPC alone: a
+        // miss here, so the name resolves fresh once trust is established.
+    }
+    match served_display {
+        Some(address) if address == DASHBOARD_XITE_ADDRESS && registered(address) => {
+            Some((address.to_string(), false))
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod name_mapping_tests {
+    use super::*;
+
+    fn bound(address: &str, height: u64) -> Value {
+        json!({
+            "address": address,
+            "resolved_at": 1,
+            "finality_height": height,
+            "finality_digest": "aa",
+        })
+    }
+
+    #[test]
+    fn legacy_mode_prefers_the_display_alias_then_any_cache_entry() {
+        let entry = json!("epix1cache");
+        assert_eq!(
+            select_name_mapping(false, Some(&entry), |_, _| false, Some("epix1shown"), |_| true),
+            Some(("epix1shown".into(), true))
+        );
+        assert_eq!(
+            select_name_mapping(false, Some(&entry), |_, _| false, None, |_| false),
+            Some(("epix1cache".into(), true))
+        );
+        assert_eq!(select_name_mapping(false, None, |_, _| false, None, |_| false), None);
+    }
+
+    #[test]
+    fn finality_mode_precedence_is_verified_then_superseded_then_dashboard_alias() {
+        let current = bound("epix1now", 7);
+        // Bound to the current checkpoint: verified, the display alias is moot.
+        assert_eq!(
+            select_name_mapping(true, Some(&current), |h, _| h == 7, Some(DASHBOARD_XITE_ADDRESS), |_| true),
+            Some(("epix1now".into(), true))
+        );
+        // Superseded: provisional, and only for a registered xite.
+        assert_eq!(
+            select_name_mapping(true, Some(&current), |_, _| false, None, |a| a == "epix1now"),
+            Some(("epix1now".into(), false))
+        );
+        assert_eq!(
+            select_name_mapping(
+                true,
+                Some(&current),
+                |_, _| false,
+                Some(DASHBOARD_XITE_ADDRESS),
+                |a| a == DASHBOARD_XITE_ADDRESS
+            ),
+            None,
+            "a superseded entry beats a disagreeing display alias, and never drives a clone"
+        );
+        // Legacy and unbound entries are misses; the display alias only
+        // counts for the shipped dashboard, and only when it is registered.
+        let legacy = json!("epix1legacy");
+        assert_eq!(select_name_mapping(true, Some(&legacy), |_, _| true, None, |_| true), None);
+        assert_eq!(select_name_mapping(true, None, |_, _| true, Some("epix1other"), |_| true), None);
+        assert_eq!(
+            select_name_mapping(true, Some(&legacy), |_, _| true, Some(DASHBOARD_XITE_ADDRESS), |_| true),
+            Some((DASHBOARD_XITE_ADDRESS.into(), false))
+        );
+        assert_eq!(
+            select_name_mapping(true, None, |_, _| true, Some(DASHBOARD_XITE_ADDRESS), |_| false),
+            None
+        );
+    }
 }
 
 fn now_secs() -> i64 {
@@ -5181,6 +5344,8 @@ impl AppState {
             nmh_token: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
             launch_homepage: std::sync::Mutex::new(None),
+            launch_status: RwLock::new(LaunchStatus::default()),
+            resolve_status: RwLock::new(HashMap::new()),
             data_root: persist.data_root,
             xites_path: persist.xites_path,
             data_dir_conf: std::sync::Mutex::new(None),
@@ -6630,52 +6795,72 @@ impl AppState {
         self.persist_xites().await;
     }
 
+    /// Drop a xite's display alias: the name moved to another address on the
+    /// chain, and the old xite must stop answering to it.
+    pub async fn clear_display(&self, address: &str) {
+        {
+            let mut xites = self.xites.write().await;
+            let Some(x) = xites.get_mut(address) else { return };
+            if x.display.is_none() {
+                return;
+            }
+            x.display = None;
+        }
+        self.persist_xites().await;
+    }
+
     /// The `.epix` name a served xite was resolved from, if any.
     pub async fn display_of(&self, address: &str) -> Option<String> {
         self.xites.read().await.get(address).and_then(|x| x.display.clone())
     }
 
-    /// Resolve a `.epix` name (xID) to its bech32 address: first the served
-    /// xites' display metadata, then the on-disk resolve cache (written by the
-    /// node on every chain resolution - so a name maps as soon as it resolves,
-    /// even while its clone is still downloading). `None` for unknown names.
+    /// Resolve a `.epix` name (xID) to its bech32 address from local state:
+    /// the on-disk resolve cache (written by the node on every chain
+    /// resolution - so a name maps as soon as it resolves, even while its
+    /// clone is still downloading) and the served xites' display metadata.
+    /// `None` for unknown names. See [`Self::resolve_name_verified`] for the
+    /// precedence and what an unverified answer may be used for.
     pub async fn resolve_name(&self, name: &str) -> Option<String> {
-        let served = {
-            let xites = self.xites.read().await;
-            xites
-                .iter()
-                .find(|(_, x)| x.display.as_deref() == Some(name))
-                .map(|(address, _)| address.clone())
-        };
-        // Before the finality cutover, keep the historical display-name fast
-        // path. In finality mode, a persisted display is trusted only through
-        // the exact bound resolve-cache entry checked below.
-        if !epix_chain::verify_finality_enabled() {
-            if served.is_some() {
-                return served;
-            }
-        }
-        // Entries are `{"address": …, "resolved_at": …}` or a legacy string.
-        let root = self.data_root.as_ref()?;
-        let cache: serde_json::Map<String, Value> =
-            std::fs::read(root.join("resolve-cache.json"))
-                .ok()
-                .and_then(|b| serde_json::from_slice(&b).ok())?;
-        let entry = cache.get(name)?;
-        if epix_chain::verify_finality_enabled() {
-            let height = entry.get("finality_height")?.as_u64()?;
-            let digest = entry.get("finality_digest")?.as_str()?;
-            if !epix_chain::finality_checkpoint_matches(height, digest) {
-                return None;
-            }
-        }
-        let address = entry
-            .as_str()
-            .or_else(|| entry.get("address").and_then(Value::as_str))
-            .map(str::to_string)?;
-        // In finality mode the chain-bound cache wins over stale sites.json
-        // display data, including a mapping to a different address.
-        Some(address)
+        self.resolve_name_verified(name).await.map(|(address, _verified)| address)
+    }
+
+    /// [`Self::resolve_name`] plus whether the mapping is chain-verified.
+    ///
+    /// With finality verification off, the display alias is the historical
+    /// fast path and any cache entry counts. With it on, in this order:
+    ///   1. a cache entry bound to the CURRENT checkpoint - verified;
+    ///   2. a cache entry bound to an older checkpoint - this node's own
+    ///      earlier verified answer, superseded by a light-client advance or
+    ///      a later resolve; serves provisionally, and only a xite that is
+    ///      already registered (never a clone);
+    ///   3. no bound entry: the registry's display alias, and only when it
+    ///      names the shipped dashboard - for any other xite a display alias
+    ///      alone proves nothing (legacy entries were written trusting the RPC).
+    /// The cache entry beats the display alias whenever it exists, so the
+    /// wrapper, the node and the background verifier agree on one address.
+    pub async fn resolve_name_verified(&self, name: &str) -> Option<(String, bool)> {
+        let finality_required = epix_chain::verify_finality_enabled();
+        // Entries are `{"address": …, "resolved_at": …, "finality_height": …,
+        // "finality_digest": …}`, an older unbound object, or a legacy string.
+        let entry: Option<Value> = self.data_root.as_ref().and_then(|root| {
+            let cache: serde_json::Map<String, Value> =
+                std::fs::read(root.join("resolve-cache.json"))
+                    .ok()
+                    .and_then(|b| serde_json::from_slice(&b).ok())?;
+            cache.get(name).cloned()
+        });
+        let xites = self.xites.read().await;
+        let served = xites
+            .iter()
+            .find(|(_, x)| x.display.as_deref() == Some(name))
+            .map(|(address, _)| address.as_str());
+        select_name_mapping(
+            finality_required,
+            entry.as_ref(),
+            epix_chain::finality_checkpoint_matches,
+            served,
+            |address| xites.contains_key(address),
+        )
     }
 
     /// Whether an xID name currently has an active (non-revoked) linked identity
@@ -9850,6 +10035,147 @@ impl AppState {
     /// the wrapper's corner home button and the admin pages' back link go.
     pub fn set_homepage(&self, target: &str) {
         *self.launch_homepage.lock().unwrap() = Some(target.to_string());
+    }
+
+    /// Record where the homepage name points and whether the chain has
+    /// confirmed it. `address` None means the launch is deferred: nothing on
+    /// disk maps the name yet and the on-demand resolver owns it.
+    pub async fn set_launch_status(&self, display: &str, address: Option<&str>, verified: bool) {
+        let mut launch = self.launch_status.write().await;
+        launch.display = display.to_string();
+        launch.address = address.map(str::to_string);
+        launch.verified = verified;
+    }
+
+    pub async fn launch_status(&self) -> LaunchStatus {
+        self.launch_status.read().await.clone()
+    }
+
+    /// The `launch` block of serverInfo.
+    pub async fn launch_status_json(&self) -> Value {
+        let launch = self.launch_status.read().await;
+        json!({
+            "display": launch.display,
+            "address": launch.address,
+            "verified": launch.verified,
+            "deferred": launch.address.is_none(),
+        })
+    }
+
+    /// The served xite carrying `name` as its display alias, if any. This is
+    /// registry metadata, not a verified mapping; callers decide what it is
+    /// worth (see [`Self::resolve_name_verified`]).
+    pub async fn address_for_display(&self, name: &str) -> Option<String> {
+        let xites = self.xites.read().await;
+        xites
+            .iter()
+            .find(|(_, x)| x.display.as_deref() == Some(name))
+            .map(|(address, _)| address.clone())
+    }
+
+    /// Move `host` to a new resolution state. `since` restarts only when the
+    /// state changes, so the loading screen can say how long it has waited.
+    pub async fn resolve_status_set(
+        &self,
+        host: &str,
+        state: &str,
+        reason: Option<&str>,
+        detail: Option<String>,
+    ) {
+        let mut statuses = self.resolve_status.write().await;
+        let entry = statuses.entry(host.to_string()).or_insert_with(|| ResolveStatus {
+            state: String::new(),
+            reason: None,
+            detail: None,
+            address: None,
+            verified: false,
+            attempts: 0,
+            since: now_secs().max(0) as u64,
+        });
+        if entry.state != state {
+            entry.state = state.to_string();
+            entry.since = now_secs().max(0) as u64;
+        }
+        entry.reason = reason.map(str::to_string);
+        entry.detail = detail;
+    }
+
+    /// `host` resolved to `address`: the page reloads onto the address-keyed
+    /// loading screen when it sees this.
+    pub async fn resolve_status_resolved(&self, host: &str, address: &str, verified: bool) {
+        self.resolve_status_set(host, "resolved", None, None).await;
+        let mut statuses = self.resolve_status.write().await;
+        if let Some(entry) = statuses.get_mut(host) {
+            entry.address = Some(address.to_string());
+            entry.verified = verified;
+        }
+    }
+
+    /// One more resolve attempt for `host` (drives "attempt N" on screen).
+    pub async fn resolve_status_attempt(&self, host: &str) {
+        if let Some(entry) = self.resolve_status.write().await.get_mut(host) {
+            entry.attempts += 1;
+        }
+    }
+
+    pub async fn resolve_status(&self, host: &str) -> Option<ResolveStatus> {
+        self.resolve_status.read().await.get(host).cloned()
+    }
+
+    /// Hosts whose resolution is parked on something outside the node's
+    /// control (the network, the name registry, a name server that did not
+    /// answer, Tor) - the ones a network change should retry.
+    pub async fn parked_resolve_hosts(&self) -> Vec<String> {
+        self.resolve_status
+            .read()
+            .await
+            .iter()
+            .filter(|(_, status)| {
+                matches!(status.state.as_str(), "waiting_network" | "establishing_trust")
+                    || (status.state == "failed"
+                        && matches!(
+                            status.reason.as_deref(),
+                            Some("no_network" | "rpc_error" | "bad_answer" | "tor_required" | "not_found")
+                        ))
+            })
+            .map(|(host, _)| host.clone())
+            .collect()
+    }
+
+    /// The `resolveStatus` answer for `host`: its own progress plus the
+    /// network facts the loading screen needs to explain a wait.
+    pub async fn resolve_status_json(&self, host: &str) -> Value {
+        let status = self.resolve_status(host).await;
+        let (_, tor_status) = self.tor_status().await;
+        let lc = epix_chain::lc_status::snapshot();
+        let (state, reason, detail, address, verified, attempts, since) = match status {
+            Some(s) => (s.state, s.reason, s.detail, s.address, s.verified, s.attempts, s.since),
+            None => ("idle".to_string(), None, None, None, false, 0u32, now_secs().max(0) as u64),
+        };
+        json!({
+            "host": host,
+            "state": state,
+            "reason": reason,
+            "detail": detail,
+            "address": address,
+            "verified": verified,
+            "attempts": attempts,
+            "since": since,
+            "tor_status": tor_status,
+            "trust": self.xid_trust_label(),
+            "sources_reachable": lc.get("sources_reachable").cloned().unwrap_or(Value::Null),
+            "sources_total": lc.get("sources_total").cloned().unwrap_or(Value::Null),
+        })
+    }
+
+    /// The network came back (the OS said so, or the user tapped Retry):
+    /// wake everything that was waiting on it instead of letting the backoff
+    /// timers run out.
+    pub async fn network_changed(&self) {
+        epix_chain::wake_light_client();
+        if let Some(hook) = self.on_demand.read().await.clone() {
+            hook.network_changed();
+        }
     }
 
     /// The node's homepage xite: the launch target if recorded, else a served
@@ -13663,24 +13989,49 @@ impl AppState {
     pub fn xid_trust_status(&self) -> Value {
         let required = epix_chain::verify_finality_enabled();
         let pinned = epix_chain::pinned_validators();
-        let anchored = pinned.is_some();
+        // A pin that has aged past its weak-subjectivity window fails every
+        // resolve exactly like no pin at all, so "anchored" means usable.
+        let usable = epix_chain::trust_usable();
         let state = if !required {
             "legacy"
         } else if self.offline_by_policy() {
             "offline_cache"
-        } else if anchored {
+        } else if usable {
             "anchored"
+        } else if pinned.is_some() {
+            "expired"
         } else {
             "establishing"
         };
+        let lc = epix_chain::lc_status::snapshot();
+        let field = |key: &str| lc.get(key).cloned().unwrap_or(Value::Null);
         json!({
             "required": required,
-            "anchored": anchored,
+            "anchored": usable,
+            "usable": usable,
             "state": state,
             "validators": pinned.as_ref().map(|set| set.validators.len()).unwrap_or(0),
             "height": epix_chain::xid_max_height(),
             "deferred_xites": self.xid_deferred_count(),
+            "phase": field("phase"),
+            "last_error": field("last_error"),
+            "sources_reachable": field("sources_reachable"),
+            "sources_total": field("sources_total"),
+            "next_retry_unix": field("next_retry_unix"),
         })
+    }
+
+    /// The trust state in the four words the loading screen understands.
+    pub fn xid_trust_label(&self) -> &'static str {
+        if !epix_chain::verify_finality_enabled() {
+            "legacy"
+        } else if epix_chain::trust_usable() {
+            "anchored"
+        } else if epix_chain::pinned_validators().is_some() {
+            "expired"
+        } else {
+            "establishing"
+        }
     }
 
     /// Re-index the xites whose last pass WITHHELD a verdict on a child
@@ -16710,6 +17061,9 @@ impl AppState {
             // "Checking…"/"Waiting for trackers…" forever instead of saying so.
             "offline": self.offline_by_policy(),
             "xid_trust": self.xid_trust_status(),
+            // The homepage's current mapping: `verified: false` means the node
+            // is serving its saved copy while the name is re-checked.
+            "launch": self.launch_status_json().await,
             // Chain endpoints for xites. The single fields carry the CURRENT
             // live choice: for the REST URL that is the endpoint the node's
             // own chain traffic last confirmed working (failed calls rotate
@@ -17510,7 +17864,7 @@ impl AppState {
     /// Resolve through the node-owned resolver without cloning. This is used
     /// by the authenticated native-messaging endpoint so the browser helper
     /// cannot create its own unconfigured chain resolver.
-    pub async fn resolve_on_demand(&self, host: &str) -> Option<String> {
+    pub async fn resolve_on_demand(&self, host: &str) -> Option<ResolvedHost> {
         let resolver = self.on_demand.read().await.clone()?;
         resolver.resolve(host).await
     }
@@ -19684,8 +20038,8 @@ impl AppState {
             return key;
         }
         if let Some(hook) = self.on_demand.read().await.clone() {
-            if let Some(address) = hook.resolve(host).await {
-                return address;
+            if let Some(resolved) = hook.resolve(host).await {
+                return resolved.address;
             }
         }
         key
@@ -40037,8 +40391,9 @@ mod tests {
             async fn ensure(&self, _host: &str) -> Result<(), String> {
                 Ok(())
             }
-            async fn resolve(&self, host: &str) -> Option<String> {
-                host.starts_with("epix1").then(|| host.to_string())
+            async fn resolve(&self, host: &str) -> Option<ResolvedHost> {
+                host.starts_with("epix1")
+                    .then(|| ResolvedHost { address: host.to_string(), verified: true })
             }
         }
         let state = AppState::new("test");
@@ -45928,8 +46283,9 @@ mod tests {
             async fn ensure(&self, _host: &str) -> Result<(), String> {
                 Ok(())
             }
-            async fn resolve(&self, host: &str) -> Option<String> {
-                host.starts_with("epix1").then(|| host.to_string())
+            async fn resolve(&self, host: &str) -> Option<ResolvedHost> {
+                host.starts_with("epix1")
+                    .then(|| ResolvedHost { address: host.to_string(), verified: true })
             }
         }
         let dir = tempfile::tempdir().unwrap();

@@ -471,6 +471,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
     let mut cmds: Vec<Arc<dyn WsCommand>> = vec![
         Arc::new(Ping),
         Arc::new(ServerInfo),
+        Arc::new(ResolveStatusCmd),
+        Arc::new(NetworkRetry),
         Arc::new(XiteInfo),
         Arc::new(ChannelJoin { cmd: "channelJoin" }),
         Arc::new(ChannelJoin { cmd: "channelJoinAllsite" }),
@@ -1086,6 +1088,42 @@ impl WsCommand for ServerInfo {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         Ok(s.state.server_info().await)
+    }
+}
+
+/// `resolveStatus {host}` - where the on-demand resolution of a name stands,
+/// for the wrapper's loading screen while the name has no address yet. Not
+/// admin-gated and needs no bound xite: the page asking has none.
+struct ResolveStatusCmd;
+#[async_trait]
+impl WsCommand for ResolveStatusCmd {
+    fn name(&self) -> &'static str {
+        "resolveStatus"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let host = p
+            .get("host")
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .and_then(Value::as_str)
+            .map(|h| h.trim().to_lowercase())
+            .filter(|h| !h.is_empty())
+            .ok_or("Missing host")?;
+        Ok(s.state.resolve_status_json(&host).await)
+    }
+}
+
+/// `networkRetry` - the user (or the OS, through the shells) says the network
+/// is back: retry everything parked on it right away instead of waiting out
+/// the backoff timers.
+struct NetworkRetry;
+#[async_trait]
+impl WsCommand for NetworkRetry {
+    fn name(&self) -> &'static str {
+        "networkRetry"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        s.state.network_changed().await;
+        Ok(json!("ok"))
     }
 }
 

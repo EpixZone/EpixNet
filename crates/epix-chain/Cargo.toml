@@ -19,6 +19,9 @@ thiserror = "2"
 tempfile = "3"
 fslock-guard = "0.8"
 tokio = { version = "1", features = ["sync", "time"] }
+# join_all for the light client's cold-bootstrap fan-out; the crate has no
+# runtime of its own, so no spawn-based concurrency is available here.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 tendermint-light-client-verifier = "0.40"
 tendermint = { version = "0.40", default-features = false, features = ["rust-crypto"] }
 bech32 = "0.12"

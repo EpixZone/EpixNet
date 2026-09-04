@@ -3,7 +3,8 @@ use axum::body::{to_bytes, Body};
 use axum::extract::ConnectInfo;
 use axum::http::{Request, StatusCode};
 use epix_ui::{
-    nmh_request_mac, nmh_response_mac_valid, AppState, OnDemandResolver, UiServer, NMH_RESOLVE_PATH,
+    nmh_request_mac, nmh_response_mac_valid, AppState, OnDemandResolver, ResolvedHost, UiServer,
+    NMH_RESOLVE_PATH,
 };
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -17,8 +18,9 @@ impl OnDemandResolver for FixedResolver {
         Ok(())
     }
 
-    async fn resolve(&self, host: &str) -> Option<String> {
-        (host == "talk.epix").then(|| "epix1verified".to_string())
+    async fn resolve(&self, host: &str) -> Option<ResolvedHost> {
+        (host == "talk.epix")
+            .then(|| ResolvedHost { address: "epix1verified".to_string(), verified: true })
     }
 }
 

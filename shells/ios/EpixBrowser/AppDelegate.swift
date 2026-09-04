@@ -65,6 +65,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// chrome while the node boots and the first page paints; removed on the
     /// first navigation finish. Mirrors the desktop toolbar spin (PR #231).
     var splashView: UIView?
+    /// The view the splash covers, kept so a boot retry can put it back.
+    var splashHost: UIView?
+    /// Set once the node page (or the shell's own error page) is requested,
+    /// so an earlier navigation settling cannot drop the splash too early.
+    var nodePageRequested = false
+    /// The launch target, for the error page's "Try again".
+    var bootTarget = "dashboard.epix"
+    /// Network reachability, to wake the node when a connection returns.
+    var pathMonitor: NWPathMonitor?
     /// Route clearnet browsing through the node's Tor SOCKS listener. Default
     /// on (opt-out), like the desktop extension. Persisted across launches.
     var torClearnet = true
@@ -111,6 +120,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         let target = (launchOptions?[.url] as? URL).flatMap(targetFrom) ?? "dashboard.epix"
         currentDisplay = target
         bootNode(target: target)
+        watchConnectivity()
 
         // Reflect the Tor state in the button's badge, at the extension's cadence.
         torTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
@@ -558,7 +568,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     }
 
     /// Boot the Rust node off the main thread, then load the local URL.
+    /// Also the "Try again" path of the error page, so it is safe to run more
+    /// than once: the FFI start() runs again after a failed boot.
     private func bootNode(target: String) {
+        bootTarget = target
         DispatchQueue.global(qos: .userInitiated).async {
             let dataDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].path
             try? FileManager.default.createDirectory(
@@ -580,7 +593,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                 } catch {
                     // The default port can be taken - in the simulator the
                     // Mac's own desktop node shares this loopback. Let the
-                    // OS pick a port; uiUrl() reports the real bind.
+                    // OS pick a port; uiUrl() reports the real bind. Only for
+                    // a bind failure: any other error is shown as-is instead
+                    // of re-running the whole boot on an ephemeral port.
+                    let text = self.node.lastError() ?? "\(error)"
+                    guard text.contains("bind") else { throw error }
                     try self.node.start(config: config("127.0.0.1:0"))
                 }
                 if let ui = self.node.uiUrl(), let u = URL(string: ui),
@@ -588,9 +605,18 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                 {
                     self.nodeBase = "http://\(host):\(port)"
                 }
-                DispatchQueue.main.async { self.load(display: target) }
+                DispatchQueue.main.async {
+                    self.nodePageRequested = true
+                    self.load(display: target)
+                }
             } catch {
-                DispatchQueue.main.async { self.showError("\(error)") }
+                // The FFI keeps the node's own message; the thrown value only
+                // wraps it as an enum case.
+                let message = self.node.lastError() ?? "\(error)"
+                DispatchQueue.main.async {
+                    self.nodePageRequested = true
+                    self.showError(message)
+                }
             }
         }
     }
@@ -1122,6 +1148,33 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 
         host.addSubview(overlay)
         splashView = overlay
+        splashHost = host
+    }
+
+    /// Tell the node when the network comes back, so it retries what was
+    /// parked on it (the name registry check, a homepage waiting to resolve)
+    /// instead of waiting out its backoff timers.
+    private func watchConnectivity() {
+        let monitor = NWPathMonitor()
+        var wasOnline = true
+        monitor.pathUpdateHandler = { [weak self] path in
+            let online = path.status == .satisfied
+            if online && !wasOnline {
+                DispatchQueue.global(qos: .utility).async { self?.node.networkChanged() }
+            }
+            wasOnline = online
+        }
+        monitor.start(queue: DispatchQueue.global(qos: .utility))
+        pathMonitor = monitor
+    }
+
+    /// Bring the splash back and boot again (the error page's "Try again").
+    private func retryBoot() {
+        nodePageRequested = false
+        if splashView == nil, let host = splashHost {
+            presentSplash(over: host)
+        }
+        bootNode(target: bootTarget)
     }
 
     /// Fade the loading splash out and remove it. Idempotent.
@@ -1135,8 +1188,62 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         )
     }
 
-    private func showError(_ message: String) {
-        let html = "<body style='font:16px system-ui;padding:2rem;color:#f87171'>Could not start Epix: \(message)</body>"
+    /// The error page's "Try again" and "Reset settings" links; intercepted
+    /// in decidePolicyFor.
+    static let retryUrl = "epixshell://retry"
+    static let resetUrl = "epixshell://reset-config"
+
+    /// The error page's "Reset connection settings and try again". The settings
+    /// page that would fix a bad settings file is served by the node, which is
+    /// exactly what did not start, so the shell does this part: set the file
+    /// aside (kept, never deleted) and boot with defaults.
+    private func resetConfigAndRetry() {
+        let dataDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let config = dataDir.appendingPathComponent("private/config.json")
+        if FileManager.default.fileExists(atPath: config.path) {
+            let stamp = Int(Date().timeIntervalSince1970)
+            let aside = dataDir.appendingPathComponent("private/config.json.broken-\(stamp)")
+            if (try? FileManager.default.moveItem(at: config, to: aside)) == nil {
+                try? FileManager.default.removeItem(at: config)
+            }
+        }
+        retryBoot()
+    }
+
+    /// An inline page for when the node could not start or stays unreachable -
+    /// never a blank view or a bare error string. Carries the node's own
+    /// message when there is one and a "Try again" that boots the node again
+    /// without leaving the app.
+    private func showError(_ message: String?) {
+        var detail = ""
+        if let message, !message.trimmingCharacters(in: .whitespaces).isEmpty {
+            let escaped = message
+                .replacingOccurrences(of: "&", with: "&amp;")
+                .replacingOccurrences(of: "<", with: "&lt;")
+                .replacingOccurrences(of: ">", with: "&gt;")
+            detail = "<p style=\"font-family:monospace;font-size:13px;color:#94a3b8;text-align:left;"
+                + "overflow-wrap:anywhere;background:#1e293b;padding:12px;border-radius:8px\">"
+                + escaped + "</p>"
+        }
+        let html = """
+            <html><head><meta name="viewport" content="width=device-width, initial-scale=1"></head>
+            <body style="background:#0b0e14;color:#cbd5e1;font-family:-apple-system,sans-serif;margin:0;
+                         display:flex;align-items:center;justify-content:center;min-height:100vh">
+            <div style="text-align:center;padding:24px;max-width:26em">
+              <h2 style="color:#e2e8f0">EpixNet could not start</h2>
+              <p>The built-in node did not start. This is usually temporary.</p>
+              \(detail)
+              <p><a href="\(Self.retryUrl)" style="display:inline-block;padding:12px 24px;background:#8a4bdb;
+                 color:#fff;border-radius:10px;text-decoration:none;font-weight:600">Try again</a></p>
+              <p style="font-size:14px"><a href="\(Self.resetUrl)" style="color:#a78bfa;text-decoration:none;
+                 display:inline-block;padding:10px 0">Reset connection settings and try again</a><br>
+                 <span style="font-size:13px;color:#64748b">Starts with default settings. Your current
+                 settings file is kept next to it, not deleted. You can change settings again from
+                 the dashboard menu once EpixNet is running.</span></p>
+              <p style="font-size:13px;color:#64748b">If this keeps happening, close the app fully and
+                 reopen it, or report a bug at github.com/EpixZone/EpixNet.</p>
+            </div></body></html>
+            """
         webView?.loadHTMLString(html, baseURL: nil)
     }
 
@@ -1189,6 +1296,17 @@ extension AppDelegate: WKNavigationDelegate {
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
+        // The error page's "Try again": boot the node again in-process.
+        if navigationAction.request.url?.absoluteString == Self.retryUrl {
+            decisionHandler(.cancel)
+            retryBoot()
+            return
+        }
+        if navigationAction.request.url?.absoluteString == Self.resetUrl {
+            decisionHandler(.cancel)
+            resetConfigAndRetry()
+            return
+        }
         if let url = navigationAction.request.url, let rewritten = xiteRewrite(url) {
             decisionHandler(.cancel)
             // Load top-level even when the click came from the wrapper's
@@ -1199,24 +1317,38 @@ extension AppDelegate: WKNavigationDelegate {
         decisionHandler(.allow)
     }
 
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
-        hideSplash()
+    /// The splash comes down only once a page we asked for has settled: the
+    /// node's page, or the shell's own error page. Anything earlier (the
+    /// initial blank view) must not drop it onto an empty screen.
+    private func pageSettled() {
+        if nodePageRequested { hideSplash() }
         syncToolbar()
+    }
+
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        pageSettled()
     }
 
     func webView(
         _ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error
     ) {
-        hideSplash()
-        syncToolbar()
+        pageSettled()
     }
 
     func webView(
         _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        hideSplash()
-        syncToolbar()
+        // A request to the node that never connected renders as nothing in
+        // WKWebView. Show the shell's page with a retry instead of a blank
+        // view (Android has the same fallback after its port wait).
+        let failed = (error as NSError).userInfo[NSURLErrorFailingURLStringErrorKey] as? String ?? ""
+        if failed.hasPrefix(nodeBase) {
+            nodePageRequested = true
+            showError(node.lastError() ?? "The node is not answering on \(nodeBase).")
+            return
+        }
+        pageSettled()
     }
 }
 

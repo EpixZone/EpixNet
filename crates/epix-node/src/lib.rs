@@ -190,44 +190,174 @@ pub fn parse_inner_path(arg: &str) -> String {
     }
 }
 
-/// Resolve `target` into `(xite_address, display_name, from_cache)`: pass an
-/// `epix1…` address through; resolve a `.epix` name (or bare label, defaulting
-/// to the `epix` TLD) from the on-disk cache, hitting the chain only when the
-/// name has no cache entry or the entry expired ([`RESOLVE_CACHE_TTL_SECS`]).
-/// If an expired entry can't be re-resolved (chain unreachable), the stale
-/// mapping keeps serving rather than failing the boot.
-async fn resolve_target(
+/// The xite the shipped dashboard lives at. The one address the node knows by
+/// heart: it may serve it under `dashboard.epix` from the on-disk copy while
+/// the chain is unreachable, and it is the only xite that gets the dashboard's
+/// ADMIN grant without a prompt (the same trust as the app binary itself).
+pub const DASHBOARD_XITE_ADDRESS: &str = epix_ui::DASHBOARD_XITE_ADDRESS;
+
+/// What boot serves for the launch target, decided from LOCAL state only. Boot
+/// never asks the chain: a name lookup can block for the length of an RPC
+/// timeout and fail for every reason the network can fail, and none of those
+/// should keep a node from serving what it already has. A fresh install with
+/// nothing on disk defers to the on-demand resolver, which reports its progress
+/// to the loading screen; a returning node serves its copy right away and
+/// re-verifies the name in the background.
+#[derive(Debug)]
+enum LaunchSelection {
+    /// Serve `address` now. `verified` is false for a provisional mapping: a
+    /// finality-bound cache entry that a later checkpoint superseded, whose
+    /// xite is already on disk. It serves that copy and nothing else.
+    Resolved { address: String, display: String, verified: bool },
+    /// Nothing local maps the name to a xite on disk: the on-demand resolver
+    /// takes it from here.
+    Deferred { display: String },
+}
+
+fn select_launch(
     data_root: &std::path::Path,
     target: &str,
-) -> Result<(String, String, bool), String> {
+    on_disk: impl Fn(&str) -> bool,
+) -> Result<LaunchSelection, String> {
+    select_launch_from(target, |full| validated_cached_resolution(data_root, full), on_disk)
+}
+
+/// [`select_launch`] with the cache lookup injected, so the decision can be
+/// tested in both finality modes without touching the process-wide flag.
+fn select_launch_from(
+    target: &str,
+    lookup: impl Fn(&str) -> Option<CachedResolution>,
+    on_disk: impl Fn(&str) -> bool,
+) -> Result<LaunchSelection, String> {
     let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
     match epix_core::classify_label(name) {
         epix_core::LabelClass::Address => {
-            return Ok((name.to_string(), name.to_string(), false));
+            return Ok(LaunchSelection::Resolved {
+                address: name.to_string(),
+                display: name.to_string(),
+                verified: true,
+            });
         }
         epix_core::LabelClass::AddressShaped => {
             return Err(address_shaped_target_error(name, tld));
         }
         epix_core::LabelClass::Name => {}
     }
-    let full = format!("{name}.{tld}");
-    match validated_cached_resolution(data_root, &full) {
-        Some((address, true)) => return Ok((address, full, true)),
-        Some((stale, false)) => {
-            // Expired: refresh from the chain; keep the stale mapping if that fails.
-            return Ok(match try_resolve_on_chain_bound(name, tld).await {
-                Ok((address, binding)) => {
-                    write_resolve_cache_bound(data_root, &full, &address, binding.as_ref());
-                    (address, full, false)
-                }
-                Err(_) => (stale, full, true),
-            });
-        }
-        None => {}
+    let display = format!("{name}.{tld}");
+    Ok(match lookup(&display) {
+        // Fresh or stale, a verified mapping serves; a stale one is refreshed
+        // in the background once the chain answers.
+        Some(cached) if cached.verified => LaunchSelection::Resolved {
+            address: cached.address,
+            display,
+            verified: true,
+        },
+        Some(cached) if on_disk(&cached.address) => LaunchSelection::Resolved {
+            address: cached.address,
+            display,
+            verified: false,
+        },
+        // The shipped dashboard needs no name lookup to exist: its address is
+        // compiled in (the same trust as the app itself, and what the desktop
+        // server launches by), so a fresh install downloads it from peers
+        // right away and the name is confirmed against the chain afterwards.
+        // Nothing else gets this: any other name with nothing local waits for
+        // the registry.
+        _ if display == DASHBOARD_XITE_NAME => LaunchSelection::Resolved {
+            address: DASHBOARD_XITE_ADDRESS.to_string(),
+            display,
+            verified: false,
+        },
+        _ => LaunchSelection::Deferred { display },
+    })
+}
+
+/// The name the shipped dashboard is registered under.
+pub const DASHBOARD_XITE_NAME: &str = "dashboard.epix";
+
+/// Whether a xite's root manifest is on disk under `data_root` - the
+/// precondition for serving a provisional (unverified) name mapping.
+fn content_on_disk(data_root: &std::path::Path, address: &str) -> bool {
+    data_root.join("data").join(address).join("content.json").is_file()
+}
+
+/// The shipped dashboard is the node's own control panel: it gets ADMIN
+/// without the wrapper's "This xite requests permission" prompt. Only that
+/// one address ever does. A name pointing anywhere else keeps the prompt,
+/// because ADMIN is the whole node (keys, config, shutdown) and a name record
+/// on the chain is not the user's consent. Restricted gateways grant nothing.
+async fn grant_dashboard_admin(state: &AppState, address: &str) {
+    if address != DASHBOARD_XITE_ADDRESS || state.ui_restrict().await {
+        return;
     }
-    let (address, binding) = try_resolve_on_chain_bound(name, tld).await?;
-    write_resolve_cache_bound(data_root, &full, &address, binding.as_ref());
-    Ok((address, full, false))
+    if !state.xite_has_admin(address).await {
+        state.add_permission(address, "ADMIN").await;
+    }
+}
+
+/// Why a name could not be resolved right now, kept typed so the loading
+/// screen can say the right thing instead of "could not resolve".
+#[derive(Debug)]
+enum ResolveError {
+    /// An address-shaped label with a bad checksum: never resolved as a name.
+    MistypedAddress(String),
+    /// The chain answered for the name, but it carries no xite address (or an
+    /// invalid one).
+    NoXiteRecord(String),
+    Chain(epix_chain::ChainError),
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::MistypedAddress(text) | Self::NoXiteRecord(text) => f.write_str(text),
+            Self::Chain(error) => write!(f, "{error}"),
+        }
+    }
+}
+
+impl ResolveError {
+    /// The `resolveStatus` state and reason for this failure, and whether the
+    /// resolver should keep trying. Nothing here is a verdict on the name:
+    /// even "not found" comes from a single RPC answer with no proof behind
+    /// it, so it is retried slowly and never written down.
+    fn status(&self) -> (&'static str, &'static str, bool) {
+        use epix_chain::ChainError::*;
+        match self {
+            Self::MistypedAddress(_) => ("failed", "mistyped_address", false),
+            Self::NoXiteRecord(_) => ("failed", "not_found", true),
+            Self::Chain(NotFound(_)) => ("failed", "not_found", true),
+            Self::Chain(TrustNotEstablished)
+            | Self::Chain(FinalityUnverified(_))
+            | Self::Chain(NotFinalized)
+            | Self::Chain(FinalityAdvanced) => ("establishing_trust", "trust_unavailable", true),
+            Self::Chain(Rpc(message)) => {
+                if rpc_error_means_no_network(message) {
+                    ("waiting_network", "no_network", true)
+                } else {
+                    ("resolving", "rpc_error", true)
+                }
+            }
+            Self::Chain(MerkleInvalid)
+            | Self::Chain(DigestMismatch)
+            | Self::Chain(LeafBindingFailed(_))
+            | Self::Chain(Malformed(_)) => ("resolving", "bad_answer", true),
+        }
+    }
+}
+
+/// Whether an RPC transport error reads as "no network at all" rather than
+/// "this server did not answer": a DNS or connect failure on every endpoint,
+/// or the light client's last probe reaching none of its sources.
+fn rpc_error_means_no_network(message: &str) -> bool {
+    let text = message.to_ascii_lowercase();
+    let transport = ["dns", "connect", "network is unreachable", "error sending request", "no route"]
+        .iter()
+        .any(|needle| text.contains(needle));
+    let probe = epix_chain::lc_status::snapshot();
+    let none_reachable = probe.get("sources_reachable").and_then(serde_json::Value::as_u64) == Some(0)
+        && probe.get("sources_total").and_then(serde_json::Value::as_u64).unwrap_or(0) > 0;
+    transport || none_reachable
 }
 
 fn address_shaped_target_error(name: &str, tld: &str) -> String {
@@ -242,54 +372,64 @@ fn validated_xite_address(address: &str, source: &str) -> Result<Address, String
     })
 }
 
-fn validated_cached_resolution(data_root: &std::path::Path, full: &str) -> Option<(String, bool)> {
-    let (address, fresh) = cached_resolution(data_root, full)?;
-    let address = Address::parse(address).ok()?;
-    Some((address.to_string(), fresh))
+fn validated_cached_resolution(
+    data_root: &std::path::Path,
+    full: &str,
+) -> Option<CachedResolution> {
+    let cached = cached_resolution(data_root, full)?;
+    let address = Address::parse(cached.address).ok()?;
+    Some(CachedResolution { address: address.to_string(), ..cached })
 }
 
 async fn try_resolve_on_chain_bound(
     name: &str,
     tld: &str,
-) -> Result<(String, Option<(u64, String)>), String> {
+) -> Result<(String, Option<(u64, String)>), ResolveError> {
     // Typo-space guard: an exact checksum-valid address is the dotted alias
     // and resolves to itself, never via xID (a registered same-string name is
     // inert). An address-SHAPED label with a bad checksum is a mistyped or
     // forged address and is refused outright - otherwise an attacker could
     // register the typo-space around a real address as names and phish.
-        match epix_core::classify_label(name) {
+    match epix_core::classify_label(name) {
         epix_core::LabelClass::Address => return Ok((name.to_string(), None)),
-            epix_core::LabelClass::AddressShaped => {
-            return Err(address_shaped_target_error(name, tld));
-            }
-            epix_core::LabelClass::Name => {}
+        epix_core::LabelClass::AddressShaped => {
+            return Err(ResolveError::MistypedAddress(address_shaped_target_error(name, tld)));
         }
-    let resolver = epix_chain::XidResolver::new(epix_chain::DEFAULT_RPC_URL);
+        epix_core::LabelClass::Name => {}
+    }
+    // The shared resolver follows the configured endpoint list and rotates
+    // to the next endpoint when one fails; a throwaway single-endpoint
+    // resolver here made api.epix.zone alone a single point of failure.
+    let resolver = epix_chain::shared_resolver();
     let (domain, binding) = resolver
         .resolve_fresh_bound(name, tld)
         .await
-        .map_err(|e| format!("could not resolve {name}.{tld}: {e}"))?;
-    let address = domain
-        .xite_address()
-        .ok_or_else(|| format!("{name}.{tld} has no EpixNet xite address record"))?;
-    let address = validated_xite_address(address, &format!("{name}.{tld} xID record"))?;
+        .map_err(ResolveError::Chain)?;
+    let address = domain.xite_address().ok_or_else(|| {
+        ResolveError::NoXiteRecord(format!("{name}.{tld} has no EpixNet xite address record"))
+    })?;
+    let address = validated_xite_address(address, &format!("{name}.{tld} xID record"))
+        .map_err(ResolveError::NoXiteRecord)?;
     Ok((address.to_string(), binding))
 }
 
 /// What [`serve`] should bring up as the node's launch xite (its homepage).
 enum LaunchTarget {
-    /// Resolved to a xite address (from cache or the chain): register it and
-    /// serve whatever is already on disk.
+    /// Resolved to a xite address from local state: register it and serve
+    /// whatever is already on disk. `verified` is false for a provisional
+    /// mapping (see [`LaunchSelection`]), which the node re-verifies against
+    /// the chain in the background.
     Resolved {
         address: String,
         display: String,
         data_dir: PathBuf,
         content: Option<serde_json::Value>,
+        verified: bool,
     },
-    /// Deferred: in Tor-Always mode the launch name had no cache entry, and
-    /// resolving it on the chain before Tor is up would leak it over clearnet.
-    /// Only the homepage name is set; the on-demand resolver clones it on first
-    /// open, once Tor has bootstrapped.
+    /// Deferred: nothing local maps the launch name to a xite on disk (a fresh
+    /// install, or an uncached name). Only the homepage name is set; the
+    /// on-demand resolver resolves and clones it on first open, once the
+    /// network and the name registry are reachable.
     Deferred { display: String },
 }
 
@@ -356,57 +496,16 @@ pub async fn boot(
     );
 
     // Parse the startup network policy strictly, arm its egress gate, and only
-    // then select the launch target. Tor-Always and offline mode use the cache
-    // only. An uncached name is deferred instead of leaking before the runtime
-    // has established its final network policy. While finality trust is still
-    // network-bootstrapping, an unresolvable launch name is likewise deferred:
-    // the light client installs the quorum-bootstrapped pin only after `serve`
-    // starts, so failing boot on it would deadlock every fresh install.
-    let (launch, startup_network_policy) = prepare_startup_launch_with(
-        &opts,
-        matches!(xid_finality, XidFinalityBoot::NetworkBootstrap { .. }),
-        arm_startup_network_policy,
-        |data_root, target| async move { resolve_target(&data_root, &target).await },
-    )
-    .await?;
+    // then select the launch target from local state. Boot never touches the
+    // chain: a name that has nothing on disk is deferred to the on-demand
+    // resolver (which waits for trust and the network and reports progress),
+    // and a name whose copy is on disk serves at once, verified later.
+    let (launch, startup_network_policy) =
+        prepare_startup_launch_with(&opts, arm_startup_network_policy)?;
 
     serve(opts, launch, xid_finality, startup_network_policy).await
 }
 
-/// The display form of a launch target: a raw `epix1…` address passes through;
-/// a `.epix` name (or bare label defaulting to the `epix` TLD) is normalized to
-/// `name.tld` - the same string the on-demand resolver keys on.
-fn launch_display(target: &str) -> Result<String, String> {
-    let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
-    match epix_core::classify_label(name) {
-        epix_core::LabelClass::Address => Ok(name.to_string()),
-        epix_core::LabelClass::AddressShaped => Err(address_shaped_target_error(name, tld)),
-        epix_core::LabelClass::Name => Ok(format!("{name}.{tld}")),
-    }
-}
-
-/// Resolve a launch target from the on-disk cache only (no chain query), for
-/// Always mode where an uncached name must not be resolved over clearnet at
-/// boot. Returns `(address, display)` on any cache hit (fresh or stale, since a
-/// stale mapping keeps serving); `None` when the name has never been resolved,
-/// so it defers to the on-demand resolver.
-fn cached_launch(
-    data_root: &std::path::Path,
-    target: &str,
-) -> Result<Option<(String, String)>, String> {
-    let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
-    match epix_core::classify_label(name) {
-        epix_core::LabelClass::Address => {
-            return Ok(Some((name.to_string(), name.to_string())));
-        }
-        epix_core::LabelClass::AddressShaped => {
-            return Err(address_shaped_target_error(name, tld));
-        }
-        epix_core::LabelClass::Name => {}
-    }
-    let full = format!("{name}.{tld}");
-    Ok(validated_cached_resolution(data_root, &full).map(|(address, _fresh)| (address, full)))
-}
 
 /// Build a [`LaunchTarget::Resolved`] for an address we can serve now: create
 /// its data dir and load any content.json already on disk. The UI server must
@@ -421,6 +520,7 @@ fn resolved_launch(
     opts: &NodeOptions,
     address: String,
     display: String,
+    verified: bool,
 ) -> Result<LaunchTarget, String> {
     let parsed = validated_xite_address(&address, "launch target")?;
     let address = parsed.to_string();
@@ -437,6 +537,7 @@ fn resolved_launch(
         display,
         data_dir,
         content,
+        verified,
     })
 }
 
@@ -675,51 +776,30 @@ fn arm_startup_network_policy(policy: StartupNetworkPolicy) {
     }
 }
 
-/// Select the launch target under the armed startup network policy.
-/// `awaiting_network_trust` is true while xID finality verification is ON with
-/// no pin installed yet ([`XidFinalityBoot::NetworkBootstrap`]): in that state
-/// chain resolution fails closed by design, so a launch name that cannot be
-/// resolved is deferred to the on-demand resolver instead of failing boot —
-/// the light client that bootstraps the pin only runs once the node serves.
-/// A malformed target (address-shaped typo) still fails boot in every mode.
-async fn prepare_startup_launch_with<A, F, Fut>(
+/// Select the launch target under the armed startup network policy, from local
+/// state only (see [`select_launch`]). The policy is armed first so nothing
+/// that runs later can egress before the node's final network policy is set.
+/// A malformed target (address-shaped typo) still fails boot in every mode; an
+/// unreachable chain, missing trust, or an unknown name never does.
+fn prepare_startup_launch_with<A>(
     opts: &NodeOptions,
-    awaiting_network_trust: bool,
     arm_policy: A,
-    resolve: F,
 ) -> Result<(LaunchTarget, StartupNetworkPolicy), String>
 where
     A: FnOnce(StartupNetworkPolicy),
-    F: FnOnce(PathBuf, String) -> Fut,
-    Fut: std::future::Future<Output = Result<(String, String, bool), String>>,
 {
     let policy = startup_network_policy(&opts.data_root, opts)?;
     arm_policy(policy);
-
-    if policy.defers_chain_resolution() {
-        let launch = match cached_launch(&opts.data_root, &opts.target)? {
-            Some((address, display)) => resolved_launch(opts, address, display),
-            None => Ok(LaunchTarget::Deferred {
-                display: launch_display(&opts.target)?,
-            }),
-        }?;
-        return Ok((launch, policy));
-    }
-    match resolve(opts.data_root.clone(), opts.target.clone()).await {
-        Ok((address, display, _from_cache)) => {
-            Ok((resolved_launch(opts, address, display)?, policy))
+    let selection = select_launch(&opts.data_root, &opts.target, |address| {
+        content_on_disk(&opts.data_root, address)
+    })?;
+    let launch = match selection {
+        LaunchSelection::Resolved { address, display, verified } => {
+            resolved_launch(opts, address, display, verified)?
         }
-        // No trust root yet, so this failure was inevitable, not a verdict on
-        // the name. Serve deferred; `launch_display` still rejects a target
-        // that is malformed in its own right.
-        Err(_) if awaiting_network_trust => Ok((
-            LaunchTarget::Deferred {
-                display: launch_display(&opts.target)?,
-            },
-            policy,
-        )),
-        Err(e) => Err(e),
-    }
+        LaunchSelection::Deferred { display } => LaunchTarget::Deferred { display },
+    };
+    Ok((launch, policy))
 }
 
 /// Acquire and retain the requested UI listener. Only the default port falls
@@ -2757,7 +2837,34 @@ struct OnDemand {
     /// up, `await_tor_ready` refuses to fall through to a clearnet clone in this
     /// mode, so a cold-start or Tor-down clone never leaks the real IP.
     tor_always: std::sync::atomic::AtomicBool,
+    /// Hosts whose name is being resolved right now (before an address is
+    /// known, so `in_flight` cannot key them). The wrapper, its inner-file
+    /// gate, and a reload can all ask for the same name while it waits on
+    /// trust or the network: one of them does the work, the rest wait.
+    resolving: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    /// Wakes the launch-name verifier (trust anchored, network back).
+    verifier_wake: tokio::sync::Notify,
 }
+
+/// Holds a host's slot in [`OnDemand::resolving`]; releases it on drop, so an
+/// aborted resolve cannot squat the name.
+struct ResolveSlot {
+    set: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+    host: String,
+}
+
+impl Drop for ResolveSlot {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.host);
+        }
+    }
+}
+
+/// How long an on-demand resolve keeps trying before its caller gives up.
+/// The status it publishes stays on screen either way; a Retry or a network
+/// change starts a fresh attempt.
+const RESOLVE_BUDGET: std::time::Duration = std::time::Duration::from_secs(10 * 60);
 
 #[async_trait::async_trait]
 impl epix_ui::OnDemandResolver for OnDemand {
@@ -2775,28 +2882,25 @@ impl epix_ui::OnDemandResolver for OnDemand {
             return Ok(());
         }
         if self.network_disabled {
+            self.state
+                .resolve_status_set(host, "failed", Some("offline_policy"), None)
+                .await;
             return Err(format!(
                 "offline mode cannot resolve or fetch incomplete site {host}"
             ));
         }
-        // In Always mode, resolving a name that has no cache entry hits the
-        // chain, which is gated until Tor is up. Wait for Tor first so the
-        // resolve rides it (and never falls back to clearnet) - this is the path
-        // a deferred launch name takes on first open. Cached names and raw
-        // addresses need no chain query, so they skip the wait.
-        if self.tor_always.load(std::sync::atomic::Ordering::Relaxed)
-            && needs_chain_resolve(&self.data_root, host)
-            && !self.await_tor_ready().await
-        {
-            return Err(
-                "Tor is not available and Always mode forbids clearnet, so this site \
-                 cannot be resolved right now"
-                    .to_string(),
-            );
+        // One resolve per host at a time; later askers wait for its outcome.
+        let Some(slot) = self.claim_resolve_slot(host) else {
+            return self.wait_for_resolve(host).await;
+        };
+        let resolved = self.resolve_with_status(host).await;
+        drop(slot);
+        let Resolved { address, verified } = resolved?;
+        // The homepage's name just resolved: record what it points to, and
+        // whether the chain said so, for serverInfo and the verifier.
+        if self.state.homepage().await.as_deref() == Some(host) {
+            self.state.set_launch_status(host, Some(&address), verified).await;
         }
-        let address = resolve_host(&self.data_root, host)
-            .await
-            .ok_or_else(|| format!("could not resolve {host}"))?;
         // Coalesce concurrent clones on the RESOLVED address: the first does
         // the work, the rest wait briefly for it to land. Keying on the raw
         // host string let a clone opened as `name.epix` and one opened as its
@@ -2824,7 +2928,7 @@ impl epix_ui::OnDemandResolver for OnDemand {
         let spawn_host = host.to_string();
         let spawn_address = address.clone();
         let handle = tokio::spawn(async move {
-            let result = this.do_ensure(&spawn_host, &spawn_address).await;
+            let result = this.do_ensure(&spawn_host, &spawn_address, verified).await;
             if let Err(error) = result {
                 this.state
                     .log(
@@ -2850,61 +2954,113 @@ impl epix_ui::OnDemandResolver for OnDemand {
         self.wait_for_inflight(&address).await
     }
 
-    async fn resolve(&self, host: &str) -> Option<String> {
-        if self.network_disabled {
-            resolve_host_cached_only(&self.data_root, host)
+    async fn resolve(&self, host: &str) -> Option<epix_ui::ResolvedHost> {
+        let resolved = if self.network_disabled {
+            self.resolve_host_cached_only(host).await
         } else {
-        resolve_host(&self.data_root, host).await
+            self.resolve_host(host).await.ok()
+        }?;
+        Some(epix_ui::ResolvedHost { address: resolved.address, verified: resolved.verified })
+    }
+
+    fn network_changed(&self) {
+        let Some(this) = self.me.upgrade() else { return };
+        // Anything parked on the network or the registry goes again now
+        // instead of waiting out its backoff: the resolve loops and the trust
+        // wait listen on the light client's wake, the verifier on its own.
+        this.verifier_wake.notify_one();
+        tokio::spawn(async move {
+            for host in this.state.parked_resolve_hosts().await {
+                let state = this.state.clone();
+                tokio::spawn(async move {
+                    state.ensure_xite(&host).await;
+                });
+            }
+        });
     }
 }
+
+/// A name-to-address answer from the on-demand resolver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Resolved {
+    address: String,
+    /// False for a saved mapping the chain has not confirmed this session: it
+    /// serves a xite already on this node and never drives a clone.
+    verified: bool,
 }
 
-/// Resolve without any chain access. Raw addresses pass through and cached
-/// names use either a fresh or stale validated mapping.
-fn resolve_host_cached_only(data_root: &std::path::Path, host: &str) -> Option<String> {
-    let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
-    match epix_core::classify_label(name) {
-        epix_core::LabelClass::Address => Some(name.to_string()),
-        epix_core::LabelClass::AddressShaped => None,
-        epix_core::LabelClass::Name => {
-            validated_cached_resolution(data_root, &format!("{name}.{tld}"))
-                .map(|(address, _fresh)| address)
+impl OnDemand {
+    /// Resolve without any chain access: raw addresses pass through, cached
+    /// names use their verified mapping (fresh or stale), and an unverified
+    /// (superseded) mapping only when the xite is already registered.
+    async fn resolve_host_cached_only(&self, host: &str) -> Option<Resolved> {
+        let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+        match epix_core::classify_label(name) {
+            epix_core::LabelClass::Address => {
+                Some(Resolved { address: name.to_string(), verified: true })
+            }
+            epix_core::LabelClass::AddressShaped => None,
+            epix_core::LabelClass::Name => {
+                let cached = validated_cached_resolution(&self.data_root, &format!("{name}.{tld}"))?;
+                if cached.verified || self.state.has_xite(&cached.address).await {
+                    Some(Resolved { address: cached.address, verified: cached.verified })
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Resolve `host` (a `.epix` name or an `epix1…` address) to a xite
+    /// address: the on-disk cache first, the chain on a miss or expiry, and
+    /// the saved mapping when the chain does not answer. A successful chain
+    /// lookup is written back to the cache. Never clones.
+    async fn resolve_host(&self, host: &str) -> Result<Resolved, ResolveError> {
+        let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+        // Every label classifies against the address space, including dotless
+        // inputs. Short `epix1…` branding names remain names; checksum-valid
+        // addresses pass through; address-shaped bad checksums fail closed.
+        match epix_core::classify_label(name) {
+            epix_core::LabelClass::Address => {
+                return Ok(Resolved { address: name.to_string(), verified: true });
+            }
+            epix_core::LabelClass::AddressShaped => {
+                return Err(ResolveError::MistypedAddress(address_shaped_target_error(name, tld)));
+            }
+            epix_core::LabelClass::Name => {}
+        }
+        let full = format!("{name}.{tld}");
+        let cached = validated_cached_resolution(&self.data_root, &full);
+        if let Some(cached) = &cached {
+            if cached.verified && cached.fresh {
+                return Ok(Resolved { address: cached.address.clone(), verified: true });
+            }
+        }
+        match try_resolve_on_chain_bound(name, tld).await {
+            Ok((address, binding)) => {
+                write_resolve_cache_bound(&self.data_root, &full, &address, binding.as_ref());
+                Ok(Resolved { address, verified: true })
+            }
+            Err(error) => match cached {
+                // Stale but verified: the mapping keeps serving, like before.
+                Some(cached) if cached.verified => {
+                    Ok(Resolved { address: cached.address, verified: true })
+                }
+                // Superseded: only for a xite that is already here.
+                Some(cached) if self.state.has_xite(&cached.address).await => {
+                    Ok(Resolved { address: cached.address, verified: false })
+                }
+                _ => Err(error),
+            },
         }
     }
 }
 
-/// Resolve `host` (a `.epix` name or an `epix1…` address) to a xite address,
-/// consulting the on-disk cache first and the chain only on a miss/expiry.
-/// A successful chain lookup is written back to the cache. Never clones.
-async fn resolve_host(data_root: &std::path::Path, host: &str) -> Option<String> {
-    let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
-    // Every label classifies against the address space, including dotless
-    // inputs. Short `epix1…` branding names remain names; checksum-valid
-    // addresses pass through; address-shaped bad checksums fail closed.
-    match epix_core::classify_label(name) {
-        epix_core::LabelClass::Address => return Some(name.to_string()),
-        epix_core::LabelClass::AddressShaped => return None,
-        epix_core::LabelClass::Name => {}
-    }
-    let full = format!("{name}.{tld}");
-    match validated_cached_resolution(data_root, &full) {
-        Some((address, true)) => Some(address),
-        stale => match try_resolve_on_chain_bound(name, tld).await {
-            Ok((address, binding)) => {
-                write_resolve_cache_bound(data_root, &full, &address, binding.as_ref());
-                Some(address)
-            }
-            Err(_) => stale.map(|(address, _)| address),
-        },
-    }
-}
-
-/// Whether resolving `host` will hit the chain and cannot fall back: a `.epix`
-/// name (not a raw `epix1…` address) with no cache entry at all. A fresh entry
-/// resolves from cache; a stale one still serves its stale mapping if the chain
-/// is unreachable - only a total miss forces a chain query with nothing to fall
-/// back to. Used to decide whether to wait for Tor before resolving in Always
-/// mode (mirrors [`resolve_host`]'s cache key).
+/// Whether resolving `host` must reach the chain: a `.epix` name (not a raw
+/// `epix1…` address) with no VERIFIED cache entry. A verified entry, fresh or
+/// stale, serves without the chain (a stale one is refreshed when the chain
+/// answers and kept when it does not); a superseded or missing entry needs
+/// the chain, so in Always mode the resolve waits for Tor first.
 fn needs_chain_resolve(data_root: &std::path::Path, host: &str) -> bool {
     let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
     // Only a real NAME can hit the chain. Valid addresses resolve to themselves
@@ -2912,7 +3068,8 @@ fn needs_chain_resolve(data_root: &std::path::Path, host: &str) -> bool {
     if epix_core::classify_label(name) != epix_core::LabelClass::Name {
         return false;
     }
-    validated_cached_resolution(data_root, &format!("{name}.{tld}")).is_none()
+    !validated_cached_resolution(data_root, &format!("{name}.{tld}"))
+        .is_some_and(|cached| cached.verified)
 }
 
 #[async_trait::async_trait]
@@ -3017,7 +3174,9 @@ impl OnDemand {
     /// "Disabled" is not treated as terminal here - on a cold start the Tor loop
     /// may not have flipped the status to "Bootstrapping" yet, and `tor_expected`
     /// already told us it is coming.
-    async fn await_tor_ready(&self) -> bool {
+    /// `address` is the xite whose loading screen should hear about the wait
+    /// (`waiting_tor` / `tor_skipped` events); `None` when there is none yet.
+    async fn await_tor_ready(&self, address: Option<&str>) -> bool {
         use std::sync::atomic::Ordering;
         if !self.tor_expected.load(Ordering::Relaxed) {
             return true;
@@ -3034,6 +3193,16 @@ impl OnDemand {
                     .to_string(),
             )
             .await;
+        let tell = |event: &str, status: &str| {
+            if let Some(address) = address {
+                self.state.push_clone_event(
+                    address,
+                    serde_json::json!([event, status]),
+                    serde_json::json!({ "tor_status": status }),
+                );
+            }
+        };
+        let mut last_status = String::new();
         // ~2 minutes. Arti's cold bootstrap is ~10-40s, but a slow link (or a
         // Windows machine fetching a fresh consensus) can take longer.
         for _ in 0..240 {
@@ -3041,14 +3210,26 @@ impl OnDemand {
             if up {
                 return true;
             }
+            if status != last_status {
+                // The screen would otherwise sit on "Searching for peers" for
+                // the whole bootstrap with nothing to show for it.
+                tell("waiting_tor", &status);
+                last_status = status.clone();
+            }
             if status == "Failed" {
                 // Fall through to clearnet only when clearnet is allowed.
+                if !always {
+                    tell("tor_skipped", &status);
+                }
                 return !always;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
         // Timed out: proceed over clearnet only when Always mode isn't forcing
         // Tor. In Always mode, refuse rather than leak.
+        if !always {
+            tell("tor_skipped", &last_status);
+        }
         !always
     }
 
@@ -3073,8 +3254,9 @@ impl OnDemand {
     }
 
     /// The clone/resume work behind [`Self::ensure`], which resolved `host`
-    /// to `address` and holds the in-flight slot for it.
-    async fn do_ensure(&self, host: &str, address: &str) -> Result<(), String> {
+    /// to `address` (`verified` says whether the chain confirmed that) and
+    /// holds the in-flight slot for it.
+    async fn do_ensure(&self, host: &str, address: &str, verified: bool) -> Result<(), String> {
         if self.network_disabled {
             return Err(format!(
                 "offline mode cannot resolve or fetch incomplete site {host}"
@@ -3086,21 +3268,242 @@ impl OnDemand {
         // but its core files are incomplete (an interrupted earlier clone).
         // Owned xites never re-clone: local edits stay.
         let was_registered = self.state.has_xite(address).await;
-        if was_registered && host != address {
+        // The `.epix` name is display metadata on the address-keyed entry -
+        // written only for a chain-verified mapping, so a saved (superseded)
+        // mapping never launders itself into the registry as if it were.
+        if was_registered && host != address && verified {
             self.state.set_display(address, host).await;
         }
         let resume = was_registered
             && !self.state.xite_owned(address).await
             && !self.state.xite_core_complete(address).await;
         if !was_registered || resume {
-            self.clone_or_resume(host, address, &data_dir, was_registered).await?;
+            self.clone_or_resume(host, address, &data_dir, was_registered, verified).await?;
         }
-        // The `.epix` name is display metadata on the address-keyed entry.
-        if host != address {
+        if host != address && verified {
             self.state.set_display(address, host).await;
         }
         self.state.log("INFO", format!("On-demand cloned {host} -> {address}")).await;
         Ok(())
+    }
+
+    /// Claim the resolve slot for `host`, or `None` if another caller holds it.
+    fn claim_resolve_slot(&self, host: &str) -> Option<ResolveSlot> {
+        let mut set = self.resolving.lock().ok()?;
+        if !set.insert(host.to_string()) {
+            return None;
+        }
+        Some(ResolveSlot { set: self.resolving.clone(), host: host.to_string() })
+    }
+
+    /// Wait for the resolve (and clone) another caller is running for `host`.
+    async fn wait_for_resolve(&self, host: &str) -> Result<(), String> {
+        for _ in 0..600 {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            let key = self.state.canonical_key(host).await;
+            if key != host && self.state.has_xite(&key).await {
+                return Ok(());
+            }
+            let still_resolving = self.resolving.lock().map(|set| set.contains(host)).unwrap_or(false);
+            if !still_resolving && key == host {
+                return Err(format!("could not resolve {host}"));
+            }
+        }
+        Err("timed out waiting for a concurrent resolve".into())
+    }
+
+    /// Resolve `host` while telling the loading screen what is being waited
+    /// on, retrying on everything that is not a verdict: no network, trust
+    /// still establishing, a name server that did not answer or answered
+    /// nonsense. "Not found" is retried slowly too - it comes from one RPC
+    /// answer with no proof behind it. Gives up after [`RESOLVE_BUDGET`]; the
+    /// published status stays, and a Retry or a network change starts over.
+    async fn resolve_with_status(&self, host: &str) -> Result<Resolved, String> {
+        use std::sync::atomic::Ordering;
+        let (name, _tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
+        let is_name = epix_core::classify_label(name) == epix_core::LabelClass::Name;
+        let needs_chain = is_name && needs_chain_resolve(&self.data_root, host);
+        self.state.resolve_status_set(host, "resolving", None, None).await;
+        if needs_chain {
+            // A name whose xite is already registered under a saved mapping
+            // (the shipped dashboard on a fresh install, a superseded cache
+            // entry) resumes its download from that address right away: the
+            // files are signed by the address either way, and the launch
+            // verifier confirms the name in the background. Waiting for the
+            // registry here would hold the first screen hostage to the RPCs.
+            if let Some((address, false)) = self.state.resolve_name_verified(host).await {
+                if self.state.has_xite(&address).await {
+                    self.state.resolve_status_resolved(host, &address, false).await;
+                    return Ok(Resolved { address, verified: false });
+                }
+            }
+            // In Always mode the chain query must ride Tor: wait for it, and
+            // never fall back to clearnet - this is the path a deferred launch
+            // name takes on first open.
+            if self.tor_always.load(Ordering::Relaxed) && !self.state.tor_status().await.0 {
+                self.state
+                    .resolve_status_set(host, "failed", Some("tor_required"), None)
+                    .await;
+                if !self.await_tor_ready(None).await {
+                    return Err(
+                        "Tor is not available and Always mode forbids clearnet, so this site \
+                         cannot be resolved right now"
+                            .to_string(),
+                    );
+                }
+                self.state.resolve_status_set(host, "resolving", None, None).await;
+            }
+            self.await_trust(host).await?;
+        }
+        let deadline = std::time::Instant::now() + RESOLVE_BUDGET;
+        let mut backoff = std::time::Duration::from_secs(2);
+        loop {
+            self.state.resolve_status_attempt(host).await;
+            let error = match self.resolve_host(host).await {
+                Ok(resolved) => {
+                    self.state
+                        .resolve_status_resolved(host, &resolved.address, resolved.verified)
+                        .await;
+                    return Ok(resolved);
+                }
+                Err(error) => error,
+            };
+            let (state, reason, retry) = error.status();
+            self.state
+                .resolve_status_set(host, state, Some(reason), Some(error.to_string()))
+                .await;
+            if !retry || std::time::Instant::now() >= deadline {
+                return Err(error.to_string());
+            }
+            // A network change or a newly anchored pin wakes every sleeper.
+            let nap = if reason == "not_found" { std::time::Duration::from_secs(30) } else { backoff };
+            tokio::select! {
+                _ = tokio::time::sleep(nap) => {}
+                _ = epix_chain::light_client_wake().notified() => {}
+            }
+            backoff = (backoff * 2).min(std::time::Duration::from_secs(30));
+            if needs_chain {
+                self.await_trust(host).await?;
+            }
+        }
+    }
+
+    /// Block until the name registry can be trusted (the light client has a
+    /// usable pin), publishing what the wait is about: the registry itself,
+    /// or the network under it when the last probe reached no name server.
+    async fn await_trust(&self, host: &str) -> Result<(), String> {
+        if epix_chain::trust_ready() {
+            return Ok(());
+        }
+        let started = std::time::Instant::now();
+        loop {
+            let probe = epix_chain::lc_status::snapshot();
+            let reachable = probe.get("sources_reachable").and_then(serde_json::Value::as_u64);
+            let total = probe.get("sources_total").and_then(serde_json::Value::as_u64).unwrap_or(0);
+            let detail = probe
+                .get("last_error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string);
+            if reachable == Some(0) && total > 0 {
+                self.state
+                    .resolve_status_set(host, "waiting_network", Some("no_network"), detail)
+                    .await;
+            } else {
+                self.state
+                    .resolve_status_set(host, "establishing_trust", None, detail)
+                    .await;
+            }
+            if started.elapsed() >= RESOLVE_BUDGET {
+                return Err("the Epix name registry could not be verified yet".into());
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {}
+                _ = epix_chain::light_client_wake().notified() => {}
+            }
+            if epix_chain::trust_ready() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Re-check the homepage name against the chain whenever it is being
+    /// served from a saved (unverified) mapping, as soon as trust and the
+    /// network allow. Only a proven answer changes anything: a different
+    /// address moves the name (and clears it off the old xite) and the new
+    /// xite downloads on the next open; every error just waits for the next
+    /// chance. "Not found" is an error here too - one RPC's word is not proof.
+    fn spawn_launch_verifier(self: &Arc<Self>) {
+        let this = self.clone();
+        tokio::spawn(async move {
+            let mut backoff = std::time::Duration::from_secs(5);
+            loop {
+                let launch = this.state.launch_status().await;
+                let (label, tld) = launch.display.rsplit_once('.').unwrap_or((&launch.display, "epix"));
+                let pending = !this.network_disabled
+                    && launch.address.is_some()
+                    && !launch.verified
+                    && epix_core::classify_label(label) == epix_core::LabelClass::Name;
+                let mut verified_now = false;
+                if pending && epix_chain::trust_ready() {
+                    let full = format!("{label}.{tld}");
+                    match try_resolve_on_chain_bound(label, tld).await {
+                        Ok((address, binding)) => {
+                            write_resolve_cache_bound(&this.data_root, &full, &address, binding.as_ref());
+                            this.adopt_verified_launch(&full, launch.address.as_deref(), &address).await;
+                            verified_now = true;
+                        }
+                        Err(error) => {
+                            this.state
+                                .log("DEBUG", format!("Homepage name check for {full} deferred: {error}"))
+                                .await;
+                        }
+                    }
+                }
+                if verified_now || !pending {
+                    backoff = std::time::Duration::from_secs(5);
+                }
+                let nap = if pending && !verified_now { backoff } else { std::time::Duration::from_secs(3600) };
+                tokio::select! {
+                    _ = tokio::time::sleep(nap) => {}
+                    _ = this.verifier_wake.notified() => {}
+                    _ = epix_chain::light_client_wake().notified() => {}
+                }
+                backoff = (backoff * 2).min(std::time::Duration::from_secs(60));
+            }
+        });
+    }
+
+    /// The chain confirmed where the homepage name points.
+    async fn adopt_verified_launch(&self, display: &str, current: Option<&str>, address: &str) {
+        match current {
+            Some(current) if current == address => {
+                self.state.set_display(address, display).await;
+                self.state.log("INFO", format!("{display} verified: {address}")).await;
+            }
+            _ => {
+                if let Some(current) = current {
+                    // The name moved. The old xite stays served under its
+                    // address, but it no longer answers to the name.
+                    self.state.clear_display(current).await;
+                    self.state
+                        .log("WARN", format!("{display} now points to {address} (was {current})"))
+                        .await;
+                    self.state.push_notification(
+                        "info",
+                        &format!(
+                            "{display} has been updated to a new version. It will download the \
+                             next time you open it."
+                        ),
+                        0,
+                    );
+                }
+                if self.state.has_xite(address).await {
+                    self.state.set_display(address, display).await;
+                }
+            }
+        }
+        self.state.set_launch_status(display, Some(address), true).await;
+        grant_dashboard_admin(&self.state, address).await;
     }
 
     /// Run the actual download for [`Self::do_ensure`]: register the entry,
@@ -3111,6 +3514,7 @@ impl OnDemand {
         address: &str,
         data_dir: &std::path::Path,
         was_registered: bool,
+        verified: bool,
     ) -> Result<(), String> {
         if !was_registered {
             // Register the xite empty BEFORE the download (EpixNet's
@@ -3123,9 +3527,10 @@ impl OnDemand {
                     XiteEntry { storage: XiteStorage::new(data_dir), content: None },
                 )
                 .await;
-            if host != address {
+            if host != address && verified {
                 self.state.set_display(address, host).await;
             }
+            grant_dashboard_admin(&self.state, address).await;
         }
         // Onion-seeded xites are only reachable once Tor is up. On a cold
         // start the plain TCP transport is still installed, so wait for the
@@ -3134,7 +3539,13 @@ impl OnDemand {
         // download failed". No-op once Tor is up (the steady state). In
         // Always mode, if Tor never comes up, abort rather than clone over
         // clearnet and leak the real IP.
-        if !self.await_tor_ready().await {
+        if !self.await_tor_ready(Some(address)).await {
+            let (_, tor_status) = self.state.tor_status().await;
+            self.state.push_clone_event(
+                address,
+                serde_json::json!(["file_failed", "index.html"]),
+                serde_json::json!({ "reason": "tor_unavailable", "tor_status": tor_status, "peers": 0 }),
+            );
             return Err(
                 "Tor is not available and Always mode forbids clearnet, so this site \
                  cannot be fetched right now"
@@ -3149,17 +3560,32 @@ impl OnDemand {
         let (content, bytes, user_files) = match cloned {
             Ok(r) => r,
             Err(e) => {
-                // Tell the loading screen ("index.html download failed",
-                // "No peers found" when none). Keep the xite registered
-                // even on a first-load failure: add_xite already persisted
-                // it to sites.json, so it survives a restart and resumes on
-                // a later visit (the resume path re-attempts an incomplete
-                // clone). Dropping it here used to lose a freshly-added xite
-                // whose first load failed - e.g. no peers online yet.
+                // Tell the loading screen why, so it can say "no one is
+                // sharing this xite" or "the files could not be downloaded"
+                // instead of guessing. Keep the xite registered even on a
+                // first-load failure: add_xite already persisted it to
+                // sites.json, so it survives a restart and resumes on a later
+                // visit (the resume path re-attempts an incomplete clone).
+                // Dropping it here used to lose a freshly-added xite whose
+                // first load failed - e.g. no peers online yet.
+                let peers = self.state.peer_counts(address).await.total;
+                let (_, tor_status) = self.state.tor_status().await;
+                let reason = if e.contains("verif") {
+                    "content_unverified"
+                } else if peers == 0 {
+                    "no_peers"
+                } else {
+                    "files_unavailable"
+                };
                 self.state.push_clone_event(
                     address,
                     serde_json::json!(["file_failed", "index.html"]),
-                    serde_json::json!({}),
+                    serde_json::json!({
+                        "reason": reason,
+                        "tor_status": tor_status,
+                        "peers": peers,
+                        "detail": e,
+                    }),
                 );
                 return Err(e);
             }
@@ -3400,37 +3826,73 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             .and_then(|v| v.as_u64())
             .filter(|&s| s >= 60)
             .unwrap_or(3600);
-        let mut cfg = xid_lightclient_config(&state, &data_root).await;
         // The advance rotates across the bootstrap RPCs on failure: the pin
         // must keep advancing inside its weak-subjectivity window even when
         // the first endpoint dies for good, and the sources list is exactly
         // the set of independent operators fit for that job. The URL that
-        // answers stays first for the next cycle.
-        let mut rpc_candidates: Vec<String> = std::iter::once(cfg.rpc_url.clone())
-            .chain(cfg.bootstrap_sources.iter().cloned())
-            .collect();
-        rpc_candidates.dedup();
+        // answers stays first for the next cycle. The list is re-read from
+        // config on every cycle: a user stuck on "checking the name registry"
+        // can change the RPC endpoints on the Config page and tap Retry, with
+        // no restart (which the phone apps cannot do anyway).
+        let mut preferred: Option<String> = None;
         // Until first trust is established (fresh install, or back after a
         // long offline stretch), retry quickly with backoff — a user opening
         // the app should not wait 15 minutes for names to resolve. Once
         // trusted, settle into the regular cadence.
         let mut fast_retry_secs = 5u64;
         loop {
+            let mut cfg = xid_lightclient_config(&state, &data_root).await;
+            let mut rpc_candidates: Vec<String> = std::iter::once(cfg.rpc_url.clone())
+                .chain(cfg.bootstrap_sources.iter().cloned())
+                .collect();
+            rpc_candidates.dedup();
+            if let Some(index) = preferred
+                .as_ref()
+                .and_then(|url| rpc_candidates.iter().position(|candidate| candidate == url))
+            {
+                rpc_candidates.swap(0, index);
+            }
             let before = epix_chain::pinned_validators();
             let outcome =
                 advance_with_rpc_rotation(&state, &mut cfg, &mut rpc_candidates).await;
+            if outcome.is_ok() {
+                // The rotation moved the URL that answered to the front.
+                preferred = rpc_candidates.first().cloned();
+            }
             // A xite whose user content could not be xID-verified is waiting on
             // exactly this: the trusted set going from nothing to something.
             // Only that transition retries - not every tick, or an hourly
             // UpToDate would re-index the whole deferred set forever.
             let anchored_now = before.is_none() && epix_chain::pinned_validators().is_some();
             let advanced_ok = outcome.is_ok();
+            match &outcome {
+                Ok(_) => {
+                    epix_chain::lc_status::set_last_error(None);
+                    epix_chain::lc_status::mark_success();
+                }
+                Err(error) => {
+                    epix_chain::lc_status::set_phase("failed");
+                    epix_chain::lc_status::set_last_error(Some(error.clone()));
+                }
+            }
             log_xid_lightclient_outcome(&state, before, outcome).await;
             if anchored_now {
-                let state = state.clone();
+                let retry_state = state.clone();
                 tokio::spawn(async move {
-                    state.retry_deferred_xid_xites().await;
+                    retry_state.retry_deferred_xid_xites().await;
                 });
+                // A deferred homepage (fresh install) can resolve now: start
+                // its download without waiting for the page to ask again, and
+                // wake every resolve parked on trust.
+                let launch = state.launch_status().await;
+                if launch.address.is_none() && !launch.display.is_empty() {
+                    let ensure_state = state.clone();
+                    let home = launch.display.clone();
+                    tokio::spawn(async move {
+                        ensure_state.ensure_xite(&home).await;
+                    });
+                }
+                epix_chain::wake_light_client();
             }
             // The lazy hourly cadence applies only after a SUCCESSFUL cycle.
             // A failed one retries with backoff even when a pin is active:
@@ -3443,10 +3905,22 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
                 interval_secs
             } else {
                 let delay = fast_retry_secs;
-                fast_retry_secs = (fast_retry_secs * 2).min(interval_secs);
-                delay
+                // While something is waiting on trust (a fresh install's first
+                // page), never back off past half a minute: the wait is on
+                // screen, and a network that comes back should be noticed.
+                let cap = if state.parked_resolve_hosts().await.is_empty() { interval_secs } else { 30 };
+                fast_retry_secs = (fast_retry_secs * 2).min(cap);
+                delay.min(cap)
             };
-            tokio::time::sleep(std::time::Duration::from_secs(delay)).await;
+            epix_chain::lc_status::set_next_retry_unix(now_secs() as i64 + delay as i64);
+            // A network change (the shell, or the Retry button) wakes the loop
+            // early and resets the backoff: the user just told us to try.
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(delay)) => {}
+                _ = epix_chain::light_client_wake().notified() => {
+                    fast_retry_secs = 5;
+                }
+            }
         }
     });
 }
@@ -3728,21 +4202,56 @@ async fn serve(
     // nothing - the on-demand resolver clones it on first open once Tor is up -
     // but still records the homepage so the wrapper knows where to send the
     // browser. `address` is empty in that case.
-    let (address, display) = match launch {
-        LaunchTarget::Resolved { address, display, data_dir, content } => {
+    let (address, display, launch_verified) = match launch {
+        LaunchTarget::Resolved { address, display, data_dir, content, verified } => {
             state
                 .add_xite(&address, XiteEntry { storage: XiteStorage::new(&data_dir), content })
                 .await;
             if display != address {
                 state.set_display(&address, &display).await;
             }
-            (address, display)
+            (address, display, verified)
         }
-        LaunchTarget::Deferred { display } => (String::new(), display),
+        LaunchTarget::Deferred { display } => (String::new(), display, false),
     };
     // The launch xite is the homepage: the wrapper's corner home button and
     // the admin pages' back link return here from any other xite.
     state.set_homepage(&display);
+    // A deferred name may still have its copy on disk under the registry's
+    // display alias (the resolve cache was lost, or the entry was never bound):
+    // the shipped dashboard is served from that copy while the chain is
+    // unreachable. Only the well-known dashboard address qualifies - a display
+    // alias alone is not proof of anything for any other xite.
+    let launch_address = if address.is_empty() {
+        match state.address_for_display(&display).await {
+            Some(alias) if alias == DASHBOARD_XITE_ADDRESS && state.content(&alias).await.is_some() => {
+                Some(alias)
+            }
+            _ => None,
+        }
+    } else {
+        Some(address.clone())
+    };
+    let launch_verified = launch_verified && !address.is_empty();
+    state
+        .set_launch_status(&display, launch_address.as_deref(), launch_verified)
+        .await;
+    if let Some(launch_address) = &launch_address {
+        grant_dashboard_admin(&state, launch_address).await;
+    }
+    if let Some(launch_address) = launch_address.as_deref().filter(|_| !launch_verified) {
+        let source = if state.content(launch_address).await.is_some() {
+            "from the saved copy"
+        } else {
+            "from its built-in address"
+        };
+        state
+            .log(
+                "INFO",
+                format!("Serving {display} {source}; the name is confirmed once the Epix chain answers"),
+            )
+            .await;
+    }
 
     // Xite dbs are in-memory, so merger databases (Git Epix, Epix Post) are
     // empty on every boot until filled from their merged xites - do it now
@@ -3800,8 +4309,13 @@ async fn serve(
         in_flight_token: std::sync::atomic::AtomicU64::new(0),
         tor_expected: std::sync::atomic::AtomicBool::new(false),
         tor_always: std::sync::atomic::AtomicBool::new(false),
+        resolving: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+        verifier_wake: tokio::sync::Notify::new(),
     });
     state.set_on_demand(on_demand.clone()).await;
+    // A homepage served from its saved copy (or deferred) gets its name
+    // checked against the chain as soon as trust and the network allow.
+    on_demand.spawn_launch_verifier();
     // The same component syncs included/user content for existing xites
     // (called by the resync loop, so EpixTalk-style posts stay fresh).
     state.set_content_syncer(on_demand.clone()).await;
@@ -4165,11 +4679,30 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
-/// Look up a name in the resolve cache: `Some((address, fresh))` where `fresh`
-/// says the entry is within [`RESOLVE_CACHE_TTL_SECS`]. When finality is active,
-/// a name entry is accepted only if it carries the exact height and digest of
-/// the current durable checkpoint. Legacy unbound entries become cache misses.
-fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<(String, bool)> {
+/// A resolve-cache entry as the cache-only paths see it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CachedResolution {
+    address: String,
+    /// The mapping is chain-verified: a finality-bound entry whose binding is
+    /// still the current checkpoint, or any entry while verification is off.
+    /// An unverified entry is this node's own earlier finality-bound answer
+    /// that a later checkpoint superseded (a light-client advance, a resolve
+    /// of another name, the pin aging out). It may only ever serve a xite that
+    /// is already on disk under that address, never drive a clone, and it is
+    /// re-verified as soon as the chain answers.
+    verified: bool,
+    /// Within [`RESOLVE_CACHE_TTL_SECS`]. A stale entry is re-resolved when the
+    /// chain is reachable and kept when it is not.
+    fresh: bool,
+}
+
+/// Look up a name in the resolve cache. When finality is active, an entry is
+/// verified only if it carries the exact height and digest of the current
+/// durable checkpoint; a bound entry that no longer matches is unverified.
+/// Legacy unbound entries (written trusting the RPC alone, before finality
+/// binding existed) are cache misses in finality mode - they are the one kind
+/// an attacker could have planted, so they resolve fresh, once.
+fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<CachedResolution> {
     let cache = read_resolve_cache(data_root);
     let finality_required =
         epix_chain::verify_finality_enabled() && cache_target_requires_finality(full);
@@ -4187,22 +4720,31 @@ fn parse_cached_resolution(
     value: &serde_json::Value,
     finality_required: bool,
     binding_current: impl Fn(u64, &str) -> bool,
-) -> Option<(String, bool)> {
+) -> Option<CachedResolution> {
     match value {
-        serde_json::Value::String(address) if !finality_required => Some((address.clone(), false)),
+        // Legacy plain-string entries: with verification off they are the
+        // compatibility cache, treated as expired; with it on they are a miss.
+        serde_json::Value::String(address) if !finality_required => Some(CachedResolution {
+            address: address.clone(),
+            verified: true,
+            fresh: false,
+        }),
         serde_json::Value::String(_) => None,
         serde_json::Value::Object(entry) => {
-            if finality_required {
-                let height = entry.get("finality_height")?.as_u64()?;
-                let digest = entry.get("finality_digest")?.as_str()?;
-                if !binding_current(height, digest) {
-                    return None;
-                }
-            }
             let address = entry.get("address")?.as_str()?.to_string();
             let resolved_at = entry.get("resolved_at").and_then(|v| v.as_u64()).unwrap_or(0);
             let fresh = now_secs().saturating_sub(resolved_at) < RESOLVE_CACHE_TTL_SECS;
-            Some((address, fresh))
+            if !finality_required {
+                return Some(CachedResolution { address, verified: true, fresh });
+            }
+            // Unbound objects have the same provenance as legacy strings.
+            let height = entry.get("finality_height")?.as_u64()?;
+            let digest = entry.get("finality_digest")?.as_str()?;
+            if binding_current(height, digest) {
+                Some(CachedResolution { address, verified: true, fresh })
+            } else {
+                Some(CachedResolution { address, verified: false, fresh: false })
+            }
         }
         _ => None,
     }
@@ -5120,13 +5662,16 @@ mod tests {
     fn resolve_cache_ttl_fresh_expired_legacy() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
+        let cached = |address: &str, verified: bool, fresh: bool| {
+            Some(CachedResolution { address: address.into(), verified, fresh })
+        };
 
         // Miss.
         assert_eq!(cached_resolution(root, "talk.epix"), None);
 
-        // A fresh write is fresh.
+        // A fresh write is fresh (and, with verification off, verified).
         write_resolve_cache(root, "talk.epix", "epix1talk");
-        assert_eq!(cached_resolution(root, "talk.epix"), Some(("epix1talk".into(), true)));
+        assert_eq!(cached_resolution(root, "talk.epix"), cached("epix1talk", true, true));
 
         // An entry past the TTL reports expired (address still returned, so
         // callers can fall back to it when the chain is unreachable).
@@ -5136,18 +5681,21 @@ mod tests {
             "legacy.epix": "epix1legacy",
         });
         std::fs::write(resolve_cache_path(root), serde_json::to_vec(&cache).unwrap()).unwrap();
-        assert_eq!(cached_resolution(root, "old.epix"), Some(("epix1old".into(), false)));
+        assert_eq!(cached_resolution(root, "old.epix"), cached("epix1old", true, false));
 
         // Legacy plain-string entries: address known, treated as expired.
-        assert_eq!(cached_resolution(root, "legacy.epix"), Some(("epix1legacy".into(), false)));
+        assert_eq!(cached_resolution(root, "legacy.epix"), cached("epix1legacy", true, false));
 
         // Re-writing upgrades a legacy entry to the timestamped form.
         write_resolve_cache(root, "legacy.epix", "epix1legacy");
-        assert_eq!(cached_resolution(root, "legacy.epix"), Some(("epix1legacy".into(), true)));
+        assert_eq!(cached_resolution(root, "legacy.epix"), cached("epix1legacy", true, true));
     }
 
     #[test]
-    fn finality_mode_rejects_unbound_or_superseded_cache_entries() {
+    fn finality_mode_drops_unbound_entries_and_marks_superseded_ones_unverified() {
+        let cached = |address: &str, verified: bool, fresh: bool| {
+            Some(CachedResolution { address: address.into(), verified, fresh })
+        };
         let unbound = serde_json::json!({
             "address": "epix1forged",
             "resolved_at": now_secs(),
@@ -5158,8 +5706,13 @@ mod tests {
             "a fresh legacy cache entry must not bypass finality"
         );
         assert_eq!(
+            parse_cached_resolution(&serde_json::json!("epix1forged"), true, |_h, _d| true),
+            None,
+            "a legacy string entry is a miss in finality mode"
+        );
+        assert_eq!(
             parse_cached_resolution(&unbound, false, |_height, _digest| false),
-            Some(("epix1forged".into(), true)),
+            cached("epix1forged", true, true),
             "explicit legacy mode keeps the compatibility cache"
         );
 
@@ -5173,12 +5726,14 @@ mod tests {
             parse_cached_resolution(&bound, true, |height, digest| {
                 height == 42 && digest == "11".repeat(32)
             }),
-            Some(("epix1verified".into(), true))
+            cached("epix1verified", true, true)
         );
+        // Superseded: the answer stays known but unverified - it may serve a
+        // xite already on disk, never drive a clone - and never counts as fresh.
         assert_eq!(
             parse_cached_resolution(&bound, true, |_height, _digest| false),
-            None,
-            "a cache binding stops being valid when the checkpoint advances"
+            cached("epix1verified", false, false),
+            "a cache binding stops being verified when the checkpoint advances"
         );
 
         let pinned_at = 1_000_000_i64;
@@ -5188,20 +5743,20 @@ mod tests {
             parse_cached_resolution(&bound, true, |_height, _digest| {
                 pin_current_at(pinned_at + ws_period)
             }),
-            Some(("epix1verified".into(), true)),
+            cached("epix1verified", true, true),
             "the exact weak-subjectivity boundary is still usable"
         );
         assert_eq!(
             parse_cached_resolution(&bound, true, |_height, _digest| {
                 pin_current_at(pinned_at + ws_period + 1)
             }),
-            None,
-            "after pin expiry a disk entry is a total miss, not a stale fallback"
+            cached("epix1verified", false, false),
+            "after pin expiry a disk entry is unverified, not gone"
         );
         assert_eq!(
             parse_cached_resolution(&bound, true, |height, _digest| height >= 43),
-            None,
-            "a height-42 cache must miss after a trusted repin at height 43"
+            cached("epix1verified", false, false),
+            "a height-42 cache is unverified after a trusted repin at height 43"
         );
     }
 
@@ -5539,45 +6094,84 @@ mod tests {
     }
 
     #[test]
-    fn cached_launch_uses_cache_only_and_defers_a_miss() {
+    fn select_launch_uses_local_state_only_and_defers_a_miss() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let resolved = |selection: LaunchSelection| match selection {
+            LaunchSelection::Resolved { address, display, verified } => (address, display, verified),
+            LaunchSelection::Deferred { display } => panic!("{display} must be resolved"),
+        };
+        let nothing_on_disk = |_: &str| false;
 
         // A checksum-valid address passes straight through in either form.
         assert_eq!(
-            cached_launch(root, DASH).unwrap(),
-            Some((DASH.into(), DASH.into()))
+            resolved(select_launch(root, DASH, nothing_on_disk).unwrap()),
+            (DASH.into(), DASH.into(), true)
         );
         assert_eq!(
-            cached_launch(root, &format!("{DASH}.epix")).unwrap(),
-            Some((DASH.into(), DASH.into()))
+            resolved(select_launch(root, &format!("{DASH}.epix"), nothing_on_disk).unwrap()),
+            (DASH.into(), DASH.into(), true)
         );
 
-        // An uncached name has no cache hit -> None (boot defers it).
-        assert_eq!(cached_launch(root, "talk.epix").unwrap(), None);
-        assert_eq!(cached_launch(root, "epix1shop").unwrap(), None);
+        // An uncached name is deferred: boot never asks the chain.
+        assert!(matches!(
+            select_launch(root, "talk.epix", nothing_on_disk).unwrap(),
+            LaunchSelection::Deferred { display } if display == "talk.epix"
+        ));
+        assert!(matches!(
+            select_launch(root, "epix1shop", nothing_on_disk).unwrap(),
+            LaunchSelection::Deferred { display } if display == "epix1shop.epix"
+        ));
 
-        // Once cached it resolves from disk without touching the chain, keyed by
-        // the full name (matching how resolve_target writes it).
+        // Once cached it resolves from disk, keyed by the full name.
         write_resolve_cache(root, "talk.epix", DASH);
         assert_eq!(
-            cached_launch(root, "talk.epix").unwrap(),
-            Some((DASH.into(), "talk.epix".into()))
+            resolved(select_launch(root, "talk.epix", nothing_on_disk).unwrap()),
+            (DASH.into(), "talk.epix".into(), true)
         );
 
         // A bare label defaults to the epix TLD for both lookup and display.
         write_resolve_cache(root, "blog.epix", DASH);
         assert_eq!(
-            cached_launch(root, "blog").unwrap(),
-            Some((DASH.into(), "blog.epix".into()))
+            resolved(select_launch(root, "blog", nothing_on_disk).unwrap()),
+            (DASH.into(), "blog.epix".into(), true)
         );
 
         // A bad-checksum address shape is rejected before a forged cache entry
         // can turn it into a name.
         let typo = format!("{}q", &DASH[..DASH.len() - 1]);
         write_resolve_cache(root, &format!("{typo}.epix"), "epix1forged");
-        assert!(cached_launch(root, &typo).is_err());
+        let error = select_launch(root, &typo, nothing_on_disk).unwrap_err();
+        assert!(error.contains("bad checksum"), "{error}");
+    }
+
+    #[test]
+    fn superseded_launch_mapping_serves_only_what_is_on_disk() {
+        const TALK: &str = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+        let superseded = |_: &str| {
+            Some(CachedResolution { address: TALK.into(), verified: false, fresh: false })
+        };
+        let verified = |_: &str| {
+            Some(CachedResolution { address: TALK.into(), verified: true, fresh: false })
+        };
+
+        // The copy is on disk: serve it now, flagged for re-verification.
+        assert!(matches!(
+            select_launch_from("talk.epix", superseded, |address| address == TALK).unwrap(),
+            LaunchSelection::Resolved { address, display, verified: false }
+                if address == TALK && display == "talk.epix"
+        ));
+        // Nothing on disk: an unverified mapping must not drive a clone.
+        assert!(matches!(
+            select_launch_from("talk.epix", superseded, |_| false).unwrap(),
+            LaunchSelection::Deferred { display } if display == "talk.epix"
+        ));
+        // A verified mapping serves regardless (the clone is on demand).
+        assert!(matches!(
+            select_launch_from("talk.epix", verified, |_| false).unwrap(),
+            LaunchSelection::Resolved { verified: true, .. }
+        ));
     }
 
     #[test]
@@ -5623,38 +6217,28 @@ mod tests {
     }
 
     #[test]
-    fn launch_display_normalizes_names_and_addresses() {
-        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
-        assert_eq!(launch_display("talk.epix").unwrap(), "talk.epix");
-        assert_eq!(launch_display("blog").unwrap(), "blog.epix");
-        assert_eq!(launch_display("epix1shop").unwrap(), "epix1shop.epix");
-        assert_eq!(launch_display(DASH).unwrap(), DASH);
-        assert_eq!(launch_display(&format!("{DASH}.epix")).unwrap(), DASH);
-
-        let typo = format!("{}q", &DASH[..DASH.len() - 1]);
-        assert!(launch_display(&typo).is_err());
-    }
-
-    #[tokio::test]
-    async fn resolve_target_rejects_bad_checksum_and_resolves_bare_epix1_name() {
+    fn select_launch_rejects_bad_checksum_and_resolves_bare_epix1_name() {
         const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let typo = format!("{}q", &DASH[..DASH.len() - 1]);
 
         write_resolve_cache(root, &format!("{typo}.epix"), "epix1forged");
-        let error = resolve_target(root, &typo).await.unwrap_err();
+        let error = select_launch(root, &typo, |_| false).unwrap_err();
         assert!(error.contains("bad checksum"), "{error}");
 
+        // A short epix1 branding name is a name, resolved through the cache.
         write_resolve_cache(root, "epix1shop.epix", DASH);
-        assert_eq!(
-            resolve_target(root, "epix1shop").await.unwrap(),
-            (DASH.into(), "epix1shop.epix".into(), true)
-        );
-        assert_eq!(
-            resolve_target(root, DASH).await.unwrap(),
-            (DASH.into(), DASH.into(), false)
-        );
+        assert!(matches!(
+            select_launch(root, "epix1shop", |_| false).unwrap(),
+            LaunchSelection::Resolved { address, display, verified: true }
+                if address == DASH && display == "epix1shop.epix"
+        ));
+        assert!(matches!(
+            select_launch(root, DASH, |_| false).unwrap(),
+            LaunchSelection::Resolved { address, display, verified: true }
+                if address == DASH && display == DASH
+        ));
     }
 
     #[test]
@@ -5672,7 +6256,7 @@ mod tests {
 
         for invalid in [&absolute, &traversal, &invalid_bech32] {
             assert!(validated_xite_address(invalid, "test xID record").is_err());
-            assert!(resolved_launch(&opts, invalid.clone(), "evil.epix".into()).is_err());
+            assert!(resolved_launch(&opts, invalid.clone(), "evil.epix".into(), true).is_err());
         }
         assert!(!absolute_escape.exists());
         assert!(!traversal_escape.exists());
@@ -5693,10 +6277,13 @@ mod tests {
         .unwrap();
         for name in ["absolute.epix", "traversal.epix", "invalid.epix"] {
             assert_eq!(validated_cached_resolution(&data_root, name), None);
-            assert_eq!(cached_launch(&data_root, name).unwrap(), None);
+            assert!(matches!(
+                select_launch(&data_root, name, |_| true).unwrap(),
+                LaunchSelection::Deferred { .. }
+            ));
         }
 
-        let launch = resolved_launch(&opts, DASH.into(), "safe.epix".into()).unwrap();
+        let launch = resolved_launch(&opts, DASH.into(), "safe.epix".into(), true).unwrap();
         let LaunchTarget::Resolved { data_dir, .. } = launch else {
             panic!("valid address must produce a resolved launch");
         };
@@ -5754,10 +6341,8 @@ mod tests {
         assert!(error.contains("cannot read node config"), "{error}");
     }
 
-    #[tokio::test]
-    async fn offline_uncached_launch_arms_no_egress_without_calling_resolver() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-
+    #[test]
+    fn offline_uncached_launch_arms_no_egress_and_defers() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         std::fs::create_dir_all(root.join("private")).unwrap();
@@ -5768,82 +6353,81 @@ mod tests {
         .unwrap();
         let opts = NodeOptions::new(root, "uncached.epix");
         let armed = Arc::new(std::sync::Mutex::new(None));
-        let resolver_called = Arc::new(AtomicBool::new(false));
 
         let armed_for_hook = armed.clone();
-        let called_for_resolver = resolver_called.clone();
-        let (launch, policy) = prepare_startup_launch_with(
-            &opts,
-            false,
-            move |policy| *armed_for_hook.lock().unwrap() = Some(policy),
-            move |_data_root, _target| {
-                called_for_resolver.store(true, Ordering::SeqCst);
-                async { Err::<(String, String, bool), String>("resolver called".into()) }
-            },
-        )
-        .await
+        let (launch, policy) = prepare_startup_launch_with(&opts, move |policy| {
+            *armed_for_hook.lock().unwrap() = Some(policy)
+        })
         .unwrap();
 
         assert_eq!(policy, StartupNetworkPolicy::Offline);
         assert_eq!(*armed.lock().unwrap(), Some(StartupNetworkPolicy::Offline));
-        assert!(!resolver_called.load(Ordering::SeqCst));
         let LaunchTarget::Deferred { display } = launch else {
             panic!("an uncached offline launch must remain deferred");
         };
         assert_eq!(display, "uncached.epix");
     }
 
-    /// The v0.5.0 fresh-install deadlock: with no pin installed, chain
-    /// resolution fails closed BEFORE the light client that would bootstrap
-    /// the pin ever runs. Boot must defer the homepage, not die.
-    #[tokio::test]
-    async fn awaiting_network_trust_defers_unresolvable_launch_instead_of_failing_boot() {
+    /// A fresh install: nothing on disk maps the homepage name. Boot defers
+    /// it to the on-demand resolver (which waits for trust and the network
+    /// and reports progress) instead of asking the chain itself - the v0.5.0
+    /// deadlock was a boot-time resolve failing closed before the light client
+    /// that would have made it succeed ever ran.
+    #[test]
+    fn uncached_launch_name_is_deferred_without_touching_the_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let opts = NodeOptions::new(root, "talk.epix");
+
+        let (launch, policy) = prepare_startup_launch_with(&opts, |_policy| {}).unwrap();
+
+        assert_eq!(policy, StartupNetworkPolicy::Direct);
+        let LaunchTarget::Deferred { display } = launch else {
+            panic!("an uncached launch name must be deferred");
+        };
+        assert_eq!(display, "talk.epix");
+    }
+
+    /// The shipped dashboard is the one name that needs no registry to
+    /// exist: a fresh install serves it from its compiled-in address at once
+    /// (unverified until the chain confirms the name), so the first screen
+    /// never depends on an RPC being reachable.
+    #[test]
+    fn dashboard_launch_serves_from_the_compiled_in_address_on_a_fresh_install() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let opts = NodeOptions::new(root, "dashboard.epix");
 
-        let (launch, policy) = prepare_startup_launch_with(
-            &opts,
-            true,
-            |_policy| {},
-            |_data_root, _target| async {
-                Err::<(String, String, bool), String>(
-                    "could not resolve dashboard.epix: finality not verified: \
-                     no pinned validator set installed"
-                        .into(),
-                )
-            },
-        )
-        .await
-        .unwrap();
+        let (launch, _policy) = prepare_startup_launch_with(&opts, |_policy| {}).unwrap();
 
-        assert_eq!(policy, StartupNetworkPolicy::Direct);
-        let LaunchTarget::Deferred { display } = launch else {
-            panic!("an unresolvable launch during trust bootstrap must be deferred");
+        let LaunchTarget::Resolved { address, display, verified, content, .. } = launch else {
+            panic!("the dashboard must be resolved on a fresh install");
         };
+        assert_eq!(address, DASHBOARD_XITE_ADDRESS);
         assert_eq!(display, "dashboard.epix");
+        assert!(!verified, "nothing confirmed the name yet");
+        assert!(content.is_none(), "nothing is on disk yet; the clone is on demand");
+        // A verified cache entry takes precedence over the compiled-in address.
+        write_resolve_cache(root, "dashboard.epix", "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu");
+        let (launch, _policy) = prepare_startup_launch_with(&opts, |_policy| {}).unwrap();
+        assert!(matches!(
+            launch,
+            LaunchTarget::Resolved { verified: true, address, .. }
+                if address == "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu"
+        ));
     }
 
     /// The deferral never hides a malformed target: an address-shaped typo is
-    /// a phishing guard and still fails boot while trust is bootstrapping.
-    #[tokio::test]
-    async fn awaiting_network_trust_still_rejects_address_shaped_typo() {
+    /// a phishing guard and still fails boot.
+    #[test]
+    fn address_shaped_typo_still_fails_boot() {
         const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let typo = format!("{}q", &DASH[..DASH.len() - 1]);
         let opts = NodeOptions::new(root, &typo);
 
-        let result = prepare_startup_launch_with(
-            &opts,
-            true,
-            |_policy| {},
-            |_data_root, _target| async {
-                Err::<(String, String, bool), String>("bad checksum".into())
-            },
-        )
-        .await;
-        let error = match result {
+        let error = match prepare_startup_launch_with(&opts, |_policy| {}) {
             Ok(_) => panic!("an address-shaped typo must stop startup"),
             Err(error) => error,
         };
@@ -5851,33 +6435,26 @@ mod tests {
         assert!(error.contains("bad checksum"), "{error}");
     }
 
-    /// With a trust root installed, a resolve failure is a real verdict and
-    /// still stops boot exactly as before.
-    #[tokio::test]
-    async fn resolve_failure_with_trust_installed_still_fails_boot() {
+    /// A cached launch name whose copy is on disk serves at boot; the chain
+    /// is never consulted, so no outage can fail boot any more.
+    #[test]
+    fn cached_launch_name_serves_at_boot() {
+        const DASH: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         let opts = NodeOptions::new(root, "dashboard.epix");
+        write_resolve_cache(root, "dashboard.epix", DASH);
 
-        let result = prepare_startup_launch_with(
-            &opts,
-            false,
-            |_policy| {},
-            |_data_root, _target| async {
-                Err::<(String, String, bool), String>("could not resolve dashboard.epix".into())
-            },
-        )
-        .await;
-        let error = match result {
-            Ok(_) => panic!("a resolve failure with trust installed must stop startup"),
-            Err(error) => error,
+        let (launch, _policy) = prepare_startup_launch_with(&opts, |_policy| {}).unwrap();
+
+        let LaunchTarget::Resolved { address, display, verified, .. } = launch else {
+            panic!("a cached launch name must serve at boot");
         };
-
-        assert!(error.contains("could not resolve"), "{error}");
+        assert_eq!((address.as_str(), display.as_str(), verified), (DASH, "dashboard.epix", true));
     }
 
-    #[tokio::test]
-    async fn malformed_config_stops_before_route_or_resolver_egress() {
+    #[test]
+    fn malformed_config_stops_before_route_is_armed() {
         use std::sync::atomic::{AtomicBool, Ordering};
 
         let dir = tempfile::tempdir().unwrap();
@@ -5886,28 +6463,17 @@ mod tests {
         std::fs::write(root.join("private").join("config.json"), b"{").unwrap();
         let opts = NodeOptions::new(root, "uncached.epix");
         let route_armed = Arc::new(AtomicBool::new(false));
-        let resolver_called = Arc::new(AtomicBool::new(false));
 
         let armed_for_hook = route_armed.clone();
-        let called_for_resolver = resolver_called.clone();
-        let result = prepare_startup_launch_with(
-            &opts,
-            false,
-            move |_policy| armed_for_hook.store(true, Ordering::SeqCst),
-            move |_data_root, _target| {
-                called_for_resolver.store(true, Ordering::SeqCst);
-                async { Err::<(String, String, bool), String>("resolver called".into()) }
-            },
-        )
-        .await;
-        let error = match result {
+        let error = match prepare_startup_launch_with(&opts, move |_policy| {
+            armed_for_hook.store(true, Ordering::SeqCst)
+        }) {
             Ok(_) => panic!("malformed config must stop startup"),
             Err(error) => error,
         };
 
         assert!(error.contains("invalid node config"), "{error}");
         assert!(!route_armed.load(Ordering::SeqCst));
-        assert!(!resolver_called.load(Ordering::SeqCst));
     }
 
     #[tokio::test]
@@ -5952,6 +6518,8 @@ mod tests {
             in_flight_token: std::sync::atomic::AtomicU64::new(0),
             tor_expected: std::sync::atomic::AtomicBool::new(false),
             tor_always: std::sync::atomic::AtomicBool::new(false),
+            resolving: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            verifier_wake: tokio::sync::Notify::new(),
         };
 
         // A raw address that is not local would normally announce to the Epix

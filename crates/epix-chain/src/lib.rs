@@ -397,6 +397,23 @@ pub fn verify_finality_enabled() -> bool {
     XID_VERIFY_FINALITY.load(Ordering::Relaxed)
 }
 
+/// Whether the installed pin can back a verified resolution right now: a
+/// pinned validator set is installed AND it is inside its weak-subjectivity
+/// window. An expired pin counts as no pin: finality fails closed on it, so
+/// anything waiting for trust must keep waiting (the light client re-anchors
+/// it, see [`lightclient`]).
+pub fn trust_usable() -> bool {
+    finality_pin_floor_at(now_unix()).is_some()
+}
+
+/// Whether a resolve may go ahead as far as trust is concerned: either
+/// client-side finality verification is off (legacy RPC-boolean mode) or the
+/// pin is usable. The on-demand resolve path waits on this before asking the
+/// chain for a name.
+pub fn trust_ready() -> bool {
+    !verify_finality_enabled() || trust_usable()
+}
+
 /// Install a pinned validator set from a JSON pin file and turn ON client-side
 /// xID finality verification. After this, xID resolution REQUIRES a digest signed
 /// by more than two thirds of the pinned voting power and fails closed otherwise
@@ -594,6 +611,271 @@ pub fn finality_checkpoint_covers(height: u64) -> bool {
         && height <= checkpoint_height
 }
 
+// ---------------------------------------------------------------------------
+// Light-client status and wake signal. The bootstrap code and the node's
+// light-client loop write the status; the UI reads it (serverInfo.xid_trust)
+// so a user sitting through a slow first start can see what is going on.
+// Nothing here gates a resolve: [`trust_usable`] does that.
+// ---------------------------------------------------------------------------
+
+/// Process-wide status of the light-client loop that establishes and
+/// advances trust: the phase it is in, what its last attempt found, and when
+/// it will try again. Display data only.
+pub mod lc_status {
+    use std::sync::{OnceLock, RwLock};
+
+    /// One reading of the light-client loop.
+    #[derive(Clone, Debug, serde::Serialize)]
+    pub struct LightClientStatus {
+        /// `idle` | `probing` | `bootstrapping` | `verifying` | `anchored` | `failed`.
+        pub phase: String,
+        /// The most recent failure; cleared by [`mark_success`].
+        pub last_error: Option<String>,
+        /// Bootstrap sources that answered the last `/status` probe, once one
+        /// has run.
+        pub sources_reachable: Option<u32>,
+        pub sources_total: Option<u32>,
+        pub last_attempt_unix: i64,
+        pub last_success_unix: i64,
+        pub next_retry_unix: i64,
+    }
+
+    fn cell() -> &'static RwLock<LightClientStatus> {
+        static CELL: OnceLock<RwLock<LightClientStatus>> = OnceLock::new();
+        CELL.get_or_init(|| {
+            RwLock::new(LightClientStatus {
+                phase: "idle".to_string(),
+                last_error: None,
+                sources_reachable: None,
+                sources_total: None,
+                last_attempt_unix: 0,
+                last_success_unix: 0,
+                next_retry_unix: 0,
+            })
+        })
+    }
+
+    // A panic while holding the lock poisons it; the status is only display
+    // data, so keep serving it rather than going blank for the process life.
+    fn update(apply: impl FnOnce(&mut LightClientStatus)) {
+        match cell().write() {
+            Ok(mut status) => apply(&mut status),
+            Err(poisoned) => apply(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// A clone of the current status.
+    pub fn get() -> LightClientStatus {
+        match cell().read() {
+            Ok(status) => status.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        }
+    }
+
+    pub fn set_phase(phase: &str) {
+        update(|status| status.phase = phase.to_string());
+    }
+
+    pub fn set_sources(reachable: u32, total: u32) {
+        update(|status| {
+            status.sources_reachable = Some(reachable);
+            status.sources_total = Some(total);
+        });
+    }
+
+    pub fn set_last_error(error: Option<String>) {
+        update(|status| status.last_error = error);
+    }
+
+    pub fn set_next_retry_unix(at: i64) {
+        update(|status| status.next_retry_unix = at);
+    }
+
+    /// Stamp the start of an attempt.
+    pub fn mark_attempt() {
+        let now = crate::now_unix();
+        update(|status| status.last_attempt_unix = now);
+    }
+
+    /// Stamp a successful attempt. The last error is cleared with it: a
+    /// success has just disproved it, and a stale message next to
+    /// `anchored` would only confuse the reader.
+    pub fn mark_success() {
+        let now = crate::now_unix();
+        update(|status| {
+            status.last_success_unix = now;
+            status.last_error = None;
+        });
+    }
+
+    /// The status as JSON with exactly the struct's fields (snake_case), for
+    /// `serverInfo.xid_trust`.
+    pub fn snapshot() -> serde_json::Value {
+        serde_json::to_value(get()).unwrap_or(serde_json::Value::Null)
+    }
+}
+
+/// The signal the light-client loop sleeps on between attempts, so a
+/// "network is back" report (the shells' connectivity callback, the wrapper's
+/// Retry button) ends its backoff at once instead of after up to an hour.
+pub fn light_client_wake() -> &'static tokio::sync::Notify {
+    static WAKE: tokio::sync::Notify = tokio::sync::Notify::const_new();
+    &WAKE
+}
+
+/// Wake the light-client loop. Both calls are needed: `notify_waiters`
+/// reaches a loop that is sleeping on `notified()` right now, and
+/// `notify_one` leaves a permit for one that is mid-attempt and will only
+/// start waiting later, so the wake is never lost. The cost is at most one
+/// extra retry when both land on the same waiter.
+pub fn wake_light_client() {
+    let wake = light_client_wake();
+    wake.notify_waiters();
+    wake.notify_one();
+}
+
+#[cfg(test)]
+mod lc_status_tests {
+    use super::*;
+
+    /// The only test that writes the status cell, so it can assert exact
+    /// values without racing another test.
+    #[test]
+    fn setters_land_in_the_snapshot_and_success_clears_the_error() {
+        lc_status::set_phase("probing");
+        lc_status::set_sources(2, 4);
+        lc_status::set_last_error(Some("only 2/4 sources reachable".into()));
+        lc_status::set_next_retry_unix(99);
+        lc_status::mark_attempt();
+
+        let snapshot = lc_status::snapshot();
+        // serde_json sorts object keys, so compare as a set.
+        let mut keys: Vec<&str> =
+            snapshot.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        let mut expected = [
+            "phase",
+            "last_error",
+            "sources_reachable",
+            "sources_total",
+            "last_attempt_unix",
+            "last_success_unix",
+            "next_retry_unix",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "exactly the struct's fields, nothing else");
+        assert_eq!(snapshot["phase"], "probing");
+        assert_eq!(snapshot["last_error"], "only 2/4 sources reachable");
+        assert_eq!(snapshot["sources_reachable"], 2);
+        assert_eq!(snapshot["sources_total"], 4);
+        assert_eq!(snapshot["next_retry_unix"], 99);
+        assert!(snapshot["last_attempt_unix"].as_i64().unwrap() > 0);
+        assert_eq!(snapshot["last_success_unix"], 0);
+
+        lc_status::mark_success();
+        lc_status::set_phase("anchored");
+        let status = lc_status::get();
+        assert_eq!(status.phase, "anchored");
+        assert!(status.last_error.is_none(), "a success disproves the last error");
+        assert!(status.last_success_unix >= status.last_attempt_unix);
+        assert_eq!(status.next_retry_unix, 99, "success leaves the retry schedule alone");
+
+        lc_status::set_phase("idle");
+    }
+
+    #[tokio::test]
+    async fn wake_reaches_a_waiter_whether_or_not_it_is_waiting_yet() {
+        // Not waiting yet: the permit from notify_one is picked up later.
+        wake_light_client();
+        tokio::time::timeout(std::time::Duration::from_secs(2), light_client_wake().notified())
+            .await
+            .expect("a wake sent before the wait must still be seen");
+
+        // Already waiting (or about to): either notify_waiters or the permit
+        // reaches it, so the outcome does not depend on the interleaving.
+        let waiter = tokio::spawn(async { light_client_wake().notified().await });
+        wake_light_client();
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("a waiting loop must be woken")
+            .unwrap();
+    }
+}
+
+#[cfg(test)]
+mod trust_gate_tests {
+    use super::*;
+
+    /// Puts the process-global finality state back the way it was, since
+    /// these tests move it under the shared test lock.
+    struct Restore {
+        verify: bool,
+        pinned: Option<finality::PinnedSet>,
+    }
+
+    impl Restore {
+        fn capture() -> Self {
+            Self {
+                verify: verify_finality_enabled(),
+                pinned: pinned_validators(),
+            }
+        }
+    }
+
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            set_verify_finality(false);
+            set_pinned_validators(self.pinned.take());
+            set_verify_finality(self.verify);
+        }
+    }
+
+    fn pin_captured_at(unix: i64) -> finality::PinnedSet {
+        let mut validators = std::collections::HashMap::new();
+        validators.insert(
+            "epixvalcons1gate".to_string(),
+            finality::PinnedValidator { pubkey: [3u8; 32], voting_power: 1 },
+        );
+        finality::PinnedSet::new(validators, "epix_1917-1", unix, 7).unwrap()
+    }
+
+    #[tokio::test]
+    async fn trust_usable_needs_a_pin_inside_its_window() {
+        let _guard = finality_state_test_guard().await;
+        let _restore = Restore::capture();
+
+        set_pinned_validators(None);
+        assert!(!trust_usable(), "no pin: nothing to trust");
+
+        set_pinned_validators(Some(pin_captured_at(now_unix())));
+        assert!(trust_usable(), "a fresh pin is usable");
+
+        // Just past the window even after the allowed clock skew.
+        let expired = now_unix()
+            - XID_WS_PERIOD_SECS.load(Ordering::Relaxed)
+            - XID_SKEW_SECS.load(Ordering::Relaxed)
+            - 1;
+        set_pinned_validators(Some(pin_captured_at(expired)));
+        assert!(!trust_usable(), "an expired pin is as good as none");
+    }
+
+    #[tokio::test]
+    async fn trust_ready_only_waits_when_verification_is_on() {
+        let _guard = finality_state_test_guard().await;
+        let _restore = Restore::capture();
+
+        set_pinned_validators(None);
+        set_verify_finality(false);
+        assert!(trust_ready(), "legacy mode never waits for a pin");
+
+        set_verify_finality(true);
+        assert!(!trust_ready(), "verification on and no pin: wait");
+
+        set_pinned_validators(Some(pin_captured_at(now_unix())));
+        assert!(trust_ready(), "verification on and a fresh pin: go");
+    }
+}
+
 #[cfg(test)]
 mod endpoint_rotation_tests {
     use super::*;
@@ -779,6 +1061,7 @@ mod chain_error_tests {
             (ChainError::LeafBindingFailed("x".into()), false),
             (ChainError::FinalityUnverified("x".into()), false),
             (ChainError::FinalityAdvanced, false),
+            (ChainError::TrustNotEstablished, false),
             (ChainError::Malformed("x".into()), false),
         ];
         for (error, expected) in cases {
@@ -1050,6 +1333,13 @@ pub enum ChainError {
     /// could be published. The resolver catches this internally and retries.
     #[error("finality advanced while publishing the resolved snapshot")]
     FinalityAdvanced,
+    /// Client-side finality verification is on but there is no usable pinned
+    /// validator set yet (none installed, or the installed one is past its
+    /// weak-subjectivity window). The resolver refuses to ask the chain at all
+    /// in this state, so no name reaches an RPC before trust exists; the caller
+    /// waits for the light client to anchor and retries.
+    #[error("trust not established: no pinned validator set yet")]
+    TrustNotEstablished,
     #[error("malformed chain response: {0}")]
     Malformed(String),
 }
@@ -1063,7 +1353,7 @@ impl ChainError {
     /// outage (`Rpc`), a hostile or broken RPC (`MerkleInvalid`,
     /// `DigestMismatch`, `LeafBindingFailed`, `Malformed`), or a trust state
     /// that is not established yet (`NotFinalized`, `FinalityUnverified`,
-    /// `FinalityAdvanced`).
+    /// `FinalityAdvanced`, `TrustNotEstablished`).
     ///
     /// Callers use this to decide whether a verification verdict may be
     /// RECORDED. Treating an outage as "name not found" is how a node that
