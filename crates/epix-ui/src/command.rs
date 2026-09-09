@@ -23,6 +23,8 @@ const ADMIN_COMMANDS: &[&str] = &[
     "certList",
     "certSet",
     "channelJoinAllsite",
+    "identityRemove",
+    "identitySetDefault",
     "chartDbQuery",
     "chartGetPeerLocations",
     "configList",
@@ -107,8 +109,16 @@ const DELETE_XITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
 /// (public gateway) node these need genuine ownership of the bound xite, never
 /// just the wrapper's elevated id - otherwise any visitor could rewrite or
 /// delete files on a xite the gateway only serves.
-const WRITE_COMMANDS: &[&str] =
-    &["fileWrite", "fileDelete", "siteSign", "sitePublish", "certAdd"];
+const WRITE_COMMANDS: &[&str] = &[
+    "fileWrite",
+    "fileDelete",
+    "siteSign",
+    "sitePublish",
+    "identitySelect",
+    "identitySetDefault",
+    "identityLinkComplete",
+    "identityRemove",
+];
 
 /// ADMIN commands that are read-only and expose nothing sensitive, so a
 /// restricted (public gateway) node still answers them - the read-only
@@ -605,7 +615,16 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(UserSetGlobalSettings),
         Arc::new(WrapperNonce),
         Arc::new(FileGet),
-        // Certs: obtain + select an ID-provider identity.
+        // Identities: link, list and select xIDs, plus the legacy cert*
+        // wrappers older xites still call.
+        Arc::new(IdentityList),
+        Arc::new(IdentitySelect),
+        Arc::new(IdentitySetDefault),
+        Arc::new(IdentityLinkStart),
+        Arc::new(IdentityLinkComplete),
+        Arc::new(IdentityRemove),
+        Arc::new(IdentityDiscover),
+        Arc::new(XidInvalidateCache),
         Arc::new(CertAdd),
         Arc::new(CertSelect),
         Arc::new(CertSet),
@@ -1719,17 +1738,19 @@ fn xid_info_value(info: &epix_chain::xid_identity::XidInfo) -> Value {
 }
 
 /// First string out of `[value]` / `{key: value}` params (xites use both).
+/// `peer_address` is the key the xID xite's link flow sends.
 fn xid_param<'a>(p: &'a Value, key: &str) -> Option<&'a str> {
     p.as_array()
         .and_then(|a| a.first())
         .or_else(|| p.get(key))
+        .or_else(|| p.get("peer_address"))
         .and_then(|v| v.as_str())
 }
 
 /// `xidResolve(address)` - reverse-resolve a linked identity address to its
-/// xID name (chain-verified, cached). When the queried address is the user's
-/// own auth address for this xite and it isn't linked, the user's other
-/// addresses (master + per-xite auths) are tried too, matching EpixNet.
+/// xID name (chain-verified, cached). When the queried address is one of the
+/// user's own and it isn't linked, the user's other addresses (master,
+/// identities, per-xite keys) are tried too, matching EpixNet.
 /// Also registered as `xidResolveIdentity`, the name some apps call.
 struct XidResolve {
     cmd: &'static str,
@@ -1754,14 +1775,9 @@ impl WsCommand for XidResolve {
         if let Some(info) = epix_chain::xid_identity::resolve_identity(address).await {
             return Ok(xid_info_value(&info));
         }
-        let own = s
-            .state
-            .user_auth_address(s.address()?)
-            .await
-            .map(|a| a == address)
-            .unwrap_or(false);
-        if own {
-            for other in s.state.user_all_addresses().await {
+        let held = s.state.user_all_addresses().await;
+        if held.iter().any(|a| a == address) {
+            for other in held {
                 if other == address {
                     continue;
                 }
@@ -2398,8 +2414,9 @@ fn aes_try_keys(iv: &[u8], ct: &[u8], keys: &[Vec<u8>]) -> Value {
     Value::Null
 }
 
-/// `ecdsaSign(data, privatekey?)` - sign `data`. With no key, the user's auth
-/// private key for the bound xite is used.
+/// `ecdsaSign(data, privatekey?)` - sign `data`. With no key, the bound
+/// xite's identity key is used (the same key that signs its user content);
+/// with no identity selected the command fails with `XID_REQUIRED`.
 struct EcdsaSign;
 #[async_trait]
 impl WsCommand for EcdsaSign {
@@ -2412,7 +2429,7 @@ impl WsCommand for EcdsaSign {
             Some(pk) => pk.to_string(),
             None => {
                 let address = s.address()?.to_string();
-                s.state.user_auth_privatekey(&address).await?
+                s.state.user_cert_auth_privatekey(&address).await?
             }
         };
         Ok(Value::from(epix_crypt::sign(data, &privatekey)?))
@@ -3303,11 +3320,30 @@ impl WsCommand for PermissionDetails {
             .unwrap_or("");
         let details = match permission {
             "ADMIN" => "Allow this xite to administrate your Epix node \
-                <span style='color: red'>(Make sure you trust the xite developer before accepting!)</span>",
+                <span style='color: red'>(Make sure you trust the xite developer before accepting!)</span>"
+                .to_string(),
             "NOSANDBOX" => "Allow this xite to run any code on your machine \
-                <span style='color: red'>(Make sure you trust the xite developer before accepting!)</span>",
-            p if p.starts_with("Merger:") => "Allow this xite to read and list other xites of a given type",
-            _ => "",
+                <span style='color: red'>(Make sure you trust the xite developer before accepting!)</span>"
+                .to_string(),
+            "CHANNELS" => "Allow this xite to read your whole private message inbox (every app) \
+                and to send private messages as your identity"
+                .to_string(),
+            p if p.starts_with("Channels:") => {
+                // The app name comes from the xite; it is rendered as HTML.
+                let app = p["Channels:".len()..]
+                    .replace('&', "&amp;")
+                    .replace('<', "&lt;")
+                    .replace('>', "&gt;")
+                    .replace('"', "&quot;");
+                format!(
+                    "Allow this xite to read and send private messages for its own app \
+                    (<b>{app}</b>) as your identity. It cannot see your mail or other apps."
+                )
+            }
+            p if p.starts_with("Merger:") => {
+                "Allow this xite to read and list other xites of a given type".to_string()
+            }
+            _ => String::new(),
         };
         Ok(Value::from(details))
     }
@@ -3881,64 +3917,178 @@ fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
         .or_else(|| p.as_str())
 }
 
-/// `certAdd` - store a cert issued by an ID provider (bound to the xite's auth
-/// address) and select it globally. Not admin (any xite can offer a cert).
+/// The legacy `certList` row shape over the identity model: every linked
+/// identity as an `xid.epix` cert, `selected` for the one this xite acts as.
+async fn legacy_cert_rows(state: &AppState, address: &str) -> Vec<Value> {
+    state
+        .identity_rows(address)
+        .await
+        .into_iter()
+        .map(|row| {
+            json!({
+                "auth_address": row["auth_address"],
+                "auth_type": "xid",
+                "auth_user_name": row["name"],
+                "domain": epix_user::XID_CERT_DOMAIN,
+                "selected": row["selected"],
+            })
+        })
+        .collect()
+}
+
+/// `identityList` - the linked identities with this xite's selection state:
+/// `{identities: [{xid, name, auth_address, directory, cert_user_id, selected,
+/// default, linked_at}], selected, default, scope, unlinked}`.
+struct IdentityList;
+#[async_trait]
+impl WsCommand for IdentityList {
+    fn name(&self) -> &'static str {
+        "identityList"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(s.state.identity_list_for(s.address()?).await)
+    }
+}
+
+/// `identitySelect {auth_address}` - which held identity this xite acts as: an
+/// address, `""` for none (browse anonymously), or `null` to inherit the
+/// node-wide default. Per-xite, so no ADMIN.
+struct IdentitySelect;
+#[async_trait]
+impl WsCommand for IdentitySelect {
+    fn name(&self) -> &'static str {
+        "identitySelect"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let raw = p
+            .get("auth_address")
+            .or_else(|| p.as_array().and_then(|a| a.first()));
+        let choice = match raw {
+            None | Some(Value::Null) => None,
+            Some(v) => Some(
+                v.as_str()
+                    .ok_or("identitySelect: auth_address must be a string or null")?,
+            ),
+        };
+        let changed = s.state.identity_select(&address, choice).await?;
+        Ok(Value::from(if changed { "ok" } else { "Not changed" }))
+    }
+}
+
+/// `identitySetDefault {auth_address}` - the node-wide default identity every
+/// xite without an override acts as; `""` clears it. Admin.
+struct IdentitySetDefault;
+#[async_trait]
+impl WsCommand for IdentitySetDefault {
+    fn name(&self) -> &'static str {
+        "identitySetDefault"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let addr = arg_str(p, "auth_address", 0).unwrap_or("");
+        let choice = (!addr.is_empty()).then_some(addr);
+        let changed = s.state.identity_set_default(choice).await?;
+        Ok(Value::from(if changed { "ok" } else { "Not changed" }))
+    }
+}
+
+/// `identityLinkStart` - pick (or mint) a spare identity address and return
+/// `{auth_address, url}`: the xID xite URL that links it on chain and comes
+/// back to this xite. The node completes the link itself when the xID xite's
+/// poll (`xidInvalidateCache`) confirms the transaction.
+struct IdentityLinkStart;
+#[async_trait]
+impl WsCommand for IdentityLinkStart {
+    fn name(&self) -> &'static str {
+        "identityLinkStart"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let (auth_address, url) = s.state.identity_link_start(&address).await?;
+        Ok(json!({ "auth_address": auth_address, "url": url }))
+    }
+}
+
+/// `identityLinkComplete {auth_address, name?}` - record a linked identity
+/// once the chain lists `auth_address` as active for `name` (reverse-resolved
+/// when omitted), and select it for this xite. Returns `{xid, auth_address,
+/// cert_user_id, added}` or `{error: "identity_not_linked", auth_address}`.
+struct IdentityLinkComplete;
+#[async_trait]
+impl WsCommand for IdentityLinkComplete {
+    fn name(&self) -> &'static str {
+        "identityLinkComplete"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = s.address()?.to_string();
+        let auth_address = arg_str(p, "auth_address", 0)
+            .ok_or("identityLinkComplete: auth_address required")?;
+        let name = arg_str(p, "name", 1).filter(|n| !n.is_empty());
+        s.state.identity_link_complete(auth_address, name, Some(&address)).await
+    }
+}
+
+/// `identityRemove {auth_address}` - forget a linked identity. Its key stays
+/// in users.json and content it published stays valid. Admin.
+struct IdentityRemove;
+#[async_trait]
+impl WsCommand for IdentityRemove {
+    fn name(&self) -> &'static str {
+        "identityRemove"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let auth_address =
+            arg_str(p, "auth_address", 0).ok_or("identityRemove: auth_address required")?;
+        let removed = s.state.identity_remove(auth_address).await;
+        Ok(Value::from(if removed { "ok" } else { "Not changed" }))
+    }
+}
+
+/// `identityDiscover` - every xID name the chain links to one of the user's
+/// addresses: `[{name, tld, auth_address, active, held_locally}]`.
+struct IdentityDiscover;
+#[async_trait]
+impl WsCommand for IdentityDiscover {
+    fn name(&self) -> &'static str {
+        "identityDiscover"
+    }
+    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Ok(json!(s.state.identity_discover(&[]).await))
+    }
+}
+
+/// `xidInvalidateCache {peer_address|address}` - drop the cached reverse
+/// lookup for one address so the next `xidResolve` asks the chain. The xID
+/// xite polls this right after its linking transaction; when the address is
+/// the link this node started, the node completes the link in the background.
+struct XidInvalidateCache;
+#[async_trait]
+impl WsCommand for XidInvalidateCache {
+    fn name(&self) -> &'static str {
+        "xidInvalidateCache"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = xid_param(p, "address").ok_or("xidInvalidateCache: address required")?;
+        s.state.xid_invalidate_cache(address).await;
+        Ok(Value::from("ok"))
+    }
+}
+
+/// `certAdd` - provider-issued certs are gone; identities are linked xIDs.
 struct CertAdd;
 #[async_trait]
 impl WsCommand for CertAdd {
     fn name(&self) -> &'static str {
         "certAdd"
     }
-    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let address = s.address()?.to_string();
-        let domain = arg_str(p, "domain", 0).ok_or("certAdd: domain required")?;
-        let auth_type = arg_str(p, "auth_type", 1).unwrap_or("web");
-        let auth_user_name = arg_str(p, "auth_user_name", 2).unwrap_or("");
-        let cert = arg_str(p, "cert", 3).unwrap_or("");
-        match s.state.cert_add(&address, domain, auth_type, auth_user_name, cert).await? {
-            Some(true) => {
-                s.state.push_notification(
-                    "done",
-                    &format!("New certificate added: {auth_type}/{auth_user_name}@{domain}"),
-                    5000,
-                );
-                s.state.push_xite_info(&address).await;
-                Ok(Value::from("ok"))
-            }
-            // A different cert already exists for this domain: ask the user to
-            // confirm the change (EpixNet's confirm prompt), then replace.
-            Some(false) => {
-                let ok = s
-                    .state
-                    .confirm(
-                        &address,
-                        &format!("Change your certificate to {auth_type}/{auth_user_name}@{domain}?"),
-                        "Change",
-                    )
-                    .await;
-                if !ok {
-                    return Ok(Value::from("Not changed"));
-                }
-                s.state
-                    .cert_replace(&address, domain, auth_type, auth_user_name, cert)
-                    .await?;
-                s.state.push_notification(
-                    "done",
-                    &format!("Certificate changed to {auth_type}/{auth_user_name}@{domain}"),
-                    5000,
-                );
-                s.state.push_xite_info(&address).await;
-                Ok(Value::from("ok"))
-            }
-            None => Ok(Value::from("Not changed")),
-        }
+    async fn handle(&self, _s: &WsSession, _p: &Value) -> Result<Value, String> {
+        Err("certAdd is not supported: link an xID identity instead (identityLinkComplete)".into())
     }
 }
 
-/// `certSelect` - choose which stored identity to use on this xite. Full picker
-/// UI needs wrapper confirm/injectScript events (a follow-up); for now this
-/// selects the first acceptable cert (or leaves the current one) and returns the
-/// account list so a caller can display choices.
+/// `certSelect {accepted_domains?, accept_any?}` - legacy picker entry: when
+/// xID identities are acceptable, opens the account picker and waits for the
+/// choice; returns the legacy cert rows either way.
 struct CertSelect;
 #[async_trait]
 impl WsCommand for CertSelect {
@@ -3953,27 +4103,16 @@ impl WsCommand for CertSelect {
             .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
             .unwrap_or_default();
         let accept_any = p.get("accept_any").and_then(|v| v.as_bool()).unwrap_or(accepted.is_empty());
-
-        let certs = s.state.cert_list(&address).await;
-        // Pick an acceptable cert to select (already-selected wins; else first).
-        let acceptable = |domain: &str| accept_any || accepted.iter().any(|d| d == domain);
-        let already = certs.iter().find(|c| c["selected"].as_bool() == Some(true));
-        let choice = already
-            .filter(|c| c["domain"].as_str().is_some_and(acceptable))
-            .or_else(|| certs.iter().find(|c| c["domain"].as_str().is_some_and(acceptable)));
-        if let Some(cert) = choice {
-            if let Some(domain) = cert["domain"].as_str() {
-                s.state.cert_set(domain).await;
-                s.state.push_xite_info(&address).await;
-            }
+        if accept_any || accepted.iter().any(|d| d == epix_user::XID_CERT_DOMAIN) {
+            let _ = s.state.cert_xid(&address, None).await?;
         }
-        // Return the accounts so a UI can present them (None + the certs).
-        Ok(json!(certs))
+        Ok(json!(legacy_cert_rows(&s.state, &address).await))
     }
 }
 
-/// `certSet {domain}` - select a cert on all xites (portable cert), or clear
-/// with an empty domain. Admin.
+/// `certSet {domain}` - legacy: `""` browses this xite anonymously (the
+/// sidebar's disconnect button), anything else inherits the default identity
+/// again. Per-xite now, not global. Admin.
 struct CertSet;
 #[async_trait]
 impl WsCommand for CertSet {
@@ -3982,20 +4121,17 @@ impl WsCommand for CertSet {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let domain = arg_str(p, "domain", 0).unwrap_or("");
-        s.state.cert_set(domain).await;
-        if let Ok(addr) = s.address() {
-            let addr = addr.to_string();
-            s.state.push_xite_info(&addr).await;
-        }
+        let address = s.address()?.to_string();
+        let choice = if domain.is_empty() { Some("") } else { None };
+        s.state.identity_select(&address, choice).await?;
         Ok(Value::from("ok"))
     }
 }
 
 /// `certXid` - the xID identity flow (EpixNet's `actionCertXid`). With no
-/// name, shows the account picker (discovered linked xID names + a "New"
-/// link) and acts on the choice; with a name, acquires that cert directly.
-/// Self-signs the cert once the chosen address is verified on chain as an
-/// active linked identity, else offers to open the xID xite to link it.
+/// name, shows the account picker (held identities, names the chain links to
+/// the user's addresses, and a "New" link) and acts on the choice; with a
+/// name, selects or links that identity directly.
 struct CertXid;
 #[async_trait]
 impl WsCommand for CertXid {
@@ -4010,7 +4146,8 @@ impl WsCommand for CertXid {
     }
 }
 
-/// `certList` - the user's certs with which is selected for this xite. Admin.
+/// `certList` - legacy: the linked identities as `xid.epix` cert rows with
+/// which is selected for this xite. Admin.
 struct CertList;
 #[async_trait]
 impl WsCommand for CertList {
@@ -4019,7 +4156,7 @@ impl WsCommand for CertList {
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        Ok(json!(s.state.cert_list(&address).await))
+        Ok(json!(legacy_cert_rows(&s.state, &address).await))
     }
 }
 
@@ -4496,13 +4633,17 @@ mod tests {
     #[tokio::test]
     async fn ecdsa_sign_then_verify_roundtrips() {
         let state = AppState::new("test");
-        let session = WsSession::new(state, Some("1site".into()));
-        // Sign with the user's auth key for the xite (no explicit privatekey).
+        let session = WsSession::new(state.clone(), Some("1site".into()));
+        // No identity: nothing signs (browsing is anonymous).
+        let err = EcdsaSign.handle(&session, &json!(["a message"])).await.unwrap_err();
+        assert_eq!(err, epix_user::XID_REQUIRED);
+        // With an identity, the signature verifies against its address - the
+        // same key that signs the user's content, not the derived xite key.
+        let addr = state.test_link_identity("alice").await;
         let sig = EcdsaSign.handle(&session, &json!(["a message"])).await.unwrap();
         let sig = sig.as_str().unwrap();
-        // The signer address is the user's auth address for this xite.
-        let address = session.state.user_auth_address("1site").await.unwrap();
-        assert!(epix_crypt::verify("a message", &address, sig));
+        assert_eq!(session.state.user_auth_address("1site").await.unwrap(), addr);
+        assert!(epix_crypt::verify("a message", &addr, sig));
     }
 
     #[tokio::test]
@@ -4999,7 +5140,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cert_add_select_list_flow() {
+    async fn identity_commands_flow() {
         let state = AppState::new("test");
         let dir = tempfile::tempdir().unwrap();
         state
@@ -5011,36 +5152,127 @@ mod tests {
                 },
             )
             .await;
-        let session = WsSession::new(state, Some("talk.epix".into()));
+        let session = WsSession::new(state.clone(), Some("talk.epix".into()));
+        async fn info(session: &WsSession) -> Value {
+            XiteInfo.handle(session, &Value::Null).await.unwrap()
+        }
 
-        // No certs yet.
-        let list = CertList.handle(&session, &Value::Null).await.unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 0);
+        // No identities yet: browsing is anonymous, the legacy list is empty,
+        // and provider certs are gone.
+        let list = IdentityList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list["identities"], json!([]));
+        assert!(list["selected"].is_null());
+        assert_eq!(list["scope"], "inherit");
+        assert_eq!(CertList.handle(&session, &Value::Null).await.unwrap(), json!([]));
+        assert!(info(&session).await["cert_user_id"].is_null());
+        assert!(CertAdd.handle(&session, &json!({ "domain": "xid.epix" })).await.is_err());
 
-        // certAdd stores + selects a cert for this xite's identity.
-        CertAdd
-            .handle(&session, &json!({
-                "domain": "xid.epix",
-                "auth_type": "xid",
-                "auth_user_name": "alice",
-                "cert": "sig",
-            }))
+        // Link an identity through the WS command (the chain stand-in lists
+        // the minted address as active for the name).
+        let alice = state.test_mint_identity_address().await;
+        crate::state::xid_test::link("alice", &alice);
+        let res = IdentityLinkComplete
+            .handle(&session, &json!({ "auth_address": alice, "name": "alice" }))
             .await
             .unwrap();
-        let list = CertList.handle(&session, &Value::Null).await.unwrap();
-        assert_eq!(list.as_array().unwrap().len(), 1);
-        assert_eq!(list[0]["domain"], "xid.epix");
-        assert_eq!(list[0]["auth_user_name"], "alice");
-        assert_eq!(list[0]["selected"], true);
+        assert_eq!(res["xid"], "alice.epix");
+        assert_eq!(res["cert_user_id"], "alice@xid.epix");
+        assert_eq!(res["added"], true);
 
-        // siteInfo now reports the cert user id.
-        let info = XiteInfo.handle(&session, &Value::Null).await.unwrap();
-        assert_eq!(info["cert_user_id"], "alice@xid.epix");
+        // It became the default, so this xite inherits it; the legacy list
+        // renders it as an xid.epix cert.
+        let list = IdentityList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list["identities"][0]["selected"], true);
+        assert_eq!(list["default"], alice);
+        assert_eq!(list["scope"], "inherit");
+        let legacy = CertList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(legacy[0]["domain"], "xid.epix");
+        assert_eq!(legacy[0]["auth_user_name"], "alice");
+        assert_eq!(legacy[0]["selected"], true);
+        let i = info(&session).await;
+        assert_eq!(i["cert_user_id"], "alice@xid.epix");
+        assert_eq!(i["xid_directory"], "alice.epix");
+        assert_eq!(i["identities"][0]["xid"], "alice.epix");
 
-        // certSet "" clears it everywhere.
+        // A second identity linked from this xite becomes its override (alice
+        // stays the default), and the selection commands move it around.
+        let bob = state.test_mint_identity_address().await;
+        crate::state::xid_test::link("bob", &bob);
+        IdentityLinkComplete
+            .handle(&session, &json!({ "auth_address": bob, "name": "bob" }))
+            .await
+            .unwrap();
+        let i = info(&session).await;
+        assert_eq!(i["cert_user_id"], "bob@xid.epix");
+        assert_eq!(i["identity_scope"], "xite");
+        assert_eq!(
+            IdentitySelect.handle(&session, &json!({ "auth_address": null })).await.unwrap(),
+            "ok"
+        );
+        assert_eq!(info(&session).await["cert_user_id"], "alice@xid.epix");
+        assert_eq!(
+            IdentitySetDefault.handle(&session, &json!({ "auth_address": bob })).await.unwrap(),
+            "ok"
+        );
+        assert_eq!(info(&session).await["cert_user_id"], "bob@xid.epix");
+        assert_eq!(
+            IdentitySelect.handle(&session, &json!({ "auth_address": alice })).await.unwrap(),
+            "ok"
+        );
+        let i = info(&session).await;
+        assert_eq!(i["cert_user_id"], "alice@xid.epix");
+        assert_eq!(i["identity_scope"], "xite");
+        assert_eq!(
+            IdentitySelect.handle(&session, &json!({ "auth_address": alice })).await.unwrap(),
+            "Not changed"
+        );
+
+        // certSet "" browses this xite anonymously; the default is untouched.
         CertSet.handle(&session, &json!([""])).await.unwrap();
-        let info = XiteInfo.handle(&session, &Value::Null).await.unwrap();
-        assert!(info["cert_user_id"].is_null());
+        let i = info(&session).await;
+        assert!(i["cert_user_id"].is_null());
+        assert_eq!(i["identity_scope"], "none");
+        assert_eq!(IdentityList.handle(&session, &Value::Null).await.unwrap()["default"], bob);
+
+        // Unknown identities are refused; removing the default clears it.
+        assert!(IdentitySelect
+            .handle(&session, &json!({ "auth_address": "epix1nobody" }))
+            .await
+            .is_err());
+        assert_eq!(
+            IdentityRemove.handle(&session, &json!({ "auth_address": bob })).await.unwrap(),
+            "ok"
+        );
+        let list = IdentityList.handle(&session, &Value::Null).await.unwrap();
+        assert_eq!(list["identities"].as_array().unwrap().len(), 1);
+        assert!(list["default"].is_null());
+        assert_eq!(list["unlinked"], json!([bob]));
+    }
+
+    #[tokio::test]
+    async fn xid_resolve_accepts_peer_address() {
+        // The xID xite's link flow sends `{peer_address}`; dotted names are
+        // forward-resolved, so the parameter is read without any chain call.
+        assert_eq!(xid_param(&json!({ "peer_address": "epix1abc" }), "address"), Some("epix1abc"));
+        assert_eq!(xid_param(&json!({ "address": "epix1abc" }), "address"), Some("epix1abc"));
+        assert_eq!(xid_param(&json!(["epix1abc"]), "address"), Some("epix1abc"));
+        assert_eq!(xid_param(&json!({}), "address"), None);
+    }
+
+    #[tokio::test]
+    async fn permission_details_describe_channel_grants() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state, Some("talk.epix".into()));
+        let whole = PermissionDetails.handle(&session, &json!("CHANNELS")).await.unwrap();
+        assert!(whole.as_str().unwrap().contains("whole private message inbox"), "{whole}");
+        let scoped = PermissionDetails.handle(&session, &json!(["Channels:talk"])).await.unwrap();
+        let text = scoped.as_str().unwrap();
+        assert!(text.contains("<b>talk</b>") && text.contains("cannot see your mail"), "{text}");
+        // The app name is xite-supplied and rendered as HTML: it is escaped.
+        let hostile =
+            PermissionDetails.handle(&session, &json!("Channels:<img src=x>")).await.unwrap();
+        assert!(!hostile.as_str().unwrap().contains("<img"), "{hostile}");
+        assert_eq!(PermissionDetails.handle(&session, &json!("Nope")).await.unwrap(), json!(""));
     }
 
     #[test]

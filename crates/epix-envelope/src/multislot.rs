@@ -115,20 +115,34 @@ fn open_body(k_msg: &[u8; 32], body_ct: &[u8]) -> Option<Vec<u8>> {
 }
 
 /// The cleartext of the shared body: everything the engine's per-slot seal used
-/// to carry, now shared across all slots. `f` = sender xID, `t` = sent_ms.
-fn encode_body_plain(sender_xid: &str, members: &[String], subject: &str, body: &str, sent_ms: i64) -> Vec<u8> {
-    json!({ "f": sender_xid, "m": members, "s": subject, "b": body, "t": sent_ms })
-        .to_string()
-        .into_bytes()
+/// to carry, now shared across all slots. `f` = sender xID, `t` = sent_ms,
+/// `a` = the client app the message belongs to. `a` is omitted for mail, so a
+/// mail body is byte-identical to the pre-app format and a node that predates
+/// the tag reads every message as mail.
+fn encode_body_plain(
+    sender_xid: &str,
+    members: &[String],
+    subject: &str,
+    body: &str,
+    sent_ms: i64,
+    app: &str,
+) -> Vec<u8> {
+    let mut v = json!({ "f": sender_xid, "m": members, "s": subject, "b": body, "t": sent_ms });
+    if !app.is_empty() && app != crate::store::DEFAULT_APP {
+        v["a"] = json!(app);
+    }
+    v.to_string().into_bytes()
 }
 
-/// The decrypted shared body: `(sender_xid, members, subject, body, sent_ms)`.
+/// The decrypted shared body: `(sender_xid, members, subject, body, sent_ms, app)`.
 pub struct BodyPlain {
     pub sender_xid: String,
     pub members: Vec<String>,
     pub subject: String,
     pub body: String,
     pub sent_ms: i64,
+    /// The client app named inside the sealed body; mail when untagged.
+    pub app: String,
 }
 
 fn decode_body_plain(bytes: &[u8]) -> Option<BodyPlain> {
@@ -143,6 +157,12 @@ fn decode_body_plain(bytes: &[u8]) -> Option<BodyPlain> {
         subject: v.get("s").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         body: v.get("b").and_then(|x| x.as_str()).unwrap_or("").to_string(),
         sent_ms: v.get("t").and_then(|x| x.as_i64()).unwrap_or(0),
+        app: v
+            .get("a")
+            .and_then(|x| x.as_str())
+            .filter(|a| !a.is_empty())
+            .unwrap_or(crate::store::DEFAULT_APP)
+            .to_string(),
     })
 }
 
@@ -278,6 +298,7 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     conv_id: [u8; 16],
     subject: &str,
     body: &str,
+    app: &str,
     now_ms: i64,
     next_attempt_ms: i64,
     rule: &PoolRule,
@@ -313,7 +334,7 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
 
     // ONE shared body under a fresh single-use key.
     let k_msg = rand32();
-    let body_plain = encode_body_plain(my_xid, members, subject, body, now_ms);
+    let body_plain = encode_body_plain(my_xid, members, subject, body, now_ms, app);
     let body_ct = seal_body(&k_msg, &body_plain);
     let ks_plain = keyslot_plain(&k_msg, &body_ct);
 
@@ -440,6 +461,7 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
         subject: subject.to_string(),
         body: body.to_string(),
         sent_ms: now_ms,
+        app: app.to_string(),
     });
     let commit = crate::store::OutboundCommit {
         sessions,
@@ -468,6 +490,7 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     conv_id: [u8; 16],
     subject: &str,
     body: &str,
+    app: &str,
     now_ms: i64,
     next_attempt_ms: i64,
     rule: &PoolRule,
@@ -485,6 +508,7 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
         conv_id,
         subject,
         body,
+        app,
         now_ms,
         next_attempt_ms,
         rule,
@@ -570,6 +594,7 @@ pub fn send_multi_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
         conv_id,
         subject,
         body,
+        crate::store::DEFAULT_APP,
         now_ms,
         next_attempt_ms,
         rule,
@@ -592,6 +617,7 @@ pub fn prepare_multi_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
     conv_id: [u8; 16],
     subject: &str,
     body: &str,
+    app: &str,
     now_ms: i64,
     next_attempt_ms: i64,
     rule: &PoolRule,
@@ -608,6 +634,7 @@ pub fn prepare_multi_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
         conv_id,
         subject,
         body,
+        app,
         now_ms,
         next_attempt_ms,
         rule,
@@ -693,6 +720,7 @@ pub fn send_multi_with_rln_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
         conv_id,
         subject,
         body,
+        crate::store::DEFAULT_APP,
         now_ms,
         next_attempt_ms,
         rule,
@@ -715,6 +743,7 @@ pub fn prepare_multi_with_rln_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
     conv_id: [u8; 16],
     subject: &str,
     body: &str,
+    app: &str,
     now_ms: i64,
     next_attempt_ms: i64,
     rule: &PoolRule,
@@ -738,6 +767,7 @@ pub fn prepare_multi_with_rln_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
         conv_id,
         subject,
         body,
+        app,
         now_ms,
         next_attempt_ms,
         rule,
@@ -760,6 +790,7 @@ pub fn prepare_multi_with_rln_reserved_scheduled<E: Engine + ?Sized, S: Envelope
     conv_id: [u8; 16],
     subject: &str,
     body: &str,
+    app: &str,
     now_ms: i64,
     next_attempt_ms: i64,
     rule: &PoolRule,
@@ -777,6 +808,7 @@ pub fn prepare_multi_with_rln_reserved_scheduled<E: Engine + ?Sized, S: Envelope
         conv_id,
         subject,
         body,
+        app,
         now_ms,
         next_attempt_ms,
         rule,
@@ -930,7 +962,7 @@ mod tests {
     #[test]
     fn shared_body_binding_rejects_a_substituted_body() {
         let k_msg = [7u8; 32];
-        let plain = encode_body_plain("alice.epix", &["bob.epix".into()], "subj", "body ZXQ", 42);
+        let plain = encode_body_plain("alice.epix", &["bob.epix".into()], "subj", "body ZXQ", 42, "mail");
         let body_ct = seal_body(&k_msg, &plain);
         let hash = *blake3::hash(&body_ct).as_bytes();
 
@@ -942,11 +974,30 @@ mod tests {
 
         // A DIFFERENT body (attacker swap) fails the hash binding even though the
         // key is right — no substituted body is ever accepted.
-        let other = seal_body(&k_msg, &encode_body_plain("alice.epix", &[], "", "EVIL", 0));
+        let other = seal_body(&k_msg, &encode_body_plain("alice.epix", &[], "", "EVIL", 0, "mail"));
         assert!(open_shared_body(&k_msg, &hash, &other).is_none(), "swapped body rejected");
 
         // Wrong key fails the AEAD.
         assert!(open_shared_body(&[9u8; 32], &hash, &body_ct).is_none(), "wrong key rejected");
+    }
+
+    #[test]
+    fn body_plain_carries_the_app_tag_and_defaults_to_mail() {
+        // Mail bodies stay byte-identical to the pre-app format: no `a` field.
+        let mail = encode_body_plain("alice.epix", &[], "s", "b", 1, "mail");
+        assert!(!String::from_utf8_lossy(&mail).contains("\"a\""));
+        assert_eq!(decode_body_plain(&mail).unwrap().app, "mail");
+        // A body written before the tag existed reads as mail too.
+        let legacy = br#"{"f":"alice.epix","m":[],"s":"s","b":"b","t":1}"#;
+        assert_eq!(decode_body_plain(legacy).unwrap().app, "mail");
+        // Any other app travels inside the sealed body and comes back out.
+        let talk = encode_body_plain("alice.epix", &[], "s", "b", 1, "talk");
+        assert_eq!(decode_body_plain(&talk).unwrap().app, "talk");
+        let k = [5u8; 32];
+        let ct = seal_body(&k, &talk);
+        assert!(!String::from_utf8_lossy(&ct).contains("talk"), "the tag is sealed");
+        let bp = open_shared_body(&k, blake3::hash(&ct).as_bytes(), &ct).unwrap();
+        assert_eq!(bp.app, "talk");
     }
 
     #[test]

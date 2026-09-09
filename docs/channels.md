@@ -51,6 +51,73 @@ members + messages), NOT a second mail-specific schema — mail, forum, and DMs 
 UI surfaces over one channel store. The group engine is `epix-group-proto`
 (MLS-backed), a sibling of `epix-pairwise-engine`, behind the same `Engine` seam.
 
+## Identities and the hub
+
+- **One channel identity per linked xID.** A node holds any number of linked
+  identities (see users.json `identities`, the `identity*` WS commands and the
+  Config page's Identities section). Each has its own channel key material
+  (`derive_consumer_seed("channel", <linked address>)`), its own key bundle
+  directory `data/users/<name>.epix/` in the hub, its own RLN membership, and its
+  own inbox in the private index (`identity` rows; every identity-scoped table
+  carries `identity_id`). A xite's `channel*` commands act as the identity that
+  xite currently uses (the node-wide default, or the xite's own choice); an
+  explicit `{auth_address}` / `{xid}` parameter names another held identity.
+  With no identity, reads answer empty and sends fail with `xID required`.
+- **The hub is the xID xite** (`epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c`,
+  `channel_xite`). It holds every identity's bundle and the pool. Epix Mail is
+  a client, like any xite that holds a channel grant. The node auto-adds the hub
+  when channels are on, so channels work for a user who never opens Mail.
+- **Setup is automatic and node-side.** Linking an identity derives its keys and
+  publishes its bundle into the hub (`epix-plugins::channel_setup`): the node
+  writes the bundle, signs the identity's `content.json` *as that identity*, and
+  publishes. It retries while the hub is not synced or the chain is unreachable
+  and reports `published / pending / failed / off` on the Config page and in
+  `channelSessionInfo.identity.setup`. This replaces the earlier explicit
+  "Generate encryption keys" step: **every linked identity has a public channel
+  account unless its channels are turned off first** (`channelIdentitySetEnabled`).
+- **Client gate.** Only Epix Mail, a trusted operator session, or a xite holding
+  `ADMIN`, `CHANNELS` (whole inbox) or `Channels:<app>` (one app's threads) may
+  call `channel*`. Events (`channelEvent`) are routed to client xites whose
+  effective identity matches the event's identity, never to the hub.
+- **Shared allowance.** The RLN usage ledger stays per node: every identity a
+  node holds spends from one allowance, so outbound volume cannot reveal how
+  many personas the node runs. Membership (`member` in `channelRlnStatus`) is
+  per identity.
+
+## Channels for every xite (app scope)
+
+Mail is one client. Any xite can carry its own private conversations (DMs in
+Talk, encrypted comments, ...) over the same pool, identities and hub:
+
+- **Grant.** The xite asks for `Channels:<app>` through the normal permission
+  prompt (`wrapperPermissionAdd`); `<app>` is a short lowercase token such as
+  `talk`. `CHANNELS` grants the whole inbox (every app) and is what a mail-type
+  client holds; Epix Mail has it implicitly. `permissionDetails` explains both.
+- **Scope.** A `Channels:<app>` xite sees, sends and edits only its app's
+  threads: `channelThreads`, `channelSearch`, `channelSend`, `channelConversation`,
+  `channelMarkRead`, `channelSetConvState`, `channelDeleteLocal` and the `unread`
+  count in `channelSessionInfo` are confined to the granted app, and asking for
+  another app is refused. A full grant defaults to every app on reads and to
+  `mail` on sends; it may pass `{app}` to narrow a read or to tag a send.
+- **The tag travels inside the sealed body.** `channelSend([recipients, subject,
+  body, {conv_id?, app?}])` puts `a: <app>` in the shared AEAD body next to the
+  sender, members, subject and time (`epix-envelope::multislot`). Nothing about
+  the app is visible in the pool record. Mail bodies omit the field, so they stay
+  byte-identical to the pre-app format and a node that predates the tag reads
+  every message as mail. The recipient's indexer stores it as `thread.app`
+  (`channels.db` v7); a conversation keeps the app of its first message.
+- **Events.** `channelSubscribe([{app?}])` registers the calling xite for
+  `channelEvent`s (in memory: call it on every page load). Events carry `app`
+  and reach a client only when its scope matches and its effective identity is
+  the one the message landed in.
+- **Dashboard.** Feed rows deep-link to the xite subscribed for the row's app,
+  else to Mail. The mail badge counts unread threads of the apps without a
+  subscribed client; each subscribed app gets a badge of its own (`channel:<app>`).
+
+A second client therefore needs `wrapperPermissionAdd("Channels:talk")`, then
+`channelSessionInfo`, `channelSubscribe`, `channelKeyLookup`, `channelSend` with
+`{app: "talk"}`, and `channelThreads` / `channelConversation` as usual.
+
 ## Layers
 
 1. **Generic anonymous envelope pool** (`epix-content::pool`, `epix-ui::pool`).
@@ -106,7 +173,13 @@ UI surfaces over one channel store. The group engine is `epix-group-proto`
 
 ## Config (node)
 
-`channel_enabled`, `channel_xite`, `channel_backfill_weeks` (0=all, newest-first),
+`channel_enabled`, `channel_xite` (the hub; blank = the xID xite; test networks
+only), `channel_legacy_xites` (pools still indexed read-only during the hub
+cutover, one per line; default Epix Mail's old pool, blank once the cutover is
+done), `channel_legacy_mail_xite` (where `messages.json` legacy mail is read
+from; default Epix Mail), `channel_feed_per_identity` (badge unread mail per
+identity on the dashboard; off collapses the badges so a shared screen does not
+show which personas the node holds), `channel_backfill_weeks` (0=all, newest-first),
 `channel_send_jitter_max_secs` (default 0 = off; when set, the WHOLE send is
 delayed by a random `0..=max` seconds and detached from the send handler so a
 directly-connected peer can't bind "user pressed send" to the pool write —
@@ -117,7 +190,20 @@ disables; see [`channel-count-privacy.md`](channel-count-privacy.md)),
 `channel_feed_snippets`, and `channel_allow_insecure_engine` (DEV only — runs the
 FakeEngine, which provides no confidentiality).
 
-## Site (mail xite) changes
+## Hub xite (the xID xite) contents
+
+- **content.json**: `pool.channels` descriptor (dir `pool`, class `epix-pool-1`,
+  `since_week`, `fanout` 16, `pow_bits` 20, `pad_buckets` [8192,32768,131072],
+  `max_record_bytes` 200000, `sync_order` newest_first); `includes` for
+  `data/users/content.json`; `distribution.paths` `data/users/` (feed) and `pool/`
+  (package), complete retention; `ignore` covers `data/users/.*|pool/.*`.
+- **data/users/content.json**: `cert_signers {"xid.epix": ["chain"]}` and
+  `permission_rules {".*": {files_allowed: "data\.json|data-[0-9a-z]+\.json",
+  max_size: 8192}}`.
+- The wizard app itself is untouched; `siteSign` keeps these fields across the
+  app's own releases.
+
+## Site (mail xite) changes (historical: the first cutover, when Mail hosted the pool)
 
 - **content.json**: `pool.channels` descriptor (dir `pool`, class `epix-pool-1`,
   `since_week`, `fanout` 16, `pow_bits` 20, `pad_buckets` [8192,32768,131072],

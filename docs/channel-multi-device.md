@@ -43,11 +43,14 @@ devices clobbering each other:
   `data/users/content.json` and `data-default/users/content-default.json`
   (owner-signed — takes effect when the site is re-signed, same step as the
   cutover runbook).
-- **Slot selection** (`Channel.js publishKeyBundle`): a device takes the primary
+- **Slot selection** (node-side, `epix-plugins::channel_setup`; the Mail client
+  used to do this in `Channel.js publishKeyBundle`): a device takes the primary
   `data.json` slot when it is free or already **its own**, and its per-device
   `data-<auth>.json` slot only when a *different* device already holds the
   primary. So single-device users stay on `data.json` — readable even by nodes
   that only look at `data.json` — and a second device never overwrites the first.
+  The setup worker re-checks every 30 s that its slot is still committed, so a
+  race between two devices' first publishes heals on the next pass.
 - The node reads **both** `data.json` and every `data-<auth>.json`, requires a
   valid v3 `auth_sig`, binds a secondary filename to that authenticated `auth`,
   groups by the cert-gated directory name, and **dedups by IK keeping

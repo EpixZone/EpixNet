@@ -936,3 +936,61 @@ fn one_record_delivers_to_two_local_identities() {
     assert_eq!(node_db.messages(id_mud, &conv_hex).unwrap().len(), 1);
     assert_eq!(node_db.messages(id_work, &conv_hex).unwrap().len(), 1);
 }
+
+/// The client app tag rides inside the sealed body: the sender's own copy and the
+/// recipient's thread both carry it, a mail-scoped read does not see it, and the
+/// pool record never shows it.
+#[test]
+fn app_tag_travels_inside_the_sealed_body() {
+    let e = FakeEngine;
+    let r = rule();
+    let now = 1_780_000_000_000i64;
+    let alice_db = ChannelDb::memory().unwrap();
+    let bob_db = ChannelDb::memory().unwrap();
+    let alice = rand_id();
+    let bob = rand_id();
+    let alice_id = alice_db.upsert_identity("alice.epix", "epix1alice", 0, None).unwrap();
+    let bob_id = bob_db.upsert_identity("bob.epix", "epix1bob", 0, None).unwrap();
+    let bob_bundle = e.publish_bundle(&bob, "bob.epix");
+    let alice_bundle = e.publish_bundle(&alice, "alice.epix");
+    let resolve = |xid: &str| -> Vec<serde_json::Value> {
+        if xid == "alice.epix" { vec![alice_bundle.clone()] } else { Vec::new() }
+    };
+
+    let conv = conv16();
+    let conv_hex = hex::encode(conv);
+    let prepared = epix_envelope::prepare_multi_scheduled(
+        &alice_db, &e, alice_id, &alice, "alice.epix",
+        &["alice.epix".into(), "bob.epix".into()], &[Dest { bundle: bob_bundle }],
+        conv, "dm", "hey ZXQ", "talk", now, now, &r, true,
+    )
+    .unwrap();
+    let record = prepared.commit.record.clone();
+    alice_db.commit_outbound(&prepared.commit).unwrap();
+
+    // The sender's own copy is a talk thread, invisible to a mail-scoped read.
+    assert_eq!(alice_db.thread_app(alice_id, &conv_hex).unwrap().as_deref(), Some("talk"));
+    assert!(alice_db.threads_in_app(alice_id, Some("mail"), "all", 0, 10).unwrap().is_empty());
+    assert_eq!(alice_db.threads_in_app(alice_id, Some("talk"), "all", 0, 10).unwrap().len(), 1);
+    // The public record carries the tag only inside the ciphertext.
+    assert!(!record.to_string().contains("\"a\":\"talk\""));
+
+    match process_record_one(
+        &bob_db, &e, &[(bob_id, bob.clone(), "bob.epix".into())], &record, now + 1, resolve,
+    )
+    .unwrap()
+    {
+        ProcessOutcome::Indexed { app, conv_id, .. } => {
+            assert_eq!(app, "talk");
+            assert_eq!(conv_id, conv_hex);
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(bob_db.thread_app(bob_id, &conv_hex).unwrap().as_deref(), Some("talk"));
+    assert_eq!(bob_db.threads_in_app(bob_id, Some("talk"), "all", 0, 10).unwrap().len(), 1);
+    assert!(bob_db.threads_in_app(bob_id, Some("mail"), "all", 0, 10).unwrap().is_empty());
+    assert_eq!(bob_db.unread_count_in_app(bob_id, Some("talk")).unwrap(), 1);
+    assert_eq!(bob_db.unread_count_in_app(bob_id, Some("mail")).unwrap(), 0);
+    assert_eq!(bob_db.search_in_app(bob_id, Some("mail"), "ZXQ", 10).unwrap().len(), 0);
+    assert_eq!(bob_db.search_in_app(bob_id, Some("talk"), "ZXQ", 10).unwrap().len(), 1);
+}

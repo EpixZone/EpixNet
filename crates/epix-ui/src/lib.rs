@@ -1701,7 +1701,35 @@ async fn serve_config_post(
 /// erroring: the button set is rendered from the schema, so an unknown one
 /// means a stale page, not an attack (the CSRF token was already checked).
 async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
-    match action {
+    let done = |msg: &str| Redirect::to(&format!("/Config?done={}", url_encode(msg))).into_response();
+    let failed = |msg: &str| Redirect::to(&format!("/Config?error={}", url_encode(msg))).into_response();
+    // Per-row actions carry their argument after a colon (`identityRemove:<addr>`).
+    let (name, arg) = action.split_once(':').unwrap_or((action, ""));
+    match name {
+        // --- Identities section
+        "identityDefault" => match ctx.state.identity_set_default(Some(arg)).await {
+            Ok(_) => done("Default identity changed"),
+            Err(error) => failed(&error),
+        },
+        "identityRemove" => {
+            if ctx.state.identity_remove(arg).await {
+                done("Identity removed. Its key stays in users.json and its published content stays valid.")
+            } else {
+                failed("Unknown identity")
+            }
+        }
+        // Hands the browser to the xID xite, which links the address on chain
+        // and returns here; the node records the link when the xite's poll
+        // confirms the transaction (see `xid_invalidate_cache`).
+        "identityLinkStart" => match ctx.state.identity_link_start("Config").await {
+            Ok((_, url)) => Redirect::to(&url).into_response(),
+            Err(error) => failed(&error),
+        },
+        "identityDiscover" => done(&discover_and_link_identities(ctx).await),
+        "identityHook" => match run_identity_hook(ctx, arg).await {
+            Ok(()) => done("Done"),
+            Err(error) => failed(&error),
+        },
         // Drop the on-disk resolve cache, the display-name bindings, and the
         // chain layer's in-memory caches, so the next visit to any `.epix`
         // name re-resolves on chain (e.g. after a name is moved to a new
@@ -1722,6 +1750,44 @@ async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
         }
         _ => Redirect::to("/Config").into_response(),
     }
+}
+
+/// `identityDiscover`: link every active name the chain lists for an address
+/// this node holds but has not linked yet. Returns the flash message.
+async fn discover_and_link_identities(ctx: &Ctx) -> String {
+    let found = ctx.state.identity_discover(&[]).await;
+    let mut linked = 0;
+    for candidate in found.iter().filter(|d| !d.held_locally && d.active) {
+        let result = ctx
+            .state
+            .identity_link_complete(&candidate.auth_address, Some(&candidate.name), None)
+            .await;
+        if result.is_ok_and(|r| r.get("xid").is_some()) {
+            linked += 1;
+        }
+    }
+    match linked {
+        0 => "No new identities found".to_string(),
+        1 => "Linked 1 identity".to_string(),
+        n => format!("Linked {n} identities"),
+    }
+}
+
+/// A status provider's action: `identityHook:<cmd>:<base64url params>`, run
+/// as the node itself (the page is already behind the CSRF token).
+async fn run_identity_hook(ctx: &Ctx, arg: &str) -> Result<(), String> {
+    use base64::Engine as _;
+    let (cmd, params_b64) = arg.split_once(':').unwrap_or((arg, ""));
+    let params = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(params_b64)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!([]));
+    if cmd.is_empty() || !ctx.registry.has(cmd) {
+        return Err("Unknown action".to_string());
+    }
+    let session = WsSession::new_trusted(ctx.state.clone(), None);
+    ctx.registry.dispatch(&session, cmd, &params, i64::MAX).await.map(|_| ())
 }
 
 /// Persist the submitted settings and redirect back, carrying any `data_dir`
@@ -1821,16 +1887,20 @@ async fn serve_config_page(
     let can_restart = ctx.state.can_restart();
     let homepage = ctx.state.homepage().await.unwrap_or_default();
     let theme = ctx.state.theme_class().await;
+    let identities = ctx.state.identity_config_rows().await;
     (
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         render_config_page(
             &values,
-            &pending,
-            can_restart,
-            flash,
-            &homepage,
-            &theme,
-            ctx.state.ui_csrf_token(),
+            ConfigPageView {
+                identities: &identities,
+                pending: &pending,
+                can_restart,
+                flash,
+                homepage: &homepage,
+                theme: &theme,
+                csrf: ctx.state.ui_csrf_token(),
+            },
         ),
     )
         .into_response()
@@ -1928,6 +1998,17 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
 
 /// Render the settings page, styled like EpixNet's Config page: settings are
 /// grouped into sections (Web Interface / Network / Performance / Epix Chain
+/// Everything the settings page shows besides the config rows themselves.
+struct ConfigPageView<'a> {
+    identities: &'a [Value],
+    pending: &'a [String],
+    can_restart: bool,
+    flash: Option<(bool, String)>,
+    homepage: &'a str,
+    theme: &'a str,
+    csrf: &'a str,
+}
+
 /// Config) with a widget per config kind. Keys whose backend isn't built yet
 /// (Tor, tracker proxy) render disabled with a "coming soon" note.
 ///
@@ -1938,13 +2019,9 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
 /// offers the restart when a restart-only key is pending.
 fn render_config_page(
     values: &[(&str, &str, &str, String, String, &str)],
-    pending: &[String],
-    can_restart: bool,
-    flash: Option<(bool, String)>,
-    homepage: &str,
-    theme: &str,
-    csrf: &str,
+    view: ConfigPageView<'_>,
 ) -> String {
+    let ConfigPageView { identities, pending, can_restart, flash, homepage, theme, csrf } = view;
     let esc = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -1978,6 +2055,12 @@ fn render_config_page(
                 esc(section)
             ));
             current_section = section;
+        }
+
+        // The identity table is rendered from users.json, not from a value.
+        if *kind == "identities" {
+            sections.push_str(&render_identities_item(label, identities));
+            continue;
         }
 
         // A "soon:" prefix means the control is shown but disabled.
@@ -2150,10 +2233,145 @@ fn render_config_page(
     page_shell("Configuration", "Configuration", "", &body, homepage, theme)
 }
 
+/// The Identities section: one `config-item` holding the linked-identity table
+/// (xID, address, one column per status provider, per-row actions). The
+/// buttons are submit buttons inside the settings form, like every other
+/// action button on the page (see the `button:` branch above), with the row's
+/// address carried in the `action` value.
+fn render_identities_item(label: &str, identities: &[Value]) -> String {
+    let description = "Browsing needs no identity; posting needs one. The default applies \
+                       to every xite that has not chosen its own. Xites pick a different \
+                       identity from their account menu.";
+    if identities.is_empty() {
+        return format!(
+            "<div class='config-item identities-item'>\
+               <div class='title'><h3>{label}</h3>\
+                 <div class='description'>{description}</div></div>\
+               <div class='value'><p class='identities-empty'>No identities linked yet. \
+               Link one below, or from any xite's account menu.</p></div>\
+             </div>",
+            label = attr_escape(label),
+        );
+    }
+    let providers = identity_status_providers(identities);
+    let mut head = String::from("<th>xID</th><th>Address</th>");
+    for name in &providers {
+        head.push_str(&format!("<th>{}</th>", attr_escape(name)));
+    }
+    head.push_str("<th></th>");
+    let body: String = identities.iter().map(|row| render_identity_row(row, &providers)).collect();
+    format!(
+        "<div class='config-item identities-item'>\
+           <div class='title'><h3>{label}</h3>\
+             <div class='description'>{description}</div></div>\
+           <div class='value'><table class='identities'>\
+             <thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>\
+         </div>",
+        label = attr_escape(label),
+    )
+}
+
+/// HTML-escape text for element content or a single-quoted attribute.
+fn attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// One column per status provider seen on any row, in stable order.
+fn identity_status_providers(identities: &[Value]) -> Vec<String> {
+    let mut providers: Vec<String> = Vec::new();
+    for row in identities {
+        let Some(status) = row["status"].as_object() else { continue };
+        for name in status.keys() {
+            if !providers.contains(name) {
+                providers.push(name.clone());
+            }
+        }
+    }
+    providers.sort();
+    providers
+}
+
+/// One identity's table row: name and address, a cell per status provider,
+/// and the row actions.
+fn render_identity_row(row: &Value, providers: &[String]) -> String {
+    let xid = row["xid"].as_str().unwrap_or("");
+    let addr = row["auth_address"].as_str().unwrap_or("");
+    let is_default = row["default"] == true;
+    let default_pill = if is_default { " <span class='pill'>default</span>" } else { "" };
+    let mut cells = format!(
+        "<td><b>{xid}</b>{default_pill}</td><td class='mono'>{addr}</td>",
+        xid = attr_escape(xid),
+        addr = attr_escape(addr),
+    );
+    for name in providers {
+        cells.push_str(&format!("<td>{}</td>", render_identity_status_cell(&row["status"][name.as_str()])));
+    }
+    cells.push_str(&format!("<td class='actions'>{}</td>", render_identity_row_actions(xid, addr, is_default)));
+    format!("<tr>{cells}</tr>")
+}
+
+/// A provider's status for one identity: state, summary, detail, and its
+/// action buttons (`identityHook:<cmd>:<base64url params>`).
+fn render_identity_status_cell(status: &Value) -> String {
+    use base64::Engine as _;
+    let summary = status["summary"].as_str().unwrap_or("");
+    let detail = status["detail"].as_str().unwrap_or("");
+    let mut cell = format!(
+        "<span class='status status-{}'>{}</span>",
+        attr_escape(status["state"].as_str().unwrap_or("")),
+        attr_escape(summary)
+    );
+    if !detail.is_empty() {
+        cell.push_str(&format!("<div class='detail'>{}</div>", attr_escape(detail)));
+    }
+    for action in status["actions"].as_array().into_iter().flatten() {
+        let (Some(cmd), Some(text)) = (action["cmd"].as_str(), action["label"].as_str()) else {
+            continue;
+        };
+        let params =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(action["params"].to_string());
+        cell.push_str(&format!(
+            "<button class='button button-small' type='submit' name='action' \
+             value='identityHook:{cmd}:{params}'>{text}</button>",
+            cmd = attr_escape(cmd),
+            text = attr_escape(text),
+        ));
+    }
+    cell
+}
+
+/// "Make default" (unless it already is) and "Remove" for one identity.
+fn render_identity_row_actions(xid: &str, addr: &str, is_default: bool) -> String {
+    let mut actions = String::new();
+    if !is_default {
+        actions.push_str(&format!(
+            "<button class='button button-small' type='submit' name='action' \
+             value='identityDefault:{addr}'>Make default</button>",
+            addr = attr_escape(addr),
+        ));
+    }
+    actions.push_str(&format!(
+        "<button class='button button-small button-danger' type='submit' name='action' \
+         value='identityRemove:{addr}' data-confirm='Remove {xid} from this node? Its key \
+         stays in users.json and content it already published stays valid.'>Remove</button>",
+        addr = attr_escape(addr),
+        xid = attr_escape(xid),
+    ));
+    actions
+}
+
 /// Client script for the settings page: track edits against each row's saved
 /// value, drive the gutter markers (green while unsaved, reset-to-default on
-/// click) and the floating save/restart bars.
+/// click), the floating save/restart bars, and the confirm prompts on
+/// destructive row actions.
 const CONFIG_PAGE_JS: &str = "<script>(function(){\
+Array.prototype.slice.call(document.querySelectorAll('button[data-confirm]')).forEach(function(b){\
+b.addEventListener('click',function(e){if(!confirm(b.getAttribute('data-confirm')))e.preventDefault();});\
+});\
 var items=Array.prototype.slice.call(document.querySelectorAll('.config-item[data-key]'));\
 function ctl(item){return item.querySelector(\"input[type=checkbox],select,textarea,input.input-text\");}\
 function current(item){\
@@ -2366,6 +2584,20 @@ textarea.input-text{resize:vertical;line-height:1.5}\
 .input-text:disabled{background:var(--epix-surface-2);color:var(--epix-text-low);border-color:var(--epix-border);cursor:not-allowed}\
 .section-title{font-size:12px;font-weight:600;color:var(--epix-text-mid);text-transform:uppercase;letter-spacing:.08em;margin:32px 0 4px;padding-bottom:8px;border-bottom:1px solid var(--epix-border)}\
 .config{margin-bottom:8px}\
+.identities{width:100%;border-collapse:collapse;font-size:13px}\
+.identities th{text-align:left;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.08em;color:var(--epix-text-mid);padding:6px 8px;border-bottom:1px solid var(--epix-border)}\
+.identities td{padding:8px;border-bottom:1px solid var(--epix-border);vertical-align:top}\
+.identities tr:last-child td{border-bottom:0}\
+.identities .mono{font-family:var(--epix-font-mono);font-size:12px;overflow-wrap:anywhere}\
+.identities .actions{white-space:nowrap;text-align:right}\
+.identities .detail{color:var(--epix-text-low);font-size:12px;margin-top:2px}\
+.identities .pill{display:inline-block;margin-left:6px;padding:0 8px;border-radius:999px;font-size:11px;font-weight:600;border:1px solid var(--epix-border-strong);color:var(--epix-text-mid);vertical-align:middle}\
+.identities-empty{color:var(--epix-text-mid);font-size:13px;margin:0}\
+.button-small{margin:0 0 0 6px;height:30px;padding:0 12px;font-size:12px;border-radius:6px}\
+.button-danger{background:var(--epix-danger-soft);color:var(--epix-ink-soft)}\
+.config-item.identities-item:has(.value .button){padding-right:0}\
+.config-item.identities-item:has(.value .button) .value{position:static;transform:none;margin-top:10px}\
+@media (max-width:640px){.identities thead{display:none}.identities tr{display:block;padding:8px 0;border-bottom:1px solid var(--epix-border)}.identities td{display:block;border:0;padding:2px 0}.identities .actions{text-align:left;white-space:normal}.identities .button-small{margin:6px 6px 0 0}}\
 .config-item .marker{position:absolute;left:-26px;top:14px;width:22px;height:22px;display:flex;align-items:center;justify-content:center;font-size:24px;font-weight:700;line-height:1;text-decoration:none;color:var(--epix-accent);opacity:0;pointer-events:none;transform:scale(1.8);transition:opacity .4s,transform .4s}\
 .config-item .marker.visible{opacity:1;pointer-events:auto;transform:scale(1)}\
 .config-item .marker.changed{color:var(--epix-success)}\
@@ -3705,5 +3937,38 @@ mod csp_tests {
         assert!(csp.contains("script-src 'nonce-NONCE123' 'wasm-unsafe-eval'"));
         assert!(csp.starts_with("default-src 'none'"));
         assert!(!csp.contains("img-src 'self'"), "the 'self' image scope was the bug");
+    }
+}
+
+#[cfg(test)]
+mod identities_page_tests {
+    use super::render_identities_item;
+    use serde_json::json;
+
+    #[test]
+    fn identity_table_renders_rows_status_and_actions() {
+        let rows = vec![
+            json!({
+                "xid": "alice.epix", "auth_address": "epix1alice", "default": true,
+                "status": { "Channels": {
+                    "state": "published", "summary": "channels: published", "detail": "3 peers",
+                    "actions": [{ "cmd": "channelIdentitySetup", "params": [{ "auth": "epix1alice" }], "label": "Retry setup" }]
+                } }
+            }),
+            json!({ "xid": "bob.epix", "auth_address": "epix1bob", "default": false, "status": {} }),
+        ];
+        let html = render_identities_item("Linked xIDs", &rows);
+        assert!(html.contains("<b>alice.epix</b> <span class='pill'>default</span>"), "{html}");
+        assert!(html.contains("<th>Channels</th>"));
+        assert!(html.contains("channels: published") && html.contains("3 peers"));
+        assert!(html.contains("value='identityHook:channelIdentitySetup:"), "provider action button");
+        assert!(!html.contains("value='identityDefault:epix1alice'"), "the default has no Make default");
+        assert!(html.contains("value='identityDefault:epix1bob'"));
+        assert!(html.contains("value='identityRemove:epix1bob'"));
+        assert!(html.contains("data-confirm='Remove bob.epix"));
+
+        let empty = render_identities_item("Linked xIDs", &[]);
+        assert!(empty.contains("No identities linked yet"));
+        assert!(!empty.contains("<table"));
     }
 }

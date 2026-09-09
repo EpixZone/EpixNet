@@ -1782,6 +1782,23 @@ pub mod xid_identity {
         }
     }
 
+    /// Drop the cached reverse lookup for one address (and the name it
+    /// resolved to), so the next resolve asks the chain. The link flow polls
+    /// this right after a linking transaction; unlike [`clear`] it touches
+    /// nothing else.
+    pub fn forget(address: &str) {
+        let Ok(mut guard) = CACHE.write() else { return };
+        let Some(map) = guard.as_mut() else { return };
+        let fqdn = map
+            .get(address)
+            .and_then(|entry| entry.info.as_ref())
+            .map(|info| format!("{}.{}", info.name, info.tld));
+        map.remove(address);
+        if let Some(fqdn) = fqdn {
+            map.remove(&fqdn);
+        }
+    }
+
     /// Reverse-resolve a linked identity address to its xID, or `None` if the
     /// address isn't linked to any name.
     pub async fn resolve_identity(address: &str) -> Option<XidInfo> {

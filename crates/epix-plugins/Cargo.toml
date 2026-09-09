@@ -10,6 +10,7 @@ epix-content = { path = "../epix-content" }
 epix-crypt = { path = "../epix-crypt" }
 epix-discovery = { path = "../epix-discovery" }
 epix-ui = { path = "../epix-ui" }
+epix-user = { path = "../epix-user" }
 epix-plugin = { path = "../epix-plugin" }
 epix-peer = { path = "../epix-peer" }
 # The mail plugin: metadata-private mail as a consumer of the generic pool.
@@ -37,4 +38,5 @@ windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 epix-xite = { path = "../epix-xite" }
+epix-ui = { path = "../epix-ui", features = ["test-support"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }

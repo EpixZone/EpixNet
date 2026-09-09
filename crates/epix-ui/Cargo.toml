@@ -68,6 +68,9 @@ rustix = { version = "1.1", features = ["fs"] }
 epix-fs = { path = "../epix-fs" }
 
 [features]
+# Test support: an offline chain stand-in and an identity helper that lets
+# another crate's tests link xIDs without the network. Never for production.
+test-support = []
 # UiPassword: a cookie-session login gate over the whole UI. Off by default and
 # on mobile (a phone's UI is already local to the device); enable for a shared
 # or exposed desktop node.

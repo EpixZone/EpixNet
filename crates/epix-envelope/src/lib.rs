@@ -44,5 +44,5 @@ pub use multislot::{
 };
 pub use store::{
     EnvelopeStore, InboundCommit, NewSession, OutboundCommit, OutboundMessage, OutboundRecovery,
-    OutboundSession, PendingOutbound, RlnReservation, SessionMatch, TAG_LOOKAHEAD,
+    OutboundSession, PendingOutbound, RlnReservation, SessionMatch, DEFAULT_APP, TAG_LOOKAHEAD,
 };

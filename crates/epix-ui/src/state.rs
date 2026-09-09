@@ -123,6 +123,11 @@ pub struct ResolvedHost {
 /// unreachable, and the only xite granted ADMIN without a prompt.
 pub const DASHBOARD_XITE_ADDRESS: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 
+/// The Epix chain's xID xite: where identities are linked on chain, and (as
+/// the channel hub) where key bundles and the envelope pool live. EpixNet's
+/// `xid_xite`.
+pub const XID_XITE_ADDRESS: &str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
+
 /// Extra peer discovery beyond the trackers - the runtime installs a DHT
 /// lookup here so announces and on-demand clones can find peers for rare
 /// xites when the trackers come up short. Kept as a trait so `epix-ui` has
@@ -2267,6 +2272,11 @@ async fn verified_parent_still_authorizes(
                 return Err(format!("injected recovery signer resolution failure: {name}"));
             }
         }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(identities) = xid_test::lookup(&name) {
+            xid_map.insert(name, chain_xid_identities(identities));
+            continue;
+        }
         let identities = epix_chain::xid_signers::resolve_identities_checked(label, tld)
             .await
             .map_err(|error| format!("could not resolve recovery signer {name}: {error}"))?;
@@ -4162,6 +4172,10 @@ pub struct AppState {
     /// connection subscribes and forwards matching messages to its socket, so
     /// the dashboard updates live instead of waiting for its next poll.
     events: tokio::sync::broadcast::Sender<UiEvent>,
+    /// Identity-layer changes for plugins (see [`IdentityEvent`]).
+    identity_events: tokio::sync::broadcast::Sender<IdentityEvent>,
+    /// The identity link in flight, if any (see [`PendingLink`]).
+    pending_link: std::sync::Mutex<Option<PendingLink>>,
     /// Node config set via `configSet` (e.g. `language`). Persisted so it
     /// survives restarts.
     config: RwLock<serde_json::Map<String, Value>>,
@@ -4447,6 +4461,130 @@ pub struct AppState {
 /// - `target` routes by xite: `Some(addr)` only to connections bound to that
 ///   xite (so `setSiteInfo` for one alias does not overwrite another's), `None`
 ///   is any xite.
+/// An identity-layer change, broadcast to plugins that keep per-identity
+/// state (the channel plugin publishes a key bundle per linked identity).
+#[derive(Clone, Debug)]
+pub enum IdentityEvent {
+    /// A new identity was linked.
+    Added(String),
+    /// An identity was forgotten.
+    Removed(String),
+    /// A xite's effective identity changed (`None` = anonymous now).
+    Selected { xite: String, auth_address: Option<String> },
+    /// The node-wide default changed (`None` = cleared).
+    DefaultChanged(Option<String>),
+}
+
+/// Which xites an identity change is pushed to.
+#[derive(Clone, Debug)]
+pub enum IdentityChangeScope {
+    /// One xite's override changed.
+    Xite(String),
+    /// The default changed: every xite that inherits it.
+    Default,
+}
+
+/// Capability key prefix under which a plugin registers an
+/// [`IdentityStatusProvider`] (see [`AppState::register_identity_status_provider`]).
+pub const IDENTITY_STATUS_CAP_PREFIX: &str = "identity_status:";
+
+/// A plugin's per-identity status column on the Config page's Identities
+/// section - the channel plugin reports "published / pending / failed / off"
+/// this way without epix-ui depending on it.
+#[async_trait::async_trait]
+pub trait IdentityStatusProvider: Send + Sync {
+    /// Column heading, e.g. `Channels`.
+    fn name(&self) -> &'static str;
+    /// `{state, summary, detail?, actions?: [{cmd, params, label}]}` for one
+    /// identity, or `None` when the provider has nothing to say about it. An
+    /// action is a WS command the Config page runs as the node when clicked.
+    async fn status(&self, auth_address: &str) -> Option<Value>;
+}
+
+/// The capability-registry wrapper for a provider (the registry stores and
+/// downcasts concrete types).
+pub struct IdentityStatusRegistration(pub Arc<dyn IdentityStatusProvider>);
+
+/// An xID name linked on chain to an address this node holds.
+#[derive(Clone, Debug, serde::Serialize)]
+pub struct DiscoveredIdentity {
+    pub name: String,
+    pub tld: String,
+    pub auth_address: String,
+    pub active: bool,
+    /// Already recorded as a linked identity in users.json.
+    pub held_locally: bool,
+}
+
+/// An identity link in flight: `identityLinkStart` handed `auth_address` to
+/// the xID xite, and the xite's post-transaction poll (`xidInvalidateCache`)
+/// completes the link here.
+#[derive(Clone, Debug)]
+struct PendingLink {
+    auth_address: String,
+    /// Where to select the identity once linked: a xite address, or `Config`.
+    return_to: String,
+    started: std::time::Instant,
+}
+
+/// Who signs a user content.json: the key plus the cert fields the signed
+/// content carries. Built from the xite's identity by default; the channel
+/// plugin builds one for a specific identity when it publishes a key bundle.
+#[derive(Clone, Debug)]
+pub struct UserContentSigner {
+    pub auth_privatekey: String,
+    pub cert_user_id: Option<String>,
+    pub cert_auth_type: Option<String>,
+    pub cert_sign: Option<String>,
+}
+
+impl UserContentSigner {
+    /// The signer for a linked identity.
+    pub fn for_identity(identity: &epix_user::Identity) -> Self {
+        Self {
+            auth_privatekey: identity.auth_privatekey.clone(),
+            cert_user_id: Some(identity.cert_user_id()),
+            cert_auth_type: Some(identity.cert_auth_type().to_string()),
+            cert_sign: Some(identity.cert_sign.clone()),
+        }
+    }
+
+    /// A bare key with no cert fields (owners signing a foreign directory).
+    pub fn raw_key(auth_privatekey: String) -> Self {
+        Self { auth_privatekey, cert_user_id: None, cert_auth_type: None, cert_sign: None }
+    }
+}
+
+/// Offline stand-in for the chain's linked-identity set, so tests that sign
+/// into `data/users/<name>.epix/` never hit the network.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) mod xid_test {
+    use std::collections::HashMap;
+    use std::sync::RwLock;
+
+    static MAP: RwLock<Option<HashMap<String, Vec<epix_chain::Identity>>>> = RwLock::new(None);
+
+    /// Pretend `name` (`alice` or `alice.epix`) has `addr` as an active linked identity.
+    pub fn link(name: &str, addr: &str) {
+        let fqdn = if name.contains('.') { name.to_string() } else { format!("{name}.epix") };
+        let mut guard = MAP.write().unwrap();
+        let list = guard.get_or_insert_with(HashMap::new).entry(fqdn).or_default();
+        if !list.iter().any(|i| i.address == addr) {
+            list.push(epix_chain::Identity {
+                address: addr.to_string(),
+                label: "epixnet".to_string(),
+                active: true,
+                revoked_at: 0,
+                revoked_at_time: 0,
+            });
+        }
+    }
+
+    pub fn lookup(fqdn: &str) -> Option<Vec<epix_chain::Identity>> {
+        MAP.read().ok()?.as_ref()?.get(fqdn).cloned()
+    }
+}
+
 #[derive(Clone)]
 pub struct UiEvent {
     pub channel: Option<String>,
@@ -5288,6 +5426,8 @@ impl AppState {
             geoip: RwLock::new(None),
             conn_pool: crate::conn_pool::ConnectionPool::new(CONNECTION_POOL_MAX),
             events: tokio::sync::broadcast::channel(4096).0,
+            identity_events: tokio::sync::broadcast::channel(64).0,
+            pending_link: std::sync::Mutex::new(None),
             config: RwLock::new(persist.config),
             config_path: persist.config_path,
             boot_config: std::sync::Mutex::new(None),
@@ -5450,6 +5590,9 @@ impl AppState {
                 .ok()
                 .and_then(|b| serde_json::from_slice(&b).ok())
                 .unwrap_or_default();
+            for stored in m.values_mut() {
+                stored.migrate_legacy();
+            }
             m.insert(user.master_address.clone(), user.clone());
             m
         };
@@ -5871,16 +6014,16 @@ impl AppState {
     }
 
     /// The user's directory name under data/users/ (EpixNet's
-    /// `getUserDirectory`): the xID cert's `<name>.epix` when one is selected,
-    /// else the auth address. EpixTalk-style pages build their write paths
-    /// from this, and notification queries reference it as `{xid_directory}`.
-    pub async fn user_directory(&self, address: &str, auth_address: &str) -> String {
-        match self.user.read().await.get_cert(address) {
-            Some(cert) if cert.auth_type == "xid" && !cert.auth_user_name.is_empty() => {
-                format!("{}.epix", cert.auth_user_name)
-            }
-            _ => auth_address.to_string(),
-        }
+    /// `getUserDirectory`): the identity's `<name>.epix` when the xite has
+    /// one, else `fallback` (callers pass the auth address they already hold,
+    /// or `""` for "no directory"). Pages build their write paths from this,
+    /// and notification queries reference it as `{xid_directory}`.
+    pub async fn user_directory(&self, address: &str, fallback: &str) -> String {
+        self.user
+            .read()
+            .await
+            .user_directory(address)
+            .unwrap_or_else(|| fallback.to_string())
     }
 
     /// A xite's stored per-user settings (`userGetSettings`).
@@ -6016,11 +6159,10 @@ impl AppState {
                     query = query.replace(":params", &inlined);
                 }
                 if query.contains("{xid_directory}") {
-                    let auth = self.user.write().await.auth_address(address).unwrap_or_default();
-                    if auth.is_empty() {
+                    // No identity, no directory: the query cannot match anything.
+                    let Some(dir) = self.user.read().await.user_directory(address) else {
                         continue;
-                    }
-                    let dir = self.user_directory(address, &auth).await;
+                    };
                     query = query.replace("{xid_directory}", &dir);
                 }
                 let last_seen = dismissed.get(name).and_then(|v| v.as_i64()).unwrap_or(0);
@@ -13372,14 +13514,23 @@ impl AppState {
         self.user.read().await.follows.clone()
     }
 
-    /// All identity addresses this node's user controls: the master address
-    /// plus every per-xite auth address. xidResolve's fallback tries them all
-    /// when the queried address is the user's own (EpixNet does the same, so
-    /// an identity linked under any of the user's addresses is found).
+    /// All identity addresses this node's user controls: the master address,
+    /// every linked identity, and every per-xite derived key. xidResolve's
+    /// fallback tries them all when the queried address is the user's own
+    /// (EpixNet does the same, so an identity linked under any of the user's
+    /// addresses is found).
     pub async fn user_all_addresses(&self) -> Vec<String> {
         let user = self.user.read().await;
-        let mut out = vec![user.master_address.clone()];
-        out.extend(user.xites.values().map(|s| s.auth_address.clone()));
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for addr in std::iter::once(user.master_address.clone())
+            .chain(user.identities().iter().map(|i| i.auth_address.clone()))
+            .chain(user.xites.values().map(|s| s.auth_address.clone()))
+        {
+            if seen.insert(addr.clone()) {
+                out.push(addr);
+            }
+        }
         out
     }
 
@@ -13387,143 +13538,536 @@ impl AppState {
     pub async fn user_encrypt_privatekey(&self, address: &str, index: u64,
     ) -> Result<String, String> {
         let mut user = self.user.write().await;
-        // Ensure the xite entry exists with the active cert attached (Python's
-        // getSiteData does this implicitly) - the cert shifts the derivation.
+        // The per-xite derived entry feeds the derivation index.
         user.xite_data(address)?;
         user.encrypt_privatekey(address, index)
     }
 
-    /// The user's auth (identity) private key (WIF) for a xite - used by
-    /// `ecdsaSign` when no explicit key is given.
-    pub async fn user_auth_privatekey(&self, address: &str) -> Result<String, String> {
-        self.user.write().await.xite_data(address).map(|d| d.auth_privatekey.clone())
-    }
-
-    /// The cert-aware auth key that signs this user's content unit. Channel v3
-    /// bundles use it to bind their device IK/SPK tuple to the linked identity.
+    /// The private key that signs this user's content on `address`: the
+    /// selected identity's, or [`epix_user::XID_REQUIRED`] when the xite has
+    /// none. Channel v3 bundles use it to bind their device IK/SPK tuple to
+    /// the linked identity.
     pub async fn user_cert_auth_privatekey(&self, address: &str) -> Result<String, String> {
-        let key = {
-            let mut user = self.user.write().await;
-            user.auth_privatekey(address)?
-        };
-        self.save_user().await;
-        Ok(key)
+        self.user.read().await.auth_privatekey(address)
     }
 
-    /// The user's auth (identity) address for a xite.
+    /// The identity address that signs user content on `address`, or
+    /// [`epix_user::XID_REQUIRED`] when the xite has none.
     pub async fn user_auth_address(&self, address: &str) -> Result<String, String> {
-        self.user.write().await.auth_address(address)
+        self.user.read().await.auth_address(address)
     }
 
-    // --- Certs (certAdd / certSelect / certSet / certList) ------------------
-
-    /// Add a cert obtained from an ID provider, bound to the xite's current auth
-    /// address, and (if newly added) select it globally. Returns:
-    /// `Ok(Some(true))` added + selected, `Ok(None)` unchanged (identical),
-    /// `Ok(Some(false))` a different cert exists for the domain (needs the user
-    /// to confirm replacement). Persists on change.
-    pub async fn cert_add(
-        &self,
-        address: &str,
-        domain: &str,
-        auth_type: &str,
-        auth_user_name: &str,
-        cert_sign: &str,
-    ) -> Result<Option<bool>, String> {
-        let mut user = self.user.write().await;
-        let auth_address = user.auth_address(address)?;
-        let res = user.add_cert(&auth_address, domain, auth_type, auth_user_name, cert_sign)?;
-        if res == Some(true) {
-            user.set_cert_global(Some(domain));
-        }
-        drop(user);
-        if res == Some(true) {
-            self.save_user().await;
-        }
-        Ok(res)
+    /// The private key (WIF) of a held linked identity, by its address.
+    pub async fn identity_auth_privatekey(&self, auth_address: &str) -> Result<String, String> {
+        self.user
+            .read()
+            .await
+            .identity(auth_address)
+            .map(|i| i.auth_privatekey.clone())
+            .ok_or_else(|| format!("unknown identity {auth_address}"))
     }
 
-    /// Replace an existing cert for `domain` (used after the user confirms the
-    /// change prompt), then select it globally.
-    pub async fn cert_replace(
+    /// The identity in effect for `xite`, if any.
+    pub async fn identity_for(&self, xite: &str) -> Option<epix_user::Identity> {
+        self.user.read().await.identity_for(xite).cloned()
+    }
+
+    /// Every linked identity, in link order.
+    pub async fn identities(&self) -> Vec<epix_user::Identity> {
+        self.user.read().await.identities().to_vec()
+    }
+
+    /// Refuse writes and signatures under `data/users/` when `address` has no
+    /// identity: browsing needs none, posting needs an xID.
+    pub(crate) async fn require_identity_for(
         &self,
         address: &str,
-        domain: &str,
-        auth_type: &str,
-        auth_user_name: &str,
-        cert_sign: &str,
+        inner_path: &str,
     ) -> Result<(), String> {
-        let mut user = self.user.write().await;
-        let auth_address = user.auth_address(address)?;
-        user.delete_cert(domain);
-        user.add_cert(&auth_address, domain, auth_type, auth_user_name, cert_sign)?;
-        user.set_cert_global(Some(domain));
-        drop(user);
-        self.save_user().await;
+        if inner_path.starts_with("data/users/")
+            && self.user.read().await.identity_for(address).is_none()
+        {
+            return Err(epix_user::XID_REQUIRED.to_string());
+        }
         Ok(())
     }
 
-    /// Select a cert domain on all xites (portable cert), or clear with an empty
-    /// domain. `certSet`. Persists.
-    pub async fn cert_set(&self, domain: &str) {
-        let d = if domain.is_empty() { None } else { Some(domain) };
-        self.user.write().await.set_cert_global(d);
+    // --- Identities (identityList / identitySelect / identitySetDefault /
+    //     identityLinkStart / identityLinkComplete / identityRemove) ----------
+
+    /// Test helper: mint a spare identity address and return it.
+    #[cfg(test)]
+    pub(crate) async fn test_mint_identity_address(&self) -> String {
+        self.user.write().await.generate_new_identity_address().unwrap().0
+    }
+
+    /// Test helper: mint an identity address and link it as `name` offline
+    /// (the chain stand-in lists it as active). Returns the address.
+    #[cfg(test)]
+    pub(crate) async fn test_link_identity(&self, name: &str) -> String {
+        self.test_support_link_identity(name).await
+    }
+
+    /// Test support (feature `test-support`): mint an identity address, record
+    /// it as the linked identity `name` with a real self-signed cert, make the
+    /// offline chain stand-in list it as active, save, and notify plugins as a
+    /// real link would. Returns the address. Never compiled into production.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn test_support_link_identity(&self, name: &str) -> String {
+        let (addr, key) = self.user.write().await.generate_new_identity_address().unwrap();
+        let sign = epix_crypt::sign_keccak(&format!("{addr}#xid/{name}"), &key).unwrap();
+        self.user.write().await.add_identity(name, &addr, &sign, None).unwrap();
+        xid_test::link(name, &addr);
         self.save_user().await;
+        let _ = self.identity_events.send(IdentityEvent::Added(addr.clone()));
+        addr
     }
 
-    /// The user's certs for `certList` (`[{auth_address, auth_type,
-    /// auth_user_name, domain, selected}]`).
-    pub async fn cert_list(&self, address: &str) -> Vec<Value> {
-        self.user.write().await.cert_list(address)
+    /// Subscribe to identity-layer changes (see [`IdentityEvent`]).
+    pub fn subscribe_identity_events(&self) -> tokio::sync::broadcast::Receiver<IdentityEvent> {
+        self.identity_events.subscribe()
     }
 
-    /// Whether the user already holds a cert for `domain` (used by certAdd to
-    /// decide whether to prompt for replacement).
-    pub async fn has_cert(&self, domain: &str) -> bool {
-        self.user.read().await.certs.contains_key(domain)
+    /// The identity rows for a xite (`siteInfo.identities`).
+    pub async fn identity_rows(&self, xite: &str) -> Vec<Value> {
+        self.user.read().await.identity_list(xite)
     }
 
-    // --- xID cert (certXid) --------------------------------------------------
+    /// `identityList`: the rows plus the xite's selection state.
+    pub async fn identity_list_for(&self, xite: &str) -> Value {
+        let user = self.user.read().await;
+        json!({
+            "identities": user.identity_list(xite),
+            "selected": user
+                .identity_for(xite)
+                .map(|i| Value::from(i.auth_address.clone()))
+                .unwrap_or(Value::Null),
+            "default": user.default_identity.clone().map(Value::from).unwrap_or(Value::Null),
+            "scope": user.identity_scope(xite).as_str(),
+            "unlinked": user.unlinked_identity_addresses(),
+        })
+    }
 
-    /// The Epix chain's xID auth/linking xite - where "New" and the
-    /// not-yet-linked redirect send the user to link an identity address to
-    /// their xID name. EpixNet's `xid_xite`.
-    const XID_XITE: &str = "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c";
+    /// Register a per-identity status provider for the Config page under
+    /// `identity_status:<name>`.
+    pub fn register_identity_status_provider(
+        &self,
+        name: &str,
+        provider: Arc<dyn IdentityStatusProvider>,
+    ) {
+        self.install_capability(
+            &format!("{IDENTITY_STATUS_CAP_PREFIX}{name}"),
+            Arc::new(IdentityStatusRegistration(provider)),
+        );
+    }
 
-    /// Show the xID cert-selection dialog and act on the choice (EpixNet's
-    /// `actionCertXid`). Discovers which of the user's addresses already map
-    /// to a registered xID name on chain, offers them plus a "New" option
-    /// that links a fresh identity, and on selection acquires (self-signs) the
-    /// cert or redirects to the xID xite to link. Returns the WS result the
-    /// xite's callback expects (`"ok"`, `"Not changed"`, or an error object).
+    /// Every registered per-identity status provider, in key order.
+    pub fn identity_status_providers(&self) -> Vec<Arc<dyn IdentityStatusProvider>> {
+        let Ok(caps) = self.capabilities.read() else { return Vec::new() };
+        let mut keys: Vec<&String> =
+            caps.keys().filter(|k| k.starts_with(IDENTITY_STATUS_CAP_PREFIX)).collect();
+        keys.sort();
+        keys.into_iter()
+            .filter_map(|k| caps.get(k)?.clone().downcast::<IdentityStatusRegistration>().ok())
+            .map(|registration| registration.0.clone())
+            .collect()
+    }
+
+    /// The Config page's identity rows: every linked identity with its
+    /// `default` flag, plus one `status.<Provider>` object per registered
+    /// status provider.
+    pub async fn identity_config_rows(&self) -> Vec<Value> {
+        let mut rows = self.user.read().await.identity_list("");
+        let providers = self.identity_status_providers();
+        for row in rows.iter_mut() {
+            let auth = row["auth_address"].as_str().unwrap_or("").to_string();
+            let mut status = serde_json::Map::new();
+            for provider in &providers {
+                if let Some(value) = provider.status(&auth).await {
+                    status.insert(provider.name().to_string(), value);
+                }
+            }
+            row["status"] = Value::Object(status);
+        }
+        rows
+    }
+
+    /// Select an identity for one xite (`identitySelect`): `None` inherits the
+    /// default, `Some("")` browses anonymously, `Some(addr)` uses that held
+    /// identity. Persists and notifies the xite on change.
+    pub async fn identity_select(&self, xite: &str, choice: Option<&str>) -> Result<bool, String> {
+        let changed = self.user.write().await.select_identity(xite, choice)?;
+        if changed {
+            self.save_user().await;
+            self.push_identity_changed(IdentityChangeScope::Xite(xite.to_string())).await;
+        }
+        Ok(changed)
+    }
+
+    /// Set (or clear) the node-wide default identity (`identitySetDefault`).
+    pub async fn identity_set_default(&self, auth_address: Option<&str>) -> Result<bool, String> {
+        let changed = self.user.write().await.set_default_identity(auth_address)?;
+        if changed {
+            self.save_user().await;
+            self.push_identity_changed(IdentityChangeScope::Default).await;
+        }
+        Ok(changed)
+    }
+
+    /// Forget a linked identity (`identityRemove`). Its key stays in
+    /// users.json and content it already published stays valid on the network;
+    /// xites that pointed at it fall back to the default.
+    pub async fn identity_remove(&self, auth_address: &str) -> bool {
+        let removed = self.user.write().await.remove_identity(auth_address);
+        if removed {
+            self.save_user().await;
+            let _ = self.identity_events.send(IdentityEvent::Removed(auth_address.to_string()));
+            self.push_identity_changed(IdentityChangeScope::Default).await;
+        }
+        removed
+    }
+
+    /// Every xID name linked on chain to an address this user holds, as
+    /// `{name, tld, auth_address, active, held_locally}`. Resolves the master
+    /// address, every minted identity address, every held identity and
+    /// `extra` (a xite's derived key, for links made before the identity
+    /// series existed). Never stops at the first unlinked address.
+    pub async fn identity_discover(&self, extra: &[String]) -> Vec<DiscoveredIdentity> {
+        let (addresses, held) = {
+            let user = self.user.read().await;
+            let held: std::collections::HashSet<String> =
+                user.identities().iter().map(|i| i.auth_address.clone()).collect();
+            let mut addresses = vec![user.master_address.clone()];
+            addresses.extend(user.identity_addresses());
+            addresses.extend(held.iter().cloned());
+            addresses.extend(extra.iter().cloned());
+            (addresses, held)
+        };
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for addr in addresses {
+            if !seen.insert(addr.clone()) {
+                continue;
+            }
+            if let Some(info) = epix_chain::xid_identity::resolve_identity(&addr).await {
+                out.push(DiscoveredIdentity {
+                    name: info.name,
+                    tld: info.tld,
+                    active: info.active,
+                    held_locally: held.contains(&addr),
+                    auth_address: addr,
+                });
+            }
+        }
+        out
+    }
+
+    /// The linked-identity set of `label.tld` on chain: `Ok(None)` when the
+    /// name does not exist, `Err` when the chain could not answer.
+    async fn chain_identities_for(
+        label: &str,
+        tld: &str,
+    ) -> Result<Option<Vec<epix_chain::Identity>>, String> {
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some(identities) = xid_test::lookup(&format!("{label}.{tld}")) {
+            return Ok(Some(identities));
+        }
+        match epix_chain::shared_resolver().resolve(label, tld).await {
+            Ok(domain) => Ok(Some(domain.identities)),
+            Err(error) if error.is_authoritative() => Ok(None),
+            Err(error) => Err(format!("resolve {label}.{tld}: {error}")),
+        }
+    }
+
+    /// Whether `name` is a well-formed xID label (lowercase, digits, inner `-`).
+    fn valid_xid_label(name: &str) -> bool {
+        !name.is_empty()
+            && name
+                .bytes()
+                .enumerate()
+                .all(|(i, c)| c.is_ascii_lowercase() || c.is_ascii_digit() || (i > 0 && c == b'-'))
+    }
+
+    /// The xID xite URL that links `auth_address` on chain and returns to
+    /// `return_to` (a xite address, or `Config`). The exact shape is the
+    /// integration contract with the xID xite.
+    fn xid_link_url(auth_address: &str, return_to: &str) -> String {
+        format!("/{XID_XITE_ADDRESS}/?linkIdentity={auth_address}&returnTo=/{return_to}")
+    }
+
+    /// Remember an in-flight link so `xidInvalidateCache` can complete it.
+    fn record_pending_link(&self, auth_address: &str, return_to: &str) {
+        *self.pending_link.lock().unwrap() = Some(PendingLink {
+            auth_address: auth_address.to_string(),
+            return_to: return_to.to_string(),
+            started: std::time::Instant::now(),
+        });
+    }
+
+    /// Pick the address to hand the xID xite as "New": the first minted
+    /// identity address that is neither a held identity nor (per
+    /// `linked_on_chain`) already linked to a name; mints one when none is
+    /// spare. Persists when it minted.
+    async fn pick_new_identity_address(
+        &self,
+        linked_on_chain: &std::collections::HashSet<String>,
+    ) -> Result<String, String> {
+        let (addr, minted) = {
+            let mut user = self.user.write().await;
+            match user
+                .unlinked_identity_addresses()
+                .into_iter()
+                .find(|a| !linked_on_chain.contains(a))
+            {
+                Some(a) => (a, false),
+                None => (user.generate_new_identity_address()?.0, true),
+            }
+        };
+        if minted {
+            self.save_user().await;
+        }
+        Ok(addr)
+    }
+
+    /// Begin linking a new identity (`identityLinkStart`): pick (or mint) a
+    /// spare identity address and build the xID xite URL that links it and
+    /// returns to `return_to`. Returns `(auth_address, url)`. Bounded chain
+    /// discovery skips addresses that turn out to be linked already.
+    pub async fn identity_link_start(&self, return_to: &str) -> Result<(String, String), String> {
+        let discovered = tokio::time::timeout(
+            std::time::Duration::from_secs(8),
+            self.identity_discover(&[]),
+        )
+        .await
+        .unwrap_or_default();
+        let linked: std::collections::HashSet<String> =
+            discovered.into_iter().map(|d| d.auth_address).collect();
+        let addr = self.pick_new_identity_address(&linked).await?;
+        self.record_pending_link(&addr, return_to);
+        let url = Self::xid_link_url(&addr, return_to);
+        Ok((addr, url))
+    }
+
+    /// Complete a link (`identityLinkComplete`): verify on chain that
+    /// `auth_address` is an ACTIVE linked identity of `name` (reverse-resolving
+    /// the name when none is given), self-sign the cert, record the identity,
+    /// and select it for `select_for` (a xite address; `None` for the Config
+    /// page). Returns `{xid, auth_address, cert_user_id, added}`, or
+    /// `{error: "identity_not_linked", auth_address}` when the chain does not
+    /// list the address - offering, on a xite, to open the xID xite to link it.
+    pub async fn identity_link_complete(
+        &self,
+        auth_address: &str,
+        name: Option<&str>,
+        select_for: Option<&str>,
+    ) -> Result<Value, String> {
+        let privatekey = self
+            .user
+            .read()
+            .await
+            .privatekey_for(auth_address)
+            .ok_or("No private key for the linked identity")?;
+        let not_linked = json!({ "error": "identity_not_linked", "auth_address": auth_address });
+        let Some(name) = Self::link_name_for(auth_address, name).await else {
+            return Ok(not_linked);
+        };
+        let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), epix_user::XID_TLD));
+        if !Self::valid_xid_label(label) {
+            return Err("Invalid xID name".to_string());
+        }
+
+        // Verify on chain: the name resolves and this address is an ACTIVE
+        // linked identity of it.
+        let Some(identities) = Self::chain_identities_for(label, tld).await? else {
+            return Ok(json!({ "error": format!("xID name '{label}.{tld}' not found on chain") }));
+        };
+        if !identities.iter().any(|i| i.address == auth_address && i.active) {
+            if let Some(xite) = select_for {
+                self.offer_link_on_xite(auth_address, xite, label, tld).await;
+            }
+            return Ok(not_linked);
+        }
+
+        // Self-signed cert: sign "<auth_address>#xid/<name>" with the auth key.
+        let cert_subject = format!("{auth_address}#xid/{label}");
+        let cert_sign = epix_crypt::sign_keccak(&cert_subject, &privatekey)
+            .map_err(|e| format!("Failed to sign certificate: {e}"))?;
+        let (added, became_default) =
+            self.record_linked_identity(label, auth_address, &cert_sign, select_for).await?;
+        self.push_notification(
+            "done",
+            &format!("xID linked: {label}@{}", epix_user::XID_CERT_DOMAIN),
+            5000,
+        );
+        if added {
+            let _ = self.identity_events.send(IdentityEvent::Added(auth_address.to_string()));
+        }
+        if became_default {
+            self.push_identity_changed(IdentityChangeScope::Default).await;
+        }
+        if let Some(xite) = select_for {
+            self.push_identity_changed(IdentityChangeScope::Xite(xite.to_string())).await;
+        }
+        Ok(json!({
+            "xid": format!("{label}.{tld}"),
+            "auth_address": auth_address,
+            "cert_user_id": format!("{label}@{}", epix_user::XID_CERT_DOMAIN),
+            "added": added,
+        }))
+    }
+
+    /// The name a link is for: the given one, normalized, else the chain's
+    /// reverse lookup of the address. `None` when the chain lists no name.
+    async fn link_name_for(auth_address: &str, name: Option<&str>) -> Option<String> {
+        if let Some(n) = name {
+            return Some(n.trim().to_lowercase());
+        }
+        epix_chain::xid_identity::resolve_identity(auth_address)
+            .await
+            .map(|info| format!("{}.{}", info.name, info.tld))
+    }
+
+    /// The address is not linked on chain: ask the user on `xite` whether to
+    /// open the xID xite to link it, remembering the link in flight so the
+    /// xite's later poll can complete it.
+    async fn offer_link_on_xite(&self, auth_address: &str, xite: &str, label: &str, tld: &str) {
+        let url = Self::xid_link_url(auth_address, xite);
+        let body = format!(
+            "Your address is not linked as an identity for <b>{}.{}</b>.<br><br>\
+             Open the xID site to link it?",
+            html_escape(label),
+            html_escape(tld)
+        );
+        if self.confirm(xite, &body, "Open xID").await {
+            self.record_pending_link(auth_address, xite);
+            self.push_redirect(xite, &url);
+        }
+    }
+
+    /// Store the verified identity, select it for the linking xite and save.
+    /// Returns `(added, became_default)`.
+    async fn record_linked_identity(
+        &self,
+        label: &str,
+        auth_address: &str,
+        cert_sign: &str,
+        select_for: Option<&str>,
+    ) -> Result<(bool, bool), String> {
+        let result = {
+            let mut user = self.user.write().await;
+            let added = user.add_identity(label, auth_address, cert_sign, None)?;
+            let became_default = user.default_identity.as_deref() == Some(auth_address);
+            if let Some(xite) = select_for {
+                // The xite the user linked from uses the new identity: as the
+                // default when it just became one (so it keeps inheriting),
+                // else as this xite's override.
+                let choice = if became_default { None } else { Some(auth_address) };
+                user.select_identity(xite, choice)?;
+            }
+            (added, became_default)
+        };
+        self.save_user().await;
+        let mut pending = self.pending_link.lock().unwrap();
+        if pending.as_ref().is_some_and(|p| p.auth_address == auth_address) {
+            *pending = None;
+        }
+        Ok(result)
+    }
+
+    /// `xidInvalidateCache`: drop the cached reverse lookup for `address` so
+    /// the next resolve asks the chain, and - when this address is the link in
+    /// flight - complete the link in the background. The xID xite polls this
+    /// right after its linking transaction, so the user returns already linked.
+    pub async fn xid_invalidate_cache(&self, address: &str) {
+        epix_chain::xid_identity::forget(address);
+        let pending = {
+            let mut guard = self.pending_link.lock().unwrap();
+            match guard.as_ref() {
+                Some(p) if p.auth_address == address => {
+                    if p.started.elapsed() > std::time::Duration::from_secs(30 * 60) {
+                        *guard = None;
+                        None
+                    } else {
+                        Some(p.clone())
+                    }
+                }
+                _ => None,
+            }
+        };
+        let Some(pending) = pending else { return };
+        let state = self.owned_state();
+        tokio::spawn(async move {
+            let select_for = (pending.return_to != "Config").then_some(pending.return_to.as_str());
+            match state.identity_link_complete(&pending.auth_address, None, select_for).await {
+                Ok(result) if result.get("xid").is_some() => {}
+                Ok(result) => {
+                    state
+                        .log("INFO", format!("identity link pending: {result}"))
+                        .await;
+                }
+                Err(error) => {
+                    state
+                        .log("WARNING", format!("identity link could not complete: {error}"))
+                        .await;
+                }
+            }
+        });
+    }
+
+    // --- xID picker (certXid) -----------------------------------------------
+
+    /// Show the xID account picker and act on the choice (EpixNet's
+    /// `actionCertXid`, kept as the entry point every xite calls). Lists the
+    /// held identities, any name the chain links to one of the user's
+    /// addresses but this node has not recorded yet, and a "New" link into the
+    /// xID xite. Returns the WS result the xite's callback expects (`"ok"`,
+    /// `"Not changed"`, or an error object).
     ///
-    /// With `xid_name` set, skips the dialog and goes straight to acquisition
-    /// (EpixNet's direct-name path).
+    /// With `xid_name` set, skips the dialog: selects the held identity of that
+    /// name, or links the discovered one.
     pub async fn cert_xid(&self, xite_address: &str, xid_name: Option<&str>,
     ) -> Result<Value, String> {
         if let Some(name) = xid_name {
-            return self.cert_xid_acquire(xite_address, name, None).await;
+            let held = self
+                .user
+                .read()
+                .await
+                .identity_by_name(name)
+                .map(|i| i.auth_address.clone());
+            if let Some(addr) = held {
+                self.identity_select(xite_address, Some(&addr)).await?;
+                return Ok(Value::from("ok"));
+            }
+            let wanted = name.trim().to_lowercase();
+            let wanted = wanted
+                .strip_suffix(&format!(".{}", epix_user::XID_TLD))
+                .unwrap_or(&wanted)
+                .to_string();
+            let discovered = self.identity_discover(&[]).await;
+            return match discovered.iter().find(|d| d.name == wanted) {
+                Some(found) => {
+                    self.identity_link_complete(&found.auth_address, Some(&found.name), Some(xite_address))
+                        .await
+                }
+                None => Ok(json!({
+                    "error": format!("xID name '{wanted}.epix' is not linked to any of your addresses")
+                })),
+            };
         }
 
-        let auth_address = self.user.write().await.auth_address(xite_address)?;
-        let (existing_cert, is_xid_active, identity_addresses) = {
-            let user = self.user.read().await;
-            let existing = user.certs.get("xid.epix").cloned();
-            let active = user.get_cert(xite_address).map(|c| c.auth_type == "xid").unwrap_or(false);
-            (existing, active, user.identity_addresses())
-        };
-        let existing_name = existing_cert.as_ref().map(|c| c.auth_user_name.clone());
-
+        // The xite's own derived key: links made before the identity series
+        // existed were bound to it.
+        let own_auth = self.user.write().await.xite_data(xite_address)?.auth_address.clone();
         self.push_inject_script(xite_address, "$('#button-identity').text('Checking...')");
-        // The discovery asks the chain once per identity. With the name
+        // The discovery asks the chain once per address. With the name
         // registry unreachable that used to hang the picker on "Checking..."
-        // for an RPC timeout per identity per endpoint; a xite's first screen
+        // for an RPC timeout per address per endpoint; a xite's first screen
         // must not wait on that. Bound the whole lookup: past the budget the
-        // picker opens with the local choices only (None, New) and the names
-        // show up the next time it is opened with the registry back.
-        let (discovered, new_addr) = match tokio::time::timeout(
+        // picker opens with the local choices only and the chain's names show
+        // up the next time it is opened with the registry back.
+        let discovered = match tokio::time::timeout(
             std::time::Duration::from_secs(8),
-            Self::discover_xid_names(&auth_address, &identity_addresses, existing_name.as_deref()),
+            self.identity_discover(&[own_auth]),
         )
         .await
         {
@@ -13534,96 +14078,73 @@ impl AppState {
                     "xID discovery did not answer within 8s; offering local choices only".to_string(),
                 )
                 .await;
-                (Vec::new(), None)
+                Vec::new()
             }
         };
         self.push_inject_script(xite_address, "$('#button-identity').text('Change')");
 
-        // No spare unlinked identity: mint one so "New" always has an address.
-        let new_addr = match new_addr {
-            Some(a) => a,
-            None => {
-                let (addr, _pk) = self.user.write().await.generate_new_identity_address()?;
-                self.save_user().await;
-                addr
-            }
-        };
+        let linked_on_chain: std::collections::HashSet<String> =
+            discovered.iter().map(|d| d.auth_address.clone()).collect();
+        let new_addr = self.pick_new_identity_address(&linked_on_chain).await?;
+        self.record_pending_link(&new_addr, xite_address);
 
-        let body = Self::xid_picker_body(
-            xite_address,
-            existing_name.as_deref(),
-            is_xid_active,
-            &discovered,
-            &new_addr,
-        );
+        let rows = self.user.read().await.identity_list(xite_address);
+        let unheld: Vec<&DiscoveredIdentity> =
+            discovered.iter().filter(|d| !d.held_locally && d.active).collect();
+        let body = Self::xid_picker_body(xite_address, &rows, &unheld, &new_addr);
 
         // Ask, then act on the clicked option's title.
         let choice = self.notification_ask(xite_address, &body).await;
         self.apply_xid_choice(xite_address, choice.as_deref()).await
     }
 
-    /// Discover linked xID names across the user's addresses. The xite's own
-    /// auth address first, then each standalone identity - stopping at the
-    /// first UNLINKED identity, which becomes the "New" candidate. Returns
-    /// `(discovered (name, address) pairs, unlinked address if any)`.
-    async fn discover_xid_names(
-        auth_address: &str,
-        identity_addresses: &[String],
-        existing_name: Option<&str>,
-    ) -> (Vec<(String, String)>, Option<String>) {
-        let mut discovered: Vec<(String, String)> = Vec::new();
-        if let Some(info) = epix_chain::xid_identity::resolve_identity(auth_address).await {
-            if existing_name != Some(info.name.as_str()) {
-                discovered.push((info.name.clone(), auth_address.to_string()));
-            }
-        }
-        for addr in identity_addresses {
-            if addr == auth_address {
-                continue;
-            }
-            match epix_chain::xid_identity::resolve_identity(addr).await {
-                Some(info) if existing_name != Some(info.name.as_str()) => {
-                    discovered.push((info.name.clone(), addr.clone()));
-                }
-                Some(_) => {}
-                None => return (discovered, Some(addr.clone())),
-            }
-        }
-        (discovered, None)
-    }
-
-    /// The account-picker dialog markup (EpixNet's classes/titles).
+    /// The account-picker dialog markup (EpixNet's classes/titles). Rows:
+    /// `None`, one `select:<addr>` per held identity, one `link:<name>:<addr>`
+    /// per discovered-but-unrecorded name, and the `New` navigation link.
     fn xid_picker_body(
         xite_address: &str,
-        existing_name: Option<&str>,
-        is_xid_active: bool,
-        discovered: &[(String, String)],
+        rows: &[Value],
+        unheld: &[&DiscoveredIdentity],
         new_addr: &str,
     ) -> String {
         let mut body = String::from(
             "<span style='padding-bottom: 5px; display: inline-block'>\
              Select the xID account you want to use on this site:</span>",
         );
-        let none_current = if is_xid_active { "" } else { " <small>(currently selected)</small>" };
-        let none_active = if is_xid_active { "" } else { " active" };
+        let any_selected = rows.iter().any(|r| r["selected"] == true);
+        let none_current = if any_selected { "" } else { " <small>(currently selected)</small>" };
+        let none_active = if any_selected { "" } else { " active" };
         body.push_str(&format!(
             "<a href='#Select+account' class='select select-close cert{none_active}' title=''>\
              <b>None</b>{none_current}</a>"
         ));
-        if let Some(name) = existing_name.filter(|n| !n.is_empty()) {
-            let cur = if is_xid_active { " <small>(currently selected)</small>" } else { "" };
-            let act = if is_xid_active { " active" } else { "" };
+        for row in rows {
+            let xid = row["xid"].as_str().unwrap_or("");
+            let addr = row["auth_address"].as_str().unwrap_or("");
+            let selected = row["selected"] == true;
+            let mut tags = String::new();
+            if selected {
+                tags.push_str(" <small>(currently selected)</small>");
+            }
+            if row["default"] == true {
+                tags.push_str(" <small>(default)</small>");
+            }
+            let act = if selected { " active" } else { "" };
             body.push_str(&format!(
-                "<a href='#Select+account' class='select select-close cert{act}' title='xid.epix'>\
-                 <b>{}@xid.epix</b>{cur}</a>",
-                html_escape(name)
+                "<a href='#Select+account' class='select select-close cert{act}' title='select:{}'>\
+                 <b>{}</b>{tags}</a>",
+                html_escape(addr),
+                html_escape(xid)
             ));
         }
-        for (name, addr) in discovered {
+        for found in unheld {
             body.push_str(&format!(
-                "<a href='#Select+account' class='select select-close cert' title='acquire:{}:{}'>\
-                 <b>{}.epix</b> <small>(acquire certificate)</small></a>",
-                html_escape(name), html_escape(addr), html_escape(name)
+                "<a href='#Select+account' class='select select-close cert' title='link:{}:{}'>\
+                 <b>{}.{}</b> <small>(link)</small></a>",
+                html_escape(&found.name),
+                html_escape(&found.auth_address),
+                html_escape(&found.name),
+                html_escape(&found.tld)
             ));
         }
         let short = if new_addr.len() > 14 {
@@ -13631,8 +14152,7 @@ impl AppState {
         } else {
             new_addr.to_string()
         };
-        let new_link =
-            format!("/{}/?linkIdentity={}&returnTo=/{}", Self::XID_XITE, new_addr, xite_address);
+        let new_link = Self::xid_link_url(new_addr, xite_address);
         body.push_str(&format!(
             "<a href='{new_link}' target='_top' class='select'>\
              <b>New</b> {short} <small>Register &raquo;</small></a>"
@@ -13650,143 +14170,31 @@ impl AppState {
             // "New" is a plain navigation link (no `.cert` class), so it never
             // resolves the callback - the wrapper just follows the href.
             None => Ok(Value::from("Not changed")),
-            // "" = None option: drop the global xID cert.
-            Some("") | Some("xid.epix") => {
-                let selected = choice.filter(|c| !c.is_empty());
-                self.user.write().await.set_cert_global(selected);
-                self.save_user().await;
-                self.push_cert_changed(xite_address).await;
+            // "" = None option: browse this xite anonymously.
+            Some("") => {
+                self.identity_select(xite_address, Some("")).await?;
                 Ok(Value::from("ok"))
             }
-            Some(choice) if choice.starts_with("acquire:") => {
+            // Legacy token from older pages: inherit the default again.
+            Some("xid.epix") => {
+                self.identity_select(xite_address, None).await?;
+                Ok(Value::from("ok"))
+            }
+            Some(choice) if choice.starts_with("select:") => {
+                self.identity_select(xite_address, Some(&choice["select:".len()..])).await?;
+                Ok(Value::from("ok"))
+            }
+            Some(choice) if choice.starts_with("link:") => {
                 let parts: Vec<&str> = choice.splitn(3, ':').collect();
-                if parts.len() == 3 {
-                    self.cert_xid_acquire(xite_address, parts[1], Some(parts[2])).await
-                } else {
-                    Err("Invalid acquire choice".to_string())
+                if parts.len() != 3 {
+                    return Err("Invalid link choice".to_string());
                 }
+                let result = self
+                    .identity_link_complete(parts[2], Some(parts[1]), Some(xite_address))
+                    .await?;
+                Ok(if result.get("xid").is_some() { Value::from("ok") } else { result })
             }
             Some(_) => Ok(Value::from("Not changed")),
-        }
-    }
-
-    /// Acquire (self-sign) an xID cert for `xid_name`, verifying on chain that
-    /// the auth address is an active linked identity of that name. If it isn't
-    /// linked, offers to open the xID xite to link it. EpixNet's
-    /// `_processCertXid`. `linked_auth_address` overrides the xite's own auth
-    /// address (when the identity was discovered under a different one).
-    async fn cert_xid_acquire(
-        &self,
-        xite_address: &str,
-        xid_name: &str,
-        linked_auth_address: Option<&str>,
-    ) -> Result<Value, String> {
-        let name = xid_name.trim().to_lowercase();
-        if name.is_empty()
-            || !name
-                .bytes()
-                .enumerate()
-                .all(|(i, c)| c.is_ascii_lowercase() || c.is_ascii_digit() || (i > 0 && c == b'-'))
-        {
-            return Err("Invalid xID name".to_string());
-        }
-
-        // Resolve the auth address + its private key to sign the cert.
-        let (auth_address, privatekey) = match linked_auth_address {
-            Some(addr) => {
-                let pk = self
-                    .user
-                    .read()
-                    .await
-                    .privatekey_for(addr)
-                    .ok_or("No private key for the linked identity")?;
-                (addr.to_string(), pk)
-            }
-            None => {
-                let mut user = self.user.write().await;
-                let sd = user.xite_data(xite_address)?.clone();
-                (sd.auth_address, sd.auth_privatekey)
-            }
-        };
-
-        // Verify on chain: the name resolves and this address is an ACTIVE
-        // linked identity of it. Uses the full snapshot (identities + active).
-        let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
-        let domain = match epix_chain::shared_resolver().resolve(label, tld).await {
-            Ok(d) => d,
-            Err(_) => {
-                return Ok(json!({ "error": format!("xID name '{name}' not found on chain") }))
-            }
-        };
-        let linked = domain
-            .identities
-            .iter()
-            .any(|i| i.address == auth_address && i.active);
-        if !linked {
-            // Offer to open the xID xite to link this address.
-            let url = format!(
-                "/{}/?linkIdentity={}&returnTo=/{}",
-                Self::XID_XITE, auth_address, xite_address
-            );
-            let body = format!(
-                "Your address is not linked as an identity for <b>{}.{}</b>.<br><br>\
-                 Open the xID site to link it?",
-                html_escape(label), html_escape(tld)
-            );
-            if self.confirm(xite_address, &body, "Open xID").await {
-                self.push_redirect(xite_address, &url);
-            }
-            return Ok(json!({ "error": "identity_not_linked", "auth_address": auth_address }));
-        }
-
-        // Self-signed cert: sign "<auth_address>#xid/<name>" with the auth key.
-        let cert_subject = format!("{auth_address}#xid/{label}");
-        let cert_sign = epix_crypt::sign_keccak(&cert_subject, &privatekey)
-            .map_err(|e| format!("Failed to sign certificate: {e}"))?;
-
-        let mut user = self.user.write().await;
-        match user.add_cert(&auth_address, "xid.epix", "xid", label, &cert_sign)? {
-            Some(true) => {
-                user.set_cert_global(Some("xid.epix"));
-                drop(user);
-                self.save_user().await;
-                self.push_notification(
-                    "done",
-                    &format!("xID certificate acquired: {label}@xid.epix"),
-                    5000,
-                );
-                self.push_cert_changed(xite_address).await;
-                Ok(Value::from("ok"))
-            }
-            Some(false) => {
-                // A different xID cert exists: confirm replacement.
-                drop(user);
-                let body = "You already have an xID cert. Replace it?".to_string();
-                if !self.confirm(xite_address, &body, "Replace").await {
-                    return Ok(Value::from("Not changed"));
-                }
-                let mut user = self.user.write().await;
-                user.delete_cert("xid.epix");
-                user.add_cert(&auth_address, "xid.epix", "xid", label, &cert_sign)?;
-                user.set_cert_global(Some("xid.epix"));
-                drop(user);
-                self.save_user().await;
-                self.push_notification(
-                    "done",
-                    &format!("xID certificate updated: {label}@xid.epix"),
-                    5000,
-                );
-                self.push_cert_changed(xite_address).await;
-                Ok(Value::from("ok"))
-            }
-            None => {
-                // Identical cert already present: just select it.
-                user.set_cert_global(Some("xid.epix"));
-                drop(user);
-                self.save_user().await;
-                self.push_cert_changed(xite_address).await;
-                Ok(Value::from("ok"))
-            }
         }
     }
 
@@ -13824,15 +14232,44 @@ impl AppState {
         }
     }
 
-    /// Notify the xite (and its wrapper) that the selected cert changed, so the
-    /// page re-renders its identity - EpixNet's `updateWebsocket(cert_changed)`.
-    async fn push_cert_changed(&self, address: &str) {
-        let mut info = self.xite_info(address).await;
-        if let Value::Object(m) = &mut info {
-            m.insert("event".to_string(), json!(["cert_changed", "xid.epix"]));
-            self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.to_string()),
-            );
+    /// Notify every affected xite (and its wrapper) that its identity changed,
+    /// so pages re-render - EpixNet's `updateWebsocket(cert_changed)`. The
+    /// event keeps the literal `cert_changed` name xites already match, with
+    /// the new `cert_user_id` (or null) as its argument. Also broadcasts an
+    /// [`IdentityEvent`] to plugins.
+    pub async fn push_identity_changed(&self, scope: IdentityChangeScope) {
+        let targets: Vec<String> = match &scope {
+            IdentityChangeScope::Xite(address) => vec![address.clone()],
+            IdentityChangeScope::Default => {
+                let addresses = self.xite_addresses().await;
+                let user = self.user.read().await;
+                addresses
+                    .into_iter()
+                    .filter(|a| user.identity_scope(a) == epix_user::IdentityScope::Inherit)
+                    .collect()
+            }
+        };
+        for address in targets {
+            let mut info = self.xite_info(&address).await;
+            if let Value::Object(m) = &mut info {
+                let id = m.get("cert_user_id").cloned().unwrap_or(Value::Null);
+                m.insert("event".to_string(), json!(["cert_changed", id]));
+                self.push_event("setSiteInfo", info, Some("siteChanged"), Some(address.clone()));
+            }
         }
+        let event = {
+            let user = self.user.read().await;
+            match scope {
+                IdentityChangeScope::Xite(xite) => IdentityEvent::Selected {
+                    auth_address: user.identity_for(&xite).map(|i| i.auth_address.clone()),
+                    xite,
+                },
+                IdentityChangeScope::Default => {
+                    IdentityEvent::DefaultChanged(user.default_identity.clone())
+                }
+            }
+        };
+        let _ = self.identity_events.send(event);
     }
 
     /// The configured Epix chain REST endpoints (Vrf / XidResolver), most
@@ -14869,7 +15306,7 @@ impl AppState {
             )
         };
         if !owned {
-            let auth = self.user.write().await.auth_address(address).unwrap_or_default();
+            let auth = self.user.read().await.auth_address(address).unwrap_or_default();
             let is_signer = content
                 .as_ref()
                 .and_then(|c| c.get("signers"))
@@ -20155,8 +20592,11 @@ impl AppState {
         }
         let content = self.content(address).await;
         let signers = if inner_path.starts_with("data/users/") {
-            let auth = self.user.write().await.auth_address(address).unwrap_or_default();
-            vec![Value::from(auth)]
+            // Anonymous browsing signs nothing: an empty signer list.
+            match self.user.read().await.auth_address(address) {
+                Ok(auth) => vec![Value::from(auth)],
+                Err(_) => Vec::new(),
+            }
         } else {
             content
                 .as_ref()
@@ -20198,11 +20638,10 @@ impl AppState {
             None => {
                 let mut c = serde_json::Map::new();
                 let user = self.user.read().await;
-                if let (Some(id), Some(cert)) = (user.cert_user_id(address), user.get_cert(address))
-                {
-                    c.insert("cert_user_id".into(), json!(id));
-                    c.insert("cert_auth_type".into(), json!(cert.auth_type));
-                    c.insert("cert_sign".into(), json!(cert.cert_sign));
+                if let Some(identity) = user.identity_for(address) {
+                    c.insert("cert_user_id".into(), json!(identity.cert_user_id()));
+                    c.insert("cert_auth_type".into(), json!(identity.cert_auth_type()));
+                    c.insert("cert_sign".into(), json!(identity.cert_sign));
                 }
                 Value::Object(c)
             }
@@ -21378,6 +21817,13 @@ impl AppState {
         names.dedup();
         let mut xid_map = epix_content::XidMap::new();
         for name in names {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(identities) = xid_test::lookup(&name) {
+                let mut identities = chain_xid_identities(identities);
+                identities.sort_by(|a, b| a.address.cmp(&b.address));
+                xid_map.insert(name, identities);
+                continue;
+            }
             let (label, tld) = name
                 .rsplit_once('.')
                 .unwrap_or((name.as_str(), "epix"));
@@ -21937,6 +22383,11 @@ impl AppState {
         names.dedup();
         let mut out = XidResolution::default();
         for name in names {
+            #[cfg(any(test, feature = "test-support"))]
+            if let Some(identities) = xid_test::lookup(&name) {
+                out.map.insert(name, chain_xid_identities(identities));
+                continue;
+            }
             let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
             match epix_chain::xid_signers::resolve_identities_or_cached(label, tld).await {
                 Ok((identities, from_cache)) => {
@@ -23208,8 +23659,32 @@ impl AppState {
         Ok(())
     }
 
-    /// Write a file into a xite's storage (`fileWrite`).
+    /// Write a file into a xite's storage (`fileWrite`). Under `data/users/`
+    /// the xite must have an identity selected (posting needs an xID).
     pub async fn write_file(&self, address: &str, inner_path: &str, bytes: &[u8],
+    ) -> Result<(), String> {
+        self.write_file_with(address, inner_path, bytes, true).await
+    }
+
+    /// [`Self::write_file`] for the node's own background writers - the
+    /// channel plugin publishing a key bundle for an identity that is not the
+    /// xite's effective one. Skips the caller-identity check; the signer still
+    /// has to satisfy the directory's rules at sign time.
+    pub async fn write_file_unchecked(
+        &self,
+        address: &str,
+        inner_path: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        self.write_file_with(address, inner_path, bytes, false).await
+    }
+
+    async fn write_file_with(
+        &self,
+        address: &str,
+        inner_path: &str,
+        bytes: &[u8],
+        enforce_identity: bool,
     ) -> Result<(), String> {
         let state = self.owned_state();
         let address = address.to_string();
@@ -23217,7 +23692,7 @@ impl AppState {
         let bytes = bytes.to_vec();
         tokio::spawn(async move {
             state
-                .write_file_owned(&address, &inner_path, &bytes)
+                .write_file_owned(&address, &inner_path, &bytes, enforce_identity)
                 .await
         })
         .await
@@ -23229,6 +23704,7 @@ impl AppState {
         address: &str,
         inner_path: &str,
         bytes: &[u8],
+        enforce_identity: bool,
     ) -> Result<(), String> {
         let _activation = self.xite_activation_gate.clone().read_owned().await;
         let (storage, canonical) = {
@@ -23239,6 +23715,9 @@ impl AppState {
                 canonical_address(xite.content.as_ref(), address),
             )
         };
+        if enforce_identity {
+            self.require_identity_for(address, inner_path).await?;
+        }
         let governing = self.content_inner_path(address, inner_path).await;
         let manifest_guard = self.acquire_manifest_mutex(&canonical, &governing).await?;
         let tree = self.tree_mutation_lock(&canonical).lock_owned().await;
@@ -23381,6 +23860,7 @@ impl AppState {
                 canonical_address(e.content.as_ref(), address),
             )
         };
+        self.require_identity_for(address, inner_path).await?;
         let governing = self.content_inner_path(address, inner_path).await;
         let manifest_guard = self.acquire_manifest_mutex(&canonical, &governing).await?;
         let tree = self.tree_mutation_lock(&canonical).lock_owned().await;
@@ -25542,11 +26022,7 @@ impl AppState {
         if !record.is_object() {
             return Err("record must be a JSON object".into());
         }
-        let key = {
-            let mut user = self.user.write().await;
-            user.auth_privatekey(address)?
-        };
-        self.save_user().await; // auth_privatekey may have derived the xite entry
+        let key = self.user.read().await.auth_privatekey(address)?;
         // The node sets `author` authoritatively to the address this key
         // recovers to, so a client can never claim another author. On creation
         // (no post_id yet) it derives the immutable CRDT key; edit/delete keep
@@ -25636,11 +26112,37 @@ impl AppState {
         Ok(files)
     }
 
+    /// Sign a user content.json as the xite's identity (no `privatekey`), or
+    /// with an explicit bare key and no cert fields (owners, tests).
     pub async fn sign_user_content(
         &self,
         address: &str,
         content_inner_path: &str,
         privatekey: Option<String>,
+        origin: Option<u64>,
+    ) -> Result<(), String> {
+        let signer = privatekey.map(UserContentSigner::raw_key);
+        self.sign_user_content_with(address, content_inner_path, signer, origin).await
+    }
+
+    /// Sign a user content.json as a specific signer - an identity other than
+    /// the xite's effective one (the channel plugin publishes a key bundle per
+    /// linked identity into the hub this way).
+    pub async fn sign_user_content_as(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        signer: UserContentSigner,
+        origin: Option<u64>,
+    ) -> Result<(), String> {
+        self.sign_user_content_with(address, content_inner_path, Some(signer), origin).await
+    }
+
+    async fn sign_user_content_with(
+        &self,
+        address: &str,
+        content_inner_path: &str,
+        signer: Option<UserContentSigner>,
         origin: Option<u64>,
     ) -> Result<(), String> {
         let state = self.owned_state();
@@ -25651,7 +26153,7 @@ impl AppState {
                 .sign_user_content_owned(
                     &address,
                     &content_inner_path,
-                    privatekey,
+                    signer,
                     origin,
                 )
                 .await
@@ -25661,26 +26163,21 @@ impl AppState {
     }
 
     /// What the signed result will carry as its cert: the stored content, with
-    /// the user's own cert id on top when the node signs as them (`own_cert`,
-    /// i.e. no explicit private key was passed). Only a resolution hint, so
-    /// the chain cert name can be resolved before signing; the authoritative
-    /// cert check runs at verify.
-    async fn child_cert_hint(
-        &self,
-        address: &str,
+    /// the signer's cert id on top when there is one. Only a resolution hint,
+    /// so the chain cert name can be resolved before signing; the
+    /// authoritative cert check runs at verify.
+    fn child_cert_hint(
         content_inner_path: &str,
         storage: &XiteStorage,
-        own_cert: bool,
+        cert_user_id: Option<&str>,
     ) -> Value {
         let mut hint = storage
             .read(content_inner_path)
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .unwrap_or_else(|| json!({}));
-        if own_cert {
-            if let Some(id) = self.user.read().await.cert_user_id(address) {
-                hint["cert_user_id"] = json!(id);
-            }
+        if let Some(id) = cert_user_id {
+            hint["cert_user_id"] = json!(id);
         }
         hint
     }
@@ -25689,7 +26186,7 @@ impl AppState {
         &self,
         address: &str,
         content_inner_path: &str,
-        privatekey: Option<String>,
+        signer: Option<UserContentSigner>,
         origin: Option<u64>,
     ) -> Result<(), String> {
         let activation = self.xite_activation_gate.clone().read_owned().await;
@@ -25702,9 +26199,19 @@ impl AppState {
                 xite.content.clone(),
             )
         };
-        let cert_hint = self
-            .child_cert_hint(address, content_inner_path, &storage, privatekey.is_none())
-            .await;
+        // No explicit signer: the xite's identity signs, and it must have one.
+        let signer = match signer {
+            Some(signer) => signer,
+            None => {
+                let user = self.user.read().await;
+                let identity = user
+                    .identity_for(address)
+                    .ok_or_else(|| epix_user::XID_REQUIRED.to_string())?;
+                UserContentSigner::for_identity(identity)
+            }
+        };
+        let cert_hint =
+            Self::child_cert_hint(content_inner_path, &storage, signer.cert_user_id.as_deref());
         let authority = self
             .verified_child_authority(address, content_inner_path, Some(&cert_hint))
             .await?;
@@ -25714,24 +26221,18 @@ impl AppState {
 
         // The cert fields to extend the content.json with, and the signing key.
         let (mut extend, key) = {
-            let mut user = self.user.write().await;
             let mut extend = serde_json::Map::new();
-            if privatekey.is_none() {
-                if let Some(id) = user.cert_user_id(address) {
-                    if let Some(cert) = user.get_cert(address) {
-                        extend.insert("cert_auth_type".into(), json!(cert.auth_type));
-                        extend.insert("cert_sign".into(), json!(cert.cert_sign));
-                    }
-                    extend.insert("cert_user_id".into(), json!(id));
-                }
+            if let Some(id) = &signer.cert_user_id {
+                extend.insert("cert_user_id".into(), json!(id));
             }
-            let key = match privatekey {
-                Some(k) => k,
-                None => user.auth_privatekey(address)?,
-            };
-            (extend, key)
+            if let Some(auth_type) = &signer.cert_auth_type {
+                extend.insert("cert_auth_type".into(), json!(auth_type));
+            }
+            if let Some(sign) = &signer.cert_sign {
+                extend.insert("cert_sign".into(), json!(sign));
+            }
+            (extend, signer.auth_privatekey.clone())
         };
-        self.save_user().await; // auth_privatekey may have derived the xite entry
 
         let manifest = self
             .acquire_manifest_mutex(&canonical, content_inner_path)
@@ -31205,14 +31706,20 @@ impl AppState {
             )
         };
 
-        let auth_address = self
-            .user
-            .write()
-            .await
-            .auth_address(address)
-            .unwrap_or_default();
-        let cert_user_id = self.user.read().await.cert_user_id(address);
-        let xid_directory = self.user_directory(address, &auth_address).await;
+        // Identity: null everywhere when the xite is browsed anonymously. The
+        // full identity list rides along so pickers render without a round
+        // trip; `identity_scope` says whether the xite inherits the default.
+        let (auth_address, cert_user_id, xid_directory, identities, identity_scope) = {
+            let user = self.user.read().await;
+            let identity = user.identity_for(address);
+            (
+                identity.map(|i| Value::from(i.auth_address.clone())).unwrap_or(Value::Null),
+                identity.map(|i| Value::from(i.cert_user_id())).unwrap_or(Value::Null),
+                identity.map(|i| Value::from(i.xid())).unwrap_or(Value::Null),
+                Value::Array(user.identity_list(address)),
+                user.identity_scope(address).as_str(),
+            )
+        };
         // Whether users.json holds this xite's own private key (a bool, never
         // the key itself) - EpixNet's formatSiteInfo parity. The wrapper
         // infopanel and the sidebar sign/publish buttons key off this: true ->
@@ -31249,6 +31756,8 @@ impl AppState {
             "privatekey": has_privatekey,
             "feed_follow_num": feed_follow_num,
             "xid_directory": xid_directory,
+            "identities": identities,
+            "identity_scope": identity_scope,
             "address": address,
             "display": display,
             "address_short": short,
@@ -32336,6 +32845,17 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    /// Mint an identity address, link it as `name` offline (the chain stand-in
+    /// lists it as active) and return its address. The first link becomes the
+    /// node-wide default, so every xite without an override acts as it.
+    async fn link_test_identity(state: &AppState, name: &str) -> String {
+        let (addr, key) = state.user.write().await.generate_new_identity_address().unwrap();
+        let sign = epix_crypt::sign_keccak(&format!("{addr}#xid/{name}"), &key).unwrap();
+        state.user.write().await.add_identity(name, &addr, &sign, None).unwrap();
+        xid_test::link(name, &addr);
+        addr
+    }
+
     fn write_signed_user_governor(
         storage: &XiteStorage,
         privatekey: &str,
@@ -32522,29 +33042,27 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn cert_aware_auth_address_and_private_key_stay_paired_for_linked_override() {
+    async fn identity_auth_address_and_private_key_stay_paired() {
         let state = AppState::new("test");
         let xite_key = epix_crypt::new_seed();
         let xite = epix_crypt::privatekey_to_address(&xite_key).unwrap();
-        let (raw_auth, linked_auth) = {
-            let mut user = state.user.write().await;
-            let raw_auth = user.auth_address(&xite).unwrap();
-            let (linked_auth, _) = user.generate_new_identity_address().unwrap();
-            user.add_cert(&linked_auth, "xid.epix", "xid", "alice", "test-cert")
-                .unwrap();
-            user.set_cert_global(Some("xid.epix"));
-            (raw_auth, linked_auth)
-        };
-        assert_ne!(
-            raw_auth, linked_auth,
-            "the regression requires a true override"
+        // No identity: the xite is anonymous and nothing signs.
+        assert_eq!(
+            state.user_auth_address(&xite).await.unwrap_err(),
+            epix_user::XID_REQUIRED
         );
+        assert_eq!(
+            state.user_cert_auth_privatekey(&xite).await.unwrap_err(),
+            epix_user::XID_REQUIRED
+        );
+        let raw_auth = state.user.write().await.xite_data(&xite).unwrap().auth_address.clone();
+        let linked_auth = link_test_identity(&state, "alice").await;
+        assert_ne!(raw_auth, linked_auth, "the identity is not the derived xite key");
         assert_eq!(state.user_auth_address(&xite).await.unwrap(), linked_auth);
         let key = state.user_cert_auth_privatekey(&xite).await.unwrap();
-        assert_eq!(
-            epix_crypt::privatekey_to_address(&key).unwrap(),
-            linked_auth
-        );
+        assert_eq!(epix_crypt::privatekey_to_address(&key).unwrap(), linked_auth);
+        assert_eq!(state.identity_auth_privatekey(&linked_auth).await.unwrap(), key);
+        assert_eq!(state.user_directory(&xite, "").await, "alice.epix");
     }
 
     #[test]
@@ -35861,11 +36379,13 @@ mod tests {
             info["address_hash"].as_str().unwrap(),
             hex::encode(Sha256::digest(addr.as_bytes()))
         );
-        // Real derived identity.
-        assert!(info["auth_address"].as_str().unwrap().starts_with("epix1"));
-        // No cert selected: the user directory is the bare auth address
-        // (EpixNet's getUserDirectory; an xid cert would make it <name>.epix).
-        assert_eq!(info["xid_directory"], info["auth_address"]);
+        // No identity linked: the xite is browsed anonymously, so every
+        // identity field is null and the list is empty.
+        assert!(info["auth_address"].is_null());
+        assert!(info["cert_user_id"].is_null());
+        assert!(info["xid_directory"].is_null());
+        assert_eq!(info["identities"], json!([]));
+        assert_eq!(info["identity_scope"], "inherit");
 
         // Real stats from content.json.
         assert_eq!(info["settings"]["size"], 350);
@@ -41118,8 +41638,9 @@ mod tests {
             )
             .await;
 
-        // Touch the xite (siteInfo derives the auth identity) and follow a feed.
-        state.xite_info(addr).await;
+        // Derive the xite's per-user record (its settings/key entry) and
+        // follow a feed.
+        state.user.write().await.xite_data(addr).unwrap();
         state.set_feed_follow(addr, json!({ "posts": ["q", []] })).await;
         assert!(state.user.read().await.xites.contains_key(addr));
         assert!(state.user.read().await.follows.contains_key(addr));
@@ -41501,8 +42022,8 @@ mod tests {
     async fn user_content_signs_with_the_users_auth_key() {
         // The EpixTalk topic flow: fileWrite the data file, then siteSign /
         // sitePublish with its inner_path - the node maps it to the user's own
-        // content.json, hashes the dir, and signs as the user. A classic
-        // auth-address-named user dir needs no chain resolution.
+        // content.json, hashes the dir, and signs as the user's identity into
+        // its `<name>.epix` directory (the chain stand-in resolves the name).
         let root = tempdir().unwrap();
         let xite_key = epix_crypt::new_seed();
         let state = AppState::with_data_dir("test", root.path());
@@ -41517,8 +42038,8 @@ mod tests {
             )
             .await;
 
-        let auth = state.user.write().await.auth_address(&xite).unwrap();
-        let dir = format!("data/users/{auth}");
+        let auth = link_test_identity(&state, "alice").await;
+        let dir = "data/users/alice.epix".to_string();
         let data_path = format!("{dir}/data.json");
         state.write_file(&xite, &data_path, br#"{"topic":[{"topic_id":1}]}"#).await.unwrap();
 
@@ -41562,8 +42083,8 @@ mod tests {
             )
             .await;
 
-        let auth = state.user.write().await.auth_address(&xite).unwrap();
-        let dir = format!("data/users/{auth}");
+        let _auth = link_test_identity(&state, "alice").await;
+        let dir = "data/users/alice.epix".to_string();
         let data_path = format!("{dir}/data.json");
         let content_path = format!("{dir}/content.json");
         storage.write(&data_path, b"old child data").unwrap();
@@ -41606,33 +42127,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn merged_xite_signing_uses_the_globally_selected_cert() {
+    async fn merged_xite_signing_inherits_the_default_identity() {
         // Python MergerSite copied the merger xite's cert onto the merged xite
-        // on every write because python certs were per-xite. Rust certs are
-        // global: a xite entry derived after certSelect auto-attaches the
-        // active cert, so a merged xite first touched through a merger path
-        // signs as the cert identity with no copy step. This pins that down
-        // against a hub whose user_contents actually demands the cert.
+        // on every write because python certs were per-xite. Here the default
+        // identity applies to every xite that has no override, so a merged
+        // xite first touched through a merger path signs as that identity with
+        // no copy step. Pinned against a hub whose user_contents demands the
+        // xID cert.
         let root = tempdir().unwrap();
         let state = AppState::with_data_dir("test", root.path());
+        let identity_auth = link_test_identity(&state, "alice").await;
 
-        // A provider issues a cert for the identity the user derived on the
-        // provider's own xite, and the user selects it globally.
-        let issuer_key = epix_crypt::new_seed();
-        let issuer = epix_crypt::privatekey_to_address(&issuer_key).unwrap();
-        let cert_auth = {
-            let mut user = state.user.write().await;
-            let cert_auth = user.xite_data("epix1certprovider").unwrap().auth_address.clone();
-            let cert_sign =
-                epix_crypt::sign(&format!("{cert_auth}#web/tester"), &issuer_key).unwrap();
-            user.add_cert(&cert_auth, "certs.epix", "web", "tester", &cert_sign).unwrap();
-            user.set_cert_global(Some("certs.epix"));
-            // A brand-new entry derived after the selection carries the cert.
-            assert_eq!(user.xite_data("epix1fresh").unwrap().cert.as_deref(), Some("certs.epix"));
-            cert_auth
-        };
-
-        // A merger xite and a hub whose user dirs require a certs.epix cert.
+        // A merger xite and a hub whose user dirs require an xID cert.
         let hub_key = epix_crypt::new_seed();
         let hub = epix_crypt::privatekey_to_address(&hub_key).unwrap();
         let storage = XiteStorage::new(root.path().join("data").join(&hub));
@@ -41642,7 +42148,7 @@ mod tests {
             "modified": 1.0,
             "user_contents": {
                 "permissions": {},
-                "cert_signers": { "certs.epix": [issuer] },
+                "cert_signers": { "xid.epix": ["chain"] },
             }
         });
         epix_content::sign(&mut users_content, &hub_key).unwrap();
@@ -41679,22 +42185,23 @@ mod tests {
             .await;
         state.add_permission("epix1merger", "Merger:PostHub").await;
 
-        // First touch of the merged xite: it reports the cert's auth address,
-        // so the user dir the merger's xite writes into is the cert identity's.
-        let auth = state.user.write().await.auth_address(&hub).unwrap();
-        assert_eq!(auth, cert_auth, "the global cert reached the merged site");
+        // First touch of the merged xite: it reports the identity, so the user
+        // dir the merger's xite writes into is the identity's.
+        let auth = state.user_auth_address(&hub).await.unwrap();
+        assert_eq!(auth, identity_auth, "the default identity reached the merged site");
+        assert_eq!(state.user_directory(&hub, "").await, "alice.epix");
 
-        let merged_path = format!("merged-PostHub/{hub}/data/users/{auth}/data.json");
+        let merged_path = format!("merged-PostHub/{hub}/data/users/alice.epix/data.json");
         let (target, inner) =
             state.resolve_merged("epix1merger", &merged_path).await.unwrap().unwrap();
         assert_eq!(target, hub);
         state.write_file(&target, &inner, br#"{"post":[{"post_id":1}]}"#).await.unwrap();
         let content_path = state.content_inner_path(&target, &inner).await;
-        assert_eq!(content_path, format!("data/users/{auth}/content.json"));
+        assert_eq!(content_path, "data/users/alice.epix/content.json");
 
         // The rule really bites: signing with the bare key (no cert fields
         // attached) is refused by the hub's cert_signers.
-        let bare_key = state.user.read().await.get_cert(&hub).unwrap().auth_privatekey.clone();
+        let bare_key = state.identity_auth_privatekey(&auth).await.unwrap();
         let err = state
             .sign_user_content(&target, &content_path, Some(bare_key), None)
             .await
@@ -41705,10 +42212,243 @@ mod tests {
         state.sign_user_content(&target, &content_path, None, None).await.unwrap();
         let signed: Value =
             serde_json::from_slice(&storage.read(&content_path).unwrap()).unwrap();
-        assert_eq!(signed["cert_user_id"], json!("tester@certs.epix"));
-        assert_eq!(signed["cert_auth_type"], json!("web"));
-        assert!(signed["signs"][&cert_auth].is_string(), "signed as the cert identity: {signed}");
+        assert_eq!(signed["cert_user_id"], json!("alice@xid.epix"));
+        assert_eq!(signed["cert_auth_type"], json!("xid"));
+        assert!(signed["signs"][&auth].is_string(), "signed as the identity: {signed}");
         assert!(signed["files"]["data.json"]["sha512"].is_string(), "data.json hashed");
+
+        // An explicit signer for another identity signs the same way (the
+        // channel plugin publishes key bundles per identity like this).
+        let bob = link_test_identity(&state, "bob").await;
+        let bob_dir = "data/users/bob.epix";
+        state
+            .write_file(&hub, &format!("{bob_dir}/data.json"), br#"{"post":[]}"#)
+            .await
+            .unwrap();
+        let signer = {
+            let user = state.user.read().await;
+            UserContentSigner::for_identity(user.identity(&bob).unwrap())
+        };
+        state
+            .sign_user_content_as(&hub, &format!("{bob_dir}/content.json"), signer, None)
+            .await
+            .unwrap();
+        let signed: Value = serde_json::from_slice(
+            &storage.read(&format!("{bob_dir}/content.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(signed["cert_user_id"], json!("bob@xid.epix"));
+        assert!(signed["signs"][&bob].is_string(), "signed as bob: {signed}");
+    }
+
+    #[tokio::test]
+    async fn writes_under_data_users_need_an_identity() {
+        let root = tempdir().unwrap();
+        let xite_key = epix_crypt::new_seed();
+        let state = AppState::with_data_dir("test", root.path());
+        let xite = epix_crypt::privatekey_to_address(&xite_key).unwrap();
+        let storage = XiteStorage::new(root.path().join("data").join(&xite));
+        let (_, signed_root) = write_signed_user_governor(&storage, &xite_key);
+        state
+            .add_xite(&xite, XiteEntry { storage: storage.clone(), content: Some(signed_root) })
+            .await;
+
+        // Anonymous: every posting path refuses; browsing metadata is null.
+        let path = "data/users/nobody.epix/data.json";
+        let err = state.write_file(&xite, path, b"{}").await.unwrap_err();
+        assert_eq!(err, epix_user::XID_REQUIRED);
+        let err = state.delete_file(&xite, path, None).await.unwrap_err();
+        assert_eq!(err, epix_user::XID_REQUIRED);
+        let err = state
+            .sign_user_content(&xite, "data/users/nobody.epix/content.json", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err, epix_user::XID_REQUIRED);
+        let err = state.sign_record(&xite, json!({ "body": "hi" })).await.unwrap_err();
+        assert_eq!(err, epix_user::XID_REQUIRED);
+        let rules = state.file_rules(&xite, path).await;
+        assert_eq!(rules["signers"], json!([]));
+        let info = state.xite_info(&xite).await;
+        assert!(info["auth_address"].is_null(), "{info}");
+        assert!(info["cert_user_id"].is_null());
+        assert!(info["xid_directory"].is_null());
+        assert_eq!(info["identities"], json!([]));
+        assert_eq!(info["identity_scope"], "inherit");
+
+        // With an identity the same paths work and siteInfo names it.
+        let auth = link_test_identity(&state, "alice").await;
+        state
+            .write_file(&xite, "data/users/alice.epix/data.json", br#"{"topic":[]}"#)
+            .await
+            .unwrap();
+        let rules = state.file_rules(&xite, "data/users/alice.epix/data.json").await;
+        assert_eq!(rules["signers"], json!([auth]));
+        let info = state.xite_info(&xite).await;
+        assert_eq!(info["auth_address"], auth);
+        assert_eq!(info["cert_user_id"], "alice@xid.epix");
+        assert_eq!(info["xid_directory"], "alice.epix");
+        assert_eq!(info["identities"][0]["selected"], true);
+        assert_eq!(info["identities"][0]["default"], true);
+
+        // Explicitly anonymous on this xite despite the default.
+        state.identity_select(&xite, Some("")).await.unwrap();
+        let info = state.xite_info(&xite).await;
+        assert!(info["auth_address"].is_null());
+        assert_eq!(info["identity_scope"], "none");
+        assert_eq!(info["identities"][0]["selected"], false);
+        assert_eq!(
+            state.sign_record(&xite, json!({ "body": "hi" })).await.unwrap_err(),
+            epix_user::XID_REQUIRED
+        );
+    }
+
+    #[tokio::test]
+    async fn default_change_reaches_only_inheriting_xites() {
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        for a in ["epix1talk", "epix1blog"] {
+            state
+                .add_xite(a, XiteEntry {
+                    storage: XiteStorage::new(root.path().join("data").join(a)),
+                    content: None,
+                })
+                .await;
+        }
+        let alice = link_test_identity(&state, "alice").await;
+        let bob = link_test_identity(&state, "bob").await;
+        state.identity_select("epix1talk", Some(&bob)).await.unwrap();
+
+        let mut identity_events = state.subscribe_identity_events();
+        let mut ui_events = state.events.subscribe();
+        let told = |ui_events: &mut tokio::sync::broadcast::Receiver<UiEvent>| {
+            let mut told = Vec::new();
+            while let Ok(ev) = ui_events.try_recv() {
+                if ev.payload.contains("cert_changed") {
+                    told.push((ev.target.unwrap(), ev.payload));
+                }
+            }
+            told
+        };
+
+        // The default moves: Blog inherits and is told, Talk has its own
+        // override and is left alone.
+        assert!(state.identity_set_default(Some(&bob)).await.unwrap());
+        let pushed = told(&mut ui_events);
+        assert_eq!(pushed.len(), 1, "{pushed:?}");
+        assert_eq!(pushed[0].0, "epix1blog");
+        assert!(pushed[0].1.contains("bob@xid.epix"), "{}", pushed[0].1);
+        assert!(matches!(
+            identity_events.try_recv().unwrap(),
+            IdentityEvent::DefaultChanged(Some(ref a)) if *a == bob
+        ));
+
+        // A per-xite change reaches that xite only, with the new identity.
+        assert!(state.identity_select("epix1talk", Some(&alice)).await.unwrap());
+        let pushed = told(&mut ui_events);
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].0, "epix1talk");
+        assert!(pushed[0].1.contains("alice@xid.epix"));
+        assert!(matches!(
+            identity_events.try_recv().unwrap(),
+            IdentityEvent::Selected { ref xite, auth_address: Some(ref a) } if xite == "epix1talk" && *a == alice
+        ));
+
+        // Removing the default clears it and tells every inheriting xite.
+        assert!(state.identity_remove(&bob).await);
+        assert!(matches!(identity_events.try_recv().unwrap(), IdentityEvent::Removed(ref a) if *a == bob));
+        let pushed = told(&mut ui_events);
+        assert_eq!(pushed.len(), 1);
+        assert_eq!(pushed[0].0, "epix1blog");
+        assert!(pushed[0].1.contains(r#"["cert_changed",null]"#), "{}", pushed[0].1);
+        assert!(state.xite_info("epix1blog").await["auth_address"].is_null());
+        assert_eq!(state.xite_info("epix1talk").await["auth_address"], alice);
+    }
+
+    #[tokio::test]
+    async fn identity_config_rows_merge_provider_status() {
+        struct Fake;
+        #[async_trait::async_trait]
+        impl IdentityStatusProvider for Fake {
+            fn name(&self) -> &'static str {
+                "Channels"
+            }
+            async fn status(&self, auth_address: &str) -> Option<Value> {
+                Some(json!({ "state": "pending", "summary": format!("channels: pending for {auth_address}") }))
+            }
+        }
+        let state = AppState::new("test");
+        assert!(state.identity_config_rows().await.is_empty());
+        let alice = link_test_identity(&state, "alice").await;
+        state.register_identity_status_provider("channels", Arc::new(Fake));
+        assert_eq!(state.identity_status_providers().len(), 1);
+        let rows = state.identity_config_rows().await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["xid"], "alice.epix");
+        assert_eq!(rows[0]["default"], true);
+        assert_eq!(rows[0]["status"]["Channels"]["state"], "pending");
+        assert!(rows[0]["status"]["Channels"]["summary"].as_str().unwrap().contains(&alice));
+    }
+
+    #[tokio::test]
+    async fn legacy_users_json_upgrades_on_boot() {
+        // A schema-1 users.json (one xid.epix cert selected on every xite)
+        // loads as one identity that is the default, and is rewritten once.
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("private")).unwrap();
+        let mut fixture = epix_user::User::generate();
+        let (linked, linked_key) = fixture.generate_new_identity_address().unwrap();
+        fixture.xite_data("epix1talk").unwrap();
+        let talk = fixture.xites["epix1talk"].clone();
+        std::fs::write(
+            root.path().join("private/users.json"),
+            serde_json::to_vec(&json!({
+                fixture.master_address.clone(): {
+                    "master_seed": fixture.master_seed,
+                    "sites": {
+                        "epix1talk": {
+                            "auth_address": talk.auth_address,
+                            "auth_privatekey": talk.auth_privatekey,
+                            "cert": "xid.epix"
+                        },
+                        "_identity_100000001": {
+                            "auth_address": linked, "auth_privatekey": linked_key
+                        }
+                    },
+                    "certs": {
+                        "xid.epix": {
+                            "auth_address": linked, "auth_privatekey": linked_key,
+                            "auth_type": "xid", "auth_user_name": "alice", "cert_sign": "legacy"
+                        }
+                    },
+                    "settings": { "next_identity_index": 100000002 }
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let state = AppState::with_data_dir("test", root.path());
+        state
+            .add_xite("epix1talk", XiteEntry {
+                storage: XiteStorage::new(root.path().join("data/epix1talk")),
+                content: None,
+            })
+            .await;
+        let info = state.xite_info("epix1talk").await;
+        assert_eq!(info["auth_address"], linked);
+        assert_eq!(info["cert_user_id"], "alice@xid.epix");
+        assert_eq!(info["xid_directory"], "alice.epix");
+        assert_eq!(info["identity_scope"], "inherit");
+        assert_eq!(info["identities"][0]["default"], true);
+
+        let raw: Value =
+            serde_json::from_slice(&std::fs::read(root.path().join("private/users.json")).unwrap())
+                .unwrap();
+        let entry = &raw[&fixture.master_address];
+        assert_eq!(entry["schema_version"], 2);
+        assert_eq!(entry["default_identity"], linked);
+        assert!(entry["certs"].get("xid.epix").is_none());
+        assert!(entry["xites"]["epix1talk"].get("cert").is_none());
     }
 
     #[tokio::test]
@@ -41731,8 +42471,8 @@ mod tests {
             )
             .await;
 
-        let auth = state.user.write().await.auth_address(&xite).unwrap();
-        let dir = format!("data/users/{auth}");
+        let _auth = link_test_identity(&state, "alice").await;
+        let dir = "data/users/alice.epix".to_string();
         let data_path = format!("{dir}/data.json");
         let content_path = format!("{dir}/content.json");
         let v1 = br#"{"topic":[]}"#.to_vec();
@@ -43417,6 +44157,8 @@ mod tests {
             .unwrap();
 
         let state = AppState::new("test");
+        // Writes under data/users/ need an identity on the node.
+        link_test_identity(&state, "fixture").await;
         state
             .add_xite(
                 xite.clone(),
@@ -45992,6 +46734,8 @@ mod tests {
         // and, critically, that a BLANK publish never wipes existing posts.
         let dir = tempdir().unwrap();
         let state = AppState::new("test");
+        // Writes under data/users/ need an identity on the node.
+        link_test_identity(&state, "fixture").await;
         let xite = "1Site";
         let storage = XiteStorage::new(dir.path().join(xite));
         storage
@@ -46104,22 +46848,30 @@ mod tests {
     async fn identity_persists_across_restart() {
         let dir = tempdir().unwrap();
         let addr = "talk.epix";
-        let a1 = {
+        let linked = {
             let s = AppState::with_data_dir("test", dir.path());
             s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None,
                 },
             ).await;
-            s.xite_info(addr).await["auth_address"].as_str().unwrap().to_string()
+            // A fresh node has no identity: the xite is anonymous.
+            assert!(s.xite_info(addr).await["auth_address"].is_null());
+            let linked = link_test_identity(&s, "alice").await;
+            s.identity_select(addr, Some(&linked)).await.unwrap();
+            s.save_user().await;
+            assert_eq!(s.xite_info(addr).await["auth_address"], linked);
+            linked
         };
-        // A fresh node over the same data dir derives the same identity.
-        let a2 = {
-            let s = AppState::with_data_dir("test", dir.path());
-            s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None,
-                },
-            ).await;
-            s.xite_info(addr).await["auth_address"].as_str().unwrap().to_string()
-        };
-        assert_eq!(a1, a2, "auth address is stable across restarts");
+        // A fresh node over the same data dir loads the same identity, default
+        // and per-xite override.
+        let s = AppState::with_data_dir("test", dir.path());
+        s.add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None,
+            },
+        ).await;
+        let info = s.xite_info(addr).await;
+        assert_eq!(info["auth_address"], linked, "identity is stable across restarts");
+        assert_eq!(info["cert_user_id"], "alice@xid.epix");
+        assert_eq!(info["identity_scope"], "xite");
+        assert_eq!(s.user.read().await.default_identity.as_deref(), Some(linked.as_str()));
     }
 
     #[tokio::test]

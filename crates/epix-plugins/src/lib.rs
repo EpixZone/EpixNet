@@ -7,6 +7,7 @@
 
 pub mod beacon;
 pub mod channel;
+pub mod channel_setup;
 pub mod rln;
 pub mod sidebar;
 

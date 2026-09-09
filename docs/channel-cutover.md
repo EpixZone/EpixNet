@@ -1,3 +1,8 @@
+> **Historical.** This runbook moved mail from plaintext `messages.json` to the
+> anonymous pool hosted by the Epix Mail xite. The pool and the key bundles have
+> since moved to the hub (the xID xite) and setup is per identity and automatic;
+> see [`channel-hub-cutover.md`](channel-hub-cutover.md) for the current runbook.
+
 # Epix Mail → metadata-private channels — cutover runbook
 
 How to move the live Epix Mail site (`epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa`)

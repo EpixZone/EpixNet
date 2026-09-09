@@ -25,6 +25,13 @@ pub trait LocalFeedSource: Send + Sync {
     /// A single notification entry `{ "site", "title", "name", "count",
     /// "last_seen" }`, or `None` when the source has nothing to report.
     async fn notification_entry(&self) -> Option<Value>;
+
+    /// Every notification entry this source contributes. Defaults to the one
+    /// [`Self::notification_entry`]; a source that badges per identity
+    /// overrides this and returns one entry per identity.
+    async fn notification_entries(&self) -> Vec<Value> {
+        self.notification_entry().await.into_iter().collect()
+    }
 }
 
 impl AppState {
@@ -49,9 +56,7 @@ impl AppState {
         let sources = self.local_sources_snapshot().await;
         let mut entries = Vec::new();
         for s in sources {
-            if let Some(e) = s.notification_entry().await {
-                entries.push(e);
-            }
+            entries.extend(s.notification_entries().await);
         }
         entries
     }

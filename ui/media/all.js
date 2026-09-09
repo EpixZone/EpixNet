@@ -1594,6 +1594,14 @@ if (window.getComputedStyle(document.body).transform) {
         }
       }
       message = e.data;
+      // The xID xite announces a finished on-chain link this way. Only the
+      // inner frame itself may say so, and the node re-verifies the link on
+      // chain (and needs the address's key) before recording anything, so a
+      // forged message can at most re-link an identity the user already has.
+      if (message && typeof message === "object" && message.type === "xid-identity-linked" && typeof message.address === "string" && e.source === this.inner) {
+        this.ws.cmd("identityLinkComplete", { "auth_address": message.address });
+        return false;
+      }
       if (!message || typeof message !== "object" || !message.cmd) {
         this.log("Invalid message:", message);
         return false;
@@ -2092,18 +2100,24 @@ if (window.getComputedStyle(document.body).transform) {
       }
     };
 
+    // Per-xite, per-identity storage key. An anonymous xite (no identity
+    // selected) gets a stable "anon" slot instead of a "null" one.
+    Wrapper.prototype.localStorageKey = function () {
+      return "xite." + this.xite_info.address + "." + (this.xite_info.auth_address || "anon");
+    };
+
     Wrapper.prototype.actionGetLocalStorage = function (message) {
       return $.when(this.event_xite_info).done((function (_this) {
         return function () {
           var data;
-          data = localStorage.getItem("xite." + _this.xite_info.address + "." + _this.xite_info.auth_address);
+          data = localStorage.getItem(_this.localStorageKey());
           if (!data) {
             // Legacy keys, newest first: the "site."-prefixed auth_address
             // key, then the pre-auth_address global one. Both migrate forward
             // to the "xite." prefix so no stored data is lost on the rename.
             data = localStorage.getItem("site." + _this.xite_info.address + "." + _this.xite_info.auth_address) || localStorage.getItem("site." + _this.xite_info.address);
             if (data) {
-              localStorage.setItem("xite." + _this.xite_info.address + "." + _this.xite_info.auth_address, data);
+              localStorage.setItem(_this.localStorageKey(), data);
               localStorage.removeItem("site." + _this.xite_info.address + "." + _this.xite_info.auth_address);
               localStorage.removeItem("site." + _this.xite_info.address);
               _this.log("Migrated LocalStorage to the xite. prefix");
@@ -2125,7 +2139,7 @@ if (window.getComputedStyle(document.body).transform) {
       return $.when(this.event_xite_info).done((function (_this) {
         return function () {
           var back;
-          back = localStorage.setItem("xite." + _this.xite_info.address + "." + _this.xite_info.auth_address, JSON.stringify(message.params));
+          back = localStorage.setItem(_this.localStorageKey(), JSON.stringify(message.params));
           return _this.sendInner({
             "cmd": "response",
             "to": message.id,
