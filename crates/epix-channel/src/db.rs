@@ -28,6 +28,16 @@ CREATE TABLE IF NOT EXISTS identity (
     derive_index  INTEGER NOT NULL,
     bundle_json   TEXT,
     scan_cursor   INTEGER NOT NULL DEFAULT 0,
+    -- Per-identity channel setup: the node publishes one key bundle per
+    -- linked identity and tracks that job here (see the plugin's setup worker).
+    enabled       INTEGER NOT NULL DEFAULT 1,
+    setup_state   TEXT NOT NULL DEFAULT 'keys',
+    setup_error   TEXT,
+    setup_attempts INTEGER NOT NULL DEFAULT 0,
+    setup_next_ms INTEGER NOT NULL DEFAULT 0,
+    published_path TEXT,
+    published_ms  INTEGER NOT NULL DEFAULT 0,
+    published_peers INTEGER NOT NULL DEFAULT 0,
     UNIQUE(auth_address, derive_index));
 
 CREATE TABLE IF NOT EXISTS session (
@@ -71,6 +81,9 @@ CREATE TABLE IF NOT EXISTS thread (
     starred       INTEGER NOT NULL DEFAULT 0,
     archived      INTEGER NOT NULL DEFAULT 0,
     enc           INTEGER NOT NULL DEFAULT 0,
+    -- The client app a thread belongs to ('mail' by default); a xite that
+    -- holds a scoped channel grant only sees its own app's threads.
+    app           TEXT NOT NULL DEFAULT 'mail',
     UNIQUE(identity_id, conv_id));
 CREATE INDEX IF NOT EXISTS thread_identity_last ON thread(identity_id, last_ms);
 
@@ -121,6 +134,8 @@ CREATE TABLE IF NOT EXISTS processed (
 -- leave an appendable record, never a stranded ratchet advance.
 CREATE TABLE IF NOT EXISTS outbound (
     outbox_id     INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
+    -- The local identity that sealed the record (0 = written before v7).
+    identity_id   INTEGER NOT NULL DEFAULT 0,
     record_json  TEXT NOT NULL,
     shard_path   TEXT NOT NULL,
     created_ms   INTEGER NOT NULL,
@@ -178,7 +193,27 @@ pub struct IdentityRow {
     pub auth_address: String,
     pub derive_index: i64,
     pub bundle_json: Option<String>,
-    pub scan_cursor: i64,
+    /// Whether channels are on for this identity (off = not indexed, not
+    /// published, not counted).
+    pub enabled: bool,
+    pub setup: IdentitySetup,
+}
+
+/// The persisted state of one identity's channel setup job.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentitySetup {
+    /// `keys` (derived, not yet published), `pending` (publish scheduled or
+    /// retrying), `published`, `failed`, or `off`.
+    pub state: String,
+    pub error: Option<String>,
+    pub attempts: i64,
+    /// Unix ms before which no publish attempt is made (backoff).
+    pub next_ms: i64,
+    /// The bundle path this device holds in the hub (`data/users/<xid>/data.json`
+    /// or its per-device slot).
+    pub published_path: Option<String>,
+    pub published_ms: i64,
+    pub published_peers: i64,
 }
 
 /// Current peer-device metadata retained by an established session.
@@ -411,7 +446,9 @@ impl ChannelDb {
     /// (drop the record-wide `sign_h UNIQUE`) + `processed`. v3 = per-DEVICE
     /// sessions (`session.peer_ik` leg key; UNIQUE moved off the human `peer_xid`).
     /// v4 = retain the peer device's linked-identity address for revocation.
-    const SCHEMA_VERSION: i64 = 6;
+    /// v5/v6 = durable outbox recovery and per-leg ordering. v7 = per-identity
+    /// setup columns, `outbound.identity_id`, `thread.app`.
+    const SCHEMA_VERSION: i64 = 7;
 
     fn open_inner(db: Database, enc_key: Option<[u8; 32]>) -> Result<Self> {
         let me = Self { db, enc_key };
@@ -431,6 +468,9 @@ impl ChannelDb {
         }
         if prior < 6 {
             me.migrate_to_v6()?; // per-leg ordering and recoverable route cleanup
+        }
+        if prior < 7 {
+            me.migrate_to_v7()?; // per-identity setup, outbound identity, thread app
         }
         // Each migration advances user_version in the same transaction as its
         // schema mutation. This final assignment is only a no-op for current
@@ -828,6 +868,64 @@ impl ChannelDb {
         tx.commit().map_err(db_err)
     }
 
+    fn table_columns(
+        conn: &rusqlite::Connection,
+        table: &str,
+    ) -> Result<std::collections::HashSet<String>> {
+        let mut stmt = conn
+            .prepare(&format!("PRAGMA table_info({table})"))
+            .map_err(db_err)?;
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .map_err(db_err)?;
+        rows.map(|row| row.map_err(db_err)).collect()
+    }
+
+    fn migrate_to_v7(&self) -> Result<()> {
+        let mut conn = self.db.conn()?;
+        let identity_columns = Self::table_columns(&conn, "identity")?;
+        let outbound_columns = Self::table_columns(&conn, "outbound")?;
+        let thread_columns = Self::table_columns(&conn, "thread")?;
+        let tx = conn.transaction().map_err(db_err)?;
+        for (name, sql) in [
+            ("enabled", "ALTER TABLE identity ADD COLUMN enabled INTEGER NOT NULL DEFAULT 1"),
+            ("setup_state", "ALTER TABLE identity ADD COLUMN setup_state TEXT NOT NULL DEFAULT 'keys'"),
+            ("setup_error", "ALTER TABLE identity ADD COLUMN setup_error TEXT"),
+            ("setup_attempts", "ALTER TABLE identity ADD COLUMN setup_attempts INTEGER NOT NULL DEFAULT 0"),
+            ("setup_next_ms", "ALTER TABLE identity ADD COLUMN setup_next_ms INTEGER NOT NULL DEFAULT 0"),
+            ("published_path", "ALTER TABLE identity ADD COLUMN published_path TEXT"),
+            ("published_ms", "ALTER TABLE identity ADD COLUMN published_ms INTEGER NOT NULL DEFAULT 0"),
+            ("published_peers", "ALTER TABLE identity ADD COLUMN published_peers INTEGER NOT NULL DEFAULT 0"),
+        ] {
+            if !identity_columns.contains(name) {
+                tx.execute_batch(sql).map_err(db_err)?;
+            }
+        }
+        if !outbound_columns.contains("identity_id") {
+            tx.execute_batch(
+                "ALTER TABLE outbound ADD COLUMN identity_id INTEGER NOT NULL DEFAULT 0",
+            )
+            .map_err(db_err)?;
+            // A node that held exactly one identity owns every queued row.
+            tx.execute_batch(
+                "UPDATE outbound SET identity_id =
+                    (SELECT identity_id FROM identity)
+                 WHERE (SELECT COUNT(*) FROM identity) = 1",
+            )
+            .map_err(db_err)?;
+        }
+        if !thread_columns.contains("app") {
+            tx.execute_batch("ALTER TABLE thread ADD COLUMN app TEXT NOT NULL DEFAULT 'mail'")
+                .map_err(db_err)?;
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS thread_identity_app_last ON thread(identity_id, app, last_ms);
+             PRAGMA user_version = 7;",
+        )
+        .map_err(db_err)?;
+        tx.commit().map_err(db_err)
+    }
+
     /// Whether content is sealed at rest (drives the search fallback).
     pub fn is_encrypted(&self) -> bool {
         self.enc_key.is_some()
@@ -959,27 +1057,119 @@ impl ChannelDb {
             .ok_or_else(|| Error::Db("identity upsert did not return id".into()))
     }
 
-    /// All identities (the indexer trial-matches every inbound record against
-    /// each of these).
-    pub fn identities(&self) -> Result<Vec<IdentityRow>> {
+    const IDENTITY_COLUMNS: &'static str = "identity_id, xid, auth_address, derive_index, bundle_json, \
+         enabled, setup_state, setup_error, setup_attempts, setup_next_ms, published_path, \
+         published_ms, published_peers";
+
+    fn identity_rows(&self, where_sql: &str, params: &[Value]) -> Result<Vec<IdentityRow>> {
         let rows = self.db.query(
-            "SELECT identity_id, xid, auth_address, derive_index, bundle_json, scan_cursor
-             FROM identity ORDER BY identity_id DESC",
-            &[],
+            &format!(
+                "SELECT {} FROM identity {where_sql} ORDER BY identity_id DESC",
+                Self::IDENTITY_COLUMNS
+            ),
+            params,
         )?;
         Ok(rows
             .into_iter()
             .filter_map(|r| {
+                let text = |key: &str| r.get(key).and_then(|v| v.as_str()).map(String::from);
+                let int = |key: &str| r.get(key).and_then(|v| v.as_i64()).unwrap_or(0);
                 Some(IdentityRow {
                     identity_id: r.get("identity_id")?.as_i64()?,
                     xid: r.get("xid")?.as_str()?.to_string(),
                     auth_address: r.get("auth_address")?.as_str()?.to_string(),
                     derive_index: r.get("derive_index")?.as_i64()?,
-                    bundle_json: r.get("bundle_json").and_then(|v| v.as_str()).map(String::from),
-                    scan_cursor: r.get("scan_cursor").and_then(|v| v.as_i64()).unwrap_or(0),
+                    bundle_json: text("bundle_json"),
+                    enabled: int("enabled") != 0,
+                    setup: IdentitySetup {
+                        state: text("setup_state").unwrap_or_else(|| "keys".to_string()),
+                        error: text("setup_error"),
+                        attempts: int("setup_attempts"),
+                        next_ms: int("setup_next_ms"),
+                        published_path: text("published_path"),
+                        published_ms: int("published_ms"),
+                        published_peers: int("published_peers"),
+                    },
                 })
             })
             .collect())
+    }
+
+    /// All identities (the indexer trial-matches every inbound record against
+    /// each ENABLED one; setup and the Config page see them all).
+    pub fn identities(&self) -> Result<Vec<IdentityRow>> {
+        self.identity_rows("", &[])
+    }
+
+    /// One identity by its row id.
+    pub fn identity_by_id(&self, identity_id: i64) -> Result<Option<IdentityRow>> {
+        Ok(self
+            .identity_rows("WHERE identity_id=?", &[Value::from(identity_id)])?
+            .into_iter()
+            .next())
+    }
+
+    /// One identity by its linked address (any derive index; the first wins).
+    pub fn identity_by_auth(&self, auth_address: &str) -> Result<Option<IdentityRow>> {
+        Ok(self
+            .identity_rows("WHERE auth_address=?", &[Value::from(auth_address)])?
+            .into_iter()
+            .next())
+    }
+
+    /// Turn channels on or off for one identity.
+    pub fn set_identity_enabled(&self, identity_id: i64, enabled: bool) -> Result<()> {
+        self.db.execute(
+            "UPDATE identity SET enabled=? WHERE identity_id=?",
+            &[Value::from(enabled as i64), Value::from(identity_id)],
+        )?;
+        Ok(())
+    }
+
+    /// Persist one identity's setup-job state.
+    pub fn set_identity_setup(&self, identity_id: i64, setup: &IdentitySetup) -> Result<()> {
+        self.db.execute(
+            "UPDATE identity SET setup_state=?, setup_error=?, setup_attempts=?, setup_next_ms=?,
+                    published_path=?, published_ms=?, published_peers=?
+             WHERE identity_id=?",
+            &[
+                Value::from(setup.state.as_str()),
+                setup.error.as_deref().map(Value::from).unwrap_or(Value::Null),
+                Value::from(setup.attempts),
+                Value::from(setup.next_ms),
+                setup.published_path.as_deref().map(Value::from).unwrap_or(Value::Null),
+                Value::from(setup.published_ms),
+                Value::from(setup.published_peers),
+                Value::from(identity_id),
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Forget an identity and everything indexed for it: its queued outbound
+    /// rows with their dependencies and route cleanup, messages (the FTS
+    /// triggers follow), threads, sessions with their expected tags, the
+    /// per-identity `processed` marks, and the row itself. Every child is
+    /// deleted explicitly rather than through foreign-key cascades, which are
+    /// only enforced when the connection has them on. Peer revocation
+    /// observations are shared and stay.
+    pub fn delete_identity(&self, identity_id: i64) -> Result<()> {
+        let mut conn = self.db.conn()?;
+        let tx = conn.transaction().map_err(db_err)?;
+        for sql in [
+            "DELETE FROM outbound_dependency WHERE outbox_id IN (SELECT outbox_id FROM outbound WHERE identity_id=?1)",
+            "DELETE FROM outbound_route_cleanup WHERE outbox_id IN (SELECT outbox_id FROM outbound WHERE identity_id=?1)",
+            "DELETE FROM outbound WHERE identity_id=?1",
+            "DELETE FROM msg WHERE identity_id=?1",
+            "DELETE FROM thread WHERE identity_id=?1",
+            "DELETE FROM expected_tag WHERE session_id IN (SELECT session_id FROM session WHERE identity_id=?1)",
+            "DELETE FROM session WHERE identity_id=?1",
+            "DELETE FROM processed WHERE identity_id=?1",
+            "DELETE FROM identity WHERE identity_id=?1",
+        ] {
+            tx.execute(sql, rusqlite::params![identity_id]).map_err(db_err)?;
+        }
+        tx.commit().map_err(db_err)
     }
 
     /// Distinct established peers, including devices whose published bundle
@@ -1401,11 +1591,19 @@ impl ChannelDb {
                 )
             })
             .unwrap_or((None, None, None));
+        // The sealing identity: the own-copy message's, else the first leg's.
+        let identity_id = commit
+            .sent
+            .as_ref()
+            .map(|sent| sent.identity_id)
+            .or_else(|| commit.sessions.first().map(|session| session.identity_id))
+            .unwrap_or(0);
         tx.execute(
             "INSERT INTO outbound
                 (record_json, shard_path, created_ms, next_attempt_ms,
-                 author_key, key_enc, rln_first_unit, rln_weight, rln_root, last_error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL)",
+                 author_key, key_enc, rln_first_unit, rln_weight, rln_root, last_error,
+                 identity_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, NULL, ?10)",
             rusqlite::params![
                 record_json,
                 commit.shard_path,
@@ -1416,6 +1614,7 @@ impl ChannelDb {
                 rln_first_unit,
                 rln_weight,
                 rln_root,
+                identity_id,
             ],
         )
         .map_err(db_err)?;
@@ -1564,6 +1763,7 @@ impl ChannelDb {
             sent.sent_ms,
             0,
             1,
+            &sent.app,
         )?;
         tx.execute(
             "INSERT INTO msg
@@ -1606,6 +1806,7 @@ impl ChannelDb {
                     row.get::<_, Option<i64>>(8)?,
                     row.get::<_, Option<Vec<u8>>>(9)?,
                     row.get::<_, Option<String>>(10)?,
+                    row.get::<_, i64>(11)?,
                 ))
             })
             .map_err(db_err)?;
@@ -1623,9 +1824,11 @@ impl ChannelDb {
                 rln_weight,
                 rln_root,
                 last_error,
+                identity_id,
             ) = row.map_err(db_err)?;
             out.push(PendingOutbound {
                 outbox_id,
+                identity_id,
                 record: serde_json::from_str(&record_json)?,
                 shard_path,
                 created_ms,
@@ -1645,7 +1848,7 @@ impl ChannelDb {
         self.query_pending_outbound(
             "SELECT outbox_id, record_json, shard_path, created_ms, next_attempt_ms,
                     COALESCE(author_key, ''), key_enc, rln_first_unit, rln_weight,
-                    rln_root, last_error
+                    rln_root, last_error, identity_id
              FROM outbound ORDER BY outbox_id ASC LIMIT ?1",
             [limit as i64],
         )
@@ -1658,7 +1861,8 @@ impl ChannelDb {
         self.query_pending_outbound(
             "SELECT o.outbox_id, o.record_json, o.shard_path, o.created_ms,
                     o.next_attempt_ms, COALESCE(o.author_key, ''), o.key_enc,
-                    o.rln_first_unit, o.rln_weight, o.rln_root, o.last_error
+                    o.rln_first_unit, o.rln_weight, o.rln_root, o.last_error,
+                    o.identity_id
              FROM outbound o
              WHERE o.next_attempt_ms <= ?1
                AND NOT EXISTS (
@@ -1682,7 +1886,8 @@ impl ChannelDb {
         self.query_pending_outbound(
             "SELECT o.outbox_id, o.record_json, o.shard_path, o.created_ms,
                     o.next_attempt_ms, COALESCE(o.author_key, ''), o.key_enc,
-                    o.rln_first_unit, o.rln_weight, o.rln_root, o.last_error
+                    o.rln_first_unit, o.rln_weight, o.rln_root, o.last_error,
+                    o.identity_id
              FROM outbound o
              WHERE o.outbox_id <= ?1
                AND o.next_attempt_ms <= ?2
@@ -1822,16 +2027,31 @@ impl ChannelDb {
         rows.map(|row| row.map_err(db_err)).collect()
     }
 
-    pub fn outbox_status(&self) -> Result<(i64, Option<String>)> {
+    /// Queued row count and the oldest row's last error. With an identity,
+    /// only that identity's rows (plus pre-v7 rows, which carry no identity).
+    pub fn outbox_status(&self, identity_id: Option<i64>) -> Result<(i64, Option<String>)> {
         let conn = self.db.conn()?;
-        conn.query_row(
-            "SELECT COUNT(*),
-                    (SELECT last_error FROM outbound ORDER BY outbox_id LIMIT 1)
-             FROM outbound",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .map_err(db_err)
+        match identity_id {
+            None => conn
+                .query_row(
+                    "SELECT COUNT(*),
+                            (SELECT last_error FROM outbound ORDER BY outbox_id LIMIT 1)
+                     FROM outbound",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(db_err),
+            Some(identity_id) => conn
+                .query_row(
+                    "SELECT COUNT(*),
+                            (SELECT last_error FROM outbound
+                             WHERE identity_id IN (?1, 0) ORDER BY outbox_id LIMIT 1)
+                     FROM outbound WHERE identity_id IN (?1, 0)",
+                    rusqlite::params![identity_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .map_err(db_err),
+        }
     }
 
     /// Persist a route-only descriptor migration for an exact signed record.
@@ -2041,6 +2261,7 @@ impl ChannelDb {
             c.sent_ms,
             /*incr_unread=*/ 1,
             /*incr_count=*/ 1,
+            &c.app,
         )?;
 
         let msg_id: i64 = {
@@ -2118,7 +2339,7 @@ impl ChannelDb {
         let (subject_stored, body_stored, snippet_stored, enc) = self.seal_content(subject, body);
         let thread_id = upsert_thread_tx(
             &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), &subject_stored,
-            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1,
+            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1, epix_envelope::DEFAULT_APP,
         )?;
         tx.execute(
             "INSERT INTO msg
@@ -2178,7 +2399,7 @@ impl ChannelDb {
         let (subject_stored, body_stored, snippet_stored, enc) = self.seal_content(subject, body);
         let thread_id = upsert_thread_tx(
             &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), &subject_stored,
-            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1,
+            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1, epix_envelope::DEFAULT_APP,
         )?;
         let dir = if is_out { "out" } else { "in" };
         tx.execute(
@@ -2206,25 +2427,37 @@ impl ChannelDb {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<Value>> {
+        self.threads_in_app(identity_id, None, folder, offset, limit)
+    }
+
+    /// [`Self::threads`] restricted to one client app (`None` = every app).
+    pub fn threads_in_app(
+        &self,
+        identity_id: i64,
+        app: Option<&str>,
+        folder: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
         let filter = match folder {
             "archived" => "archived=1",
             "starred" => "starred=1 AND archived=0",
             _ => "archived=0",
         };
+        let app_filter = if app.is_some() { " AND app=?" } else { "" };
         let sql = format!(
             "SELECT thread_id, conv_id, peer_xid, members, subject, snippet, last_ms, msg_count,
-                    unread, starred, archived, enc
-             FROM thread WHERE identity_id=? AND {filter}
+                    unread, starred, archived, enc, app
+             FROM thread WHERE identity_id=? AND {filter}{app_filter}
              ORDER BY last_ms DESC LIMIT ? OFFSET ?"
         );
-        let rows = self.db.query(
-            &sql,
-            &[
-                Value::from(identity_id),
-                Value::from(limit),
-                Value::from(offset),
-            ],
-        )?;
+        let mut params = vec![Value::from(identity_id)];
+        if let Some(app) = app {
+            params.push(Value::from(app));
+        }
+        params.push(Value::from(limit));
+        params.push(Value::from(offset));
+        let rows = self.db.query(&sql, &params)?;
         self.decrypt_rows(rows, &["subject", "snippet"])
     }
 
@@ -2242,28 +2475,58 @@ impl ChannelDb {
     /// at-rest encryption is on, FTS indexes ciphertext (useless), so search
     /// falls back to a decrypt-then-scan over the identity's messages.
     pub fn search(&self, identity_id: i64, query: &str, limit: i64) -> Result<Vec<Value>> {
+        self.search_in_app(identity_id, None, query, limit)
+    }
+
+    /// [`Self::search`] restricted to one client app (`None` = every app).
+    pub fn search_in_app(
+        &self,
+        identity_id: i64,
+        app: Option<&str>,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
         if self.is_encrypted() {
-            return self.search_scan(identity_id, query, limit);
+            return self.search_scan(identity_id, app, query, limit);
         }
-        self.db.query(
+        let app_filter = if app.is_some() { " AND t.app = ?" } else { "" };
+        let sql = format!(
             "SELECT m.msg_id, m.conv_id, m.dir, m.sender_xid, m.subject, m.sent_ms,
                     snippet(msg_fts, 1, '[', ']', '…', 12) AS snippet
              FROM msg_fts f JOIN msg m ON m.msg_id = f.rowid
-             WHERE f.msg_fts MATCH ? AND m.identity_id = ?
-             ORDER BY m.sent_ms DESC LIMIT ?",
-            &[Value::from(query), Value::from(identity_id), Value::from(limit)],
-        )
+                  JOIN thread t ON t.thread_id = m.thread_id
+             WHERE f.msg_fts MATCH ? AND m.identity_id = ?{app_filter}
+             ORDER BY m.sent_ms DESC LIMIT ?"
+        );
+        let mut params = vec![Value::from(query), Value::from(identity_id)];
+        if let Some(app) = app {
+            params.push(Value::from(app));
+        }
+        params.push(Value::from(limit));
+        self.db.query(&sql, &params)
     }
 
     /// Decrypt-then-scan search used when content is sealed at rest. Linear in
     /// the identity's message count; a substring (case-insensitive) match, which
     /// is what the site's own client-side search does anyway.
-    fn search_scan(&self, identity_id: i64, query: &str, limit: i64) -> Result<Vec<Value>> {
-        let rows = self.db.query(
-            "SELECT msg_id, conv_id, dir, sender_xid, subject, body, sent_ms, enc
-             FROM msg WHERE identity_id=? ORDER BY sent_ms DESC",
-            &[Value::from(identity_id)],
-        )?;
+    fn search_scan(
+        &self,
+        identity_id: i64,
+        app: Option<&str>,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let app_filter = if app.is_some() { " AND t.app = ?" } else { "" };
+        let sql = format!(
+            "SELECT m.msg_id, m.conv_id, m.dir, m.sender_xid, m.subject, m.body, m.sent_ms, m.enc
+             FROM msg m JOIN thread t ON t.thread_id = m.thread_id
+             WHERE m.identity_id=?{app_filter} ORDER BY m.sent_ms DESC"
+        );
+        let mut params = vec![Value::from(identity_id)];
+        if let Some(app) = app {
+            params.push(Value::from(app));
+        }
+        let rows = self.db.query(&sql, &params)?;
         let q = query.to_lowercase();
         let mut out = Vec::new();
         for row in rows {
@@ -2342,12 +2605,53 @@ impl ChannelDb {
 
     /// Total unread conversations for an identity (drives the badge).
     pub fn unread_count(&self, identity_id: i64) -> Result<i64> {
+        self.unread_count_in_app(identity_id, None)
+    }
+
+    /// Unread threads for an identity within one client app (`None` = every app).
+    pub fn unread_count_in_app(&self, identity_id: i64, app: Option<&str>) -> Result<i64> {
+        let conn = self.db.conn()?;
+        match app {
+            Some(app) => conn.query_row(
+                "SELECT COUNT(*) FROM thread WHERE identity_id=? AND app=? AND unread>0 AND archived=0",
+                rusqlite::params![identity_id, app],
+                |r| r.get::<_, i64>(0),
+            ),
+            None => conn.query_row(
+                "SELECT COUNT(*) FROM thread WHERE identity_id=? AND unread>0 AND archived=0",
+                [identity_id],
+                |r| r.get::<_, i64>(0),
+            ),
+        }
+        .map_err(db_err)
+    }
+
+    /// Unread threads for an identity in every app EXCEPT `apps` (the ones a
+    /// dedicated client xite badges itself): what the mail badge counts.
+    pub fn unread_count_outside_apps(&self, identity_id: i64, apps: &[String]) -> Result<i64> {
+        if apps.is_empty() {
+            return self.unread_count_in_app(identity_id, None);
+        }
+        let placeholders = vec!["?"; apps.len()].join(",");
+        let sql = format!(
+            "SELECT COUNT(*) AS n FROM thread
+             WHERE identity_id=? AND unread>0 AND archived=0 AND app NOT IN ({placeholders})"
+        );
+        let mut params = vec![Value::from(identity_id)];
+        params.extend(apps.iter().map(|a| Value::from(a.as_str())));
+        let rows = self.db.query(&sql, &params)?;
+        Ok(rows.first().and_then(|r| r.get("n")).and_then(Value::as_i64).unwrap_or(0))
+    }
+
+    /// The client app a conversation belongs to, if this identity has the thread.
+    pub fn thread_app(&self, identity_id: i64, conv_id: &str) -> Result<Option<String>> {
         let conn = self.db.conn()?;
         conn.query_row(
-            "SELECT COUNT(*) FROM thread WHERE identity_id=? AND unread>0 AND archived=0",
-            [identity_id],
-            |r| r.get::<_, i64>(0),
+            "SELECT app FROM thread WHERE identity_id=? AND conv_id=?",
+            rusqlite::params![identity_id, conv_id],
+            |r| r.get::<_, String>(0),
         )
+        .optional()
         .map_err(db_err)
     }
 
@@ -2374,7 +2678,9 @@ impl ChannelDb {
 /// Upsert a thread inside a transaction and return its id. `incr_unread` /
 /// `incr_count` are added to the running totals; `subject_stored`/`snippet_stored`
 /// (already sealed if at-rest encryption is on, with `enc` the flag) are set when
-/// the thread is new or this message is newer than the stored `last_ms`.
+/// the thread is new or this message is newer than the stored `last_ms`. `app`
+/// (the client app named inside the sealed body) is fixed by the thread's first
+/// message: a conversation never moves between apps.
 #[allow(clippy::too_many_arguments)]
 fn upsert_thread_tx(
     tx: &rusqlite::Transaction,
@@ -2388,11 +2694,12 @@ fn upsert_thread_tx(
     sent_ms: i64,
     incr_unread: i64,
     incr_count: i64,
+    app: &str,
 ) -> Result<i64> {
     tx.execute(
         "INSERT INTO thread
-            (identity_id, conv_id, peer_xid, members, subject, snippet, enc, last_ms, msg_count, unread)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+            (identity_id, conv_id, peer_xid, members, subject, snippet, enc, last_ms, msg_count, unread, app)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(identity_id, conv_id) DO UPDATE SET
             peer_xid = COALESCE(thread.peer_xid, excluded.peer_xid),
             members  = COALESCE(excluded.members, thread.members),
@@ -2413,6 +2720,7 @@ fn upsert_thread_tx(
             sent_ms,
             incr_count,
             incr_unread,
+            app,
         ],
     )
     .map_err(db_err)?;
@@ -2502,6 +2810,67 @@ mod tests {
     }
 
     #[test]
+    fn thread_app_follows_the_sealed_body_tag() {
+        let d = db();
+        let idn = d.upsert_identity("mud.epix", "epix1mud", 0, None).unwrap();
+        let sid = d
+            .create_session(NewSession {
+                identity_id: idn,
+                conv_id: "dm1",
+                peer_xid: Some("dice.epix"),
+                peer_ik: "ik-dice",
+                peer_auth: None,
+                role: "resp",
+                ratchet: b"r0",
+                established_ms: 1,
+                recv_tags: &[],
+            })
+            .unwrap();
+        let inbound = |sign: u8, app: &str, sent_ms: i64| InboundCommit {
+            identity_id: idn,
+            session_id: Some(sid),
+            new_session: None,
+            conv_id: "dm1".into(),
+            peer_xid: Some("dice.epix".into()),
+            sender_xid: Some("dice.epix".into()),
+            members: vec![],
+            app: app.into(),
+            subject: "ping".into(),
+            body: "you there ZQ7".into(),
+            sent_ms,
+            received_ms: sent_ms + 1,
+            epoch: 0,
+            sign_h: vec![sign; 16],
+            ratchet_after: b"r1".to_vec(),
+            consumed_tag: vec![],
+            new_tags: vec![],
+        };
+        // A talk DM lands beside a plain mail thread.
+        d.commit_inbound(&inbound(1, "talk", 5)).unwrap();
+        d.insert_sent(idn, "m1", Some("dice.epix"), &[], "mud.epix", "Dinner", "pizza ZQ7", 7)
+            .unwrap();
+
+        assert_eq!(d.thread_app(idn, "dm1").unwrap().as_deref(), Some("talk"));
+        assert_eq!(d.thread_app(idn, "m1").unwrap().as_deref(), Some("mail"));
+        assert!(d.thread_app(idn, "nope").unwrap().is_none());
+        assert_eq!(d.threads_in_app(idn, Some("talk"), "all", 0, 10).unwrap()[0]["conv_id"], "dm1");
+        assert_eq!(d.threads_in_app(idn, Some("mail"), "all", 0, 10).unwrap()[0]["conv_id"], "m1");
+        // Search and unread counts honour the same scope.
+        assert_eq!(d.search_in_app(idn, Some("talk"), "ZQ7", 10).unwrap().len(), 1);
+        assert_eq!(d.search_in_app(idn, Some("mail"), "ZQ7", 10).unwrap().len(), 1);
+        assert_eq!(d.search_in_app(idn, None, "ZQ7", 10).unwrap().len(), 2);
+        assert_eq!(d.unread_count_in_app(idn, Some("talk")).unwrap(), 1);
+        assert_eq!(d.unread_count_in_app(idn, Some("mail")).unwrap(), 0);
+        assert_eq!(d.unread_count_in_app(idn, None).unwrap(), 1);
+        assert_eq!(d.unread_count_outside_apps(idn, &["talk".into()]).unwrap(), 0);
+        assert_eq!(d.unread_count_outside_apps(idn, &[]).unwrap(), 1);
+        // A follow-up in the same conversation keeps the thread's app.
+        d.commit_inbound(&inbound(2, "mail", 8)).unwrap();
+        assert_eq!(d.thread_app(idn, "dm1").unwrap().as_deref(), Some("talk"));
+        assert_eq!(d.threads_in_app(idn, Some("talk"), "all", 0, 10).unwrap()[0]["msg_count"], 2);
+    }
+
+    #[test]
     fn identity_upsert_is_idempotent() {
         let d = db();
         let a = d.upsert_identity("mud.epix", "epix1mud", 0, Some("{\"ik\":\"x\"}")).unwrap();
@@ -2544,6 +2913,7 @@ mod tests {
             .unwrap();
 
         let c = InboundCommit {
+            app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
             new_session: None,
@@ -2613,6 +2983,7 @@ mod tests {
             })
             .unwrap();
         d.commit_inbound(&InboundCommit {
+            app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
             new_session: None,
@@ -2701,6 +3072,7 @@ mod tests {
             })
             .unwrap();
         d.commit_inbound(&InboundCommit {
+            app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
             new_session: None,
@@ -3025,7 +3397,81 @@ mod tests {
                 .unwrap();
         }
         let d = ChannelDb::open(&path).unwrap();
-        assert_eq!(d.user_version().unwrap(), 6);
+        assert_eq!(d.user_version().unwrap(), ChannelDb::SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn v7_identity_setup_state_round_trips_and_delete_cascades() {
+        let d = ChannelDb::memory().unwrap();
+        let alice = d.upsert_identity("alice.epix", "epix1alice", 0, None).unwrap();
+        let bob = d.upsert_identity("bob.epix", "epix1bob", 0, None).unwrap();
+
+        // Fresh rows: enabled, keys derived, nothing published.
+        let row = d.identity_by_auth("epix1alice").unwrap().unwrap();
+        assert_eq!(row.identity_id, alice);
+        assert!(row.enabled);
+        assert_eq!(row.setup.state, "keys");
+        assert_eq!(row.setup.published_path, None);
+        assert!(d.identity_by_auth("epix1nobody").unwrap().is_none());
+
+        // Setup state and the enabled flag persist.
+        let setup = IdentitySetup {
+            state: "published".into(),
+            error: None,
+            attempts: 2,
+            next_ms: 0,
+            published_path: Some("data/users/alice.epix/data.json".into()),
+            published_ms: 1234,
+            published_peers: 3,
+        };
+        d.set_identity_setup(alice, &setup).unwrap();
+        assert_eq!(d.identity_by_id(alice).unwrap().unwrap().setup, setup);
+        d.set_identity_enabled(alice, false).unwrap();
+        assert!(!d.identity_by_id(alice).unwrap().unwrap().enabled);
+
+        // Threads default to the mail app; a scoped query sees only its app.
+        d.insert_sent(alice, "c1", Some("bob.epix"), &[], "alice.epix", "s", "b", 10).unwrap();
+        d.insert_sent(bob, "c2", Some("alice.epix"), &[], "bob.epix", "s", "b", 20).unwrap();
+        d.database()
+            .execute("UPDATE thread SET app='talk' WHERE conv_id='c2'", &[])
+            .unwrap();
+        assert_eq!(d.threads_in_app(bob, Some("talk"), "all", 0, 10).unwrap().len(), 1);
+        assert!(d.threads_in_app(bob, Some("mail"), "all", 0, 10).unwrap().is_empty());
+        assert_eq!(d.threads(bob, "all", 0, 10).unwrap()[0]["app"], "talk");
+        assert_eq!(d.threads(alice, "all", 0, 10).unwrap()[0]["app"], "mail");
+
+        // Queued outbound rows are per identity; pre-v7 rows (0) count for everyone.
+        for (id, path) in [(alice, "a"), (bob, "b"), (0, "legacy")] {
+            d.database()
+                .execute(
+                    "INSERT INTO outbound (identity_id, record_json, shard_path, created_ms, next_attempt_ms)
+                     VALUES (?, '{}', ?, 0, 0)",
+                    &[Value::from(id), Value::from(path)],
+                )
+                .unwrap();
+        }
+        d.database()
+            .execute(
+                "INSERT INTO processed (sign_h, identity_id) VALUES (X'01', ?)",
+                &[Value::from(alice)],
+            )
+            .unwrap();
+        assert_eq!(d.outbox_status(None).unwrap().0, 3);
+        assert_eq!(d.outbox_status(Some(alice)).unwrap().0, 2, "alice's row plus the legacy row");
+        assert_eq!(d.outbox_status(Some(bob)).unwrap().0, 2);
+
+        // Deleting alice removes only her rows.
+        d.delete_identity(alice).unwrap();
+        assert!(d.identity_by_id(alice).unwrap().is_none());
+        assert!(d.threads(alice, "all", 0, 10).unwrap().is_empty());
+        assert!(d.messages(alice, "c1").unwrap().is_empty());
+        assert_eq!(d.threads(bob, "all", 0, 10).unwrap().len(), 1);
+        assert_eq!(d.outbox_status(None).unwrap().0, 2);
+        let count = |sql: &str| {
+            d.database().query(sql, &[]).unwrap()[0].get("n").unwrap().as_i64().unwrap()
+        };
+        assert_eq!(count("SELECT COUNT(*) AS n FROM processed"), 0);
+        assert_eq!(count("SELECT COUNT(*) AS n FROM identity"), 1);
     }
 
     #[cfg(unix)]
@@ -3121,6 +3567,7 @@ mod tests {
             .unwrap();
         let sign_h = vec![42u8; 16];
         let commit = InboundCommit {
+            app: "mail".into(),
             identity_id: idn,
             session_id: None,
             new_session: Some(epix_envelope::OutboundSession {
@@ -3179,6 +3626,7 @@ mod tests {
         d.remember_revoked_device("b.epix", Some("epix1b"), "b-ik", 2)
             .unwrap();
         let inbound = InboundCommit {
+            app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
             new_session: None,
@@ -3236,6 +3684,7 @@ mod tests {
             .upsert_identity("mine.epix", "epix1active", 1, None)
             .unwrap();
         let make_commit = |identity_id: i64, suffix: &str| InboundCommit {
+            app: "mail".into(),
             identity_id,
             session_id: None,
             new_session: Some(epix_envelope::OutboundSession {
@@ -3348,6 +3797,7 @@ mod tests {
             next_attempt_ms: 1,
             recovery: recovery(),
             sent: own.then(|| epix_envelope::OutboundMessage {
+                app: "mail".into(),
                 identity_id: idn,
                 conv_id: "group".into(),
                 peer_xid: None,
@@ -3430,6 +3880,7 @@ mod tests {
             next_attempt_ms,
             recovery: recovery(),
             sent: Some(epix_envelope::OutboundMessage {
+                app: "mail".into(),
                 identity_id,
                 conv_id: conv.into(),
                 peer_xid: None,
@@ -3476,6 +3927,7 @@ mod tests {
             next_attempt_ms,
             recovery: recovery(),
             sent: Some(epix_envelope::OutboundMessage {
+                app: "mail".into(),
                 identity_id,
                 conv_id: conv.clone(),
                 peer_xid: None,
@@ -3617,7 +4069,11 @@ mod tests {
 
         // Opening via ChannelDb runs the v1→v2→v3 migrations.
         let d = ChannelDb::open(&path).unwrap();
-        assert_eq!(d.user_version().unwrap(), 6, "migrated to latest schema");
+        assert_eq!(d.user_version().unwrap(), ChannelDb::SCHEMA_VERSION, "migrated to latest schema");
+        // v7 columns landed on the old identity table and read back with defaults.
+        let rows = d.identities().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|r| r.enabled && r.setup.state == "keys"));
 
         // The v1 message survived the msg-table rebuild, FTS included.
         let msgs = d.messages(1, "abcd").unwrap();

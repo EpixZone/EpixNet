@@ -37,16 +37,36 @@ const OUTBOX_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_sec
 
 /// The channel-specific state a running node holds — installed once at startup and
 /// retrieved by the `channel*` commands from the bound `AppState`.
-/// The official Epix Mail xite: the default channel xite when `channel_xite`
-/// is unset or blank, so metadata-private mail works out of the box. The
-/// Config page default MUST equal this (a schema test pins it).
-pub const DEFAULT_CHANNEL_XITE: &str = "epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa";
+/// The channel hub: the xite that holds every identity's key bundle
+/// (`data/users/<name>.epix/`) and the anonymous envelope pool. It is the xID
+/// xite, so linking an identity and publishing its channel keys land in one
+/// place; the node auto-adds it when channels are on. The default when
+/// `channel_xite` is unset or blank. The Config page default MUST equal this
+/// (a schema test pins it).
+pub const DEFAULT_CHANNEL_XITE: &str = epix_ui::state::XID_XITE_ADDRESS;
+
+/// The Epix Mail xite: the mail CLIENT. Feed rows deep-link to it, and the
+/// legacy (pre-pool) `messages.json` import reads from it. Until the hub
+/// cutover completes it also hosted the pool, so it is the default entry of
+/// `channel_legacy_xites` (pools still indexed read-only).
+pub const EPIX_MAIL_XITE: &str = "epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa";
 
 pub struct ChannelState {
     pub db: Arc<ChannelDb>,
     pub engine: Arc<dyn Engine>,
+    /// The hub: where key bundles and the pool live.
     pub xite: String,
-    pub identity_id: std::sync::atomic::AtomicI64,
+    /// Pools still indexed read-only during the hub cutover (records and
+    /// bundles are read from them; nothing is ever sent to them).
+    pub legacy_xites: Vec<String>,
+    /// Set once the hub is present locally with its pool descriptor.
+    pub hub_ready: std::sync::atomic::AtomicBool,
+    pub hub_ready_notify: tokio::sync::Notify,
+    /// Wakes the per-identity setup worker (see `channel_setup`).
+    pub setup_wake: tokio::sync::Notify,
+    /// Client xites that receive `channelEvent`s: xite -> app scope (`None` =
+    /// every app). Epix Mail is pre-seeded; other xites `channelSubscribe`.
+    pub clients: tokio::sync::RwLock<std::collections::HashMap<String, Option<String>>>,
     /// Serializes the send path. Detection tags and AEAD nonces are a pure
     /// deterministic function of ratchet state, so two concurrent sends that read
     /// the SAME session before either persists would seal from identical state —
@@ -68,7 +88,49 @@ pub struct ChannelState {
     pub index_retry: tokio::sync::Notify,
 }
 
-fn now_ms() -> i64 {
+impl ChannelState {
+    pub fn new(
+        db: Arc<ChannelDb>,
+        engine: Arc<dyn Engine>,
+        xite: String,
+        legacy_xites: Vec<String>,
+    ) -> Self {
+        let mut clients = std::collections::HashMap::new();
+        clients.insert(EPIX_MAIL_XITE.to_string(), None);
+        Self {
+            db,
+            engine,
+            xite,
+            legacy_xites,
+            hub_ready: std::sync::atomic::AtomicBool::new(false),
+            hub_ready_notify: tokio::sync::Notify::new(),
+            setup_wake: tokio::sync::Notify::new(),
+            clients: tokio::sync::RwLock::new(clients),
+            send_lock: tokio::sync::Mutex::new(()),
+            outbox_lock: tokio::sync::Mutex::new(()),
+            delivery_lock: tokio::sync::Mutex::new(()),
+            rln_usage_ready: std::sync::atomic::AtomicBool::new(false),
+            index_retry: tokio::sync::Notify::new(),
+        }
+    }
+
+    /// Every pool this node indexes: the hub first, then the legacy pools.
+    pub fn pool_xites(&self) -> Vec<String> {
+        let mut out = vec![self.xite.clone()];
+        out.extend(self.legacy_xites.iter().cloned());
+        out
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(db: Arc<ChannelDb>, engine: Arc<dyn Engine>, xite: String) -> Self {
+        let state = Self::new(db, engine, xite, Vec::new());
+        // Unit tests stage sends without the RLN reconciliation pass.
+        state.rln_usage_ready.store(true, std::sync::atomic::Ordering::Release);
+        state
+    }
+}
+
+pub(crate) fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
@@ -198,7 +260,7 @@ async fn channel_staging_guard(
 }
 
 /// Normalize a recipient id to its user directory name (`name.epix`).
-fn norm_xid(x: &str) -> String {
+pub(crate) fn norm_xid(x: &str) -> String {
     let x = x.trim().trim_end_matches('.');
     if x.ends_with(".epix") {
         x.to_string()
@@ -218,64 +280,244 @@ fn normalized_recipients(values: &[Value]) -> Vec<String> {
     recipients
 }
 
-fn channel_state(s: &WsSession) -> Result<Arc<ChannelState>, String> {
-    s.state.capability::<ChannelState>(CHANNEL_CAP).ok_or_else(|| "channels are not enabled".to_string())
+/// The plugin state, after the client gate: the calling xite must be a channel
+/// client. Epix Mail is one by default; a trusted operator session and any xite
+/// holding ADMIN, `CHANNELS` (the whole inbox) or `Channels:<app>` (one app)
+/// qualify. Nothing else may read the inbox or send.
+pub(crate) async fn channel_state(s: &WsSession) -> Result<Arc<ChannelState>, String> {
+    let ms = s
+        .state
+        .capability::<ChannelState>(CHANNEL_CAP)
+        .ok_or_else(|| "channels are not enabled".to_string())?;
+    channel_client_ok(s).await?;
+    Ok(ms)
 }
 
-/// The node's single channel identity `(identity_id, secret, xid)`.
-async fn channel_identity(
+async fn channel_client_ok(s: &WsSession) -> Result<(), String> {
+    if s.trusted {
+        return Ok(());
+    }
+    let xite = s.address().map_err(|_| "channels: no xite bound".to_string())?;
+    if xite == EPIX_MAIL_XITE {
+        return Ok(());
+    }
+    let granted = s.state.xite_permissions(xite).await;
+    if granted
+        .iter()
+        .any(|p| p == "ADMIN" || p == "CHANNELS" || p.starts_with("Channels:"))
+    {
+        return Ok(());
+    }
+    Err("channels: this xite has no channel permission".to_string())
+}
+
+/// The app scope a client xite may see: `None` for a full grant (Mail, ADMIN,
+/// `CHANNELS`, trusted), else the app named by its `Channels:<app>` grant.
+pub(crate) async fn client_app_scope(s: &WsSession) -> Option<String> {
+    if s.trusted {
+        return None;
+    }
+    let Ok(xite) = s.address() else { return None };
+    if xite == EPIX_MAIL_XITE {
+        return None;
+    }
+    let granted = s.state.xite_permissions(xite).await;
+    if granted.iter().any(|p| p == "ADMIN" || p == "CHANNELS") {
+        return None;
+    }
+    granted
+        .iter()
+        .find_map(|p| p.strip_prefix("Channels:").map(str::to_string))
+}
+
+/// The app filter a read acts in: `None` = every app (a full grant with no
+/// explicit `app`), else one app. A scoped grant cannot widen or switch.
+pub(crate) fn resolve_app_filter(
+    scope: Option<String>,
+    requested: Option<&str>,
+) -> Result<Option<String>, String> {
+    if let Some(app) = requested {
+        if !valid_app_name(app) {
+            return Err(format!("channels: invalid app name {app:?}"));
+        }
+    }
+    match (scope, requested) {
+        (Some(granted), Some(wanted)) if granted != wanted => {
+            Err(format!("channels: this xite is scoped to app {granted}"))
+        }
+        (Some(granted), _) => Ok(Some(granted)),
+        (None, wanted) => Ok(wanted.map(str::to_string)),
+    }
+}
+
+/// The app a send goes out in: a scoped grant fixes it; a full grant takes the
+/// requested app, default mail. The name is sealed into the message body.
+pub(crate) fn resolve_send_app(
+    scope: Option<String>,
+    requested: Option<&str>,
+) -> Result<String, String> {
+    Ok(resolve_app_filter(scope, requested)?
+        .unwrap_or_else(|| epix_envelope::DEFAULT_APP.to_string()))
+}
+
+/// App names are short lowercase tokens: they travel inside every sealed body
+/// and name a permission (`Channels:<app>`).
+fn valid_app_name(app: &str) -> bool {
+    !app.is_empty()
+        && app.len() <= 32
+        && app
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+}
+
+/// A scoped client may only touch conversations of its own app. A conversation
+/// this identity does not hold passes (there is nothing to reach).
+async fn ensure_conv_in_scope(
+    s: &WsSession,
+    ms: &ChannelState,
+    identity_id: i64,
+    conv_id: &str,
+) -> Result<(), String> {
+    let Some(scope) = client_app_scope(s).await else { return Ok(()) };
+    match ms.db.thread_app(identity_id, conv_id).map_err(|e| e.to_string())? {
+        Some(app) if app != scope => Err(format!("channels: conversation belongs to app {app}")),
+        _ => Ok(()),
+    }
+}
+
+fn requested_app(o: Option<&Value>) -> Option<&str> {
+    o.and_then(|v| v.get("app")).and_then(Value::as_str)
+}
+
+/// The identity a command acts as: its private-index row, linked address,
+/// directory name and channel secret.
+pub(crate) struct IdentityCtx {
+    pub identity_id: i64,
+    pub auth: String,
+    pub xid: String,
+    pub secret: IdentitySecret,
+}
+
+/// The first object parameter of a command (`[{...}]` or `{...}`).
+fn first_param_object(p: &Value) -> Option<&Value> {
+    p.as_array()
+        .and_then(|a| a.first())
+        .filter(|v| v.is_object())
+        .or_else(|| p.is_object().then_some(p))
+}
+
+/// The identity a command acts as: an explicit `{auth_address}` / `{xid}`
+/// parameter naming a held identity, else the calling xite's effective one.
+/// `Ok(None)` means the xite is browsed anonymously - reads return empty.
+pub(crate) async fn resolve_identity(
+    s: &WsSession,
+    ms: &ChannelState,
+    p: &Value,
+) -> Result<Option<IdentityCtx>, String> {
+    let explicit = first_param_object(p).and_then(|o| {
+        o.get("auth_address")
+            .or_else(|| o.get("auth"))
+            .or_else(|| o.get("xid"))
+            .and_then(Value::as_str)
+            .filter(|v| !v.is_empty())
+    });
+    let identity = match explicit {
+        Some(key) => {
+            let key = key.trim().to_lowercase();
+            let bare = key.strip_suffix(".epix").unwrap_or(&key).to_string();
+            Some(
+                s.state
+                    .identities()
+                    .await
+                    .into_iter()
+                    .find(|i| i.auth_address == key || i.name == bare)
+                    .ok_or_else(|| format!("unknown identity {key}"))?,
+            )
+        }
+        None => s.state.identity_for(s.address().unwrap_or("")).await,
+    };
+    match identity {
+        Some(identity) => identity_ctx_for(&s.state, ms, &identity).await.map(Some),
+        None => Ok(None),
+    }
+}
+
+/// [`resolve_identity`] for commands that act as an identity: sends, marks,
+/// deletions. Anonymous callers get `XID_REQUIRED`.
+pub(crate) async fn require_identity(
+    s: &WsSession,
+    ms: &ChannelState,
+    p: &Value,
+) -> Result<IdentityCtx, String> {
+    resolve_identity(s, ms, p)
+        .await?
+        .ok_or_else(|| epix_user::XID_REQUIRED.to_string())
+}
+
+pub(crate) async fn identity_ctx_for(
     state: &Arc<AppState>,
     ms: &ChannelState,
-) -> Result<(i64, IdentitySecret, String, String), String> {
-    let current_auth = state.user_auth_address(&ms.xite).await?;
-    let row = ms
-        .db
-        .identities()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .find(|row| row.auth_address == current_auth)
-        .ok_or("current linked identity has no channel bundle; publish your key bundle first")?;
-    let seed = state
-        .derive_consumer_seed("channel", &row.auth_address)
-        .await;
-    Ok((
-        row.identity_id,
-        IdentitySecret::new(seed),
-        row.xid,
-        row.auth_address,
-    ))
+    identity: &epix_user::Identity,
+) -> Result<IdentityCtx, String> {
+    let identity_id = ensure_identity_row(&ms.db, identity)?;
+    let seed = state.derive_consumer_seed("channel", &identity.auth_address).await;
+    Ok(IdentityCtx {
+        identity_id,
+        auth: identity.auth_address.clone(),
+        xid: identity.xid(),
+        secret: IdentitySecret::new(seed),
+    })
 }
 
-/// Build the one authenticated local device bundle used by both startup and
-/// explicit publish. Address, signing key, channel seed, and directory name are
-/// all derived from the same cert-aware linked identity.
-async fn local_channel_bundle(
-    state: &Arc<AppState>,
-    xite: &str,
+/// The private-index row for a linked identity, created on first use. Keeps
+/// an existing row's stored bundle (the upsert would otherwise clear it).
+pub(crate) fn ensure_identity_row(
+    db: &ChannelDb,
+    identity: &epix_user::Identity,
+) -> Result<i64, String> {
+    let xid = identity.xid();
+    match db.identity_by_auth(&identity.auth_address).map_err(|e| e.to_string())? {
+        Some(row) => {
+            if row.xid != xid {
+                db.upsert_identity(&xid, &identity.auth_address, 0, row.bundle_json.as_deref())
+                    .map_err(|e| e.to_string())?;
+            }
+            Ok(row.identity_id)
+        }
+        None => db
+            .upsert_identity(&xid, &identity.auth_address, 0, None)
+            .map_err(|e| e.to_string()),
+    }
+}
+
+/// Build one identity's authenticated device bundle: address, signing key,
+/// channel seed and directory name all come from the same linked identity.
+pub(crate) fn build_identity_bundle(
     engine: &dyn Engine,
-) -> Result<(String, String, Value), String> {
-    let auth = state.user_auth_address(xite).await?;
-    let xid = state.user_directory(xite, &auth).await;
-    let seed = state.derive_consumer_seed("channel", &auth).await;
-    let mut bundle = engine.publish_bundle(&IdentitySecret::new(seed), &xid);
+    auth: &str,
+    xid: &str,
+    auth_privatekey: &str,
+    seed: [u8; 32],
+) -> Result<Value, String> {
+    let mut bundle = engine.publish_bundle(&IdentitySecret::new(seed), xid);
     if let Some(object) = bundle.as_object_mut() {
         object.insert("auth".into(), json!(auth));
     }
     if bundle.get("v").and_then(Value::as_i64) == Some(3) {
-        let auth_key = state.user_cert_auth_privatekey(xite).await?;
-        let signer = epix_crypt::privatekey_to_address(&auth_key).map_err(|e| e.to_string())?;
+        let signer =
+            epix_crypt::privatekey_to_address(auth_privatekey).map_err(|e| e.to_string())?;
         if signer != auth {
-            return Err("selected channel auth key does not match the linked address".into());
+            return Err("channel auth key does not match the linked address".into());
         }
         let payload = epix_pairwise_engine::keys::bundle_auth_payload(&bundle)
             .ok_or("could not canonicalize channel bundle")?;
-        bundle["auth_sig"] =
-            json!(epix_crypt::sign_keccak(&payload, &auth_key).map_err(|e| e.to_string())?);
+        bundle["auth_sig"] = json!(epix_crypt::sign_keccak(&payload, auth_privatekey)
+            .map_err(|e| e.to_string())?);
         if !engine.verify_bundle(&bundle) {
             return Err("generated channel bundle failed authenticated verification".into());
         }
     }
-    Ok((auth, xid, bundle))
+    Ok(bundle)
 }
 
 fn ensure_local_sender_active(
@@ -298,16 +540,21 @@ fn ensure_local_sender_active(
     Ok(())
 }
 
-/// All local channel identities to trial-match inbound records against.
-async fn build_identities(
-    state: &Arc<AppState>,
-    db: &ChannelDb,
-) -> Vec<(i64, IdentitySecret, String)> {
-    let Ok(rows) = db.identities() else { return Vec::new() };
-    let mut out = Vec::new();
-    for r in rows {
+/// The local identities the indexer trial-matches inbound records against
+/// (every ENABLED row), plus what an event needs to name each of them.
+struct LocalIdentities {
+    keys: Vec<(i64, IdentitySecret, String)>,
+    /// identity_id -> (xid, auth_address)
+    meta: std::collections::HashMap<i64, (String, String)>,
+}
+
+async fn build_identities(state: &Arc<AppState>, db: &ChannelDb) -> LocalIdentities {
+    let mut out = LocalIdentities { keys: Vec::new(), meta: std::collections::HashMap::new() };
+    let Ok(rows) = db.identities() else { return out };
+    for r in rows.into_iter().filter(|r| r.enabled) {
         let seed = state.derive_consumer_seed("channel", &r.auth_address).await;
-        out.push((r.identity_id, IdentitySecret::new(seed), r.xid));
+        out.meta.insert(r.identity_id, (r.xid.clone(), r.auth_address.clone()));
+        out.keys.push((r.identity_id, IdentitySecret::new(seed), r.xid));
     }
     out
 }
@@ -321,7 +568,7 @@ async fn build_identities(
 /// The per-device bundle filename for a linked-identity address. `epix1…`
 /// addresses are bech32 (`[0-9a-z]` only), so this is filesystem- and
 /// permission-regex-safe: `data-<auth>.json` matches `data-[0-9a-z]+\.json`.
-fn device_bundle_file(auth: &str) -> String {
+pub(crate) fn device_bundle_file(auth: &str) -> String {
     let safe: String = auth.chars().filter(|c| c.is_ascii_lowercase() || c.is_ascii_digit()).collect();
     format!("data-{safe}.json")
 }
@@ -379,13 +626,15 @@ struct PublishedBundleSources<'a> {
     sessions_by_name: &'a SessionPeerMap,
 }
 
+/// Every user's published key bundles on `xites` (the hub, or the hub plus the
+/// legacy pools for the inbound anti-spoof union), classified against the chain.
 async fn load_published_bundles(
     state: &Arc<AppState>,
-    xite: &str,
+    xites: &[String],
     engine: &dyn Engine,
     db: &ChannelDb,
 ) -> Result<PublishedBundles, String> {
-    let mut by_name = read_published_bundle_files(state, xite, engine).await;
+    let mut by_name = read_published_bundle_files(state, xites, engine).await;
     db.backfill_session_peer_auth(&published_auth_bindings(engine, &by_name))
         .map_err(|error| error.to_string())?;
     let sessions_by_name = session_peers_by_name(db, &mut by_name)?;
@@ -416,30 +665,33 @@ async fn load_published_bundles(
 
 async fn read_published_bundle_files(
     state: &Arc<AppState>,
-    xite: &str,
+    xites: &[String],
     engine: &dyn Engine,
 ) -> PublishedBundleMap {
     let mut by_name = PublishedBundleMap::new();
-    for path in state.list_xite_files(xite).await {
-        let Some((dir, file)) = bundle_path_parts(&path) else {
-            continue;
-        };
-        let Some(bytes) = state.read_xite_file(xite, &path).await else {
-            continue;
-        };
-        let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
-            continue;
-        };
-        // Attribute the bundle to the cert-gated directory it lives in. Drop a
-        // bundle whose declared xID disagrees with that authenticated directory.
-        let key = norm_xid(dir);
-        if !bundle_xid_matches_directory(&v, &key) {
-            continue;
+    for xite in xites {
+        for path in state.list_xite_files(xite).await {
+            let Some((dir, file)) = bundle_path_parts(&path) else {
+                continue;
+            };
+            let Some(bytes) = state.read_xite_file(xite, &path).await else {
+                continue;
+            };
+            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            // Attribute the bundle to the cert-gated directory it lives in.
+            // Drop a bundle whose declared xID disagrees with that
+            // authenticated directory.
+            let key = norm_xid(dir);
+            if !bundle_xid_matches_directory(&v, &key) {
+                continue;
+            }
+            if !engine.verify_bundle(&v) || !bundle_filename_matches_auth(file, &v) {
+                continue;
+            }
+            by_name.entry(key).or_default().push(v);
         }
-        if !engine.verify_bundle(&v) || !bundle_filename_matches_auth(file, &v) {
-            continue;
-        }
-        by_name.entry(key).or_default().push(v);
     }
     by_name
 }
@@ -711,9 +963,13 @@ pub fn refine_device_bundles(mut devs: Vec<Value>, active: &[String]) -> Vec<Val
 
 /// Map one process outcome to a `channelEvent` payload; a first-contact hit flags
 /// that a NEW session formed (so the caller can re-scan for out-of-order records).
-fn indexed_event(outcome: ProcessOutcome, new_session: &mut bool) -> Option<Value> {
+fn indexed_event(
+    outcome: ProcessOutcome,
+    new_session: &mut bool,
+    meta: &std::collections::HashMap<i64, (String, String)>,
+) -> Option<Value> {
     let ProcessOutcome::Indexed {
-        conv_id, sender_xid, subject, snippet, unread, first_contact, pending, ..
+        identity_id, conv_id, sender_xid, subject, snippet, app, unread, first_contact, pending, ..
     } = outcome
     else {
         return None;
@@ -721,8 +977,15 @@ fn indexed_event(outcome: ProcessOutcome, new_session: &mut bool) -> Option<Valu
     if first_contact {
         *new_session = true;
     }
+    let (xid, auth) = meta.get(&identity_id).cloned().unwrap_or_default();
     Some(json!({
         "type": "new_message",
+        // The identity the message landed in, so a client shows it in the
+        // right inbox (routing already filters by the xite's identity).
+        "identity_id": identity_id,
+        "xid": xid,
+        "auth": auth,
+        "app": app,
         "conv_id": conv_id,
         "from_xid": sender_xid,
         "subject": subject,
@@ -745,6 +1008,7 @@ fn process_batch_blocking(
     records: &[Value],
     now: i64,
     bundles: &PublishedBundles,
+    meta: &std::collections::HashMap<i64, (String, String)>,
 ) -> Result<(Vec<Value>, bool), String> {
     let resolve = |xid: &str| -> Vec<Value> {
         bundles
@@ -779,7 +1043,7 @@ fn process_batch_blocking(
         )
         .map_err(|error| error.to_string())?;
         for outcome in outcomes {
-            if let Some(ev) = indexed_event(outcome, &mut new_session) {
+            if let Some(ev) = indexed_event(outcome, &mut new_session, meta) {
                 events.push(ev);
             }
         }
@@ -792,7 +1056,7 @@ async fn index_batch(
     ms: &Arc<ChannelState>,
     records: Vec<Value>,
 ) -> Result<bool, String> {
-    let identities = build_identities(state, &ms.db).await;
+    let LocalIdentities { keys: identities, meta } = build_identities(state, &ms.db).await;
     if identities.is_empty() || records.is_empty() {
         return Ok(false);
     }
@@ -800,11 +1064,13 @@ async fn index_batch(
     let engine = ms.engine.clone();
     let now = now_ms();
     // Published bundles, so the first-contact anti-spoof check can resolve a
-    // sender_xid → bundle.ik synchronously inside spawn_blocking.
-    let bundles = match load_published_bundles(state, &ms.xite, ms.engine.as_ref(), &ms.db).await {
-        Ok(bundles) => bundles,
-        Err(e) => return Err(format!("channel revocation refresh failed closed: {e}")),
-    };
+    // sender_xid → bundle.ik synchronously inside spawn_blocking. Inbound reads
+    // the hub AND the legacy pools: a sender still on the old pool is real.
+    let bundles =
+        match load_published_bundles(state, &ms.pool_xites(), ms.engine.as_ref(), &ms.db).await {
+            Ok(bundles) => bundles,
+            Err(e) => return Err(format!("channel revocation refresh failed closed: {e}")),
+        };
 
     // Serialize inbound ratchet advances against the SEND path: both do a
     // read-modify-write of the same opaque session-ratchet blob, so without a
@@ -814,16 +1080,42 @@ async fn index_batch(
     let (events, new_session) = {
         let _guard = ms.send_lock.lock().await;
         tokio::task::spawn_blocking(move || {
-            process_batch_blocking(&db, engine.as_ref(), &identities, &records, now, &bundles)
+            process_batch_blocking(&db, engine.as_ref(), &identities, &records, now, &bundles, &meta)
         })
         .await
         .map_err(|error| format!("channel index task failed: {error}"))??
     };
 
     for ev in events {
-        state.push_site_event(&ms.xite, "channelEvent", ev);
+        deliver_channel_event(state, ms, ev).await;
     }
     Ok(new_session)
+}
+
+/// Push a `channelEvent` to every client xite whose effective identity is the
+/// one the event names (an event without `auth` reaches every client), within
+/// the client's app scope (an event without `app`, such as an identity's setup
+/// landing, concerns every app). Nothing is ever pushed to the hub: no app is
+/// bound to it.
+pub(crate) async fn deliver_channel_event(state: &Arc<AppState>, ms: &ChannelState, ev: Value) {
+    let auth = ev.get("auth").and_then(Value::as_str).filter(|a| !a.is_empty()).map(str::to_string);
+    let app = ev.get("app").and_then(Value::as_str).filter(|a| !a.is_empty()).map(str::to_string);
+    let clients: Vec<(String, Option<String>)> =
+        ms.clients.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    for (xite, scope) in clients {
+        if let (Some(scope), Some(app)) = (&scope, &app) {
+            if scope != app {
+                continue;
+            }
+        }
+        if let Some(auth) = &auth {
+            match state.identity_for(&xite).await {
+                Some(identity) if identity.auth_address == *auth => {}
+                _ => continue,
+            }
+        }
+        state.push_site_event(&xite, "channelEvent", ev.clone());
+    }
 }
 
 #[cfg(not(test))]
@@ -983,21 +1275,65 @@ async fn open_db(state: &Arc<AppState>) -> Option<Arc<ChannelDb>> {
 /// returns is ever shared — it is computed and rendered only on this node.
 struct ChannelFeedSource {
     db: Arc<ChannelDb>,
-    xite: String,
+    /// For the subscribed client xites: a row of another app deep-links to the
+    /// xite that subscribed for that app.
+    ms: Arc<ChannelState>,
+    /// The mail CLIENT xite the rows deep-link to (never the hub).
+    client_xite: String,
     snippets: bool,
+    /// Badge each identity separately when the node holds more than one.
+    /// Off collapses them into one "Messages" badge so the dashboard does not
+    /// show which personas this node holds.
+    per_identity: bool,
+}
+
+impl ChannelFeedSource {
+    fn enabled_identities(&self) -> Vec<epix_channel::IdentityRow> {
+        self.db
+            .identities()
+            .map(|rows| rows.into_iter().filter(|r| r.enabled).collect())
+            .unwrap_or_default()
+    }
+
+    fn title_for(&self, xid: &str, several: bool) -> String {
+        if several && self.per_identity {
+            format!("Messages ({xid})")
+        } else {
+            "Messages".to_string()
+        }
+    }
+
+    /// app -> the client xite subscribed for it (scoped grants only).
+    async fn app_sites(&self) -> std::collections::HashMap<String, String> {
+        self.ms
+            .clients
+            .read()
+            .await
+            .iter()
+            .filter_map(|(xite, scope)| scope.clone().map(|app| (app, xite.clone())))
+            .collect()
+    }
 }
 
 #[async_trait]
 impl epix_ui::local_feed::LocalFeedSource for ChannelFeedSource {
     async fn feed_rows(&self, limit: i64) -> Vec<Value> {
         let mut rows = Vec::new();
-        let Ok(identities) = self.db.identities() else { return rows };
+        let identities = self.enabled_identities();
+        let several = identities.len() > 1;
+        let app_sites = self.app_sites().await;
         for id in identities {
             let Ok(threads) = self.db.threads(id.identity_id, "all", 0, limit) else { continue };
+            let title = self.title_for(&id.xid, several);
             for t in threads {
                 let peer = t.get("peer_xid").and_then(|v| v.as_str()).unwrap_or("someone");
                 let subject = t.get("subject").and_then(|v| v.as_str()).unwrap_or("");
                 let last_ms = t.get("last_ms").and_then(|v| v.as_i64()).unwrap_or(0);
+                let app = t
+                    .get("app")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(epix_envelope::DEFAULT_APP);
+                let site = app_sites.get(app).cloned().unwrap_or_else(|| self.client_xite.clone());
                 let body = if self.snippets {
                     format!("{peer}: {subject}")
                 } else {
@@ -1005,11 +1341,12 @@ impl epix_ui::local_feed::LocalFeedSource for ChannelFeedSource {
                 };
                 rows.push(json!({
                     "type": "channel",
-                    "title": "Messages",
+                    "title": title,
                     "body": body,
                     "date_added": last_ms as f64 / 1000.0,
-                    "site": self.xite,
+                    "site": site,
                     "feed_name": "channel",
+                    "app": app,
                 }));
             }
         }
@@ -1017,22 +1354,63 @@ impl epix_ui::local_feed::LocalFeedSource for ChannelFeedSource {
     }
 
     async fn notification_entry(&self) -> Option<Value> {
-        if self.xite.is_empty() {
+        if self.client_xite.is_empty() {
             return None;
         }
+        let app_sites = self.app_sites().await;
+        let claimed: Vec<String> = app_sites.keys().cloned().collect();
         let mut total = 0i64;
-        if let Ok(identities) = self.db.identities() {
-            for id in identities {
-                total += self.db.unread_count(id.identity_id).unwrap_or(0);
-            }
+        for id in self.enabled_identities() {
+            total += self.db.unread_count_outside_apps(id.identity_id, &claimed).unwrap_or(0);
         }
         Some(json!({
-            "site": self.xite,
+            "site": self.client_xite,
             "title": "Messages",
             "name": "channel",
             "count": total,
             "last_seen": 0,
         }))
+    }
+
+    /// The mail badge (one per identity when the node holds several and
+    /// `channel_feed_per_identity` is on) counts every app without a client of
+    /// its own; each subscribed app xite gets its own badge.
+    async fn notification_entries(&self) -> Vec<Value> {
+        let identities = self.enabled_identities();
+        let app_sites = self.app_sites().await;
+        let claimed: Vec<String> = app_sites.keys().cloned().collect();
+        let mut out: Vec<Value> = Vec::new();
+        if !self.client_xite.is_empty() {
+            if !self.per_identity || identities.len() < 2 {
+                out.extend(self.notification_entry().await);
+            } else {
+                for id in &identities {
+                    out.push(json!({
+                        "site": self.client_xite,
+                        "title": format!("Messages ({})", id.xid),
+                        "name": format!("channel:{}", id.xid),
+                        "count": self.db.unread_count_outside_apps(id.identity_id, &claimed).unwrap_or(0),
+                        "last_seen": 0,
+                    }));
+                }
+            }
+        }
+        let mut apps: Vec<(&String, &String)> = app_sites.iter().collect();
+        apps.sort();
+        for (app, site) in apps {
+            let mut count = 0i64;
+            for id in &identities {
+                count += self.db.unread_count_in_app(id.identity_id, Some(app)).unwrap_or(0);
+            }
+            out.push(json!({
+                "site": site,
+                "title": format!("Messages ({app})"),
+                "name": format!("channel:{app}"),
+                "count": count,
+                "last_seen": 0,
+            }));
+        }
+        out
     }
 }
 
@@ -1062,43 +1440,15 @@ impl Plugin for ChannelPlugin {
             Arc::new(ChannelDeleteLocal),
             Arc::new(ChannelMigrateLegacy),
             Arc::new(ChannelRlnStatus),
+            Arc::new(ChannelSubscribe),
+            Arc::new(crate::channel_setup::ChannelIdentitySetup),
+            Arc::new(crate::channel_setup::ChannelIdentitySetEnabled),
+            Arc::new(crate::channel_setup::ChannelIdentityStatus),
         ]
     }
 
     fn start(&self, state: &Arc<AppState>) {
         tokio::spawn(run_channel_plugin(state.clone()));
-    }
-}
-
-async fn initialize_local_channel_identity(
-    state: &Arc<AppState>,
-    xite: &str,
-    engine: &dyn Engine,
-    db: &ChannelDb,
-) -> Option<i64> {
-    let (auth, xid, bundle) = match local_channel_bundle(state, xite, engine).await {
-        Ok(bundle) => bundle,
-        Err(error) => {
-            state
-                .log(
-                    "ERROR",
-                    &format!("could not build authenticated channel bundle: {error}"),
-                )
-                .await;
-            return None;
-        }
-    };
-    match db.upsert_identity(&xid, &auth, 0, Some(&bundle.to_string())) {
-        Ok(identity_id) => Some(identity_id),
-        Err(error) => {
-            state
-                .log(
-                    "ERROR",
-                    &format!("could not persist channel identity: {error}"),
-                )
-                .await;
-            None
-        }
     }
 }
 
@@ -1169,157 +1519,171 @@ fn spawn_channel_sweep(state: Arc<AppState>, xite: String) {
 async fn run_channel_indexer(
     state: &Arc<AppState>,
     ms: &Arc<ChannelState>,
-    xite: &str,
     mut rx: tokio::sync::broadcast::Receiver<epix_ui::pool::PoolDelta>,
 ) {
+    let pools = ms.pool_xites();
     loop {
         match rx.recv().await {
-            Ok(delta) if delta.address == xite => {
+            Ok(delta) if pools.contains(&delta.address) => {
                 index_records(state, ms, delta.records.as_ref().clone()).await;
             }
             Ok(_) => {}
             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                let all = state.pool_all_records(xite).await;
-                index_records(state, ms, all).await;
+                for pool in &pools {
+                    let all = state.pool_all_records(pool).await;
+                    index_records(state, ms, all).await;
+                }
             }
             Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
         }
     }
 }
 
-async fn run_channel_plugin(state: Arc<AppState>) {
-            // ON by default: metadata-private mail is a core feature, not an
-            // opt-in. `channel_enabled=false` remains the explicit off switch.
-            if !state.config_bool("channel_enabled", true).await {
-                return;
+/// The configured legacy pool xites (`channel_legacy_xites`, one per line or
+/// comma-separated), minus the hub itself. Unset = Epix Mail's old pool.
+fn configured_legacy_xites(value: Option<Value>, hub: &str) -> Vec<String> {
+    let text = match value {
+        None => EPIX_MAIL_XITE.to_string(),
+        Some(Value::String(s)) => s,
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(_) => String::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    for item in text.split(|c| c == '\n' || c == ',') {
+        let item = item.trim();
+        if item.is_empty() || item == hub || out.iter().any(|o| o == item) {
+            continue;
+        }
+        out.push(item.to_string());
+    }
+    out
+}
+
+/// Wait until the hub xite is served locally with its pool descriptor,
+/// cloning it on demand when the node can (a fresh node has never visited the
+/// xID xite). An operator's NoNewSites lock or an offline node just keeps
+/// waiting; channels come up the moment the hub lands, without a restart.
+async fn ensure_hub(state: &Arc<AppState>, ms: &ChannelState) {
+    let hub = ms.xite.clone();
+    let mut attempt = 0u32;
+    loop {
+        if state.has_xite(&hub).await && !state.pool_rules_for(&hub).await.is_empty() {
+            break;
+        }
+        if state.has_on_demand().await {
+            let added = state.ensure_xite(&hub).await;
+            if !added && attempt % 10 == 0 {
+                state
+                    .log("INFO", format!("channels: hub xite {hub} is not available yet (attempt {attempt})"))
+                    .await;
             }
-            // Unset/blank falls back to the official Epix Mail xite, so mail
-            // works out of the box with zero configuration.
-            let xite = state
-                .config_get("channel_xite")
-                .await
-                .and_then(|v| v.as_str().map(str::trim).map(String::from))
-                .filter(|s| !s.is_empty())
-                .unwrap_or_else(|| DEFAULT_CHANNEL_XITE.to_string());
-            // A fresh node may not have the channel xite yet (the user has
-            // never opened Epix Mail). Idle here until it appears - the moment
-            // the xite is registered (first visit / clone), channels come up
-            // without a restart. Costs one cheap lookup a minute meanwhile.
-            while !state.has_xite(&xite).await {
-                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            }
-            let Some(engine) = build_engine(&state).await else { return };
-            let Some(db) = open_db(&state).await else {
-                state.log("ERROR", "could not open the channel index").await;
-                return;
-            };
-
-            let Some(local_identity_id) = initialize_local_channel_identity(
-                &state,
-                &xite,
-                engine.as_ref(),
-                &db,
-            )
-            .await
-            else {
-                return;
-            };
-
-            let ms = Arc::new(ChannelState {
-                db: db.clone(),
-                engine: engine.clone(),
-                xite: xite.clone(),
-                identity_id: std::sync::atomic::AtomicI64::new(local_identity_id),
-                send_lock: tokio::sync::Mutex::new(()),
-                outbox_lock: tokio::sync::Mutex::new(()),
-                delivery_lock: tokio::sync::Mutex::new(()),
-                rln_usage_ready: std::sync::atomic::AtomicBool::new(false),
-                index_retry: tokio::sync::Notify::new(),
-            });
-            state.install_capability(CHANNEL_CAP, ms.clone());
-            {
-                let s = state.clone();
-                let m = ms.clone();
-                tokio::spawn(retry_index_records(s, m));
-            }
-            // Auto-import legacy (pre-ECX) mail once the plugin is up:
-            // idempotent, and it must run BEFORE any rule-driven cleanup can
-            // delete legacy messages.json files - otherwise a user who never
-            // opens settings silently loses their old mail on cutover.
-            {
-                let s = state.clone();
-                let m = ms.clone();
-                tokio::spawn(async move {
-                    match import_legacy_mail(&s, &m).await {
-                        Ok(report) if report.imported > 0 => {
-                            s.log(
-                                "INFO",
-                                format!(
-                                    "channels: imported {} legacy mail message(s) into the private index",
-                                    report.imported
-                                ),
-                            )
-                            .await;
-                        }
-                        Ok(_) => {}
-                        Err(e) => {
-                            s.log("DEBUG", format!("channels: legacy mail import: {e}")).await;
-                        }
-                    }
-                });
-            }
-
-            install_channel_rln(&state, &ms, &xite).await;
-
-            // Reconcile every provisional RLN range before any durable record
-            // can publish or be acknowledged. The exact record and ratchet
-            // advance already committed together, so retry remains idempotent.
-            spawn_channel_outbox_worker(state.clone(), ms.clone());
-
-            let snippets = state.config_bool("channel_feed_snippets", false).await;
+        } else if attempt == 0 {
             state
-                .register_local_source(Arc::new(ChannelFeedSource {
-                    db: db.clone(),
-                    xite: xite.clone(),
-                    snippets,
-                }))
+                .log("INFO", format!("channels: waiting for the hub xite {hub}"))
                 .await;
+        }
+        attempt += 1;
+        let secs = (1u64 << attempt.min(7)).min(120);
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+    }
+    ms.hub_ready.store(true, std::sync::atomic::Ordering::Release);
+    // A stored permit: the setup worker picks it up even if it was mid-pass.
+    ms.hub_ready_notify.notify_one();
+}
 
-            // Subscribe to the pool-delta bus BEFORE kicking off backfill, so no
-            // backfilled record's delta is missed.
-            let rx = state.subscribe_pool_deltas();
+async fn run_channel_plugin(state: Arc<AppState>) {
+    // ON by default: metadata-private channels are a core feature, not an
+    // opt-in. `channel_enabled=false` remains the explicit off switch.
+    if !state.config_bool("channel_enabled", true).await {
+        return;
+    }
+    // Unset/blank falls back to the hub (the xID xite).
+    let xite = state
+        .config_get("channel_xite")
+        .await
+        .and_then(|v| v.as_str().map(str::trim).map(String::from))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| DEFAULT_CHANNEL_XITE.to_string());
+    let legacy_xites = configured_legacy_xites(state.config_get("channel_legacy_xites").await, &xite);
+    let Some(engine) = build_engine(&state).await else { return };
+    let Some(db) = open_db(&state).await else {
+        state.log("ERROR", "could not open the channel index").await;
+        return;
+    };
 
-            // A shard can have committed durably just before a crash, after its
-            // delta was emitted but before the private index consumed it. No new
-            // delta is generated on restart, so scan the verified/routed local
-            // pool once before waiting for network activity.
-            let retained = state.pool_all_records(&xite).await;
-            index_records(&state, &ms, retained).await;
+    // Zero identities is a valid boot: browsing needs none. Rows are created
+    // lazily per linked identity by the setup worker and by the first command
+    // that acts as one.
+    let ms = Arc::new(ChannelState::new(db.clone(), engine.clone(), xite.clone(), legacy_xites));
+    state.install_capability(CHANNEL_CAP, ms.clone());
+    state.register_identity_status_provider(
+        "channels",
+        Arc::new(crate::channel_setup::ChannelIdentityStatusProvider { ms: ms.clone() }),
+    );
+    {
+        let s = state.clone();
+        let m = ms.clone();
+        tokio::spawn(retry_index_records(s, m));
+    }
+    // Per-identity setup: derive keys, publish each identity's bundle into the
+    // hub, import that identity's legacy mail once. Runs from boot so a user
+    // who never opens Mail still gets set up.
+    tokio::spawn(crate::channel_setup::run_setup_worker(state.clone(), ms.clone()));
 
-            // Newest-first historical backfill.
-            let weeks = state
-                .config_get("channel_backfill_weeks")
-                .await
-                .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
-                .unwrap_or(4);
-            spawn_channel_backfill(state.clone(), xite.clone(), weeks);
+    let snippets = state.config_bool("channel_feed_snippets", false).await;
+    let per_identity = state.config_bool("channel_feed_per_identity", true).await;
+    state
+        .register_local_source(Arc::new(ChannelFeedSource {
+            db: db.clone(),
+            ms: ms.clone(),
+            client_xite: EPIX_MAIL_XITE.to_string(),
+            snippets,
+            per_identity,
+        }))
+        .await;
 
-            // Periodic anti-entropy sweep of the current-week shards.
-            spawn_channel_sweep(state.clone(), xite.clone());
-            run_channel_indexer(&state, &ms, &xite, rx).await;
+    // Subscribe to the pool-delta bus BEFORE the hub lands and backfill starts,
+    // so no record's delta is missed.
+    let rx = state.subscribe_pool_deltas();
+    ensure_hub(&state, &ms).await;
+
+    install_channel_rln(&state, &ms, &xite).await;
+
+    // Reconcile every provisional RLN range before any durable record can
+    // publish or be acknowledged. The exact record and ratchet advance already
+    // committed together, so retry remains idempotent.
+    spawn_channel_outbox_worker(state.clone(), ms.clone());
+
+    // A shard can have committed durably just before a crash, after its delta
+    // was emitted but before the private index consumed it. No new delta is
+    // generated on restart, so scan the verified/routed local pools once
+    // before waiting for network activity.
+    for pool in ms.pool_xites() {
+        let retained = state.pool_all_records(&pool).await;
+        index_records(&state, &ms, retained).await;
+    }
+
+    // Newest-first historical backfill and the periodic anti-entropy sweep,
+    // for the hub and every legacy pool still being read.
+    let weeks = state
+        .config_get("channel_backfill_weeks")
+        .await
+        .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
+        .unwrap_or(4);
+    for pool in ms.pool_xites() {
+        spawn_channel_backfill(state.clone(), pool.clone(), weeks);
+        spawn_channel_sweep(state.clone(), pool);
+    }
+    run_channel_indexer(&state, &ms, rx).await;
 }
 
 // ===========================================================================
 // WS commands
 // ===========================================================================
-
-/// Fetch the single identity id (for db reads scoped to this node's mailbox).
-fn identity_id(ms: &ChannelState) -> Result<i64, String> {
-    let id = ms.identity_id.load(std::sync::atomic::Ordering::Acquire);
-    (id > 0)
-        .then_some(id)
-        .ok_or_else(|| "no channel identity".to_string())
-}
 
 /// Whether OUR device's key bundle is committed in the xite's shared data:
 /// present in `data/users/<dir>/` (primary `data.json` or this device's slot),
@@ -1327,7 +1691,7 @@ fn identity_id(ms: &ChannelState) -> Result<i64, String> {
 /// directory's signed `content.json`. The last clause is what separates
 /// "published" from "an unsigned local draft" - a failed half-publish must
 /// keep the onboarding publish step visible.
-async fn own_bundle_committed(
+pub(crate) async fn own_bundle_committed(
     state: &Arc<AppState>,
     xite: &str,
     engine: &dyn Engine,
@@ -1378,36 +1742,92 @@ impl WsCommand for ChannelSessionInfo {
     fn name(&self) -> &'static str {
         "channelSessionInfo"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let unread = match identity_id(&ms) {
-            Ok(id) => ms.db.unread_count(id).unwrap_or(0),
-            Err(_) => 0,
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let identity = resolve_identity(s, &ms, p).await?;
+        let scope = client_app_scope(s).await;
+        // Every identity's state, for the account switcher (full grants only;
+        // a scoped client learns nothing about the other personas).
+        let identities: Vec<Value> = if scope.is_none() {
+            ms.db
+                .identities()
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .map(|row| {
+                    json!({
+                        "auth": row.auth_address,
+                        "xid": row.xid,
+                        "enabled": row.enabled,
+                        "state": crate::channel_setup::effective_state(&row),
+                        "unread": ms.db.unread_count(row.identity_id).unwrap_or(0),
+                    })
+                })
+                .collect()
+        } else {
+            Vec::new()
         };
-        // "Published" means this device's bundle is COMMITTED: written, valid,
-        // and hash-declared in the user's SIGNED content.json - not merely
-        // that the node auto-initialized its local (private) identity at boot,
-        // and not merely that an unsigned draft sits on disk (a publish that
-        // failed halfway through must keep offering the publish step, or the
-        // user is stranded with a bundle only their own node can see).
-        // Joining the mail platform stays an explicit, user-visible act:
-        // until the user publishes, nothing about them exists in shared data.
-        let key_bundle_published = match s.state.user_auth_address(&ms.xite).await {
-            Ok(auth) => {
-                let dir = norm_xid(&s.state.user_directory(&ms.xite, &auth).await);
-                own_bundle_committed(&s.state, &ms.xite, ms.engine.as_ref(), &auth, &dir).await
-            }
-            Err(_) => false,
-        };
-        let (outbox_pending, outbox_error) = ms.db.outbox_status().map_err(|e| e.to_string())?;
-        Ok(json!({
+        let mut info = json!({
             "enabled": true,
             "xite": ms.xite,
+            "hub_ready": ms.hub_ready.load(std::sync::atomic::Ordering::Acquire),
+            "client_xite": EPIX_MAIL_XITE,
+            "identity": Value::Null,
+            "identities": identities,
+            // Flat legacy fields the current Mail client reads.
+            "key_bundle_published": false,
+            "unread": 0,
+            "outbox_pending": 0,
+            "outbox_error": Value::Null,
+        });
+        let Some(ctx) = identity else { return Ok(info) };
+        let row = ms.db.identity_by_id(ctx.identity_id).map_err(|e| e.to_string())?;
+        // "Published" means this device's bundle is COMMITTED in the hub:
+        // written, valid, and hash-declared in the identity's SIGNED
+        // content.json - not merely that the node derived keys, and not merely
+        // that an unsigned draft sits on disk.
+        let key_bundle_published =
+            own_bundle_committed(&s.state, &ms.xite, ms.engine.as_ref(), &ctx.auth, &norm_xid(&ctx.xid))
+                .await;
+        let app = resolve_app_filter(scope.clone(), requested_app(first_param_object(p)))?;
+        let unread = ms.db.unread_count_in_app(ctx.identity_id, app.as_deref()).unwrap_or(0);
+        let (outbox_pending, outbox_error) =
+            ms.db.outbox_status(Some(ctx.identity_id)).map_err(|e| e.to_string())?;
+        info["identity"] = json!({
+            "auth": ctx.auth,
+            "xid": ctx.xid,
+            "enabled": row.as_ref().map(|r| r.enabled).unwrap_or(true),
+            "setup": row.as_ref().map(crate::channel_setup::setup_json).unwrap_or(Value::Null),
             "key_bundle_published": key_bundle_published,
             "unread": unread,
             "outbox_pending": outbox_pending,
             "outbox_error": outbox_error,
-        }))
+        });
+        info["key_bundle_published"] = json!(key_bundle_published);
+        info["unread"] = json!(unread);
+        info["outbox_pending"] = json!(outbox_pending);
+        info["outbox_error"] = json!(outbox_error);
+        Ok(info)
+    }
+}
+
+/// `channelSubscribe([{app?}])` - receive `channelEvent`s on this xite for the
+/// identity it acts as, within its app scope (a scoped grant cannot widen).
+struct ChannelSubscribe;
+#[async_trait]
+impl WsCommand for ChannelSubscribe {
+    fn name(&self) -> &'static str {
+        "channelSubscribe"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let xite = s.address()?.to_string();
+        let requested = first_param_object(p)
+            .and_then(|o| o.get("app"))
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let scope = resolve_app_filter(client_app_scope(s).await, requested.as_deref())?;
+        ms.clients.write().await.insert(xite, scope.clone());
+        Ok(json!({ "ok": true, "app": scope }))
     }
 }
 
@@ -1421,8 +1841,9 @@ impl WsCommand for ChannelRlnStatus {
     fn name(&self) -> &'static str {
         "channelRlnStatus"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let identity = resolve_identity(s, &ms, p).await?;
         let Some(rule) = s.state.pool_rules_for(&ms.xite).await.into_iter().next() else {
             return Ok(json!({ "rln_required": false, "retention_weeks": 0 }));
         };
@@ -1441,10 +1862,12 @@ impl WsCommand for ChannelRlnStatus {
         let admission = s.state.capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP);
         let (used, limit, member) = match &admission {
             Some(a) => {
+                // The allowance is per NODE (one ledger shared by every identity
+                // it holds); membership is per identity.
                 let (used, limit) = a.usage(&ms.xite, epoch.max(0) as u64).unwrap_or((0, 0));
-                let member = match s.state.user_auth_address(&ms.xite).await.ok() {
-                    Some(auth) => {
-                        let seed = s.state.derive_consumer_seed("rln", &auth).await;
+                let member = match &identity {
+                    Some(ctx) => {
+                        let seed = s.state.derive_consumer_seed("rln", &ctx.auth).await;
                         a.is_member(&ms.xite, &epix_rln::RlnIdentity::from_seed(&seed))
                     }
                     None => false,
@@ -1473,27 +1896,37 @@ impl WsCommand for ChannelKeyBundlePublish {
     fn name(&self) -> &'static str {
         "channelKeyBundlePublish"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let (auth, xid, bundle) =
-            local_channel_bundle(&s.state, &ms.xite, ms.engine.as_ref()).await?;
-        let identity_id = ms
-            .db
-            .upsert_identity(&xid, &auth, 0, Some(&bundle.to_string()))
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let ctx = require_identity(s, &ms, p).await?;
+        let identity = s
+            .state
+            .identities()
+            .await
+            .into_iter()
+            .find(|i| i.auth_address == ctx.auth)
+            .ok_or_else(|| epix_user::XID_REQUIRED.to_string())?;
+        let seed = s.state.derive_consumer_seed("channel", &ctx.auth).await;
+        let bundle = build_identity_bundle(
+            ms.engine.as_ref(),
+            &ctx.auth,
+            &ctx.xid,
+            &identity.auth_privatekey,
+            seed,
+        )?;
+        ms.db
+            .upsert_identity(&ctx.xid, &ctx.auth, 0, Some(&bundle.to_string()))
             .map_err(|e| e.to_string())?;
-        ms.identity_id
-            .store(identity_id, std::sync::atomic::Ordering::Release);
-        // Cutover-safe multi-device: the site publishes to the primary
-        // `data/users/<xid>/data.json` when that slot is free or already this
-        // device's (so nodes that only read `data.json` keep working), and to the
-        // per-device `device_path` only when a DIFFERENT device already holds the
-        // primary slot — so two devices never clobber each other.
-        let device_path = format!("data/users/{xid}/{}", device_bundle_file(&auth));
+        // The node publishes the bundle into the hub itself (the setup worker
+        // does it); the legacy shape below keeps older Mail clients working,
+        // which wrote the bundle into their own xite from these fields.
+        crate::channel_setup::request_setup(&ms, ctx.identity_id)?;
+        let device_path = format!("data/users/{}/{}", ctx.xid, device_bundle_file(&ctx.auth));
         Ok(json!({
             "ok": true,
-            "xid": xid,
-            "auth": auth,
-            "primary_path": format!("data/users/{xid}/data.json"),
+            "xid": ctx.xid,
+            "auth": ctx.auth,
+            "primary_path": format!("data/users/{}/data.json", ctx.xid),
             "device_path": device_path,
             "bundle": bundle,
         }))
@@ -1507,16 +1940,17 @@ impl WsCommand for ChannelKeyLookup {
         "channelKeyLookup"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
+        let ms = channel_state(s).await?;
         let xids = p
             .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.as_array())
             .ok_or("channelKeyLookup: [xids] required")?;
         // One resolve covers every looked-up name: grouped, active-filtered,
-        // deduped device bundles (the same view the send fan-out uses).
+        // deduped device bundles (the same view the send fan-out uses). Sends
+        // go to the hub, so only hub bundles count as reachable.
         let published =
-            load_published_bundles(&s.state, &ms.xite, ms.engine.as_ref(), &ms.db).await?;
+            load_published_bundles(&s.state, &[ms.xite.clone()], ms.engine.as_ref(), &ms.db).await?;
         let mut out = serde_json::Map::new();
         for x in xids {
             let Some(xid) = x.as_str() else { continue };
@@ -1544,10 +1978,12 @@ impl WsCommand for ChannelContacts {
     fn name(&self) -> &'static str {
         "channelContacts"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let id = identity_id(&ms)?;
-        let threads = ms.db.threads(id, "all", 0, 500).map_err(|e| e.to_string())?;
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let Some(ctx) = resolve_identity(s, &ms, p).await? else {
+            return Ok(json!([]));
+        };
+        let threads = ms.db.threads(ctx.identity_id, "all", 0, 500).map_err(|e| e.to_string())?;
         let mut seen = std::collections::BTreeSet::new();
         for t in threads {
             if let Some(p) = t.get("peer_xid").and_then(|v| v.as_str()) {
@@ -1720,10 +2156,31 @@ fn recovered_record_material(
     Ok((epoch, ct))
 }
 
+/// The linked address a queued record's RLN proof belongs to: the row's
+/// identity, or - for a pre-v7 row that recorded none - the node's default.
+async fn outbound_identity_auth(
+    state: &Arc<AppState>,
+    ms: &ChannelState,
+    identity_id: i64,
+) -> Result<String, String> {
+    if identity_id > 0 {
+        if let Some(row) = ms.db.identity_by_id(identity_id).map_err(|e| e.to_string())? {
+            return Ok(row.auth_address);
+        }
+    }
+    state
+        .identity_for("")
+        .await
+        .map(|identity| identity.auth_address)
+        .ok_or_else(|| "queued channel record belongs to no held identity".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn refresh_recovered_rln(
     state: &Arc<AppState>,
     ms: &ChannelState,
     rule: &epix_content::pool::PoolRule,
+    identity_id: i64,
     record: &mut Value,
     recovery: &mut epix_envelope::OutboundRecovery,
     epoch: i64,
@@ -1738,7 +2195,7 @@ async fn refresh_recovered_rln(
     let admission = state
         .capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP)
         .ok_or("this pool requires RLN but no admission gate is loaded")?;
-    let auth = state.user_auth_address(&ms.xite).await?;
+    let auth = outbound_identity_auth(state, ms, identity_id).await?;
     let seed = state.derive_consumer_seed("rln", &auth).await;
     let identity = epix_rln::RlnIdentity::from_seed(&seed);
     let _transaction = admission.send_transaction(&ms.xite).await;
@@ -1819,8 +2276,17 @@ async fn recover_outbound_representation(
         return Ok(pending.clone());
     }
     let (epoch, ct) = recovered_record_material(&record, &recovery)?;
-    let representation_changed =
-        refresh_recovered_rln(state, ms, &rule, &mut record, &mut recovery, epoch, &ct).await?;
+    let representation_changed = refresh_recovered_rln(
+        state,
+        ms,
+        &rule,
+        pending.identity_id,
+        &mut record,
+        &mut recovery,
+        epoch,
+        &ct,
+    )
+    .await?;
 
     let capacity_retry = pending
         .last_error
@@ -2057,12 +2523,15 @@ struct ChannelSendRequest {
     subject: String,
     body: String,
     conv_hint: Option<[u8; 16]>,
+    /// The client app the message belongs to, sealed into its body.
+    app: String,
 }
 
 struct LocalChannelSender {
     identity_id: i64,
     secret: IdentitySecret,
     xid: String,
+    auth: String,
 }
 
 #[derive(Clone)]
@@ -2083,6 +2552,7 @@ struct ChannelSealContext {
     conv: [u8; 16],
     subject: String,
     body: String,
+    app: String,
     rule: epix_content::pool::PoolRule,
     chunk_count: usize,
     rln: Option<ChannelRlnSendContext>,
@@ -2098,7 +2568,14 @@ struct ChannelChunkSeal {
     scheduled_ms: i64,
 }
 
-fn parse_channel_send_request(p: &Value) -> Result<ChannelSendRequest, String> {
+/// `channelSend([recipients, subject, body, conv_id? | {conv_id?, app?}])`. The
+/// options after the body are a hex `conv_id` string (a reply) and/or an object
+/// naming the reply conversation and the client app; `scope` is the caller's
+/// grant (a scoped xite cannot send as another app).
+fn parse_channel_send_request(
+    p: &Value,
+    scope: Option<String>,
+) -> Result<ChannelSendRequest, String> {
     let values = p
         .as_array()
         .ok_or("channelSend: [recipients, subject, body, conv_id?]")?;
@@ -2110,16 +2587,20 @@ fn parse_channel_send_request(p: &Value) -> Result<ChannelSendRequest, String> {
     if recipients.is_empty() {
         return Err("channelSend: at least one recipient required".into());
     }
+    let opts = values.iter().skip(3).find(|v| v.is_object());
     let conv_hint = values
         .get(3)
         .and_then(Value::as_str)
+        .or_else(|| opts.and_then(|o| o.get("conv_id")).and_then(Value::as_str))
         .and_then(|value| hex::decode(value).ok())
         .and_then(|bytes| bytes.try_into().ok());
+    let app = resolve_send_app(scope, requested_app(opts))?;
     Ok(ChannelSendRequest {
         recipients,
         subject: values.get(1).and_then(Value::as_str).unwrap_or("").to_string(),
         body: values.get(2).and_then(Value::as_str).unwrap_or("").to_string(),
         conv_hint,
+        app,
     })
 }
 
@@ -2145,8 +2626,9 @@ async fn local_sender_snapshot(
 async fn validated_local_sender(
     state: &Arc<AppState>,
     ms: &ChannelState,
+    ctx: IdentityCtx,
 ) -> Result<LocalChannelSender, String> {
-    let (identity_id, secret, xid, auth) = channel_identity(state, ms).await?;
+    let IdentityCtx { identity_id, auth, xid, secret } = ctx;
     let snapshot = local_sender_snapshot(state, &xid).await;
     let active_addrs: Vec<String> = snapshot
         .as_ref()
@@ -2176,6 +2658,7 @@ async fn validated_local_sender(
         identity_id,
         secret,
         xid,
+        auth,
     })
 }
 
@@ -2191,16 +2674,15 @@ async fn channel_rln_send_context(
     state: &Arc<AppState>,
     ms: &ChannelState,
     rule: &epix_content::pool::PoolRule,
+    auth: &str,
 ) -> Result<Option<ChannelRlnSendContext>, String> {
     if !rule.rln_required {
         return Ok(None);
     }
-    let admission = state.capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP);
-    let auth = state.user_auth_address(&ms.xite).await.ok();
-    let (Some(admission), Some(auth)) = (admission, auth) else {
+    let Some(admission) = state.capability::<crate::rln::RlnAdmission>(crate::rln::RLN_CAP) else {
         return Err("this pool requires RLN but no membership is available".into());
     };
-    let seed = state.derive_consumer_seed("rln", &auth).await.to_vec();
+    let seed = state.derive_consumer_seed("rln", auth).await.to_vec();
     Ok(Some(ChannelRlnSendContext {
         admission,
         seed,
@@ -2223,6 +2705,7 @@ fn seal_channel_chunk_without_rln(
         context.conv,
         &context.subject,
         &context.body,
+        &context.app,
         input.now_ms,
         input.scheduled_ms,
         &context.rule,
@@ -2274,6 +2757,7 @@ fn seal_channel_chunk_with_rln(
         context.conv,
         &context.subject,
         &context.body,
+        &context.app,
         input.now_ms,
         input.scheduled_ms,
         &context.rule,
@@ -2381,6 +2865,13 @@ async fn stage_prepared_outbound(
         .zip(staged)
         .map(|(prepared, (outbox_id, _msg_id))| PendingOutbound {
             outbox_id,
+            identity_id: prepared
+                .commit
+                .sent
+                .as_ref()
+                .map(|sent| sent.identity_id)
+                .or_else(|| prepared.commit.sessions.first().map(|session| session.identity_id))
+                .unwrap_or(0),
             record: prepared.commit.record,
             shard_path: prepared.commit.shard_path,
             created_ms: prepared.commit.created_ms,
@@ -2420,6 +2911,7 @@ async fn prepare_outbound_records(
         conv,
         subject: request.subject.clone(),
         body: request.body.clone(),
+        app: request.app.clone(),
         rule: rule.clone(),
         chunk_count: destinations.len().div_ceil(epix_envelope::SLOTS),
         rln,
@@ -2460,13 +2952,15 @@ async fn immediate_channel_delivery(
 }
 
 async fn execute_channel_send(s: &WsSession, p: &Value) -> Result<Value, String> {
-    let ms = channel_state(s)?;
-    let request = parse_channel_send_request(p)?;
-    let sender = validated_local_sender(&s.state, &ms).await?;
+    let ms = channel_state(s).await?;
+    let request = parse_channel_send_request(p, client_app_scope(s).await)?;
+    let ctx = require_identity(s, &ms, p).await?;
+    let sender = validated_local_sender(&s.state, &ms, ctx).await?;
     let conv = request.conv_hint.unwrap_or_else(epix_envelope::new_conv_id);
     let members = channel_conversation_members(&request.recipients, &sender.xid);
+    // Destinations come from the hub only: that is where every send lands.
     let published =
-        load_published_bundles(&s.state, &ms.xite, ms.engine.as_ref(), &ms.db).await?;
+        load_published_bundles(&s.state, &[ms.xite.clone()], ms.engine.as_ref(), &ms.db).await?;
     let destinations = resolve_destinations(&ms, &request.recipients, &published).await?;
 
     let _staging_outbox_guard = channel_staging_guard(&ms).await?;
@@ -2478,7 +2972,7 @@ async fn execute_channel_send(s: &WsSession, p: &Value) -> Result<Value, String>
         .into_iter()
         .next()
         .ok_or("this xite has no pool configured")?;
-    let rln = channel_rln_send_context(&s.state, &ms, &rule).await?;
+    let rln = channel_rln_send_context(&s.state, &ms, &rule, &sender.auth).await?;
     let send_jitter = send_jitter_max_secs(&s.state).await;
     let burst_jitter = burst_jitter_max_secs(&s.state).await;
     let origin_delay = if send_jitter == 0 {
@@ -2532,13 +3026,19 @@ impl WsCommand for ChannelThreads {
         "channelThreads"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let id = identity_id(&ms)?;
+        let ms = channel_state(s).await?;
+        let Some(ctx) = resolve_identity(s, &ms, p).await? else {
+            return Ok(json!({ "threads": [] }));
+        };
         let o = p.as_array().and_then(|a| a.first());
         let folder = o.and_then(|v| v.get("folder")).and_then(|v| v.as_str()).unwrap_or("all");
         let offset = o.and_then(|v| v.get("offset")).and_then(|v| v.as_i64()).unwrap_or(0);
         let limit = o.and_then(|v| v.get("limit")).and_then(|v| v.as_i64()).unwrap_or(50);
-        let rows = ms.db.threads(id, folder, offset, limit).map_err(|e| e.to_string())?;
+        let app = resolve_app_filter(client_app_scope(s).await, requested_app(o))?;
+        let rows = ms
+            .db
+            .threads_in_app(ctx.identity_id, app.as_deref(), folder, offset, limit)
+            .map_err(|e| e.to_string())?;
         Ok(json!({ "threads": rows }))
     }
 }
@@ -2550,15 +3050,18 @@ impl WsCommand for ChannelConversation {
         "channelConversation"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let id = identity_id(&ms)?;
+        let ms = channel_state(s).await?;
         let conv = p
             .as_array()
             .and_then(|a| a.first())
             .and_then(|v| v.get("conv_id").or(Some(v)))
             .and_then(|v| v.as_str())
             .ok_or("channelConversation: conv_id required")?;
-        let rows = ms.db.messages(id, conv).map_err(|e| e.to_string())?;
+        let Some(ctx) = resolve_identity(s, &ms, p).await? else {
+            return Ok(json!({ "messages": [] }));
+        };
+        ensure_conv_in_scope(s, &ms, ctx.identity_id, conv).await?;
+        let rows = ms.db.messages(ctx.identity_id, conv).map_err(|e| e.to_string())?;
         Ok(json!({ "messages": rows }))
     }
 }
@@ -2570,12 +3073,18 @@ impl WsCommand for ChannelSearch {
         "channelSearch"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let id = identity_id(&ms)?;
+        let ms = channel_state(s).await?;
         let a = p.as_array();
         let query = a.and_then(|a| a.first()).and_then(|v| v.as_str()).ok_or("channelSearch: query required")?;
         let limit = a.and_then(|a| a.get(1)).and_then(|v| v.as_i64()).unwrap_or(100);
-        let rows = ms.db.search(id, query, limit).map_err(|e| e.to_string())?;
+        let app = resolve_app_filter(client_app_scope(s).await, requested_app(a.and_then(|a| a.get(2))))?;
+        let Some(ctx) = resolve_identity(s, &ms, p).await? else {
+            return Ok(json!({ "results": [] }));
+        };
+        let rows = ms
+            .db
+            .search_in_app(ctx.identity_id, app.as_deref(), query, limit)
+            .map_err(|e| e.to_string())?;
         Ok(json!({ "results": rows }))
     }
 }
@@ -2587,12 +3096,13 @@ impl WsCommand for ChannelMarkRead {
         "channelMarkRead"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let id = identity_id(&ms)?;
+        let ms = channel_state(s).await?;
         let a = p.as_array();
         let conv = a.and_then(|a| a.first()).and_then(|v| v.as_str()).ok_or("channelMarkRead: conv_id required")?;
         let read = a.and_then(|a| a.get(1)).and_then(|v| v.as_bool()).unwrap_or(true);
-        ms.db.mark_read(id, conv, read).map_err(|e| e.to_string())?;
+        let ctx = require_identity(s, &ms, p).await?;
+        ensure_conv_in_scope(s, &ms, ctx.identity_id, conv).await?;
+        ms.db.mark_read(ctx.identity_id, conv, read).map_err(|e| e.to_string())?;
         Ok(json!({ "ok": true }))
     }
 }
@@ -2604,14 +3114,15 @@ impl WsCommand for ChannelSetConvState {
         "channelSetConvState"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let id = identity_id(&ms)?;
+        let ms = channel_state(s).await?;
         let a = p.as_array().ok_or("channelSetConvState: [conv_id, {starred?, archived?}]")?;
         let conv = a.first().and_then(|v| v.as_str()).ok_or("channelSetConvState: conv_id required")?;
         let opts = a.get(1);
         let starred = opts.and_then(|v| v.get("starred")).and_then(|v| v.as_bool());
         let archived = opts.and_then(|v| v.get("archived")).and_then(|v| v.as_bool());
-        ms.db.set_conv_state(id, conv, starred, archived).map_err(|e| e.to_string())?;
+        let ctx = require_identity(s, &ms, p).await?;
+        ensure_conv_in_scope(s, &ms, ctx.identity_id, conv).await?;
+        ms.db.set_conv_state(ctx.identity_id, conv, starred, archived).map_err(|e| e.to_string())?;
         Ok(json!({ "ok": true }))
     }
 }
@@ -2623,10 +3134,11 @@ impl WsCommand for ChannelDeleteLocal {
         "channelDeleteLocal"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let id = identity_id(&ms)?;
+        let ms = channel_state(s).await?;
         let conv = p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()).ok_or("channelDeleteLocal: conv_id required")?;
-        ms.db.delete_conversation(id, conv).map_err(|e| e.to_string())?;
+        let ctx = require_identity(s, &ms, p).await?;
+        ensure_conv_in_scope(s, &ms, ctx.identity_id, conv).await?;
+        ms.db.delete_conversation(ctx.identity_id, conv).map_err(|e| e.to_string())?;
         Ok(json!({ "ok": true }))
     }
 }
@@ -2638,30 +3150,53 @@ impl WsCommand for ChannelDeleteLocal {
 /// legacy user sees their old mail with zero action, BEFORE any rule-driven
 /// cleanup can delete the legacy files out from under them; the WS command
 /// remains for an explicit re-run from the site's settings.
-async fn import_legacy_mail(
+/// The xite whose `data/users/*/messages.json` legacy mail is imported from:
+/// Epix Mail, the pre-pool mail site (`channel_legacy_mail_xite` overrides it
+/// for test networks). Never the hub.
+async fn legacy_mail_xite(state: &Arc<AppState>) -> String {
+    state
+        .config_get("channel_legacy_mail_xite")
+        .await
+        .and_then(|v| v.as_str().map(str::trim).map(String::from))
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| EPIX_MAIL_XITE.to_string())
+}
+
+pub(crate) async fn import_legacy_mail(
     state: &Arc<AppState>,
     ms: &Arc<ChannelState>,
+    ctx: &IdentityCtx,
 ) -> Result<epix_channel::legacy::LegacyImport, String> {
-    let (identity_id, _secret, my_xid, _auth) = channel_identity(state, ms).await?;
+    let mail_xite = legacy_mail_xite(state).await;
+    if !state.has_xite(&mail_xite).await {
+        return Ok(epix_channel::legacy::LegacyImport::default());
+    }
     // The mail key (encrypt index 0) that decrypts legacy ECIES ciphertext
-    // sealed to me — the same key the old site used via eciesDecrypt.
-    let privkey = state.user_encrypt_privatekey(&ms.xite, 0).await?;
+    // sealed to me - the same key the old site used via eciesDecrypt. Every
+    // identity on the node shares it (its derivation is per xite, shifted by
+    // the xID provider domain, not per identity).
+    let privkey = state.user_encrypt_privatekey(&mail_xite, 0).await?;
 
     // Gather every user's legacy messages.json currently on disk. Reading is
     // non-destructive.
     let mut containers: Vec<Value> = Vec::new();
-    for path in state.list_xite_files(&ms.xite).await {
+    for path in state.list_xite_files(&mail_xite).await {
         if path.starts_with("data/users/") && path.ends_with("/messages.json") {
-            if let Some(bytes) = state.read_xite_file(&ms.xite, &path).await {
+            if let Some(bytes) = state.read_xite_file(&mail_xite, &path).await {
                 if let Ok(v) = serde_json::from_slice::<Value>(&bytes) {
                     containers.push(v);
                 }
             }
         }
     }
+    if containers.is_empty() {
+        return Ok(epix_channel::legacy::LegacyImport::default());
+    }
 
     // Decrypt + insert off the async runtime (one ECIES open per candidate).
     let db = (*ms.db).clone();
+    let identity_id = ctx.identity_id;
+    let my_xid = ctx.xid.clone();
     let report = tokio::task::spawn_blocking(move || {
         epix_channel::legacy::import_legacy_containers(&db, identity_id, &my_xid, &privkey, &containers)
     })
@@ -2670,11 +3205,19 @@ async fn import_legacy_mail(
 
     // Refresh the badge if anything landed, and let the page reload threads.
     if report.imported > 0 {
-        state.push_site_event(
-            &ms.xite,
-            "channelEvent",
-            json!({ "type": "migrated", "imported": report.imported }),
-        );
+        deliver_channel_event(
+            state,
+            ms,
+            json!({
+                "type": "migrated",
+                "imported": report.imported,
+                "identity_id": ctx.identity_id,
+                "xid": ctx.xid,
+                "auth": ctx.auth,
+                "app": "mail",
+            }),
+        )
+        .await;
     }
     Ok(report)
 }
@@ -2685,9 +3228,10 @@ impl WsCommand for ChannelMigrateLegacy {
     fn name(&self) -> &'static str {
         "channelMigrateLegacy"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        let ms = channel_state(s)?;
-        let report = import_legacy_mail(&s.state, &ms).await?;
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let ctx = require_identity(s, &ms, p).await?;
+        let report = import_legacy_mail(&s.state, &ms, &ctx).await?;
         Ok(json!({
             "imported": report.imported,
             "skipped": report.skipped,
@@ -2950,17 +3494,7 @@ mod multi_device_tests {
             })
             .unwrap();
         let pending = db.pending_outbound(1).unwrap().remove(0);
-        let channel = super::ChannelState {
-            db: db.clone(),
-            engine: Arc::new(FakeEngine),
-            xite: XITE.into(),
-            identity_id: std::sync::atomic::AtomicI64::new(0),
-            send_lock: tokio::sync::Mutex::new(()),
-            outbox_lock: tokio::sync::Mutex::new(()),
-            delivery_lock: tokio::sync::Mutex::new(()),
-            rln_usage_ready: std::sync::atomic::AtomicBool::new(true),
-            index_retry: tokio::sync::Notify::new(),
-        };
+        let channel = super::ChannelState::for_test(db.clone(), Arc::new(FakeEngine), XITE.into());
 
         let paused_delivery = channel.delivery_lock.lock().await;
         let staging = tokio::time::timeout(
@@ -3102,17 +3636,7 @@ mod multi_device_tests {
             .reschedule_outbound(outbox_id, super::now_ms())
             .unwrap();
         let retried = reopened.pending_outbound(1).unwrap().remove(0);
-        let restarted_channel = super::ChannelState {
-            db: reopened,
-            engine: Arc::new(FakeEngine),
-            xite: XITE.into(),
-            identity_id: std::sync::atomic::AtomicI64::new(0),
-            send_lock: tokio::sync::Mutex::new(()),
-            outbox_lock: tokio::sync::Mutex::new(()),
-            delivery_lock: tokio::sync::Mutex::new(()),
-            rln_usage_ready: std::sync::atomic::AtomicBool::new(true),
-            index_retry: tokio::sync::Notify::new(),
-        };
+        let restarted_channel = super::ChannelState::for_test(reopened, Arc::new(FakeEngine), XITE.into());
         let retry_error = super::append_outbound(&state, &restarted_channel, &retried)
             .await
             .unwrap_err();
@@ -3173,6 +3697,27 @@ mod multi_device_tests {
 }
 
 #[cfg(test)]
+mod legacy_pool_config_tests {
+    use super::{configured_legacy_xites, EPIX_MAIL_XITE};
+    use serde_json::json;
+
+    #[test]
+    fn legacy_pools_parse_lines_commas_and_skip_the_hub() {
+        let hub = "epix1hub";
+        assert_eq!(configured_legacy_xites(None, hub), vec![EPIX_MAIL_XITE.to_string()]);
+        assert!(configured_legacy_xites(Some(json!("")), hub).is_empty());
+        assert_eq!(
+            configured_legacy_xites(Some(json!(" epix1a \nepix1b, epix1a\nepix1hub")), hub),
+            vec!["epix1a".to_string(), "epix1b".to_string()]
+        );
+        assert_eq!(
+            configured_legacy_xites(Some(json!(["epix1x", "epix1hub"])), hub),
+            vec!["epix1x".to_string()]
+        );
+    }
+}
+
+#[cfg(test)]
 mod default_config_tests {
     /// The Config page's Channels defaults must equal the plugin's code
     /// defaults, or the UI advertises a state the node does not actually use.
@@ -3188,5 +3733,8 @@ mod default_config_tests {
         assert_eq!(*enabled_default, "true", "channels are ON by default");
         let (_, _, _, xite_default, _) = row("channel_xite");
         assert_eq!(*xite_default, super::DEFAULT_CHANNEL_XITE);
+        assert_eq!(super::DEFAULT_CHANNEL_XITE, epix_ui::state::XID_XITE_ADDRESS, "the hub is the xID xite");
+        let (_, _, _, legacy_default, _) = row("channel_legacy_xites");
+        assert_eq!(*legacy_default, super::EPIX_MAIL_XITE, "Mail's old pool stays indexed during the cutover");
     }
 }

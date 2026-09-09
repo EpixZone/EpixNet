@@ -22,6 +22,8 @@ use crate::state::DEFAULT_VOLUNTEER_QUOTA;
 ///   - `"select:Label=value|Label2=value2"` - dropdown (label defaults to value
 ///     when there's no `=`)
 ///   - `"button:actionName"` - an action button (not a stored config key)
+///   - `"identities"` - the linked-identity table (rendered from users.json,
+///     not a stored config key)
 ///   - `"soon:<inner>"` - render `<inner>` disabled with a "coming soon" note,
 ///     for keys whose backend (Tor transport, SOCKS proxy) isn't built yet.
 pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
@@ -220,23 +222,48 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "text",
     ),
     ("Epix Chain Config", "xid_clear_cache", "Clear xID Cache", "", "button:xidClearCache"),
+    // --- Identities: the linked xIDs this node holds. The list is rendered
+    // from users.json (not a stored config key); the buttons start the xID
+    // xite's link flow, or record names the chain already links to one of
+    // the node's addresses.
+    ("Identities", "identities", "Linked xIDs", "", "identities"),
+    ("Identities", "identity_link", "Link a new identity", "", "button:identityLinkStart"),
+    (
+        "Identities",
+        "identity_discover",
+        "Find identities already linked to my addresses",
+        "",
+        "button:identityDiscover",
+    ),
     // --- Channels (metadata-private mail / DMs / forum over the envelope pool)
-    // ON by default with the official Epix Mail xite, so encrypted mail works
-    // out of the box. Both defaults MUST match the ChannelPlugin's code
-    // defaults (`config_bool("channel_enabled", true)` /
-    // `DEFAULT_CHANNEL_XITE`) - a test in epix-plugins pins the xite address.
+    // ON by default. The hub that holds key bundles and the pool is the xID
+    // xite (auto-added by the node), so encrypted channels work out of the box
+    // for every linked identity. The defaults MUST match the ChannelPlugin's
+    // code defaults (`config_bool("channel_enabled", true)`,
+    // `DEFAULT_CHANNEL_XITE`, `EPIX_MAIL_XITE`) - a test in epix-plugins pins them.
     ("Channels", "channel_enabled", "Enable metadata-private channels", "true", "bool"),
     (
         "Channels",
         "channel_xite",
-        "Channel xite address (blank = the official Epix Mail xite)",
-        "epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa",
+        "Channel hub xite address (blank = the xID xite; advanced, test networks only)",
+        "epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c",
         "text",
+    ),
+    (
+        "Channels",
+        "channel_legacy_xites",
+        "Legacy pool xites still indexed read-only during the hub cutover (one per line)",
+        "epix1pvta40a8d944w3npr9ztqrfh3wec53hh2je4fa",
+        "textarea",
     ),
     ("Channels", "channel_backfill_weeks", "Weeks of channel history to backfill (0 = all)", "4", "text"),
     ("Channels", "channel_send_jitter_max_secs", "Max random send delay (metadata privacy)", "0", "text"),
     ("Channels", "channel_burst_jitter_max_secs", "Max per-record gap for >8-recipient sends (metadata privacy)", "60", "text"),
     ("Channels", "channel_feed_snippets", "Show message snippets in the dashboard feed", "false", "bool"),
+    // Badge each identity's unread mail separately on the dashboard. Off
+    // collapses them into one badge, so a shared screen does not reveal which
+    // personas this node holds.
+    ("Channels", "channel_feed_per_identity", "Badge unread mail per identity on the dashboard", "true", "bool"),
     // Seal message content + ratchet state at rest under a seed-derived key.
     // Trade-off: full-text search falls back to a slower decrypt-then-scan. The
     // default here MUST match the code default in the channel plugin
@@ -248,10 +275,10 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     ("Channels", "channel_allow_insecure_engine", "DEV: allow the insecure test channel engine", "false", "bool"),
 ];
 
-/// True for schema entries that aren't stored config keys (action buttons), so
-/// `configList` / save loops can skip them.
+/// True for schema entries that aren't stored config keys (action buttons, the
+/// identity table), so `configList` / save loops can skip them.
 pub fn is_config_action(kind: &str) -> bool {
-    kind.starts_with("button:")
+    kind.starts_with("button:") || kind == "identities"
 }
 
 /// Config keys the node only reads while booting - changing one takes effect

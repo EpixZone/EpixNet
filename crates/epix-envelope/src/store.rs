@@ -14,6 +14,10 @@
 use epix_core::Result;
 use serde_json::Value;
 
+/// The client app a message belongs to when its sealed body carries no tag:
+/// mail, the first channel surface. Every other app names itself in the body.
+pub const DEFAULT_APP: &str = "mail";
+
 /// Number of expected-tag lookahead slots kept per session per direction — a
 /// received record consumes its tag and the window is topped back up to K, so
 /// out-of-order / lost pool records within a window of K still match in O(1).
@@ -54,6 +58,9 @@ pub struct InboundCommit {
     pub sender_xid: Option<String>,
     /// Full participant list of the thread (JSON-stored; enables reply-all).
     pub members: Vec<String>,
+    /// The client app tag carried inside the sealed body ([`DEFAULT_APP`] when
+    /// the body has none).
+    pub app: String,
     pub subject: String,
     pub body: String,
     pub sent_ms: i64,
@@ -124,6 +131,8 @@ pub struct OutboundMessage {
     pub subject: String,
     pub body: String,
     pub sent_ms: i64,
+    /// The client app the message was sent in (also sealed into the body).
+    pub app: String,
 }
 
 /// Durable RLN allowance allocation for one sealed ciphertext. A retry against
@@ -162,6 +171,10 @@ pub struct OutboundCommit {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PendingOutbound {
     pub outbox_id: i64,
+    /// The local identity that sealed this record (0 for rows written before
+    /// the column existed; such a row belongs to whichever identity the node
+    /// held then).
+    pub identity_id: i64,
     pub record: Value,
     pub shard_path: String,
     pub created_ms: i64,

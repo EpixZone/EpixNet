@@ -2914,6 +2914,7 @@ dependencies = [
  "epix-plugin",
  "epix-rln",
  "epix-ui",
+ "epix-user",
  "epix-xite",
  "hex",
  "serde_json",

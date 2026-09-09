@@ -243,8 +243,11 @@ async fn users_json_reads_the_legacy_sites_key_and_writes_xites() {
 
     let state = AppState::with_data_dir("run-1", root.path());
     // The legacy key loaded: the saved per-xite auth survived. (Had it not,
-    // this would mint a fresh auth address from the master seed instead.)
-    assert_eq!(state.user_auth_address(&address).await.unwrap(), "epix1auth");
+    // this would mint a fresh auth address from the master seed instead.) It
+    // is a per-xite key, not an identity, so the xite still browses
+    // anonymously - but the key is held.
+    assert_eq!(state.user_auth_address(&address).await.unwrap_err(), epix_user::XID_REQUIRED);
+    assert!(state.user_all_addresses().await.contains(&"epix1auth".to_string()));
 
     // Any save rewrites the file under the new key.
     state.save_user().await;

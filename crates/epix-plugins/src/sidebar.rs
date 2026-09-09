@@ -375,14 +375,16 @@ fn render_sidebar(
          <a href='#DB-Rebuild' class='button' id='button-dbrebuild'>Rebuild</a></li>",
     );
 
-    // Identity
-    let identity = match cert_user_id {
-        Some(id) => esc(id),
-        None => esc(auth_address),
+    // Identity: the xID this xite acts as, or none - browsing is anonymous
+    // until one is selected from the picker the button opens.
+    let (identity, action) = match cert_user_id {
+        Some(id) => (esc(id), "Change"),
+        None if !auth_address.is_empty() => (esc(auth_address), "Change"),
+        None => ("No identity selected".to_string(), "Select"),
     };
     b.push_str(&format!(
-        "<li><label>Identity address \
-          <a href='#Change' id='button-identity' class='link-right'>Change</a></label>\
+        "<li><label>Identity \
+          <a href='#Change' id='button-identity' class='link-right'>{action}</a></label>\
          <span class='console-address'>{identity}</span></li>",
     ));
 
@@ -468,6 +470,9 @@ mod tests {
         let html = render_sidebar("1abc.epix", &info, counts, 1_048_576, 524_288, &includes);
 
         assert!(html.contains("<h1>My Xite</h1>"));
+        // A selected identity shows its address and a Change link.
+        assert!(html.contains("epix1abcauthaddress"));
+        assert!(html.contains("id='button-identity' class='link-right'>Change</a>"));
         // New sections/controls.
         assert!(html.contains("id='link-copypeers'"), "copy peers link");
         assert!(html.contains("id='checkbox-autodownloadoptional' checked"), "autodownload on");
@@ -524,6 +529,9 @@ mod tests {
         });
         let counts = PeerCounts { total: 1, connected: 1, connectable: 1, onion: 0, local: 0 };
         let html = render_sidebar("1abc", &idle, counts, 0, 0, &[]);
+        // No identity on this xite: the panel says so and offers to select one.
+        assert!(html.contains("No identity selected"), "{html}");
+        assert!(html.contains("id='button-identity' class='link-right'>Select</a>"));
         assert!(!html.contains("optional-progress"), "no live panel when idle");
         assert!(!html.contains("opt-spinner"), "no spinner when idle");
 
