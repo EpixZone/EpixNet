@@ -1057,7 +1057,7 @@ impl ChannelDb {
             .ok_or_else(|| Error::Db("identity upsert did not return id".into()))
     }
 
-    const IDENTITY_COLUMNS: &'static str = "identity_id, xid, auth_address, derive_index, bundle_json, \
+    const IDENTITY_COLUMNS: &str = "identity_id, xid, auth_address, derive_index, bundle_json, \
          enabled, setup_state, setup_error, setup_attempts, setup_next_ms, published_path, \
          published_ms, published_peers";
 

@@ -13867,14 +13867,9 @@ impl AppState {
             .await
             .privatekey_for(auth_address)
             .ok_or("No private key for the linked identity")?;
-        let name = match name {
-            Some(n) => n.trim().to_lowercase(),
-            None => match epix_chain::xid_identity::resolve_identity(auth_address).await {
-                Some(info) => format!("{}.{}", info.name, info.tld),
-                None => {
-                    return Ok(json!({ "error": "identity_not_linked", "auth_address": auth_address }))
-                }
-            },
+        let not_linked = json!({ "error": "identity_not_linked", "auth_address": auth_address });
+        let Some(name) = Self::link_name_for(auth_address, name).await else {
+            return Ok(not_linked);
         };
         let (label, tld) = name.rsplit_once('.').unwrap_or((name.as_str(), epix_user::XID_TLD));
         if !Self::valid_xid_label(label) {
@@ -13883,58 +13878,22 @@ impl AppState {
 
         // Verify on chain: the name resolves and this address is an ACTIVE
         // linked identity of it.
-        let identities = match Self::chain_identities_for(label, tld).await? {
-            Some(identities) => identities,
-            None => {
-                return Ok(json!({ "error": format!("xID name '{label}.{tld}' not found on chain") }))
-            }
+        let Some(identities) = Self::chain_identities_for(label, tld).await? else {
+            return Ok(json!({ "error": format!("xID name '{label}.{tld}' not found on chain") }));
         };
-        let linked = identities.iter().any(|i| i.address == auth_address && i.active);
-        if !linked {
+        if !identities.iter().any(|i| i.address == auth_address && i.active) {
             if let Some(xite) = select_for {
-                let url = Self::xid_link_url(auth_address, xite);
-                let body = format!(
-                    "Your address is not linked as an identity for <b>{}.{}</b>.<br><br>\
-                     Open the xID site to link it?",
-                    html_escape(label),
-                    html_escape(tld)
-                );
-                if self.confirm(xite, &body, "Open xID").await {
-                    self.record_pending_link(auth_address, xite);
-                    self.push_redirect(xite, &url);
-                }
+                self.offer_link_on_xite(auth_address, xite, label, tld).await;
             }
-            return Ok(json!({ "error": "identity_not_linked", "auth_address": auth_address }));
+            return Ok(not_linked);
         }
 
         // Self-signed cert: sign "<auth_address>#xid/<name>" with the auth key.
         let cert_subject = format!("{auth_address}#xid/{label}");
         let cert_sign = epix_crypt::sign_keccak(&cert_subject, &privatekey)
             .map_err(|e| format!("Failed to sign certificate: {e}"))?;
-
-        let (added, became_default) = {
-            let mut user = self.user.write().await;
-            let added = user.add_identity(label, auth_address, &cert_sign, None)?;
-            let became_default = user.default_identity.as_deref() == Some(auth_address);
-            if let Some(xite) = select_for {
-                // The xite the user linked from uses the new identity: as the
-                // default when it just became one (so it keeps inheriting),
-                // else as this xite's override.
-                if became_default {
-                    user.select_identity(xite, None)?;
-                } else {
-                    user.select_identity(xite, Some(auth_address))?;
-                }
-            }
-            (added, became_default)
-        };
-        self.save_user().await;
-        {
-            let mut pending = self.pending_link.lock().unwrap();
-            if pending.as_ref().is_some_and(|p| p.auth_address == auth_address) {
-                *pending = None;
-            }
-        }
+        let (added, became_default) =
+            self.record_linked_identity(label, auth_address, &cert_sign, select_for).await?;
         self.push_notification(
             "done",
             &format!("xID linked: {label}@{}", epix_user::XID_CERT_DOMAIN),
@@ -13955,6 +13914,64 @@ impl AppState {
             "cert_user_id": format!("{label}@{}", epix_user::XID_CERT_DOMAIN),
             "added": added,
         }))
+    }
+
+    /// The name a link is for: the given one, normalized, else the chain's
+    /// reverse lookup of the address. `None` when the chain lists no name.
+    async fn link_name_for(auth_address: &str, name: Option<&str>) -> Option<String> {
+        if let Some(n) = name {
+            return Some(n.trim().to_lowercase());
+        }
+        epix_chain::xid_identity::resolve_identity(auth_address)
+            .await
+            .map(|info| format!("{}.{}", info.name, info.tld))
+    }
+
+    /// The address is not linked on chain: ask the user on `xite` whether to
+    /// open the xID xite to link it, remembering the link in flight so the
+    /// xite's later poll can complete it.
+    async fn offer_link_on_xite(&self, auth_address: &str, xite: &str, label: &str, tld: &str) {
+        let url = Self::xid_link_url(auth_address, xite);
+        let body = format!(
+            "Your address is not linked as an identity for <b>{}.{}</b>.<br><br>\
+             Open the xID site to link it?",
+            html_escape(label),
+            html_escape(tld)
+        );
+        if self.confirm(xite, &body, "Open xID").await {
+            self.record_pending_link(auth_address, xite);
+            self.push_redirect(xite, &url);
+        }
+    }
+
+    /// Store the verified identity, select it for the linking xite and save.
+    /// Returns `(added, became_default)`.
+    async fn record_linked_identity(
+        &self,
+        label: &str,
+        auth_address: &str,
+        cert_sign: &str,
+        select_for: Option<&str>,
+    ) -> Result<(bool, bool), String> {
+        let result = {
+            let mut user = self.user.write().await;
+            let added = user.add_identity(label, auth_address, cert_sign, None)?;
+            let became_default = user.default_identity.as_deref() == Some(auth_address);
+            if let Some(xite) = select_for {
+                // The xite the user linked from uses the new identity: as the
+                // default when it just became one (so it keeps inheriting),
+                // else as this xite's override.
+                let choice = if became_default { None } else { Some(auth_address) };
+                user.select_identity(xite, choice)?;
+            }
+            (added, became_default)
+        };
+        self.save_user().await;
+        let mut pending = self.pending_link.lock().unwrap();
+        if pending.as_ref().is_some_and(|p| p.auth_address == auth_address) {
+            *pending = None;
+        }
+        Ok(result)
     }
 
     /// `xidInvalidateCache`: drop the cached reverse lookup for `address` so

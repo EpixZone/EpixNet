@@ -597,15 +597,23 @@ impl User {
     /// per-xite `cert` domain is dropped, and dangling references are cleared.
     /// One-way and idempotent. Returns whether anything changed.
     pub fn migrate_legacy(&mut self) -> bool {
-        let mut changed = false;
+        let (mut changed, migrated_default) = self.migrate_legacy_certs();
+        changed |= self.pick_migrated_default(migrated_default);
+        changed |= self.drop_legacy_cert_domains();
+        changed |= self.clear_dangling_identity_refs();
+        changed
+    }
 
-        // 1. xID certs -> identities.
+    /// Step 1: every xID cert becomes an identity. Returns whether anything
+    /// changed and the address a xite had selected, if any (the default-to-be).
+    fn migrate_legacy_certs(&mut self) -> (bool, Option<String>) {
         let xid_domains: Vec<String> = self
             .legacy_certs
             .iter()
             .filter(|(domain, cert)| domain.as_str() == XID_CERT_DOMAIN || cert.auth_type == "xid")
             .map(|(domain, _)| domain.clone())
             .collect();
+        let mut changed = false;
         let mut migrated_default: Option<String> = None;
         for domain in &xid_domains {
             let Some(cert) = self.legacy_certs.get(domain).cloned() else { continue };
@@ -626,37 +634,55 @@ impl User {
                 });
             }
             // A xite that had this cert selected made it the active identity.
-            let selected_here = self
-                .xites
-                .iter()
-                .any(|(addr, x)| !addr.starts_with("_identity_") && x.cert.as_deref() == Some(domain));
-            if selected_here && migrated_default.is_none() {
+            if migrated_default.is_none() && self.legacy_cert_selected(domain) {
                 migrated_default = Some(cert.auth_address.clone());
             }
             self.legacy_certs.remove(domain);
             changed = true;
         }
+        (changed, migrated_default)
+    }
 
-        // 2. Default identity.
-        if self.default_identity.is_none() {
-            let candidate = migrated_default.or_else(|| {
-                (self.identities.len() == 1).then(|| self.identities[0].auth_address.clone())
-            });
-            if candidate.is_some() {
-                self.default_identity = candidate;
-                changed = true;
-            }
+    /// Whether any real xite (not an `_identity_` key slot) had `domain` as
+    /// its schema-1 cert.
+    fn legacy_cert_selected(&self, domain: &str) -> bool {
+        self.xites
+            .iter()
+            .any(|(addr, x)| !addr.starts_with("_identity_") && x.cert.as_deref() == Some(domain))
+    }
+
+    /// Step 2: the default identity, when none is set: the migrated selection,
+    /// else the only identity.
+    fn pick_migrated_default(&mut self, migrated_default: Option<String>) -> bool {
+        if self.default_identity.is_some() {
+            return false;
         }
+        let candidate = migrated_default.or_else(|| {
+            (self.identities.len() == 1).then(|| self.identities[0].auth_address.clone())
+        });
+        if candidate.is_none() {
+            return false;
+        }
+        self.default_identity = candidate;
+        true
+    }
 
-        // 3. Drop the schema-1 per-xite cert domains.
+    /// Step 3: drop the schema-1 per-xite cert domains.
+    fn drop_legacy_cert_domains(&mut self) -> bool {
+        let mut changed = false;
         for xite in self.xites.values_mut() {
             if xite.cert.is_some() {
                 xite.cert = None;
                 changed = true;
             }
         }
+        changed
+    }
 
-        // 4. Dangling references.
+    /// Step 4: a default or a per-xite choice naming an identity this user
+    /// does not hold is cleared.
+    fn clear_dangling_identity_refs(&mut self) -> bool {
+        let mut changed = false;
         if let Some(addr) = self.default_identity.clone() {
             if self.identity(&addr).is_none() {
                 self.default_identity = None;
@@ -665,11 +691,13 @@ impl User {
         }
         let held: Vec<String> = self.identities.iter().map(|i| i.auth_address.clone()).collect();
         for xite in self.xites.values_mut() {
-            if let Some(addr) = xite.identity.as_deref() {
-                if !addr.is_empty() && !held.iter().any(|h| h == addr) {
-                    xite.identity = None;
-                    changed = true;
-                }
+            let dangling = xite
+                .identity
+                .as_deref()
+                .is_some_and(|addr| !addr.is_empty() && !held.iter().any(|h| h == addr));
+            if dangling {
+                xite.identity = None;
+                changed = true;
             }
         }
         changed
@@ -758,27 +786,31 @@ impl User {
     /// node runs one identity; Multiuser switches among several by master seed).
     /// A schema-1 entry is migrated and written back once.
     pub fn load_or_create(path: &Path) -> Result<Self, String> {
-        if let Ok(bytes) = std::fs::read(path) {
-            if let Ok(Value::Object(users)) = serde_json::from_slice::<Value>(&bytes) {
-                for (master_address, entry) in &users {
-                    if let Some((user, migrated)) = Self::from_file_entry(master_address, entry) {
-                        // A seed-derived master address must match its key, or
-                        // the file is corrupt for that entry - skip it.
-                        if epix_crypt::privatekey_to_address(&user.master_seed).as_deref()
-                            == Ok(master_address)
-                        {
-                            if migrated {
-                                user.save(path)?;
-                            }
-                            return Ok(user);
-                        }
-                    }
-                }
+        if let Some((user, migrated)) = Self::load_first_valid_entry(path) {
+            if migrated {
+                user.save(path)?;
             }
+            return Ok(user);
         }
         let user = Self::generate();
         user.save(path)?;
         Ok(user)
+    }
+
+    /// The first `users.json` entry whose master address matches its seed,
+    /// with whether it was migrated from schema 1. An entry whose address does
+    /// not match its key is corrupt and skipped.
+    fn load_first_valid_entry(path: &Path) -> Option<(Self, bool)> {
+        let bytes = std::fs::read(path).ok()?;
+        let Value::Object(users) = serde_json::from_slice::<Value>(&bytes).ok()? else {
+            return None;
+        };
+        users.iter().find_map(|(master_address, entry)| {
+            let (user, migrated) = Self::from_file_entry(master_address, entry)?;
+            let matches = epix_crypt::privatekey_to_address(&user.master_seed).as_deref()
+                == Ok(master_address);
+            matches.then_some((user, migrated))
+        })
     }
 
     /// Persist to a `users.json` file, preserving any other users' entries so a

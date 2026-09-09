@@ -213,126 +213,168 @@ pub(crate) async fn reconcile_identities(
     legacy_imported: &mut std::collections::HashSet<i64>,
 ) {
     let linked = state.identities().await;
+    drop_unlinked_rows(ms, &linked);
+    for identity in &linked {
+        reconcile_identity(state, ms, identity, legacy_imported).await;
+    }
+}
 
-    // Rows for identities this node no longer holds are dropped (the removal
-    // event may have been missed while the worker was busy).
-    if let Ok(rows) = ms.db.identities() {
-        for row in rows {
-            if !linked.iter().any(|i| i.auth_address == row.auth_address) {
-                let _ = ms.db.delete_identity(row.identity_id);
-            }
+/// Rows for identities this node no longer holds are dropped (the removal
+/// event may have been missed while the worker was busy).
+fn drop_unlinked_rows(ms: &ChannelState, linked: &[epix_user::Identity]) {
+    let Ok(rows) = ms.db.identities() else { return };
+    for row in rows {
+        if !linked.iter().any(|i| i.auth_address == row.auth_address) {
+            let _ = ms.db.delete_identity(row.identity_id);
         }
     }
+}
 
-    for identity in linked {
-        let Ok(identity_id) = ensure_identity_row(&ms.db, &identity) else { continue };
-        let Ok(Some(row)) = ms.db.identity_by_id(identity_id) else { continue };
-        let now = now_ms();
+/// Bring one identity's setup up to date: mark it off, leave it alone, or
+/// attempt a publish and record the outcome.
+async fn reconcile_identity(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+    identity: &epix_user::Identity,
+    legacy_imported: &mut std::collections::HashSet<i64>,
+) {
+    let Ok(identity_id) = ensure_identity_row(&ms.db, identity) else { return };
+    let Ok(Some(row)) = ms.db.identity_by_id(identity_id) else { return };
+    let now = now_ms();
 
-        if !row.enabled {
-            if row.setup.state != STATE_OFF {
-                let _ = ms.db.set_identity_setup(
-                    identity_id,
-                    &IdentitySetup { state: STATE_OFF.to_string(), ..row.setup.clone() },
-                );
-            }
-            continue;
+    if !row.enabled {
+        if row.setup.state != STATE_OFF {
+            let _ = ms.db.set_identity_setup(
+                identity_id,
+                &IdentitySetup { state: STATE_OFF.to_string(), ..row.setup.clone() },
+            );
         }
-        match row.setup.state.as_str() {
-            STATE_FAILED => continue,
-            STATE_PENDING if row.setup.next_ms > now => continue,
-            STATE_PUBLISHED => {
-                // Re-publish only when the hub no longer carries our committed
-                // bundle (a resync from a peer that never got it, a pruned
-                // directory).
-                let committed = own_bundle_committed(
-                    state,
-                    &ms.xite,
-                    ms.engine.as_ref(),
-                    &identity.auth_address,
-                    &norm_xid(&identity.xid()),
+        return;
+    }
+    if !needs_publish(state, ms, identity, identity_id, &row, now, legacy_imported).await {
+        return;
+    }
+    if !ms.hub_ready.load(std::sync::atomic::Ordering::Acquire) {
+        let _ = ms.db.set_identity_setup(
+            identity_id,
+            &IdentitySetup {
+                state: STATE_PENDING.to_string(),
+                error: Some("waiting for the hub xite to sync".to_string()),
+                // The hub's arrival wakes the worker; no extra delay.
+                next_ms: now,
+                ..row.setup.clone()
+            },
+        );
+        return;
+    }
+    let outcome = publish_identity_bundle(state, ms, identity).await;
+    record_publish_outcome(state, ms, identity, identity_id, &row, now, outcome, legacy_imported).await;
+}
+
+/// Whether the stored setup state calls for a publish attempt now. A published
+/// identity is left alone (its legacy mail imported once) while the hub still
+/// carries its committed bundle; it is republished after a resync from a peer
+/// that never got it or a pruned directory.
+async fn needs_publish(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+    identity: &epix_user::Identity,
+    identity_id: i64,
+    row: &epix_channel::IdentityRow,
+    now: i64,
+    legacy_imported: &mut std::collections::HashSet<i64>,
+) -> bool {
+    match row.setup.state.as_str() {
+        STATE_FAILED => false,
+        STATE_PENDING if row.setup.next_ms > now => false,
+        STATE_PUBLISHED => {
+            let committed = own_bundle_committed(
+                state,
+                &ms.xite,
+                ms.engine.as_ref(),
+                &identity.auth_address,
+                &norm_xid(&identity.xid()),
+            )
+            .await;
+            if committed {
+                import_legacy_once(state, ms, identity, identity_id, legacy_imported).await;
+            }
+            !committed
+        }
+        _ => true,
+    }
+}
+
+/// Persist a publish attempt's result: published (announce it and import
+/// legacy mail), pending with backoff, or failed.
+#[allow(clippy::too_many_arguments)]
+async fn record_publish_outcome(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+    identity: &epix_user::Identity,
+    identity_id: i64,
+    row: &epix_channel::IdentityRow,
+    now: i64,
+    outcome: Result<IdentitySetup, SetupError>,
+    legacy_imported: &mut std::collections::HashSet<i64>,
+) {
+    match outcome {
+        Ok(setup) => {
+            let _ = ms.db.set_identity_setup(identity_id, &setup);
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "channels: published {}'s key bundle to the hub ({})",
+                        identity.xid(),
+                        setup.published_path.as_deref().unwrap_or("")
+                    ),
                 )
                 .await;
-                if committed {
-                    import_legacy_once(state, ms, &identity, identity_id, legacy_imported).await;
-                    continue;
-                }
-            }
-            _ => {}
+            deliver_channel_event(
+                state,
+                ms,
+                json!({
+                    "type": "setup",
+                    "identity_id": identity_id,
+                    "xid": identity.xid(),
+                    "auth": identity.auth_address,
+                    // No app: an identity's keys serve every client app.
+                    "state": STATE_PUBLISHED,
+                }),
+            )
+            .await;
+            import_legacy_once(state, ms, identity, identity_id, legacy_imported).await;
         }
-
-        if !ms.hub_ready.load(std::sync::atomic::Ordering::Acquire) {
+        Err(SetupError::Transient(error)) => {
+            let attempts = row.setup.attempts + 1;
             let _ = ms.db.set_identity_setup(
                 identity_id,
                 &IdentitySetup {
                     state: STATE_PENDING.to_string(),
-                    error: Some("waiting for the hub xite to sync".to_string()),
-                    // The hub's arrival wakes the worker; no extra delay.
-                    next_ms: now,
+                    error: Some(error),
+                    attempts,
+                    next_ms: now + (backoff_secs(attempts) * 1000) as i64,
                     ..row.setup.clone()
                 },
             );
-            continue;
         }
-
-        match publish_identity_bundle(state, ms, &identity).await {
-            Ok(setup) => {
-                let _ = ms.db.set_identity_setup(identity_id, &setup);
-                state
-                    .log(
-                        "INFO",
-                        format!(
-                            "channels: published {}'s key bundle to the hub ({})",
-                            identity.xid(),
-                            setup.published_path.as_deref().unwrap_or("")
-                        ),
-                    )
-                    .await;
-                deliver_channel_event(
-                    state,
-                    ms,
-                    json!({
-                        "type": "setup",
-                        "identity_id": identity_id,
-                        "xid": identity.xid(),
-                        "auth": identity.auth_address,
-                        // No app: an identity's keys serve every client app.
-                        "state": STATE_PUBLISHED,
-                    }),
+        Err(SetupError::Definite(error)) => {
+            state
+                .log(
+                    "WARNING",
+                    format!("channels: setup for {} failed: {error}", identity.xid()),
                 )
                 .await;
-                import_legacy_once(state, ms, &identity, identity_id, legacy_imported).await;
-            }
-            Err(SetupError::Transient(error)) => {
-                let attempts = row.setup.attempts + 1;
-                let _ = ms.db.set_identity_setup(
-                    identity_id,
-                    &IdentitySetup {
-                        state: STATE_PENDING.to_string(),
-                        error: Some(error),
-                        attempts,
-                        next_ms: now + (backoff_secs(attempts) * 1000) as i64,
-                        ..row.setup.clone()
-                    },
-                );
-            }
-            Err(SetupError::Definite(error)) => {
-                state
-                    .log(
-                        "WARNING",
-                        format!("channels: setup for {} failed: {error}", identity.xid()),
-                    )
-                    .await;
-                let _ = ms.db.set_identity_setup(
-                    identity_id,
-                    &IdentitySetup {
-                        state: STATE_FAILED.to_string(),
-                        error: Some(error),
-                        attempts: row.setup.attempts + 1,
-                        ..row.setup.clone()
-                    },
-                );
-            }
+            let _ = ms.db.set_identity_setup(
+                identity_id,
+                &IdentitySetup {
+                    state: STATE_FAILED.to_string(),
+                    error: Some(error),
+                    attempts: row.setup.attempts + 1,
+                    ..row.setup.clone()
+                },
+            );
         }
     }
 }

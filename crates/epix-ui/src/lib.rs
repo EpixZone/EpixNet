@@ -1725,45 +1725,11 @@ async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
             Ok((_, url)) => Redirect::to(&url).into_response(),
             Err(error) => failed(&error),
         },
-        "identityDiscover" => {
-            let found = ctx.state.identity_discover(&[]).await;
-            let mut linked = 0;
-            for candidate in found.iter().filter(|d| !d.held_locally && d.active) {
-                if let Ok(result) = ctx
-                    .state
-                    .identity_link_complete(&candidate.auth_address, Some(&candidate.name), None)
-                    .await
-                {
-                    if result.get("xid").is_some() {
-                        linked += 1;
-                    }
-                }
-            }
-            match linked {
-                0 => done("No new identities found"),
-                1 => done("Linked 1 identity"),
-                n => done(&format!("Linked {n} identities")),
-            }
-        }
-        // A status provider's action: `identityHook:<cmd>:<base64url params>`,
-        // run as the node itself (the page is already behind the CSRF token).
-        "identityHook" => {
-            use base64::Engine as _;
-            let (cmd, params_b64) = arg.split_once(':').unwrap_or((arg, ""));
-            let params = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(params_b64)
-                .ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .unwrap_or_else(|| json!([]));
-            if cmd.is_empty() || !ctx.registry.has(cmd) {
-                return failed("Unknown action");
-            }
-            let session = WsSession::new_trusted(ctx.state.clone(), None);
-            match ctx.registry.dispatch(&session, cmd, &params, i64::MAX).await {
-                Ok(_) => done("Done"),
-                Err(error) => failed(&error),
-            }
-        }
+        "identityDiscover" => done(&discover_and_link_identities(ctx).await),
+        "identityHook" => match run_identity_hook(ctx, arg).await {
+            Ok(()) => done("Done"),
+            Err(error) => failed(&error),
+        },
         // Drop the on-disk resolve cache, the display-name bindings, and the
         // chain layer's in-memory caches, so the next visit to any `.epix`
         // name re-resolves on chain (e.g. after a name is moved to a new
@@ -1784,6 +1750,44 @@ async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
         }
         _ => Redirect::to("/Config").into_response(),
     }
+}
+
+/// `identityDiscover`: link every active name the chain lists for an address
+/// this node holds but has not linked yet. Returns the flash message.
+async fn discover_and_link_identities(ctx: &Ctx) -> String {
+    let found = ctx.state.identity_discover(&[]).await;
+    let mut linked = 0;
+    for candidate in found.iter().filter(|d| !d.held_locally && d.active) {
+        let result = ctx
+            .state
+            .identity_link_complete(&candidate.auth_address, Some(&candidate.name), None)
+            .await;
+        if result.is_ok_and(|r| r.get("xid").is_some()) {
+            linked += 1;
+        }
+    }
+    match linked {
+        0 => "No new identities found".to_string(),
+        1 => "Linked 1 identity".to_string(),
+        n => format!("Linked {n} identities"),
+    }
+}
+
+/// A status provider's action: `identityHook:<cmd>:<base64url params>`, run
+/// as the node itself (the page is already behind the CSRF token).
+async fn run_identity_hook(ctx: &Ctx, arg: &str) -> Result<(), String> {
+    use base64::Engine as _;
+    let (cmd, params_b64) = arg.split_once(':').unwrap_or((arg, ""));
+    let params = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(params_b64)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .unwrap_or_else(|| json!([]));
+    if cmd.is_empty() || !ctx.registry.has(cmd) {
+        return Err("Unknown action".to_string());
+    }
+    let session = WsSession::new_trusted(ctx.state.clone(), None);
+    ctx.registry.dispatch(&session, cmd, &params, i64::MAX).await.map(|_| ())
 }
 
 /// Persist the submitted settings and redirect back, carrying any `data_dir`
@@ -1888,13 +1892,15 @@ async fn serve_config_page(
         [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
         render_config_page(
             &values,
-            &identities,
-            &pending,
-            can_restart,
-            flash,
-            &homepage,
-            &theme,
-            ctx.state.ui_csrf_token(),
+            ConfigPageView {
+                identities: &identities,
+                pending: &pending,
+                can_restart,
+                flash,
+                homepage: &homepage,
+                theme: &theme,
+                csrf: ctx.state.ui_csrf_token(),
+            },
         ),
     )
         .into_response()
@@ -1992,6 +1998,17 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
 
 /// Render the settings page, styled like EpixNet's Config page: settings are
 /// grouped into sections (Web Interface / Network / Performance / Epix Chain
+/// Everything the settings page shows besides the config rows themselves.
+struct ConfigPageView<'a> {
+    identities: &'a [Value],
+    pending: &'a [String],
+    can_restart: bool,
+    flash: Option<(bool, String)>,
+    homepage: &'a str,
+    theme: &'a str,
+    csrf: &'a str,
+}
+
 /// Config) with a widget per config kind. Keys whose backend isn't built yet
 /// (Tor, tracker proxy) render disabled with a "coming soon" note.
 ///
@@ -2002,14 +2019,9 @@ async fn serve_stats_page(State(ctx): State<Ctx>) -> Response {
 /// offers the restart when a restart-only key is pending.
 fn render_config_page(
     values: &[(&str, &str, &str, String, String, &str)],
-    identities: &[Value],
-    pending: &[String],
-    can_restart: bool,
-    flash: Option<(bool, String)>,
-    homepage: &str,
-    theme: &str,
-    csrf: &str,
+    view: ConfigPageView<'_>,
 ) -> String {
+    let ConfigPageView { identities, pending, can_restart, flash, homepage, theme, csrf } = view;
     let esc = |s: &str| {
         s.replace('&', "&amp;")
             .replace('<', "&lt;")
@@ -2227,14 +2239,6 @@ fn render_config_page(
 /// action button on the page (see the `button:` branch above), with the row's
 /// address carried in the `action` value.
 fn render_identities_item(label: &str, identities: &[Value]) -> String {
-    use base64::Engine as _;
-    let esc = |s: &str| {
-        s.replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-            .replace('\'', "&#39;")
-    };
     let description = "Browsing needs no identity; posting needs one. The default applies \
                        to every xite that has not chosen its own. Xites pick a different \
                        identity from their account menu.";
@@ -2246,83 +2250,16 @@ fn render_identities_item(label: &str, identities: &[Value]) -> String {
                <div class='value'><p class='identities-empty'>No identities linked yet. \
                Link one below, or from any xite's account menu.</p></div>\
              </div>",
-            label = esc(label),
+            label = attr_escape(label),
         );
     }
-    // One column per status provider seen on any row, in stable order.
-    let mut providers: Vec<String> = Vec::new();
-    for row in identities {
-        if let Some(status) = row["status"].as_object() {
-            for name in status.keys() {
-                if !providers.contains(name) {
-                    providers.push(name.clone());
-                }
-            }
-        }
-    }
-    providers.sort();
+    let providers = identity_status_providers(identities);
     let mut head = String::from("<th>xID</th><th>Address</th>");
     for name in &providers {
-        head.push_str(&format!("<th>{}</th>", esc(name)));
+        head.push_str(&format!("<th>{}</th>", attr_escape(name)));
     }
     head.push_str("<th></th>");
-    let mut body = String::new();
-    for row in identities {
-        let xid = row["xid"].as_str().unwrap_or("");
-        let addr = row["auth_address"].as_str().unwrap_or("");
-        let is_default = row["default"] == true;
-        let default_pill = if is_default { " <span class='pill'>default</span>" } else { "" };
-        let mut cells = format!(
-            "<td><b>{xid}</b>{default_pill}</td><td class='mono'>{addr}</td>",
-            xid = esc(xid),
-            addr = esc(addr),
-        );
-        for name in &providers {
-            let status = &row["status"][name.as_str()];
-            let summary = status["summary"].as_str().unwrap_or("");
-            let detail = status["detail"].as_str().unwrap_or("");
-            let mut cell = format!("<span class='status status-{}'>{}</span>",
-                esc(status["state"].as_str().unwrap_or("")), esc(summary));
-            if !detail.is_empty() {
-                cell.push_str(&format!("<div class='detail'>{}</div>", esc(detail)));
-            }
-            if let Some(actions) = status["actions"].as_array() {
-                for action in actions {
-                    let (Some(cmd), Some(text)) =
-                        (action["cmd"].as_str(), action["label"].as_str())
-                    else {
-                        continue;
-                    };
-                    let params = base64::engine::general_purpose::URL_SAFE_NO_PAD
-                        .encode(action["params"].to_string());
-                    cell.push_str(&format!(
-                        "<button class='button button-small' type='submit' name='action' \
-                         value='identityHook:{cmd}:{params}'>{text}</button>",
-                        cmd = esc(cmd),
-                        text = esc(text),
-                    ));
-                }
-            }
-            cells.push_str(&format!("<td>{cell}</td>"));
-        }
-        let mut actions = String::new();
-        if !is_default {
-            actions.push_str(&format!(
-                "<button class='button button-small' type='submit' name='action' \
-                 value='identityDefault:{addr}'>Make default</button>",
-                addr = esc(addr),
-            ));
-        }
-        actions.push_str(&format!(
-            "<button class='button button-small button-danger' type='submit' name='action' \
-             value='identityRemove:{addr}' data-confirm='Remove {xid} from this node? Its key \
-             stays in users.json and content it already published stays valid.'>Remove</button>",
-            addr = esc(addr),
-            xid = esc(xid),
-        ));
-        cells.push_str(&format!("<td class='actions'>{actions}</td>"));
-        body.push_str(&format!("<tr>{cells}</tr>"));
-    }
+    let body: String = identities.iter().map(|row| render_identity_row(row, &providers)).collect();
     format!(
         "<div class='config-item identities-item'>\
            <div class='title'><h3>{label}</h3>\
@@ -2330,8 +2267,101 @@ fn render_identities_item(label: &str, identities: &[Value]) -> String {
            <div class='value'><table class='identities'>\
              <thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>\
          </div>",
-        label = esc(label),
+        label = attr_escape(label),
     )
+}
+
+/// HTML-escape text for element content or a single-quoted attribute.
+fn attr_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+/// One column per status provider seen on any row, in stable order.
+fn identity_status_providers(identities: &[Value]) -> Vec<String> {
+    let mut providers: Vec<String> = Vec::new();
+    for row in identities {
+        let Some(status) = row["status"].as_object() else { continue };
+        for name in status.keys() {
+            if !providers.contains(name) {
+                providers.push(name.clone());
+            }
+        }
+    }
+    providers.sort();
+    providers
+}
+
+/// One identity's table row: name and address, a cell per status provider,
+/// and the row actions.
+fn render_identity_row(row: &Value, providers: &[String]) -> String {
+    let xid = row["xid"].as_str().unwrap_or("");
+    let addr = row["auth_address"].as_str().unwrap_or("");
+    let is_default = row["default"] == true;
+    let default_pill = if is_default { " <span class='pill'>default</span>" } else { "" };
+    let mut cells = format!(
+        "<td><b>{xid}</b>{default_pill}</td><td class='mono'>{addr}</td>",
+        xid = attr_escape(xid),
+        addr = attr_escape(addr),
+    );
+    for name in providers {
+        cells.push_str(&format!("<td>{}</td>", render_identity_status_cell(&row["status"][name.as_str()])));
+    }
+    cells.push_str(&format!("<td class='actions'>{}</td>", render_identity_row_actions(xid, addr, is_default)));
+    format!("<tr>{cells}</tr>")
+}
+
+/// A provider's status for one identity: state, summary, detail, and its
+/// action buttons (`identityHook:<cmd>:<base64url params>`).
+fn render_identity_status_cell(status: &Value) -> String {
+    use base64::Engine as _;
+    let summary = status["summary"].as_str().unwrap_or("");
+    let detail = status["detail"].as_str().unwrap_or("");
+    let mut cell = format!(
+        "<span class='status status-{}'>{}</span>",
+        attr_escape(status["state"].as_str().unwrap_or("")),
+        attr_escape(summary)
+    );
+    if !detail.is_empty() {
+        cell.push_str(&format!("<div class='detail'>{}</div>", attr_escape(detail)));
+    }
+    for action in status["actions"].as_array().into_iter().flatten() {
+        let (Some(cmd), Some(text)) = (action["cmd"].as_str(), action["label"].as_str()) else {
+            continue;
+        };
+        let params =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(action["params"].to_string());
+        cell.push_str(&format!(
+            "<button class='button button-small' type='submit' name='action' \
+             value='identityHook:{cmd}:{params}'>{text}</button>",
+            cmd = attr_escape(cmd),
+            text = attr_escape(text),
+        ));
+    }
+    cell
+}
+
+/// "Make default" (unless it already is) and "Remove" for one identity.
+fn render_identity_row_actions(xid: &str, addr: &str, is_default: bool) -> String {
+    let mut actions = String::new();
+    if !is_default {
+        actions.push_str(&format!(
+            "<button class='button button-small' type='submit' name='action' \
+             value='identityDefault:{addr}'>Make default</button>",
+            addr = attr_escape(addr),
+        ));
+    }
+    actions.push_str(&format!(
+        "<button class='button button-small button-danger' type='submit' name='action' \
+         value='identityRemove:{addr}' data-confirm='Remove {xid} from this node? Its key \
+         stays in users.json and content it already published stays valid.'>Remove</button>",
+        addr = attr_escape(addr),
+        xid = attr_escape(xid),
+    ));
+    actions
 }
 
 /// Client script for the settings page: track edits against each row's saved
