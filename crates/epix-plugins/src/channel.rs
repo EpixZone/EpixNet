@@ -1539,6 +1539,40 @@ async fn run_channel_indexer(
     }
 }
 
+/// The hub this node uses, from the persisted `channel_xite`. Unset or blank
+/// means the xID xite. A value naming Epix Mail is the first cutover's
+/// Phase 0 setting (Mail hosted the pool then); channels have since moved to
+/// the xID xite and Mail's content.json declares no pool any more, so a node
+/// that kept the setting would wait for a hub that never comes. It is treated
+/// as blank; the second value says the persisted setting should be cleared so
+/// the Config page shows what the node actually uses.
+fn migrate_hub_xite(value: Option<Value>) -> (String, bool) {
+    let configured = value
+        .and_then(|v| v.as_str().map(str::trim).map(String::from))
+        .filter(|s| !s.is_empty());
+    match configured {
+        Some(x) if x == EPIX_MAIL_XITE => (DEFAULT_CHANNEL_XITE.to_string(), true),
+        Some(x) => (x, false),
+        None => (DEFAULT_CHANNEL_XITE.to_string(), false),
+    }
+}
+
+async fn resolve_hub_xite(state: &Arc<AppState>) -> String {
+    let (xite, clear_stale) = migrate_hub_xite(state.config_get("channel_xite").await);
+    if clear_stale {
+        state
+            .log(
+                "INFO",
+                format!(
+                    "channels: channel_xite named Epix Mail, the pre-cutover pool host; channels moved to the xID xite {xite}, using it and clearing the setting"
+                ),
+            )
+            .await;
+        state.config_set("channel_xite", Value::Null).await;
+    }
+    xite
+}
+
 /// The configured legacy pool xites (`channel_legacy_xites`, one per line or
 /// comma-separated), minus the hub itself. Unset = Epix Mail's old pool.
 fn configured_legacy_xites(value: Option<Value>, hub: &str) -> Vec<String> {
@@ -1571,8 +1605,24 @@ async fn ensure_hub(state: &Arc<AppState>, ms: &ChannelState) {
     let hub = ms.xite.clone();
     let mut attempt = 0u32;
     loop {
-        if state.has_xite(&hub).await && !state.pool_rules_for(&hub).await.is_empty() {
-            break;
+        if state.has_xite(&hub).await {
+            if !state.pool_rules_for(&hub).await.is_empty() {
+                break;
+            }
+            // Served and complete but without a pool descriptor: nothing the
+            // node can fetch will change that, so say why channels are stuck
+            // instead of waiting silently (the on-demand path below returns
+            // without a word for a complete xite).
+            if attempt % 10 == 0 && state.xite_core_complete(&hub).await {
+                state
+                    .log(
+                        "WARNING",
+                        format!(
+                            "channels: hub xite {hub} is served locally but its content.json declares no pool; waiting for the hub owner to publish one"
+                        ),
+                    )
+                    .await;
+            }
         }
         if state.has_on_demand().await {
             let added = state.ensure_xite(&hub).await;
@@ -1601,13 +1651,7 @@ async fn run_channel_plugin(state: Arc<AppState>) {
     if !state.config_bool("channel_enabled", true).await {
         return;
     }
-    // Unset/blank falls back to the hub (the xID xite).
-    let xite = state
-        .config_get("channel_xite")
-        .await
-        .and_then(|v| v.as_str().map(str::trim).map(String::from))
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| DEFAULT_CHANNEL_XITE.to_string());
+    let xite = resolve_hub_xite(&state).await;
     let legacy_xites = configured_legacy_xites(state.config_get("channel_legacy_xites").await, &xite);
     let Some(engine) = build_engine(&state).await else { return };
     let Some(db) = open_db(&state).await else {
@@ -3698,8 +3742,23 @@ mod multi_device_tests {
 
 #[cfg(test)]
 mod legacy_pool_config_tests {
-    use super::{configured_legacy_xites, EPIX_MAIL_XITE};
+    use super::{configured_legacy_xites, migrate_hub_xite, DEFAULT_CHANNEL_XITE, EPIX_MAIL_XITE};
     use serde_json::json;
+
+    /// A node upgraded from the first cutover, where `channel_xite` pointed at
+    /// Mail, must land on the xID hub and clear the stale setting; any other
+    /// explicit hub (test networks) is kept as is.
+    #[test]
+    fn stale_mail_hub_setting_migrates_to_the_xid_xite() {
+        assert_eq!(migrate_hub_xite(None), (DEFAULT_CHANNEL_XITE.to_string(), false));
+        assert_eq!(migrate_hub_xite(Some(json!("  "))), (DEFAULT_CHANNEL_XITE.to_string(), false));
+        assert_eq!(
+            migrate_hub_xite(Some(json!(format!(" {EPIX_MAIL_XITE} ")))),
+            (DEFAULT_CHANNEL_XITE.to_string(), true)
+        );
+        assert_eq!(migrate_hub_xite(Some(json!("epix1testhub"))), ("epix1testhub".to_string(), false));
+        assert_eq!(migrate_hub_xite(Some(json!(42))), (DEFAULT_CHANNEL_XITE.to_string(), false));
+    }
 
     #[test]
     fn legacy_pools_parse_lines_commas_and_skip_the_hub() {
