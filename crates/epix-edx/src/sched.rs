@@ -2537,7 +2537,11 @@ mod tests {
         ];
 
         let swarm = Swarm::new(store.clone(), id, size);
-        let deadline = Deadline { ms: 0, max_wait: Duration::from_millis(600) };
+        // Real clock, so the budget must absorb a loaded CI runner: the stall
+        // window is a share of it (PRIMARY_BUDGET_DIVISOR) and the duplicate
+        // has to answer in what remains. 600 ms flaked on CI with the
+        // duplicate issued too late to win; locally the test takes ~0.35 s.
+        let deadline = Deadline { ms: 0, max_wait: Duration::from_secs(3) };
         let groups = swarm.groups_of(&(0..size));
         let charge = peers[0].conn.charge_fetch(size);
         let roster = Roster::new(peers);

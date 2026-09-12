@@ -206,7 +206,7 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     let target = epix_node::parse_target(raw_arg);
 
     let data_root = epix_node::data_root();
-    if let Err(e) = std::fs::create_dir_all(&data_root) {
+    if let Err(e) = tokio::fs::create_dir_all(&data_root).await {
         eprintln!("cannot create data dir {}: {e}", data_root.display());
         std::process::exit(1);
     }
