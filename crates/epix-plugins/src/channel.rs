@@ -1543,20 +1543,84 @@ fn spawn_channel_outbox_worker(state: Arc<AppState>, ms: Arc<ChannelState>) {
     });
 }
 
-fn spawn_channel_backfill(state: Arc<AppState>, xite: String, weeks: u64) {
+/// Weeks of pool history a boot should fetch: the configured depth, or
+/// everything since the last sweep peers answered, whichever reaches further
+/// back. A node away for a year must not stop at the configured few weeks
+/// and leave eleven months of mail unread on the network. `0` (all) stays
+/// all; with no recorded sync (first boot) the configured depth applies.
+/// The last-sync week itself and the one before are refetched too: a record
+/// sent in those weeks may have reached peers after this node went away.
+pub(crate) fn backfill_weeks(configured: u64, last_sync_ms: Option<i64>, now_ms: i64) -> u64 {
+    if configured == 0 {
+        return 0;
+    }
+    let Some(last) = last_sync_ms else { return configured };
+    let cur_week = epix_content::pool::week_of(epix_content::pool::epoch_now(now_ms));
+    let last_week = epix_content::pool::week_of(epix_content::pool::epoch_now(last));
+    let since = (cur_week - last_week).max(0) as u64 + 2;
+    configured.max(since)
+}
+
+fn spawn_channel_backfill(state: Arc<AppState>, ms: Arc<ChannelState>, xite: String, configured: u64) {
     tokio::spawn(async move {
-        state.backfill_pool_shards(&xite, weeks).await;
+        let last = ms.db.pool_last_sync_ms(&xite).ok().flatten();
+        let weeks = backfill_weeks(configured, last, now_ms());
+        if weeks != configured {
+            state
+                .log(
+                    "INFO",
+                    format!(
+                        "channels: {xite}: peers last answered a pool sync {} day(s) ago; backfilling {weeks} week(s) of history (configured: {configured})",
+                        last.map(|l| (now_ms() - l).max(0) / 86_400_000).unwrap_or(0)
+                    ),
+                )
+                .await;
+        }
+        // A boot's peer table is often empty for the first minute (Tor still
+        // bootstrapping, discovery cold), and one silent attempt would leave
+        // the history unfetched until the next restart. Retry with backoff
+        // until some peer serves a shard; give up after a bounded number of
+        // passes so an empty pool on a quiet network does not poll forever.
+        for attempt in 0..BACKFILL_ATTEMPTS {
+            if state.backfill_pool_shards(&xite, weeks).await {
+                let _ = ms.db.set_pool_last_sync_ms(&xite, now_ms());
+                return;
+            }
+            tokio::time::sleep(backfill_retry_delay(attempt)).await;
+        }
+        state
+            .log(
+                "INFO",
+                format!(
+                    "channels: {xite}: no peer served any pool shard in {BACKFILL_ATTEMPTS} backfill passes; the periodic sweep continues"
+                ),
+            )
+            .await;
     });
 }
 
-fn spawn_channel_sweep(state: Arc<AppState>, xite: String) {
+/// Boot backfill passes before giving up: 15 s doubling to the 5 minute cap,
+/// about an hour in total (465 s of ramp plus eleven capped waits).
+const BACKFILL_ATTEMPTS: u32 = 16;
+
+/// Delay before backfill pass `attempt + 1`: 15 s doubling to a 5 minute cap.
+fn backfill_retry_delay(attempt: u32) -> std::time::Duration {
+    std::time::Duration::from_secs((15u64 << attempt.min(5)).min(300))
+}
+
+fn spawn_channel_sweep(state: Arc<AppState>, ms: Arc<ChannelState>, xite: String) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(SWEEP_INTERVAL).await;
             if !state.config_bool("channel_enabled", true).await {
                 continue;
             }
-            state.resync_pool_shards_for(&xite).await;
+            // Only a pass some peer answered counts as a sync: a mute pass
+            // (nothing served) must not advance the mark, or the next boot
+            // would skip the weeks this node was effectively offline.
+            if state.resync_pool_shards_for(&xite).await {
+                let _ = ms.db.set_pool_last_sync_ms(&xite, now_ms());
+            }
         }
     });
 }
@@ -1764,8 +1828,8 @@ async fn run_channel_plugin(state: Arc<AppState>) {
         .and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())))
         .unwrap_or(4);
     for pool in ms.pool_xites() {
-        spawn_channel_backfill(state.clone(), pool.clone(), weeks);
-        spawn_channel_sweep(state.clone(), pool);
+        spawn_channel_backfill(state.clone(), ms.clone(), pool.clone(), weeks);
+        spawn_channel_sweep(state.clone(), ms.clone(), pool);
     }
     run_channel_indexer(&state, &ms, rx).await;
 }
@@ -3860,6 +3924,37 @@ mod client_xite_tests {
         assert_eq!(client_xite_for_app(&clients, Some("mail")), EPIX_MAIL_XITE);
         assert_eq!(client_xite_for_app(&clients, Some("forum")), EPIX_MAIL_XITE);
         assert_eq!(client_xite_for_app(&clients, None), EPIX_MAIL_XITE);
+    }
+}
+
+#[cfg(test)]
+mod backfill_weeks_tests {
+    use super::backfill_weeks;
+
+    const WEEK_MS: i64 = 7 * 86_400_000;
+
+    /// A boot fetches the configured depth, or everything since peers last
+    /// answered a sync when that is further back; "all" stays all.
+    #[test]
+    fn a_long_absence_widens_the_backfill_past_the_configured_weeks() {
+        let now = 1_800_000_000_000i64;
+        assert_eq!(backfill_weeks(4, None, now), 4, "first boot: configured depth");
+        assert_eq!(backfill_weeks(0, Some(now - 52 * WEEK_MS), now), 0, "all stays all");
+        assert_eq!(backfill_weeks(4, Some(now), now), 4, "synced this week: configured wins");
+        assert_eq!(backfill_weeks(4, Some(now - WEEK_MS), now), 4, "last week: still within 4");
+        assert_eq!(backfill_weeks(4, Some(now - 10 * WEEK_MS), now), 12, "ten weeks away: 10 + 2 margin");
+        assert_eq!(backfill_weeks(4, Some(now - 52 * WEEK_MS), now), 54, "a year away");
+        assert_eq!(backfill_weeks(4, Some(now + WEEK_MS), now), 4, "a future stamp (clock skew) is ignored");
+    }
+
+    /// The boot backfill retries while no peer answers: 15 s doubling to a
+    /// 5 minute cap, a bounded number of times.
+    #[test]
+    fn backfill_retry_backs_off_to_a_cap() {
+        let secs: Vec<u64> = (0..super::BACKFILL_ATTEMPTS).map(|a| super::backfill_retry_delay(a).as_secs()).collect();
+        assert_eq!(&secs[..6], &[15, 30, 60, 120, 240, 300]);
+        assert!(secs.iter().all(|&s| s <= 300));
+        assert!(secs.iter().sum::<u64>() >= 3_600, "gives the peer table about an hour");
     }
 }
 
