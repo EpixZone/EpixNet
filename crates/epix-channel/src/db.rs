@@ -2461,6 +2461,34 @@ impl ChannelDb {
         self.decrypt_rows(rows, &["subject", "snippet"])
     }
 
+    /// The identity's own outbound messages across every conversation, newest
+    /// first, each joined with its thread's members and peer so a "Sent" view
+    /// can render flat per-message rows. `app` narrows to one client app.
+    pub fn sent_messages_in_app(
+        &self,
+        identity_id: i64,
+        app: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let app_filter = if app.is_some() { " AND t.app=?" } else { "" };
+        let sql = format!(
+            "SELECT m.msg_id, m.conv_id, m.subject, m.body, m.sent_ms, m.enc,
+                    t.members, t.peer_xid, t.app
+             FROM msg m JOIN thread t ON t.thread_id = m.thread_id
+             WHERE m.identity_id=? AND m.dir='out'{app_filter}
+             ORDER BY m.sent_ms DESC, m.msg_id DESC LIMIT ? OFFSET ?"
+        );
+        let mut params = vec![Value::from(identity_id)];
+        if let Some(app) = app {
+            params.push(Value::from(app));
+        }
+        params.push(Value::from(limit));
+        params.push(Value::from(offset));
+        let rows = self.db.query(&sql, &params)?;
+        self.decrypt_rows(rows, &["subject", "body"])
+    }
+
     /// Messages of a conversation, oldest first.
     pub fn messages(&self, identity_id: i64, conv_id: &str) -> Result<Vec<Value>> {
         let rows = self.db.query(
@@ -2807,6 +2835,33 @@ mod tests {
             author_private_key: epix_crypt::new_seed(),
             rln: None,
         }
+    }
+
+    /// The Sent view lists the identity's own outbound messages, newest first,
+    /// with the thread's members, and honours the app scope.
+    #[test]
+    fn sent_messages_list_my_outbound_rows_newest_first() {
+        let d = db();
+        let idn = d.upsert_identity("a.epix", "epix1a", 0, None).unwrap();
+        let other = d.upsert_identity("z.epix", "epix1z", 0, None).unwrap();
+        let members = vec!["a.epix".to_string(), "b.epix".to_string()];
+        d.insert_sent(idn, "cv1", Some("b.epix"), &members, "a.epix", "first", "body1", 10).unwrap();
+        d.insert_sent(idn, "cv1", Some("b.epix"), &members, "a.epix", "second", "body2", 20).unwrap();
+        d.insert_sent(idn, "cv2", Some("c.epix"), &[], "a.epix", "to c", "body3", 15).unwrap();
+        d.insert_sent(other, "cvz", Some("b.epix"), &[], "z.epix", "not mine", "x", 30).unwrap();
+
+        let rows = d.sent_messages_in_app(idn, None, 0, 10).unwrap();
+        let subjects: Vec<&str> = rows.iter().map(|r| r["subject"].as_str().unwrap()).collect();
+        assert_eq!(subjects, ["second", "to c", "first"]);
+        assert_eq!(rows[0]["conv_id"], "cv1");
+        assert_eq!(rows[0]["peer_xid"], "b.epix");
+        assert_eq!(rows[0]["body"], "body2");
+        assert!(rows[0]["members"].as_str().unwrap().contains("b.epix"));
+        assert_eq!(rows[1]["peer_xid"], "c.epix");
+
+        assert_eq!(d.sent_messages_in_app(idn, Some("mail"), 0, 10).unwrap().len(), 3);
+        assert!(d.sent_messages_in_app(idn, Some("talk"), 0, 10).unwrap().is_empty());
+        assert_eq!(d.sent_messages_in_app(idn, None, 1, 1).unwrap()[0]["subject"], "to c");
     }
 
     #[test]

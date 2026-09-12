@@ -261,9 +261,39 @@ fn hash_entry(
     json!({ "size": bytes.len(), "sha512": sha512, "b3": b3 })
 }
 
+/// Paths a sign never declares whatever the `ignore` pattern says: dotfiles
+/// (the sign cache, `.git`), the `-old`/`-new` swap files, and SQLite's
+/// runtime companions (`-shm`, `-wal`, `-journal`). The last are per-process
+/// scratch next to a node-built database; declaring them ships a moment of
+/// one node's lock state to every peer and then fails their hash check as
+/// soon as the database is touched again. The `.db` file itself is a
+/// content decision (a xite may ship a static database), so it stays under
+/// `ignore`.
 fn skip_hashing(rel: &str) -> bool {
     let base = rel.rsplit('/').next().unwrap_or(rel);
-    base.starts_with('.') || rel.ends_with("-old") || rel.ends_with("-new")
+    base.starts_with('.')
+        || rel.ends_with("-old")
+        || rel.ends_with("-new")
+        || rel.ends_with("-shm")
+        || rel.ends_with("-wal")
+        || rel.ends_with("-journal")
+}
+
+#[cfg(test)]
+mod skip_hashing_tests {
+    use super::skip_hashing;
+
+    #[test]
+    fn sqlite_runtime_files_are_never_signed() {
+        for path in ["data/users/epixmail.db-shm", "data/users/epixmail.db-wal", "data/x.db-journal"] {
+            assert!(skip_hashing(path), "{path}");
+        }
+        for path in ["data/users/epixmail.db", "img/favicon.png", "data/users/content.json", "walrus.json"] {
+            assert!(!skip_hashing(path), "{path}");
+        }
+        assert!(skip_hashing(".sign-cache.json"));
+        assert!(skip_hashing("content.json-old"));
+    }
 }
 
 /// A content path pattern (`ignore` or `optional`) compiled with EpixNet's

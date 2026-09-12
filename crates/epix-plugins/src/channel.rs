@@ -1433,6 +1433,7 @@ impl Plugin for ChannelPlugin {
             Arc::new(ChannelContacts),
             Arc::new(ChannelSend),
             Arc::new(ChannelThreads),
+            Arc::new(ChannelSent),
             Arc::new(ChannelConversation),
             Arc::new(ChannelSearch),
             Arc::new(ChannelMarkRead),
@@ -3084,6 +3085,33 @@ impl WsCommand for ChannelThreads {
             .threads_in_app(ctx.identity_id, app.as_deref(), folder, offset, limit)
             .map_err(|e| e.to_string())?;
         Ok(json!({ "threads": rows }))
+    }
+}
+
+/// `channelSent([{app?, offset?, limit?}])` - the acting identity's own sent
+/// messages, newest first, as flat per-message rows (`msg_id`, `conv_id`,
+/// `subject`, `body`, `sent_ms`, `members`, `peer_xid`, `app`). Scoped like
+/// `channelThreads`: a `Channels:<app>` client sees only its app.
+struct ChannelSent;
+#[async_trait]
+impl WsCommand for ChannelSent {
+    fn name(&self) -> &'static str {
+        "channelSent"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let Some(ctx) = resolve_identity(s, &ms, p).await? else {
+            return Ok(json!({ "messages": [] }));
+        };
+        let o = p.as_array().and_then(|a| a.first());
+        let offset = o.and_then(|v| v.get("offset")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let limit = o.and_then(|v| v.get("limit")).and_then(|v| v.as_i64()).unwrap_or(50);
+        let app = resolve_app_filter(client_app_scope(s).await, requested_app(o))?;
+        let rows = ms
+            .db
+            .sent_messages_in_app(ctx.identity_id, app.as_deref(), offset, limit)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "messages": rows }))
     }
 }
 
