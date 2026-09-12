@@ -1909,19 +1909,21 @@ impl AppState {
 
     /// Anti-entropy sweep of the current + previous week's shards (mirrors
     /// [`AppState::resync_merge_files_for`], enumerating shard paths from the
-    /// pool descriptor rather than `declared_merge_files`).
-    pub async fn resync_pool_shards_for(self: &Arc<Self>, address: &str) {
+    /// pool descriptor rather than `declared_merge_files`). Returns whether
+    /// some peer served a shard this pass: the caller's evidence that the
+    /// pool was actually synced, as opposed to asked into a void.
+    pub async fn resync_pool_shards_for(self: &Arc<Self>, address: &str) -> bool {
         if !self.is_serving(address).await {
-            return;
+            return false;
         }
         let rules = self.pool_rules_for(address).await;
         if rules.is_empty() {
-            return;
+            return false;
         }
         let cur_week = pool::week_of(pool::epoch_now(now_ms()));
         let candidates = self.fetch_candidate_peers(address, POOL_SWEEP_PEERS).await;
         if candidates.is_empty() {
-            return;
+            return false;
         }
         let started = std::time::Instant::now();
         let total = candidates.len();
@@ -1932,6 +1934,7 @@ impl AppState {
 
         // Reclaim disk: drop shards past the owner-set retention window.
         self.prune_expired_pool_shards(address).await;
+        pass.served > 0
     }
 
     /// The current + previous week's shard paths split into those due for a
@@ -2071,19 +2074,20 @@ impl AppState {
     }
 
     /// Newest-first historical backfill up to `max_weeks` back (0 = all),
-    /// honoring the descriptor's `sync_order`.
-    pub async fn backfill_pool_shards(self: &Arc<Self>, address: &str, max_weeks: u64) {
+    /// honoring the descriptor's `sync_order`. Returns whether some peer
+    /// served a shard.
+    pub async fn backfill_pool_shards(self: &Arc<Self>, address: &str, max_weeks: u64) -> bool {
         if !self.is_serving(address).await {
-            return;
+            return false;
         }
         let rules = self.pool_rules_for(address).await;
         if rules.is_empty() {
-            return;
+            return false;
         }
         let cur_week = pool::week_of(pool::epoch_now(now_ms()));
         let peers = self.fetch_candidate_peers(address, POOL_SWEEP_PEERS).await;
         if peers.is_empty() {
-            return;
+            return false;
         }
         // One dial session for the whole history, like the periodic sweep - a
         // backfill enumerates far more paths, so per-path dialing hurt most
@@ -2106,6 +2110,7 @@ impl AppState {
         }
         let mut pass = SweepPass::new(peers);
         pass.sweep_paths(self, address, paths, false).await;
+        pass.served > 0
     }
 
     /// Read every on-disk shard of `address` and return all records — the source

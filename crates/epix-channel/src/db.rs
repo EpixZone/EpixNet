@@ -183,6 +183,9 @@ CREATE TABLE IF NOT EXISTS shard_cursor (
     records       INTEGER NOT NULL DEFAULT 0,
     sealed        INTEGER NOT NULL DEFAULT 0,
     updated_ms    INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS pool_sync (
+    xite          TEXT PRIMARY KEY NOT NULL,
+    last_ms       INTEGER NOT NULL DEFAULT 0);
 ";
 
 /// A stored identity row.
@@ -2476,6 +2479,28 @@ impl ChannelDb {
         self.decrypt_rows(rows, &["subject", "body"])
     }
 
+    /// When peers last answered a sweep or backfill of `xite`'s pool (ms), if
+    /// ever. A boot uses it to decide how far back to refetch history: a node
+    /// away for months must not stop at the configured few weeks.
+    pub fn pool_last_sync_ms(&self, xite: &str) -> Result<Option<i64>> {
+        let conn = self.db.conn()?;
+        conn.query_row("SELECT last_ms FROM pool_sync WHERE xite=?1", [xite], |row| row.get(0))
+            .optional()
+            .map_err(db_err)
+    }
+
+    /// Record that peers answered a sweep or backfill of `xite`'s pool now.
+    pub fn set_pool_last_sync_ms(&self, xite: &str, ms: i64) -> Result<()> {
+        let conn = self.db.conn()?;
+        conn.execute(
+            "INSERT INTO pool_sync (xite, last_ms) VALUES (?1, ?2)
+             ON CONFLICT(xite) DO UPDATE SET last_ms=excluded.last_ms",
+            rusqlite::params![xite, ms],
+        )
+        .map_err(db_err)?;
+        Ok(())
+    }
+
     /// Messages of a conversation, oldest first.
     pub fn messages(&self, identity_id: i64, conv_id: &str) -> Result<Vec<Value>> {
         let rows = self.db.query(
@@ -2849,6 +2874,18 @@ mod tests {
         assert_eq!(d.sent_messages_in_app(idn, Some("mail"), 0, 10).unwrap().len(), 3);
         assert!(d.sent_messages_in_app(idn, Some("talk"), 0, 10).unwrap().is_empty());
         assert_eq!(d.sent_messages_in_app(idn, None, 1, 1).unwrap()[0]["subject"], "to c");
+    }
+
+    #[test]
+    fn pool_last_sync_is_persisted_per_xite() {
+        let d = db();
+        assert_eq!(d.pool_last_sync_ms("epix1hub").unwrap(), None);
+        d.set_pool_last_sync_ms("epix1hub", 1_000).unwrap();
+        d.set_pool_last_sync_ms("epix1legacy", 5).unwrap();
+        assert_eq!(d.pool_last_sync_ms("epix1hub").unwrap(), Some(1_000));
+        d.set_pool_last_sync_ms("epix1hub", 2_000).unwrap();
+        assert_eq!(d.pool_last_sync_ms("epix1hub").unwrap(), Some(2_000));
+        assert_eq!(d.pool_last_sync_ms("epix1legacy").unwrap(), Some(5));
     }
 
     #[test]

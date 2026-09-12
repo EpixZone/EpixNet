@@ -179,7 +179,7 @@ cutover, one per line; default Epix Mail's old pool, blank once the cutover is
 done), `channel_legacy_mail_xite` (where `messages.json` legacy mail is read
 from; default Epix Mail), `channel_feed_per_identity` (badge unread mail per
 identity on the dashboard; off collapses the badges so a shared screen does not
-show which personas the node holds), `channel_backfill_weeks` (0=all, newest-first),
+show which personas the node holds), `channel_backfill_weeks` (0=all, newest-first; a boot widens it to everything since peers last answered a sync, so a node away for months still gets its mail),
 `channel_send_jitter_max_secs` (default 0 = off; when set, the WHOLE send is
 delayed by a random `0..=max` seconds and detached from the send handler so a
 directly-connected peer can't bind "user pressed send" to the pool write —
