@@ -16,7 +16,7 @@ epix-crypt = { path = "../epix-crypt" }
 epix-edx = { path = "../epix-edx" }
 epix-transport = { path = "../epix-transport" }
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

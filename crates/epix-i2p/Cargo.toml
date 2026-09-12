@@ -16,7 +16,7 @@ yosemite = "0.7"
 # router cross-compiles to Android/iOS. Pinned to a rev for reproducibility.
 emissary-core = { git = "https://github.com/eepnet/emissary", rev = "4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32", optional = true, features = ["events"] }
 emissary-util = { git = "https://github.com/eepnet/emissary", rev = "4495edc6e67eccfa7d4bbb0c7b309febbf2e6a32", optional = true, default-features = false, features = ["tokio", "rustls"] }
-tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "fs"] }
 async-trait = "0.1"
 tracing = "0.1"
 # For the .b32.i2p short address: sha256(destination) then base32.

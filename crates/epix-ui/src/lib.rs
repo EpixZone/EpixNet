@@ -283,11 +283,11 @@ impl UiServer {
         use std::os::unix::fs::PermissionsExt;
         let ctx = self.ctx.clone();
         tokio::spawn(async move {
-            let _ = std::fs::remove_file(&path); // a stale socket from a crash
+            let _ = tokio::fs::remove_file(&path).await; // a stale socket from a crash
             let pointer = path.with_extension("sock.path");
             let (listener, path) = match tokio::net::UnixListener::bind(&path) {
                 Ok(l) => {
-                    let _ = std::fs::remove_file(&pointer);
+                    let _ = tokio::fs::remove_file(&pointer).await;
                     (l, path)
                 }
                 Err(e) => {
@@ -305,7 +305,6 @@ impl UiServer {
                     // set_permissions on a directory another user owns fails,
                     // so a squatted path is refused instead of bound next to.
                     use std::hash::{Hash, Hasher};
-                    use std::os::unix::fs::DirBuilderExt;
                     let base = std::env::var_os("XDG_RUNTIME_DIR")
                         .map(std::path::PathBuf::from)
                         .or_else(|| {
@@ -326,14 +325,15 @@ impl UiServer {
                     let mut h = std::collections::hash_map::DefaultHasher::new();
                     path.hash(&mut h);
                     let dir = base.join(format!("epix-admin-{:016x}", h.finish()));
-                    let _ = std::fs::create_dir_all(&base);
-                    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
-                    let meta = std::fs::symlink_metadata(&dir);
+                    let _ = tokio::fs::create_dir_all(&base).await;
+                    let _ = tokio::fs::DirBuilder::new().mode(0o700).create(&dir).await;
+                    let meta = tokio::fs::symlink_metadata(&dir).await;
                     let owned = meta.map(|m| m.is_dir()).unwrap_or(false)
-                        && std::fs::set_permissions(
+                        && tokio::fs::set_permissions(
                             &dir,
                             std::fs::Permissions::from_mode(0o700),
                         )
+                        .await
                         .is_ok();
                     if !owned {
                         ctx.state
@@ -347,10 +347,10 @@ impl UiServer {
                         return;
                     }
                     let fb = dir.join("admin.sock");
-                    let _ = std::fs::remove_file(&fb);
+                    let _ = tokio::fs::remove_file(&fb).await;
                     match tokio::net::UnixListener::bind(&fb) {
                         Ok(l) => {
-                            let _ = std::fs::write(&pointer, fb.to_string_lossy().as_bytes());
+                            let _ = tokio::fs::write(&pointer, fb.to_string_lossy().as_bytes()).await;
                             ctx.state
                                 .log(
                                     "INFO",
@@ -374,7 +374,7 @@ impl UiServer {
                     }
                 }
             };
-            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+            let _ = tokio::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).await;
             ctx.state.log("INFO", format!("Admin socket at {}", path.display())).await;
             loop {
                 match listener.accept().await {

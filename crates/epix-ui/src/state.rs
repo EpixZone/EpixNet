@@ -2183,7 +2183,7 @@ async fn verified_parent_still_authorizes(
                     plan.governing
                 ));
             };
-            let bytes = std::fs::read(&plan.old_manifest_backup).map_err(|error| {
+            let bytes = tokio::fs::read(&plan.old_manifest_backup).await.map_err(|error| {
                 format!(
                     "could not read old child manifest {}: {error}",
                     plan.old_manifest_backup.display()
@@ -2233,7 +2233,7 @@ async fn verified_parent_still_authorizes(
             let bytes = if checking_old {
                 if let Some(file) = plan.files.iter().find(|file| file.inner_path == inner_path) {
                     if recovery_path_exists(&file.backup_path)? {
-                        std::fs::read(&file.backup_path).map_err(|error| error.to_string())?
+                        tokio::fs::read(&file.backup_path).await.map_err(|error| error.to_string())?
                     } else if storage.verify(&inner_path, expected) {
                         storage.read(&inner_path).map_err(|error| error.to_string())?
                     } else {
@@ -6984,13 +6984,14 @@ impl AppState {
         let finality_required = epix_chain::verify_finality_enabled();
         // Entries are `{"address": …, "resolved_at": …, "finality_height": …,
         // "finality_digest": …}`, an older unbound object, or a legacy string.
-        let entry: Option<Value> = self.data_root.as_ref().and_then(|root| {
-            let cache: serde_json::Map<String, Value> =
-                std::fs::read(root.join("resolve-cache.json"))
-                    .ok()
-                    .and_then(|b| serde_json::from_slice(&b).ok())?;
-            cache.get(name).cloned()
-        });
+        let entry: Option<Value> = match self.data_root.as_ref() {
+            Some(root) => tokio::fs::read(root.join("resolve-cache.json"))
+                .await
+                .ok()
+                .and_then(|b| serde_json::from_slice::<serde_json::Map<String, Value>>(&b).ok())
+                .and_then(|cache| cache.get(name).cloned()),
+            None => None,
+        };
         let xites = self.xites.read().await;
         let served = xites
             .iter()
@@ -7056,7 +7057,7 @@ impl AppState {
         // signer receipt while the chain caches are being cleared.
         self.bump_db_filter_epoch();
         if let Some(root) = &self.data_root {
-            let _ = std::fs::remove_file(root.join("resolve-cache.json"));
+            let _ = tokio::fs::remove_file(root.join("resolve-cache.json")).await;
         }
         {
             let mut xites = self.xites.write().await;
@@ -7436,7 +7437,7 @@ impl AppState {
         &self,
         path: &std::path::Path,
     ) -> Option<serde_json::Map<String, Value>> {
-        match std::fs::read(path) {
+        match tokio::fs::read(path).await {
             Ok(bytes) => match serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes) {
                 Ok(map) => Some(map),
                 Err(error) => {
@@ -7779,12 +7780,19 @@ impl AppState {
         // until the next post arrives): take the newest content.json
         // anywhere in the tree, once, at restore. New arrivals keep it
         // fresh incrementally from here.
-        let newest = walk_content_json(&dir)
-            .into_iter()
-            .filter_map(|p| std::fs::read(dir.join(&p)).ok())
-            .filter_map(|b| serde_json::from_slice::<Value>(&b).ok())
-            .filter_map(|c| c.get("modified").and_then(|v| v.as_f64()))
-            .fold(0.0_f64, f64::max);
+        let newest = {
+            let dir = dir.to_path_buf();
+            tokio::task::spawn_blocking(move || {
+                walk_content_json(&dir)
+                    .into_iter()
+                    .filter_map(|p| std::fs::read(dir.join(&p)).ok())
+                    .filter_map(|b| serde_json::from_slice::<Value>(&b).ok())
+                    .filter_map(|c| c.get("modified").and_then(|v| v.as_f64()))
+                    .fold(0.0_f64, f64::max)
+            })
+            .await
+            .unwrap_or(0.0)
+        };
         self.bump_modified(canonical, newest).await;
         // The `.epix` name is display metadata, not a second serving key.
         if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
@@ -8576,7 +8584,8 @@ impl AppState {
         // simply skipped, so every restart wiped its peer list and it could
         // never accumulate one - leaving a stream to whichever single peer it
         // happened to rediscover.
-        let mut map: serde_json::Map<String, Value> = std::fs::read(path)
+        let mut map: serde_json::Map<String, Value> = tokio::fs::read(path)
+            .await
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default();
@@ -9574,7 +9583,13 @@ impl AppState {
     /// addresses that imported cleanly.
     pub async fn import_bundle(self: &Arc<Self>, bundle: &std::path::Path,
     ) -> Result<Vec<String>, String> {
-        let file = std::fs::File::open(bundle).map_err(|e| e.to_string())?;
+        let file = {
+            let bundle = bundle.to_path_buf();
+            tokio::task::spawn_blocking(move || std::fs::File::open(bundle))
+                .await
+                .map_err(|e| e.to_string())?
+                .map_err(|e| e.to_string())?
+        };
         let mut zip = zip::ZipArchive::new(file).map_err(|e| e.to_string())?;
         let root = self.data_root_path().ok_or("No data root")?.join("data");
         let activation = self.xite_activation_gate.clone().read_owned().await;
@@ -17625,7 +17640,7 @@ impl AppState {
     pub async fn browser_settings(&self) -> (bool, bool) {
         let Some(root) = &self.data_root else { return (false, true);
         };
-        match std::fs::read(root.join("browser-settings.json")) {
+        match tokio::fs::read(root.join("browser-settings.json")).await {
             Ok(bytes) => {
                 let v: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
                 let tor_clearnet =
@@ -28567,11 +28582,11 @@ impl AppState {
         let mut out = Vec::new();
         let mut stack = vec![start.clone()];
         while let Some(dir) = stack.pop() {
-            let Ok(entries) = std::fs::read_dir(&dir) else { continue;
-            };
-            for entry in entries.flatten() {
+            let Ok(mut entries) = tokio::fs::read_dir(&dir).await else { continue };
+            while let Ok(Some(entry)) = entries.next_entry().await {
                 let path = entry.path();
-                if path.is_dir() {
+                let is_dir = entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                if is_dir {
                     stack.push(path);
                 } else if let Ok(rel) = path.strip_prefix(&start) {
                     // Relative to the REQUESTED dir, not the xite root:
@@ -30331,12 +30346,10 @@ impl AppState {
         // missing would re-plan it forever.
         for f in declared_files_under(&storage, Some(&content), "files") {
             let size = f.size.max(0) as u64;
-            let at_size = storage
-                .path(&f.inner_path)
-                .ok()
-                .and_then(|p| std::fs::metadata(p).ok())
-                .map(|m| m.len() as i64 == f.size)
-                .unwrap_or(false);
+            let at_size = match storage.path(&f.inner_path) {
+                Ok(p) => tokio::fs::metadata(p).await.map(|m| m.len() as i64 == f.size).unwrap_or(false),
+                Err(_) => false,
+            };
             if at_size {
                 present = present.saturating_add(size);
             } else {
@@ -31179,7 +31192,7 @@ impl AppState {
                     drop(_manifest);
                     return false;
                 };
-                match std::fs::canonicalize(data_root.join("edx-store")) {
+                match tokio::fs::canonicalize(data_root.join("edx-store")).await {
                     Ok(root) => Some(root),
                     Err(error) => {
                         drop(tree);
