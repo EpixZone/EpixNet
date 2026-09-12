@@ -59,8 +59,9 @@ setup. Coordinated, and partly destructive at the last step. Keep backups.
 ## Verify (must return nothing, on every peer)
 
 ```
-grep -lE '"(from_xid|to|recipient|members|conv_id|peer_xid|subject|author)"' data/<hub>/pool/**/*.json
+grep -lE '"(from_xid|to|recipient|members|conv_id|peer_xid|subject)"' data/<hub>/pool/**/*.json
 grep -lr '\.epix' data/<hub>/pool/                # no xid in the pool
+# (`author` is legitimately present: it is the record's throwaway signing key, not the sender)
 find data/<hub>/data/users -name data.json -size +8k  # none
 ```
 

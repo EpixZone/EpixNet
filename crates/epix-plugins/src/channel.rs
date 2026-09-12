@@ -1116,6 +1116,39 @@ pub(crate) async fn deliver_channel_event(state: &Arc<AppState>, ms: &ChannelSta
         }
         state.push_site_event(&xite, "channelEvent", ev.clone());
     }
+    // A message that landed is activity on its client xite even though the
+    // bytes live in the hub's pool and no content.json changed. Advance that
+    // xite's "last updated" so its dashboard row says "just now" instead of
+    // the age of its last signed release, and push its siteInfo so an open
+    // dashboard redraws without a reload.
+    if ev.get("type").and_then(Value::as_str) == Some("new_message") {
+        let client = {
+            let clients = ms.clients.read().await;
+            client_xite_for_app(&clients, app.as_deref())
+        };
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        state.bump_modified(&client, now).await;
+        state.push_xite_info(&client).await;
+    }
+}
+
+/// The client xite a message of `app` belongs to on the dashboard: the xite
+/// that subscribed for that app, else Epix Mail, which holds the whole inbox.
+/// Never the hub: no app is bound to it.
+fn client_xite_for_app(
+    clients: &std::collections::HashMap<String, Option<String>>,
+    app: Option<&str>,
+) -> String {
+    app.and_then(|app| {
+        clients
+            .iter()
+            .find(|(_, scope)| scope.as_deref() == Some(app))
+            .map(|(xite, _)| xite.clone())
+    })
+    .unwrap_or_else(|| EPIX_MAIL_XITE.to_string())
 }
 
 #[cfg(not(test))]
@@ -3737,6 +3770,25 @@ mod multi_device_tests {
         );
         restarted_channel.db.ack_outbound(legacy_id).unwrap();
         assert!(!restarted_channel.db.outbound_pending(legacy_id).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod client_xite_tests {
+    use super::{client_xite_for_app, EPIX_MAIL_XITE};
+    use std::collections::HashMap;
+
+    /// A landed message bumps the dashboard row of the xite that will show
+    /// it: the app's subscribed client, else Mail. Never the hub.
+    #[test]
+    fn message_activity_lands_on_the_apps_client_xite_else_mail() {
+        let mut clients: HashMap<String, Option<String>> = HashMap::new();
+        clients.insert(EPIX_MAIL_XITE.to_string(), None);
+        clients.insert("epix1talk".to_string(), Some("talk".to_string()));
+        assert_eq!(client_xite_for_app(&clients, Some("talk")), "epix1talk");
+        assert_eq!(client_xite_for_app(&clients, Some("mail")), EPIX_MAIL_XITE);
+        assert_eq!(client_xite_for_app(&clients, Some("forum")), EPIX_MAIL_XITE);
+        assert_eq!(client_xite_for_app(&clients, None), EPIX_MAIL_XITE);
     }
 }
 

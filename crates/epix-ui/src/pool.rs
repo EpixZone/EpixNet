@@ -141,9 +141,32 @@ const POOL_SWEEP_PEERS: usize = 16;
 /// quiet pass up to [`POOL_SWEEP_QUIET_CAP_MS`]. Small enough that a shard that
 /// starts receiving is back in the hot set within a couple of minutes.
 const POOL_SWEEP_QUIET_BASE_MS: i64 = 60_000;
-/// Ceiling for the quiet backoff: even a shard that has never held anything is
-/// re-checked at least this often.
+/// Ceiling for the quiet backoff on the CURRENT week's shards, the hot set a
+/// new record lands in. Kept short so the first message after a quiet spell
+/// is pulled within minutes even on a node that cannot be pushed to (no port
+/// forward, an onion service peers cannot reach): with a 30 minute ceiling a
+/// pool that was empty all day made a fresh message wait up to half an hour.
+/// 16 fanout paths every three minutes is a handful of small requests.
+const POOL_SWEEP_QUIET_CAP_HOT_MS: i64 = 3 * 60_000;
+/// Ceiling for the quiet backoff on older shards: even a shard that has never
+/// held anything is re-checked at least this often.
 const POOL_SWEEP_QUIET_CAP_MS: i64 = 30 * 60_000;
+
+/// The week number in a shard path (`<dir>/w<week>/<xx>.json`), if any.
+fn pool_shard_week(path: &str) -> Option<i64> {
+    path.split('/')
+        .filter_map(|seg| seg.strip_prefix('w'))
+        .find_map(|rest| rest.parse::<i64>().ok())
+}
+
+/// The quiet-backoff ceiling for one shard path: short for the current week's
+/// paths (where new records land), long for everything older.
+fn pool_sweep_quiet_cap_ms(path: &str, cur_week: i64) -> i64 {
+    match pool_shard_week(path) {
+        Some(week) if week >= cur_week => POOL_SWEEP_QUIET_CAP_HOT_MS,
+        _ => POOL_SWEEP_QUIET_CAP_MS,
+    }
+}
 
 /// One sweep pass over pool shard paths, shared by the periodic sweep and the
 /// historical backfill. The whole path list goes out in ONE dial session, so a
@@ -1952,8 +1975,21 @@ impl AppState {
     }
 
     /// Record what a swept path yielded: anything new makes it hot again, a
-    /// quiet pass cools it (exponential, capped at [`POOL_SWEEP_QUIET_CAP_MS`]).
+    /// quiet pass cools it (exponential, capped per [`pool_sweep_quiet_cap_ms`]:
+    /// the current week's shards stay warm, older ones cool for real).
     pub(crate) fn note_pool_sweep_result(&self, address: &str, path: &str, merged: bool) {
+        let cur_week = pool::week_of(pool::epoch_now(now_ms()));
+        self.note_pool_sweep_result_at(address, path, merged, cur_week, now_ms());
+    }
+
+    fn note_pool_sweep_result_at(
+        &self,
+        address: &str,
+        path: &str,
+        merged: bool,
+        cur_week: i64,
+        now: i64,
+    ) {
         let key = format!("{address}\0{path}");
         let Ok(mut map) = self.pool_sweep_backoff.lock() else { return };
         if merged {
@@ -1964,8 +2000,8 @@ impl AppState {
         entry.0 = entry.0.saturating_add(1);
         let delay = POOL_SWEEP_QUIET_BASE_MS
             .saturating_mul(1i64 << entry.0.min(6))
-            .min(POOL_SWEEP_QUIET_CAP_MS);
-        entry.1 = now_ms().saturating_add(delay);
+            .min(pool_sweep_quiet_cap_ms(path, cur_week));
+        entry.1 = now.saturating_add(delay);
     }
 
     /// One log line per sweep pass, and a WARNING when nothing answered - a
@@ -2141,5 +2177,49 @@ mod tests {
             retention_keep_from_for_rule(&retention_rule(true), 13),
             Some(0)
         );
+    }
+}
+
+#[cfg(test)]
+mod sweep_backoff_tests {
+    use super::*;
+
+    #[test]
+    fn shard_week_is_parsed_from_the_path() {
+        assert_eq!(pool_shard_week("pool/w2958/0a.json"), Some(2958));
+        assert_eq!(pool_shard_week("nested/dir/w7/ff.json"), Some(7));
+        assert_eq!(pool_shard_week("pool/week/0a.json"), None);
+        assert_eq!(pool_shard_week("wibble/0a.json"), None);
+    }
+
+    /// The current week's shards are where a new record lands: their quiet
+    /// backoff must stay short. Older weeks may cool to the long ceiling.
+    #[test]
+    fn current_week_shards_keep_a_short_backoff_ceiling() {
+        assert_eq!(pool_sweep_quiet_cap_ms("pool/w2958/00.json", 2958), POOL_SWEEP_QUIET_CAP_HOT_MS);
+        assert_eq!(pool_sweep_quiet_cap_ms("pool/w2959/00.json", 2958), POOL_SWEEP_QUIET_CAP_HOT_MS);
+        assert_eq!(pool_sweep_quiet_cap_ms("pool/w2957/00.json", 2958), POOL_SWEEP_QUIET_CAP_MS);
+        assert_eq!(pool_sweep_quiet_cap_ms("pool/odd/00.json", 2958), POOL_SWEEP_QUIET_CAP_MS);
+        assert!(POOL_SWEEP_QUIET_CAP_HOT_MS < POOL_SWEEP_QUIET_CAP_MS);
+    }
+
+    /// After many quiet passes a current-week path is due again within the
+    /// short ceiling, a previous-week path only after the long one, and a
+    /// merge makes a path due immediately.
+    #[test]
+    fn quiet_passes_cool_hot_and_cold_shards_differently() {
+        let state = AppState::new("test");
+        let (addr, hot, cold) = ("epix1pool", "pool/w2958/03.json", "pool/w2957/03.json");
+        let now = 1_000_000_000_000i64;
+        for _ in 0..12 {
+            state.note_pool_sweep_result_at(addr, hot, false, 2958, now);
+            state.note_pool_sweep_result_at(addr, cold, false, 2958, now);
+        }
+        assert!(!state.pool_shard_due(addr, hot, now + POOL_SWEEP_QUIET_CAP_HOT_MS - 1));
+        assert!(state.pool_shard_due(addr, hot, now + POOL_SWEEP_QUIET_CAP_HOT_MS));
+        assert!(!state.pool_shard_due(addr, cold, now + POOL_SWEEP_QUIET_CAP_HOT_MS));
+        assert!(state.pool_shard_due(addr, cold, now + POOL_SWEEP_QUIET_CAP_MS));
+        state.note_pool_sweep_result_at(addr, cold, true, 2958, now);
+        assert!(state.pool_shard_due(addr, cold, now));
     }
 }
