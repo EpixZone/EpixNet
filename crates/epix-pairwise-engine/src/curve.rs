@@ -76,17 +76,28 @@ mod tests {
     #[test]
     fn representatives_look_uniform_ish() {
         // The top bit of a representative should not be pinned (unlike a raw
-        // x25519 u-coordinate, which is always < 2^255). Sample a few.
+        // x25519 u-coordinate, which is always < 2^255): it must come up both
+        // set and clear. Only about half of random keys encode at all, and
+        // each encodable representative has its high bit set with
+        // probability 1/2, so 16 samples failed roughly one CI run in two
+        // hundred. 512 samples put a false failure below 2^-200.
+        let mut encoded = 0;
         let mut high_set = 0;
-        for _ in 0..16 {
+        let mut high_clear = 0;
+        for _ in 0..512 {
             let e = rand32();
             if let Some(r) = elligator_encode(&e, rand32()[0]) {
+                encoded += 1;
                 if r[31] & 0x80 != 0 {
                     high_set += 1;
+                } else {
+                    high_clear += 1;
                 }
             }
         }
         // Not a statistical proof, just a smoke test that the high bit varies.
-        assert!(high_set > 0, "representative high bit is randomized");
+        assert!(encoded > 0, "some random keys encode");
+        assert!(high_set > 0, "representative high bit is sometimes set");
+        assert!(high_clear > 0, "representative high bit is sometimes clear");
     }
 }
