@@ -23,11 +23,20 @@ setup. Coordinated, and partly destructive at the last step. Keep backups.
 
 1. **Hub owner** adds the pool descriptor and the user-content rules to the xID
    xite's content.json (see "Hub xite contents" in `channels.md`), re-signs and
-   publishes. The address does not change.
+   publishes. The address does not change. `data/users/content.json` is an
+   include with `signers: []`, so it needs its own signature by the owner key
+   (`siteSign` with that `inner_path`): signing the root does not sign it, and
+   an unsigned include is rejected as a governing parent, which leaves every
+   identity's setup at `pending: no verified governing parent for
+   data/users/<name>.epix/content.json` until it is signed.
 2. **Node release N** ships: `channel_xite` default = the hub,
    `channel_legacy_xites` default = Mail, per-identity setup, the Mail client
    update in the same window. On first boot every node auto-adds the hub and
-   every enabled linked identity republishes its bundle there. Inbox history is
+   every enabled linked identity republishes its bundle there. A node that set
+   `channel_xite` to Mail during the first cutover is migrated on boot: the
+   value is treated as blank and cleared from the config (logged as
+   `channels: channel_xite named Epix Mail ...`), since Mail no longer declares
+   a pool and keeping it would wait for a hub that never comes. Inbox history is
    intact; records still landing in Mail's pool keep arriving via the legacy
    read. Users see Config > Identities show "channels: pending" for a moment,
    then "published"; Mail shows the onboarding banner until then.
