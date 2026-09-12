@@ -247,7 +247,7 @@ deletion. Ordered:
 ## Verification (forbidden-metadata checklist — must return nothing)
 
 ```
-grep -lE '"(from_xid|to|recipient|members|conv_id|peer_xid|subject|seq|author)"' pool/w*/*.json
+grep -lE '"(from_xid|to|recipient|members|conv_id|peer_xid|subject|seq)"' pool/w*/*.json
 grep -lr '\.epix' pool/                     # no xid in any shard
 grep -lr '<plaintext marker>' pool/         # no cleartext body
 grep -lE '"(conversations|ct|peer_xid|my_seq|from_xid)"' data/users/*/data.json

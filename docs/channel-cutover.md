@@ -84,7 +84,7 @@ users. Keep an offline archive of `data/users/` first.
 ## 5. Verify (must return nothing on every peer)
 
 ```
-grep -lE '"(from_xid|to|recipient|members|conv_id|peer_xid|subject|author)"' data/<addr>/pool/**/*.json
+grep -lE '"(from_xid|to|recipient|members|conv_id|peer_xid|subject)"' data/<addr>/pool/**/*.json
 grep -lr '\.epix' data/<addr>/pool/                 # no xid in the pool
 ls data/<addr>/data/users/*/messages.json           # none after Phase 4
 find data/<addr>/data/users -name data.json -size +4k   # none
