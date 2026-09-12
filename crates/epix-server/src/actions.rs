@@ -489,7 +489,8 @@ async fn admin_call(
         Err(_) => {
             // A node whose data dir cannot host unix sockets (network share)
             // binds in the temp dir and records where in admin.sock.path.
-            let redirected = std::fs::read_to_string(data_root.join("admin.sock.path"))
+            let redirected = tokio::fs::read_to_string(data_root.join("admin.sock.path"))
+                .await
                 .ok()
                 .map(|p| p.trim().to_string());
             match redirected {

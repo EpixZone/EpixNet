@@ -1498,7 +1498,7 @@ pub async fn node_key(state: &Arc<AppState>) -> String {
         return epix_crypt::new_seed();
     };
     let path = dir.join("edx-node.key");
-    if let Ok(existing) = std::fs::read_to_string(&path) {
+    if let Ok(existing) = tokio::fs::read_to_string(&path).await {
         let key = existing.trim().to_string();
         if key.len() == 64 && key.bytes().all(|b| b.is_ascii_hexdigit()) {
             return key;
@@ -5746,7 +5746,7 @@ pub async fn enable_serving(
     choker: Option<SharedChoker>,
 ) -> Option<Arc<Store>> {
     let path = data_dir.join("edx-store");
-    if let Err(e) = std::fs::create_dir_all(&path) {
+    if let Err(e) = tokio::fs::create_dir_all(&path).await {
         state.log("WARN", format!("EDX store dir {}: {e}", path.display())).await;
         return None;
     }

@@ -325,7 +325,7 @@ impl I2pIdentity {
 /// under the same local-disk trust assumption.
 async fn load_or_create_identity(data_dir: &Path, sam_port: u16) -> Result<I2pIdentity> {
     let path = data_dir.join("destination.key");
-    if let Ok(text) = std::fs::read_to_string(&path) {
+    if let Ok(text) = tokio::fs::read_to_string(&path).await {
         if let Some(identity) = I2pIdentity::parse(&text) {
             return Ok(identity);
         }

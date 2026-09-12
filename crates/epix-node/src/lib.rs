@@ -1255,7 +1255,9 @@ async fn load_clone_xite(
     address: &str,
     data_dir: &std::path::Path,
 ) -> Result<(Xite, bool), String> {
-    std::fs::create_dir_all(data_dir).map_err(|error| format!("create xite dir: {error}"))?;
+    tokio::fs::create_dir_all(data_dir)
+        .await
+        .map_err(|error| format!("create xite dir: {error}"))?;
     let address =
         Address::parse(address.to_string()).map_err(|error| format!("bad address: {error}"))?;
     let storage = XiteStorage::new(data_dir);

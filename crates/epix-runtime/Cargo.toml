@@ -23,7 +23,7 @@ epix-tor = { path = "../epix-tor", optional = true }
 epix-i2p = { path = "../epix-i2p", optional = true, default-features = false }
 epix-reticulum = { path = "../epix-reticulum", optional = true }
 epix-bt = { path = "../epix-bt", optional = true }
-tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros", "net", "fs"] }
 async-trait = "0.1"
 serde_json = "1"
 serde = { version = "1", features = ["derive"] }

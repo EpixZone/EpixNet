@@ -12,7 +12,7 @@ path = "src/main.rs"
 epix-i2p = { path = "../epix-i2p" }
 epix-node = { path = "../epix-node" }
 epix-ui = { path = "../epix-ui" }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util", "fs"] }
 # Secure origins: a per-install local CA that signs on-the-fly leaf certs for
 # `*.epix`, so Firefox loads `https://dashboard.epix/` as a real secure context.
 rcgen = "0.14"

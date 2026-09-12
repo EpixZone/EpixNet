@@ -962,21 +962,27 @@ impl AppState {
         let shard_lock = self.pool_shard_lock(address, inner_path);
         let bytes = {
             let _guard = shard_lock.lock().await;
-            (|| -> std::io::Result<Vec<u8>> {
+            let max_shard_bytes = rule.max_shard_bytes;
+            let path = path.clone();
+            // Blocking read off the runtime thread; the shard lock is held
+            // across it so an append cannot interleave with the serve.
+            tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
                 use std::io::Read as _;
 
                 // The signed-object transport caps pool shards at the rule's
                 // clamped max size. Read at most one byte beyond it so a corrupt
                 // oversized file cannot become an unbounded GetSigned allocation.
                 let mut file = std::fs::File::open(path)?
-                    .take((rule.max_shard_bytes as u64).saturating_add(1));
+                    .take((max_shard_bytes as u64).saturating_add(1));
                 let mut bytes = Vec::new();
                 file.read_to_end(&mut bytes)?;
-                if bytes.len() > rule.max_shard_bytes {
+                if bytes.len() > max_shard_bytes {
                     return Err(std::io::Error::other("pool shard exceeds serve limit"));
                 }
                 Ok(bytes)
-            })()
+            })
+            .await
+            .unwrap_or_else(|join| Err(std::io::Error::other(join)))
         };
         drop(shard_lock);
         self.release_pool_shard_lock(address, inner_path);
