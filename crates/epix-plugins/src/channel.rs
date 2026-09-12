@@ -1367,6 +1367,16 @@ impl epix_ui::local_feed::LocalFeedSource for ChannelFeedSource {
                     .and_then(|v| v.as_str())
                     .unwrap_or(epix_envelope::DEFAULT_APP);
                 let site = app_sites.get(app).cloned().unwrap_or_else(|| self.client_xite.clone());
+                // The row's headline opens the conversation: Mail routes
+                // `?Thread/<conv_id>`. Another app's client has its own
+                // routing, so its rows open the xite itself. Without a url
+                // the dashboard links to `<xite>/undefined`.
+                let conv_id = t.get("conv_id").and_then(|v| v.as_str()).unwrap_or("");
+                let url = if site == self.client_xite && !conv_id.is_empty() {
+                    format!("?Thread/{conv_id}")
+                } else {
+                    String::new()
+                };
                 let body = if self.snippets {
                     format!("{peer}: {subject}")
                 } else {
@@ -1378,6 +1388,7 @@ impl epix_ui::local_feed::LocalFeedSource for ChannelFeedSource {
                     "body": body,
                     "date_added": last_ms as f64 / 1000.0,
                     "site": site,
+                    "url": url,
                     "feed_name": "channel",
                     "app": app,
                 }));
@@ -1466,6 +1477,7 @@ impl Plugin for ChannelPlugin {
             Arc::new(ChannelContacts),
             Arc::new(ChannelSend),
             Arc::new(ChannelThreads),
+            Arc::new(ChannelSent),
             Arc::new(ChannelConversation),
             Arc::new(ChannelSearch),
             Arc::new(ChannelMarkRead),
@@ -3120,6 +3132,33 @@ impl WsCommand for ChannelThreads {
     }
 }
 
+/// `channelSent([{app?, offset?, limit?}])` - the acting identity's own sent
+/// messages, newest first, as flat per-message rows (`msg_id`, `conv_id`,
+/// `subject`, `body`, `sent_ms`, `members`, `peer_xid`, `app`). Scoped like
+/// `channelThreads`: a `Channels:<app>` client sees only its app.
+struct ChannelSent;
+#[async_trait]
+impl WsCommand for ChannelSent {
+    fn name(&self) -> &'static str {
+        "channelSent"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let ms = channel_state(s).await?;
+        let Some(ctx) = resolve_identity(s, &ms, p).await? else {
+            return Ok(json!({ "messages": [] }));
+        };
+        let o = p.as_array().and_then(|a| a.first());
+        let offset = o.and_then(|v| v.get("offset")).and_then(|v| v.as_i64()).unwrap_or(0);
+        let limit = o.and_then(|v| v.get("limit")).and_then(|v| v.as_i64()).unwrap_or(50);
+        let app = resolve_app_filter(client_app_scope(s).await, requested_app(o))?;
+        let rows = ms
+            .db
+            .sent_messages_in_app(ctx.identity_id, app.as_deref(), offset, limit)
+            .map_err(|e| e.to_string())?;
+        Ok(json!({ "messages": rows }))
+    }
+}
+
 struct ChannelConversation;
 #[async_trait]
 impl WsCommand for ChannelConversation {
@@ -3770,6 +3809,38 @@ mod multi_device_tests {
         );
         restarted_channel.db.ack_outbound(legacy_id).unwrap();
         assert!(!restarted_channel.db.outbound_pending(legacy_id).unwrap());
+    }
+}
+
+#[cfg(test)]
+mod feed_row_tests {
+    use super::{ChannelFeedSource, ChannelState, EPIX_MAIL_XITE};
+    use epix_channel::ChannelDb;
+    use epix_envelope::FakeEngine;
+    use epix_ui::local_feed::LocalFeedSource as _;
+    use std::sync::Arc;
+
+    /// A feed row's headline must open the conversation in Mail
+    /// (`?Thread/<conv_id>`); a row without a url sent the dashboard to
+    /// `<xite>/undefined`.
+    #[tokio::test]
+    async fn feed_rows_deep_link_into_the_mail_thread() {
+        let db = Arc::new(ChannelDb::memory().unwrap());
+        let idn = db.upsert_identity("a.epix", "epix1a", 0, None).unwrap();
+        db.insert_sent(idn, "cv1", Some("b.epix"), &[], "a.epix", "hi", "body", 10).unwrap();
+        let ms = Arc::new(ChannelState::for_test(db.clone(), Arc::new(FakeEngine), "epix1hub".into()));
+        let source = ChannelFeedSource {
+            db: db.clone(),
+            ms,
+            client_xite: EPIX_MAIL_XITE.to_string(),
+            snippets: false,
+            per_identity: true,
+        };
+        let rows = source.feed_rows(10).await;
+        assert_eq!(rows.len(), 1, "{rows:?}");
+        assert_eq!(rows[0]["site"], EPIX_MAIL_XITE);
+        assert_eq!(rows[0]["url"], "?Thread/cv1");
+        assert_eq!(rows[0]["body"], "New message from b.epix");
     }
 }
 

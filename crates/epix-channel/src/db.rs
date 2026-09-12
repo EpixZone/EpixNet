@@ -1642,7 +1642,7 @@ impl ChannelDb {
         )?;
         let (ratchet_stored, enc) = self.enc_blob(&session.ratchet_after);
         let Some(session_id) = session.session_id else {
-            return Self::insert_outbound_session_tx(tx, session, ratchet_stored, enc);
+            return Self::insert_outbound_session_tx(tx, session, ratchet_stored, enc).map(|_| ());
         };
 
         let current = tx
@@ -1701,12 +1701,15 @@ impl ChannelDb {
         Ok(())
     }
 
+    /// Insert a session row plus its expected receive tags; returns the new
+    /// `session_id`. Shared by the outbound commit and the first-contact
+    /// inbound commit, which stage the same session shape.
     fn insert_outbound_session_tx(
         tx: &rusqlite::Transaction<'_>,
         session: &OutboundSession,
         ratchet_stored: Vec<u8>,
         enc: i64,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         tx.execute(
             "INSERT INTO session
                 (identity_id, conv_id, peer_xid, peer_ik, peer_auth, role,
@@ -1733,7 +1736,7 @@ impl ChannelDb {
             )
             .map_err(db_err)?;
         }
-        Ok(())
+        Ok(session_id)
     }
 
     fn insert_outbound_message_tx(
@@ -2213,33 +2216,7 @@ impl ChannelDb {
             }
 
             let (ratchet_stored, enc) = self.enc_blob(&session.ratchet_after);
-            tx.execute(
-                "INSERT INTO session
-                    (identity_id, conv_id, peer_xid, peer_ik, peer_auth, role,
-                     ratchet, enc, established_ms)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                rusqlite::params![
-                    session.identity_id,
-                    session.conv_id,
-                    session.peer_xid,
-                    session.peer_ik,
-                    session.peer_auth,
-                    session.role,
-                    ratchet_stored,
-                    enc,
-                    session.established_ms,
-                ],
-            )
-            .map_err(db_err)?;
-            let session_id = tx.last_insert_rowid();
-            for (n, tag) in &session.recv_tags {
-                tx.execute(
-                    "INSERT OR IGNORE INTO expected_tag (tag, session_id, n) VALUES (?1, ?2, ?3)",
-                    rusqlite::params![tag, session_id, *n as i64],
-                )
-                .map_err(db_err)?;
-            }
-            session_id
+            Self::insert_outbound_session_tx(&tx, session, ratchet_stored, enc)?
         };
 
         let members_json = if c.members.is_empty() {
@@ -2430,7 +2407,29 @@ impl ChannelDb {
         self.threads_in_app(identity_id, None, folder, offset, limit)
     }
 
-    /// [`Self::threads`] restricted to one client app (`None` = every app).
+    /// Bind an identity-scoped, optionally app-scoped, paged query:
+    /// `identity_id`, then the app when the query carries its clause, then
+    /// `LIMIT ?` and `OFFSET ?`. `app_clause` is the SQL fragment to splice
+    /// where the app restriction goes (empty when `app` is `None`).
+    fn app_page_params(
+        identity_id: i64,
+        app: Option<&str>,
+        limit: i64,
+        offset: i64,
+    ) -> Vec<Value> {
+        let mut params = vec![Value::from(identity_id)];
+        if let Some(app) = app {
+            params.push(Value::from(app));
+        }
+        params.push(Value::from(limit));
+        params.push(Value::from(offset));
+        params
+    }
+
+    fn app_clause(app: Option<&str>, column: &str) -> String {
+        if app.is_some() { format!(" AND {column}=?") } else { String::new() }
+    }
+
     pub fn threads_in_app(
         &self,
         identity_id: i64,
@@ -2444,21 +2443,37 @@ impl ChannelDb {
             "starred" => "starred=1 AND archived=0",
             _ => "archived=0",
         };
-        let app_filter = if app.is_some() { " AND app=?" } else { "" };
+        let app_filter = Self::app_clause(app, "app");
         let sql = format!(
             "SELECT thread_id, conv_id, peer_xid, members, subject, snippet, last_ms, msg_count,
                     unread, starred, archived, enc, app
              FROM thread WHERE identity_id=? AND {filter}{app_filter}
              ORDER BY last_ms DESC LIMIT ? OFFSET ?"
         );
-        let mut params = vec![Value::from(identity_id)];
-        if let Some(app) = app {
-            params.push(Value::from(app));
-        }
-        params.push(Value::from(limit));
-        params.push(Value::from(offset));
-        let rows = self.db.query(&sql, &params)?;
+        let rows = self.db.query(&sql, &Self::app_page_params(identity_id, app, limit, offset))?;
         self.decrypt_rows(rows, &["subject", "snippet"])
+    }
+
+    /// The identity's own outbound messages across every conversation, newest
+    /// first, each joined with its thread's members and peer so a "Sent" view
+    /// can render flat per-message rows. `app` narrows to one client app.
+    pub fn sent_messages_in_app(
+        &self,
+        identity_id: i64,
+        app: Option<&str>,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let app_filter = Self::app_clause(app, "t.app");
+        let sql = format!(
+            "SELECT m.msg_id, m.conv_id, m.subject, m.body, m.sent_ms, m.enc,
+                    t.members, t.peer_xid, t.app
+             FROM msg m JOIN thread t ON t.thread_id = m.thread_id
+             WHERE m.identity_id=? AND m.dir='out'{app_filter}
+             ORDER BY m.sent_ms DESC, m.msg_id DESC LIMIT ? OFFSET ?"
+        );
+        let rows = self.db.query(&sql, &Self::app_page_params(identity_id, app, limit, offset))?;
+        self.decrypt_rows(rows, &["subject", "body"])
     }
 
     /// Messages of a conversation, oldest first.
@@ -2807,6 +2822,33 @@ mod tests {
             author_private_key: epix_crypt::new_seed(),
             rln: None,
         }
+    }
+
+    /// The Sent view lists the identity's own outbound messages, newest first,
+    /// with the thread's members, and honours the app scope.
+    #[test]
+    fn sent_messages_list_my_outbound_rows_newest_first() {
+        let d = db();
+        let idn = d.upsert_identity("a.epix", "epix1a", 0, None).unwrap();
+        let other = d.upsert_identity("z.epix", "epix1z", 0, None).unwrap();
+        let members = vec!["a.epix".to_string(), "b.epix".to_string()];
+        d.insert_sent(idn, "cv1", Some("b.epix"), &members, "a.epix", "first", "body1", 10).unwrap();
+        d.insert_sent(idn, "cv1", Some("b.epix"), &members, "a.epix", "second", "body2", 20).unwrap();
+        d.insert_sent(idn, "cv2", Some("c.epix"), &[], "a.epix", "to c", "body3", 15).unwrap();
+        d.insert_sent(other, "cvz", Some("b.epix"), &[], "z.epix", "not mine", "x", 30).unwrap();
+
+        let rows = d.sent_messages_in_app(idn, None, 0, 10).unwrap();
+        let subjects: Vec<&str> = rows.iter().map(|r| r["subject"].as_str().unwrap()).collect();
+        assert_eq!(subjects, ["second", "to c", "first"]);
+        assert_eq!(rows[0]["conv_id"], "cv1");
+        assert_eq!(rows[0]["peer_xid"], "b.epix");
+        assert_eq!(rows[0]["body"], "body2");
+        assert!(rows[0]["members"].as_str().unwrap().contains("b.epix"));
+        assert_eq!(rows[1]["peer_xid"], "c.epix");
+
+        assert_eq!(d.sent_messages_in_app(idn, Some("mail"), 0, 10).unwrap().len(), 3);
+        assert!(d.sent_messages_in_app(idn, Some("talk"), 0, 10).unwrap().is_empty());
+        assert_eq!(d.sent_messages_in_app(idn, None, 1, 1).unwrap()[0]["subject"], "to c");
     }
 
     #[test]
