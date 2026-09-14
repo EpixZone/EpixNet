@@ -168,9 +168,18 @@ where
     if endpoints.is_empty() {
         return Err(ChainError::Rpc("no chain RPC endpoints configured".into()));
     }
+    if let Some(remaining) = endpoint_outage_remaining(endpoints) {
+        return Err(ChainError::Rpc(format!(
+            "every chain RPC endpoint was unreachable; not dialing again for {}s",
+            remaining.as_secs().max(1)
+        )));
+    }
     let count = endpoints.len();
     let start = preferred.load(Ordering::Relaxed) % count;
     let mut last = None;
+    // Only transport-level failures count towards an outage: an endpoint that
+    // ANSWERED with a proof error or "no such name" is up.
+    let mut all_unreachable = true;
     for offset in 0..count {
         let index = (start + offset) % count;
         match op(endpoints[index].clone()).await {
@@ -178,12 +187,62 @@ where
                 if index != start {
                     preferred.store(index, Ordering::Relaxed);
                 }
+                note_endpoint_rotation(endpoints, false);
                 return Ok(value);
             }
-            Err(error) => last = Some(error),
+            Err(error) => {
+                all_unreachable &= matches!(error, ChainError::Rpc(_));
+                last = Some(error);
+            }
         }
     }
+    note_endpoint_rotation(endpoints, all_unreachable);
     Err(last.expect("at least one endpoint was attempted"))
+}
+
+/// How long a rotation that failed to REACH every endpoint short-circuits the
+/// next calls against the same list. Sized so a node that boots with no route
+/// out (power back before the router, a VPN front-end still down) spends one
+/// round of connect timeouts learning the chain is unreachable, not one round
+/// per name it verifies: each xite it restores resolves its signers, and a
+/// seeder restoring a few dozen xites that way sat for 15 minutes before it
+/// served anything - and was power-cycled by hand before it got there. Cached
+/// resolutions answer in the meantime, exactly as they do after the slow
+/// failure.
+const ENDPOINT_OUTAGE_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Endpoint lists whose last rotation reached nothing, with the instant the
+/// verdict expires. Keyed by the exact list so unrelated lists (a devnet
+/// override, tests) never see each other's outage.
+fn endpoint_outages(
+) -> &'static std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>> {
+    static OUTAGES: OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
+    > = OnceLock::new();
+    OUTAGES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn endpoint_outage_key(endpoints: &[String]) -> String {
+    endpoints.join("\n")
+}
+
+fn endpoint_outage_remaining(endpoints: &[String]) -> Option<std::time::Duration> {
+    let outages = endpoint_outages().lock().ok()?;
+    outages
+        .get(&endpoint_outage_key(endpoints))?
+        .checked_duration_since(std::time::Instant::now())
+}
+
+fn note_endpoint_rotation(endpoints: &[String], all_unreachable: bool) {
+    let Ok(mut outages) = endpoint_outages().lock() else {
+        return;
+    };
+    let key = endpoint_outage_key(endpoints);
+    if all_unreachable {
+        outages.insert(key, std::time::Instant::now() + ENDPOINT_OUTAGE_COOLDOWN);
+    } else {
+        outages.remove(&key);
+    }
 }
 
 /// Proxy URL, Tor requirement, validation state, and cached-client generation
@@ -927,6 +986,79 @@ mod endpoint_rotation_tests {
         .await
         .unwrap_err();
         assert!(matches!(error, ChainError::Rpc(message) if message == "https://b down"));
+    }
+
+    #[tokio::test]
+    async fn a_rotation_that_reaches_nothing_short_circuits_the_next_calls() {
+        let list = endpoints(&["https://outage-a.test", "https://outage-b.test"]);
+        let preferred = AtomicUsize::new(0);
+        let _ = rotate_endpoints::<(), _, _>(&list, &preferred, |base| async move {
+            Err(ChainError::Rpc(format!("{base} unreachable")))
+        })
+        .await;
+
+        // Within the cooldown nothing is dialed: the caller gets an immediate
+        // transport error (non-authoritative, so cached answers still serve).
+        let dialed = AtomicUsize::new(0);
+        let error = rotate_endpoints::<(), _, _>(&list, &preferred, |_| {
+            dialed.fetch_add(1, Ordering::Relaxed);
+            async move { Err(ChainError::Rpc("must not be reached".into())) }
+        })
+        .await
+        .unwrap_err();
+        assert_eq!(
+            dialed.load(Ordering::Relaxed),
+            0,
+            "no endpoint dialed during the cooldown"
+        );
+        assert!(!error.is_authoritative());
+        assert!(matches!(error, ChainError::Rpc(message) if message.contains("not dialing again")));
+
+        // An unrelated list is unaffected.
+        let other = endpoints(&["https://outage-c.test"]);
+        let answered = rotate_endpoints(&other, &AtomicUsize::new(0), |base| async move {
+            Ok::<_, ChainError>(base)
+        })
+        .await
+        .unwrap();
+        assert_eq!(answered, "https://outage-c.test");
+
+        // A success (the network is back) clears the verdict at once.
+        note_endpoint_rotation(&list, false);
+        let answered = rotate_endpoints(&list, &preferred, |base| async move {
+            Ok::<_, ChainError>(base)
+        })
+        .await
+        .unwrap();
+        assert_eq!(answered, "https://outage-a.test");
+        assert!(endpoint_outage_remaining(&list).is_none());
+    }
+
+    #[tokio::test]
+    async fn an_endpoint_that_answered_with_an_error_is_not_an_outage() {
+        // "No such name" and proof failures mean the endpoint is up: the next
+        // call still dials.
+        let list = endpoints(&["https://answered-a.test", "https://answered-b.test"]);
+        let preferred = AtomicUsize::new(0);
+        let _ = rotate_endpoints::<(), _, _>(&list, &preferred, |base| async move {
+            if base == "https://answered-a.test" {
+                Err(ChainError::Rpc(format!("{base} unreachable")))
+            } else {
+                Err(ChainError::NotFound("nobody".into()))
+            }
+        })
+        .await;
+        let dialed = AtomicUsize::new(0);
+        let _ = rotate_endpoints::<(), _, _>(&list, &preferred, |_| {
+            dialed.fetch_add(1, Ordering::Relaxed);
+            async move { Err(ChainError::NotFound("nobody".into())) }
+        })
+        .await;
+        assert_eq!(
+            dialed.load(Ordering::Relaxed),
+            2,
+            "both endpoints dialed again"
+        );
     }
 
     #[tokio::test]
