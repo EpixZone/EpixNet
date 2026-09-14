@@ -369,7 +369,7 @@ async fn an_unparseable_registry_is_set_aside_not_overwritten() {
     );
     let kept: Vec<String> = std::fs::read_dir(&private)
         .unwrap()
-        .filter_map(|entry| entry.ok())
+        .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
         .filter(|name| name.starts_with("xites.json.corrupt-"))
         .collect();
