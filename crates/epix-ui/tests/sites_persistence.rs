@@ -295,6 +295,133 @@ async fn restore_falls_back_to_local_copy_for_unverified_content() {
 }
 
 #[tokio::test]
+async fn adds_during_boot_restore_do_not_rewrite_the_registry() {
+    // Boot restore adds every registered xite one at a time, and each add
+    // used to persist the in-memory list - so the registry on disk held only
+    // the xites restored so far. A power cut during a slow restore (no
+    // network up: every signer resolve timing out) then forgot the rest. A
+    // 27-xite seeder came back with 8 after one outage and 5 after the next.
+    let root = tempfile::tempdir().unwrap();
+    let mut xites = Vec::new();
+    for modified in [1000, 2000, 3000] {
+        let privkey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+        let (content, bytes) = signed_content(&address, &privkey, modified);
+        let storage = XiteStorage::new(&root.path().join("data").join(&address));
+        storage.write("content.json", &bytes).unwrap();
+        xites.push((address, storage, content));
+    }
+    {
+        let state = AppState::with_data_dir("run-1", root.path());
+        for (address, storage, content) in &xites {
+            state
+                .add_xite(address, XiteEntry { storage: storage.clone(), content: Some(content.clone()) })
+                .await;
+        }
+    }
+    let registry = root.path().join("private/xites.json");
+    let before = std::fs::read(&registry).unwrap();
+    let parsed: serde_json::Value = serde_json::from_slice(&before).unwrap();
+    assert_eq!(parsed.as_object().unwrap().len(), 3);
+
+    // Second run, mid-restore: the runtime has armed the gate and the first
+    // xite has just been re-added (what restore_one_xite does per entry).
+    let state = AppState::with_data_dir("run-2", root.path());
+    state.set_boot_restore_pending(true);
+    let (address, storage, content) = &xites[0];
+    state
+        .add_xite(address, XiteEntry { storage: storage.clone(), content: Some(content.clone()) })
+        .await;
+    assert_eq!(
+        std::fs::read(&registry).unwrap(),
+        before,
+        "the on-disk registry is untouched until the restore settles"
+    );
+
+    // The pass completes: the other two restore, the gate drops, and the
+    // full list is written once.
+    assert_eq!(state.restore_xites().await, 2);
+    assert!(!state.boot_restore_pending());
+    let after: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+    let after = after.as_object().unwrap();
+    assert_eq!(after.len(), 3);
+    for (address, _, _) in &xites {
+        assert!(after.contains_key(address), "{address} survives the restart");
+    }
+}
+
+#[tokio::test]
+async fn an_unparseable_registry_is_set_aside_not_overwritten() {
+    let root = tempfile::tempdir().unwrap();
+    let private = root.path().join("private");
+    std::fs::create_dir_all(&private).unwrap();
+    let registry = private.join("xites.json");
+    let truncated = b"{\"epix1truncated\": {\"own\": tr";
+    std::fs::write(&registry, truncated).unwrap();
+
+    let state = AppState::with_data_dir("run-1", root.path());
+    assert_eq!(state.restore_xites().await, 0);
+    assert_eq!(
+        std::fs::read(&registry).unwrap(),
+        truncated,
+        "restore alone never writes over a registry it could not read"
+    );
+    let kept: Vec<String> = std::fs::read_dir(&private)
+        .unwrap()
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("xites.json.corrupt-"))
+        .collect();
+    assert_eq!(kept.len(), 1, "a copy of the corrupt registry is kept for recovery: {kept:?}");
+    assert_eq!(std::fs::read(private.join(&kept[0])).unwrap(), truncated);
+
+    // The node still runs: the next add writes a fresh registry.
+    let privkey = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+    let (content, bytes) = signed_content(&address, &privkey, 1000);
+    let storage = XiteStorage::new(&root.path().join("data").join(&address));
+    storage.write("content.json", &bytes).unwrap();
+    state.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&registry).unwrap()).unwrap();
+    assert!(saved.get(&address).is_some());
+}
+
+#[tokio::test]
+async fn holding_the_private_key_makes_a_re_added_xite_owned() {
+    // A seeder whose registry lost its own xite gets it back through an
+    // on-demand clone as a plain download: own = false, and the optional-file
+    // cap may then delete the originals. The saved private key says whose
+    // xite it is.
+    let root = tempfile::tempdir().unwrap();
+    let privkey = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&privkey).unwrap();
+    let (content, bytes) = signed_content(&address, &privkey, 1000);
+    let storage = XiteStorage::new(&root.path().join("data").join(&address));
+    storage.write("content.json", &bytes).unwrap();
+    {
+        let state = AppState::with_data_dir("run-1", root.path());
+        state
+            .add_xite(&address, XiteEntry { storage: storage.clone(), content: Some(content.clone()) })
+            .await;
+        state.set_xite_privatekey(&address, &privkey).await.unwrap();
+    }
+    // The registry entry is gone (a partial rewrite); the key is not.
+    std::fs::write(root.path().join("private/xites.json"), b"{}").unwrap();
+
+    let state = AppState::with_data_dir("run-2", root.path());
+    assert_eq!(state.restore_xites().await, 0);
+    state.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
+    let info = state.xite_info(&address).await;
+    assert_eq!(info["settings"]["own"], json!(true), "the key holder owns the xite");
+    let saved: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(root.path().join("private/xites.json")).unwrap())
+            .unwrap();
+    assert_eq!(saved[&address]["own"], json!(true));
+}
+
+#[tokio::test]
 async fn global_settings_survive_a_restart() {
     let root = tempfile::tempdir().unwrap();
 

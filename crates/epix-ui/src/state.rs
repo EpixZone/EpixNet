@@ -6762,6 +6762,20 @@ impl AppState {
                     auto_default || self.config_bool("download_optional_default", true).await;
             }
         }
+        // Holding the xite's private key IS ownership, whatever the registry
+        // says. An entry rebuilt from scratch (the seeder's own xite dropped
+        // from the registry, then brought back by an on-demand clone) would
+        // otherwise come back as a plain download - and the optional-file
+        // cap treats a non-owned xite's files as evictable cache, so the
+        // seeder's originals could be deleted out from under it.
+        if !settings.own {
+            let user = self.user.read().await;
+            if user.xite_privatekey(&canonical).is_some()
+                || (address != canonical && user.xite_privatekey(&address).is_some())
+            {
+                settings.own = true;
+            }
+        }
         if let Some(granted) = self.grants.read().await.get(&canonical) {
             settings.permissions = granted.clone();
         }
@@ -7364,6 +7378,19 @@ impl AppState {
 
     async fn persist_xites_strict(&self) -> Result<(), String> {
         let Some(path) = &self.xites_path else { return Ok(()) };
+        // Boot restore re-adds every registered xite one at a time, and each
+        // add lands here. Writing the in-memory list at that point rewrites
+        // the registry with only the xites restored SO FAR, so a power cut or
+        // a service stop midway forgets every xite the pass had not reached
+        // yet (a 27-xite seeder came back with 8, then 5, across two
+        // outages - each restore ran for minutes because no network was up).
+        // The on-disk registry stays untouched until the pass settles;
+        // restore_xites writes the complete list once at the end.
+        if self.boot_restore_pending() {
+            return Err(
+                "boot restore in progress: the xite registry is written once it settles".into(),
+            );
+        }
         let _registry = self.xite_registry_lock.lock().await;
         let xites = self.xites.read().await;
         let bytes = Self::xite_registry_bytes(&xites, &std::collections::HashSet::new())?;
@@ -7372,6 +7399,10 @@ impl AppState {
     }
 
     pub async fn persist_xites(&self) {
+        if self.boot_restore_pending() {
+            // Deferred by design, not a failure: restore_xites persists once.
+            return;
+        }
         if let Err(error) = self.persist_xites_strict().await {
             self.log("ERROR", format!("Could not persist served xites: {error}"))
                 .await;
@@ -7384,20 +7415,36 @@ impl AppState {
     /// content.json is missing or fails verification. Returns how many were
     /// restored. Call once at startup before serving.
     pub async fn restore_xites(self: &Arc<Self>) -> usize {
-        let restored = self.restore_xites_inner().await;
+        // Armed here as well as by the node runtime (which sets it before its
+        // UI can serve): the registry write gate belongs to the pass itself,
+        // whoever runs it.
+        self.set_boot_restore_pending(true);
+        let (restored, registry_readable) = self.restore_xites_inner().await;
         // Whatever happened (registry missing, parse error, full restore),
         // boot restore is now SETTLED: gated aggregates may answer.
         self.set_boot_restore_pending(false);
+        // Every add during the pass deferred its registry write (see
+        // persist_xites_strict); write the settled list once now. Never over
+        // a registry that could not be read or acted on, though: those bytes
+        // may be the only copy of the operator's xite list, and
+        // load_xite_registry has set a copy aside for recovery.
+        if registry_readable {
+            self.persist_xites().await;
+        }
         restored
     }
 
-    async fn restore_xites_inner(self: &Arc<Self>) -> usize {
-        let (Some(path), Some(root)) = (&self.xites_path, &self.data_root) else { return 0;
+    /// Returns (xites restored, whether the on-disk registry was read and
+    /// walked). False in the second slot means nothing must write the
+    /// registry on this pass's behalf.
+    async fn restore_xites_inner(self: &Arc<Self>) -> (usize, bool) {
+        let (Some(path), Some(root)) = (&self.xites_path, &self.data_root) else {
+            return (0, false);
         };
         let registry = self.xite_registry_lock.lock().await;
         let root = root.join("data");
         let Some(mut map) = self.load_xite_registry(path).await else {
-            return 0;
+            return (0, false);
         };
         let intents = match self.read_xite_removal_intents() {
             Ok(intents) => intents,
@@ -7406,7 +7453,7 @@ impl AppState {
                 // entries that may already have been removed from disk.
                 self.log("ERROR", format!("Could not read xite removals: {error}"))
                     .await;
-                return 0;
+                return (0, false);
             }
         };
         if !intents.is_empty() {
@@ -7427,7 +7474,24 @@ impl AppState {
                 restored += 1;
             }
         }
-        restored
+        (restored, true)
+    }
+
+    /// Keep a copy of a registry that failed to parse, next to it, before
+    /// anything can replace it. A truncated or half-written registry is still
+    /// the operator's xite list; the next successful persist (the launch
+    /// xite, an on-demand clone) overwrites the live file, and without the
+    /// copy the list would be gone for good.
+    fn set_aside_corrupt_registry(path: &std::path::Path) -> String {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let aside = path.with_extension(format!("json.corrupt-{stamp}"));
+        match std::fs::copy(path, &aside) {
+            Ok(_) => format!("; copy kept at {}", aside.display()),
+            Err(error) => format!("; could not keep a copy: {error}"),
+        }
     }
 
     /// Read and parse the served-xite registry. `None` = unreadable or
@@ -7440,10 +7504,11 @@ impl AppState {
             Ok(bytes) => match serde_json::from_slice::<serde_json::Map<String, Value>>(&bytes) {
                 Ok(map) => Some(map),
                 Err(error) => {
+                    let kept = Self::set_aside_corrupt_registry(path);
                     self.log(
                         "ERROR",
                         format!(
-                            "Could not parse served-xite registry {}: {error}",
+                            "Could not parse served-xite registry {}: {error}{kept}",
                             path.display()
                         ),
                     )
