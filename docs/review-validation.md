@@ -220,13 +220,20 @@ The wallet workflow now supplies `--target "$GITHUB_SHA"` when creating the
 release. The final EpixNet pin uses the correctly tagged rebuild and verifies
 the downloaded archive's SHA-256 before embedding it.
 
-- Wallet commit: `5d0f7775d23a6e318f0eab32590f5df68a7f9ffc`.
-- Release tag: `wallet-5d0f7775d23a`; GitHub's tag ref matches that commit.
+- Wallet commit: `504774303656fe23acd54f7588d28d874282c54a`.
+- Release tag: `wallet-504774303656`; GitHub's tag ref matches that commit.
 - `epix-wallet-firefox.zip` SHA-256:
-  `3a14bb25f4beed75164cb25caf54b5502cf6f5d28862b61f352238259490a400`.
+  `2104680f275ac49d0dcf937970ceabc0755073e1b2eb86e95410a5db49869a48`.
 
 The temporary mistagged prerelease created by the first review build was
 removed after verifying the corrected replacement.
+
+After wallet PR #17 merged, the pin was advanced to its merged release. The
+release tag points to the exact merge commit, and the downloaded archive
+matches GitHub's SHA-256 digest. All 105 extension files are byte-identical to
+the previously verified wallet build; only the archive packaging differs.
+A production browser build downloaded, verified, and embedded the merged
+release successfully, with neither wallet override set.
 
 ## PR analyzer follow-up
 
