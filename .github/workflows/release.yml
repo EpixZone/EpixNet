@@ -222,6 +222,10 @@ jobs:
           java-version: "17"
 
       - uses: android-actions/setup-android@v4
+        with:
+          # The default includes the obsolete `tools` package, which sdkmanager
+          # can no longer resolve. Install the SDK and NDK versions below.
+          packages: platform-tools
 
       - name: Install SDK + NDK packages
         run: |
