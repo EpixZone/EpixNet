@@ -17,11 +17,16 @@
 mod autostart;
 mod ca;
 mod eepsite;
+mod browser_process;
 mod ext;
 #[cfg(windows)]
 mod icon;
 mod ipc;
 mod proxy;
+mod shutdown;
+mod splash_view;
+mod startup;
+mod startup_handoff;
 mod tray;
 #[cfg(test)]
 #[path = "../wallet_stage.rs"]
@@ -123,36 +128,34 @@ fn main() {
         }
     };
 
-    let (ready, firefox_child) = rt.block_on(boot(&raw_arg, background));
-
-    // Hand the main thread to the tray. It keeps the node alive after the
-    // browser closes and quits it on demand. When no tray host is available
-    // (headless Linux, GTK failure, EPIX_NO_TRAY), `run` logs why and hands the
-    // browser process back so we fall back to the old behaviour: run until the
-    // window closes, then shut down.
-    let firefox_path = ready.firefox.clone();
-    let ctx = tray::TrayContext {
-        ready,
-        child: firefox_child,
-        rt: rt.handle().clone(),
-        open_rx,
-    };
-    if let Err(child) = tray::run(ctx) {
-        match child {
-            // We launched a browser: run until it closes, then shut down.
+    let handle = rt.handle().clone();
+    let outcome = startup::run(&rt, !background, move |progress| async move {
+        let (ready, child) = boot(&raw_arg, background, progress).await?;
+        Ok(tray::TrayContext {
+            ready,
+            child,
+            rt: handle,
+            open_rx,
+        })
+    });
+    match outcome {
+        Ok(startup::Outcome::Finished) => {}
+        Ok(startup::Outcome::WithoutTray { child, firefox }) => match child {
             Some(child) => {
-                tray::wait_for_browser(child, &firefox_path);
+                tray::wait_for_browser(child, &firefox);
                 println!("· browser closed - shutting down the node");
             }
-            // Background mode with no tray host and no window: keep the node
-            // serving (there is nothing to wait on); the user stops it by
-            // killing the process.
             None => {
                 eprintln!("· running headless (no tray, no window); the node keeps serving");
                 tray::park();
             }
+        },
+        Err(error) => {
+            eprintln!("could not start EpixNet: {error}");
+            std::process::exit(1);
         }
     }
+    shutdown::shutdown(rt);
 }
 
 /// The launcher has no console of its own on Windows (GUI subsystem, so no
@@ -204,35 +207,29 @@ fn attach_console_or_log(data_root: &Path) {
 /// Boot the node, write the managed profile, install the extension, and launch
 /// Firefox (non-blocking) unless `background`. Returns the running state the
 /// tray watches plus the browser process (`None` in background mode - the tray
-/// opens the browser on demand). Fatal setup errors exit the process directly.
-async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::Child>) {
+/// opens the browser on demand). Errors reach the startup window and the log.
+async fn boot(
+    raw_arg: &str,
+    background: bool,
+    progress: startup::Progress,
+) -> Result<(Ready, Option<std::process::Child>), String> {
     let target = epix_node::parse_target(raw_arg);
+    progress.report(startup::Stage::Preparing);
 
     let data_root = epix_node::data_root();
-    if let Err(e) = tokio::fs::create_dir_all(&data_root).await {
-        eprintln!("cannot create data dir {}: {e}", data_root.display());
-        std::process::exit(1);
-    }
+    tokio::fs::create_dir_all(&data_root)
+        .await
+        .map_err(|e| format!("Cannot create the data folder: {e}"))?;
 
-    let firefox = match find_firefox() {
-        Some(p) => p,
-        None => {
-            eprintln!(
-                "Firefox not found. Install Firefox (or Firefox ESR), or set \
-                 EPIX_FIREFOX to its executable path."
-            );
-            std::process::exit(1);
-        }
-    };
+    let firefox = find_firefox().ok_or_else(|| {
+        "The Epix Browser engine was not found. Reinstall EpixNet.".to_string()
+    })?;
 
     // The local CA for secure `https://*.epix` origins.
-    let ca = match LocalCa::load_or_create(&data_root.join("browser-ca")) {
-        Ok(ca) => Arc::new(ca),
-        Err(e) => {
-            eprintln!("could not set up the local CA: {e}");
-            std::process::exit(1);
-        }
-    };
+    let ca = Arc::new(
+        LocalCa::load_or_create(&data_root.join("browser-ca"))
+            .map_err(|e| format!("Could not prepare secure browsing: {e}"))?,
+    );
 
     // Boot the node and serve the plain UI on loopback.
     println!("· starting the Epix node …");
@@ -250,13 +247,11 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
         version: env!("EPIX_VERSION").to_string(),
         rev: env!("EPIX_GIT_REV").to_string(),
     };
-    let (server, running) = match epix_node::boot(opts).await {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("could not start the node: {e}");
-            std::process::exit(1);
-        }
-    };
+    let (server, running) = epix_node::boot_with_progress(opts, |stage| {
+        progress.report(stage.into());
+    })
+    .await
+    .map_err(|e| format!("Could not start the local node: {e}"))?;
     let display = running.display.clone();
     let ui_addr = running.ui_addr;
 
@@ -279,8 +274,7 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     if !wait_for_port(ui_addr, Duration::from_secs(30)).await
         || !wait_for_port(proxy_addr, Duration::from_secs(10)).await
     {
-        eprintln!("the node did not come up");
-        std::process::exit(1);
+        return Err("The local browser connection did not become ready.".into());
     }
     println!("· node serving (xite: {display}); browser proxy on {proxy_addr}");
 
@@ -320,10 +314,12 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
     let display = epix_ui::aliased_origin(&display);
     // Write the managed profile (CA injected so https://*.epix is trusted), then
     // install the theme + wallet extension into it.
+    progress.report(startup::Stage::Profile);
     let (profile, secure) = setup_profile(
         &data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &firefox, &ca,
-    );
+    )?;
     ensure_search_policy(&firefox);
+    progress.report(startup::Stage::Wallet);
     install_addons(&profile, &firefox, ext_capable);
 
     // The CA is trusted: let the proxy upgrade plain-http xite loads to https.
@@ -333,7 +329,20 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
 
     let scheme = if secure { "https" } else { "http" };
     let start_url = format!("{scheme}://{display}/");
-    let child = launch_browser(background, &firefox, &profile, &start_url);
+    progress.report(startup::Stage::Browser);
+    let mut handoff = if progress.visible() && !background {
+        Some(startup_handoff::BrowserHandoff::start(start_url.clone()).await?)
+    } else {
+        None
+    };
+    let launch_url = handoff
+        .as_ref()
+        .map_or(start_url.as_str(), |handoff| handoff.url());
+    let mut child = launch_browser(background, &firefox, &profile, launch_url)?;
+    if let Some(handoff) = &mut handoff {
+        wait_for_browser_window(handoff, &mut child, Duration::from_secs(60)).await?;
+    }
+    progress.report(startup::Stage::Ready);
 
     // A Config-page restart relaunches this executable in background mode:
     // the node comes back up without popping a second browser window, and the
@@ -362,7 +371,24 @@ async fn boot(raw_arg: &str, background: bool) -> (Ready, Option<std::process::C
         tor_on,
         i2p_on,
     };
-    (ready, child)
+    Ok((ready, child))
+}
+
+async fn wait_for_browser_window(
+    handoff: &mut startup_handoff::BrowserHandoff,
+    child: &mut Option<std::process::Child>,
+    deadline: Duration,
+) -> Result<(), String> {
+    let result = tokio::time::timeout(deadline, handoff.wait())
+        .await
+        .map_err(|_| "Epix Browser did not show its startup page. Reopen EpixNet to try again.".to_string())
+        .and_then(|result| result);
+    if result.is_err() {
+        // Dropping Child does not stop it. Reap this launch's browser before
+        // presenting an error so it cannot keep the managed profile locked.
+        tray::close_browser(child);
+    }
+    result
 }
 
 /// Serve the browser proxy on `proxy_addr` in the background: TLS-terminated
@@ -423,13 +449,12 @@ fn setup_profile(
     ext_capable: bool,
     firefox: &Path,
     ca: &LocalCa,
-) -> (PathBuf, bool) {
+) -> Result<(PathBuf, bool), String> {
     let profile = data_root.join("firefox-profile");
     if let Err(e) =
         write_profile(&profile, proxy_addr, socks_addr, display, true, tor_clearnet, ext_capable)
     {
-        eprintln!("could not write the Firefox profile: {e}");
-        std::process::exit(1);
+        return Err(format!("Could not prepare the browser profile: {e}"));
     }
     let secure = match install_ca(&profile, firefox, ca) {
         Ok(()) => ensure_ca_imported(&profile, firefox, ca),
@@ -442,7 +467,7 @@ fn setup_profile(
         let _ =
             write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
     }
-    (profile, secure)
+    Ok((profile, secure))
 }
 
 /// Whether the profile's NSS DB (`cert9.db`) holds this exact CA cert. NSS
@@ -500,8 +525,13 @@ fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
                     std::thread::sleep(Duration::from_millis(300));
                 }
                 _ => {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    #[cfg(windows)]
+                    browser_process::close_browser_tree(&mut child);
+                    #[cfg(not(windows))]
+                    {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                    }
                     break;
                 }
             }
@@ -576,32 +606,19 @@ fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
 
 /// Launch Firefox on the managed profile (spawn, not wait - the node outlives
 /// the window, anchored by the tray). Returns `None` in background mode (the
-/// tray opens the browser on demand) or if the launch fails; neither is fatal,
-/// the tray keeps the node up and "Open EpixNet" retries.
+/// tray opens the browser on demand). Launch failures reach the startup UI.
 fn launch_browser(
     background: bool,
     firefox: &Path,
     profile: &Path,
     start_url: &str,
-) -> Option<std::process::Child> {
+) -> Result<Option<std::process::Child>, String> {
     if background {
         println!("· background mode: node + tray up, no browser window");
-        return None;
+        return Ok(None);
     }
-    println!("· launching Firefox at {start_url}");
-    let mut cmd = Command::new(firefox);
-    // --allow-downgrade: never let Firefox's profile-downgrade dialog block
-    // startup. It fires when the profile was last opened by a NEWER Firefox
-    // than this one - e.g. the user's system Firefox touched the managed
-    // profile once - and would otherwise leave the managed browser stuck on a
-    // modal ("You've launched an older version of Firefox") with no xite
-    // loaded. We manage this profile, so just proceed.
-    cmd.arg("--allow-downgrade").arg("--profile").arg(profile).arg("--no-remote").arg("--new-instance");
-    // Linux: the shell picks the window icon by matching the window class /
-    // app id against a .desktop entry - ours (StartupWMClass=EpixNet, with the
-    // Epix icon) matches these. --class covers X11, --name the Wayland app id.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    cmd.args(["--class", "EpixNet", "--name", "EpixNet"]);
+    println!("· launching Epix Browser at {start_url}");
+    let mut cmd = browser_process::browser_command(firefox, profile);
     match cmd.arg(start_url).spawn() {
         Ok(mut child) => {
             // `--no-remote --new-instance` on a profile another Firefox already
@@ -611,20 +628,13 @@ fn launch_browser(
             // Firefox, which still locks the profile.
             std::thread::sleep(Duration::from_millis(700));
             if let Ok(Some(status)) = child.try_wait() {
-                eprintln!(
-                    "· note: Firefox exited immediately ({status}). Another EpixNet or a \
-                     Firefox on this profile is likely already running; close it (or quit \
-                     EpixNet from the tray) and reopen. Profile: {}",
-                    profile.display()
-                );
-                return None;
+                return Err(format!(
+                    "Epix Browser closed during startup ({status}). Close any other EpixNet browser and try again."
+                ));
             }
-            Some(child)
+            Ok(Some(child))
         }
-        Err(e) => {
-            eprintln!("could not launch Firefox at {}: {e}", firefox.display());
-            None
-        }
+        Err(e) => Err(format!("Could not open Epix Browser: {e}")),
     }
 }
 
@@ -1228,6 +1238,21 @@ async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn browser_handoff_timeout_reaps_the_owned_browser_process() {
+        let mut handoff = startup_handoff::BrowserHandoff::start("http://dashboard.epix/".into())
+            .await
+            .unwrap();
+        let mut child = Some(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let result = wait_for_browser_window(&mut handoff, &mut child, Duration::from_millis(30)).await;
+        let reaped = child.as_mut().unwrap().try_wait().unwrap().is_some();
+        // Clean up the fixture even when the regression assertion fails.
+        tray::close_browser(&mut child);
+        assert!(result.unwrap_err().contains("did not show its startup page"));
+        assert!(reaped, "failed startup left its browser process running");
+    }
 
     #[test]
     fn warmup_waits_for_the_launcher_stub_only_on_windows() {

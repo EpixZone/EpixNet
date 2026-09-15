@@ -24,6 +24,9 @@ uniffi = { version = "0.32", features = ["tokio"] }
 tokio = { version = "1", features = ["rt-multi-thread", "sync"] }
 thiserror = "2"
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 # The embedded I2P router is compiled in AND auto-enabled on first run, same as
 # desktop (privacy by default). It's a leaf: transit tunnels are disabled and

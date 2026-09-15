@@ -468,18 +468,45 @@ fn init_logging() {
     let _ = fmt().with_env_filter(filter).with_ansi(false).try_init();
 }
 
-/// Boot the node: resolve, clone + verify (unless already on disk), set up the
-/// UI server and the background runtime, and return the [`UiServer`] future to
-/// await plus the [`RunningNode`] handle. Cloning uses the network only when
-/// the xite is not already complete on disk.
+/// Local startup work reported by [`boot_with_progress`]. Network bootstrap
+/// and xite downloads continue in the background after these stages.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BootStage {
+    PreparingData,
+    LoadingSettings,
+    RestoringXites,
+    RebuildingDatabases,
+    StartingServices,
+    /// The UI listener is owned. The caller must drive [`UiServer::serve`]
+    /// before HTTP requests can be handled; no browser readiness is implied.
+    Prepared,
+}
+
+/// Prepare local xites, the UI listener, and the background runtime. The
+/// caller drives the returned [`UiServer`] to accept requests. Network
+/// bootstrap and missing-xite downloads do not block local startup.
 pub async fn boot(
     opts: NodeOptions,
 ) -> Result<(UiServer, RunningNode), String> {
+    boot_with_progress(opts, |_| {}).await
+}
+
+/// Boot with synchronous stage notifications. Work stages are reported before
+/// they begin; [`BootStage::Prepared`] is reported only after success. The
+/// callback should only enqueue a UI update or log a message: it runs on the
+/// boot task and must return promptly without panicking. Errors stop the stage
+/// sequence and are returned to the caller.
+pub async fn boot_with_progress(
+    opts: NodeOptions,
+    report: impl Fn(BootStage) + Send + Sync,
+) -> Result<(UiServer, RunningNode), String> {
     init_logging();
+    report(BootStage::PreparingData);
     std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
     // A restore staged by the Backup & Restore wizard applies now, before
     // anything reads the data dir (users.json, sites.json, config).
     epix_ui::backup::apply_pending_restore(&opts.data_root);
+    report(BootStage::LoadingSettings);
     // Carry a Python client's epixnet.conf settings over into config.json before
     // anything reads config (the Tor-Always egress gate below, then AppState).
     migrate_legacy_conf(&opts.data_root);
@@ -503,7 +530,7 @@ pub async fn boot(
     let (launch, startup_network_policy) =
         prepare_startup_launch_with(&opts, arm_startup_network_policy)?;
 
-    serve(opts, launch, xid_finality, startup_network_policy).await
+    serve(opts, launch, xid_finality, startup_network_policy, &report).await
 }
 
 
@@ -4237,6 +4264,7 @@ async fn serve(
     launch: LaunchTarget,
     xid_finality: XidFinalityBoot,
     startup_network_policy: StartupNetworkPolicy,
+    report: &(dyn Fn(BootStage) + Send + Sync),
 ) -> Result<(UiServer, RunningNode), String> {
     let state = AppState::with_data_dir(&opts.version, &opts.data_root);
     // Set BEFORE any xite is restored: a node that is offline by policy will
@@ -4351,6 +4379,7 @@ async fn serve(
     }
 
     // Restore xites served in a previous run (from sites.json).
+    report(BootStage::RestoringXites);
     let restored = state.restore_xites().await;
     if restored > 0 {
         state.log("INFO", format!("Restored {restored} xite(s) from sites.json")).await;
@@ -4417,6 +4446,7 @@ async fn serve(
     // empty on every boot until filled from their merged xites - do it now
     // that all restored xites are registered, or merger pages show nothing
     // until some merger action happens to trigger a rebuild.
+    report(BootStage::RebuildingDatabases);
     state.rebuild_merger_dbs().await;
     // Per-xite dbs are just as boot-empty: warm them in the background so
     // the dashboard's first feedQuery finds real rows instead of racing
@@ -4487,6 +4517,7 @@ async fn serve(
     }
     state.rebuild_merger_dbs().await;
 
+    report(BootStage::StartingServices);
     // Seeding + offline policy. The Config page persists values as STRINGS
     // (like i2p_sam_port below), so accept both forms - reading only the
     // number form made a configured port silently fall back to the default.
@@ -4764,6 +4795,7 @@ async fn serve(
     // (restricted / NoNewSites) node can still be administered server-side.
     #[cfg(unix)]
     server.spawn_admin_socket(opts.data_root.join("admin.sock"));
+    report(BootStage::Prepared);
     Ok((server, RunningNode { state, display, address, ui_addr: bind }))
 }
 
@@ -5400,6 +5432,101 @@ pub fn open_in_browser(url: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn boot_progress_reports_data_failure_without_prepared() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("not-a-directory");
+        tokio::fs::write(&root, b"existing file").await.unwrap();
+        let stages = std::sync::Mutex::new(Vec::new());
+        let result = boot_with_progress(NodeOptions::new(&root, "dashboard.epix"), |stage| {
+            stages.lock().unwrap().push(stage);
+        })
+        .await;
+        assert!(matches!(result, Err(error) if error.contains("create data root")));
+        assert_eq!(*stages.lock().unwrap(), vec![BootStage::PreparingData]);
+        assert_eq!(tokio::fs::read(&root).await.unwrap(), b"existing file");
+    }
+
+    #[test]
+    fn boot_progress_reports_offline_stages_before_serving() {
+        const WORKER_ENV: &str = "EPIX_BOOT_PROGRESS_WORKER";
+        if std::env::var_os(WORKER_ENV).is_some() {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap()
+                .block_on(verify_offline_boot_progress());
+            return;
+        }
+        // Boot installs process-wide chain trust and routing. Run the real
+        // offline node in its own process so parallel tests stay independent.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::boot_progress_reports_offline_stages_before_serving",
+                "--nocapture",
+            ])
+            .env(WORKER_ENV, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(status.success(), "offline boot progress child failed: {status}");
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("offline boot progress child timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    async fn verify_offline_boot_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        tokio::fs::create_dir(dir.path().join("private")).await.unwrap();
+        tokio::fs::write(
+            dir.path().join("private/config.json"),
+            br#"{"offline":true,"xid_lc_enabled":false}"#,
+        )
+        .await
+        .unwrap();
+        let stages = std::sync::Mutex::new(Vec::new());
+        let mut opts = NodeOptions::new(dir.path(), DASHBOARD_XITE_ADDRESS);
+        opts.ui_addr = "127.0.0.1:0".to_string();
+        let (server, running) = boot_with_progress(opts, |stage| {
+            if stage == BootStage::Prepared {
+                let port: u16 = std::fs::read_to_string(dir.path().join("ui_port"))
+                    .unwrap()
+                    .parse()
+                    .unwrap();
+                assert!(
+                    std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).is_err(),
+                    "Prepared must retain the UI listener before notifying the caller"
+                );
+            }
+            stages.lock().unwrap().push(stage);
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            *stages.lock().unwrap(),
+            vec![
+                BootStage::PreparingData,
+                BootStage::LoadingSettings,
+                BootStage::RestoringXites,
+                BootStage::RebuildingDatabases,
+                BootStage::StartingServices,
+                BootStage::Prepared,
+            ]
+        );
+        assert!(running.state.offline_by_policy());
+        assert_eq!(running.address, DASHBOARD_XITE_ADDRESS);
+        drop(server);
+    }
 
     #[test]
     fn missing_finality_pin_is_the_normal_network_bootstrap_state() {
