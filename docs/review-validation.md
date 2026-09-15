@@ -87,13 +87,14 @@ verifying that an idle encrypted clearnet connection releases its socket and
 disappears from Stats. Other ignored tests include live-network/devnet checks
 and deliberate golden-vector regeneration; they were not collectively enabled.
 
-The final combined run with the rebuilt wallet embedded passed **1,615 tests,
+The final combined run with the published wallet pin embedded passed **1,618 tests,
 0 failed, 17 ignored** across the same 104 test binaries:
 
 ```sh
-EPIX_WALLET_DIST=/path/to/epix-wallet/apps/extension/build/firefox \
-  cargo test --workspace --all-targets --locked --no-fail-fast
+cargo test --workspace --all-targets --locked --no-fail-fast
 ```
+
+Neither `EPIX_WALLET_DIST` nor `EPIX_WALLET_SKIP` was set for this run.
 
 The extra ignored test is the real-Firefox startup check, which was also run
 separately and passed.
@@ -106,9 +107,26 @@ An actual fresh-profile Firefox ESR test reproduced the hang with
 `--wait-for-browser`; removing that Windows-only flag completed in 2.06 seconds.
 The compiled Rust regression using the packaged Firefox then passed in 0.92
 seconds. New temporary-profile desktop launches reached Firefox in 6.54 and
-3.47 seconds. The HTTPS dashboard rendered and the embedded wallet addon was
-active. The wallet provider is injected into xite documents; the wrapper has a stricter
-script policy, so checking only the outer frame is insufficient.
+3.47 seconds. The HTTPS dashboard rendered.
+
+Those desktop checks exposed a second startup issue: the embedded wallet
+appeared active in Firefox's metadata but its provider was absent from pages.
+Certificate warm-up had cached the profile before extension installation.
+Temporarily installing the same XPI after startup restored the provider on plain
+HTML, the nonce-protected wrapper, and the dashboard, isolating the stale cache.
+Two new cache regression tests failed before implementation changes. The fix
+invalidates the derived add-on startup cache after an XPI changes and increments
+the wallet pack version to repair existing profiles. Unchanged bundles retain
+the cache. The browser crate then passed **34 tests with 1 ignored**.
+
+The rebuilt desktop with a local wallet build launched a fresh profile in
+**5.71 seconds**. A final rebuild using the published wallet pin launched in
+**6.33 seconds**; the installed XPI's content, injected, and polyfill scripts
+matched the staged immutable artifact byte for byte. With
+normal startup installation, the wallet provider and `keplr.ping()` worked on
+plain HTML, the nonce-protected wrapper and its iframe, and the real HTTPS
+dashboard wrapper and iframe. No temporary add-on installation was used for
+this final check.
 
 ```sh
 EPIX_TEST_FIREFOX=/path/to/packaged/firefox cargo test -p epix-browser fresh_firefox_warmup_exits -- --ignored
@@ -130,6 +148,10 @@ Additional tests reproduced and now prevent:
 
 The local debug build emits an Apple linker warning about large unwind tables;
 the executables built successfully. This is separate from the startup defect.
+The workspace-wide `cargo fmt --all -- --check` reports existing formatting
+differences in many unchanged files. Checking `epix-blob/examples/export.rs`
+from the base commit reproduced that failure; this review does not reformat
+the whole workspace.
 
 ## Mobile
 
@@ -151,7 +173,16 @@ destinations, encoded path handling, and hash navigation, not WebKit rendering.
 Full iOS compilation/simulation was unavailable: only macOS Command Line Tools
 were installed (`simctl` and the iOS SDK were absent), and remaining storage was
 insufficient for Xcode plus its runtime alongside the Android and Rust builds.
-See [mobile test instructions](../shells/tests.md) for reproducible commands.
+Both mobile feature sets also compiled and linked on the macOS host:
+
+```sh
+cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery --locked
+cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery,bittorrent --locked
+```
+
+The iOS dependency tree excluded `epix-bt`. These are host feature-profile
+checks, not native SDK builds. See [mobile test instructions](../shells/tests.md)
+for reproducible device-method test commands.
 
 ## Wallet
 
@@ -174,3 +205,25 @@ pending-request regression. All routing/storage races were reproduced before
 fixes; Firefox's base proxy-permission finding was withdrawn after inspecting
 the actual Firefox manifest override. Physical hardware wallet tests and funded
 transaction tests were not performed.
+
+Wallet CI completed successfully. Jest emitted a nonfatal forced-worker-exit
+warning in some package suites; the base branch also emitted this warning in
+several unchanged packages. This does not establish that all test resources
+are closed cleanly.
+
+## Immutable wallet build provenance
+
+The first branch build published the expected artifact but its Git tag pointed
+at the default branch instead of the built commit. A read of GitHub's tag ref
+confirmed the mismatch, and an executable workflow test failed before the fix.
+The wallet workflow now supplies `--target "$GITHUB_SHA"` when creating the
+release. The final EpixNet pin uses the correctly tagged rebuild and verifies
+the downloaded archive's SHA-256 before embedding it.
+
+- Wallet commit: `5d0f7775d23a6e318f0eab32590f5df68a7f9ffc`.
+- Release tag: `wallet-5d0f7775d23a`; GitHub's tag ref matches that commit.
+- `epix-wallet-firefox.zip` SHA-256:
+  `3a14bb25f4beed75164cb25caf54b5502cf6f5d28862b61f352238259490a400`.
+
+The temporary mistagged prerelease created by the first review build was
+removed after verifying the corrected replacement.
