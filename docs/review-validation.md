@@ -227,3 +227,26 @@ the downloaded archive's SHA-256 before embedding it.
 
 The temporary mistagged prerelease created by the first review build was
 removed after verifying the corrected replacement.
+
+## PR analyzer follow-up
+
+The PR scan reported two Sonar maintainability issues and one GitHub Advanced
+Security finding. The database mapper is now split into smaller helpers while
+preserving its transaction boundary, mapping order, sibling-row behavior, and
+CRDT folding. All 20 database tests passed before and after the refactor,
+including rollback and merger/profile-join coverage. The browser startup test
+module now follows all production items.
+
+The security finding concerned temporary directories in wallet-staging tests.
+A new regression failed before the fix: with a `022` umask the directory was
+created as `0755`, allowing access by other local users. The fixture now uses
+`tempfile` for secure allocation and automatic cleanup, with Unix `0700`
+permissions requested at creation. All four staging tests pass. Production
+wallet-staging behavior is unchanged.
+
+The companion wallet PR's Sonar assertion finding was also corrected. All 58
+extension tests, extension typechecking, ESLint, and Prettier passed again.
+That follow-up changes only a test assertion, so the immutable wallet artifact
+above still contains the current runtime code. Existing repository security
+alerts were inventoried separately; none were dismissed or suppressed to make
+these PR checks pass.

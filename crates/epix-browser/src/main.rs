@@ -532,42 +532,6 @@ fn ca_warmup_command(profile: &Path, firefox: &Path, shot: &Path) -> Command {
     command
 }
 
-#[cfg(test)]
-mod startup_tests {
-    use super::*;
-
-    #[test]
-    fn warmup_waits_for_the_launcher_stub_only_on_windows() {
-        let command = ca_warmup_command(Path::new("profile"), Path::new("firefox"), Path::new("shot.png"));
-        assert_eq!(command.get_args().any(|arg| arg == "--wait-for-browser"), cfg!(windows));
-    }
-
-    /// Run against the actual packaged Firefox in addition to the portable
-    /// command test: EPIX_TEST_FIREFOX=/path/to/firefox cargo test -p epix-browser
-    /// fresh_firefox_warmup_exits -- --ignored
-    #[test]
-    #[ignore = "requires EPIX_TEST_FIREFOX pointing to a runnable Firefox ESR"]
-    fn fresh_firefox_warmup_exits() {
-        let firefox = PathBuf::from(std::env::var_os("EPIX_TEST_FIREFOX").expect("set EPIX_TEST_FIREFOX"));
-        let profile = tempfile::tempdir().unwrap();
-        let shot = profile.path().join("startup.png");
-        let mut child = ca_warmup_command(profile.path(), &firefox, &shot)
-            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(15);
-        let status = loop {
-            if let Some(status) = child.try_wait().unwrap() { break status; }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                panic!("fresh Firefox certificate warmup did not exit within 15 seconds");
-            }
-            std::thread::sleep(Duration::from_millis(50));
-        };
-        assert!(status.success());
-        assert!(shot.is_file());
-    }
-}
-
 /// Install the starter chrome theme and, when the edition allows unsigned
 /// add-ons, the Epix Wallet extension + its native host. All best-effort:
 /// failures are logged, never fatal (the theme persists once written).
@@ -1259,4 +1223,40 @@ async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     false
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn warmup_waits_for_the_launcher_stub_only_on_windows() {
+        let command = ca_warmup_command(Path::new("profile"), Path::new("firefox"), Path::new("shot.png"));
+        assert_eq!(command.get_args().any(|arg| arg == "--wait-for-browser"), cfg!(windows));
+    }
+
+    /// Run against the actual packaged Firefox in addition to the portable
+    /// command test: EPIX_TEST_FIREFOX=/path/to/firefox cargo test -p epix-browser
+    /// fresh_firefox_warmup_exits -- --ignored
+    #[test]
+    #[ignore = "requires EPIX_TEST_FIREFOX pointing to a runnable Firefox ESR"]
+    fn fresh_firefox_warmup_exits() {
+        let firefox = PathBuf::from(std::env::var_os("EPIX_TEST_FIREFOX").expect("set EPIX_TEST_FIREFOX"));
+        let profile = tempfile::tempdir().unwrap();
+        let shot = profile.path().join("startup.png");
+        let mut child = ca_warmup_command(profile.path(), &firefox, &shot)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() { break status; }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fresh Firefox certificate warmup did not exit within 15 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.success());
+        assert!(shot.is_file());
+    }
 }

@@ -105,43 +105,43 @@ pub fn copy_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
     use std::path::PathBuf;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    struct Fixture(PathBuf);
+    struct Fixture(tempfile::TempDir);
     impl Fixture {
         fn new() -> Self {
-            static NEXT: AtomicU64 = AtomicU64::new(0);
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos();
-            let path = std::env::temp_dir().join(format!(
-                "epix-stage-{}-{nonce}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            ));
-            // Fail on collision; never reuse someone else's directory.
-            std::fs::create_dir(&path).unwrap();
-            Self(path)
+            let mut builder = tempfile::Builder::new();
+            builder.prefix("epix-stage-");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                builder.permissions(std::fs::Permissions::from_mode(0o700));
+            }
+            Self(builder.tempdir().unwrap())
         }
         fn source(&self) -> PathBuf {
-            let src = self.0.join("source");
+            let src = self.0.path().join("source");
             std::fs::create_dir_all(src.join("assets")).unwrap();
             std::fs::write(src.join("manifest.json"), r#"{"version":"1"}"#).unwrap();
             src
         }
     }
-    impl Drop for Fixture {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
+    #[cfg(unix)]
+    #[test]
+    fn fixture_directory_is_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let fixture = Fixture::new();
+        let permissions = std::fs::metadata(fixture.0.path()).unwrap().permissions();
+        assert_eq!(
+            permissions.mode() & 0o077,
+            0,
+            "fixture files must stay private to their creator"
+        );
     }
 
     #[test]
     fn changed_bundle_with_unchanged_manifest_is_staged() {
         let fixture = Fixture::new();
         let src = fixture.source();
-        let dest = fixture.0.join("dest");
+        let dest = fixture.0.path().join("dest");
         std::fs::write(src.join("assets/background.js"), "old code").unwrap();
         stage_from_local(&src, &dest);
         std::fs::write(src.join("assets/background.js"), "new code").unwrap();
@@ -156,7 +156,7 @@ mod tests {
     fn removed_assets_are_removed_and_readme_preserved() {
         let fixture = Fixture::new();
         let src = fixture.source();
-        let dest = fixture.0.join("dest");
+        let dest = fixture.0.path().join("dest");
         std::fs::write(src.join("old.js"), "old").unwrap();
         stage_from_local(&src, &dest);
         std::fs::write(dest.join("README.md"), "tracked instructions").unwrap();
@@ -178,7 +178,7 @@ mod tests {
     fn identical_tree_is_reused_and_large_files_compare_past_first_chunk() {
         let fixture = Fixture::new();
         let src = fixture.source();
-        let dest = fixture.0.join("dest");
+        let dest = fixture.0.path().join("dest");
         let mut bytes = vec![b'x'; 131073];
         std::fs::write(src.join("large.js"), &bytes).unwrap();
         stage_from_local(&src, &dest);

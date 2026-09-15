@@ -6,7 +6,7 @@ downloads, automatic retries, and I2P. It supplements the earlier
 
 ## Validation results
 
-The full Rust workspace passed **1,664 tests, zero failed, and 17 opt-in tests
+Before the PR analyzer follow-up, the full Rust workspace passed **1,664 tests, zero failed, and 17 opt-in tests
 ignored** across 106 test binaries, with the published wallet pin embedded.
 Neither `EPIX_WALLET_DIST` nor `EPIX_WALLET_SKIP` was set. Focused coverage
 includes 26 retry/lifecycle tests, 12 tracker tests, two SAM startup tests, two
