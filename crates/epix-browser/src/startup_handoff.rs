@@ -473,7 +473,8 @@ mod tests {
     #[test]
     fn target_serialization_cannot_end_the_script_element() {
         let target = "https://dashboard.epix/#</script><script>bad()</script>&\"\u{2028}\u{2029}";
-        let html = render_page(target, "/startup/token/visible", "testnonce");
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
+        let html = render_page(target, "/startup/token/visible", &nonce);
         assert_eq!(html.matches("</script>").count(), 1);
         assert!(!html.contains("<script>bad()"));
         assert!(html.contains("\\u003c/script\\u003e"));
@@ -482,13 +483,15 @@ mod tests {
 
     #[test]
     fn browser_script_waits_for_visible_paint_and_redirects_even_if_ack_fails() {
+        let nonce = uuid::Uuid::new_v4().simple().to_string();
         let html = render_page(
             "https://dashboard.epix/#ready",
             "/startup/token/visible",
-            "testnonce",
+            &nonce,
         );
+        let script_tag = format!("<script nonce=\"{nonce}\">\n");
         let script = html
-            .split("<script nonce=\"testnonce\">\n")
+            .split(&script_tag)
             .nth(1)
             .unwrap()
             .split("</script>")

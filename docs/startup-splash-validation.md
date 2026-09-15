@@ -89,6 +89,11 @@ not a full Rust/iOS application boot.
 - iOS host checks reproduced and fixed stale failed stages advancing a retry,
   backward progress, and clipped landscape content. All 37 checks passed.
   Full Swift parsing and Swift/Kotlin binding generation also passed.
+- The iOS simulator fixture passed 56 native UIKit assertions on an iPhone SE
+  running iOS 26.2, across portrait and landscape. Screenshots were inspected;
+  the animation, layout, progress and cleanup checks passed. This fixture
+  executes production startup methods with a node-state double, not a full
+  Rust/iOS application or WebKit boot.
 - Windows renderer metadata was compiled against the pinned Windows API crate;
   GTK renderer metadata was compiled against the real Rust GTK APIs. Neither
   check is a Windows/Linux GUI runtime test. CI builds the Linux workspace.
