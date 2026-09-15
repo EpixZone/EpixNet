@@ -872,7 +872,8 @@ window.initScrollable = function () {
           return false;
         };
       })(this));
-      this.tag.find("#browse-files").attr("href", document.location.pathname.replace(/(\/.*?(\/|$)).*$/, "/list$1"));
+      // Keep the server's current-xite URL. On a .epix origin the address
+      // lives in the hostname, so rebuilding this link from pathname loses it.
       this.updateOptionalProgress();
       return this.tag.find("#browse-files");
     };

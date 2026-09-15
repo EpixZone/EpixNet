@@ -1928,7 +1928,7 @@ fn render_restarting_page(theme: &str) -> String {
     page_shell("Restarting", "Restarting EpixNet", "", body, "", theme)
 }
 
-/// Percent-encode a string for use as a query-parameter value.
+/// Percent-encode a query-parameter value or one URL path segment.
 fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -2442,9 +2442,11 @@ async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) ->
 
 /// Render the file browser for a xite directory.
 fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &str) -> String {
-    let esc = |s: &str| {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-    };
+    let esc = attr_escape;
+    // Escape URL segments independently so literal '#', '%', quotes and
+    // non-ASCII filenames survive navigation without becoming markup.
+    let url_path = |path: &str| path.split('/').map(url_encode).collect::<Vec<_>>().join("/");
+    let url_address = url_encode(address);
     let human = |n: u64| {
         if n >= 1 << 20 {
             format!("{:.1} MB", n as f64 / (1 << 20) as f64)
@@ -2460,8 +2462,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         let parent = inner.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         rows.push_str(&format!(
             "<div class='row'><a class='name dir' href='/list/{address}/{parent}'>../</a></div>",
-            address = esc(address),
-            parent = esc(parent),
+            address = url_address,
+            parent = url_path(parent),
         ));
     }
     for e in entries {
@@ -2471,8 +2473,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         if is_dir {
             rows.push_str(&format!(
                 "<div class='row'><a class='name dir' href='/list/{address}/{child}'>{name}/</a></div>",
-                address = esc(address),
-                child = esc(&child),
+                address = url_address,
+                child = url_path(&child),
                 name = esc(name),
             ));
         } else {
@@ -2480,8 +2482,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
             rows.push_str(&format!(
                 "<div class='row'><a class='name' href='/{address}/{child}'>{name}</a>\
                  <span class='size'>{size}</span></div>",
-                address = esc(address),
-                child = esc(&child),
+                address = url_address,
+                child = url_path(&child),
                 name = esc(name),
             ));
         }
@@ -2492,7 +2494,7 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         format!("Files: {}", esc(address))
     } else {
         let mut heading =
-            format!("Files: <a href='/list/{a}'>{a}</a>", a = esc(address));
+            format!("Files: <a href='/list/{url_address}'>{}</a>", esc(address));
         let segs: Vec<&str> = inner.split('/').filter(|s| !s.is_empty()).collect();
         let mut prefix = String::new();
         for (i, seg) in segs.iter().enumerate() {
@@ -2505,8 +2507,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
             } else {
                 heading.push_str(&format!(
                     "/<a href='/list/{}/{}'>{}</a>",
-                    esc(address),
-                    esc(&prefix),
+                    url_address,
+                    url_path(&prefix),
                     esc(seg),
                 ));
             }
