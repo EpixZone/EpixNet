@@ -24,9 +24,8 @@ jobs:
     permissions:
       contents: read
     env:
-      # Only the Rust build matters here; skip fetching the prebuilt wallet
-      # extension (network access, unrelated to whether the workspace compiles).
-      EPIX_WALLET_SKIP: "1"
+      # The full browser suite checks the packaged wallet too. Allow build.rs
+      # to stage the release pinned by wallet-ext.rev and verify its SHA-256.
       # Treat warnings as errors so the build stays warning-free. cargo caps
       # dependency lints to `allow`, so this only gates our own crates.
       RUSTFLAGS: "-D warnings"
