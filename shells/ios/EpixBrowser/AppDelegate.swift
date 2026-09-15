@@ -63,8 +63,13 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     var currentDisplay = ""
     /// Full-screen loading splash (spinning white Epix mark) shown over the
     /// chrome while the node boots and the first page paints; removed on the
-    /// first navigation finish. Mirrors the desktop toolbar spin (PR #231).
+    /// first navigation finish. Uses the same mark and stages as desktop.
     var splashView: UIView?
+    var splashStatus: UILabel?
+    var splashDetail: UILabel?
+    var splashProgress: UIProgressView?
+    var startupTimer: Timer?
+    var startupCompleted = 0
     /// The view the splash covers, kept so a boot retry can put it back.
     var splashHost: UIView?
     /// Set once the node page (or the shell's own error page) is requested,
@@ -571,12 +576,25 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// than once: the FFI start() runs again after a failed boot.
     private func bootNode(target: String) {
         bootTarget = target
+        stopStartupPolling()
+        startupCompleted = 0
+        setStartupProgress(
+            title: "Starting EpixNet", detail: "Getting your local workspace ready.",
+            completed: 0, total: 9)
         DispatchQueue.global(qos: .userInitiated).async {
             let dataDir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].path
             try? FileManager.default.createDirectory(
                 atPath: dataDir, withIntermediateDirectories: true)
             self.writeBrowserSettings()
+            DispatchQueue.main.async {
+                self.setStartupProgress(
+                    title: "Preparing your wallet", detail: "Preparing the built-in wallet interface.",
+                    completed: 1, total: 9)
+            }
             self.stageWalletUi(dataDir: dataDir)
+            DispatchQueue.main.async {
+                self.startStartupPolling()
+            }
             let config = { (uiAddr: String) in
                 NodeConfig(
                     dataDir: dataDir,
@@ -607,6 +625,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                     self.nodeBase = "http://\(host):\(port)"
                 }
                 DispatchQueue.main.async {
+                    self.stopStartupPolling()
+                    self.setStartupProgress(
+                        title: "Opening Epix Browser", detail: "Waiting for your first page to appear.",
+                        completed: 8, total: 9)
                     self.nodePageRequested = true
                     self.load(display: target)
                 }
@@ -615,6 +637,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                 // wraps it as an enum case.
                 let message = self.node.lastError() ?? "\(error)"
                 DispatchQueue.main.async {
+                    self.stopStartupPolling()
+                    self.splashStatus?.text = "EpixNet couldn’t start"
+                    self.splashDetail?.text = message
                     self.nodePageRequested = true
                     self.showError(message)
                 }
@@ -1154,25 +1179,52 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     }
 
     /// Show the loading splash: the white Epix mark spinning on the dark chrome
-    /// background, over `host`, until the first page paints. On a cold start the
-    /// node bootstraps Tor for tens of seconds; this covers that wait (the
-    /// desktop browser spins its toolbar icon, PR #231) instead of a blank
-    /// dark screen.
+    /// background, over `host`, until the first page paints. Progress counts
+    /// local startup stages; peer connections continue in the background.
     private func presentSplash(over host: UIView) {
         let overlay = UIView(frame: host.bounds)
         overlay.autoresizingMask = [.flexibleWidth, .flexibleHeight]
         overlay.backgroundColor = Self.chromeBg
 
+        let scroll = UIScrollView()
+        scroll.translatesAutoresizingMaskIntoConstraints = false
+        overlay.addSubview(scroll)
+        let content = UIView()
+        content.translatesAutoresizingMaskIntoConstraints = false
+        scroll.addSubview(content)
+        // Prefer centering within the viewport, but let content grow and
+        // scroll in landscape or when accessibility text needs more room.
+        let viewportHeight = content.heightAnchor.constraint(equalTo: scroll.frameLayoutGuide.heightAnchor)
+        viewportHeight.priority = .defaultLow
+        NSLayoutConstraint.activate([
+            scroll.topAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.topAnchor),
+            scroll.bottomAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.bottomAnchor),
+            scroll.leadingAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: overlay.safeAreaLayoutGuide.trailingAnchor),
+            content.topAnchor.constraint(equalTo: scroll.contentLayoutGuide.topAnchor),
+            content.bottomAnchor.constraint(equalTo: scroll.contentLayoutGuide.bottomAnchor),
+            content.leadingAnchor.constraint(equalTo: scroll.contentLayoutGuide.leadingAnchor),
+            content.trailingAnchor.constraint(equalTo: scroll.contentLayoutGuide.trailingAnchor),
+            content.widthAnchor.constraint(equalTo: scroll.frameLayoutGuide.widthAnchor),
+            content.heightAnchor.constraint(greaterThanOrEqualTo: scroll.frameLayoutGuide.heightAnchor),
+            viewportHeight,
+        ])
+
+        let markHost = UIView()
+        markHost.translatesAutoresizingMaskIntoConstraints = false
         let mark = UIImageView()
         if let path = Bundle.main.path(forResource: "epix-mark-white", ofType: "png") {
             mark.image = UIImage(contentsOfFile: path)
         }
         mark.contentMode = .scaleAspectFit
         mark.translatesAutoresizingMaskIntoConstraints = false
-        overlay.addSubview(mark)
+        markHost.addSubview(mark)
         NSLayoutConstraint.activate([
-            mark.centerXAnchor.constraint(equalTo: overlay.centerXAnchor),
-            mark.centerYAnchor.constraint(equalTo: overlay.centerYAnchor),
+            // A rotated 96pt square needs up to 136pt of clearance.
+            markHost.widthAnchor.constraint(equalToConstant: 144),
+            markHost.heightAnchor.constraint(equalToConstant: 144),
+            mark.centerXAnchor.constraint(equalTo: markHost.centerXAnchor),
+            mark.centerYAnchor.constraint(equalTo: markHost.centerYAnchor),
             mark.widthAnchor.constraint(equalToConstant: 96),
             mark.heightAnchor.constraint(equalToConstant: 96),
         ])
@@ -1186,9 +1238,122 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         spin.repeatCount = .infinity
         mark.layer.add(spin, forKey: "spin")
 
+        let status = UILabel()
+        status.textColor = .white
+        status.font = UIFontMetrics(forTextStyle: .title2).scaledFont(
+            for: .systemFont(ofSize: 23, weight: .semibold))
+        status.adjustsFontForContentSizeCategory = true
+        status.numberOfLines = 0
+        status.textAlignment = .center
+        status.translatesAutoresizingMaskIntoConstraints = false
+
+        let detail = UILabel()
+        detail.textColor = UIColor(red: 0.69, green: 0.71, blue: 0.77, alpha: 1)
+        detail.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(
+            for: .systemFont(ofSize: 14))
+        detail.adjustsFontForContentSizeCategory = true
+        detail.numberOfLines = 0
+        detail.textAlignment = .center
+        detail.translatesAutoresizingMaskIntoConstraints = false
+
+        let progress = UIProgressView(progressViewStyle: .default)
+        progress.progressTintColor = UIColor(red: 0.55, green: 0.29, blue: 0.96, alpha: 1)
+        progress.trackTintColor = UIColor(red: 0.17, green: 0.18, blue: 0.24, alpha: 1)
+        progress.translatesAutoresizingMaskIntoConstraints = false
+        progress.accessibilityLabel = "Startup stages"
+        let stack = UIStackView(arrangedSubviews: [markHost, status, detail, progress])
+        stack.axis = .vertical
+        stack.alignment = .center
+        stack.spacing = 14
+        stack.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(stack)
+        let progressWidth = progress.widthAnchor.constraint(equalToConstant: 220)
+        progressWidth.priority = .defaultHigh
+        NSLayoutConstraint.activate([
+            stack.centerXAnchor.constraint(equalTo: content.centerXAnchor),
+            stack.centerYAnchor.constraint(equalTo: content.centerYAnchor),
+            stack.widthAnchor.constraint(equalTo: content.widthAnchor, constant: -48),
+            stack.topAnchor.constraint(greaterThanOrEqualTo: content.topAnchor, constant: 24),
+            stack.bottomAnchor.constraint(lessThanOrEqualTo: content.bottomAnchor, constant: -24),
+            status.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            detail.widthAnchor.constraint(equalTo: stack.widthAnchor),
+            progress.widthAnchor.constraint(lessThanOrEqualTo: stack.widthAnchor),
+            progress.heightAnchor.constraint(equalToConstant: 3),
+            progressWidth,
+        ])
+
         host.addSubview(overlay)
         splashView = overlay
         splashHost = host
+        splashStatus = status
+        splashDetail = detail
+        splashProgress = progress
+        startupCompleted = 0
+        setStartupProgress(
+            title: "Starting EpixNet", detail: "Getting your local workspace ready.",
+            completed: 0, total: 9)
+    }
+
+    /// Completed lifecycle stages, never an estimate of elapsed time or bytes.
+    private func setStartupProgress(title: String, detail: String, completed: Int, total: Int) {
+        let count = max(0, min(completed, total))
+        guard count >= startupCompleted else { return }
+        startupCompleted = count
+        splashStatus?.text = title
+        splashDetail?.text = detail
+        splashProgress?.setProgress(Float(count) / Float(max(1, total)), animated: false)
+        splashProgress?.accessibilityValue = "\(count) of \(total) stages completed"
+    }
+
+    private func startStartupPolling() {
+        stopStartupPolling()
+        guard splashView != nil, !nodePageRequested else { return }
+        startupTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            self?.pollStartupProgress()
+        }
+    }
+
+    private func stopStartupPolling() {
+        startupTimer?.invalidate()
+        startupTimer = nil
+    }
+
+    /// The FFI retains failed stages; only a live attempt may advance this UI.
+    /// Neither lifecycle nor stage reads wait for the boot operation to finish.
+    private func pollStartupProgress() {
+        guard splashView != nil, !nodePageRequested else { return }
+        let state = node.state()
+        guard state == .starting || state == .serving, let stage = node.startupStage() else { return }
+        let title: String
+        let detail: String
+        let completed: Int
+        switch stage {
+        case .preparingData:
+            title = "Starting EpixNet"
+            detail = "Getting your local workspace ready."
+            completed = 2
+        case .loadingSettings:
+            title = "Loading your settings"
+            detail = "Loading your saved preferences and identities."
+            completed = 3
+        case .restoringXites:
+            title = "Restoring your xites"
+            detail = "Checking the xites saved on this device."
+            completed = 4
+        case .rebuildingDatabases:
+            title = "Preparing local databases"
+            detail = "Preparing your saved content for browsing."
+            completed = 5
+        case .startingServices:
+            title = "Starting network services"
+            detail = "Peers connect in the background."
+            completed = 6
+        case .prepared:
+            title = "Connecting your browser"
+            detail = "Checking that the local browser connection is ready."
+            completed = 7
+        }
+        setStartupProgress(title: title, detail: detail, completed: completed, total: 9)
     }
 
     /// Tell the node when the network comes back, so it retries what was
@@ -1219,8 +1384,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 
     /// Fade the loading splash out and remove it. Idempotent.
     func hideSplash() {
+        stopStartupPolling()
         guard let overlay = splashView else { return }
         splashView = nil
+        splashStatus = nil
+        splashDetail = nil
+        splashProgress = nil
         UIView.animate(
             withDuration: 0.25,
             animations: { overlay.alpha = 0 },

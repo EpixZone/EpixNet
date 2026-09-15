@@ -1,0 +1,47 @@
+name: Startup UI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'shells/ios/EpixBrowser/**'
+      - 'shells/ios/tests/**'
+      - 'shells/android/app/src/main/java/zone/epix/app/**'
+      - 'shells/android/tests/**'
+      - 'crates/epix-browser/src/startup*'
+      - 'crates/epix-ffi/src/lib.rs'
+      - '.github/workflows/startup-ui.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: startup-ui-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  ios-native:
+    name: iOS native startup widgets
+    runs-on: macos-15
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check startup lifecycle and navigation regressions
+        run: |
+          python3 shells/ios/tests/run-regressions.py
+          python3 shells/ios/tests/run-startup-regressions.py
+      - name: Render production startup widgets in an isolated iPhone simulator
+        run: python3 shells/ios/tests/run-native-startup-ui.py --output "$RUNNER_TEMP/epix-startup-ui"
+      - name: Retain simulator screenshots and native assertions
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: ios-startup-ui-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/epix-startup-ui/*.png
+            ${{ runner.temp }}/epix-startup-ui/*.json
+            ${{ runner.temp }}/epix-startup-ui/*.log
+            ${{ runner.temp }}/epix-startup-ui/*.swift
+          if-no-files-found: warn
+          retention-days: 14

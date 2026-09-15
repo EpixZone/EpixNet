@@ -9,9 +9,12 @@
 //! The bindings are generated at mobile-build time by `uniffi-bindgen` from
 //! this crate's exported types (proc-macro mode - no UDL).
 
-use epix_node::{boot, AppState, NodeOptions, RunningNode};
+use epix_node::{boot_with_progress, AppState, NodeOptions, RunningNode};
 extern "C" { #[link_name = "dup2"] fn libc_dup2(oldfd: i32, newfd: i32) -> i32; }
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    atomic::{AtomicU8, Ordering},
+    Arc, Mutex,
+};
 use tokio::runtime::Runtime;
 
 uniffi::setup_scaffolding!();
@@ -42,6 +45,31 @@ pub enum NodeState {
     Starting,
     Serving,
     Failed,
+}
+
+/// Current local startup work. Prepared means the UI listener is owned;
+/// mobile shells still wait for their first page before completing the bar.
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupStage {
+    PreparingData,
+    LoadingSettings,
+    RestoringXites,
+    RebuildingDatabases,
+    StartingServices,
+    Prepared,
+}
+
+impl From<epix_node::BootStage> for StartupStage {
+    fn from(stage: epix_node::BootStage) -> Self {
+        match stage {
+            epix_node::BootStage::PreparingData => Self::PreparingData,
+            epix_node::BootStage::LoadingSettings => Self::LoadingSettings,
+            epix_node::BootStage::RestoringXites => Self::RestoringXites,
+            epix_node::BootStage::RebuildingDatabases => Self::RebuildingDatabases,
+            epix_node::BootStage::StartingServices => Self::StartingServices,
+            epix_node::BootStage::Prepared => Self::Prepared,
+        }
+    }
 }
 
 /// A failure crossing the FFI boundary.
@@ -75,6 +103,9 @@ struct Inner {
 pub struct EpixNode {
     rt: Runtime,
     inner: Mutex<Inner>,
+    // A shell can read progress while start() is blocked, without waiting on
+    // the state mutex. Zero means no boot has been attempted.
+    startup_stage: AtomicU8,
 }
 
 #[uniffi::export]
@@ -98,6 +129,7 @@ impl EpixNode {
             .expect("build tokio runtime");
         Arc::new(Self {
             rt,
+            startup_stage: AtomicU8::new(0),
             inner: Mutex::new(Inner {
                 state: NodeState::Idle,
                 node: None,
@@ -119,6 +151,7 @@ impl EpixNode {
             }
             inner.state = NodeState::Starting;
             inner.error = None;
+            self.startup_stage.store(1, Ordering::Relaxed);
         }
         // GeoIP city DB for the sidebar globe's peer-location dots. Bundled the
         // same way the standalone server ships it; without it the node disables
@@ -151,7 +184,11 @@ impl EpixNode {
         // owned before it points a web view at ui_url. Boot retains that
         // listener inside UiServer; the background task only starts accepting.
         let booted: Result<RunningNode, String> = self.rt.block_on(async {
-            let (server, running) = boot(opts).await?;
+            let (server, running) = boot_with_progress(opts, |stage| {
+                self.startup_stage
+                    .store(StartupStage::from(stage) as u8 + 1, Ordering::Relaxed);
+            })
+            .await?;
             let ui_addr = running.ui_addr;
             tokio::spawn(async move {
                 let _ = server.serve(ui_addr).await;
@@ -178,6 +215,20 @@ impl EpixNode {
     /// The node's current lifecycle state.
     pub fn state(&self) -> NodeState {
         self.inner.lock().unwrap().state
+    }
+
+    /// A nonblocking snapshot for startup UI polling. Reset for each actual
+    /// start attempt; failures retain the last stage reached.
+    pub fn startup_stage(&self) -> Option<StartupStage> {
+        match self.startup_stage.load(Ordering::Relaxed) {
+            1 => Some(StartupStage::PreparingData),
+            2 => Some(StartupStage::LoadingSettings),
+            3 => Some(StartupStage::RestoringXites),
+            4 => Some(StartupStage::RebuildingDatabases),
+            5 => Some(StartupStage::StartingServices),
+            6 => Some(StartupStage::Prepared),
+            _ => None,
+        }
     }
 
     /// The last error, if the node failed to start.
@@ -272,6 +323,79 @@ pub struct TorStatus {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mobile_progress_tracks_failure_retry_and_real_offline_boot() {
+        const WORKER: &str = "EPIX_FFI_STARTUP_PROGRESS_TEST";
+        if std::env::var_os(WORKER).is_some() {
+            verify_mobile_progress();
+            return;
+        }
+        // start() redirects native stderr and installs global routing state.
+        // Keep this real boot isolated from the parent test runner.
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "tests::mobile_progress_tracks_failure_retry_and_real_offline_boot",
+                "--nocapture",
+            ])
+            .env(WORKER, "1")
+            .spawn()
+            .unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                assert!(
+                    status.success(),
+                    "mobile startup progress worker failed: {status}"
+                );
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("mobile startup progress worker timed out");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    fn verify_mobile_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir.path().join("data");
+        std::fs::create_dir_all(data.join("private")).unwrap();
+        std::fs::write(data.join("private/config.json"), b"{invalid json").unwrap();
+        let config = |root: &std::path::Path| NodeConfig {
+            data_dir: root.to_string_lossy().into_owned(),
+            target: epix_node::DASHBOARD_XITE_ADDRESS.into(),
+            ui_addr: "127.0.0.1:0".into(),
+            tor_mode: "disable".into(),
+            version: "startup-progress-test".into(),
+        };
+        let node = EpixNode::new();
+        assert_eq!(node.startup_stage(), None);
+        assert!(node.clone().start(config(&data)).is_err());
+        assert_eq!(node.startup_stage(), Some(StartupStage::LoadingSettings));
+        assert!(node.state() == NodeState::Failed);
+
+        let invalid_root = dir.path().join("file");
+        std::fs::write(&invalid_root, b"existing file").unwrap();
+        assert!(node.clone().start(config(&invalid_root)).is_err());
+        assert_eq!(node.startup_stage(), Some(StartupStage::PreparingData));
+
+        std::fs::write(
+            data.join("private/config.json"),
+            br#"{"offline":true,"xid_lc_enabled":false}"#,
+        )
+        .unwrap();
+        node.clone().start(config(&data)).unwrap();
+        assert!(node.state() == NodeState::Serving);
+        assert_eq!(node.startup_stage(), Some(StartupStage::Prepared));
+        assert!(node.ui_url().unwrap().starts_with("http://127.0.0.1:"));
+        // A duplicate start leaves the already-running node's progress intact.
+        node.clone().start(config(&invalid_root)).unwrap();
+        assert_eq!(node.startup_stage(), Some(StartupStage::Prepared));
+    }
 
     #[test]
     fn xid_names_cannot_resolve_before_node_finality_initializes() {

@@ -14,7 +14,7 @@
 //! an error and the caller falls back to running until the browser closes. The
 //! launcher must never fail to start because a tray icon could not appear.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -84,86 +84,145 @@ async fn snapshot(state: &epix_ui::AppState) -> Snapshot {
     }
 }
 
+/// Tray state driven by the application's existing main-thread event loop.
+/// The native event loop must be initialized before constructing this session.
+pub(crate) struct Session {
+    tray: tray_icon::TrayIcon,
+    // Both native objects must outlive the menu's event handling.
+    _menu: Menu,
+    handles: Handles,
+    snap: Arc<Mutex<Snapshot>>,
+    open_rx: std::sync::mpsc::Receiver<String>,
+    child: Option<Child>,
+    firefox: PathBuf,
+    profile: PathBuf,
+    start_url: String,
+    scheme: String,
+    badge_shown: Option<bool>,
+}
+
+impl Session {
+    /// Build the tray without starting or replacing the native event loop.
+    /// Return the complete context when the caller needs the no-tray fallback.
+    pub(crate) fn new(ctx: TrayContext) -> Result<Self, TrayContext> {
+        if let Some(reason) = unavailable_reason() {
+            log_unavailable(reason);
+            return Err(ctx);
+        }
+
+        // Native tray construction can panic on desktops without a usable
+        // toolkit. These objects remain on this thread, so unwind safety is
+        // sufficient to preserve the existing browser fallback.
+        let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&ctx)));
+        let (tray, menu, handles) = match built {
+            Ok(Ok(built)) => built,
+            Ok(Err(reason)) => {
+                log_unavailable(&reason);
+                return Err(ctx);
+            }
+            Err(_) => {
+                log_unavailable("tray init panicked");
+                return Err(ctx);
+            }
+        };
+
+        let snap = Arc::new(Mutex::new(Snapshot::default()));
+        spawn_stats_refresh(&ctx.rt, ctx.ready.state.clone(), snap.clone());
+        Ok(Self {
+            tray,
+            _menu: menu,
+            handles,
+            snap,
+            open_rx: ctx.open_rx,
+            child: ctx.child,
+            firefox: ctx.ready.firefox,
+            profile: ctx.ready.profile,
+            start_url: ctx.ready.start_url,
+            scheme: ctx.ready.scheme,
+            // Force the first draw so an existing unread badge appears.
+            badge_shown: None,
+        })
+    }
+
+    /// Refresh native state and process pending actions. Return true for Quit,
+    /// after closing the managed browser, so the caller can exit its event loop.
+    pub(crate) fn tick(&mut self) -> bool {
+        refresh_menu_stats(&self.handles, &self.snap);
+
+        let has_unread = self.snap.lock().map(|s| s.notif_count > 0).unwrap_or(false);
+        if self.badge_shown != Some(has_unread) {
+            self.badge_shown = Some(has_unread);
+            let _ = self.tray.set_icon(Some(icon_with_badge(has_unread)));
+        }
+
+        // Apply the Epix icon to newly opened Firefox windows as well.
+        #[cfg(windows)]
+        crate::icon::stamp_firefox_windows(&self.firefox);
+
+        // Later launches hand their targets to this running node.
+        while let Ok(arg) = self.open_rx.try_recv() {
+            let url = target_url(&self.scheme, &arg);
+            reopen_browser(&mut self.child, &self.firefox, &self.profile, &url);
+        }
+
+        while let Ok(ev) = MenuEvent::receiver().try_recv() {
+            if on_menu_event(
+                &ev,
+                &self.handles,
+                &mut self.child,
+                &self.firefox,
+                &self.profile,
+                &self.start_url,
+            ) {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+fn unavailable_reason() -> Option<&'static str> {
+    if std::env::var("EPIX_NO_TRAY").is_ok_and(|v| v != "0" && !v.is_empty()) {
+        Some("disabled by EPIX_NO_TRAY")
+    } else if !display_available() {
+        Some("no display (DISPLAY/WAYLAND_DISPLAY unset)")
+    } else {
+        None
+    }
+}
+
+fn log_unavailable(reason: &str) {
+    eprintln!("· system tray unavailable ({reason}); running until the browser closes");
+}
+
 /// Run the tray on the calling (main) thread. On success it takes over the
 /// thread and only returns by exiting the process from the Quit item. When no
 /// tray can be shown it logs why and hands the browser process back in `Err`,
 /// so the caller can fall back to waiting on it.
-pub fn run(ctx: TrayContext) -> Result<(), Option<Child>> {
-    let unavailable = |reason: &str, child: Option<Child>| {
-        eprintln!("· system tray unavailable ({reason}); running until the browser closes");
-        Err(child)
-    };
-
-    if std::env::var("EPIX_NO_TRAY").is_ok_and(|v| v != "0" && !v.is_empty()) {
-        return unavailable("disabled by EPIX_NO_TRAY", ctx.child);
+pub fn run(ctx: TrayContext, event_loop: Option<EventLoop<()>>) -> Result<(), Option<Child>> {
+    // Do not initialize a native toolkit when there is no display or the tray
+    // is disabled. Session::new also checks this for the startup-window path.
+    if let Some(reason) = unavailable_reason() {
+        log_unavailable(reason);
+        return Err(ctx.child);
     }
-    // Linux/BSD without a display has no tray host; don't even try to init GTK.
-    #[cfg(all(unix, not(target_os = "macos")))]
-    if std::env::var_os("DISPLAY").is_none() && std::env::var_os("WAYLAND_DISPLAY").is_none() {
-        return unavailable("no display (DISPLAY/WAYLAND_DISPLAY unset)", ctx.child);
-    }
-
-    // Building the event loop + tray touches native toolkits (GTK on Linux)
-    // that can panic on some setups. Catch it so we fall back instead of
-    // aborting the whole launcher. The built objects never cross threads here,
-    // so asserting unwind-safety is sound.
-    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| build(&ctx)));
-    let (event_loop, tray, menu, handles) = match built {
-        Ok(Ok(v)) => v,
-        Ok(Err(e)) => return unavailable(&e, ctx.child),
-        Err(_) => return unavailable("tray init panicked", ctx.child),
+    let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        event_loop.unwrap_or_else(create_event_loop)
+    }));
+    let event_loop = match built {
+        Ok(event_loop) => event_loop,
+        Err(_) => {
+            log_unavailable("event loop init panicked");
+            return Err(ctx.child);
+        }
     };
-
-    // Refresh the stats snapshot on the node's runtime every second.
-    let snap = Arc::new(Mutex::new(Snapshot::default()));
-    spawn_stats_refresh(&ctx.rt, ctx.ready.state.clone(), snap.clone());
-
-    let menu_rx = MenuEvent::receiver();
-    let open_rx = ctx.open_rx;
-    let mut child = ctx.child;
-    let firefox = ctx.ready.firefox.clone();
-    let profile = ctx.ready.profile.clone();
-    let start_url = ctx.ready.start_url.clone();
-    let scheme = ctx.ready.scheme.clone();
-    // Keep the tray and menu alive for the whole run; dropping either removes
-    // the icon. The loop below diverges, so these never actually drop. The tray
-    // is moved into the closure so its icon can be redrawn with the unread dot.
-    let _menu = menu;
-    // Whether the tray currently shows the unread dot; `None` forces the first
-    // draw so a badge already present at startup appears.
-    let mut badge_shown: Option<bool> = None;
-
+    let mut session = Session::new(ctx).map_err(|ctx| ctx.child)?;
     event_loop.run(move |_event, _target, control_flow| {
-        *control_flow = ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1000));
-
-        refresh_menu_stats(&handles, &snap);
-
-        // Tray notification dot: redraw only when the unread total crosses zero,
-        // so we don't rebuild the icon every tick.
-        let has_unread = snap.lock().map(|s| s.notif_count > 0).unwrap_or(false);
-        if badge_shown != Some(has_unread) {
-            badge_shown = Some(has_unread);
-            let _ = tray.set_icon(Some(icon_with_badge(has_unread)));
-        }
-
-        // Windows: keep the Epix icon on Firefox's windows. Applied to the
-        // live windows each tick (not patched into firefox.exe), so windows
-        // opened later get it too and a Firefox self-update can't revert it.
-        #[cfg(windows)]
-        crate::icon::stamp_firefox_windows(&firefox);
-
-        // A later launch of EpixNet hands its target here instead of starting
-        // a second node; open it in the running browser.
-        while let Ok(arg) = open_rx.try_recv() {
-            let url = target_url(&scheme, &arg);
-            reopen_browser(&mut child, &firefox, &profile, &url);
-        }
-
-        while let Ok(ev) = menu_rx.try_recv() {
-            if on_menu_event(&ev, &handles, &mut child, &firefox, &profile, &start_url) {
-                *control_flow = ControlFlow::Exit;
-            }
-        }
+        *control_flow = if session.tick() {
+            ControlFlow::Exit
+        } else {
+            ControlFlow::WaitUntil(Instant::now() + Duration::from_millis(1000))
+        };
     });
 }
 
@@ -282,11 +341,21 @@ struct Handles {
     quit: muda::MenuId,
 }
 
-type Built = (EventLoop<()>, tray_icon::TrayIcon, Menu, Handles);
+type Built = (tray_icon::TrayIcon, Menu, Handles);
 
-/// Create the event loop (this initialises GTK on Linux), the menu, and the
-/// tray icon. Any step here may fail or panic on an unsupported host.
-fn build(ctx: &TrayContext) -> Result<Built, String> {
+pub(crate) fn display_available() -> bool {
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        std::env::var_os("DISPLAY").is_some() || std::env::var_os("WAYLAND_DISPLAY").is_some()
+    }
+    #[cfg(any(target_os = "macos", windows))]
+    {
+        true
+    }
+}
+
+/// One application event loop serves both the startup window and the tray.
+pub(crate) fn create_event_loop() -> EventLoop<()> {
     // The event loop must exist before the tray on Linux (it inits GTK).
     #[allow(unused_mut)]
     let mut event_loop: EventLoop<()> = EventLoopBuilder::new().build();
@@ -298,7 +367,11 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
         use tao::platform::macos::{ActivationPolicy, EventLoopExtMacOS};
         event_loop.set_activation_policy(ActivationPolicy::Accessory);
     }
+    event_loop
+}
 
+/// Create the menu and tray after the native event loop has been initialized.
+fn build(ctx: &TrayContext) -> Result<Built, String> {
     let menu = Menu::new();
     let open = MenuItem::new("Open EpixNet", true, None);
     let header = MenuItem::new(format!("EpixNet {}", ctx.ready.version), false, None);
@@ -366,7 +439,7 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
         .build()
         .map_err(|e| format!("build tray: {e}"))?;
 
-    Ok((event_loop, tray, menu, handles))
+    Ok((tray, menu, handles))
 }
 
 /// Decode the embedded PNG into a tray icon, falling back to a solid brand
@@ -441,15 +514,7 @@ fn target_url(scheme: &str, arg: &str) -> String {
 /// still running, asks Firefox (remote) to raise it - best-effort.
 fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url: &str) {
     let spawn_fresh = |child: &mut Option<Child>| {
-        let mut cmd = Command::new(firefox);
-        // --allow-downgrade: skip the "older version of Firefox" modal that
-        // would otherwise block startup if the profile was last opened by a
-        // newer Firefox (see launch_browser in main.rs).
-        cmd.arg("--allow-downgrade").arg("--profile").arg(profile).arg("--no-remote").arg("--new-instance");
-        // Linux: match our .desktop entry (StartupWMClass=EpixNet) so the
-        // shell shows the Epix icon for the browser window.
-        #[cfg(all(unix, not(target_os = "macos")))]
-        cmd.args(["--class", "EpixNet", "--name", "EpixNet"]);
+        let mut cmd = crate::browser_process::browser_command(firefox, profile);
         if let Ok(c) = cmd.arg(url).spawn() {
             *child = Some(c);
         }
@@ -471,13 +536,17 @@ fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url
 /// Close the managed browser on quit: a graceful TERM first (unix - lets
 /// Firefox flush session state), then a hard kill if it lingers. No-op when
 /// there is no window or it already closed.
-fn close_browser(child: &mut Option<Child>) {
+pub(crate) fn close_browser(child: &mut Option<Child>) {
     let Some(child) = child.as_mut() else { return };
     if matches!(child.try_wait(), Ok(Some(_))) {
         return;
     }
-    #[cfg(unix)]
+    #[cfg(windows)]
+    crate::browser_process::close_browser_tree(child);
+    #[cfg(not(windows))]
     {
+        #[cfg(unix)]
+        {
         let _ = Command::new("kill").arg(child.id().to_string()).status();
         for _ in 0..20 {
             if matches!(child.try_wait(), Ok(Some(_))) {
@@ -485,9 +554,10 @@ fn close_browser(child: &mut Option<Child>) {
             }
             std::thread::sleep(Duration::from_millis(100));
         }
+        }
+        let _ = child.kill();
+        let _ = child.wait();
     }
-    let _ = child.kill();
-    let _ = child.wait();
 }
 
 /// Park the current thread forever, keeping the process (and the node) alive.
