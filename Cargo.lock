@@ -2845,6 +2845,7 @@ dependencies = [
  "epix-chain",
  "epix-content",
  "epix-core",
+ "epix-crypt",
  "epix-plugin",
  "epix-plugins",
  "epix-runtime",

@@ -989,10 +989,10 @@ class MainActivity : AppCompatActivity() {
             // for something that would otherwise parse as an address.
             t.startsWith("?") -> searchUrl(t.removePrefix("?"))
             t.startsWith("http://") || t.startsWith("https://") -> t
-            t.startsWith("epix://") -> {
-                val host = t.removePrefix("epix://").substringBefore('/')
-                currentDisplay = host
-                nodeUrl(host)
+            t.startsWith("epix://", ignoreCase = true) -> {
+                val rewritten = xiteRewrite(t) ?: return
+                currentDisplay = rewritten.removePrefix("$NODE_BASE/")
+                rewritten
             }
             // Explicit xite addresses go to the node: epix1... or something.epix.
             t.startsWith("epix1") || t.endsWith(".epix") -> {
@@ -1152,7 +1152,9 @@ class MainActivity : AppCompatActivity() {
         try {
             val config = NodeConfig(
                 dataDir = filesDir.absolutePath,
-                target = target,
+                // Resolve only the xite name; preserve the complete target
+                // for navigation after the node starts.
+                target = target.substringBefore('/'),
                 uiAddr = "127.0.0.1:$UI_PORT",
                 torMode = "enable",
                 version = BuildConfig.VERSION_NAME,
@@ -1681,15 +1683,15 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun nodeUrl(name: String): String = "$NODE_BASE/$name/"
+    private fun nodeUrl(name: String): String = xiteRewrite("epix://$name") ?: "$NODE_BASE/"
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
     /** Pull the xite target out of an `epix://host/path` VIEW intent. */
     private fun intentTarget(intent: Intent?): String? {
         val data: Uri = intent?.data ?: return null
-        if (data.scheme != "epix") return null
-        return data.host ?: data.toString().removePrefix("epix://").substringBefore('/')
+        if (!data.scheme.equals("epix", ignoreCase = true)) return null
+        return xiteRewrite(data.toString())?.removePrefix("$NODE_BASE/")
     }
 
     companion object {

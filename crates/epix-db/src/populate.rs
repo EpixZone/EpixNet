@@ -4,12 +4,13 @@
 //! (`to_table`), key/value pairs (`to_keyvalue`), and per-file columns
 //! (`to_json_table`), each tagged with the file's `json_id`.
 
-use crate::schema::{DbSchema, ToTable};
+use crate::schema::{DbSchema, MapSettings, ToTable};
 use epix_core::{Error, Result};
 use regex::Regex;
 use rusqlite::types::{Value as SqlValue, ValueRef};
 use rusqlite::Connection;
 use serde_json::{Map, Value};
+use std::borrow::Cow;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
 
@@ -167,6 +168,18 @@ pub fn update_json(
     data: &Value,
     xite: &str,
 ) -> Result<bool> {
+    crate::atomic(conn, || {
+        update_json_inner(conn, schema, rel_path, data, xite)
+    })
+}
+
+fn update_json_inner(
+    conn: &Connection,
+    schema: &DbSchema,
+    rel_path: &str,
+    data: &Value,
+    xite: &str,
+) -> Result<bool> {
     let mut matched = false;
     for (pattern, map) in &schema.maps {
         let re = Regex::new(&format!("^(?:{pattern})")).map_err(|e| Error::Db(e.to_string()))?;
@@ -174,130 +187,158 @@ pub fn update_json(
             continue;
         }
         matched = true;
-        let jid = json_id(conn, schema, rel_path, xite)?;
+        populate_map(conn, schema, rel_path, data, xite, map)?;
+    }
+    Ok(matched)
+}
 
-        // to_keyvalue
-        for key in &map.to_keyvalue {
+fn populate_map(
+    conn: &Connection,
+    schema: &DbSchema,
+    rel_path: &str,
+    data: &Value,
+    xite: &str,
+    map: &MapSettings,
+) -> Result<()> {
+    let jid = json_id(conn, schema, rel_path, xite)?;
+    for key in &map.to_keyvalue {
+        let val = to_sql(data.get(key).unwrap_or(&Value::Null));
+        conn.execute(
+            "INSERT OR REPLACE INTO keyvalue (json_id, key, value) VALUES (?1, ?2, ?3)",
+            rusqlite::params![jid, key, val],
+        )
+        .map_err(db_err)?;
+    }
+
+    // A user's content.json can attach cert_user_id to its sibling data.json,
+    // where post/profile queries join it. Preserve metadata-before-rows order.
+    if !map.to_json_table.is_empty() {
+        let target_jid = map_json_id(conn, schema, rel_path, xite, map.file_name.as_deref(), jid)?;
+        for key in &map.to_json_table {
             let val = to_sql(data.get(key).unwrap_or(&Value::Null));
             conn.execute(
-                "INSERT OR REPLACE INTO keyvalue (json_id, key, value) VALUES (?1, ?2, ?3)",
-                rusqlite::params![jid, key, val],
+                &format!("UPDATE json SET {key} = ?1 WHERE json_id = ?2"),
+                rusqlite::params![val, target_jid],
             )
             .map_err(db_err)?;
         }
+    }
 
-        // to_json_table: set columns on a json row - the matched file's own,
-        // or (with the map's `file_name`) its sibling's. EpixNet stores a
-        // user's cert_user_id from content.json onto the data.json row, where
-        // the post/topic queries join it from.
-        if !map.to_json_table.is_empty() {
-            let target_jid = match &map.file_name {
-                Some(file_name) => {
-                    let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                    let sibling = if dir.is_empty() {
-                        file_name.clone()
-                    } else {
-                        format!("{dir}/{file_name}")
-                    };
-                    json_id(conn, schema, &sibling, xite)?
-                }
-                None => jid,
-            };
-            for key in &map.to_json_table {
-                let val = to_sql(data.get(key).unwrap_or(&Value::Null));
-                conn.execute(
-                    &format!("UPDATE json SET {key} = ?1 WHERE json_id = ?2"),
-                    rusqlite::params![val, target_jid],
-                )
-                .map_err(db_err)?;
-            }
+    // The sibling json row is created even for maps with no table entries.
+    let table_jid = map_json_id(conn, schema, rel_path, xite, map.file_name.as_deref(), jid)?;
+    let table_data = folded_table_data(data, map.fold_crdt.as_deref());
+    for entry in &map.to_table {
+        replace_mapped_rows(conn, schema, entry, &table_data, table_jid)?;
+    }
+    Ok(())
+}
+
+fn map_json_id(
+    conn: &Connection,
+    schema: &DbSchema,
+    rel_path: &str,
+    xite: &str,
+    file_name: Option<&str>,
+    own_jid: i64,
+) -> Result<i64> {
+    let Some(file_name) = file_name else {
+        return Ok(own_jid);
+    };
+    let dir = rel_path.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+    let sibling = if dir.is_empty() {
+        file_name.to_string()
+    } else {
+        format!("{dir}/{file_name}")
+    };
+    json_id(conn, schema, &sibling, xite)
+}
+
+/// Fold merge-file records to live CRDT winners before table routing, without
+/// copying ordinary JSON files. Tombstones and losing versions stay excluded.
+fn folded_table_data<'a>(data: &'a Value, fold_node: Option<&str>) -> Cow<'a, Value> {
+    let Some(fold_node) = fold_node else {
+        return Cow::Borrowed(data);
+    };
+    let live = epix_content::live_records(data);
+    let mut folded = data.clone();
+    if let Value::Object(fields) = &mut folded {
+        fields.insert(fold_node.to_string(), Value::Array(live));
+    }
+    Cow::Owned(folded)
+}
+
+fn replace_mapped_rows(
+    conn: &Connection,
+    schema: &DbSchema,
+    entry: &ToTable,
+    data: &Value,
+    jid: i64,
+) -> Result<()> {
+    let table = entry.table();
+    let allowed = allowed_cols(schema, entry);
+    conn.execute(&format!("DELETE FROM {table} WHERE json_id = ?1"), [jid])
+        .map_err(db_err)?;
+    let Some(node_data) = data.get(entry.node()) else {
+        return Ok(());
+    };
+    match entry {
+        ToTable::Spec {
+            key_col: Some(key_col),
+            val_col,
+            ..
+        } => {
+            insert_dict_rows(
+                conn,
+                table,
+                &allowed,
+                node_data,
+                key_col,
+                val_col.as_deref(),
+                jid,
+            )?;
         }
-
-        // Merge-file rows (posts.json) attach to the SIBLING data.json json row
-        // (via `file_name`) so post -> profile joins resolve, and the versioned
-        // node is folded to its live CRDT winners first (tombstones and
-        // superseded/concurrent-losing versions dropped).
-        let table_jid = match &map.file_name {
-            Some(fname) => {
-                let dir = rel_path.rsplit_once('/').map(|(d, _)| d).unwrap_or("");
-                let sibling = if dir.is_empty() {
-                    fname.clone()
-                } else {
-                    format!("{dir}/{fname}")
-                };
-                json_id(conn, schema, &sibling, xite)?
-            }
-            None => jid,
-        };
-        let folded_owned;
-        let table_data: &Value = match &map.fold_crdt {
-            Some(fold_node) => {
-                let live = epix_content::live_records(data);
-                let mut d = data.clone();
-                if let Value::Object(m) = &mut d {
-                    m.insert(fold_node.clone(), Value::Array(live));
-                }
-                folded_owned = d;
-                &folded_owned
-            }
-            None => data,
-        };
-
-        // to_table
-        for entry in &map.to_table {
-            let table = entry.table();
-            let node = entry.node();
-            let allowed = allowed_cols(schema, entry);
-            conn.execute(
-                &format!("DELETE FROM {table} WHERE json_id = ?1"),
-                [table_jid],
-            )
-            .map_err(db_err)?;
-
-            let Some(node_data) = table_data.get(node) else {
-                continue;
-            };
-
-            match entry {
-                // Dict-mapped: `key_col` carries the map key.
-                ToTable::Spec {
-                    key_col: Some(key_col),
-                    val_col,
-                    ..
-                } => {
-                    if let Some(obj) = node_data.as_object() {
-                        for (k, v) in obj {
-                            if let Some(val_col) = val_col {
-                                let mut row = Map::new();
-                                row.insert(key_col.clone(), Value::from(k.clone()));
-                                row.insert(val_col.clone(), v.clone());
-                                insert_row(conn, table, &allowed, &row, table_jid)?;
-                            } else if let Some(row_obj) = v.as_object() {
-                                let mut row = row_obj.clone();
-                                row.insert(key_col.clone(), Value::from(k.clone()));
-                                insert_row(conn, table, &allowed, &row, table_jid)?;
-                            } else if let Some(rows) = v.as_array() {
-                                for r in rows.iter().filter_map(|r| r.as_object()) {
-                                    let mut row = r.clone();
-                                    row.insert(key_col.clone(), Value::from(k.clone()));
-                                    insert_row(conn, table, &allowed, &row, table_jid)?;
-                                }
-                            }
-                        }
-                    }
-                }
-                // List of rows.
-                _ => {
-                    if let Some(rows) = node_data.as_array() {
-                        for r in rows.iter().filter_map(|r| r.as_object()) {
-                            insert_row(conn, table, &allowed, r, table_jid)?;
-                        }
-                    }
+        _ => {
+            if let Some(rows) = node_data.as_array() {
+                for row in rows.iter().filter_map(Value::as_object) {
+                    insert_row(conn, table, &allowed, row, jid)?;
                 }
             }
         }
     }
-    Ok(matched)
+    Ok(())
+}
+
+fn insert_dict_rows(
+    conn: &Connection,
+    table: &str,
+    allowed: &[String],
+    data: &Value,
+    key_col: &str,
+    val_col: Option<&str>,
+    jid: i64,
+) -> Result<()> {
+    let Some(entries) = data.as_object() else {
+        return Ok(());
+    };
+    for (key, value) in entries {
+        if let Some(val_col) = val_col {
+            let mut row = Map::new();
+            row.insert(key_col.to_string(), Value::from(key.clone()));
+            row.insert(val_col.to_string(), value.clone());
+            insert_row(conn, table, allowed, &row, jid)?;
+        } else if let Some(fields) = value.as_object() {
+            let mut row = fields.clone();
+            row.insert(key_col.to_string(), Value::from(key.clone()));
+            insert_row(conn, table, allowed, &row, jid)?;
+        } else if let Some(rows) = value.as_array() {
+            for fields in rows.iter().filter_map(Value::as_object) {
+                let mut row = fields.clone();
+                row.insert(key_col.to_string(), Value::from(key.clone()));
+                insert_row(conn, table, allowed, &row, jid)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Populate the db by scanning every file under `db_dir` and routing the ones
@@ -788,6 +829,58 @@ mod merge_tests {
     use crate::schema::{apply, DbSchema};
     use rusqlite::Connection;
     use serde_json::json;
+
+    #[test]
+    fn failed_json_update_preserves_previous_rows_and_metadata() {
+        let schema = DbSchema::from_json(
+            r#"{"db_name":"Atomic","db_file":"db.db","version":2,
+                "maps":{"data.json":{"to_table":["post"],"to_keyvalue":["revision"]}},
+                "tables":{"post":{"cols":[["body","TEXT NOT NULL"],["json_id","INTEGER"]]}}}"#,
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn, &schema).unwrap();
+        update_json(
+            &conn,
+            &schema,
+            "data.json",
+            &json!({
+                "revision": 1, "post": [{"body": "original"}]
+            }),
+            "",
+        )
+        .unwrap();
+
+        let error = update_json(
+            &conn,
+            &schema,
+            "data.json",
+            &json!({
+                "revision": 2, "post": [{"body": "partial replacement"}, {"body": null}]
+            }),
+            "",
+        );
+        assert!(error.is_err(), "the second row must violate NOT NULL");
+        assert_eq!(
+            query(&conn, "SELECT body FROM post", &[]).unwrap(),
+            vec![json!({"body": "original"})],
+            "failed updates must roll back all rows"
+        );
+        assert_eq!(
+            query(
+                &conn,
+                "SELECT value FROM keyvalue WHERE key = 'revision'",
+                &[]
+            )
+            .unwrap(),
+            vec![json!({"value": 1})],
+            "metadata must roll back with the rows"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "failed updates must release the transaction"
+        );
+    }
 
     fn epixpost_schema() -> DbSchema {
         DbSchema::from_json(

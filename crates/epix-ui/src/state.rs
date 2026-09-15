@@ -104,6 +104,13 @@ pub trait OnDemandResolver: Send + Sync {
     /// locked-down node can still follow an xID to a xite it already serves.
     async fn resolve(&self, host: &str) -> Option<ResolvedHost>;
 
+    /// Whether a name already has a live resolver; background retries must
+    /// not accumulate another waiting request on every scheduler tick.
+    fn is_resolving(&self, _host: &str) -> bool { false }
+
+    /// Stop an existing detached clone before its xite is deleted.
+    async fn cancel(&self, _address: &str) {}
+
     /// The network came back (the OS said so, or the user tapped Retry):
     /// retry whatever was parked on it. Default: nothing to retry.
     fn network_changed(&self) {}
@@ -613,23 +620,9 @@ static ROOT_SIGN_BEFORE_CACHE_PAUSE: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 #[cfg(test)]
-static MERGER_DB_BEFORE_INSTALL_PAUSE: std::sync::LazyLock<
-    std::sync::Mutex<
-        Option<(
-            Arc<tokio::sync::Notify>,
-            Arc<tokio::sync::Semaphore>,
-        )>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-#[cfg(test)]
-static DB_QUERY_AFTER_RECEIPT_PAUSE: std::sync::LazyLock<
-    std::sync::Mutex<
-        Option<(
-            Arc<tokio::sync::Notify>,
-            Arc<tokio::sync::Semaphore>,
-        )>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+type DbTestPause = std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+>;
 #[cfg(test)]
 static DB_SNAPSHOT_XID_FAIL_ONCE: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
@@ -3563,6 +3556,26 @@ pub struct XiteEntry {
     pub content: Option<Value>,
 }
 
+/// Session-local download state, retained between attempts and websocket
+/// connections. Peer counts exclude this node's own served registry entry.
+#[derive(Clone, serde::Serialize)]
+struct CloneStatus {
+    state: &'static str,
+    attempt: u32,
+    next_retry_at: Option<i64>,
+    reason: Option<String>,
+    peers: usize,
+    #[serde(skip)]
+    progress: serde_json::Map<String, Value>,
+}
+
+impl Default for CloneStatus {
+    fn default() -> Self {
+        Self { state: "discovering", attempt: 0, next_retry_at: None, reason: None, peers: 0,
+            progress: serde_json::Map::new() }
+    }
+}
+
 /// A served xite with its derived runtime state.
 struct ManagedXite {
     storage: XiteStorage,
@@ -4208,6 +4221,9 @@ pub struct AppState {
     /// The fileserver (seeding) TCP port, 0 if seeding is disabled. Reported by
     /// `serverInfo`.
     fileserver_port: RwLock<u16>,
+    /// Actual bound TCP listener, independent of the overlay virtual port.
+    /// Absent on download-only/mobile nodes and until the accept loop is ready.
+    clearnet_listener: RwLock<Option<std::net::SocketAddr>>,
     /// UPnP: whether the fileserver port is currently open to the internet, and
     /// the node's external IP if known. Set by the runtime's UPnP loop; read by
     /// `serverInfo`. Default closed / unknown.
@@ -4274,6 +4290,11 @@ pub struct AppState {
     /// answered with "database is locked" style errors, which froze app boot
     /// chains that expected rows (EpixTalk's loading overlay, stuck forever).
     db_rebuilds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    // A fixture's synchronization hooks must not pause another AppState.
+    #[cfg(test)]
+    merger_db_before_install_pause: DbTestPause,
+    #[cfg(test)]
+    db_query_after_receipt_pause: DbTestPause,
     /// Canonicals whose last verified index WITHHELD a verdict on at least one
     /// child because an xID name could not be resolved for a non-authoritative
     /// reason (chain unreachable at boot, hostile proof, trust not up yet).
@@ -4330,6 +4351,10 @@ pub struct AppState {
     /// serving gate reads this: while a clone runs, the page document waits
     /// for the whole core set instead of booting half-downloaded.
     clones_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    clone_statuses: std::sync::Mutex<HashMap<String, CloneStatus>>,
+    clone_retry_wakes: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
+    clone_retry_dirty: std::sync::Mutex<std::collections::HashSet<String>>,
+    download_retry_wake: tokio::sync::Notify,
     /// Xite addresses with a bulk optional-file download running
     /// ([`Self::download_optional_files`]), so overlapping triggers (the
     /// sidebar toggle plus a resync tick) don't walk the same xite twice.
@@ -4654,6 +4679,9 @@ pub struct LaunchStatus {
 /// `establishing_trust`, `resolving`, `resolved`, `failed`.
 #[derive(Clone, Debug)]
 pub struct ResolveStatus {
+    // Polling a visible loader renews its interest; historical lookup records
+    // alone do not authorize permanent background network work.
+    last_observed: Option<std::time::Instant>,
     pub state: String,
     pub reason: Option<String>,
     pub detail: Option<String>,
@@ -5187,7 +5215,7 @@ fn html_escape(s: &str) -> String {
 /// the base. Lets the overlays be layered onto TCP or Tor's MixedTransport
 /// without any of them clobbering another.
 struct OverlayTransport {
-    base: Arc<dyn Transport>,
+    base: Option<Arc<dyn Transport>>,
     i2p: Option<Arc<dyn Transport>>,
     rns: Option<Arc<dyn Transport>>,
 }
@@ -5198,17 +5226,15 @@ impl Transport for OverlayTransport {
         "overlay"
     }
     async fn dial(&self, addr: &PeerAddr) -> Result<epix_transport::PeerStream, epix_core::Error> {
-        match addr {
-            PeerAddr::I2p { .. } => match &self.i2p {
-                Some(i2p) => i2p.dial(addr).await,
-                None => self.base.dial(addr).await,
-            },
-            PeerAddr::Rns(_) => match &self.rns {
-                Some(rns) => rns.dial(addr).await,
-                None => self.base.dial(addr).await,
-            },
-            _ => self.base.dial(addr).await,
-        }
+        let transport = match addr {
+            PeerAddr::I2p { .. } => self.i2p.as_ref().or(self.base.as_ref()),
+            PeerAddr::Rns(_) => self.rns.as_ref().or(self.base.as_ref()),
+            _ => self.base.as_ref(),
+        };
+        transport
+            .ok_or_else(|| epix_core::Error::Protocol(format!("no {} transport", addr.scheme())))?
+            .dial(addr)
+            .await
     }
 }
 
@@ -5437,6 +5463,7 @@ impl AppState {
             log_streams: RwLock::new(Vec::new()),
             peers_path: persist.peers_path,
             fileserver_port: RwLock::new(0),
+            clearnet_listener: RwLock::new(None),
             port_opened: RwLock::new(false),
             ip_external: RwLock::new(None),
             tor_enabled: RwLock::new(false),
@@ -5456,6 +5483,10 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
             db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            merger_db_before_install_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            db_query_after_receipt_pause: std::sync::Mutex::new(None),
             xid_deferred_xites: std::sync::Mutex::new(std::collections::HashSet::new()),
             xid_retry_in_flight: std::sync::atomic::AtomicBool::new(false),
             xid_retry_last: std::sync::Mutex::new(None),
@@ -5468,6 +5499,10 @@ impl AppState {
             active_child_syncs: std::sync::Mutex::new(std::collections::HashSet::new()),
             xite_updates_in_flight: std::sync::Mutex::new(HashMap::new()),
             clones_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            clone_statuses: std::sync::Mutex::new(HashMap::new()),
+            clone_retry_wakes: std::sync::Mutex::new(HashMap::new()),
+            clone_retry_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
+            download_retry_wake: tokio::sync::Notify::new(),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -7946,6 +7981,25 @@ impl AppState {
         }
     }
 
+    /// Identifies this registration, including across delete-and-add cycles.
+    pub async fn xite_membership_generation(&self, address: &str) -> Option<u64> {
+        self.xites.read().await.get(address).map(|xite| xite.membership_generation)
+    }
+
+    /// Ignore a late discovery answer from a removed registration. Holding the
+    /// activation gate keeps deletion/re-add atomic with both peers and UI status.
+    pub async fn record_clone_peer(
+        &self, address: &str, generation: Option<u64>, peer: PeerAddr, count: usize,
+    ) -> bool {
+        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        if generation.is_none() || self.xite_membership_generation(address).await != generation {
+            return false;
+        }
+        self.add_peers(address, [peer]).await;
+        self.push_clone_event(address, json!(["peers_added", count]), json!({"peers":count}));
+        true
+    }
+
     /// Add discovered peers to a xite, syncing `settings.peers` to the count.
     /// Silently drops this node's own addresses (see [`Self::is_own_peer`]) and
     /// placeholder shapes (an inbound overlay sender whose handshake never
@@ -7973,6 +8027,7 @@ impl AppState {
         // New peers discovered (announce/PEX/DHT/local): update the xite's
         // dashboard row live, like EpixNet's peers_added.
         if grew {
+            self.wake_clone_retry(address);
             self.push_xite_info(address).await;
         }
     }
@@ -8764,11 +8819,17 @@ impl AppState {
     /// session died does not.
     pub async fn self_advert(&self) -> epix_xite::SelfAdvert {
         let nets = self.dialable_networks().await;
+        let (tor_on, tor_status) = self.tor_status().await;
+        let listener = *self.clearnet_listener.read().await;
+        let direct = !(tor_on && tor_status == "Always");
         epix_xite::SelfAdvert {
             port: self.fileserver_port().await,
+            advertise_ipv4: direct && listener.is_some_and(|a| a.is_ipv4()),
+            advertise_ipv6: direct && listener.is_some_and(|a| a.is_ipv6()),
             onion: self.onion_address().await,
             i2p: self.i2p_address().await,
-            want_onion: self.tor_status().await.0,
+            want_clearnet: nets.clearnet,
+            want_onion: tor_on,
             want_i2p: nets.i2p,
             onion_signer: self.onion_signer.read().await.clone(),
         }
@@ -8781,6 +8842,7 @@ impl AppState {
         address: &str,
         trackers: &[epix_xite::Tracker],
     ) -> Vec<PeerAddr> {
+        let membership = self.xite_membership_generation(address).await;
         // Epix trackers are announced to over EDX; without the fetcher there is
         // no link to carry the announce (and no peers to find).
         let Some(fetcher) = self.edx_fetcher.read().await.clone() else { return Vec::new();
@@ -8791,14 +8853,36 @@ impl AppState {
         // Trackers key peers by the signed content address, so a `.epix` alias
         // must announce under that (not the display name) to find the same
         // peers as the raw address.
-        let key = {
+        let (key, can_advertise) = {
             let xites = self.xites.read().await;
-            xites
-                .get(address)
-                .map(|x| canonical_address(x.content.as_ref(), address))
-                .unwrap_or_else(|| address.to_string())
+            match xites.get(address) {
+                Some(xite) => {
+                    let key = canonical_address(xite.content.as_ref(), address);
+                    let verified = self.verified_manifest_contents
+                        .read().expect("verified_manifest_contents");
+                    let ready = xite.content.as_ref().is_some_and(|root| {
+                        verified.get(&key).and_then(|contents| contents.get("content.json"))
+                            == Some(root)
+                    });
+                    (key, ready)
+                }
+                None => (address.to_string(), false),
+            }
         };
-        let advert = std::sync::Arc::new(self.self_advert().await);
+        let mut advert = self.self_advert().await;
+        if !can_advertise {
+            // Empty clones still discover peers, but cannot serve even the
+            // signed root. Advertising them would crowd actual holders out of
+            // the tracker reply. A verified partial copy remains useful: it
+            // can serve its root and whatever verified files it already holds.
+            advert.port = 0;
+            advert.advertise_ipv4 = false;
+            advert.advertise_ipv6 = false;
+            advert.onion = None;
+            advert.i2p = None;
+            advert.onion_signer = None;
+        }
+        let advert = std::sync::Arc::new(advert);
         let i2p_on = self.dialable_networks().await.i2p;
         // Announce to every tracker concurrently: with a Beacon-sized list
         // (dozens, some dead), serial announces would stretch one pass across
@@ -8842,6 +8926,10 @@ impl AppState {
             self.push_announcer_info(&key).await;
         }
         let all = self.absorb_announce_results(set, &key).await;
+        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        if membership.is_some() && self.xite_membership_generation(address).await != membership {
+            return Vec::new();
+        }
         self.add_peers(address, all.clone()).await;
         let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
         self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len()),
@@ -10152,7 +10240,8 @@ impl AppState {
         mine.insert(addr.to_string());
     }
 
-    /// If the announce arrived over i2p, the source destination is authoritative.
+    /// A known I2P source can register only when it asks to seed. A passive
+    /// discovery request does not mean the requester holds the requested xite.
     async fn register_i2p_source_addr(
         &self,
         req: &epix_discovery::tracker_pc::AnnounceReq,
@@ -10161,11 +10250,15 @@ impl AppState {
     ) {
         let PeerAddr::I2p { dest, .. } = from else { return;
         };
-        if dest.is_empty() {
+        if !req.add.iter().any(|kind| kind == "i2p")
+            || !Self::is_overlay_self_host(dest, false)
+        {
             return;
         }
-        self.tracker_announce(&req.hashes, from).await;
-        mine.insert(from.to_string());
+        let PeerAddr::I2p { port, .. } = from else { unreachable!() };
+        let addr = Self::request_self_addr(dest, false, *port);
+        self.tracker_announce(&req.hashes, &addr).await;
+        mine.insert(addr.to_string());
     }
 
     /// Onion / i2p self-addresses from the request. We register them on
@@ -10178,6 +10271,10 @@ impl AppState {
         mine: &mut std::collections::HashSet<String>,
     ) {
         for (list, is_onion) in [(&req.onions, true), (&req.i2p, false)] {
+            let kind = if is_onion { "onion" } else { "i2p" };
+            if !req.add.iter().any(|add| add == kind) {
+                continue;
+            }
             for (i, host) in list.iter().enumerate() {
                 if !Self::is_overlay_self_host(host, is_onion) {
                     continue;
@@ -10200,7 +10297,13 @@ impl AppState {
         let label = if is_onion { host } else { host.strip_suffix(".b32").unwrap_or(host) };
         let len_ok =
             if is_onion { label.len() == 16 || label.len() == 56 } else { label.len() == 52 };
-        len_ok && label.chars().all(|c| c.is_ascii_alphanumeric())
+        if !len_ok || !label.chars().all(|c| c.is_ascii_alphanumeric()) {
+            return false;
+        }
+        // I2P tracker buckets contain exactly a 32-byte destination hash.
+        // Reject invalid alphabet/padding before they consume tracker slots.
+        is_onion || Self::request_self_addr(host, false, 0)
+            .pack().is_some_and(|packed| packed.len() == 34)
     }
 
     /// One entry of a request's onion or i2p self-address list, as a `PeerAddr`.
@@ -10209,7 +10312,7 @@ impl AppState {
             PeerAddr::Onion { host: host.to_string(), port,
             }
         } else {
-            PeerAddr::I2p { dest: host.to_string(), port,
+            PeerAddr::I2p { dest: format!("{}.b32", host.strip_suffix(".b32").unwrap_or(host).to_ascii_lowercase()), port,
             }
         }
     }
@@ -10237,6 +10340,13 @@ impl AppState {
     /// Set the fileserver (seeding) port the node bound, for `serverInfo`.
     pub async fn set_fileserver_port(&self, port: u16) {
         *self.fileserver_port.write().await = port;
+    }
+
+    /// Publish a TCP listener only once its EDX accept loop is ready. The
+    /// address family determines which source-IP claim trackers may store.
+    pub async fn set_clearnet_listener(&self, listener: Option<std::net::SocketAddr>) {
+        *self.clearnet_listener.write().await = listener;
+        self.trackers_changed.notify_one();
     }
 
     /// The fileserver (seeding) port, 0 if seeding is disabled.
@@ -10306,6 +10416,7 @@ impl AppState {
     ) {
         let mut statuses = self.resolve_status.write().await;
         let entry = statuses.entry(host.to_string()).or_insert_with(|| ResolveStatus {
+            last_observed: None,
             state: String::new(),
             reason: None,
             detail: None,
@@ -10364,10 +10475,29 @@ impl AppState {
             .collect()
     }
 
+    async fn watched_resolve_hosts(&self) -> Vec<String> {
+        let mut parked = self.parked_resolve_hosts().await;
+        let statuses = self.resolve_status.read().await;
+        // A canceled HTTP request can leave this last status behind after
+        // its resolve slot has dropped. The scheduler checks live slots too.
+        parked.extend(statuses.iter().filter(|(_, status)| status.state == "resolving")
+            .map(|(host, _)| host.clone()));
+        parked.into_iter().filter(|host| {
+            statuses.get(host).and_then(|status| status.last_observed)
+                .is_some_and(|seen| seen.elapsed() < std::time::Duration::from_secs(60))
+        }).collect()
+    }
+
     /// The `resolveStatus` answer for `host`: its own progress plus the
     /// network facts the loading screen needs to explain a wait.
     pub async fn resolve_status_json(&self, host: &str) -> Value {
-        let status = self.resolve_status(host).await;
+        let status = {
+            let mut statuses = self.resolve_status.write().await;
+            statuses.get_mut(host).map(|status| {
+                status.last_observed = Some(std::time::Instant::now());
+                status.clone()
+            })
+        };
         let (_, tor_status) = self.tor_status().await;
         let lc = epix_chain::lc_status::snapshot();
         let (state, reason, detail, address, verified, attempts, since) = match status {
@@ -10393,11 +10523,47 @@ impl AppState {
     /// The network came back (the OS said so, or the user tapped Retry):
     /// wake everything that was waiting on it instead of letting the backoff
     /// timers run out.
-    pub async fn network_changed(&self) {
+    pub async fn network_changed(self: &Arc<Self>) {
         epix_chain::wake_light_client();
+        self.trackers_changed.notify_one();
         if let Some(hook) = self.on_demand.read().await.clone() {
             hook.network_changed();
         }
+        let addresses: Vec<_> = self.xites.read().await.iter()
+            .filter(|(_, x)| x.settings.serving && !x.settings.own)
+            .map(|(address, _)| address.clone()).collect();
+        for address in addresses {
+            if !self.xite_core_complete(&address).await {
+                let _ = self.request_clone_retry(&address).await;
+            }
+        }
+    }
+
+    /// Retry an existing download in place. Automatic HTML refreshes use
+    /// `ensure_xite`; only an explicit retry or new network evidence wakes a
+    /// waiting attempt ahead of its deadline.
+    pub async fn request_clone_retry(self: &Arc<Self>, address: &str) -> Result<(), String> {
+        let address = self.canonical_key(address).await;
+        {
+            let xites = self.xites.read().await;
+            let xite = xites.get(&address).ok_or("Xite is not registered")?;
+            if !xite.settings.serving {
+                return Err("Xite download is paused".into());
+            }
+            if xite.settings.own {
+                return Ok(());
+            }
+        }
+        if self.xite_core_complete(&address).await {
+            self.set_clone_status(&address, "complete", None, None);
+            return Ok(());
+        }
+        self.wake_clone_retry(&address);
+        if !self.is_cloning(&address) {
+            let state = self.clone();
+            tokio::spawn(async move { state.ensure_xite(&address).await; });
+        }
+        Ok(())
     }
 
     /// The node's homepage xite: the launch target if recorded, else a served
@@ -13145,8 +13311,10 @@ impl AppState {
         out
     }
 
-    /// Which peer networks this node can DIAL right now. Clearnet always (the
-    /// base transport is TCP); onion when the Tor client is up - dialing
+    /// Which peer networks this node can DIAL right now. Clearnet uses the
+    /// base transport; an overlay-only embedder has no IP route. Before any
+    /// transport is installed, preserve the ordinary TCP bootstrap default.
+    /// Onion is available when the Tor client is up - dialing
     /// needs no published onion service of our own; i2p when the I2P
     /// transport is composed in and the session reports Ready; rns when the
     /// mesh transport is up.
@@ -13160,9 +13328,11 @@ impl AppState {
             .and_then(|v| v.as_str())
             .map(|p| p == "Ready")
             .unwrap_or(false);
-        let i2p = i2p_ready && self.i2p_transport.read().await.is_some();
+        let has_i2p = self.i2p_transport.read().await.is_some();
+        let i2p = i2p_ready && has_i2p;
         let rns = self.rns_transport.read().await.is_some();
-        DialableNets { clearnet: true, onion, i2p, rns,
+        let clearnet = self.base_transport.read().await.is_some() || !(has_i2p || rns);
+        DialableNets { clearnet, onion, i2p, rns,
         }
     }
 
@@ -13459,7 +13629,7 @@ impl AppState {
         }
         let mut receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
         #[cfg(test)]
-        let pause = DB_QUERY_AFTER_RECEIPT_PAUSE
+        let pause = self.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
@@ -17069,11 +17239,81 @@ impl AppState {
     /// [`Self::end_clone`] (on failure too).
     pub fn begin_clone(&self, address: &str) {
         self.clones_in_flight.lock().unwrap().insert(address.to_string());
+        self.advance_clone_attempt(address);
+    }
+
+    pub fn advance_clone_attempt(&self, address: &str) {
+        {
+            let mut statuses = self.clone_statuses.lock().unwrap();
+            let status = statuses.entry(address.to_string()).or_default();
+            status.attempt = status.attempt.saturating_add(1);
+            status.state = "discovering";
+            status.reason = None;
+            status.next_retry_at = None;
+        }
+        self.push_clone_event(address, json!(["clone_status", "discovering"]), json!({}));
+    }
+
+    pub fn set_clone_status(
+        &self, address: &str, state: &'static str, reason: Option<&str>, next_retry_at: Option<i64>,
+    ) {
+        {
+            let mut statuses = self.clone_statuses.lock().unwrap();
+            let status = statuses.entry(address.to_string()).or_default();
+            status.state = state;
+            status.reason = reason.map(str::to_string);
+            status.next_retry_at = next_retry_at;
+        }
+        self.push_clone_event(address, json!(["clone_status", state]), json!({}));
+        if state == "waiting" && next_retry_at.is_some() {
+            self.download_retry_wake.notify_one();
+        }
+    }
+
+    pub fn clone_status(&self, address: &str) -> Value {
+        self.clone_statuses.lock().unwrap().get(address)
+            .map(|status| json!(status)).unwrap_or(Value::Null)
+    }
+
+    pub fn clone_retry_deadline(&self, address: &str) -> Option<i64> {
+        self.clone_statuses.lock().unwrap().get(address)
+            .filter(|status| status.state == "waiting")
+            .and_then(|status| status.next_retry_at)
+    }
+
+    /// Shared by an active discovery/retry wait and the background scheduler.
+    pub fn clone_retry_notify(&self, address: &str) -> Arc<tokio::sync::Notify> {
+        self.clone_retry_wakes.lock().unwrap().entry(address.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Notify::new())).clone()
+    }
+
+    fn wake_clone_retry(&self, address: &str) {
+        if let Some(status) = self.clone_statuses.lock().unwrap().get_mut(address) {
+            if status.state == "waiting" {
+                status.next_retry_at = None;
+            }
+        }
+        self.clone_retry_dirty.lock().unwrap().insert(address.to_string());
+        self.clone_retry_notify(address).notify_one();
+        self.download_retry_wake.notify_one();
+    }
+
+    fn wake_waiting_clone_retries(&self) {
+        let waiting: Vec<_> = self.clone_statuses.lock().unwrap().iter()
+            .filter(|(_, status)| status.state == "waiting")
+            .map(|(address, _)| address.clone()).collect();
+        for address in waiting { self.wake_clone_retry(&address); }
+        self.download_retry_wake.notify_one();
     }
 
     /// The clone for a xite finished (or failed).
     pub fn end_clone(&self, address: &str) {
-        self.clones_in_flight.lock().unwrap().remove(address);
+        let was_active = self.clones_in_flight.lock().unwrap().remove(address);
+        if was_active {
+            // A waiting deadline may have arrived while this task still held
+            // its active flag. Recompute the next timer after releasing it.
+            self.download_retry_wake.notify_one();
+        }
     }
 
     /// Whether an on-demand clone is currently downloading this xite's files.
@@ -17175,6 +17415,56 @@ impl AppState {
     /// `started_task_num > 0` with a made-up total from any other path, or
     /// the bar regresses when streams interleave.
     pub fn push_clone_event(&self, address: &str, event: Value, fields: Value) {
+        let retained_progress = {
+            let mut statuses = self.clone_statuses.lock().unwrap();
+            let progress_fields = ["started_task_num", "tasks", "bad_files", "peers_serving"];
+            if progress_fields.iter().any(|key| fields.get(*key).and_then(Value::as_u64).is_some()) {
+                let status = statuses.entry(address.to_string()).or_default();
+                for key in progress_fields {
+                    if let Some(value) = fields.get(key).filter(|v| v.as_u64().is_some()) {
+                        status.progress.insert(key.to_string(), value.clone());
+                    }
+                }
+            }
+            statuses.get(address).map(|s| s.progress.clone()).unwrap_or_default()
+        };
+        // Retain the last outcome for a tab that reconnects after the event.
+        // A failed attempt is a wait for another source, never evidence that
+        // nobody shares this xite anywhere on the network.
+        let kind = event.get(0).and_then(Value::as_str).unwrap_or("");
+        if matches!(kind, "file_failed" | "waiting_tor" | "peers_added")
+            || (kind == "file_done" && event.get(1).and_then(Value::as_str) == Some("content.json"))
+        {
+            let mut statuses = self.clone_statuses.lock().unwrap();
+            let status = statuses.entry(address.to_string()).or_default();
+            status.attempt = status.attempt.max(1);
+            match kind {
+                "file_failed" => {
+                    status.state = "waiting";
+                    status.reason = fields.get("reason").and_then(Value::as_str).map(str::to_string);
+                    let rounds = status.attempt.saturating_sub(1) / 4;
+                    let delay = (20i64 * (1i64 << rounds.min(3))).min(90);
+                    status.next_retry_at = Some(now_secs() + delay);
+                }
+                "waiting_tor" => {
+                    status.state = "waiting";
+                    status.reason = Some("tor_bootstrapping".to_string());
+                    status.next_retry_at = None;
+                }
+                "file_done" => {
+                    status.state = "downloading";
+                    status.reason = None;
+                    status.next_retry_at = None;
+                }
+                _ => {}
+            }
+            if let Some(peers) = fields.get("peers").and_then(Value::as_u64) {
+                status.peers = peers as usize;
+            }
+        }
+        if kind == "file_failed" {
+            self.download_retry_wake.notify_one();
+        }
         // Once content.json has been verified mid-clone, the title is known:
         // carry it so the dashboard's "Connecting xites" row shows the xite's
         // name instead of its bech32 address (and the wrapper's tab title
@@ -17192,6 +17482,7 @@ impl AppState {
         };
         let mut params = json!({
             "address": address,
+            "clone_status": self.clone_status(address),
             "peers": 0,
             "tasks": 0,
             "started_task_num": 0,
@@ -17203,6 +17494,7 @@ impl AppState {
             "event": event,
         });
         if let (Value::Object(p), Value::Object(f)) = (&mut params, fields) {
+            p.extend(retained_progress);
             for (k, v) in f {
                 p.insert(k, v);
             }
@@ -18180,7 +18472,7 @@ impl AppState {
             }
             #[cfg(test)]
             let pause = {
-                MERGER_DB_BEFORE_INSTALL_PAUSE
+                self.merger_db_before_install_pause
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
@@ -18349,8 +18641,8 @@ impl AppState {
         let rns = self.rns_transport.read().await.clone();
         let composed: Option<Arc<dyn Transport>> = match (base, i2p, rns) {
             (Some(base), None, None) => Some(base),
-            (Some(base), i2p, rns) => Some(Arc::new(OverlayTransport { base, i2p, rns })),
-            _ => None,
+            (None, None, None) => None,
+            (base, i2p, rns) => Some(Arc::new(OverlayTransport { base, i2p, rns })),
         };
         *self.transport.write().await = composed;
     }
@@ -18367,6 +18659,7 @@ impl AppState {
     /// moves (mode, phase, inbound b32) - the counters in the rest of the
     /// snapshot change constantly and would push on every poll.
     pub async fn set_i2p_status(&self, status: Value) {
+        let ready = status.get("phase").and_then(Value::as_str) == Some("Ready");
         let reachability = |v: &Value| {
             let field = |k: &str| v.get(k).and_then(Value::as_str).unwrap_or("").to_string();
             (field("mode"), field("phase"), field("b32"))
@@ -18382,6 +18675,7 @@ impl AppState {
             // Same rule as set_tor_status: an I2P reachability move regates
             // i2p trackers, so the announce loop should run early.
             self.trackers_changed.notify_one();
+            if ready { self.wake_waiting_clone_retries(); }
         }
     }
 
@@ -29462,16 +29756,38 @@ impl AppState {
         });
     }
 
+    async fn download_retry_delay(&self, maximum: std::time::Duration) -> std::time::Duration {
+        let now = now_secs();
+        let xites = self.xites.read().await;
+        let active = self.clones_in_flight.lock().unwrap();
+        let statuses = self.clone_statuses.lock().unwrap();
+        let seconds = statuses.iter().filter_map(|(address, status)| {
+            let xite = xites.get(address)?;
+            if !xite.settings.serving || xite.settings.own || active.contains(address)
+                || status.state != "waiting" {
+                return None;
+            }
+            status.next_retry_at.map(|due| due.saturating_sub(now).max(1) as u64)
+        }).min();
+        seconds.map(std::time::Duration::from_secs).unwrap_or(maximum).min(maximum)
+    }
+
     pub fn spawn_optional_retry_loop(self: &Arc<Self>) {
         let state = self.clone();
         tokio::spawn(async move {
             // Let transports come up and the first announces land.
-            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            tokio::select! {
+                _ = tokio::time::sleep(state.download_retry_delay(std::time::Duration::from_secs(20)).await) => {},
+                _ = state.download_retry_wake.notified() => {},
+            }
             // Per-xite schedule: (consecutive not-done passes, next check at).
             let mut schedule: HashMap<String, (u32, i64)> = HashMap::new();
             loop {
                 state.optional_retry_tick(&mut schedule).await;
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                tokio::select! {
+                    _ = tokio::time::sleep(state.download_retry_delay(std::time::Duration::from_secs(30)).await) => {},
+                    _ = state.download_retry_wake.notified() => {},
+                }
             }
         });
     }
@@ -29537,6 +29853,9 @@ impl AppState {
     /// its candidate check, then prune schedule entries whose scope left the
     /// watched sets (toggled off, paused, or deleted).
     async fn optional_retry_tick(self: &Arc<Self>, schedule: &mut HashMap<String, (u32, i64)>) {
+        for address in self.clone_retry_dirty.lock().unwrap().drain() {
+            schedule.remove(&format!("core:{address}"));
+        }
         // Dirty addresses bypass their delay this tick.
         for addr in self.optional_dirty.lock().unwrap().drain() {
             schedule.remove(&format!("full:{addr}"));
@@ -29552,6 +29871,23 @@ impl AppState {
         let full_watch = self.full_retention_watch().await;
         for addr in &full_watch {
             self.retry_retention_candidate(addr, schedule).await;
+        }
+        // A visible name loader keeps retrying transient lookup failures even
+        // after the resolver's per-request budget expires. The observed-name
+        // lease expires when that loader closes; normal policy gates still run.
+        let resolve_watch = self.watched_resolve_hosts().await;
+        if let Some(resolver) = self.on_demand.read().await.clone() {
+            for host in &resolve_watch {
+                let key = format!("resolve:{host}");
+                if resolver.is_resolving(host)
+                    || schedule.get(&key).is_some_and(|(_, next)| *next > now_secs()) {
+                    continue;
+                }
+                schedule.insert(key, (0, now_secs() + 30));
+                let state = self.clone();
+                let host = host.clone();
+                tokio::spawn(async move { state.ensure_xite(&host).await; });
+            }
         }
         // Registered xites whose CORE files never completed - an interrupted
         // or failed clone (the seeder was offline when siteAdd/siteDownload
@@ -29570,7 +29906,10 @@ impl AppState {
         for addr in &core_watch {
             self.retry_clone_candidate(addr, schedule).await;
         }
-        schedule.retain(|k, _| Self::retry_key_watched(k, &flagged, &full_watch, &core_watch));
+        schedule.retain(|key, _| match key.strip_prefix("resolve:") {
+            Some(host) => resolve_watch.iter().any(|watched| watched == host),
+            None => Self::retry_key_watched(key, &flagged, &full_watch, &core_watch),
+        });
     }
 
     /// Whether a schedule key still belongs to a watched scope: `core:` keys
@@ -29685,8 +30024,14 @@ impl AppState {
         addr: &str,
         schedule: &mut HashMap<String, (u32, i64)>,
     ) {
+        if self.is_cloning(addr) {
+            return;
+        }
         let key = format!("core:{addr}");
         let (fails, next_at) = schedule.get(&key).copied().unwrap_or((0, 0));
+        // The coordinator's deadline also gates browser requests. Prefer it
+        // over this loop's cache, which may predate the last completed attempt.
+        let next_at = self.clone_retry_deadline(addr).unwrap_or(next_at);
         if next_at > now_secs() {
             return;
         }
@@ -29710,6 +30055,7 @@ impl AppState {
         let addr = addr.to_string();
         tokio::spawn(async move {
             if state.ensure_xite(&addr).await && state.xite_core_complete(&addr).await {
+                state.set_clone_status(&addr, "complete", None, None);
                 state.push_notification("done", &format!("Downloaded xite {addr}."), 12000);
                 // Its optional files may be wanted next (the toggles
                 // default on): check without delay.
@@ -31100,6 +31446,8 @@ impl AppState {
     }
 
     pub async fn remove_xite(&self, address: &str) -> bool {
+        let canonical = self.canonical_key(address).await;
+        let address = canonical.as_str();
         // Removal takes visible time (locks, durable intent, directory
         // deletion, Store ownership handover) and can only be reported while
         // the row still exists: phase first, so every dashboard shows
@@ -31132,6 +31480,12 @@ impl AppState {
     }
 
     async fn remove_xite_owned(&self, address: &str) -> bool {
+        // Stop the detached download before waiting for its activation and
+        // manifest guards. No old task may recreate progress after cleanup.
+        let canonical = self.canonical_key(address).await;
+        if let Some(resolver) = self.on_demand.read().await.clone() {
+            resolver.cancel(&canonical).await;
+        }
         let _activation = self.xite_activation_gate.clone().write_owned().await;
         let registry = self.xite_registry_lock.lock().await;
         let target = {
@@ -31357,6 +31711,10 @@ impl AppState {
                 .lock()
                 .unwrap()
                 .retain(|key| !remove.contains(key));
+            self.clone_statuses.lock().unwrap().retain(|key, _| !remove.contains(key));
+            self.clone_retry_wakes.lock().unwrap().retain(|key, _| !remove.contains(key));
+            self.clone_retry_dirty.lock().unwrap().retain(|key| !remove.contains(key));
+            self.clones_in_flight.lock().unwrap().retain(|key| !remove.contains(key));
         }
 
         let mut registry_persisted = true;
@@ -31828,7 +32186,7 @@ impl AppState {
                 .unwrap_or(Value::Null)
         };
 
-        json!({
+        let mut info = json!({
             "auth_address": auth_address,
             "cert_user_id": cert_user_id,
             "privatekey": has_privatekey,
@@ -31846,6 +32204,7 @@ impl AppState {
             // that watched it start. Events alone can't do that: they only
             // reach pages that were already open.
             "update_phase": update_phase,
+            "clone_status": self.clone_status(address),
             // How far the current phase has got, for the row's progress bar:
             // `{done, total}`, or null when the phase has nothing countable
             // (staging a content.json, waiting out a retry backoff). Better an
@@ -31868,7 +32227,13 @@ impl AppState {
             "workers": workers,
             "optional_progress": optional_progress,
             "content": content,
-        })
+        });
+        if let Some(status) = self.clone_statuses.lock().unwrap().get(address) {
+            if status.state != "complete" {
+                if let Value::Object(fields) = &mut info { fields.extend(status.progress.clone()); }
+            }
+        }
+        info
     }
 
     /// `siteList` - one siteInfo per served xite, for the dashboard's Xites
@@ -39083,18 +39448,19 @@ mod tests {
         );
         drop(tree);
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if store.is_complete(child_id).unwrap_or(false)
-                    && state.edx_object_path(&child_id).is_some()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        // Extern adoption makes bytes visible before the blocking worker
+        // claims their manifest reference. The detached transaction retains
+        // activation authority through both steps, so its write barrier is
+        // the completion signal for the ownership assertions below.
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.xite_activation_gate.clone().write_owned(),
+        )
         .await
-        .expect("detached root completion did not register the accepted child object");
+        .expect("detached root completion did not release activation authority");
+        assert!(store.is_complete(child_id).unwrap());
+        assert!(state.edx_object_path(&child_id).is_some());
+        drop(completion);
         assert!(store.is_extern(child_id).unwrap());
         store.claim_feed(child_id).unwrap();
         assert_eq!(store.ref_delta(child_id, 0).unwrap(), 2);
@@ -43585,7 +43951,7 @@ mod tests {
 
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *MERGER_DB_BEFORE_INSTALL_PAUSE
+        *state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -43593,8 +43959,8 @@ mod tests {
             let state = state.clone();
             tokio::spawn(async move { state.rebuild_merger_dbs().await })
         };
-        started.notified().await;
-        MERGER_DB_BEFORE_INSTALL_PAUSE
+        db_test_step("database pause reached", started.notified()).await;
+        state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -43623,7 +43989,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(!rebuild.is_finished(), "rebuild abandoned a contended authority tree");
         drop(source_tree);
-        rebuild.await.unwrap();
+        db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)
@@ -43698,12 +44064,60 @@ mod tests {
         );
     }
 
+    async fn db_test_step<T>(label: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .unwrap_or_else(|_| panic!("{label} timed out"))
+    }
+
+    #[tokio::test]
+    async fn db_test_pause_query_is_isolated_from_another_app_state() {
+        let (_first_dir, first, _) = merger_with_one_post().await;
+        let (_second_dir, second, merger) = merger_with_one_post().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *first.db_query_after_receipt_pause.lock().unwrap() = Some((started, release.clone()));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second.db_query(&merger, "SELECT title FROM post", &Value::Null),
+        )
+        .await;
+        first.db_query_after_receipt_pause.lock().unwrap().take();
+        release.close();
+        let rows = result
+            .expect("another AppState's query must not enter this fixture's pause")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn db_test_pause_merger_is_isolated_from_another_app_state() {
+        let (_first_dir, first, _) = merger_with_one_post().await;
+        let (_second_dir, second, merger) = merger_with_one_post().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *first.merger_db_before_install_pause.lock().unwrap() = Some((started, release.clone()));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second.rebuild_merger_dbs(),
+        )
+        .await;
+        first.merger_db_before_install_pause.lock().unwrap().take();
+        release.close();
+        result.expect("another AppState's rebuild must not enter this fixture's pause");
+        let rows = second
+            .db_query(&merger, "SELECT title FROM post", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
     #[tokio::test]
     async fn db_query_discards_a_detached_pre_revocation_handle() {
         let (_dir, state, merger) = merger_with_one_post().await;
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *DB_QUERY_AFTER_RECEIPT_PAUSE
+        *state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -43716,15 +44130,15 @@ mod tests {
                     .await
             })
         };
-        started.notified().await;
-        DB_QUERY_AFTER_RECEIPT_PAUSE
+        db_test_step("database pause reached", started.notified()).await;
+        state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         state.remove_permission(&merger, "Merger:EpixPost").await;
         release.add_permits(1);
 
-        let result = query.await.unwrap();
+        let result = db_test_step("paused database query completed", query).await.unwrap();
         assert!(
             result.is_err() || result.as_ref().is_ok_and(Vec::is_empty),
             "query returned rows from a database retired by permission revocation"
@@ -43744,7 +44158,7 @@ mod tests {
             .clone();
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *DB_QUERY_AFTER_RECEIPT_PAUSE
+        *state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -43757,8 +44171,8 @@ mod tests {
                     .await
             })
         };
-        started.notified().await;
-        DB_QUERY_AFTER_RECEIPT_PAUSE
+        db_test_step("database pause reached", started.notified()).await;
+        state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -43772,7 +44186,7 @@ mod tests {
         state.rebuild_merger_dbs().await;
         release.add_permits(1);
 
-        let result = query.await.unwrap();
+        let result = db_test_step("paused database query completed", query).await.unwrap();
         assert!(
             result.is_err() || result.as_ref().is_ok_and(Vec::is_empty),
             "query returned rows from a database handle retired by rebuild"
@@ -43798,7 +44212,7 @@ mod tests {
         };
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *MERGER_DB_BEFORE_INSTALL_PAUSE
+        *state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -43806,18 +44220,18 @@ mod tests {
             let state = state.clone();
             tokio::spawn(async move { state.rebuild_merger_dbs().await })
         };
-        started.notified().await;
+        db_test_step("database pause reached", started.notified()).await;
 
         state
             .delete_file(&source, "data/u/data.json", None)
             .await
             .unwrap();
-        MERGER_DB_BEFORE_INSTALL_PAUSE
+        state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         release.add_permits(1);
-        rebuild.await.unwrap();
+        db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)
@@ -47095,6 +47509,277 @@ mod tests {
             s.xite_info("epix1x").await["settings"]["modified"].as_f64().unwrap();
         assert!(capped <= now_secs() as f64 + 601.0, "capped: {capped}");
         assert!(capped >= 2000.0);
+    }
+
+    struct RetryRecorder(tokio::sync::mpsc::UnboundedSender<String>);
+
+    #[async_trait::async_trait]
+    impl OnDemandResolver for RetryRecorder {
+        async fn ensure(&self, host: &str) -> Result<(), String> {
+            let _ = self.0.send(host.to_string());
+            Err("scripted unavailable seeder".into())
+        }
+
+        async fn resolve(&self, host: &str) -> Option<ResolvedHost> {
+            Some(ResolvedHost { address: host.to_string(), verified: true })
+        }
+    }
+
+    async fn retry_fixture() -> (
+        tempfile::TempDir,
+        Arc<AppState>,
+        tokio::sync::mpsc::UnboundedReceiver<String>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        state.add_xite("epix1retry", XiteEntry {
+            storage: XiteStorage::new(dir.path()), content: None,
+        }).await;
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_on_demand(Arc::new(RetryRecorder(tx))).await;
+        (dir, state, rx)
+    }
+
+    #[tokio::test]
+    async fn clone_retry_repeats_at_deadlines_without_external_wakes_until_deleted() {
+        struct ScheduledFailure {
+            state: std::sync::Weak<AppState>,
+            attempts: tokio::sync::mpsc::UnboundedSender<(String, i64)>,
+        }
+        #[async_trait::async_trait]
+        impl OnDemandResolver for ScheduledFailure {
+            async fn ensure(&self, host: &str) -> Result<(), String> {
+                let state = self.state.upgrade().unwrap();
+                let previous_deadline = state.clone_retry_deadline(host).unwrap();
+                state.begin_clone(host);
+                // Short deadlines exercise the real scheduler across multiple
+                // failed passes without waiting minutes in the test suite.
+                state.set_clone_status(host, "waiting", Some("no_peers"), Some(now_secs() + 1));
+                tokio::task::yield_now().await;
+                state.end_clone(host);
+                let _ = self.attempts.send((host.to_string(), previous_deadline));
+                Err("scripted no peers".into())
+            }
+            async fn resolve(&self, _: &str) -> Option<ResolvedHost> { None }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let address = DASHBOARD_XITE_ADDRESS;
+        state.add_xite(address, XiteEntry {
+            storage: XiteStorage::new(dir.path().join(address)), content: None,
+        }).await;
+        let (tx, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        state.set_on_demand(Arc::new(ScheduledFailure {
+            state: Arc::downgrade(&state), attempts: tx,
+        })).await;
+        state.begin_clone(address);
+        state.set_clone_status(address, "waiting", Some("no_peers"), Some(now_secs() + 1));
+        state.spawn_optional_retry_loop();
+        // Let the scheduler observe the waiting status while the finishing
+        // task still owns its active flag, before that task releases it.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state.end_clone(address);
+        for round in 1..=3 {
+            let (host, due) = tokio::time::timeout(std::time::Duration::from_secs(3), attempts.recv())
+                .await.unwrap_or_else(|_| panic!("automatic round {round} missed the backend deadline"))
+                .unwrap();
+            assert_eq!(host, address);
+            assert!(now_secs() >= due, "automatic retries must honor backoff");
+        }
+        assert!(state.remove_xite(address).await);
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(2), attempts.recv()).await.is_err(),
+            "deletion ends automatic attempts");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_watched_lookup_coalesces_live_work_and_resumes_after_cancellation() {
+        struct Lookup {
+            active: Arc<std::sync::atomic::AtomicBool>,
+            attempts: tokio::sync::mpsc::UnboundedSender<String>,
+        }
+        #[async_trait::async_trait]
+        impl OnDemandResolver for Lookup {
+            async fn ensure(&self, host: &str) -> Result<(), String> {
+                let _ = self.attempts.send(host.to_string());
+                Err("scripted lookup outage".into())
+            }
+            async fn resolve(&self, _: &str) -> Option<ResolvedHost> { None }
+            fn is_resolving(&self, _: &str) -> bool {
+                self.active.load(std::sync::atomic::Ordering::SeqCst)
+            }
+        }
+        let state = AppState::new("test");
+        let active = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (tx, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        state.set_on_demand(Arc::new(Lookup { active: active.clone(), attempts: tx })).await;
+        state.resolve_status_set("interrupted.epix", "resolving", None, None).await;
+        state.resolve_status_json("interrupted.epix").await;
+        let mut schedule = HashMap::new();
+        state.optional_retry_tick(&mut schedule).await;
+        tokio::task::yield_now().await;
+        assert!(attempts.try_recv().is_err(), "a live lookup must not collect duplicate waiters");
+        // Canceling the originating request drops the resolver's slot, while
+        // the last visible status can still be resolving.
+        active.store(false, std::sync::atomic::Ordering::SeqCst);
+        state.optional_retry_tick(&mut schedule).await;
+        let resumed = tokio::time::timeout(std::time::Duration::from_millis(250), attempts.recv()).await;
+        assert_eq!(resumed.ok().flatten().as_deref(), Some("interrupted.epix"));
+    }
+
+    #[tokio::test]
+    async fn clone_retry_watched_name_restarts_without_network_or_manual_action() {
+        let state = AppState::new("test");
+        let (tx, mut attempts) = tokio::sync::mpsc::unbounded_channel();
+        state.set_on_demand(Arc::new(RetryRecorder(tx))).await;
+        for (host, reason) in [("waiting.epix", "rpc_error"), ("abandoned.epix", "rpc_error"),
+                               ("offline.epix", "offline_policy"), ("invalid.epix", "invalid_address")] {
+            state.resolve_status_set(host, "failed", Some(reason), None).await;
+            if host != "abandoned.epix" { state.resolve_status_json(host).await; }
+        }
+        let mut schedule = HashMap::new();
+        state.optional_retry_tick(&mut schedule).await;
+        let attempted = tokio::time::timeout(std::time::Duration::from_millis(250), attempts.recv()).await;
+        assert_eq!(attempted.ok().flatten().as_deref(), Some("waiting.epix"),
+            "the currently watched lookup must resume even after its resolve budget expired");
+        tokio::task::yield_now().await;
+        assert!(attempts.try_recv().is_err(), "abandoned and terminal lookups must not restart");
+        state.optional_retry_tick(&mut schedule).await;
+        tokio::task::yield_now().await;
+        assert!(attempts.try_recv().is_err(), "status polling must not bypass retry pacing");
+        state.resolve_status.write().await.get_mut("waiting.epix").unwrap().last_observed =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs(61));
+        schedule.clear();
+        state.optional_retry_tick(&mut schedule).await;
+        tokio::task::yield_now().await;
+        assert!(attempts.try_recv().is_err(), "closing a loader ends further lookup rounds");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_network_change_resumes_registered_incomplete_xites() {
+        let (_dir, state, mut attempts) = retry_fixture().await;
+        state.network_changed().await;
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_millis(200), attempts.recv(),
+        ).await;
+        assert_eq!(resumed.ok().flatten().as_deref(), Some("epix1retry"));
+    }
+
+    #[tokio::test]
+    async fn clone_retry_new_peer_bypasses_waiting_core_schedule() {
+        let (_dir, state, mut attempts) = retry_fixture().await;
+        let mut schedule = HashMap::from([
+            ("core:epix1retry".to_string(), (3, now_secs() + 600)),
+        ]);
+        state.add_peers("epix1retry", [
+            PeerAddr::Ip("203.0.113.7:15441".parse().unwrap()),
+        ]).await;
+        state.optional_retry_tick(&mut schedule).await;
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_millis(200), attempts.recv(),
+        ).await;
+        assert_eq!(resumed.ok().flatten().as_deref(), Some("epix1retry"));
+    }
+
+    #[tokio::test]
+    async fn clone_retry_ready_i2p_bypasses_waiting_core_schedule() {
+        let (_dir, state, mut attempts) = retry_fixture().await;
+        let mut schedule = HashMap::from([
+            ("core:epix1retry".to_string(), (3, now_secs() + 600)),
+        ]);
+        state.begin_clone("epix1retry");
+        state.push_clone_event("epix1retry", json!(["file_failed", "index.html"]),
+            json!({ "reason":"no_peers", "peers":0 }));
+        state.end_clone("epix1retry");
+        state.set_i2p_status(json!({"mode":"embedded", "phase":"Ready"})).await;
+        state.optional_retry_tick(&mut schedule).await;
+        let resumed = tokio::time::timeout(
+            std::time::Duration::from_millis(200), attempts.recv(),
+        ).await;
+        assert_eq!(resumed.ok().flatten().as_deref(), Some("epix1retry"));
+    }
+
+    #[tokio::test]
+    async fn clone_retry_active_download_does_not_consume_backoff_or_spawn_waiters() {
+        let (_dir, state, mut attempts) = retry_fixture().await;
+        state.begin_clone("epix1retry");
+        let mut schedule = HashMap::new();
+        state.retry_clone_candidate("epix1retry", &mut schedule).await;
+        tokio::task::yield_now().await;
+        assert!(schedule.is_empty(), "an active transfer is not a failed retry");
+        assert!(attempts.try_recv().is_err(), "do not spawn another waiting request");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_delete_alias_marks_the_canonical_xite_deleting() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        let address = DASHBOARD_XITE_ADDRESS;
+        state.add_xite(address, XiteEntry {
+            storage: XiteStorage::new(dir.path().join("data").join(address)), content: None,
+        }).await;
+        state.set_display(address, "rare.epix").await;
+        let hold = state.xite_activation_gate.clone().read_owned().await;
+        let deleting = state.clone();
+        let task = tokio::spawn(async move { deleting.remove_xite("rare.epix").await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while state.xite_update_phase("rare.epix").is_none()
+                && state.xite_update_phase(address).is_none() {
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        let phase = state.xite_update_phase(address);
+        drop(hold);
+        assert!(task.await.unwrap());
+        assert_eq!(phase, Some(UPDATE_PHASE_DELETING), "clones deduplicate on the canonical address");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_delete_and_readd_discards_the_old_attempt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let address = DASHBOARD_XITE_ADDRESS;
+        let storage = XiteStorage::new(dir.path().join(address));
+        state.add_xite(address, XiteEntry { storage: storage.clone(), content: None }).await;
+        state.begin_clone(address);
+        state.push_clone_event(address, json!(["file_failed", "index.html"]),
+            json!({"reason":"no_peers", "peers":0}));
+        state.wake_clone_retry(address);
+        assert!(state.remove_xite(address).await);
+        assert!(state.clone_status(address).is_null(), "deleted xites retain no retry outcome");
+        assert!(!state.is_cloning(address));
+        assert!(!state.clone_retry_wakes.lock().unwrap().contains_key(address));
+        assert!(!state.clone_retry_dirty.lock().unwrap().contains(address));
+        state.add_xite(address, XiteEntry { storage, content: None }).await;
+        state.begin_clone(address);
+        assert_eq!(state.clone_status(address)["attempt"], 1);
+        assert_eq!(state.clone_status(address)["state"], "discovering");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_progress_survives_a_late_site_info_request() {
+        let (_dir, state, _attempts) = retry_fixture().await;
+        state.begin_clone("epix1retry");
+        state.push_clone_event("epix1retry", json!(["file_done", "app.js"]),
+            json!({ "started_task_num":5, "tasks":3, "bad_files":3, "peers_serving":2 }));
+        let info = state.xite_info("epix1retry").await;
+        assert_eq!(info["started_task_num"], 5);
+        assert_eq!(info["tasks"], 3);
+        assert_eq!(info["bad_files"], 3);
+        assert_eq!(info["peers_serving"], 2);
+    }
+
+    #[tokio::test]
+    async fn clone_retry_failure_survives_a_late_site_info_request() {
+        let (_dir, state, _attempts) = retry_fixture().await;
+        state.begin_clone("epix1retry");
+        state.push_clone_event("epix1retry", json!(["file_failed", "index.html"]),
+            json!({ "reason": "no_peers", "peers": 0 }));
+        state.end_clone("epix1retry");
+        let info = state.xite_info("epix1retry").await;
+        assert_eq!(info["clone_status"]["state"], "waiting");
+        assert_eq!(info["clone_status"]["reason"], "no_peers");
+        assert_eq!(info["clone_status"]["attempt"], 1);
+        assert_eq!(info["clone_status"]["peers"], 0);
     }
 
     #[tokio::test]

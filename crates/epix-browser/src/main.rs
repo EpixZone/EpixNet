@@ -23,6 +23,9 @@ mod icon;
 mod ipc;
 mod proxy;
 mod tray;
+#[cfg(test)]
+#[path = "../wallet_stage.rs"]
+mod wallet_stage;
 
 use ca::LocalCa;
 use std::io::Write;
@@ -467,9 +470,9 @@ fn profile_trusts_ca(profile: &Path, ca: &LocalCa) -> bool {
 /// So: when `cert9.db` doesn't hold the CA yet (certutil installs put it
 /// there synchronously; policy installs on a warm profile did on a previous
 /// run), do the first startup headlessly - `--screenshot` performs a full
-/// startup (policies, add-on sync) and exits on its own; `--wait-for-browser`
-/// keeps the Windows launcher stub attached so waiting on the child means
-/// waiting for the real browser. The first warm-up run absorbs the add-on
+/// startup (policies, add-on sync) and exits on its own. On Windows only,
+/// `--wait-for-browser` keeps the launcher stub attached so waiting on the
+/// child means waiting for the real browser. The first warm-up run absorbs the add-on
 /// churn; the import lands in it or in the (churn-free) run after it. Falls
 /// back to http only if the CA never shows up.
 fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
@@ -482,17 +485,7 @@ fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
     // (e.g. as a symlink) by another local user.
     let shot = profile.join("ca-warmup.png");
     for _ in 0..3 {
-        let child = hidden_command(firefox)
-            .arg("--headless")
-            .arg("--screenshot")
-            .arg(&shot)
-            .arg("--wait-for-browser")
-            .arg("--allow-downgrade")
-            .arg("--profile")
-            .arg(profile)
-            .arg("--no-remote")
-            .arg("--new-instance")
-            .arg("about:blank")
+        let child = ca_warmup_command(profile, firefox, &shot)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -524,6 +517,19 @@ fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
          (policy import kept failing); falling back to http"
     );
     false
+}
+
+fn ca_warmup_command(profile: &Path, firefox: &Path, shot: &Path) -> Command {
+    let mut command = hidden_command(firefox);
+    command.arg("--headless").arg("--screenshot").arg(shot);
+    // This is a Windows launcher-stub flag. Passing it to macOS Firefox ESR
+    // prevents the screenshot run from completing: every fresh install waits
+    // the full 45-second timeout before its first window can open.
+    #[cfg(windows)]
+    command.arg("--wait-for-browser");
+    command.arg("--allow-downgrade").arg("--profile").arg(profile)
+        .arg("--no-remote").arg("--new-instance").arg("about:blank");
+    command
 }
 
 /// Install the starter chrome theme and, when the edition allows unsigned
@@ -1077,6 +1083,8 @@ fn write_profile(
          \x20 // Eepsites: the node carries `.i2p` hosts over its I2P router via a\n\
          \x20 // dedicated local HTTP proxy (jump links and b32 addresses included).\n\
          \x20 if (shExpMatch(host, \"*.i2p\")) {{ return \"PROXY {EEPSITE_PROXY_ADDR}\"; }}\n\
+         \x20 // Onion services always need Tor, independently of clearnet routing.\n\
+         \x20 if (shExpMatch(host, \"*.onion\")) {{ return \"SOCKS5 {socks_addr}\"; }}\n\
          \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
          \x20 // The EPIX chain's own infrastructure (rpc/api/evmrpc.epix.zone) always\n\
          \x20 // goes direct: it is the wallet's essential backend, and the endpoints\n\
@@ -1215,4 +1223,40 @@ async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
     false
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+
+    #[test]
+    fn warmup_waits_for_the_launcher_stub_only_on_windows() {
+        let command = ca_warmup_command(Path::new("profile"), Path::new("firefox"), Path::new("shot.png"));
+        assert_eq!(command.get_args().any(|arg| arg == "--wait-for-browser"), cfg!(windows));
+    }
+
+    /// Run against the actual packaged Firefox in addition to the portable
+    /// command test: EPIX_TEST_FIREFOX=/path/to/firefox cargo test -p epix-browser
+    /// fresh_firefox_warmup_exits -- --ignored
+    #[test]
+    #[ignore = "requires EPIX_TEST_FIREFOX pointing to a runnable Firefox ESR"]
+    fn fresh_firefox_warmup_exits() {
+        let firefox = PathBuf::from(std::env::var_os("EPIX_TEST_FIREFOX").expect("set EPIX_TEST_FIREFOX"));
+        let profile = tempfile::tempdir().unwrap();
+        let shot = profile.path().join("startup.png");
+        let mut child = ca_warmup_command(profile.path(), &firefox, &shot)
+            .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn().unwrap();
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() { break status; }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("fresh Firefox certificate warmup did not exit within 15 seconds");
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(status.success());
+        assert!(shot.is_file());
+    }
 }

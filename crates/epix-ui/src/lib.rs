@@ -2762,6 +2762,31 @@ async fn redirect_add(Path(address): Path<String>) -> Redirect {
 /// epix-bt's streaming cap.
 const RANGE_MAX_CHUNK: u64 = 4 * 1024 * 1024;
 
+/// A discovery attempt ending does not mean the document does not exist.
+/// Keep the wrapper's waiting screen recoverable, and let direct document
+/// navigations retry too. Normal `ensure_xite` requests respect clone backoff.
+fn download_wait_response(is_html: bool) -> Response {
+    let (content_type, body) = if is_html {
+        ("text/html; charset=utf-8", r#"<!doctype html>
+<html lang="en" data-epix-load-state="waiting">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="30"><title>Waiting for this xite - EpixNet</title>
+<style>body{margin:0;background:#101116;color:#eeeef5;font:16px/1.6 system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}main{max-width:28rem;padding:2rem}h1{font-size:1.5rem}p{color:#b2b4c7}a{color:#a8a0ff}</style></head>
+<body><main><h1>Waiting for this xite</h1><p>The download isn't ready yet. This page will try again automatically.</p><a href="/Config">Connection settings</a></main></body></html>"#)
+    } else {
+        ("text/plain; charset=utf-8", "Download not ready yet. Please retry shortly.")
+    };
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [
+            (header::CONTENT_TYPE, content_type),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::RETRY_AFTER, "30"),
+        ],
+        body,
+    ).into_response()
+}
+
 async fn serve_file(
     State(ctx): State<Ctx>,
     Path((address, mut path)): Path<(String, String)>,
@@ -2882,10 +2907,9 @@ async fn serve_file(
             || !ctx.state.xite_file_exists(&address, &path).await
             || (is_html && ctx.state.html_doc_gated(&address).await));
     if still_loading && plausible_xite_ref(&requested) && ctx.state.has_on_demand().await {
-        // Kick the clone off; also resumes an interrupted clone (a registered
-        // xite with core files missing). Keep the handle: the html gate must
-        // lift when no clone can run (failed, NoNewSites, nothing to resume),
-        // or an incomplete-but-servable xite would stall until the deadline.
+        // Kick the clone off; also resumes an interrupted clone. Keep the
+        // handle so an unsuccessful attempt returns a retryable waiting page
+        // instead of serving an incomplete document or stranding the request.
         let ensure = {
             let state = ctx.state.clone();
             let target = requested.clone();
@@ -2897,13 +2921,10 @@ async fn serve_file(
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(300);
         loop {
             let key = ctx.state.canonical_key(&requested).await;
-            // Hold an html document while its core set is still incomplete AND
-            // someone is working on completing it (a running clone, or our
-            // ensure call still deciding whether to start one).
-            let gated = is_html
-                && ctx.state.html_doc_gated(&key).await
-                && (ctx.state.is_cloning(&key) || !ensure.is_finished())
-                && std::time::Instant::now() < deadline;
+            // Never boot the page while its required scripts/styles are
+            // missing, including the gap between automatic retry attempts.
+            let gated = is_html && ctx.state.html_doc_gated(&key).await;
+            let attempt_running = ctx.state.is_cloning(&key) || !ensure.is_finished();
             if !gated
                 && ctx.state.has_xite(&key).await
                 && ctx.state.xite_file_exists(&key, &path).await
@@ -2928,11 +2949,23 @@ async fn serve_file(
                     crate::state::LoadingFile::NotInXite => {
                         return (StatusCode::NOT_FOUND, "not found").into_response();
                     }
-                    crate::state::LoadingFile::Pending => {}
+                    crate::state::LoadingFile::Pending => {
+                        // Programmatically registered xites may live outside
+                        // the clone data directory. Their accepted manifest
+                        // still distinguishes an absent path from a declared
+                        // file waiting to download, including optional files.
+                        if ctx.state.has_xite(&k).await
+                            && (ctx.state.xite_owned(&k).await
+                                || ctx.state.xite_core_complete(&k).await)
+                            && ctx.state.file_info_any(&k, &path).await.is_none()
+                        {
+                            return (StatusCode::NOT_FOUND, "not found").into_response();
+                        }
+                    }
                 }
             }
-            if std::time::Instant::now() >= deadline {
-                return (StatusCode::NOT_FOUND, "not found").into_response();
+            if std::time::Instant::now() >= deadline || !attempt_running {
+                return download_wait_response(is_html);
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }

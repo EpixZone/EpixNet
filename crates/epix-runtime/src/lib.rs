@@ -1262,6 +1262,16 @@ async fn propagation_loop(
     }
 }
 
+/// Bind the file server according to the node's clearnet policy.
+#[cfg(feature = "inbound-seeding")]
+async fn bind_seed_listener(
+    port: u16,
+    clearnet: bool,
+) -> std::io::Result<tokio::net::TcpListener> {
+    let host = if clearnet { "0.0.0.0" } else { "127.0.0.1" };
+    tokio::net::TcpListener::bind((host, port)).await
+}
+
 /// Serve inbound peers (seeding) on `port` until shutdown. Peers bring up an
 /// EDX link and pull verified ranges over it.
 #[cfg(feature = "inbound-seeding")]
@@ -1272,7 +1282,7 @@ async fn seed_loop(
     edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
-    let listener = match tokio::net::TcpListener::bind(("0.0.0.0", port)).await {
+    let listener = match bind_seed_listener(port, clearnet).await {
         Ok(l) => l,
         Err(e) => {
             state.log("ERROR", format!("File server bind on port {port} failed: {e}")).await;
@@ -1324,10 +1334,39 @@ async fn seed_loop(
         }) as epix_protocol::InboundHook);
     }
     let server = epix_protocol::PeerServer::new(es.clearnet_hook(on_inbound));
+    if let Ok(bound) = listener.local_addr() {
+        // The configured port may be zero (an ephemeral listener). Publish the
+        // bound port, and only advertise a source IP when clearnet is enabled.
+        state.set_fileserver_port(bound.port()).await;
+        if clearnet {
+            state.set_clearnet_listener(Some(bound)).await;
+        }
+    }
     state.log("INFO", format!("Seeding files (+ DHT + propagation) on port {port}")).await;
     tokio::select! {
         _ = shutdown.notified() => {}
         _ = server.serve(listener) => {}
+    }
+    state.set_clearnet_listener(None).await;
+}
+
+#[cfg(all(test, feature = "inbound-seeding"))]
+mod seed_binding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tor_always_seed_listener_is_limited_to_loopback_host() {
+        let listener = bind_seed_listener(0, false).await.unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(bound.ip().is_loopback(), "Tor-Always listener bound to {bound}");
+        assert_ne!(bound.port(), 0);
+        assert!(tokio::net::TcpStream::connect(bound).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn clearnet_seed_listener_accepts_external_interfaces() {
+        let listener = bind_seed_listener(0, true).await.unwrap();
+        assert!(listener.local_addr().unwrap().ip().is_unspecified());
     }
 }
 
@@ -2082,6 +2121,9 @@ async fn mesh_loop(
     }
 }
 
+#[cfg(all(test, feature = "i2p"))]
+mod i2p_startup_tests;
+
 #[cfg(feature = "i2p")]
 async fn i2p_loop(
     state: Arc<AppState>,
@@ -2099,6 +2141,7 @@ async fn i2p_loop(
     };
     state.log("INFO", format!("I2P: starting ({mode} router) in the background")).await;
     let (i2p, mut inbound) = epix_i2p::I2p::spawn(config);
+    let inbound_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Layer .b32.i2p dialing onto the transport (composed with TCP/Tor).
     state.set_i2p_transport(Arc::new(i2p.transport())).await;
@@ -2107,10 +2150,12 @@ async fn i2p_loop(
     // listener uses.
     if fileserver_port.is_some() {
         let hook_state = state.clone();
+        let inbound_ready = inbound_ready.clone();
         tokio::spawn(async move {
             // I2P streams are already encrypted, so EDX skips Noise here.
             let Some(es) = edx::ensure_edx_serve(&edx_cell, &hook_state).await else { return };
             let edx_hook = es.overlay_hook();
+            inbound_ready.store(true, std::sync::atomic::Ordering::Release);
             while let Some(stream) = inbound.recv().await {
                 let edx_hook = edx_hook.clone();
                 // Inbound I2P peers arrive with no dial-back address; the Hello
@@ -2127,9 +2172,11 @@ async fn i2p_loop(
     let mut announced_b32 = false;
     loop {
         let s = i2p.status().await;
+        // Publish only after an EDX accept handler is installed: a download-only
+        // node can dial I2P but must not announce an unserved destination.
         // Once ready, publish our `.b32.i2p` (minus the `.i2p` suffix) so PEX
         // advertises us and peers can reach + gossip us over I2P.
-        if !announced_b32 {
+        if !announced_b32 && inbound_ready.load(std::sync::atomic::Ordering::Acquire) {
             if let Some(host) = s.b32.strip_suffix(".i2p") {
                 state.set_i2p_address(host).await;
                 // A Hello on an i2p connection now offers this destination as

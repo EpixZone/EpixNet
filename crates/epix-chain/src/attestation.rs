@@ -308,6 +308,7 @@ mod tests {
                         }
                         Err(error) => panic!("mock server accept failed: {error}"),
                     };
+                    stream.set_nonblocking(false).unwrap();
                     stream
                         .set_read_timeout(Some(Duration::from_secs(2)))
                         .unwrap();

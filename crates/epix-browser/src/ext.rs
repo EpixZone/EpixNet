@@ -49,7 +49,8 @@ static WALLET_TOOLBAR_48: &[u8] = include_bytes!("../assets/wallet-toolbar-48.pn
 /// transform, JS patches) but the wallet build itself does not. Folded into the
 /// version stamp so an otherwise-unchanged wallet still repacks and reloads once,
 /// picking up the new packing.
-const WALLET_PACK_VERSION: u32 = 11;
+// Version 12 also repairs wallets installed before startup-cache invalidation.
+const WALLET_PACK_VERSION: u32 = 12;
 
 /// The extension id (must match the wallet `manifest.json`'s Firefox gecko id).
 pub const EXT_ID: &str = "wallet@epix.zone";
@@ -316,6 +317,17 @@ fn install_addon_xpi(
         zip.write_all(bytes).map_err(|e| format!("zip write {name}: {e}"))?;
     }
     zip.finish().map_err(|e| format!("finish xpi: {e}"))?;
+    // Firefox's certificate warmup may already have cached this profile before
+    // the wallet existed. A later sideload can appear active in extensions.json
+    // without registering its content scripts: unchanged Firefox builds skip
+    // the profile's early startup scan. Discard the derived cache after a new
+    // or updated XPI so Firefox rebuilds it before opening any pages. Keep it
+    // on the unchanged-XPI path above to preserve fast warm starts.
+    match std::fs::remove_file(profile.join("addonStartup.json.lz4")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(format!("invalidate add-on startup cache: {e}")),
+    }
     let _ = std::fs::write(&marker, &stamp_str);
     Ok(())
 }
@@ -1209,6 +1221,36 @@ mod tests {
         let mv3 = br#"{"manifest_version":3,"version":"1.0.0","permissions":["webRequest"]}"#;
         let m3: serde_json::Value = serde_json::from_slice(&transform_manifest(mv3, 1)).unwrap();
         assert_eq!(m3["permissions"].as_array().unwrap().len(), 1, "MV3 permissions untouched");
+    }
+
+    #[test]
+    fn new_addon_invalidates_startup_cache() {
+        let p = TmpProfile::new();
+        let cache = p.0.join("addonStartup.json.lz4");
+        // The certificate warmup has already cached a profile with no wallet.
+        std::fs::write(&cache, b"cached before sideload").unwrap();
+        install_theme_addon(&p.0).unwrap();
+        assert!(!cache.exists(), "Firefox must register the newly installed add-on");
+    }
+
+    #[test]
+    fn changed_addon_invalidates_startup_cache() {
+        let p = TmpProfile::new();
+        install_theme_addon(&p.0).unwrap();
+        let cache = p.0.join("addonStartup.json.lz4");
+        std::fs::write(&cache, b"cached previous add-on version").unwrap();
+        install_addon_xpi(&p.0, &THEME_ADDON, THEME_EXT_ID, 1, &[]).unwrap();
+        assert!(!cache.exists(), "Firefox must register the updated add-on");
+    }
+
+    #[test]
+    fn unchanged_addon_preserves_startup_cache() {
+        let p = TmpProfile::new();
+        install_theme_addon(&p.0).unwrap();
+        let cache = p.0.join("addonStartup.json.lz4");
+        std::fs::write(&cache, b"current add-on cache").unwrap();
+        install_theme_addon(&p.0).unwrap();
+        assert_eq!(std::fs::read(&cache).unwrap(), b"current add-on cache");
     }
 
     // An unchanged XPI is left in place (mtime preserved) so Firefox doesn't

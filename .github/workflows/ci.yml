@@ -64,6 +64,15 @@ jobs:
       # them (like the RustCrypto bump) fails here.
       - name: Build (all targets)
         run: cargo build --workspace --all-targets --locked
+      - name: Test browser startup, add-on cache, and local wallet staging
+        run: |
+          cargo test -p epix-browser startup_tests --locked
+          cargo test -p epix-browser wallet_stage --locked
+          cargo test -p epix-browser startup_cache --locked
+      - name: Test generated proxy routes and wrapper behavior
+        run: |
+          node --test crates/epix-browser/tests/pac-routing.test.cjs
+          node --test ui/tests/*.test.cjs
       # Run the deterministic crypto vectors (sslcrypto + Python interop), so a
       # change that compiles but breaks byte-compatibility is caught too.
       - name: Test crypto byte-compatibility
@@ -72,8 +81,8 @@ jobs:
       # wire protocol over sim and real TCP+Noise, self-encryption KATs, the
       # disk-audit and independent-recompute gates. These are the proofs the
       # edx branch rests on, so they run on every push.
-      - name: Test EDX crates
-        run: cargo test -p epix-blob -p epix-selfenc -p epix-edx -p epix-feed -p epix-search -p epix-xite -p epix-content --locked
+      - name: Test EDX crates and database ingestion
+        run: cargo test -p epix-blob -p epix-selfenc -p epix-edx -p epix-feed -p epix-search -p epix-xite -p epix-content -p epix-db --locked
       # The crates that consume EDX: the node runtime (resync, propagation), the
       # UI server and its WS commands, the DHT-over-payloads path, and EDX over
       # the Reticulum mesh. Their suites were compiled by the build step but
@@ -81,7 +90,7 @@ jobs:
       # binds loopback only. The 310s idle-reaper test in epix-runtime is
       # #[ignore]d and stays skipped.
       - name: Test EDX runtime, UI and wire crates
-        run: cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --locked
+        run: cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
       # Security-critical channel suites must execute, not merely compile under
       # `build --all-targets`. These cover finality-backed identity resolution,
       # durable ratchet/outbox behavior, pairwise and group engines, and RLN.

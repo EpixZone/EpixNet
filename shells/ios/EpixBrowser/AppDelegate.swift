@@ -494,10 +494,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             url = searchUrl(String(t.dropFirst()))
         } else if t.hasPrefix("http://") || t.hasPrefix("https://") {
             url = t
-        } else if t.hasPrefix("epix://") {
-            let host = String(t.dropFirst("epix://".count)).components(separatedBy: "/")[0]
-            currentDisplay = host
-            url = nodeUrl(host)
+        } else if let link = URL(string: t), let target = targetFrom(link) {
+            currentDisplay = target
+            url = nodeUrl(target)
         } else if t.hasPrefix("epix1") || t.hasSuffix(".epix") {
             // Only explicit xite addresses go to the resolver: epix1... or
             // something.epix. A bare word is a search, not an implied .epix.
@@ -581,7 +580,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             let config = { (uiAddr: String) in
                 NodeConfig(
                     dataDir: dataDir,
-                    target: target,
+                    // The resolver takes only the xite name; the full target
+                    // is retained below for navigation after the node starts.
+                    target: target.components(separatedBy: "/")[0],
                     uiAddr: uiAddr,
                     torMode: "enable",
                     version: "0.1.0"
@@ -878,6 +879,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
+        // Message handlers remain installed if this view navigates, and are
+        // visible to subframes too. Only the wallet document may access its
+        // vault and native settings, including after a sheet is replaced.
+        guard acceptsWalletMessage(message) else { return }
         if message.name == "epixClose" {
             dismissWallet()
             return
@@ -900,14 +905,46 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         else { return }
         let msg = obj["message"] as? [String: Any] ?? [:]
         handleNmh(msg) { [weak self] result in
-            guard let self, let web = self.walletWebView,
-                let body = try? JSONSerialization.data(withJSONObject: result),
+            guard let body = try? JSONSerialization.data(withJSONObject: result),
                 let json = String(data: body, encoding: .utf8)
             else { return }
             DispatchQueue.main.async {
+                guard let self, self.acceptsWalletMessage(message), let web = message.webView
+                else { return }
                 web.evaluateJavaScript("window.__epixNmhReply(\(id), \(json))")
             }
         }
+    }
+
+    private func acceptsWalletMessage(_ message: WKScriptMessage) -> Bool {
+        guard let web = message.webView, web === walletWebView,
+            walletDocumentURL(web.url) == walletDocumentURL(message.frameInfo.request.url)
+        else { return false }
+        return isWalletFrame(message.frameInfo)
+    }
+
+    private func walletDocumentURL(_ url: URL?) -> URL? {
+        guard let url, var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        else { return nil }
+        // HashRouter changes the fragment without changing the wallet document.
+        components.fragment = nil
+        return components.url
+    }
+
+    private func isWalletFrame(_ frame: WKFrameInfo) -> Bool {
+        guard frame.isMainFrame,
+            let base = URLComponents(string: nodeBase),
+            let url = frame.request.url,
+            let page = URLComponents(url: url, resolvingAgainstBaseURL: false),
+            page.scheme == base.scheme, page.host == base.host, page.port == base.port,
+            page.percentEncodedPath.hasPrefix("/EpixWallet/"),
+            let path = page.percentEncodedPath.removingPercentEncoding,
+            !path.contains("\\"),
+            !path.split(separator: "/").contains(where: { $0 == "." || $0 == ".." })
+        else { return false }
+        let origin = frame.securityOrigin
+        return origin.protocol == base.scheme && origin.host == base.host
+            && origin.port == (base.port ?? 80)
     }
 
     /// Answer one native-host command with the same JSON shapes as the
@@ -1041,10 +1078,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         default:
             break
         }
-        replyStore(id: id, result: result)
+        replyStore(id: id, result: result, to: message)
     }
 
-    private func replyStore(id: Int, result: Any) {
+    private func replyStore(id: Int, result: Any, to message: WKScriptMessage) {
         // A JSON string, a JSON array (keys), or null - all valid JS literals
         // for __epixStoreReply's second argument.
         let json: String
@@ -1064,7 +1101,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             json = "null"
         }
         DispatchQueue.main.async {
-            self.walletWebView?.evaluateJavaScript("window.__epixStoreReply(\(id), \(json))")
+            guard self.acceptsWalletMessage(message), let web = message.webView else { return }
+            web.evaluateJavaScript("window.__epixStoreReply(\(id), \(json))")
         }
     }
 
@@ -1110,7 +1148,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     }
 
     private func nodeUrl(_ name: String) -> String {
-        "\(nodeBase)/\(name)/"
+        guard let url = URL(string: "epix://\(name)"), let rewritten = xiteRewrite(url)
+        else { return "\(nodeBase)/" }
+        return rewritten.absoluteString
     }
 
     /// Show the loading splash: the white Epix mark spinning on the dark chrome
@@ -1247,12 +1287,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         webView?.loadHTMLString(html, baseURL: nil)
     }
 
-    /// Pull the xite host out of an `epix://host/path` URL.
+    /// Keep the encoded path, query and fragment from external deep links.
     private func targetFrom(_ url: URL) -> String? {
-        guard url.scheme == "epix" else { return nil }
-        return url.host ?? url.absoluteString
-            .replacingOccurrences(of: "epix://", with: "")
-            .components(separatedBy: "/").first
+        guard url.scheme?.lowercased() == "epix", let rewritten = xiteRewrite(url)
+        else { return nil }
+        return String(rewritten.absoluteString.dropFirst("\(nodeBase)/".count))
     }
 }
 
