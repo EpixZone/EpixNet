@@ -28901,21 +28901,27 @@ impl AppState {
         self.xites.read().await.get(address)?.content.clone()
     }
 
+    /// Resolve a listing directory within this xite, including symlink checks.
+    async fn xite_listing_directory(&self, address: &str, inner_path: &str) -> Option<PathBuf> {
+        let storage = self.xites.read().await.get(address)?.storage.clone();
+        let path = storage.path(inner_path).ok()?;
+        // A lexical prefix check cannot reject directory symlinks. Resolve
+        // both paths while allowing an operator-relocated storage root.
+        let root = tokio::fs::canonicalize(storage.root()).await.ok()?;
+        let dir = tokio::fs::canonicalize(path).await.ok()?;
+        dir.starts_with(&root).then_some(dir)
+    }
+
     /// `UiFileManager` - list a directory inside a xite as
     /// `[{name, is_dir, size}]`, sorted (directories first). `None` if the xite
     /// or path is unknown.
     pub async fn list_dir(&self, address: &str, inner_path: &str) -> Option<Vec<Value>> {
-        let root = self.xites.read().await.get(address)?.storage.root().to_path_buf();
-        let dir = if inner_path.is_empty() { root.clone() } else { root.join(inner_path) };
-        // Stay within the xite root.
-        if !dir.starts_with(&root) {
-            return None;
-        }
+        let dir = self.xite_listing_directory(address, inner_path).await?;
         let mut entries: Vec<Value> = Vec::new();
-        for entry in std::fs::read_dir(&dir).ok()? {
-            let Ok(entry) = entry else { continue };
+        let mut directory = tokio::fs::read_dir(&dir).await.ok()?;
+        while let Some(entry) = directory.next_entry().await.ok()? {
             let name = entry.file_name().to_string_lossy().into_owned();
-            let meta = entry.metadata().ok();
+            let meta = entry.metadata().await.ok();
             let is_dir = meta.as_ref().map(std::fs::Metadata::is_dir).unwrap_or(false);
             let size = meta.as_ref().map(std::fs::Metadata::len).unwrap_or(0);
             entries.push(json!({ "name": name, "is_dir": is_dir, "size": size }));
@@ -28933,11 +28939,7 @@ impl AppState {
     /// Recursively list every file under `inner_path` as inner paths relative to
     /// the xite root (`fileList`). Stays within the root; `None` if unknown.
     pub async fn walk_files(&self, address: &str, inner_path: &str) -> Option<Vec<String>> {
-        let root = self.xites.read().await.get(address)?.storage.root().to_path_buf();
-        let start = if inner_path.is_empty() { root.clone() } else { root.join(inner_path) };
-        if !start.starts_with(&root) {
-            return None;
-        }
+        let start = self.xite_listing_directory(address, inner_path).await?;
         let mut out = Vec::new();
         let mut stack = vec![start.clone()];
         while let Some(dir) = stack.pop() {
