@@ -620,23 +620,9 @@ static ROOT_SIGN_BEFORE_CACHE_PAUSE: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 #[cfg(test)]
-static MERGER_DB_BEFORE_INSTALL_PAUSE: std::sync::LazyLock<
-    std::sync::Mutex<
-        Option<(
-            Arc<tokio::sync::Notify>,
-            Arc<tokio::sync::Semaphore>,
-        )>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
-#[cfg(test)]
-static DB_QUERY_AFTER_RECEIPT_PAUSE: std::sync::LazyLock<
-    std::sync::Mutex<
-        Option<(
-            Arc<tokio::sync::Notify>,
-            Arc<tokio::sync::Semaphore>,
-        )>,
-    >,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+type DbTestPause = std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+>;
 #[cfg(test)]
 static DB_SNAPSHOT_XID_FAIL_ONCE: std::sync::LazyLock<std::sync::Mutex<Option<String>>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
@@ -4304,6 +4290,11 @@ pub struct AppState {
     /// answered with "database is locked" style errors, which froze app boot
     /// chains that expected rows (EpixTalk's loading overlay, stuck forever).
     db_rebuilds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    // A fixture's synchronization hooks must not pause another AppState.
+    #[cfg(test)]
+    merger_db_before_install_pause: DbTestPause,
+    #[cfg(test)]
+    db_query_after_receipt_pause: DbTestPause,
     /// Canonicals whose last verified index WITHHELD a verdict on at least one
     /// child because an xID name could not be resolved for a non-authoritative
     /// reason (chain unreachable at boot, hostile proof, trust not up yet).
@@ -5492,6 +5483,10 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
             db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            merger_db_before_install_pause: std::sync::Mutex::new(None),
+            #[cfg(test)]
+            db_query_after_receipt_pause: std::sync::Mutex::new(None),
             xid_deferred_xites: std::sync::Mutex::new(std::collections::HashSet::new()),
             xid_retry_in_flight: std::sync::atomic::AtomicBool::new(false),
             xid_retry_last: std::sync::Mutex::new(None),
@@ -13634,7 +13629,7 @@ impl AppState {
         }
         let mut receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
         #[cfg(test)]
-        let pause = DB_QUERY_AFTER_RECEIPT_PAUSE
+        let pause = self.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
@@ -18477,7 +18472,7 @@ impl AppState {
             }
             #[cfg(test)]
             let pause = {
-                MERGER_DB_BEFORE_INSTALL_PAUSE
+                self.merger_db_before_install_pause
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .clone()
@@ -43956,7 +43951,7 @@ mod tests {
 
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *MERGER_DB_BEFORE_INSTALL_PAUSE
+        *state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -43964,8 +43959,8 @@ mod tests {
             let state = state.clone();
             tokio::spawn(async move { state.rebuild_merger_dbs().await })
         };
-        started.notified().await;
-        MERGER_DB_BEFORE_INSTALL_PAUSE
+        db_test_step("database pause reached", started.notified()).await;
+        state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -43994,7 +43989,7 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(30)).await;
         assert!(!rebuild.is_finished(), "rebuild abandoned a contended authority tree");
         drop(source_tree);
-        rebuild.await.unwrap();
+        db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)
@@ -44069,12 +44064,60 @@ mod tests {
         );
     }
 
+    async fn db_test_step<T>(label: &str, future: impl std::future::Future<Output = T>) -> T {
+        tokio::time::timeout(std::time::Duration::from_secs(5), future)
+            .await
+            .unwrap_or_else(|_| panic!("{label} timed out"))
+    }
+
+    #[tokio::test]
+    async fn db_test_pause_query_is_isolated_from_another_app_state() {
+        let (_first_dir, first, _) = merger_with_one_post().await;
+        let (_second_dir, second, merger) = merger_with_one_post().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *first.db_query_after_receipt_pause.lock().unwrap() = Some((started, release.clone()));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second.db_query(&merger, "SELECT title FROM post", &Value::Null),
+        )
+        .await;
+        first.db_query_after_receipt_pause.lock().unwrap().take();
+        release.close();
+        let rows = result
+            .expect("another AppState's query must not enter this fixture's pause")
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn db_test_pause_merger_is_isolated_from_another_app_state() {
+        let (_first_dir, first, _) = merger_with_one_post().await;
+        let (_second_dir, second, merger) = merger_with_one_post().await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *first.merger_db_before_install_pause.lock().unwrap() = Some((started, release.clone()));
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            second.rebuild_merger_dbs(),
+        )
+        .await;
+        first.merger_db_before_install_pause.lock().unwrap().take();
+        release.close();
+        result.expect("another AppState's rebuild must not enter this fixture's pause");
+        let rows = second
+            .db_query(&merger, "SELECT title FROM post", &Value::Null)
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+    }
+
     #[tokio::test]
     async fn db_query_discards_a_detached_pre_revocation_handle() {
         let (_dir, state, merger) = merger_with_one_post().await;
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *DB_QUERY_AFTER_RECEIPT_PAUSE
+        *state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -44087,15 +44130,15 @@ mod tests {
                     .await
             })
         };
-        started.notified().await;
-        DB_QUERY_AFTER_RECEIPT_PAUSE
+        db_test_step("database pause reached", started.notified()).await;
+        state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         state.remove_permission(&merger, "Merger:EpixPost").await;
         release.add_permits(1);
 
-        let result = query.await.unwrap();
+        let result = db_test_step("paused database query completed", query).await.unwrap();
         assert!(
             result.is_err() || result.as_ref().is_ok_and(Vec::is_empty),
             "query returned rows from a database retired by permission revocation"
@@ -44115,7 +44158,7 @@ mod tests {
             .clone();
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *DB_QUERY_AFTER_RECEIPT_PAUSE
+        *state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -44128,8 +44171,8 @@ mod tests {
                     .await
             })
         };
-        started.notified().await;
-        DB_QUERY_AFTER_RECEIPT_PAUSE
+        db_test_step("database pause reached", started.notified()).await;
+        state.db_query_after_receipt_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
@@ -44143,7 +44186,7 @@ mod tests {
         state.rebuild_merger_dbs().await;
         release.add_permits(1);
 
-        let result = query.await.unwrap();
+        let result = db_test_step("paused database query completed", query).await.unwrap();
         assert!(
             result.is_err() || result.as_ref().is_ok_and(Vec::is_empty),
             "query returned rows from a database handle retired by rebuild"
@@ -44169,7 +44212,7 @@ mod tests {
         };
         let started = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Semaphore::new(0));
-        *MERGER_DB_BEFORE_INSTALL_PAUSE
+        *state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) =
             Some((started.clone(), release.clone()));
@@ -44177,18 +44220,18 @@ mod tests {
             let state = state.clone();
             tokio::spawn(async move { state.rebuild_merger_dbs().await })
         };
-        started.notified().await;
+        db_test_step("database pause reached", started.notified()).await;
 
         state
             .delete_file(&source, "data/u/data.json", None)
             .await
             .unwrap();
-        MERGER_DB_BEFORE_INSTALL_PAUSE
+        state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         release.add_permits(1);
-        rebuild.await.unwrap();
+        db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)

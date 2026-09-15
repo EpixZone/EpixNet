@@ -250,3 +250,16 @@ That follow-up changes only a test assertion, so the immutable wallet artifact
 above still contains the current runtime code. Existing repository security
 alerts were inventoried separately; none were dismissed or suppressed to make
 these PR checks pass.
+
+### Parallel database test isolation
+
+The next Linux CI run built successfully but reached its 45-minute timeout in
+`db_query_discards_a_detached_rebuilt_handle`. Two process-global test pause
+hooks could intercept database queries/rebuilds from unrelated test fixtures
+or overwrite another test's synchronization state. Two bounded reproductions
+confirmed that both hooks blocked an unrelated `AppState` before the fix.
+
+The hooks now belong to each `AppState` in test builds. The affected barrier
+waits and spawned-task joins have five-second bounds with diagnostic labels.
+Both isolation regressions and the previously stalled database tests pass;
+production database behavior is unchanged.
