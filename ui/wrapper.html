@@ -66,10 +66,30 @@ else if (window.opener && window.opener.location.toString()) {
 <!-- Loadingscreen -->
 <div class='loadingscreen'>
  <a href="/Config" class="loading-config">Connection settings</a>
- <div class='loading-text console'>
- </div>
- <div class="flipper-container">
-  <div class="flipper"> <div class="front"></div><div class="back"></div> </div>
+ <div class="loading-card">
+  <div class="loading-identity"><span class="loading-brand">EpixNet</span><span class="loading-address"></span></div>
+  <div class="flipper-container" aria-hidden="true">
+   <div class="flipper"> <div class="front"></div><div class="back"></div> </div>
+  </div>
+  <ol class="loading-steps" aria-label="Opening progress">
+   <li class="loading-step-0 current" aria-current="step"><span></span>Find peers</li>
+   <li class="loading-step-1"><span></span>Get info</li>
+   <li class="loading-step-2"><span></span>Download</li>
+   <li class="loading-step-3"><span></span>Open</li>
+  </ol>
+  <div class="loading-transfer" hidden>
+   <div class="transfer-labels"><span class="transfer-count"></span><span class="transfer-peers"></span></div>
+   <div class="transfer-track" role="progressbar" aria-label="Files downloaded" aria-valuemin="0"><div class="transfer-fill"></div></div>
+  </div>
+  <div class="loading-retry-status" data-state="discovering">
+   <div class="loading-auto-heading"><span class="loading-auto-dot" aria-hidden="true"></span><span class="loading-auto-label">Automatic retries are on</span><span class="loading-attempt" aria-live="polite">First connection</span></div>
+   <span class="loading-retry-note" aria-live="off">No action needed. EpixNet will keep looking.</span>
+   <span class="loading-auto-help">EpixNet keeps trying until this xite is ready or you remove it.</span>
+  </div>
+  <details class="loading-details">
+   <summary>Connection activity</summary>
+   <div class='loading-text console' role="log" aria-label="Connection activity" aria-live="off"></div>
+  </details>
  </div>
 </div>
 

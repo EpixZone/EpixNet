@@ -7,14 +7,21 @@ pub use epix_discovery::Tracker;
 
 /// How we advertise ourselves to trackers, so they hand our address to other
 /// nodes. Overlay addresses are the only way onion/i2p-only nodes get found.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct SelfAdvert {
     /// Our fileserver port (also the onion/i2p virtual port). 0 = passive.
     pub port: u16,
+    /// A live TCP listener of this family is available, and tracker traffic
+    /// is direct (a Tor exit's source IP must never become our listen address).
+    pub advertise_ipv4: bool,
+    pub advertise_ipv6: bool,
     /// Our onion address (b32 host, no `.onion`), if the service is up.
     pub onion: Option<String>,
     /// Our i2p address (b32 host, no `.i2p`, e.g. `<b32>.b32`), if ready.
     pub i2p: Option<String>,
+    /// Whether IP peers are dialable (directly or through Tor). An embedder
+    /// with only an I2P/mesh transport must not spend its reply limit on IPs.
+    pub want_clearnet: bool,
     /// Whether we can dial onion peers (Tor up) - request them from trackers.
     pub want_onion: bool,
     /// Whether we can dial i2p peers (I2P up) - request them from trackers.
@@ -24,12 +31,32 @@ pub struct SelfAdvert {
     pub onion_signer: Option<std::sync::Arc<dyn epix_discovery::OnionSigner>>,
 }
 
+impl Default for SelfAdvert {
+    fn default() -> Self {
+        Self {
+            port: 0,
+            advertise_ipv4: false,
+            advertise_ipv6: false,
+            onion: None,
+            i2p: None,
+            // Preserve the ordinary bootstrap request before overlays start.
+            want_clearnet: true,
+            want_onion: false,
+            want_i2p: false,
+            onion_signer: None,
+        }
+    }
+}
+
 impl std::fmt::Debug for SelfAdvert {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SelfAdvert")
             .field("port", &self.port)
+            .field("advertise_ipv4", &self.advertise_ipv4)
+            .field("advertise_ipv6", &self.advertise_ipv6)
             .field("onion", &self.onion)
             .field("i2p", &self.i2p)
+            .field("want_clearnet", &self.want_clearnet)
             .field("want_onion", &self.want_onion)
             .field("want_i2p", &self.want_i2p)
             .field("onion_signer", &self.onion_signer.is_some())
@@ -48,9 +75,9 @@ async fn ask_tracker(
     params: &AnnounceParams<'_>,
 ) -> Result<Vec<PeerAddr>, String> {
     match tracker {
-        Tracker::Epix(addr) => {
-            discover_via_epix_tracker(sender, addr, params).await.map_err(|e| e.to_string())
-        }
+        Tracker::Epix(addr) => discover_via_epix_tracker(sender, addr, params)
+            .await
+            .map_err(|e| e.to_string()),
         Tracker::Bt(url) => epix_discovery::announce_bittorrent(url, xite_address, port).await,
     }
 }
@@ -79,7 +106,11 @@ pub async fn announce(
     advert: &SelfAdvert,
 ) -> Result<Vec<PeerAddr>, String> {
     let hash = address_hash(xite_address);
-    let mut need_types: Vec<&str> = vec!["ipv4", "ipv6"];
+    let mut need_types: Vec<&str> = if advert.want_clearnet {
+        vec!["ipv4", "ipv6"]
+    } else {
+        Vec::new()
+    };
     if advert.want_onion {
         need_types.push("onion");
     }
@@ -90,6 +121,14 @@ pub async fn announce(
     let onions: Vec<String> = advert.onion.iter().cloned().collect();
     let i2ps: Vec<String> = advert.i2p.iter().cloned().collect();
     let mut add: Vec<&str> = Vec::new();
+    if advert.port != 0 {
+        if advert.advertise_ipv4 {
+            add.push("ipv4");
+        }
+        if advert.advertise_ipv6 {
+            add.push("ipv6");
+        }
+    }
     if !onions.is_empty() {
         add.push("onion");
     }
@@ -137,7 +176,10 @@ mod tests {
     impl AnnounceSender for Answering {
         async fn send(&self, _t: &PeerAddr, _p: Vec<u8>) -> Result<Vec<u8>, String> {
             let resp = AnnounceResp {
-                peers: vec![PeerBuckets { ipv4: self.0.clone(), ..Default::default() }],
+                peers: vec![PeerBuckets {
+                    ipv4: self.0.clone(),
+                    ..Default::default()
+                }],
                 onion_sign_this: String::new(),
                 error: String::new(),
             };
@@ -163,9 +205,14 @@ mod tests {
     /// and a small one almost always knows nobody for a given xite.
     #[tokio::test]
     async fn a_tracker_answering_zero_peers_is_a_success() {
-        let peers = announce(&Answering(Vec::new()), "epix1xyz", &one_tracker(), &SelfAdvert::default())
-            .await
-            .expect("an answer with no peers is not an error");
+        let peers = announce(
+            &Answering(Vec::new()),
+            "epix1xyz",
+            &one_tracker(),
+            &SelfAdvert::default(),
+        )
+        .await
+        .expect("an answer with no peers is not an error");
         assert!(peers.is_empty());
     }
 
@@ -189,7 +236,9 @@ mod tests {
                 if !self.0.swap(true, std::sync::atomic::Ordering::SeqCst) {
                     return Err("first tracker down".into());
                 }
-                Answering(vec![vec![1, 2, 3, 4, 0x67, 0x2B]]).send(_t, _p).await
+                Answering(vec![vec![1, 2, 3, 4, 0x67, 0x2B]])
+                    .send(_t, _p)
+                    .await
             }
         }
 

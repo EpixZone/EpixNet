@@ -914,16 +914,46 @@ fn saturating_size_total(sizes: impl IntoIterator<Item = i64>) -> i64 {
 
 type CloneFileProgress = Arc<dyn Fn(&str, usize) + Send + Sync>;
 
+#[cfg(test)]
+mod clone_discovery_tests;
+
+/// A discovery producer accounts for itself before spawning. Its drop guard
+/// decrements before waking the receiver, so completion cannot race the
+/// producer's sender destructor; cancellation and panics also release it.
+struct DiscoverySource {
+    tx: tokio::sync::mpsc::UnboundedSender<Option<PeerAddr>>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl DiscoverySource {
+    fn new(
+        tx: tokio::sync::mpsc::UnboundedSender<Option<PeerAddr>>,
+        pending: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> Self {
+        pending.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self { tx, pending }
+    }
+}
+
+impl Drop for DiscoverySource {
+    fn drop(&mut self) {
+        self.pending.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let _ = self.tx.send(None);
+    }
+}
+
 #[derive(Clone)]
 struct PexSpawner {
     found: Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
     address: String,
     state: Option<Arc<AppState>>,
+    membership: Option<u64>,
     budget: Arc<std::sync::atomic::AtomicUsize>,
+    pending: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl PexSpawner {
-    fn spawn(&self, peer: PeerAddr, tx: tokio::sync::mpsc::UnboundedSender<PeerAddr>) {
+    fn spawn(&self, peer: PeerAddr, tx: tokio::sync::mpsc::UnboundedSender<Option<PeerAddr>>) {
         use std::sync::atomic::Ordering;
 
         let Some(state) = self.state.clone() else {
@@ -940,36 +970,38 @@ impl PexSpawner {
         }
         let found = self.found.clone();
         let address = self.address.clone();
+        let source = DiscoverySource::new(tx, self.pending.clone());
         tokio::spawn(async move {
-            let Some(Ok(learned)) = state.edx_pex(peer, &address, 10, Vec::new()).await else {
-                return;
-            };
-            for learned_peer in learned {
-                if found.lock().unwrap().insert(learned_peer.to_string()) {
-                    let _ = tx.send(learned_peer);
+            if let Some(Ok(learned)) = state.edx_pex(peer, &address, 10, Vec::new()).await {
+                for learned_peer in learned {
+                    if found.lock().unwrap().insert(learned_peer.to_string()) {
+                        let _ = source.tx.send(Some(learned_peer));
+                    }
                 }
             }
+            drop(source);
         });
     }
 
-    async fn record_peer(&self, peer: PeerAddr, count: usize, t0: Option<std::time::Instant>) {
+    async fn record_peer(&self, peer: PeerAddr, count: usize, t0: Option<std::time::Instant>) -> bool {
+        if let Some(state) = &self.state {
+            if !state.record_clone_peer(&self.address, self.membership, peer.clone(), count).await {
+                return false;
+            }
+        }
         if let Some(t0) = t0.filter(|_| count <= 3) {
             trace_clone!(t0, "discovery: peer #{count} {peer}");
         }
-        if let Some(state) = &self.state {
-            state.push_clone_event(
-                &self.address,
-                serde_json::json!(["peers_added", count]),
-                serde_json::json!({ "peers": count }),
-            );
-            state.add_peers(&self.address, [peer.clone()]).await;
-        }
+        true
     }
 }
 
 struct CloneDiscovery {
-    rx: tokio::sync::mpsc::UnboundedReceiver<PeerAddr>,
-    pex_tx: tokio::sync::mpsc::UnboundedSender<PeerAddr>,
+    // None signals that a discovery source finished, including an empty
+    // answer. The PEX sender is retained so peers can fan out; it must not
+    // make the receiver wait sixty seconds after every real source exited.
+    rx: tokio::sync::mpsc::UnboundedReceiver<Option<PeerAddr>>,
+    pex_tx: tokio::sync::mpsc::UnboundedSender<Option<PeerAddr>>,
     pex: PexSpawner,
 }
 
@@ -980,12 +1012,17 @@ impl CloneDiscovery {
         let pex = self.pex;
         tokio::spawn(async move {
             let mut count = initial_count;
-            while let Ok(Some(peer)) =
-                tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await
-            {
-                count += 1;
-                pex.record_peer(peer.clone(), count, None).await;
-                pex.spawn(peer, pex_tx.clone());
+            loop {
+                if pex.pending.load(std::sync::atomic::Ordering::SeqCst) == 0 && rx.is_empty() { break; }
+                match tokio::time::timeout(std::time::Duration::from_secs(60), rx.recv()).await {
+                    Ok(Some(Some(peer))) => {
+                        count += 1;
+                        if !pex.record_peer(peer.clone(), count, None).await { break; }
+                        pex.spawn(peer, pex_tx.clone());
+                    }
+                    Ok(Some(None)) => {},
+                    _ => break,
+                }
             }
             drop(pex_tx);
         });
@@ -997,12 +1034,17 @@ async fn start_clone_discovery(
     trackers: &[epix_xite::Tracker],
     progress: Option<&Arc<AppState>>,
 ) -> CloneDiscovery {
-    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<PeerAddr>();
+    let membership = match progress {
+        Some(state) => state.xite_membership_generation(address).await,
+        None => None,
+    };
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Option<PeerAddr>>();
     let found = Arc::new(std::sync::Mutex::new(
         std::collections::HashSet::<String>::new(),
     ));
+    let pending = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     for tracker in trackers.iter().cloned() {
-        let tx = tx.clone();
+        let source = DiscoverySource::new(tx.clone(), pending.clone());
         let found = found.clone();
         let address = address.to_string();
         let state = progress.cloned();
@@ -1017,26 +1059,28 @@ async fn start_clone_discovery(
             };
             for peer in peers {
                 if found.lock().unwrap().insert(peer.to_string()) {
-                    let _ = tx.send(peer);
+                    let _ = source.tx.send(Some(peer));
                 }
             }
+            drop(source);
         });
     }
     if let Some(state) = progress {
-        let dht_tx = tx.clone();
+        let source = DiscoverySource::new(tx.clone(), pending.clone());
         let dht_found = found.clone();
         let dht_address = address.to_string();
         let dht_state = state.clone();
         tokio::spawn(async move {
             for peer in dht_state.find_peers_dht(&dht_address).await {
                 if dht_found.lock().unwrap().insert(peer.to_string()) {
-                    let _ = dht_tx.send(peer);
+                    let _ = source.tx.send(Some(peer));
                 }
             }
+            drop(source);
         });
         for peer in state.connectable_peers(address, 50).await {
             if found.lock().unwrap().insert(peer.to_string()) {
-                let _ = tx.send(peer);
+                let _ = tx.send(Some(peer));
             }
         }
     }
@@ -1049,7 +1093,9 @@ async fn start_clone_discovery(
             found,
             address: address.to_string(),
             state: progress.cloned(),
+            membership,
             budget: Arc::new(std::sync::atomic::AtomicUsize::new(3)),
+            pending,
         },
     }
 }
@@ -1102,11 +1148,11 @@ impl RootRace {
     }
 
     async fn discovered(&mut self, peer: PeerAddr, discovery: &CloneDiscovery) {
+        if !discovery.pex.record_peer(peer.clone(), self.peer_count + 1, Some(self.t0)).await {
+            self.channel_open = false;
+            return;
+        }
         self.peer_count += 1;
-        discovery
-            .pex
-            .record_peer(peer.clone(), self.peer_count, Some(self.t0))
-            .await;
         discovery.pex.spawn(peer.clone(), discovery.pex_tx.clone());
         self.spawn_or_queue(peer);
     }
@@ -1157,7 +1203,7 @@ impl RootRace {
             None if self.peer_count == 0 => {
                 Err("no peers found - is the network reachable?".to_string())
             }
-            None => Err("could not fetch + verify content.json from any peer".to_string()),
+            None => Err("content.json was unavailable from the peers tried".to_string()),
         }
     }
 }
@@ -1171,6 +1217,9 @@ async fn race_clone_root(
 ) -> Result<(Vec<u8>, usize), String> {
     let mut race = RootRace::new(address, progress, t0);
     while race.staged.is_none() {
+        if discovery.pex.pending.load(std::sync::atomic::Ordering::SeqCst) == 0 && discovery.rx.is_empty() {
+            race.channel_open = false;
+        }
         if race.exhausted() {
             break;
         }
@@ -1180,7 +1229,8 @@ async fn race_clone_root(
                 discovery.rx.recv(),
             ), if race.channel_open => {
                 match next {
-                    Ok(Some(peer)) => race.discovered(peer, discovery).await,
+                    Ok(Some(Some(peer))) => race.discovered(peer, discovery).await,
+                    Ok(Some(None)) => {},
                     Ok(None) | Err(_) => race.channel_open = false,
                 }
             }
@@ -1203,7 +1253,7 @@ fn emit_root_manifest_progress(
         return;
     };
     let needed = xite.files_needed();
-    let total = needed.len();
+    let total = xite.files().len();
     let size_needed = saturating_size_total(needed.iter().map(|file| file.size));
     let (optional_files, size_optional) = xite
         .content
@@ -1221,8 +1271,8 @@ fn emit_root_manifest_progress(
         .unwrap_or((0, 0));
     let counts = serde_json::json!({
         "peers": peer_count,
-        "bad_files": total,
-        "tasks": total,
+        "bad_files": needed.len(),
+        "tasks": needed.len(),
         "started_task_num": total,
         "size_needed": size_needed,
         "optional_files": optional_files,
@@ -1292,12 +1342,13 @@ fn clone_file_progress(
     address: &str,
     peer_count: usize,
 ) -> Option<CloneFileProgress> {
-    let clone_total = xite.files_needed().len();
+    let clone_total = xite.files().len();
+    let already_complete = clone_total.saturating_sub(xite.files_needed().len());
     progress.map(|state| {
         let state = state.clone();
         let address = address.to_string();
         let peers = peer_count.max(1);
-        let done = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let done = Arc::new(std::sync::atomic::AtomicUsize::new(already_complete));
         let from_peers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Arc::new(move |inner: &str, serving: usize| {
             use std::sync::atomic::Ordering;
@@ -1439,9 +1490,6 @@ async fn commit_clone_root(
     staged: Option<&[u8]>,
     transaction: Option<&epix_ui::state::ManifestTransaction>,
 ) -> Result<(), String> {
-    let Some(_signed) = staged else {
-        return Ok(());
-    };
     let missing = xite.files_needed();
     if !missing.is_empty() {
         return Err(format!(
@@ -1450,6 +1498,9 @@ async fn commit_clone_root(
             name_sample(&missing)
         ));
     }
+    let Some(_signed) = staged else {
+        return Ok(());
+    };
     let state = progress.ok_or("network clone has no AppState transaction owner")?;
     let transaction = transaction.ok_or("network clone lost its staged root transaction")?;
     state
@@ -1515,6 +1566,9 @@ async fn clone_xite_with_progress(
     let mut discovery = start_clone_discovery(address, trackers, progress).await;
     let (staged_bytes, peer_count) =
         fetch_missing_clone_root(&mut xite, &mut discovery, address, progress, t0).await?;
+    if staged_bytes.is_none() {
+        emit_root_manifest_progress(&xite, progress, address, peer_count);
+    }
     // The transaction holds the canonical content.json manifest guard for the
     // WHOLE core download below - files materialize into its stage, so the
     // hold is structural. The cost: an inbound Req::Update (or local publish)
@@ -2886,18 +2940,27 @@ impl epix_ui::OnDemandResolver for OnDemand {
         // resumes its download. Never for owned xites: their local edits must
         // not be overwritten with the signed versions from peers.
         let key = self.state.canonical_key(host).await;
+        if self.state.xite_update_phase(&key) == Some("deleting") {
+            return Err("xite is being deleted".into());
+        }
         if self.state.has_xite(&key).await
             && (self.state.xite_owned(&key).await || self.state.xite_core_complete(&key).await)
         {
             return Ok(());
         }
         if self.network_disabled {
+            self.state.set_clone_status(&key, "paused", Some("offline_policy"), None);
             self.state
                 .resolve_status_set(host, "failed", Some("offline_policy"), None)
                 .await;
             return Err(format!(
                 "offline mode cannot resolve or fetch incomplete site {host}"
             ));
+        }
+        if self.state.clone_retry_deadline(&key).is_some_and(|at| at > now_secs() as i64) {
+            // Repeated iframe requests observe the existing attempt's wait.
+            // Only networkRetry/new peers explicitly clear this deadline.
+            return Ok(());
         }
         // One resolve per host at a time; later askers wait for its outcome.
         let Some(slot) = self.claim_resolve_slot(host) else {
@@ -2955,13 +3018,29 @@ impl epix_ui::OnDemandResolver for OnDemand {
         });
         {
             let mut inflight = self.in_flight.lock().await;
-            if let Some(entry) = inflight.get_mut(&address) {
-                if entry.token == token {
-                    entry.abort = Some(handle.abort_handle());
-                }
+            match inflight.get_mut(&address) {
+                Some(entry) if entry.token == token => entry.abort = Some(handle.abort_handle()),
+                _ => handle.abort(),
             }
         }
         self.wait_for_inflight(&address).await
+    }
+
+    fn is_resolving(&self, host: &str) -> bool {
+        self.resolving.lock().map(|hosts| hosts.contains(host)).unwrap_or(true)
+    }
+
+    async fn cancel(&self, address: &str) {
+        let mut inflight = self.in_flight.lock().await;
+        if let Some(entry) = inflight.remove(address) {
+            if let Some(abort) = entry.abort {
+                abort.abort();
+                while !abort.is_finished() {
+                    tokio::task::yield_now().await;
+                }
+            }
+        }
+        self.state.end_clone(address);
     }
 
     async fn resolve(&self, host: &str) -> Option<epix_ui::ResolvedHost> {
@@ -3132,6 +3211,9 @@ impl OnDemand {
     /// coalesce onto it.
     async fn claim_clone_slot(&self, address: &str, served: bool) -> Option<u64> {
         let mut inflight = self.in_flight.lock().await;
+        if self.state.xite_update_phase(address) == Some("deleting") {
+            return None;
+        }
         if let Some(entry) = inflight.get(address) {
             if served || entry.started.elapsed() < STALE_CLONE_STEAL {
                 return None;
@@ -3629,6 +3711,7 @@ impl OnDemand {
             }
         };
         self.state.update_content(address, content.clone()).await;
+        self.state.set_clone_status(address, "complete", None, None);
         self.state.add_transfer(address, bytes, 0).await;
         // Rebuild the db now that the included / per-user data files are on
         // disk, so a user_contents xite's topics/comments are queryable.
@@ -3702,7 +3785,18 @@ impl OnDemand {
                     ),
                 )
                 .await;
-            tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+            let reason = if self.state.peer_counts(address).await.total == 0 {
+                "no_peers"
+            } else { "files_unavailable" };
+            self.state.set_clone_status(address, "waiting", Some(reason), Some(now_secs() as i64 + 8));
+            let wake = self.state.clone_retry_notify(address);
+            tokio::select! {
+                _ = tokio::time::sleep(std::time::Duration::from_secs(8)) => {},
+                _ = wake.notified() => {},
+            }
+            self.state.advance_clone_attempt(address);
+            // New trackers may have been learned while this attempt waited.
+            let trackers = self.state.all_trackers(&self.trackers).await;
             cloned =
                 clone_xite_with_progress(address, data_dir, &trackers, Some(&self.state)).await;
         }
@@ -6540,6 +6634,99 @@ mod tests {
 
         assert!(error.contains("invalid node config"), "{error}");
         assert!(!route_armed.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn clone_retry_automatic_ensure_obeys_failed_attempt_deadline() {
+        use epix_ui::OnDemandResolver as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        let address = DASHBOARD_XITE_ADDRESS;
+        let path = dir.path().join("data").join(address);
+        std::fs::create_dir_all(&path).unwrap();
+        state.add_xite(address, XiteEntry {
+            storage: XiteStorage::new(path), content: None,
+        }).await;
+        let resolver = Arc::new_cyclic(|me| OnDemand {
+            state: state.clone(), data_root: dir.path().to_path_buf(), trackers: vec![],
+            network_disabled: false, me: me.clone(),
+            in_flight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            in_flight_token: std::sync::atomic::AtomicU64::new(0),
+            tor_expected: std::sync::atomic::AtomicBool::new(false),
+            tor_always: std::sync::atomic::AtomicBool::new(false),
+            resolving: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            verifier_wake: tokio::sync::Notify::new(),
+        });
+        state.begin_clone(address);
+        state.push_clone_event(address, serde_json::json!(["file_failed", "index.html"]),
+            serde_json::json!({"reason":"no_peers", "peers":0}));
+        state.end_clone(address);
+        resolver.ensure(address).await.unwrap();
+        let mut inflight = resolver.in_flight.lock().await;
+        let started_again = inflight.contains_key(address);
+        for (_, entry) in inflight.drain() {
+            if let Some(task) = entry.abort { task.abort(); }
+        }
+        assert!(!started_again, "ordinary page polling must not bypass the announced retry deadline");
+    }
+
+    #[test]
+    fn clone_retry_unreachable_peers_are_not_a_signature_failure() {
+        let mut race = RootRace::new("epix1test", None, std::time::Instant::now());
+        race.peer_count = 1;
+        let error = race.into_result().unwrap_err();
+        assert!(!error.contains("verif"), "no reply says nothing about signature validity: {error}");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_progress_keeps_already_verified_core_files_in_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let address = DASHBOARD_XITE_ADDRESS;
+        let storage = XiteStorage::new(dir.path());
+        storage.write("ready.css", b"ready").unwrap();
+        let mut xite = Xite::new(validated_xite_address(address, "test").unwrap(), storage);
+        xite.content = Some(serde_json::json!({ "files": {
+            "ready.css": {"size":5, "sha512":XiteStorage::hash_bytes(b"ready")},
+            "index.html": {"size":7, "sha512":XiteStorage::hash_bytes(b"missing")},
+        }}));
+        assert_eq!(xite.files_needed().len(), 1);
+        let mut events = state.subscribe_events();
+        clone_file_progress(&xite, Some(&state), address, 1).unwrap()("index.html", 1);
+        let event: serde_json::Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
+        assert_eq!(event["params"]["started_task_num"], 2,
+            "resuming preserves the whole manifest's file count");
+        assert_eq!(event["params"]["tasks"], 0);
+    }
+
+    #[tokio::test]
+    async fn clone_retry_resume_cannot_report_complete_with_missing_core_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(
+            validated_xite_address(DASHBOARD_XITE_ADDRESS, "test").unwrap(),
+            XiteStorage::new(dir.path()),
+        );
+        xite.content = Some(serde_json::json!({ "files": {
+            "index.html": { "size": 10, "sha512": "00".repeat(32) },
+        }}));
+        assert_eq!(xite.files_needed().len(), 1);
+        let result = commit_clone_root(&xite, None, DASHBOARD_XITE_ADDRESS, None, None).await;
+        assert!(result.is_err(), "a resumed manifest still requires every core file before first paint");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_finished_empty_discovery_does_not_wait_for_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut xite = Xite::new(
+            validated_xite_address(DASHBOARD_XITE_ADDRESS, "test").unwrap(),
+            XiteStorage::new(dir.path()),
+        );
+        let mut discovery = start_clone_discovery(DASHBOARD_XITE_ADDRESS, &[], None).await;
+        let result = tokio::time::timeout(std::time::Duration::from_millis(200),
+            race_clone_root(&mut xite, &mut discovery, DASHBOARD_XITE_ADDRESS, None,
+                std::time::Instant::now())).await;
+        assert!(result.is_ok(), "all discovery sources finished; no sender may keep its own receive alive");
+        assert!(result.unwrap().unwrap_err().contains("no peers"));
     }
 
     #[tokio::test]

@@ -348,6 +348,15 @@ impl CommandRegistry {
         // gateway restrictions entirely (that is the sanctioned way to change a
         // locked-down node).
         let restrict = session.state.ui_restrict().await && !session.trusted;
+        if cmd == "networkRetry" && params.get("address").is_none() && !session.trusted {
+            let admin = match session.xite.as_deref() {
+                Some(address) => session.state.xite_has_admin(address).await,
+                None => false,
+            };
+            if restrict || (req_id < WRAPPER_ID_BASE && !admin) {
+                return Err("Global network retry requires wrapper or ADMIN authority".into());
+            }
+        }
         if is_admin_command(cmd) {
             if restrict {
                 // A locked gateway still answers the safe read-only admin
@@ -1140,8 +1149,22 @@ impl WsCommand for NetworkRetry {
     fn name(&self) -> &'static str {
         "networkRetry"
     }
-    async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        s.state.network_changed().await;
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        if let Some(address) = p.get("address").and_then(Value::as_str) {
+            let address = s.state.canonical_key(address).await;
+            if !s.trusted {
+                let bound = s.state.canonical_key(s.address()?).await;
+                let admin = !s.state.ui_restrict().await && s.state.xite_has_admin(&bound).await;
+                if address != bound && !admin {
+                    return Err("Forbidden".into());
+                }
+            }
+            s.state.request_clone_retry(&address).await?;
+        } else if p.get("address").is_some() {
+            return Err("address must be a string".into());
+        } else {
+            s.state.network_changed().await;
+        }
         Ok(json!("ok"))
     }
 }
@@ -4439,6 +4462,77 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn clone_retry_command_targets_only_the_requested_xite() {
+        struct Recorder(tokio::sync::mpsc::UnboundedSender<String>);
+        #[async_trait::async_trait]
+        impl crate::state::OnDemandResolver for Recorder {
+            async fn ensure(&self, host: &str) -> Result<(), String> {
+                let _ = self.0.send(host.to_string());
+                Err("offline seeder".into())
+            }
+            async fn resolve(&self, host: &str) -> Option<crate::state::ResolvedHost> {
+                Some(crate::state::ResolvedHost { address: host.to_string(), verified: true })
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let target = crate::state::DASHBOARD_XITE_ADDRESS;
+        let other = crate::state::XID_XITE_ADDRESS;
+        for address in [target, other] {
+            state.add_xite(address, XiteEntry {
+                storage: XiteStorage::new(dir.path().join(address)), content: None,
+            }).await;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        state.set_on_demand(Arc::new(Recorder(tx))).await;
+        let session = WsSession::new(state.clone(), Some(target.into()));
+        assert_eq!(NetworkRetry.handle(&session, &json!({"address":target})).await.unwrap(), "ok");
+        tokio::task::yield_now().await;
+        let mut attempted = vec![];
+        while let Ok(address) = rx.try_recv() { attempted.push(address); }
+        assert_eq!(attempted, vec![target.to_string()]);
+    }
+
+    #[tokio::test]
+    async fn clone_retry_global_command_requires_wrapper_or_admin_authority() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state, Some(crate::state::DASHBOARD_XITE_ADDRESS.into()));
+        let commands = CommandRegistry::with_defaults();
+        let result = commands.dispatch(&session, "networkRetry", &Value::Null, 1).await;
+        assert!(result.is_err(), "an unprivileged page cannot wake every other download");
+        assert_eq!(commands.dispatch(&session, "networkRetry", &Value::Null, WRAPPER_ID_BASE)
+            .await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_gateway_admin_address_cannot_target_another_xite() {
+        let state = AppState::new("test");
+        let dir = tempfile::tempdir().unwrap();
+        let dashboard = crate::state::DASHBOARD_XITE_ADDRESS;
+        let other = crate::state::XID_XITE_ADDRESS;
+        for address in [dashboard, other] {
+            state.add_xite(address, XiteEntry {
+                storage: XiteStorage::new(dir.path().join(address)), content: None,
+            }).await;
+        }
+        state.add_permission(dashboard, "ADMIN").await;
+        state.config_set("ui_restrict", json!(true)).await;
+        let session = WsSession::new(state.clone(), Some(dashboard.into()));
+        let result = CommandRegistry::with_defaults().dispatch(&session, "networkRetry",
+            &json!({"address":other}), WRAPPER_ID_BASE).await;
+        assert!(result.is_err(), "a public gateway visitor cannot inherit dashboard ADMIN authority");
+    }
+
+    #[tokio::test]
+    async fn clone_retry_command_rejects_an_unrelated_xite() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state, Some(crate::state::DASHBOARD_XITE_ADDRESS.into()));
+        let result = NetworkRetry.handle(&session,
+            &json!({"address":crate::state::XID_XITE_ADDRESS})).await;
+        assert!(result.is_err(), "an unprivileged page cannot wake a different xite");
+    }
 
     /// The admin socket rejects a command `has()` does not know, so an operator
     /// typo is reported instead of dispatching to `null`. `as` is the one live

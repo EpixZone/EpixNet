@@ -783,9 +783,8 @@ if (window.getComputedStyle(document.body).transform) {
       this.watchdog_timer = null;
       this.pre_stage = null;
       this.tor_waiting = false;
-      this.progress_seen = false;
-      this.actions_el = null;
-      this.retry_cb = null;
+      this.retry_timer = null;
+      this.clone_status = null;
       if (window.show_loadingscreen) {
         this.showScreen();
       }
@@ -828,7 +827,7 @@ if (window.getComputedStyle(document.body).transform) {
       })(this)), 300);
     };
 
-    Loading.STAGES = ["Searching for peers", "Fetching xite information", "Downloading files", "Opening the xite"];
+    Loading.STAGES = ["Finding this xite", "Getting xite information", "Downloading the xite", "Opening your xite"];
 
     // The centered stage ticker: previous action faded above, the current one
     // big in the middle with a live detail line, the next faded below.
@@ -863,13 +862,13 @@ if (window.getComputedStyle(document.body).transform) {
       var current;
       if (!this.stage_el || this.stage_el.length === 0) {
         this.stage_el = $(
-          "<div class='loading-stage'>" +
-          "<div class='stage stage-prev'></div>" +
-          "<div class='stage stage-current'></div>" +
-          "<div class='stage stage-detail'></div>" +
+          "<div class='loading-stage' role='status' aria-live='polite' aria-atomic='true'>" +
+          "<div class='stage stage-prev' aria-hidden='true'></div>" +
+          "<h1 class='stage stage-current'></h1>" +
+          "<p class='stage stage-detail'></p>" +
           "<div class='stage stage-next'></div>" +
           "</div>"
-        ).appendTo(".loadingscreen");
+        ).insertBefore(".loading-card .loading-steps");
         $(".loadingscreen").addClass("staged");
       }
       current = this.stage_el.find(".stage-current");
@@ -883,6 +882,12 @@ if (window.getComputedStyle(document.body).transform) {
         current.addClass("pop");
       }
       current.toggleClass("error", !!is_error);
+      $(".loading-card").toggleClass("needs-attention", !!is_error);
+      var index = this.stage_index || 0;
+      for (var step = 0; step < 4; step++) {
+        $(".loading-step-" + step).toggleClass("current", step === index)
+          .toggleClass("complete", step < index).attr("aria-current", step === index ? "step" : null);
+      }
       return this.stage_el.find(".stage-detail").text(detail || "");
     };
 
@@ -910,9 +915,9 @@ if (window.getComputedStyle(document.body).transform) {
     Loading.prototype.setTorWait = function (status) {
       var detail;
       if (status === "Bootstrapping") {
-        detail = "The first start can take up to a minute.";
+        detail = "Tor may take a few minutes on a slow connection. This page will continue when it is ready.";
       } else if (status === "Failed" || status === "Recovering") {
-        detail = "Tor couldn't start. Trying without it...";
+        detail = "Tor is reconnecting. Waiting for an available route to the xite.";
       } else {
         return this.endTorWait(""); // OK, Always or Disabled: the wait is over
       }
@@ -930,22 +935,24 @@ if (window.getComputedStyle(document.body).transform) {
       return this.startWatchdog();
     };
 
-    // Thirty seconds with no peer and no Tor wait usually means the search is
-    // stuck (no network, a dead proxy). Say so and offer a reload; any peer or
-    // file event cancels it.
+    // Silence is normal for rare xites. Keep explaining a long wait without
+    // diagnosing a broken connection or creating a separate retry schedule.
     Loading.prototype.startWatchdog = function () {
       var _this = this;
       this.clearWatchdog();
-      if (window.resolving_host || this.progress_seen || !this.screen_visible) {
+      if (window.resolving_host || this.tor_waiting || !this.screen_visible || this.stage_index === 3) {
         return;
       }
       return this.watchdog_timer = setTimeout(function () {
         _this.watchdog_timer = null;
-        if (_this.progress_seen || _this.tor_waiting || !_this.screen_visible) {
-          return;
+        if (_this.tor_waiting || !_this.screen_visible) return;
+        if (!_this.clone_status || (_this.clone_status.state !== "waiting" && _this.clone_status.state !== "paused")) {
+          var detail = (_this.stage_index || 0) < 2
+            ? "Still searching. Rare xites can take longer to find. You can leave this tab open."
+            : "Waiting for the next files. Downloaded files are kept while peers reconnect.";
+          _this.setStage(_this.stage_index || 0, detail);
         }
-        _this.setStage(_this.stage_index || 0, "Still looking for peers. Check your connection.");
-        return _this.showRetry();
+        _this.startWatchdog();
       }, 30000);
     };
 
@@ -956,45 +963,10 @@ if (window.getComputedStyle(document.body).transform) {
       }
     };
 
-    // A peer or file event: the watchdog and any stale Retry are moot.
+    // A peer or file event restarts the quiet-wait timer.
     Loading.prototype.noteProgress = function () {
-      this.progress_seen = true;
       this.clearWatchdog();
-      return this.hideRetry();
-    };
-
-    // One Retry button between the ticker and the console, 44px tall for
-    // touch. Without a callback it reloads the page, which requests the xite
-    // again from scratch; resolving mode passes the node's network retry.
-    Loading.prototype.showRetry = function (cb) {
-      var _this = this;
-      if (!this.screen_visible) {
-        return;
-      }
-      this.retry_cb = cb || function () {
-        return window.location.reload();
-      };
-      if (!this.actions_el || this.actions_el.length === 0) {
-        this.actions_el = $("<div class='loading-actions'><a href='#Retry' class='button button-retry'>Retry</a></div>");
-        this.actions_el.find(".button-retry").on("click", function () {
-          $(this).addClass("loading");
-          if (_this.retry_cb) {
-            _this.retry_cb();
-          }
-          return false;
-        });
-        this.actions_el.insertBefore(".loadingscreen .console");
-      }
-      this.actions_el.find(".button-retry").removeClass("loading");
-      return this.actions_el;
-    };
-
-    Loading.prototype.hideRetry = function () {
-      if (this.actions_el) {
-        this.actions_el.remove();
-        this.actions_el = null;
-      }
-      return this.retry_cb = null;
+      return this.startWatchdog();
     };
 
     // Plain-language reason for a failed download, from the node's reason
@@ -1002,21 +974,117 @@ if (window.getComputedStyle(document.body).transform) {
     Loading.prototype.failureText = function (reason, tor_status) {
       var text;
       if (reason === "no_peers") {
-        text = "No one is sharing this xite right now.";
+        text = "No reachable peer has been found yet. Less common xites can take longer to find.";
         if (tor_status === "Failed") {
-          text += " Tor couldn't start, so only xites shared over the regular internet can load. Tor retries every 30 seconds.";
+          text += " Tor is reconnecting. EpixNet will keep looking for an available route.";
         }
         return text;
       } else if (reason === "tor_unavailable") {
         return "Tor isn't available and Always-Tor mode never uses the regular internet.";
-      } else if (reason === "offline") {
+      } else if (reason === "offline" || reason === "offline_policy") {
         return "EpixNet is in offline mode.";
       } else if (reason === "files_unavailable") {
-        return "The xite's files couldn't be downloaded from the peers found. Trying again may help.";
+        return "Waiting for peers that have the remaining files. Files already downloaded are kept.";
       } else if (reason === "content_unverified") {
-        return "The xite's files didn't verify. Try again later.";
+        return "The xite's files didn't verify. EpixNet will try again automatically.";
       }
       return null;
+    };
+
+    Loading.prototype.stopRetryCountdown = function () {
+      if (this.retry_timer) clearInterval(this.retry_timer);
+      this.retry_timer = null;
+      $(".loading-retry-note").text("");
+    };
+
+    Loading.prototype.renderRetryCountdown = function () {
+      var status = this.clone_status;
+      if (!status || status.state !== "waiting" || !this.screen_visible) return;
+      var deadline = status.next_retry_at;
+      var text = "EpixNet will try again automatically. You can leave this tab open.";
+      if (typeof deadline === "number" && isFinite(deadline) && deadline > 0) {
+        var seconds = Math.max(0, Math.ceil(deadline - Date.now() / 1000));
+        text = seconds > 0 ? "Next automatic attempt in " + seconds + "s" : "Waiting for the next automatic attempt…";
+      }
+      $(".loading-retry-note").text(text);
+    };
+
+    Loading.prototype.showCloneStatus = function (status) {
+      if (!status || !this.screen_visible) return;
+      if (this.clone_status && status.attempt < this.clone_status.attempt) return;
+      var previous = this.clone_status;
+      this.clone_status = status;
+      this.stopRetryCountdown();
+      $(".loading-retry-status").attr("data-state", status.state);
+      $(".loading-auto-label").text("Automatic retries are on");
+      $(".loading-auto-help").text("EpixNet keeps trying until this xite is ready or you remove it.");
+      if (status.state !== "downloading") {
+        $(".transfer-peers").text(status.state === "complete" ? "Ready to open" : "Downloaded files are kept");
+      }
+      var attempt = status.attempt || 1;
+      var attemptLabel = attempt > 1 ? "Attempt " + attempt : "First connection";
+      if ($(".loading-attempt").text() !== attemptLabel) $(".loading-attempt").text(attemptLabel);
+      if (status.state === "waiting") {
+        this.clearWatchdog();
+        this.pre_stage = null;
+        this.renderStage("Waiting for a peer", this.failureText(status.reason) ||
+          "This xite is taking a little longer to reach. Files already downloaded are kept.", "", false, "");
+        this.renderRetryCountdown();
+        var _this = this;
+        if (typeof status.next_retry_at === "number") {
+          this.retry_timer = setInterval(function () { _this.renderRetryCountdown(); }, 1000);
+        }
+      } else if (status.state === "paused") {
+        this.clearWatchdog();
+        var offline = status.reason === "offline" || status.reason === "offline_policy";
+        $(".loading-auto-label").text(offline ? "Downloads are paused" : "Waiting for a connection");
+        $(".loading-retry-note").text(offline
+          ? "Turn off offline mode in Connection settings to continue."
+          : "Downloads continue automatically when a route is available.");
+        $(".loading-auto-help").text(offline ? "Your downloaded files are kept."
+          : "You can review your connection settings while you wait.");
+        this.renderStage(offline ? "Offline mode" : "Connection paused",
+          this.failureText(status.reason) || "Check Connection settings to continue.", "", true, "");
+      } else if (status.state === "complete") {
+        $(".loading-auto-label").text("Your xite is ready");
+        $(".loading-auto-help").text("Opening the downloaded page…");
+        this.setStage(3, "The files are ready. Opening the page…");
+        this.clearWatchdog();
+      } else if (status.state === "discovering" || status.state === "downloading") {
+        if (!previous || attempt > (previous.attempt || 1) || previous.state === "waiting" || previous.state === "paused") {
+          this.stage_index = status.state === "downloading" ? 2 : 0;
+          this.pre_stage = null;
+          this.tor_waiting = false;
+        }
+        if (status.state === "downloading") {
+          $(".loading-auto-label").text("Downloading automatically");
+          $(".loading-retry-note").text("Progress is saved as files arrive.");
+          this.setStage(2, "Downloading the files needed to open this xite.");
+        } else {
+          $(".loading-retry-note").text(attempt > 1
+            ? "Searching again automatically. Your progress is kept."
+            : "No action needed. EpixNet will keep looking.");
+          var peers = status.peers || 0;
+          this.setStage(peers > 0 ? Math.max(1, this.stage_index || 0) : (this.stage_index || 0), peers > 0
+            ? "Found " + peers + (peers === 1 ? " peer. Requesting xite information." : " peers. Requesting xite information.")
+            : "Looking for people sharing this xite. Rare xites may take longer.");
+        }
+        this.startWatchdog();
+      }
+    };
+
+    Loading.prototype.setTransfer = function (done, total, peers) {
+      if (!(total > 0)) return;
+      done = Math.max(0, Math.min(total, done));
+      if (done < (this.files_done || 0)) return;
+      this.files_done = done;
+      this.files_total = total;
+      $(".loading-transfer").prop("hidden", false);
+      $(".transfer-count").text(done + " of " + total + " files");
+      $(".transfer-peers").text(peers > 0 ? peers + (peers === 1 ? " peer sending files" : " peers sending files") : "Downloaded files are kept");
+      $(".transfer-track").attr("aria-valuenow", done).attr("aria-valuemax", total)
+        .attr("aria-valuetext", done + " of " + total + " files downloaded");
+      $(".transfer-fill").css("width", (done / total * 100) + "%");
     };
 
     // Seconds spent in the current lookup state. The node's `since` is a
@@ -1039,98 +1107,60 @@ if (window.getComputedStyle(document.body).transform) {
     // node's own detail string is only a last resort, and always under a
     // label.
     Loading.prototype.showResolveStatus = function (status) {
-      var _this = this;
-      var host, state, reason, label, detail, is_error, retry;
-      host = window.resolving_host;
-      state = status.state;
-      reason = status.reason;
-      is_error = false;
-      retry = false;
-      var settings = false;
+      var host = window.resolving_host;
+      var state = status.state;
+      var reason = status.reason;
+      var label = "Looking up " + host;
+      var detail = "EpixNet is checking the name registry automatically.";
+      var is_error = false;
+      var paused = false;
+      var note = "The page opens automatically when the name is found.";
       if (state === "waiting_network") {
-        label = "Connecting to the network";
-        detail = "Can't reach the Epix name servers. Check your internet connection, or change the servers in Connection settings.";
-        is_error = true;
-        retry = true;
-        settings = true;
+        label = "Waiting for the name registry";
+        detail = "The Epix name servers haven't answered yet. EpixNet will keep checking automatically.";
       } else if (state === "establishing_trust") {
         label = "Checking the Epix name registry";
-        detail = "This takes a moment the first time.";
-        if (this.stateElapsed(status) >= 45) {
-          detail = "Still working. On a slow connection this can take a few minutes.";
-          if (typeof status.sources_total === "number") {
-            detail += " Reached " + (status.sources_reachable || 0) + " of " + status.sources_total + " name servers.";
-          }
-          detail += " If your connection is fine, the name servers may be down: you can change them in Connection settings.";
-          retry = true;
-          settings = true;
+        detail = "This can take a few minutes the first time. EpixNet will continue automatically.";
+        if (this.stateElapsed(status) >= 45 && typeof status.sources_total === "number") {
+          detail += " Reached " + (status.sources_reachable || 0) + " of " + status.sources_total + " name servers.";
         }
       } else if (state === "failed") {
-        is_error = true;
-        retry = true;
         if (reason === "not_found") {
-          label = "Not found";
-          detail = "No xite is registered under this name. Check the spelling, or open it by its epix1 address.";
+          label = "Waiting for this name";
+          detail = "No xite is registered under this name yet. EpixNet will keep checking. You can also check the spelling.";
         } else if (reason === "offline_policy") {
           label = "Offline mode";
-          detail = "EpixNet is in offline mode, so only xites already on this phone open. Turn it off in Connection settings.";
+          detail = "EpixNet is in offline mode, so only xites already on this device open.";
+          note = "Change offline mode in Connection settings to continue.";
+          paused = true;
         } else if (reason === "tor_required") {
           label = "Connecting to Tor";
+          detail = "The name lookup will continue when Tor is available.";
           if (status.tor_status === "Failed") {
-            detail = "Tor couldn't connect. It retries every 30 seconds. You can switch off Always-Tor in Connection settings.";
-          } else {
-            detail = "Always-Tor mode never uses the regular internet.";
-            is_error = false;
+            detail = "Tor is reconnecting. The name lookup will continue when it is available.";
           }
         } else if (reason === "mistyped_address") {
           label = "Mistyped address";
           detail = host + " looks like an epix1 address, but its checksum does not match.";
-          retry = false; // the checksum will not change on a retry
+          note = "Check the address to continue.";
+          paused = true;
+          is_error = true;
         } else {
-          label = "Couldn't look up " + host;
-          detail = status.detail || "Trying again may help.";
-          settings = true;
+          label = "Waiting for the name registry";
+          detail = status.detail || "The name lookup hasn't completed yet.";
+          detail += " EpixNet will try again automatically.";
         }
-      } else {
-        // idle, resolving, or a state newer than this page
-        label = "Looking up " + host;
-        if (reason === "rpc_error") {
-          detail = "The Epix name service didn't answer. Trying again... (attempt " + (status.attempts || 1) + ")";
-          if ((status.attempts || 0) >= 3) {
-            detail += " You can change the name servers in Connection settings.";
-            retry = true;
-            settings = true;
-          }
-        } else if (reason === "bad_answer") {
-          detail = "Got a bad answer from a name server. Trying another one.";
-        } else {
-          detail = "";
-        }
+      } else if (reason === "rpc_error") {
+        detail = "The Epix name service didn't answer. Trying again automatically.";
+      } else if (reason === "bad_answer") {
+        detail = "A name server returned an invalid answer. Checking another one automatically.";
       }
-      this.setPreStage(label, detail, is_error);
-      if (retry) {
-        this.showRetry(function () {
-          return _this.wrapper.retryResolve();
-        });
-        return this.showSettingsAction(settings);
-      }
-      return this.hideRetry();
-    };
-
-    // A second, quieter action next to Retry: the Config page, where the
-    // name servers (RPC endpoints), Tor and offline mode live. Shown only
-    // when changing a setting could be the way out of the current state.
-    Loading.prototype.showSettingsAction = function (on) {
-      if (!this.actions_el) {
-        return;
-      }
-      var link = this.actions_el.find(".button-settings");
-      if (on && link.length === 0) {
-        this.actions_el.append("<a href='/Config' class='button button-settings'>Connection settings</a>");
-      } else if (!on) {
-        link.remove();
-      }
-      return this.actions_el;
+      $(".loading-retry-status").attr("data-state", paused ? "paused" : "discovering");
+      $(".loading-auto-label").text(paused ? "Connection paused" : "Automatic lookup is on");
+      $(".loading-attempt").text(status.attempts > 1 ? "Attempt " + status.attempts : "First lookup");
+      $(".loading-retry-note").text(note);
+      $(".loading-auto-help").text(paused ? "" : "You can leave this tab open while EpixNet keeps checking.");
+      return this.setPreStage(label, detail, is_error);
     };
 
     Loading.prototype.showScreen = function () {
@@ -1141,17 +1171,23 @@ if (window.getComputedStyle(document.body).transform) {
       if (window.is_homepage || window.resolving_host) {
         $(".fixbutton").addClass("fixbutton-hidden");
       }
-      this.printLine("Connecting...");
+      $(".loading-address").text(window.resolving_host || window.address || "Opening a xite");
+      $(".loading-details").on("toggle", function () {
+        var log = $(this).find(".console")[0];
+        if (this.open && log) log.scrollTop = log.scrollHeight;
+      });
+      this.printLine("Connecting to EpixNet…");
       if (window.resolving_host) {
-        return this.setPreStage("Looking up " + window.resolving_host, "");
+        return this.showResolveStatus({state: "idle"});
       }
-      this.setStage(0, "");
+      this.setStage(0, "Looking for people sharing this xite. Rare xites may take longer.");
       return this.startWatchdog();
     };
 
     Loading.prototype.showTooLarge = function (xite_info) {
       var button, line;
       this.log("Displaying large xite confirmation");
+      $(".loading-details").prop("open", true);
       if ($(".console .button-setlimit").length === 0) {
         line = this.printLine("Xite size: <b>" + (parseInt(xite_info.settings.size / 1024 / 1024)) + "MB</b> is larger than default allowed " + (parseInt(xite_info.size_limit)) + "MB", "warning");
         button = $("<a href='#Set+limit' class='button button-setlimit'>" + ("Open xite and set size limit to " + xite_info.next_size_limit + "MB") + "</a>");
@@ -1172,6 +1208,7 @@ if (window.getComputedStyle(document.body).transform) {
 
     Loading.prototype.showTrackerTorBridge = function (server_info) {
       var button, line;
+      $(".loading-details").prop("open", true);
       if ($(".console .button-settrackerbridge").length === 0 && !server_info.tor_use_meek_bridges) {
         line = this.printLine("Tracker connection error detected.", "error");
         button = $("<a href='#Enable+Tor+bridges' class='button button-settrackerbridge'>" + "Use Tor meek bridges for tracker connections" + "</a>");
@@ -1199,6 +1236,7 @@ if (window.getComputedStyle(document.body).transform) {
     Loading.prototype.hideScreen = function () {
       this.log("hideScreen");
       this.clearWatchdog();
+      this.stopRetryCountdown();
       $(".fixbutton").removeClass("fixbutton-hidden");
       if (!$(".loadingscreen").hasClass("done")) {
         if (this.screen_visible) {
@@ -1240,7 +1278,10 @@ if (window.getComputedStyle(document.body).transform) {
       } else {
         text = text + "<span class='cursor'> </span>";
       }
+      var activity = $(".loadingscreen .console")[0];
+      var follow = activity && activity.scrollHeight - activity.scrollTop - activity.clientHeight < 24;
       line = $("<div class='console-line'>" + text + "</div>").appendTo(".loadingscreen .console");
+      if (follow) activity.scrollTop = activity.scrollHeight;
       if (type === "warning") {
         line.addClass("console-warning");
       }
@@ -1477,6 +1518,7 @@ if (window.getComputedStyle(document.body).transform) {
       this.is_title_changed = false;
       this.allowed_event_constructors = [window.MouseEvent, window.KeyboardEvent, window.PointerEvent];
       window.onload = this.onPageLoad;
+      document.getElementById("inner-iframe").addEventListener("load", this.onPageLoad);
       window.onhashchange = (function (_this) {
         return function (e) {
           var src;
@@ -1552,13 +1594,13 @@ if (window.getComputedStyle(document.body).transform) {
         })(this));
       } else if (cmd === "setSiteInfo") {
         this.sendInner(message);
-        if (message.params.address === this.address) {
+        if (message.params.address === (this.address || window.address)) {
           this.setXiteInfo(message.params);
         }
         return this.updateProgress(message.params);
       } else if (cmd === "setAnnouncerInfo") {
         this.sendInner(message);
-        if (message.params.address === this.address) {
+        if (message.params.address === (this.address || window.address)) {
           this.setAnnouncerInfo(message.params);
         }
         return this.updateProgress(message.params);
@@ -2192,9 +2234,9 @@ if (window.getComputedStyle(document.body).transform) {
           };
         })(this));
       }
-      if (this.inner_loaded) {
-        this.reloadXiteInfo();
-      }
+      // A waiting/error iframe is not loaded, but still needs the initial
+      // retry snapshot immediately (and again after reconnecting).
+      this.reloadXiteInfo();
       // Nav-icon / tab notification badge: fetch the current unread total now
       // and keep it fresh on a light timer (the count is cheap on the node).
       this.pollNotificationCount();
@@ -2300,20 +2342,10 @@ if (window.getComputedStyle(document.body).transform) {
         this.log("Resolved " + window.resolving_host + " to " + status.address + ", reloading");
         // Show the first real stage before reloading: the reloaded page
         // starts on that same stage, so the ticker reads as continuing.
-        this.loading.hideRetry();
         this.loading.clearPreStage("");
         return window.location.replace(window.location.href);
       }
       return this.loading.showResolveStatus(status);
-    };
-
-    // The Retry button in resolving mode: wake the node's network side, then
-    // ask again right away instead of waiting for the next tick.
-    Wrapper.prototype.retryResolve = function () {
-      var _this = this;
-      return this.ws.cmd("networkRetry", [], function () {
-        return _this.pollResolveStatus(true);
-      });
     };
 
     // A xite whose content lives in per-user files (forums, blogs, mail)
@@ -2364,10 +2396,23 @@ if (window.getComputedStyle(document.body).transform) {
       }, 12000);
     };
 
+    Wrapper.prototype.loadingDocumentReady = function () {
+      try {
+        var frame = document.getElementById("inner-iframe");
+        var doc = frame.contentDocument;
+        if (!doc || doc.location.href === "about:blank" || doc.readyState !== "complete") return false;
+        if (doc.documentElement.dataset.epixLoadState) return false;
+        return true;
+      } catch (_) {
+        return !this.loading.screen_visible; // a loading xite must first produce its real document
+      }
+    };
+
     Wrapper.prototype.onPageLoad = function (e) {
       var ref;
       this.log("onPageLoad");
-      this.inner_loaded = true;
+      this.inner_loaded = this.loadingDocumentReady();
+      this.iframe_recovery_pending = false;
       if (window.resolving_host) {
         return; // the iframe is blank; there is no xite to ask about yet
       }
@@ -2376,7 +2421,7 @@ if (window.getComputedStyle(document.body).transform) {
       // was not hidden). Without this re-check the overlay only goes away on
       // the next xite event - typically the announce finishing seconds later -
       // and until then it invisibly swallows every click on the page.
-      if (this.xite_info && this.loading.screen_visible && this.xite_info.settings &&
+      if (this.inner_loaded && this.xite_info && this.loading.screen_visible && this.xite_info.settings &&
           this.xite_info.settings.size > 0 &&
           this.xite_info.settings.size < this.xite_info.size_limit * 1024 * 1024) {
         this.log("Inner loaded with siteInfo already in - hiding loading screen");
@@ -2580,7 +2625,8 @@ if (window.getComputedStyle(document.body).transform) {
           if (xite_info.size_needed) needed_line = xite_info.bad_files + " files (" + fmtSize(xite_info.size_needed) + ") needed to load";
           this.loading.noteProgress();
           this.loading.printLine(needed_line);
-          this.loading.setStage(2, "0 / " + xite_info.bad_files + " files");
+          this.loading.setTransfer(0, xite_info.bad_files, 0);
+          this.loading.setStage(2, "Downloading the files needed to open this xite.");
         } else if (xite_info.event[0] === "file_done") {
           this.loading.noteProgress();
           this.loading.printLine(xite_info.event[1] + " downloaded");
@@ -2588,17 +2634,19 @@ if (window.getComputedStyle(document.body).transform) {
             // peers_serving is how many peers the files are actually coming
             // from, which is not xite_info.peers (how many were discovered).
             var serving = xite_info.peers_serving || 0;
-            var from = serving > 0 ? " from " + serving + (serving === 1 ? " peer" : " peers") : "";
             var files_done = xite_info.started_task_num - xite_info.tasks;
             // Never step backwards (events can arrive out of order).
             if (files_done >= (this.max_files_done || 0)) {
               this.max_files_done = files_done;
-              this.loading.setStage(2, files_done + " / " + xite_info.started_task_num + " files" + from + " - " + xite_info.event[1]);
+              this.loading.setTransfer(files_done, xite_info.started_task_num, serving);
+              this.loading.setStage(2, "Receiving the files needed to open this xite.");
             }
           }
           if (xite_info.event[1] === window.file_inner_path) {
-            this.loading.setStage(3, "");
-            this.loading.hideScreen();
+            if ((xite_info.clone_status && xite_info.clone_status.state === "complete") ||
+                (!xite_info.clone_status && xite_info.tasks === 0 && xite_info.bad_files === 0)) {
+              this.loading.setStage(3, "Waiting for the page to finish opening…");
+            }
             if (!this.xite_info) {
               this.reloadXiteInfo();
             }
@@ -2615,7 +2663,7 @@ if (window.getComputedStyle(document.body).transform) {
           if (xite_info.settings.size > xite_info.size_limit * 1024 * 1024) {
             this.loading.showTooLarge(xite_info);
           } else {
-            this.loading.printLine(xite_info.event[1] + " download failed", "error");
+            this.loading.printLine("Waiting for " + xite_info.event[1]);
             // The node says why when it can. Older nodes only send the peer
             // count, where one peer or fewer means there was nobody to
             // fetch from.
@@ -2626,17 +2674,18 @@ if (window.getComputedStyle(document.body).transform) {
             var detail = this.loading.failureText(reason, xite_info.tor_status);
             if (reason === "no_peers") {
               // Only show "No peers found" after a file download has failed
-              this.xite_error = "No peers found";
-              this.loading.printLine("No peers found");
+              this.xite_error = "No reachable peers yet";
+              this.loading.printLine("No reachable peer found in this attempt");
             }
-            this.loading.setStage(this.loading.stage_index || 0, detail || (xite_info.event[1] + " download failed"), true);
+            this.loading.setStage(this.loading.stage_index || 0, detail || "Waiting for the remaining files.", reason === "content_unverified");
             this.loading.clearWatchdog();
-            this.loading.showRetry();
           }
         } else if (xite_info.event[0] === "peers_added") {
           this.loading.noteProgress();
-          this.loading.printLine("Peers found: " + xite_info.peers);
-          this.loading.setStage(1, "peers found: " + xite_info.peers);
+          var discovered = xite_info.clone_status && typeof xite_info.clone_status.peers === "number"
+            ? xite_info.clone_status.peers : xite_info.peers;
+          this.loading.printLine("Peers found: " + discovered);
+          if (discovered > 0) this.loading.setStage(1, "Requesting xite information from peers.");
         } else if (xite_info.event[0] === "waiting_tor") {
           this.loading.setTorWait(xite_info.tor_status || xite_info.event[1]);
         } else if (xite_info.event[0] === "tor_skipped") {
@@ -2644,6 +2693,24 @@ if (window.getComputedStyle(document.body).transform) {
           this.loading.endTorWait("Tor couldn't start. Trying without it...");
         }
         this.noteContentSync(xite_info);
+      }
+      // Reconnects and newly opened tabs receive snapshots rather than the
+      // earlier file_done stream. Restore their actual saved progress too.
+      if (this.loading.screen_visible && xite_info.started_task_num > 0) {
+        this.loading.setTransfer(xite_info.started_task_num - Math.max(xite_info.tasks || 0, xite_info.bad_files || 0),
+          xite_info.started_task_num, xite_info.peers_serving || 0);
+      }
+      if (xite_info.clone_status) {
+        this.loading.showCloneStatus(xite_info.clone_status);
+        if (xite_info.clone_status.state === "complete" && this.loading.screen_visible && !this.inner_loaded) {
+          var frame = document.getElementById("inner-iframe");
+          try {
+            if (frame.contentDocument && frame.contentDocument.documentElement.dataset.epixLoadState && !this.iframe_recovery_pending) {
+              this.iframe_recovery_pending = true;
+              this.reloadIframe();
+            }
+          } catch (_) {}
+        }
       }
       if (this.loading.screen_visible && !this.xite_info) {
         if (xite_info.peers > 1) {

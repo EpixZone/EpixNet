@@ -1007,38 +1007,6 @@ a {
 	padding: 10px 20px;
 }
 
-/* Retry row between the stage ticker and the console. Same flex order as the
-   console, so the DOM position (inserted just before it) decides. */
-.loading-actions {
-	order: 3;
-	margin: 0 0 18px;
-	width: 100%;
-	max-width: 560px;
-	display: flex;
-	justify-content: center;
-}
-
-.loading-actions .button {
-	min-height: 44px;
-	margin: 0;
-	padding: 12px 28px;
-	background-color: var(--epix-accent);
-	color: var(--epix-on-accent);
-	border-radius: var(--epix-radius-md);
-	font-size: 14px;
-	line-height: 20px;
-	text-transform: none;
-}
-
-/* The quieter second action (Connection settings) next to Retry */
-.loading-actions .button-settings {
-	margin-left: 12px;
-	background-color: transparent;
-	color: var(--epix-accent);
-	border: 1px solid var(--epix-accent);
-	box-sizing: border-box;
-}
-
 /* Dismissal: fade the whole screen out in place; pointer-events off so the
    invisible overlay never blocks the xite while waiting for removal */
 .loadingscreen.done {
@@ -1052,7 +1020,7 @@ a {
 .loadingscreen.done .console,
 .loadingscreen.done .flipper-container,
 .loadingscreen.done .loading-stage,
-.loadingscreen.done .loading-actions {
+.loadingscreen.done .loading-retry-status {
 	opacity: 0;
 	transform: none;
 	transition: opacity 0.3s ease;
@@ -1263,4 +1231,194 @@ a {
 	.body-sidebar .infopanel {
 		right: 0;
 	}
+}
+
+/* A steady loading card: active work, saved progress and retry timing stay
+   readable even when a rarely shared xite takes several attempts to reach. */
+.loadingscreen.ready {
+	padding: 64px 20px 32px;
+	justify-content: flex-start;
+}
+.loading-card {
+	width: 100%;
+	max-width: 600px;
+	margin: auto;
+	padding: 28px 32px 20px;
+	box-sizing: border-box;
+	display: flex;
+	flex-direction: column;
+	align-items: center;
+	background: var(--epix-surface);
+	border: 1px solid var(--epix-border);
+	border-radius: 20px;
+	box-shadow: var(--epix-shadow-sm);
+}
+.loading-identity {
+	order: 0;
+	width: 100%;
+	margin-bottom: 28px;
+	display: flex;
+	align-items: baseline;
+	gap: 16px;
+	font-size: 12px;
+}
+.loading-brand {
+	font-weight: 700;
+	font-size: 14px;
+	color: var(--epix-text);
+}
+.loading-address {
+	margin-left: auto;
+	color: var(--epix-text-low);
+	font-family: var(--epix-font-mono);
+	overflow-wrap: anywhere;
+	text-align: right;
+	max-width: 78%;
+}
+.loading-card .flipper-container {
+	width: 64px;
+	height: 64px;
+	margin: 0 0 20px;
+}
+.loading-stage {
+	margin-bottom: 20px;
+}
+.loading-stage .stage-current {
+	font-size: 28px;
+	line-height: 1.2;
+	font-weight: 650;
+	margin: 0 0 12px;
+	padding: 0;
+	letter-spacing: -.6px;
+	overflow-wrap: anywhere;
+}
+.loading-stage .stage-detail {
+	font-family: var(--epix-font-sans);
+	font-size: 14px;
+	line-height: 1.6;
+	color: var(--epix-text-mid);
+	max-width: 450px;
+	margin: 0 auto;
+	min-height: 44px;
+}
+.loading-stage .stage-prev,
+.loading-stage .stage-next { display: none; }
+.loading-steps {
+	order: 3;
+	display: flex;
+	width: 100%;
+	list-style: none;
+	margin: 0 0 24px;
+	padding: 0;
+	gap: 8px;
+}
+.loading-steps li {
+	flex: 1;
+	font-size: 11px;
+	line-height: 20px;
+	color: var(--epix-text-low);
+	text-align: center;
+}
+.loading-steps li > span {
+	display: block;
+	border-radius: 2px;
+	height: 3px;
+	margin-bottom: 8px;
+	background: var(--epix-border);
+}
+.loading-steps .current { color: var(--epix-text); font-weight: 600; }
+.loading-steps .current > span { background: var(--epix-accent); }
+.loading-steps .complete > span { background: var(--epix-teal); }
+.loading-transfer {
+	order: 4;
+	width: 100%;
+	margin: 0 0 18px;
+}
+.loading-transfer[hidden] { display: none; }
+.transfer-labels {
+	display: flex;
+	justify-content: space-between;
+	gap: 12px;
+	margin-bottom: 8px;
+	font-size: 12px;
+	line-height: 18px;
+	color: var(--epix-text-mid);
+}
+.transfer-count { font-weight: 600; }
+.transfer-peers { text-align: right; color: var(--epix-text-low); }
+.transfer-track { height: 6px; background: var(--epix-surface-2); border-radius: 3px; overflow: hidden; }
+.transfer-fill { height: 100%; width: 0; background: var(--epix-accent); transition: width .3s ease; }
+.loading-retry-status {
+	order: 5;
+	width: 100%;
+	box-sizing: border-box;
+	padding: 16px;
+	margin: 0 0 20px;
+	border: 1px solid var(--epix-border);
+	border-radius: var(--epix-radius-md);
+	background: var(--epix-surface-2);
+	text-align: left;
+	font-size: 12px;
+	line-height: 20px;
+	color: var(--epix-text-mid);
+}
+.loading-auto-heading { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.loading-auto-dot { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--epix-accent); }
+.loading-auto-label { color: var(--epix-text); font-weight: 600; }
+.loading-attempt { margin-left: auto; color: var(--epix-text-low); font-size: 11px; font-variant-numeric: tabular-nums; }
+.loading-retry-note { display: block; margin-top: 7px; font-variant-numeric: tabular-nums; }
+.loading-auto-help { display: block; margin-top: 3px; color: var(--epix-text-low); font-size: 11px; line-height: 17px; }
+.loading-retry-status[data-state="paused"] .loading-auto-dot { background: var(--epix-text-low); }
+.loading-config:focus-visible,
+.loading-details summary:focus-visible {
+	outline: 2px solid var(--epix-focus);
+	outline-offset: 4px;
+}
+.loading-config { display: inline-flex; align-items: center; min-height: 44px; box-sizing: border-box; padding: 10px 4px; top: 4px; text-transform: none; letter-spacing: 0; }
+.loading-details {
+	order: 7;
+	width: 100%;
+	border-top: 1px solid var(--epix-border);
+	padding-top: 4px;
+}
+.loading-details summary {
+	cursor: pointer;
+	min-height: 44px;
+	box-sizing: border-box;
+	padding: 12px 0;
+	font-size: 12px;
+	color: var(--epix-text-mid);
+}
+.loadingscreen .loading-details .console {
+	display: block;
+	height: auto;
+	max-height: 180px;
+	overflow: auto;
+	text-align: left;
+	background: var(--epix-surface-2);
+	padding: 12px;
+	border-radius: var(--epix-radius-md);
+	box-sizing: border-box;
+}
+.loadingscreen .loading-details .console-line { font-size: 11px; }
+.loadingscreen .console .cursor { display: none; }
+@media screen and (max-width: 640px) {
+	.loadingscreen.ready { padding: 60px 12px 16px; }
+	.loading-card { padding: 20px 18px 12px; border-radius: 16px; }
+	.loading-identity { margin-bottom: 22px; }
+	.loading-stage .stage-current { font-size: 24px; }
+	.loading-stage .stage-detail { font-size: 13px; }
+	.loading-retry-status { padding: 12px; }
+	.loading-auto-heading { gap: 5px 7px; }
+	.transfer-labels { flex-wrap: wrap; gap: 2px 12px; }
+	.transfer-peers { text-align: left; }
+}
+@media (prefers-reduced-motion: reduce) {
+	.loadingscreen .flipper,
+	.loadingscreen .console .cursor { animation: none; }
+	.loading-stage .stage-current.pop { animation: none; }
+	.loading-stage .stage,
+	.transfer-fill,
+	.loadingscreen.done,
+	.loadingscreen.ready .console { transition: none; }
 }
