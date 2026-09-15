@@ -46,13 +46,14 @@ async fn check_i2p_advert(fileserver_port: Option<u16>) {
     });
 
     let data = tempfile::tempdir().unwrap();
-    std::fs::create_dir(data.path().join("i2p")).unwrap();
+    tokio::fs::create_dir(data.path().join("i2p")).await.unwrap();
     // A persisted identity avoids generating keys on the fake router. The
     // destination bytes still go through production base64/SHA256/base32.
-    std::fs::write(
+    tokio::fs::write(
         data.path().join("i2p/destination.key"),
         "AQID\ntest-private-key\n",
     )
+    .await
     .unwrap();
     let state = AppState::with_data_dir("i2p-client", data.path());
     state

@@ -1,9 +1,13 @@
-use super::*;
+use super::{race_clone_root, start_clone_discovery, DiscoverySource, OnDemand};
+use epix_core::{Address, PeerAddr};
+use epix_ui::{AppState, XiteEntry};
 use epix_ui::state::{
     EdxBatch, EdxBatchProgress, EdxPushError, EdxPushProgress, EdxSignedProgress, EdxWant,
-    UpdatePayload,
+    UpdatePayload, DASHBOARD_XITE_ADDRESS,
 };
+use epix_xite::{Xite, XiteStorage};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 struct DiscoveryFetcher {
     signed: Vec<u8>,
@@ -123,9 +127,9 @@ async fn fixture() -> (
 ) {
     let dir = tempfile::tempdir().unwrap();
     let state = AppState::with_data_dir("test", dir.path());
-    let key = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+    let key = epix_crypt::new_seed();
     let mut content = serde_json::json!({"files":{}, "modified":1, "inner_path":"content.json"});
-    epix_content::sign(&mut content, key).unwrap();
+    epix_content::sign(&mut content, &key).unwrap();
     let address = content["signs"]
         .as_object()
         .unwrap()
@@ -134,9 +138,9 @@ async fn fixture() -> (
         .unwrap()
         .clone();
     content["address"] = serde_json::json!(address);
-    epix_content::sign(&mut content, key).unwrap();
+    epix_content::sign(&mut content, &key).unwrap();
     let path = dir.path().join("data").join(&address);
-    std::fs::create_dir_all(&path).unwrap();
+    tokio::fs::create_dir_all(&path).await.unwrap();
     state
         .add_xite(
             &address,

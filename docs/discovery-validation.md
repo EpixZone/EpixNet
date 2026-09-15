@@ -4,6 +4,18 @@ This focused review exercises tracker discovery, rare xites, interrupted
 downloads, automatic retries, and I2P. It supplements the earlier
 [review validation](review-validation.md).
 
+## Validation results
+
+The full Rust workspace passed **1,664 tests, zero failed, and 17 opt-in tests
+ignored** across 106 test binaries, with the published wallet pin embedded.
+Neither `EPIX_WALLET_DIST` nor `EPIX_WALLET_SKIP` was set. Focused coverage
+includes 26 retry/lifecycle tests, 12 tracker tests, two SAM startup tests, two
+socket-binding tests, and four HTTP recovery tests.
+
+CI also identified test-fixture cleanup: replace a fixed signing key with a
+newly generated key and use asynchronous filesystem setup in async tests.
+The affected discovery and SAM suites were rerun after these test-only changes.
+
 ## Waiting and recovery
 
 An unsuccessful discovery attempt does not establish that nobody shares the

@@ -81,5 +81,6 @@ i2p-embedded = ["i2p", "epix-runtime/i2p-embedded"]
 i2p-autostart = ["i2p-embedded"]
 
 [dev-dependencies]
+epix-crypt = { path = "../epix-crypt" }
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }
