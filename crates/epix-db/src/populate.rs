@@ -167,6 +167,18 @@ pub fn update_json(
     data: &Value,
     xite: &str,
 ) -> Result<bool> {
+    crate::atomic(conn, || {
+        update_json_inner(conn, schema, rel_path, data, xite)
+    })
+}
+
+fn update_json_inner(
+    conn: &Connection,
+    schema: &DbSchema,
+    rel_path: &str,
+    data: &Value,
+    xite: &str,
+) -> Result<bool> {
     let mut matched = false;
     for (pattern, map) in &schema.maps {
         let re = Regex::new(&format!("^(?:{pattern})")).map_err(|e| Error::Db(e.to_string()))?;
@@ -788,6 +800,58 @@ mod merge_tests {
     use crate::schema::{apply, DbSchema};
     use rusqlite::Connection;
     use serde_json::json;
+
+    #[test]
+    fn failed_json_update_preserves_previous_rows_and_metadata() {
+        let schema = DbSchema::from_json(
+            r#"{"db_name":"Atomic","db_file":"db.db","version":2,
+                "maps":{"data.json":{"to_table":["post"],"to_keyvalue":["revision"]}},
+                "tables":{"post":{"cols":[["body","TEXT NOT NULL"],["json_id","INTEGER"]]}}}"#,
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn, &schema).unwrap();
+        update_json(
+            &conn,
+            &schema,
+            "data.json",
+            &json!({
+                "revision": 1, "post": [{"body": "original"}]
+            }),
+            "",
+        )
+        .unwrap();
+
+        let error = update_json(
+            &conn,
+            &schema,
+            "data.json",
+            &json!({
+                "revision": 2, "post": [{"body": "partial replacement"}, {"body": null}]
+            }),
+            "",
+        );
+        assert!(error.is_err(), "the second row must violate NOT NULL");
+        assert_eq!(
+            query(&conn, "SELECT body FROM post", &[]).unwrap(),
+            vec![json!({"body": "original"})],
+            "failed updates must roll back all rows"
+        );
+        assert_eq!(
+            query(
+                &conn,
+                "SELECT value FROM keyvalue WHERE key = 'revision'",
+                &[]
+            )
+            .unwrap(),
+            vec![json!({"value": 1})],
+            "metadata must roll back with the rows"
+        );
+        assert!(
+            conn.is_autocommit(),
+            "failed updates must release the transaction"
+        );
+    }
 
     fn epixpost_schema() -> DbSchema {
         DbSchema::from_json(

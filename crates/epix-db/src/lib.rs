@@ -17,6 +17,35 @@ use serde_json::Value;
 
 pub type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
 
+/// An atomic operation that also composes with a caller's transaction. The
+/// savepoint rolls back on errors and unwinding without ending an outer transaction.
+pub(crate) fn atomic<T>(
+    conn: &rusqlite::Connection,
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    struct Rollback<'a> {
+        conn: &'a rusqlite::Connection,
+        active: bool,
+    }
+    impl Drop for Rollback<'_> {
+        fn drop(&mut self) {
+            if self.active {
+                let _ = self
+                    .conn
+                    .execute_batch("ROLLBACK TO epix_atomic; RELEASE epix_atomic;");
+            }
+        }
+    }
+    conn.execute_batch("SAVEPOINT epix_atomic;")
+        .map_err(|e| Error::Db(e.to_string()))?;
+    let mut rollback = Rollback { conn, active: true };
+    let result = operation()?;
+    conn.execute_batch("RELEASE epix_atomic;")
+        .map_err(|e| Error::Db(e.to_string()))?;
+    rollback.active = false;
+    Ok(result)
+}
+
 /// A connection pool over a single SQLite database.
 #[derive(Clone)]
 pub struct Database {
@@ -297,6 +326,38 @@ impl Drop for AuthorizerReset<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn atomic_updates_preserve_an_enclosing_transaction() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch("CREATE TABLE value (n INTEGER); BEGIN; INSERT INTO value VALUES (1);")
+            .unwrap();
+        let failed: Result<()> = atomic(&conn, || {
+            conn.execute("INSERT INTO value VALUES (2)", []).unwrap();
+            Err(Error::Db("rejected update".into()))
+        });
+        assert!(failed.is_err());
+        assert!(
+            !conn.is_autocommit(),
+            "the caller still owns its transaction"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM value", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+        atomic(&conn, || {
+            conn.execute("INSERT INTO value VALUES (3)", []).unwrap();
+            Ok(())
+        })
+        .unwrap();
+        conn.execute_batch("ROLLBACK;").unwrap();
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM value", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn applies_dbschema_json_and_queries() {

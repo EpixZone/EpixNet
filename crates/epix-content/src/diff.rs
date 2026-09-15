@@ -12,6 +12,10 @@
 
 use serde_json::Value;
 
+/// Bound the quadratic LCS matrix to 4 MiB. Larger edits fall back to the
+/// ordinary file transfer before allocating or comparing the matrix.
+const MAX_LCS_CELLS: usize = 1024 * 1024;
+
 /// One diff action.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffAction {
@@ -30,8 +34,10 @@ impl DiffAction {
             DiffAction::Equal(n) => Value::Array(vec!["=".into(), (*n).into()]),
             DiffAction::Remove(n) => Value::Array(vec!["-".into(), (*n).into()]),
             DiffAction::Insert(lines) => {
-                let arr =
-                    lines.iter().map(|l| Value::from(String::from_utf8_lossy(l).into_owned())).collect();
+                let arr = lines
+                    .iter()
+                    .map(|l| Value::from(String::from_utf8_lossy(l).into_owned()))
+                    .collect();
                 Value::Array(vec!["+".into(), Value::Array(arr)])
             }
         }
@@ -49,11 +55,8 @@ impl DiffAction {
                     .get(1)?
                     .as_array()?
                     .iter()
-                    .map(|l| match l {
-                        Value::String(s) => s.clone().into_bytes(),
-                        _ => Vec::new(),
-                    })
-                    .collect();
+                    .map(|l| Some(l.as_str()?.as_bytes().to_vec()))
+                    .collect::<Option<Vec<_>>>()?;
                 Some(DiffAction::Insert(lines))
             }
             _ => None,
@@ -79,22 +82,64 @@ fn split_keepends(data: &[u8]) -> Vec<&[u8]> {
 }
 
 /// Compute a line diff of `old` -> `new`. Returns `None` if the produced diff's
-/// inserted size would exceed `limit` bytes (the caller then sends the whole
-/// file). The result reconstructs `new` from `old` via [`patch`]; it need not
-/// match Python's `difflib` opcodes byte-for-byte, only be correct.
+/// inserted size would exceed `limit` bytes, its comparison matrix would
+/// exceed the work budget, or the new bytes cannot be encoded as wire strings
+/// (the caller then sends the whole file). The result reconstructs `new` from
+/// `old` via [`patch`]; it need not match Python's `difflib` opcodes byte-for-byte,
+/// only be correct.
 pub fn diff(old: &[u8], new: &[u8], limit: Option<usize>) -> Option<Vec<DiffAction>> {
+    if old == new {
+        return Some(if old.is_empty() {
+            Vec::new()
+        } else {
+            vec![DiffAction::Equal(old.len())]
+        });
+    }
+    // Insert actions are JSON strings. Lossy UTF-8 conversion would produce
+    // bytes that fail the receiver's content hash check.
+    std::str::from_utf8(new).ok()?;
     let old_lines = split_keepends(old);
     let new_lines = split_keepends(new);
 
-    // Longest common subsequence of lines (files are small - O(n*m) is fine).
+    // Appends and small edits to large files should only compare the changed
+    // middle; unchanged prefix/suffix lines need no LCS matrix.
+    let prefix = old_lines
+        .iter()
+        .zip(&new_lines)
+        .take_while(|(a, b)| a == b)
+        .count();
+    let old_tail = &old_lines[prefix..];
+    let new_tail = &new_lines[prefix..];
+    let suffix = old_tail
+        .iter()
+        .rev()
+        .zip(new_tail.iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let prefix_bytes = old_lines[..prefix].iter().map(|line| line.len()).sum();
+    let suffix_bytes = old_tail[old_tail.len() - suffix..]
+        .iter()
+        .map(|line| line.len())
+        .sum();
+    let old_lines = &old_tail[..old_tail.len() - suffix];
+    let new_lines = &new_tail[..new_tail.len() - suffix];
+
+    // Longest common subsequence of the changed lines, with bounded memory.
     let (n, m) = (old_lines.len(), new_lines.len());
-    let mut lcs = vec![vec![0u32; m + 1]; n + 1];
+    let width = m.checked_add(1)?;
+    let cells = n.checked_add(1)?.checked_mul(width)?;
+    if cells > MAX_LCS_CELLS {
+        return None;
+    }
+    // A flat matrix avoids one allocation per old line, including the
+    // highly skewed case of deleting many lines from an otherwise empty diff.
+    let mut lcs = vec![0u32; cells];
     for i in (0..n).rev() {
         for j in (0..m).rev() {
-            lcs[i][j] = if old_lines[i] == new_lines[j] {
-                lcs[i + 1][j + 1] + 1
+            lcs[i * width + j] = if old_lines[i] == new_lines[j] {
+                lcs[(i + 1) * width + j + 1] + 1
             } else {
-                lcs[i + 1][j].max(lcs[i][j + 1])
+                lcs[(i + 1) * width + j].max(lcs[i * width + j + 1])
             };
         }
     }
@@ -131,12 +176,13 @@ pub fn diff(old: &[u8], new: &[u8], limit: Option<usize>) -> Option<Vec<DiffActi
         }
     };
 
+    push_equal(&mut actions, prefix_bytes);
     while i < n && j < m {
         if old_lines[i] == new_lines[j] {
             push_equal(&mut actions, old_lines[i].len());
             i += 1;
             j += 1;
-        } else if lcs[i + 1][j] >= lcs[i][j + 1] {
+        } else if lcs[(i + 1) * width + j] >= lcs[i * width + j + 1] {
             push_remove(&mut actions, old_lines[i].len());
             i += 1;
         } else {
@@ -160,6 +206,7 @@ pub fn diff(old: &[u8], new: &[u8], limit: Option<usize>) -> Option<Vec<DiffActi
         }
         j += 1;
     }
+    push_equal(&mut actions, suffix_bytes);
     Some(actions)
 }
 
@@ -171,12 +218,18 @@ pub fn patch(old: &[u8], actions: &[DiffAction]) -> Result<Vec<u8>, String> {
     for action in actions {
         match action {
             DiffAction::Equal(n) => {
-                let end = cursor.checked_add(*n).filter(|&e| e <= old.len()).ok_or("diff: equal past end")?;
+                let end = cursor
+                    .checked_add(*n)
+                    .filter(|&e| e <= old.len())
+                    .ok_or("diff: equal past end")?;
                 out.extend_from_slice(&old[cursor..end]);
                 cursor = end;
             }
             DiffAction::Remove(n) => {
-                cursor = cursor.checked_add(*n).filter(|&e| e <= old.len()).ok_or("diff: remove past end")?;
+                cursor = cursor
+                    .checked_add(*n)
+                    .filter(|&e| e <= old.len())
+                    .ok_or("diff: remove past end")?;
             }
             DiffAction::Insert(lines) => {
                 for line in lines {
@@ -241,6 +294,80 @@ mod tests {
     }
 
     #[test]
+    fn diff_falls_back_when_line_comparison_budget_is_exceeded() {
+        // Just 8 KB of tiny lines used to allocate a 16 MB LCS matrix; a
+        // modest text file could exhaust the node's memory before `limit`
+        // was checked. Expensive diffs should use the normal file transfer.
+        let old = b"a\n".repeat(2_000);
+        let new = b"b\n".repeat(2_000);
+        assert!(diff(&old, &new, Some(30 * 1024)).is_none());
+    }
+
+    #[test]
+    fn diff_rejects_insertions_that_cannot_roundtrip_as_wire_strings() {
+        let result = diff(b"old\n", b"\xff\n", None);
+        assert!(
+            result.is_none(),
+            "binary insertions need a full file transfer"
+        );
+    }
+
+    #[test]
+    fn diff_parser_rejects_non_string_insertions() {
+        for invalid in [
+            Value::Null,
+            Value::from(123),
+            serde_json::json!({"line": "x"}),
+        ] {
+            let actions = serde_json::json!([["+", ["valid\n", invalid]]]);
+            assert!(actions_from_value(&actions).is_none());
+        }
+    }
+
+    #[test]
+    fn large_common_regions_do_not_consume_the_comparison_budget() {
+        let common = b"same\n".repeat(2_000);
+        let mut old = common.clone();
+        old.extend_from_slice(b"old\n");
+        old.extend_from_slice(&common);
+        let mut new = common.clone();
+        new.extend_from_slice(b"new\n");
+        new.extend_from_slice(&common);
+        let actions = diff(&old, &new, Some(4)).expect("only the changed line needs comparison");
+        assert_eq!(patch(&old, &actions).unwrap(), new);
+        let mut appended = old.clone();
+        appended.extend_from_slice(b"tail\n");
+        let actions = diff(&old, &appended, Some(5)).expect("an append needs no line comparisons");
+        assert_eq!(patch(&old, &actions).unwrap(), appended);
+        assert_eq!(
+            diff(&old, &old, Some(0)),
+            Some(vec![DiffAction::Equal(old.len())])
+        );
+    }
+
+    #[test]
+    fn short_text_diffs_roundtrip_exhaustively() {
+        let mut inputs = vec![Vec::new()];
+        for _ in 0..4 {
+            let previous = inputs.clone();
+            for input in previous {
+                for byte in [b'a', b'b', b'\n'] {
+                    let mut next = input.clone();
+                    next.push(byte);
+                    inputs.push(next);
+                }
+            }
+            inputs.sort();
+            inputs.dedup();
+        }
+        for old in &inputs {
+            for new in &inputs {
+                roundtrip(old, new);
+            }
+        }
+    }
+
+    #[test]
     fn patch_rejects_out_of_range() {
         // An Equal past the end of old is an error, not a panic.
         assert!(patch(b"short", &[DiffAction::Equal(100)]).is_err());
@@ -253,9 +380,9 @@ mod tests {
         let old = b"ab_old_tail";
         let actions = vec![
             DiffAction::Equal(2),                       // "ab"
-            DiffAction::Remove(4),                       // "_old"
-            DiffAction::Insert(vec![b"_new".to_vec()]),  // "_new"
-            DiffAction::Equal(5),                        // "_tail"
+            DiffAction::Remove(4),                      // "_old"
+            DiffAction::Insert(vec![b"_new".to_vec()]), // "_new"
+            DiffAction::Equal(5),                       // "_tail"
         ];
         assert_eq!(patch(old, &actions).unwrap(), b"ab_new_tail");
     }

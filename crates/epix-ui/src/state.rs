@@ -39083,18 +39083,19 @@ mod tests {
         );
         drop(tree);
 
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if store.is_complete(child_id).unwrap_or(false)
-                    && state.edx_object_path(&child_id).is_some()
-                {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
+        // Extern adoption makes bytes visible before the blocking worker
+        // claims their manifest reference. The detached transaction retains
+        // activation authority through both steps, so its write barrier is
+        // the completion signal for the ownership assertions below.
+        let completion = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.xite_activation_gate.clone().write_owned(),
+        )
         .await
-        .expect("detached root completion did not register the accepted child object");
+        .expect("detached root completion did not release activation authority");
+        assert!(store.is_complete(child_id).unwrap());
+        assert!(state.edx_object_path(&child_id).is_some());
+        drop(completion);
         assert!(store.is_extern(child_id).unwrap());
         store.claim_feed(child_id).unwrap();
         assert_eq!(store.ref_delta(child_id, 0).unwrap(), 2);

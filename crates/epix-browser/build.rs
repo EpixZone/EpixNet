@@ -22,6 +22,9 @@
 
 use std::path::{Path, PathBuf};
 
+mod wallet_stage;
+use wallet_stage::{clear_dir_keep_readme, stage_from_local};
+
 /// The epix-wallet release-download base. Each wallet build is published as a
 /// versioned `wallet-<rev>` release (see the wallet repo's
 /// `.github/workflows/build-dist.yml`); `wallet_dist_url` appends the pinned rev.
@@ -171,24 +174,6 @@ fn stage_wallet_ext() {
     let _ = std::fs::write(&stamp, &rev);
 }
 
-/// Copy a local wallet build into `shells/wallet-ext`, re-copying only when it
-/// differs from what is already staged (a changed manifest.json means a new
-/// wallet build). Panics if the source has no manifest.json.
-fn stage_from_local(src: &Path, dest: &Path) {
-    if !src.join("manifest.json").exists() {
-        panic!(
-            "EPIX_WALLET_DIST={} has no manifest.json; point it at the wallet's \
-             apps/extension/build/firefox directory",
-            src.display()
-        );
-    }
-    if same_file(&src.join("manifest.json"), &dest.join("manifest.json")) {
-        return; // already staged this build
-    }
-    clear_dir_keep_readme(dest);
-    copy_dir(src, dest).expect("copy EPIX_WALLET_DIST into shells/wallet-ext");
-}
-
 fn download_wallet(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Error>> {
     // NOSONAR - the URL is a release pinned by shells/wallet-ext.rev and the
     // archive is verified against shells/wallet-ext.sha256
@@ -227,43 +212,5 @@ fn download_wallet(url: &str, dest: &Path) -> Result<(), Box<dyn std::error::Err
         std::fs::rename(entry.path(), &to)?;
     }
     std::fs::remove_dir_all(&tmp)?;
-    Ok(())
-}
-
-/// Remove everything in `dir` except README.md (the one git-tracked file).
-fn clear_dir_keep_readme(dir: &Path) {
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for entry in entries.flatten() {
-        if entry.file_name() == "README.md" {
-            continue;
-        }
-        let path = entry.path();
-        if path.is_dir() {
-            let _ = std::fs::remove_dir_all(&path);
-        } else {
-            let _ = std::fs::remove_file(&path);
-        }
-    }
-}
-
-/// Whether two files exist and have identical bytes.
-fn same_file(a: &Path, b: &Path) -> bool {
-    match (std::fs::read(a), std::fs::read(b)) {
-        (Ok(x), Ok(y)) => x == y,
-        _ => false,
-    }
-}
-
-fn copy_dir(src: &Path, dest: &Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dest)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let to = dest.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir(&entry.path(), &to)?;
-        } else {
-            std::fs::copy(entry.path(), &to)?;
-        }
-    }
     Ok(())
 }

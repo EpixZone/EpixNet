@@ -64,6 +64,14 @@ jobs:
       # them (like the RustCrypto bump) fails here.
       - name: Build (all targets)
         run: cargo build --workspace --all-targets --locked
+      - name: Test browser startup and local wallet staging
+        run: |
+          cargo test -p epix-browser startup_tests --locked
+          cargo test -p epix-browser wallet_stage --locked
+      - name: Test generated proxy routes and wrapper permissions
+        run: |
+          node --test crates/epix-browser/tests/pac-routing.test.cjs
+          node --test ui/tests/wrapper-permissions.test.cjs
       # Run the deterministic crypto vectors (sslcrypto + Python interop), so a
       # change that compiles but breaks byte-compatibility is caught too.
       - name: Test crypto byte-compatibility

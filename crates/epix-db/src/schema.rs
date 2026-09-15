@@ -151,11 +151,23 @@ fn safe_identifier(name: &str) -> Result<()> {
 /// instead of keeping a stale table layout. Otherwise this is idempotent
 /// (`IF NOT EXISTS`).
 pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
+    crate::atomic(conn, || apply_inner(conn, schema))
+}
+
+fn apply_inner(conn: &Connection, schema: &DbSchema) -> Result<()> {
     let db = |e: rusqlite::Error| Error::Db(e.to_string());
 
     // Validate every table name up front (used in interpolated DDL below).
     for name in schema.tables.keys() {
         safe_identifier(name)?;
+    }
+    for table in schema.tables.values() {
+        for (name, _) in &table.cols {
+            safe_identifier(name)?;
+        }
+    }
+    for name in schema.json_table_cols() {
+        safe_identifier(&name)?;
     }
 
     // The keyvalue meta-table must exist before we can read the stored version.
@@ -199,10 +211,14 @@ pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
             .map(|(n, t)| format!("{n} {t}"))
             .collect::<Vec<_>>()
             .join(", ");
-        conn.execute_batch(&format!("CREATE TABLE IF NOT EXISTS {name} ({cols});"))
-            .map_err(db)?;
+        execute_schema_ddl(
+            conn,
+            &format!("CREATE TABLE IF NOT EXISTS {name} ({cols});"),
+            name,
+            true,
+        )?;
         for idx in &table.indexes {
-            conn.execute_batch(&format!("{idx};")).map_err(db)?;
+            execute_schema_ddl(conn, idx, name, false)?;
         }
     }
 
@@ -216,6 +232,44 @@ pub fn apply(conn: &Connection, schema: &DbSchema) -> Result<()> {
         .map_err(db)?;
     }
     Ok(())
+}
+
+/// Column definitions and index SQL come from downloaded xites. Let SQLite
+/// parse their full syntax, but authorize only table/index creation in this
+/// database. In particular, an injected ATTACH, PRAGMA, trigger, or transaction
+/// statement must never execute. The guard ends before the connection is reused.
+fn execute_schema_ddl(conn: &Connection, sql: &str, table: &str, create_table: bool) -> Result<()> {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    let table = table.to_owned();
+    conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if context.database_name.is_some_and(|name| name != "main") {
+            return Authorization::Deny;
+        }
+        let allowed = match context.action {
+            AuthAction::CreateTable { table_name } => {
+                create_table && (table_name == table || table_name == "sqlite_sequence")
+            }
+            AuthAction::CreateIndex { table_name, .. } => table_name == table,
+            AuthAction::Insert { table_name } | AuthAction::Update { table_name, .. } => {
+                table_name == "sqlite_master"
+            }
+            AuthAction::Read { table_name, .. } => {
+                table_name == table
+                    || table_name == "sqlite_master"
+                    || table_name == "sqlite_sequence"
+            }
+            AuthAction::Reindex { .. } | AuthAction::Function { .. } => true,
+            _ => false,
+        };
+        if allowed {
+            Authorization::Allow
+        } else {
+            Authorization::Deny
+        }
+    }));
+    let _restore = crate::AuthorizerReset(conn);
+    conn.execute_batch(sql)
+        .map_err(|e| Error::Db(e.to_string()))
 }
 
 /// The `json` (one row per data file) and `keyvalue` meta-tables, shaped by the
@@ -264,6 +318,55 @@ fn create_meta_tables(conn: &Connection, schema: &DbSchema) -> Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn untrusted_schema_index_cannot_attach_an_external_database() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = directory.path().join("external.sqlite");
+        let schema = DbSchema::from_json(
+            &serde_json::json!({
+                "version": 1,
+                "tables": {"post": {
+                    "cols": [["body", "TEXT"]],
+                    "indexes": [format!("ATTACH DATABASE '{}' AS external", external.display())]
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let result = apply(&conn, &schema);
+        assert!(
+            result.is_err(),
+            "xite-controlled indexes must not execute ATTACH"
+        );
+        assert!(
+            !external.exists(),
+            "applying a schema must not create external files"
+        );
+    }
+
+    #[test]
+    fn untrusted_schema_column_type_cannot_execute_extra_statements() {
+        let directory = tempfile::tempdir().unwrap();
+        let external = directory.path().join("external.sqlite");
+        let schema = DbSchema::from_json(&serde_json::json!({
+            "version": 1,
+            "tables": {"post": {
+                "cols": [["body", format!("TEXT); ATTACH DATABASE '{}' AS external; --", external.display())]]
+            }}
+        }).to_string()).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        let result = apply(&conn, &schema);
+        assert!(
+            result.is_err(),
+            "xite-controlled column definitions must not execute ATTACH"
+        );
+        assert!(
+            !external.exists(),
+            "applying a schema must not create external files"
+        );
+    }
+
     fn schema_with_col(version: i64, col: &str) -> DbSchema {
         let json = format!(
             r#"{{ "db_name": "T", "db_file": "db.db", "version": {version},
@@ -272,6 +375,66 @@ mod tests {
                                          "indexes": [], "schema_changed": 1 }} }} }}"#
         );
         DbSchema::from_json(&json).unwrap()
+    }
+
+    #[test]
+    fn failed_schema_upgrade_preserves_existing_data() {
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn, &schema_with_col(1, "title")).unwrap();
+        conn.execute(
+            "INSERT INTO post (post_id, title) VALUES (1, 'keep me')",
+            [],
+        )
+        .unwrap();
+        let mut next = schema_with_col(2, "body");
+        next.tables
+            .get_mut("post")
+            .unwrap()
+            .indexes
+            .push("CREATE INDEX broken ON post(no_such_column)".into());
+        assert!(apply(&conn, &next).is_err());
+        let title: String = conn
+            .query_row("SELECT title FROM post WHERE post_id = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("a failed upgrade must retain the previous schema and rows");
+        assert_eq!(title, "keep me");
+        assert!(
+            conn.is_autocommit(),
+            "a failed upgrade must release the transaction"
+        );
+    }
+
+    #[test]
+    fn schema_supports_indexes_constraints_and_autoincrement() {
+        let schema = DbSchema::from_json(
+            &serde_json::json!({
+                "version": 1,
+                "tables": {"post": {
+                    "cols": [["id", "INTEGER PRIMARY KEY AUTOINCREMENT"],
+                             ["body", "TEXT NOT NULL UNIQUE CHECK(length(body) > 0)"]],
+                    "indexes": ["CREATE INDEX IF NOT EXISTS post_body ON post(body)"]
+                }}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        apply(&conn, &schema).unwrap();
+        apply(&conn, &schema).unwrap();
+        conn.execute("INSERT INTO post(body) VALUES ('hello')", [])
+            .unwrap();
+        assert!(conn
+            .execute("INSERT INTO post(body) VALUES ('')", [])
+            .is_err());
+        assert!(conn
+            .execute("INSERT INTO post(body) VALUES ('hello')", [])
+            .is_err());
+        assert_eq!(
+            conn.query_row("SELECT id FROM post", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
     }
 
     fn columns(conn: &Connection, table: &str) -> Vec<String> {

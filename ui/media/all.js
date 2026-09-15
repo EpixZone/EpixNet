@@ -2553,6 +2553,16 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.setXiteInfo = function (xite_info) {
       var ref, ref1, ref2, ref3;
+      // Clone progress carries only settings.size, not an authoritative
+      // permissions/identity snapshot. Preserve fields from the latest full
+      // snapshot so progress cannot erase a grant or switch local storage to
+      // the anonymous identity. Full snapshots still replace revoked grants.
+      if (!Array.isArray(xite_info.settings && xite_info.settings.permissions) && this.xite_info) {
+        xite_info = $.extend({}, this.xite_info, xite_info, {
+          settings: $.extend({}, this.xite_info.settings, xite_info.settings),
+          content: $.extend({}, this.xite_info.content, xite_info.content)
+        });
+      }
       if (xite_info.event != null) {
         if (xite_info.event[0] === "file_added" && xite_info.bad_files) {
           // Only the required core downloads before the page loads. The
@@ -2676,7 +2686,11 @@ if (window.getComputedStyle(document.body).transform) {
         this.loading.showTooLarge(xite_info);
       }
       this.xite_info = xite_info;
-      return this.event_xite_info.resolve();
+      // Progress can arrive before the first siteInfo response. Permission
+      // requests and identity storage must wait for actual settings.
+      if (Array.isArray(xite_info.settings.permissions)) {
+        return this.event_xite_info.resolve();
+      }
     };
 
     Wrapper.prototype.siteSign = function (inner_path, cb) {
