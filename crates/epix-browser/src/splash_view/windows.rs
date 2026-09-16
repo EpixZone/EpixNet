@@ -6,29 +6,29 @@ use tao::window::Window;
 use windows_sys::core::w;
 use windows_sys::Win32::Foundation::{HWND, RECT};
 use windows_sys::Win32::Graphics::Gdi::{
-    CreateDIBSection, CreateFontIndirectW, CreateSolidBrush, DeleteObject, FillRect, GdiFlush,
-    GetObjectW, GetStockObject, InvalidateRect, SetBkColor, SetTextColor, BITMAPINFO,
-    BITMAPINFOHEADER, BI_RGB, DEFAULT_GUI_FONT, DIB_RGB_COLORS, HBITMAP, HBRUSH, HDC, HFONT,
-    LOGFONTW,
+    BeginPaint, CreateDIBSection, CreateFontIndirectW, CreateSolidBrush, DeleteObject, EndPaint,
+    FillRect, GdiFlush, GetObjectW, GetStockObject, InvalidateRect, SetBkColor, SetDIBitsToDevice,
+    SetTextColor, BITMAPINFO, BITMAPINFOHEADER, BI_RGB, DEFAULT_GUI_FONT, DIB_RGB_COLORS, HBITMAP,
+    HBRUSH, HDC, HFONT, LOGFONTW, PAINTSTRUCT,
 };
 use windows_sys::Win32::System::SystemServices::{SS_BITMAP, SS_CENTER, SS_NOPREFIX};
 use windows_sys::Win32::UI::Controls::{
-    InitCommonControlsEx, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, PBM_SETMARQUEE, PBM_SETPOS,
-    PBM_SETRANGE32, PBS_MARQUEE, PROGRESS_CLASSW, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS,
-    TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH, TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTTOOLINFOW,
+    InitCommonControlsEx, ICC_PROGRESS_CLASS, INITCOMMONCONTROLSEX, PBM_SETPOS, PBM_SETRANGE32,
+    PROGRESS_CLASSW, TOOLTIPS_CLASSW, TTF_IDISHWND, TTF_SUBCLASS, TTM_ADDTOOLW, TTM_SETMAXTIPWIDTH,
+    TTM_UPDATETIPTEXTW, TTS_ALWAYSTIP, TTTOOLINFOW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DestroyWindow, GetClientRect, GetWindowLongPtrW, GetWindowRect, MoveWindow,
-    SendMessageW, SetWindowLongPtrW, SetWindowTextW, ShowWindow, GWL_STYLE, HTCAPTION,
-    IMAGE_BITMAP, STM_SETIMAGE, SW_HIDE, SW_MINIMIZE, SW_SHOW, WM_COMMAND, WM_CTLCOLORSTATIC,
-    WM_ERASEBKGND, WM_NCHITTEST, WM_SETFONT, WS_CHILD, WS_POPUP, WS_VISIBLE,
+    CreateWindowExW, DestroyWindow, GetClientRect, GetWindowRect, MoveWindow, SendMessageW,
+    SetWindowTextW, ShowWindow, HTCAPTION, IMAGE_BITMAP, STM_SETIMAGE, SW_HIDE, SW_SHOW,
+    WM_CTLCOLORSTATIC, WM_ERASEBKGND, WM_NCHITTEST, WM_PAINT, WM_SETFONT, WS_CHILD, WS_POPUP,
+    WS_VISIBLE,
 };
 
 use windows_sys::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 
 const BACKGROUND: u32 = 0x0014_0e0b;
 const SUBCLASS_ID: usize = 0x4550_4958;
-const MINIMIZE_ID: usize = 1;
+const PROGRESS_SUBCLASS_ID: usize = SUBCLASS_ID + 1;
 
 pub(super) struct Controls {
     parent: HWND,
@@ -49,7 +49,7 @@ pub(super) struct Controls {
     status: HWND,
     detail: HWND,
     progress: HWND,
-    indeterminate: bool,
+    progress_paint: Box<ProgressPaint>,
 }
 
 fn wide(text: &str) -> Vec<u16> {
@@ -86,7 +86,7 @@ impl Controls {
             status: null_mut(),
             detail: null_mut(),
             progress: null_mut(),
-            indeterminate: false,
+            progress_paint: Box::new(ProgressPaint::new()),
         };
         let scale = window.scale_factor();
         // SAFETY: our subclass uses only this brush handle and is removed before it is freed.
@@ -121,17 +121,6 @@ impl Controls {
             })
             .collect();
         (controls.bitmap, controls.bitmap_bits) = image_bitmap(size)?;
-        let minimize = controls.child(window, w!("BUTTON"), "Minimize", 0, [372, 4, 80, 24])?;
-        controls.font(minimize, 11.0 * scale, false)?;
-        // SAFETY: assign an ID to our own native button for WM_COMMAND routing.
-        unsafe {
-            SetWindowLongPtrW(
-                minimize,
-                windows_sys::Win32::UI::WindowsAndMessaging::GWLP_ID,
-                MINIMIZE_ID as isize,
-            );
-        }
-
         let icon = controls.child(
             window,
             w!("STATIC"),
@@ -159,7 +148,7 @@ impl Controls {
             PROGRESS_CLASSW,
             "Startup progress",
             0,
-            [54, 229, 352, 10],
+            [54, 231, 352, 6],
         )?;
         controls.detail = controls.child(
             window,
@@ -189,6 +178,17 @@ impl Controls {
                 controls.bitmap as isize,
             );
             SendMessageW(controls.progress, PBM_SETRANGE32, 0, 1000);
+            // The native control retains its accessibility range; only its
+            // paint path changes. The boxed state stays at a stable address.
+            if SetWindowSubclass(
+                controls.progress,
+                Some(progress_proc),
+                PROGRESS_SUBCLASS_ID,
+                &mut *controls.progress_paint as *mut ProgressPaint as usize,
+            ) == 0
+            {
+                return Err("style startup progress bar".into());
+            }
             ShowWindow(controls.footer, SW_HIDE);
             controls.tooltip = CreateWindowExW(
                 0,
@@ -277,7 +277,10 @@ impl Controls {
                 return Err("read native system font".into());
             }
             font.lfHeight = -(height.round() as i32);
-            font.lfWeight = if bold { 700 } else { 400 };
+            font.lfWeight = if bold { 600 } else { 400 };
+            for (slot, character) in font.lfFaceName.iter_mut().zip(wide("Segoe UI")) {
+                *slot = character;
+            }
             let handle = CreateFontIndirectW(&font);
             if handle.is_null() {
                 return Err("create startup system font".into());
@@ -318,6 +321,11 @@ impl Controls {
         if !visible || self.failed {
             return;
         }
+        self.progress_paint.animate();
+        // SAFETY: invalidation schedules painting on this same UI thread.
+        unsafe {
+            InvalidateRect(self.progress, null(), 0);
+        }
         let frame = super::animation_frame(self.started.elapsed());
         if frame != self.last_frame {
             self.paint_frame(frame);
@@ -355,22 +363,11 @@ impl Controls {
             MoveWindow(self.detail, rect[0], rect[1], rect[2], rect[3], 1);
             ShowWindow(self.footer, if self.failed { SW_SHOW } else { SW_HIDE });
             ShowWindow(self.progress, if self.failed { SW_HIDE } else { SW_SHOW });
-            if indeterminate != self.indeterminate {
-                let style = GetWindowLongPtrW(self.progress, GWL_STYLE);
-                let style = if indeterminate {
-                    style | PBS_MARQUEE as isize
-                } else {
-                    style & !(PBS_MARQUEE as isize)
-                };
-                SetWindowLongPtrW(self.progress, GWL_STYLE, style);
-                SendMessageW(
-                    self.progress,
-                    PBM_SETMARQUEE,
-                    usize::from(indeterminate),
-                    40,
-                );
-                self.indeterminate = indeterminate;
+            self.progress_paint.indeterminate = indeterminate;
+            if total != 0 {
+                self.progress_paint.target = f64::from(completed.min(total)) / f64::from(total);
             }
+            InvalidateRect(self.progress, null(), 0);
             if total != 0 {
                 let progress = u64::from(completed.min(total)) * 1000 / u64::from(total);
                 SendMessageW(self.progress, PBM_SETPOS, progress as usize, 0);
@@ -389,6 +386,9 @@ impl Drop for Controls {
         // or font. Tao destroys the parent after this destructor returns.
         unsafe {
             RemoveWindowSubclass(self.parent, Some(panel_proc), SUBCLASS_ID);
+            if !self.progress.is_null() {
+                RemoveWindowSubclass(self.progress, Some(progress_proc), PROGRESS_SUBCLASS_ID);
+            }
             for child in self.children.drain(..).rev() {
                 DestroyWindow(child);
             }
@@ -427,10 +427,6 @@ unsafe extern "system" fn panel_proc(
                 GetClientRect(hwnd, &mut rect);
                 FillRect(wparam as HDC, &rect, brush as HBRUSH);
                 return 1;
-            }
-            WM_COMMAND if wparam & 0xffff == MINIMIZE_ID => {
-                ShowWindow(hwnd, SW_MINIMIZE);
-                return 0;
             }
             WM_NCHITTEST => {
                 let mut rect = RECT::default();
@@ -472,5 +468,133 @@ fn image_bitmap(size: u32) -> Result<(HBITMAP, *mut u32), String> {
             return Err("map startup image bitmap".into());
         }
         Ok((bitmap, bits.cast()))
+    }
+}
+
+// Paint a thin antialiased capsule while retaining the native progress
+// control's accessibility semantics. All state lives on the window thread.
+struct ProgressPaint {
+    started: Instant,
+    last_tick: Instant,
+    shown: f64,
+    target: f64,
+    indeterminate: bool,
+    pixels: Vec<u32>,
+}
+
+impl ProgressPaint {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            last_tick: Instant::now(),
+            shown: 0.0,
+            target: 0.0,
+            indeterminate: true,
+            pixels: Vec::new(),
+        }
+    }
+
+    fn animate(&mut self) {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_tick).as_secs_f64();
+        self.last_tick = now;
+        self.shown += (self.target - self.shown) * (1.0 - (-dt * 12.0).exp());
+    }
+
+    fn render(&mut self, width: usize, height: usize) {
+        self.pixels.resize(width * height, 0);
+        let w = width as f64;
+        let h = height as f64;
+        let (left, right) = if self.indeterminate {
+            let phase = self.started.elapsed().as_secs_f64() * std::f64::consts::TAU / 1.8;
+            let left = (0.5 - 0.5 * phase.cos()) * w * 0.68;
+            (left, left + w * 0.32)
+        } else {
+            (0.0, w * self.shown.clamp(0.0, 1.0))
+        };
+        let coverage = |x: f64, y: f64, left: f64, right: f64| {
+            let radius = (h / 2.0).min((right - left) / 2.0);
+            if radius <= 0.0 {
+                return 0.0;
+            }
+            let center = x.clamp(left + radius, right - radius);
+            (radius + 0.5 - ((x - center).powi(2) + (y - h / 2.0).powi(2)).sqrt()).clamp(0.0, 1.0)
+        };
+        for y in 0..height {
+            for x in 0..width {
+                let px = x as f64 + 0.5;
+                let py = y as f64 + 0.5;
+                let track = coverage(px, py, 0.0, w);
+                let fill = coverage(px, py, left, right);
+                let mix = |a: f64, b: f64, t: f64| a + (b - a) * t;
+                let t = px / w;
+                let channel = |background, rail, from, to| {
+                    mix(mix(background, rail, track), mix(from, to, t), fill).round() as u32
+                };
+                let r = channel(11.0, 35.0, 84.0, 137.0);
+                let g = channel(14.0, 43.0, 210.0, 156.0);
+                let b = channel(20.0, 58.0, 244.0, 255.0);
+                self.pixels[y * width + x] = (r << 16) | (g << 8) | b;
+            }
+        }
+    }
+}
+
+// SAFETY: the boxed paint state outlives this subclass and is accessed only
+// on the UI thread. RemoveWindowSubclass runs before that box is dropped.
+unsafe extern "system" fn progress_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: usize,
+    lparam: isize,
+    _id: usize,
+    data: usize,
+) -> isize {
+    unsafe {
+        match message {
+            WM_ERASEBKGND => return 1,
+            WM_PAINT => {
+                let mut paint = PAINTSTRUCT::default();
+                let dc = BeginPaint(hwnd, &mut paint);
+                let mut rect = RECT::default();
+                GetClientRect(hwnd, &mut rect);
+                let width = rect.right.max(0) as usize;
+                let height = rect.bottom.max(0) as usize;
+                if !dc.is_null() && width > 0 && height > 0 {
+                    let state = &mut *(data as *mut ProgressPaint);
+                    state.render(width, height);
+                    let info = BITMAPINFO {
+                        bmiHeader: BITMAPINFOHEADER {
+                            biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+                            biWidth: width as i32,
+                            biHeight: -(height as i32),
+                            biPlanes: 1,
+                            biBitCount: 32,
+                            biCompression: BI_RGB,
+                            ..Default::default()
+                        },
+                        ..Default::default()
+                    };
+                    SetDIBitsToDevice(
+                        dc,
+                        0,
+                        0,
+                        width as u32,
+                        height as u32,
+                        0,
+                        0,
+                        0,
+                        height as u32,
+                        state.pixels.as_ptr().cast(),
+                        &info,
+                        DIB_RGB_COLORS,
+                    );
+                }
+                EndPaint(hwnd, &paint);
+                return 0;
+            }
+            _ => {}
+        }
+        DefSubclassProc(hwnd, message, wparam, lparam)
     }
 }

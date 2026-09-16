@@ -30,10 +30,10 @@ impl SplashView {
             .with_inner_size(LogicalSize::new(460.0, 320.0))
             .with_resizable(false)
             // Windows cannot hide only Close in a standard caption. The native
-            // renderer supplies a draggable strip and an accessible minimize button.
+            // renderer supplies a draggable strip without caption buttons.
             .with_decorations(!cfg!(windows))
             .with_maximizable(false)
-            .with_minimizable(true)
+            .with_minimizable(!cfg!(windows))
             .with_closable(false)
             .with_theme(Some(Theme::Dark))
             .with_background_color((11, 14, 20, 255))
@@ -52,6 +52,20 @@ impl SplashView {
                 origin.y + (screen.height.saturating_sub(panel.height) / 2) as i32,
             ));
         }
+        // Tao does not automatically use the executable's embedded icon.
+        let icon =
+            image::load_from_memory(include_bytes!("../../../packaging/linux/icons/epix-64.png"))
+                .map_err(|e| format!("decode startup window icon: {e}"))?
+                .into_rgba8();
+        let (width, height) = icon.dimensions();
+        let icon = tao::window::Icon::from_rgba(icon.into_raw(), width, height)
+            .map_err(|e| format!("create startup window icon: {e}"))?;
+        window.set_window_icon(Some(icon.clone()));
+        #[cfg(windows)]
+        {
+            use tao::platform::windows::WindowExtWindows;
+            window.set_taskbar_icon(Some(icon));
+        }
         let controls = native::Controls::new(&window, BRAND_PNG)?;
         let mut view = Self { controls, window };
         view.update("Starting EpixNet", "Preparing your browser…", 0, 0);
@@ -68,7 +82,7 @@ impl SplashView {
     }
 
     pub fn update(&mut self, status: &str, detail: &str, completed_steps: u32, total_steps: u32) {
-        self.window.set_title(&format!("EpixNet — {status}"));
+        self.window.set_title(&format!("EpixNet: {status}"));
         self.controls
             .update(status, detail, completed_steps, total_steps);
     }

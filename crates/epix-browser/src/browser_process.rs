@@ -152,3 +152,116 @@ mod tests {
         );
     }
 }
+
+#[cfg(windows)]
+pub(crate) fn visible_windows(
+    child: &mut std::process::Child,
+) -> Vec<windows_sys::Win32::Foundation::HWND> {
+    // Keep the launcher's process handle alive and reject a reaped PID before
+    // consulting a snapshot. --wait-for-browser keeps Firefox's launcher alive.
+    if !matches!(child.try_wait(), Ok(None)) {
+        return Vec::new();
+    }
+    windows::visible_windows(child.id())
+}
+
+#[cfg(any(windows, test))]
+fn owned_processes(root: u32, processes: &[(u32, u32)]) -> std::collections::HashSet<u32> {
+    let mut owned = std::collections::HashSet::from([root]);
+    loop {
+        let count = owned.len();
+        for &(pid, parent) in processes {
+            if owned.contains(&parent) {
+                owned.insert(pid);
+            }
+        }
+        if owned.len() == count {
+            return owned;
+        }
+    }
+}
+
+#[cfg(windows)]
+mod windows {
+    use windows_sys::core::BOOL;
+    use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, LPARAM};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, Process32FirstW, Process32NextW, PROCESSENTRY32W,
+        TH32CS_SNAPPROCESS,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        EnumWindows, GetClassNameW, GetWindowThreadProcessId, IsWindowVisible,
+    };
+
+    struct Windows {
+        owned: std::collections::HashSet<u32>,
+        windows: Vec<HWND>,
+    }
+
+    pub(super) fn visible_windows(root: u32) -> Vec<HWND> {
+        // SAFETY: the snapshot is checked and closed on all paths. The OS only
+        // writes into the correctly sized entry while the snapshot is open.
+        unsafe {
+            let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+            if snapshot == INVALID_HANDLE_VALUE {
+                return Vec::new();
+            }
+            let mut entry = PROCESSENTRY32W {
+                dwSize: std::mem::size_of::<PROCESSENTRY32W>() as u32,
+                ..Default::default()
+            };
+            let mut processes = Vec::new();
+            let mut found = Process32FirstW(snapshot, &mut entry);
+            while found != 0 {
+                processes.push((entry.th32ProcessID, entry.th32ParentProcessID));
+                found = Process32NextW(snapshot, &mut entry);
+            }
+            CloseHandle(snapshot);
+            let mut context = Windows {
+                owned: super::owned_processes(root, &processes),
+                windows: Vec::new(),
+            };
+            // EnumWindows is synchronous; context stays alive for every callback.
+            EnumWindows(Some(collect_window), &mut context as *mut Windows as LPARAM);
+            context.windows
+        }
+    }
+
+    unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> BOOL {
+        // SAFETY: data refers to the exclusive context for this enumeration.
+        unsafe {
+            if IsWindowVisible(hwnd) == 0 {
+                return 1;
+            }
+            let context = &mut *(data as *mut Windows);
+            let mut pid = 0;
+            GetWindowThreadProcessId(hwnd, &mut pid);
+            if !context.owned.contains(&pid) {
+                return 1;
+            }
+            let mut class = [0u16; 64];
+            let len = GetClassNameW(hwnd, class.as_mut_ptr(), class.len() as i32);
+            if String::from_utf16_lossy(&class[..len.max(0) as usize]) == "MozillaWindowClass" {
+                context.windows.push(hwnd);
+            }
+            1
+        }
+    }
+}
+
+#[cfg(test)]
+mod ownership_tests {
+    #[test]
+    fn finds_out_of_order_descendants_and_excludes_unrelated_firefox() {
+        let owned = super::owned_processes(10, &[(30, 20), (99, 1), (20, 10), (100, 99), (10, 1)]);
+        assert_eq!(owned, std::collections::HashSet::from([10, 20, 30]));
+    }
+
+    #[test]
+    fn malformed_parent_cycles_cannot_stall_enumeration() {
+        assert_eq!(
+            super::owned_processes(10, &[(10, 20), (20, 10), (99, 99)]),
+            std::collections::HashSet::from([10, 20])
+        );
+    }
+}
