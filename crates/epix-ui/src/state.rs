@@ -7018,6 +7018,11 @@ impl AppState {
         } else {
             drop(_activation);
         }
+        // The wrapper and its WebSocket can arrive before on-demand discovery
+        // registers this placeholder. Rearm without waiting for metadata.
+        if self.has_bound_conn(&address) && self.has_on_demand().await {
+            self.request_xite_domain(&address).await;
+        }
     }
 
     /// Record the `.epix` name (xID) a served xite was resolved from. Display

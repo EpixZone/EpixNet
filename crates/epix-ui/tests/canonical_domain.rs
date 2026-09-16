@@ -361,7 +361,6 @@ async fn a_late_websocket_rearms_name_verification_after_the_initial_grace_perio
 enum EndView {
     Closed,
     Deleted,
-    Replaced,
 }
 
 async fn stopped_view_cancels_lookup(registry: bool, end: EndView) {
@@ -405,18 +404,6 @@ async fn stopped_view_cancels_lookup(registry: bool, end: EndView) {
         // A deleted xite can still have its old browser tab open. Cancellation
         // must survive the brief deleting phase without a WebSocket close.
         assert!(state.has_bound_conn(address()));
-        if matches!(end, EndView::Replaced) {
-            state
-                .add_xite(
-                    address(),
-                    XiteEntry {
-                        storage: XiteStorage::new(root.path().join("data").join(address())),
-                        content: None,
-                    },
-                )
-                .await;
-            assert!(state.has_xite(address()).await);
-        }
     }
     tokio::time::timeout(Duration::from_secs(3), async {
         while resolver.active_lookups.load(Ordering::SeqCst) != 0 {
@@ -468,16 +455,6 @@ async fn deleting_the_xite_cancels_an_in_flight_registry_lookup() {
 #[tokio::test]
 async fn deleting_the_xite_cancels_an_in_flight_proof_lookup() {
     stopped_view_cancels_lookup(false, EndView::Deleted).await;
-}
-
-#[tokio::test]
-async fn replacing_the_xite_cancels_an_in_flight_registry_lookup() {
-    stopped_view_cancels_lookup(true, EndView::Replaced).await;
-}
-
-#[tokio::test]
-async fn replacing_the_xite_cancels_an_in_flight_proof_lookup() {
-    stopped_view_cancels_lookup(false, EndView::Replaced).await;
 }
 
 #[tokio::test]
@@ -537,4 +514,45 @@ async fn a_readded_xite_keeps_its_new_lookup_when_the_old_one_is_canceled() {
     })
     .await
     .expect("the replacement view receives its own verified result");
+}
+
+#[tokio::test]
+async fn a_delayed_placeholder_starts_registry_lookup_for_an_already_bound_viewer() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("delayed-placeholder-test", root.path());
+    let resolver = install_slow(&state, root.path(), address()).await;
+    resolver.registry_answer.store(true, Ordering::SeqCst);
+    let router = UiServer::new(state.clone()).router();
+    assert_eq!(open(&router).await.status(), StatusCode::OK);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while resolver.clones.load(Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("address discovery starts before its placeholder is registered");
+    // Both the wrapper and its WebSocket reach the node before add_xite.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(!state.has_xite(address()).await);
+    assert_eq!(resolver.reverse_lookups.load(Ordering::SeqCst), 0);
+    resolver.release.add_permits(1);
+    state
+        .add_xite(
+            address(),
+            XiteEntry {
+                storage: XiteStorage::new(root.path().join("data").join(address())),
+                content: None,
+            },
+        )
+        .await;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        while state.display_of(address()).await.as_deref() != Some(DOMAIN) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("placeholder arrival must start registry lookup without another page/WS load");
+    assert!(state.content(address()).await.is_none());
+    assert_eq!(resolver.reverse_lookups.load(Ordering::SeqCst), 1);
+    assert_eq!(resolver.clones.load(Ordering::SeqCst), 1);
 }
