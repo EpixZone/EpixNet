@@ -2596,6 +2596,34 @@ if (window.getComputedStyle(document.body).transform) {
       })(this));
     };
 
+    // Only the node's verified reverse mapping may rename an address visit.
+    // The serving identity and active download remain keyed by the address.
+    Wrapper.prototype.applyCanonicalDomain = function (xite_info) {
+      var address = this.address || window.address;
+      var domain = xite_info.canonical_domain;
+      if (this.canonical_domain_applied || xite_info.address !== address ||
+          typeof domain !== "string" ||
+          !/^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.epix$/.test(domain)) return;
+      var url = new URL(window.location.href);
+      if (url.protocol !== "http:" && url.protocol !== "https:") return;
+      if (url.hostname === address || url.hostname === address + ".epix") {
+        // Different origins cannot use replaceState. Replace this history
+        // entry once; the new wrapper joins the same node download.
+        url.hostname = domain;
+        if (url.href === window.location.href) return;
+        this.canonical_domain_applied = true;
+        window.location.replace(url.href);
+      } else if (["127.0.0.1", "localhost", "[::1]"].indexOf(url.hostname) !== -1) {
+        var first = url.pathname.split("/")[1];
+        if (first !== address && first !== address + ".epix") return;
+        // Mobile shells display this same-origin URL through their normal
+        // location observer. Keep the iframe, progress, query and fragment.
+        url.pathname = "/" + domain + url.pathname.slice(first.length + 1);
+        this.canonical_domain_applied = true;
+        window.history.replaceState(window.history.state, "", url.href);
+      }
+    };
+
     Wrapper.prototype.setXiteInfo = function (xite_info) {
       var ref, ref1, ref2, ref3;
       // Clone progress carries only settings.size, not an authoritative
@@ -2752,6 +2780,7 @@ if (window.getComputedStyle(document.body).transform) {
         this.log("Xite too large");
         this.loading.showTooLarge(xite_info);
       }
+      if (xite_info.canonical_domain) this.applyCanonicalDomain(xite_info);
       this.xite_info = xite_info;
       // Progress can arrive before the first siteInfo response. Permission
       // requests and identity storage must wait for actual settings.

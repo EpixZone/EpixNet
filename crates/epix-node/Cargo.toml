@@ -81,6 +81,10 @@ i2p-embedded = ["i2p", "epix-runtime/i2p-embedded"]
 i2p-autostart = ["i2p-embedded"]
 
 [dev-dependencies]
+base64 = "0.23"
+ed25519-dalek = { version = "3", default-features = false }
 epix-crypt = { path = "../epix-crypt" }
+hex = "0.4"
+sha2 = "0.11"
 tempfile = "3"
 tokio = { version = "1", features = ["full"] }

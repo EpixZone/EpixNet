@@ -3079,6 +3079,80 @@ impl epix_ui::OnDemandResolver for OnDemand {
         Some(epix_ui::ResolvedHost { address: resolved.address, verified: resolved.verified })
     }
 
+    async fn resolve_verified_name(&self, host: &str) -> Option<epix_ui::ResolvedHost> {
+        if self.network_disabled {
+            return None;
+        }
+        let name = host.strip_suffix(".epix")?;
+        if name.is_empty()
+            || name.len() > 63
+            || !name.as_bytes().first()?.is_ascii_alphanumeric()
+            || !name.as_bytes().last()?.is_ascii_alphanumeric()
+            || !name.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-'
+            })
+            || epix_core::classify_label(name) != epix_core::LabelClass::Name
+        {
+            return None;
+        }
+        // This path only checks a proposed alias. Unlike ordinary serving,
+        // it cannot fall back to a saved disk mapping when current verification
+        // fails. Reuse the shared resolver's still-current proof cache; any new
+        // request enforces trust and the current Tor route before egress.
+        let (domain, binding) = epix_chain::shared_resolver()
+            .resolve_bound(name, "epix")
+            .await.ok()?;
+        let address = validated_xite_address(domain.xite_address()?, "verified xID record")
+            .ok()?
+            .to_string();
+        let outcome =
+            publish_resolve_cache_bound(&self.data_root, host, &address, binding.as_ref()).ok()?;
+        if outcome != ResolveCacheWriteOutcome::Published {
+            return None;
+        }
+        // Publication and this read may be separated by a newer checkpoint.
+        // Only expose the exact mapping that is still current in the UI cache.
+        let (cached, verified) = self.state.resolve_name_verified(host).await?;
+        (cached == address && verified).then_some(epix_ui::ResolvedHost {
+            address,
+            verified: true,
+        })
+    }
+
+    async fn reverse_xite(&self, address: &str) -> Option<String> {
+        if self.network_disabled || Address::parse(address.to_string()).is_err() {
+            return None;
+        }
+        let lookup = async {
+            let mut tried = Vec::new();
+            // Bound proof work as well as pagination. Exclusions apply only
+            // to this attempt, so a transient forward failure is not cached.
+            while tried.len() < 64 {
+                let candidates = epix_chain::shared_resolver()
+                    .xite_name_candidates_excluding(address, &tried)
+                    .await
+                    .ok()?;
+                if candidates.is_empty() {
+                    break;
+                }
+                for name in candidates {
+                    if self.resolve_verified_name(&name)
+                        .await
+                        .is_some_and(|resolved| resolved.verified && resolved.address == address)
+                    {
+                        return Some(name);
+                    }
+                    tried.push(name);
+                }
+            }
+            None
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(40), lookup)
+            .await
+            .ok()
+            .flatten()
+    }
+
     fn network_changed(&self) {
         let Some(this) = self.me.upgrade() else { return };
         // Anything parked on the network or the registry goes again now
@@ -5112,9 +5186,18 @@ fn write_resolve_cache_bound(
     address: &str,
     binding: Option<&(u64, String)>,
 ) {
+    let _ = publish_resolve_cache_bound(data_root, full, address, binding);
+}
+
+fn publish_resolve_cache_bound(
+    data_root: &std::path::Path,
+    full: &str,
+    address: &str,
+    binding: Option<&(u64, String)>,
+) -> std::io::Result<ResolveCacheWriteOutcome> {
     let finality_required =
         epix_chain::verify_finality_enabled() && cache_target_requires_finality(full);
-    let _ = write_resolve_cache_bound_checked(
+    write_resolve_cache_bound_checked(
         data_root,
         full,
         address,
@@ -5131,7 +5214,7 @@ fn write_resolve_cache_bound(
                 None => Ok(false),
             }
         },
-    );
+    )
 }
 
 fn write_resolve_cache_bound_checked(
@@ -5428,6 +5511,10 @@ pub fn open_in_browser(url: &str) {
     let (cmd, args): (&str, &[&str]) = ("xdg-open", &[]);
     let _ = std::process::Command::new(cmd).args(args).arg(url).spawn();
 }
+
+#[cfg(test)]
+#[path = "tests/navigation.rs"]
+mod navigation_tests;
 
 #[cfg(test)]
 mod tests {
