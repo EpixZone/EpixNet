@@ -20,24 +20,51 @@ async fn fixture() -> (tempfile::TempDir, axum::Router, String) {
     });
     epix_content::sign(&mut content, &key).unwrap();
     storage.write("index.html", index).unwrap();
-    storage.write("content.json", epix_content::dumps_content(&content).as_bytes()).unwrap();
+    storage
+        .write(
+            "content.json",
+            epix_content::dumps_content(&content).as_bytes(),
+        )
+        .unwrap();
     // This isolated integration-test process uses the default finality-off
     // policy; a current resolver cache entry is authoritative under that policy.
     assert!(!epix_chain::verify_finality_enabled());
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    tokio::fs::write(directory.path().join("resolve-cache.json"),
-        json!({ "talk.epix": { "address": address, "resolved_at": now } }).to_string())
-        .await.unwrap();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    tokio::fs::write(
+        directory.path().join("resolve-cache.json"),
+        json!({ "talk.epix": { "address": address, "resolved_at": now } }).to_string(),
+    )
+    .await
+    .unwrap();
     let state = AppState::with_data_dir("canonical-path-test", directory.path());
-    state.add_xite(&address, XiteEntry { storage, content: Some(content) }).await;
+    state
+        .add_xite(
+            &address,
+            XiteEntry {
+                storage,
+                content: Some(content),
+            },
+        )
+        .await;
     (directory, UiServer::new(state).router(), address)
 }
 
 async fn redirect(router: &axum::Router, host: &str, uri: &str) -> String {
-    let request = Request::builder().uri(uri).header("host", host)
-        .header("sec-fetch-mode", "navigate").header("sec-fetch-dest", "document")
-        .body(Body::empty()).unwrap();
-    let response = router.clone().oneshot(rewrite_proxy_host(request)).await.unwrap();
+    let request = Request::builder()
+        .uri(uri)
+        .header("host", host)
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .body(Body::empty())
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(rewrite_proxy_host(request))
+        .await
+        .unwrap();
     assert_eq!(response.status(), 307, "{host}{uri}");
     response.headers()["location"].to_str().unwrap().to_string()
 }
@@ -46,24 +73,35 @@ async fn redirect(router: &axum::Router, host: &str, uri: &str) -> String {
 async fn verified_host_redirect_preserves_encoded_path_and_query() {
     let (_directory, router, address) = fixture().await;
     let path = "/docs/a%23b%252Fc.html?view=a%2Fb";
-    assert_eq!(redirect(&router, &format!("{address}.epix"), path).await,
-        format!("//talk.epix{path}"));
+    assert_eq!(
+        redirect(&router, &format!("{address}.epix"), path).await,
+        format!("//talk.epix{path}")
+    );
 }
 
 #[tokio::test]
 async fn verified_loopback_redirect_preserves_encoded_path_and_query() {
     let (_directory, router, address) = fixture().await;
     let path = "/docs/a%23b%252Fc.html?view=a%2Fb";
-    assert_eq!(redirect(&router, "127.0.0.1:42222", &format!("/{address}{path}")).await,
-        format!("/talk.epix{path}"));
+    assert_eq!(
+        redirect(&router, "127.0.0.1:42222", &format!("/{address}{path}")).await,
+        format!("/talk.epix{path}")
+    );
 }
 
 #[tokio::test]
 async fn explicit_index_filenames_are_not_rewritten_as_directories() {
     let (_directory, router, address) = fixture().await;
-    for path in ["/index.html?keep=1", "/myindex.html?keep=1", "/docs/index.html?keep=1", "/docs/?keep=1"] {
-        assert_eq!(redirect(&router, &format!("{address}.epix"), path).await,
-            format!("//talk.epix{path}"));
+    for path in [
+        "/index.html?keep=1",
+        "/myindex.html?keep=1",
+        "/docs/index.html?keep=1",
+        "/docs/?keep=1",
+    ] {
+        assert_eq!(
+            redirect(&router, &format!("{address}.epix"), path).await,
+            format!("//talk.epix{path}")
+        );
     }
 }
 
@@ -71,7 +109,86 @@ async fn explicit_index_filenames_are_not_rewritten_as_directories() {
 async fn cross_xite_origin_normalization_preserves_the_encoded_document_path() {
     let (_directory, router, address) = fixture().await;
     for path in ["/docs/a%23b%252Fc.html?view=a%2Fb", "/myindex.html?keep=1"] {
-        assert_eq!(redirect(&router, "dashboard.epix", &format!("/{address}{path}")).await,
-            format!("//{address}.epix{path}"));
+        assert_eq!(
+            redirect(&router, "dashboard.epix", &format!("/{address}{path}")).await,
+            format!("//{address}.epix{path}")
+        );
+    }
+}
+
+async fn rejects_external_target(target: &str) {
+    let (_directory, router, _address) = fixture().await;
+    let request = Request::builder()
+        .uri(format!("/{target}/docs/"))
+        .header("host", "dashboard.epix")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.oneshot(rewrite_proxy_host(request)).await.unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::BAD_REQUEST,
+        "untrusted path segment must not become an origin: {:?}",
+        response.headers().get("location")
+    );
+    assert!(!response.headers().contains_key("location"));
+}
+
+#[tokio::test]
+async fn cross_xite_normalization_rejects_userinfo_in_an_address_shaped_path() {
+    rejects_external_target("epix12345678901234567890@evil.example").await;
+}
+
+#[tokio::test]
+async fn cross_xite_normalization_rejects_encoded_userinfo() {
+    rejects_external_target("epix12345678901234567890%40evil.example").await;
+}
+
+#[tokio::test]
+async fn cross_xite_normalization_rejects_encoded_host_delimiters() {
+    for target in [
+        "evil.example%23.epix",
+        "evil.example%2Fignored.epix",
+        "evil.example%5Cignored.epix",
+    ] {
+        rejects_external_target(target).await;
+    }
+}
+
+#[tokio::test]
+async fn cross_xite_normalization_accepts_valid_names_and_address_aliases() {
+    let (_directory, router, address) = fixture().await;
+    for target in [
+        "talk.epix".to_string(),
+        "safe-name.epix".to_string(),
+        format!("{address}.epix"),
+    ] {
+        assert_eq!(
+            redirect(
+                &router,
+                "dashboard.epix",
+                &format!("/{target}/docs/?keep=1")
+            )
+            .await,
+            format!("//{target}/docs/?keep=1")
+        );
+    }
+    assert_eq!(
+        redirect(&router, "dashboard.epix", "/Talk.epix/docs/").await,
+        "//talk.epix/docs/"
+    );
+}
+
+#[tokio::test]
+async fn cross_xite_normalization_requires_an_exact_valid_hostname() {
+    for target in [
+        "%20talk.epix",
+        "talk%20.epix",
+        "-talk.epix",
+        "talk-.epix",
+        "nested.talk.epix",
+    ] {
+        rejects_external_target(target).await;
     }
 }

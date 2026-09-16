@@ -736,6 +736,19 @@ pub fn aliased_origin(xite_ref: &str) -> String {
     }
 }
 
+/// An untrusted path segment may become an origin only when it names a
+/// supported xite. Decoded URL delimiters must never enter the authority.
+fn cross_xite_origin(xite_ref: &str) -> Option<String> {
+    let normalized = xite_ref.to_ascii_lowercase();
+    if epix_core::classify_label(&normalized) == epix_core::LabelClass::Address {
+        return Some(aliased_origin(&normalized));
+    }
+    if address_alias(&normalized).is_some() {
+        return Some(normalized);
+    }
+    state::xite_domain_name(&normalized).filter(|name| name == &normalized)
+}
+
 /// Rewrite a transparent-proxy request into the path form the router uses.
 /// Marks a request whose path was prefixed by [`rewrite_proxy_host`]. Lets the
 /// wrapper tell a rewritten `GET /` (serve it) apart from a URL that LITERALLY
@@ -1175,7 +1188,9 @@ async fn render_wrapper(
         // Keep the exact encoded document path and query. Scheme-relative,
         // so http/https carries. A bare address becomes its dotted alias,
         // so the browser never navigates a single-label host.
-        let origin = aliased_origin(&requested);
+        let Some(origin) = cross_xite_origin(&requested) else {
+            return (StatusCode::BAD_REQUEST, "invalid xite navigation target").into_response();
+        };
         let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
         return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
     }

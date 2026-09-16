@@ -4703,7 +4703,7 @@ pub struct ResolveStatus {
 
 /// The browser currently routes single-label names under `.epix`. A manifest
 /// claim is only a lookup hint, never a URL or an address-shaped alias.
-fn xite_domain_name(value: &str) -> Option<String> {
+pub(crate) fn xite_domain_name(value: &str) -> Option<String> {
     let name = value.trim().to_ascii_lowercase();
     let label = name.strip_suffix(".epix")?;
     let bytes = label.as_bytes();
