@@ -8,6 +8,8 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
 
+mod reverse;
+
 pub const DEFAULT_RPC_URL: &str = "https://api.epix.zone";
 type SnapshotCacheEntry = (DomainSnapshot, Instant, Option<(u64, String)>);
 type SnapshotCache = HashMap<String, SnapshotCacheEntry>;
@@ -45,6 +47,10 @@ pub struct XidResolver {
     /// records a legacy RPC boolean result. The cryptographic fast path also
     /// confirms that the tuple still matches the process-wide checkpoint.
     digest: RwLock<Option<(String, Instant, Option<u64>)>>,
+    /// Shared, bounded discovery hints; these never replace forward proofs.
+    reverse_index: tokio::sync::Mutex<reverse::Index>,
+    reverse_epoch: std::sync::atomic::AtomicU64,
+    reverse_changed: tokio::sync::Notify,
 }
 
 /// How long a confirmed-finalized digest is reused. Short: the digest advances
@@ -83,6 +89,9 @@ impl XidResolver {
             cache: RwLock::new(HashMap::new()),
             ttl: Duration::from_secs(30 * 60),
             digest: RwLock::new(None),
+            reverse_index: tokio::sync::Mutex::new(reverse::Index::default()),
+            reverse_epoch: std::sync::atomic::AtomicU64::new(0),
+            reverse_changed: tokio::sync::Notify::new(),
         }
     }
 
@@ -141,6 +150,12 @@ impl XidResolver {
     /// Drop every cached snapshot (and the finalized-digest memo), so the next
     /// resolve of any name fetches and re-verifies from the chain.
     pub async fn clear(&self) {
+        // Invalidate hints immediately and cancel a scan without waiting for
+        // its network request or the index mutex it owns. The next lookup
+        // discards the old generation before reading any of its hints.
+        self.reverse_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        self.reverse_changed.notify_waiters();
         self.cache.write().await.clear();
         *self.digest.write().await = None;
     }
@@ -174,6 +189,33 @@ impl XidResolver {
         tld: &str,
     ) -> Result<(DomainSnapshot, Option<(u64, String)>)> {
         self.resolve_inner(name, tld, false).await
+    }
+
+    /// Resolve with its exact finality binding, reusing only a current verified
+    /// snapshot. This has no stale-answer fallback when a new fetch fails.
+    pub async fn resolve_bound(
+        &self,
+        name: &str,
+        tld: &str,
+    ) -> Result<(DomainSnapshot, Option<(u64, String)>)> {
+        self.resolve_inner(name, tld, true).await
+    }
+
+    /// Unverified DNS-record hints for an address. Callers must forward-verify
+    /// every name before using it as a browser origin.
+    pub async fn xite_name_candidates(&self, address: &str) -> Result<Vec<String>> {
+        self.xite_name_candidates_excluding(address, &[]).await
+    }
+
+    /// Continue discovery past hints already tried during this lookup. Failed
+    /// forward checks are not removed from the shared index: a network failure
+    /// must not become a cached negative result for every other caller.
+    pub async fn xite_name_candidates_excluding(
+        &self,
+        address: &str,
+        tried: &[String],
+    ) -> Result<Vec<String>> {
+        reverse::lookup(self, address, tried).await
     }
 
     async fn resolve_inner(

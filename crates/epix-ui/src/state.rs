@@ -104,6 +104,14 @@ pub trait OnDemandResolver: Send + Sync {
     /// locked-down node can still follow an xID to a xite it already serves.
     async fn resolve(&self, host: &str) -> Option<ResolvedHost>;
 
+    /// Resolve through the shared xID cache and verifier, without cloning or
+    /// falling back to a stale mapping. Used to promote an address to its name.
+    async fn resolve_verified_name(&self, _host: &str) -> Option<ResolvedHost> { None }
+
+    /// Find a registry name whose verified EPIXNET record points to `address`,
+    /// without waiting for xite metadata or starting a clone.
+    async fn reverse_xite(&self, _address: &str) -> Option<String> { None }
+
     /// Whether a name already has a live resolver; background retries must
     /// not accumulate another waiting request on every scheduler tick.
     fn is_resolving(&self, _host: &str) -> bool { false }
@@ -4062,6 +4070,8 @@ pub struct AppState {
     /// the node, which has the chain + worker). Lets the browser open any
     /// `talk.epix` by typing it, cloning it live.
     on_demand: RwLock<Option<Arc<dyn OnDemandResolver>>>,
+    /// One background name check per address being opened in a wrapper.
+    xite_domain_lookups: Arc<std::sync::Mutex<HashMap<String, u64>>>,
     /// DHT-backed peer lookup, installed by the runtime.
     peer_finder: RwLock<Option<Arc<dyn PeerFinder>>>,
     /// Included/user-content syncer, installed by the node.
@@ -4689,6 +4699,44 @@ pub struct ResolveStatus {
     pub verified: bool,
     pub attempts: u32,
     pub since: u64,
+}
+
+/// The browser currently routes single-label names under `.epix`. A manifest
+/// claim is only a lookup hint, never a URL or an address-shaped alias.
+fn xite_domain_name(value: &str) -> Option<String> {
+    let name = value.trim().to_ascii_lowercase();
+    let label = name.strip_suffix(".epix")?;
+    let bytes = label.as_bytes();
+    if bytes.is_empty() || bytes.len() > 63
+        || !bytes.first()?.is_ascii_alphanumeric()
+        || !bytes.last()?.is_ascii_alphanumeric()
+        || !bytes.iter().all(|b| b.is_ascii_alphanumeric() || *b == b'-')
+        || epix_core::classify_label(label) != epix_core::LabelClass::Name
+    {
+        return None;
+    }
+    Some(name)
+}
+
+struct XiteDomainLookup {
+    address: String,
+    token: u64,
+    active: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+}
+
+impl XiteDomainLookup {
+    fn is_current(&self) -> bool {
+        self.active.lock().unwrap().get(&self.address) == Some(&self.token)
+    }
+}
+
+impl Drop for XiteDomainLookup {
+    fn drop(&mut self) {
+        let mut active = self.active.lock().unwrap();
+        if active.get(&self.address) == Some(&self.token) {
+            active.remove(&self.address);
+        }
+    }
 }
 
 /// The local name-to-address decision behind [`AppState::resolve_name_verified`],
@@ -5419,6 +5467,7 @@ impl AppState {
             rns_transport: RwLock::new(None),
             i2p_status: RwLock::new(json!({})),
             on_demand: RwLock::new(None),
+            xite_domain_lookups: Arc::new(std::sync::Mutex::new(HashMap::new())),
             peer_finder: RwLock::new(None),
             content_syncer: RwLock::new(None),
             edx_store: RwLock::new(None),
@@ -6969,6 +7018,11 @@ impl AppState {
         } else {
             drop(_activation);
         }
+        // The wrapper and its WebSocket can arrive before on-demand discovery
+        // registers this placeholder. Rearm without waiting for metadata.
+        if self.has_bound_conn(&address) && self.has_on_demand().await {
+            self.request_xite_domain(&address).await;
+        }
     }
 
     /// Record the `.epix` name (xID) a served xite was resolved from. Display
@@ -7003,6 +7057,194 @@ impl AppState {
     /// The `.epix` name a served xite was resolved from, if any.
     pub async fn display_of(&self, address: &str) -> Option<String> {
         self.xites.read().await.get(address).and_then(|x| x.display.clone())
+    }
+
+    /// The configured name and whether a fresh local proof binds it to this
+    /// address. Display metadata is only a hint: it cannot authorize a change
+    /// of browser origin. Superseded bindings may serve saved files, but may
+    /// not promote an address to a name.
+    async fn xite_domain_status(&self, address: &str) -> (Option<String>, bool) {
+        let (claim, display) = {
+            let xites = self.xites.read().await;
+            let entry = xites.get(address);
+            let claim = entry.and_then(|x| x.content.as_ref()).and_then(|content| {
+                ["domain", "xid_name"].iter().find_map(|key| {
+                    content.get(key).and_then(Value::as_str).and_then(xite_domain_name)
+                })
+            });
+            (claim, entry.and_then(|x| x.display.as_deref()).and_then(xite_domain_name))
+        };
+        let cache: serde_json::Map<String, Value> = match &self.data_root {
+            Some(root) => tokio::fs::read(root.join("resolve-cache.json")).await.ok()
+                .and_then(|bytes| serde_json::from_slice(&bytes).ok()).unwrap_or_default(),
+            None => Default::default(),
+        };
+        let mut cached_names: Vec<_> = cache.iter().filter_map(|(name, entry)| {
+            let target = entry.as_str().or_else(|| entry.get("address").and_then(Value::as_str));
+            (target == Some(address)).then(|| xite_domain_name(name)).flatten()
+        }).collect();
+        cached_names.sort();
+        let mut candidates = claim.into_iter().chain(cached_names).chain(display).collect::<Vec<_>>();
+        candidates.dedup();
+        for name in &candidates {
+            let entry = cache.get(name);
+            let fresh = entry.and_then(|value| value.get("resolved_at")).and_then(Value::as_u64)
+                .is_some_and(|resolved| (now_secs().max(0) as u64).saturating_sub(resolved) < 24 * 60 * 60);
+            let mapping = select_name_mapping(
+                epix_chain::verify_finality_enabled(), entry,
+                epix_chain::finality_checkpoint_matches, None, |_| false,
+            );
+            if fresh && mapping.is_some_and(|(target, verified)| verified && target == address) {
+                return (Some(name.clone()), true);
+            }
+        }
+        (candidates.into_iter().next(), false)
+    }
+
+    /// A name safe to show in the address bar, using local state only.
+    pub async fn verified_xite_domain(&self, address: &str) -> Option<String> {
+        let (name, verified) = self.xite_domain_status(address).await;
+        name.filter(|_| verified)
+    }
+
+    /// Start a name check alongside address discovery. It follows metadata
+    /// arriving mid-download and retries while a viewer remains on the xite;
+    /// neither the HTTP response nor the clone waits for the name registry.
+    pub async fn request_xite_domain(&self, address: &str) {
+        if Address::parse(address.to_string()).is_err() {
+            return;
+        }
+        // Hold the row while registering its lookup. A late WebSocket may
+        // still bind after deletion; it must not resurrect registry work.
+        let xites = self.xites.read().await;
+        if !xites.contains_key(address) {
+            return;
+        }
+        let token = {
+            let mut active = self.xite_domain_lookups.lock().unwrap();
+            if active.contains_key(address) || self.xite_update_phase(address) == Some("deleting") {
+                return;
+            }
+            let token = self.next_db_generation();
+            active.insert(address.to_string(), token);
+            token
+        };
+        drop(xites);
+        let lookup = XiteDomainLookup {
+            address: address.to_string(), token, active: self.xite_domain_lookups.clone(),
+        };
+        let weak = self.self_weak.get().cloned().unwrap_or_default();
+        tokio::spawn(Self::watch_xite_domain(weak, lookup));
+    }
+
+    fn xite_domain_view_active(&self, lookup: &XiteDomainLookup, started: std::time::Instant, observed: &mut bool) -> bool {
+        let address = &lookup.address;
+        let watching = self.has_bound_conn(address);
+        let abandoned = !watching && (*observed || started.elapsed() >= std::time::Duration::from_secs(10));
+        *observed |= watching;
+        !abandoned && lookup.is_current() && self.xite_update_phase(address) != Some("deleting")
+    }
+
+    async fn publish_xite_domain(&self, lookup: &XiteDomainLookup) -> bool {
+        let address = &lookup.address;
+        if !lookup.is_current() || !self.has_bound_conn(address)
+            || self.xite_update_phase(address) == Some("deleting")
+        {
+            return false;
+        }
+        let Some(name) = self.verified_xite_domain(address).await else { return false };
+        let changed = {
+            let mut xites = self.xites.write().await;
+            // Cache I/O may have overlapped deletion and a new registration.
+            // The old lookup cannot rename that replacement membership.
+            if !lookup.is_current() || !self.has_bound_conn(address)
+                || self.xite_update_phase(address) == Some("deleting")
+            {
+                return false;
+            }
+            let Some(xite) = xites.get_mut(address) else { return false };
+            let changed = xite.display.as_deref() != Some(name.as_str());
+            xite.display = Some(name);
+            changed
+        };
+        if changed {
+            self.persist_xites().await;
+        }
+        if !lookup.is_current() {
+            return false;
+        }
+        self.push_xite_info(address).await;
+        true
+    }
+
+    async fn check_xite_domain(&self, address: &str, candidate: Option<&str>) {
+        let Some(hook) = self.on_demand.read().await.clone() else { return };
+        if let Some(name) = candidate {
+            let resolved = hook.resolve_verified_name(name).await;
+            if resolved.is_some_and(|resolved| resolved.verified && resolved.address == address) {
+                return;
+            }
+        }
+        // The registry is queried even before the first peer/root manifest
+        // arrives. Its shared candidate index and verified name cache are
+        // owned by the same xID resolver used for ordinary name visits.
+        hook.reverse_xite(address).await;
+    }
+
+    /// Observe connection and cache changes even while a registry RPC waits.
+    /// True means this watcher finished (published a name or lost its viewer).
+    async fn wait_xite_domain_check(
+        &self, lookup: &XiteDomainLookup, candidate: Option<&str>,
+        started: std::time::Instant, observed: &mut bool,
+    ) -> bool {
+        let check = tokio::time::timeout(
+            std::time::Duration::from_secs(45), self.check_xite_domain(&lookup.address, candidate),
+        );
+        tokio::pin!(check);
+        loop {
+            tokio::select! {
+                _ = &mut check => {
+                    return !self.xite_domain_view_active(lookup, started, observed)
+                        || self.publish_xite_domain(lookup).await;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_secs(2)) => {
+                    if !self.xite_domain_view_active(lookup, started, observed)
+                        || self.publish_xite_domain(lookup).await
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    async fn watch_xite_domain(weak: std::sync::Weak<AppState>, lookup: XiteDomainLookup) {
+        let started = std::time::Instant::now();
+        let mut observed = false;
+        let mut last_attempt = None;
+        let mut retry_at = tokio::time::Instant::now();
+        loop {
+            let Some(state) = weak.upgrade() else { break };
+            let address = &lookup.address;
+            if !state.xite_domain_view_active(&lookup, started, &mut observed)
+                || state.publish_xite_domain(&lookup).await
+            {
+                break;
+            }
+            let (candidate, verified) = state.xite_domain_status(address).await;
+            if !verified && !state.offline_by_policy()
+                && (last_attempt.as_ref() != Some(&candidate) || tokio::time::Instant::now() >= retry_at)
+            {
+                if state.wait_xite_domain_check(&lookup, candidate.as_deref(), started, &mut observed).await {
+                    break;
+                }
+                last_attempt = Some(candidate);
+                retry_at = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+            }
+            drop(state);
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        }
+        drop(lookup);
     }
 
     /// Resolve a `.epix` name (xID) to its bech32 address from local state:
@@ -18108,6 +18350,17 @@ impl AppState {
         // parked at the slow interval would miss every short visit and its
         // over-budget completion could never ask for consent.
         self.mark_optional_dirty(address);
+        // A background tab or reconnect can bind after the original HTTP
+        // check's grace period. Rearm verification for this live viewer.
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            let state = self.owned_state();
+            let address = address.to_string();
+            runtime.spawn(async move {
+                if state.has_on_demand().await {
+                    state.request_xite_domain(&address).await;
+                }
+            });
+        }
         self.pending_prompts.lock().unwrap().remove(address).unwrap_or_default()
     }
 
@@ -31458,6 +31711,9 @@ impl AppState {
             .lock()
             .unwrap()
             .insert(address.to_string(), UPDATE_PHASE_DELETING);
+        // Invalidate before asynchronous removal starts: deletion can finish
+        // between watcher ticks, and a later re-add needs its own lookup.
+        self.xite_domain_lookups.lock().unwrap().remove(address);
         self.push_xite_info_event(address, UPDATE_PHASE_DELETING).await;
         let state = self.owned_state();
         let owned_address = address.to_string();
@@ -32198,6 +32454,7 @@ impl AppState {
             "identity_scope": identity_scope,
             "address": address,
             "display": display,
+            "canonical_domain": self.verified_xite_domain(address).await,
             "address_short": short,
             "address_hash": address_hash,
             "content_updated": settings.modified,
