@@ -330,7 +330,9 @@ async fn boot(
     let scheme = if secure { "https" } else { "http" };
     let start_url = format!("{scheme}://{display}/");
     progress.report(startup::Stage::Browser);
-    let mut handoff = if progress.visible() && !background {
+    // On Windows, observe the actual owned browser window and open the xite
+    // directly. A restored/extension tab can hide the loopback page forever.
+    let mut handoff = if !cfg!(windows) && progress.visible() && !background {
         Some(startup_handoff::BrowserHandoff::start(start_url.clone()).await?)
     } else {
         None
@@ -341,6 +343,12 @@ async fn boot(
     let mut child = launch_browser(background, &firefox, &profile, launch_url)?;
     if let Some(handoff) = &mut handoff {
         wait_for_browser_window(handoff, &mut child, Duration::from_secs(60)).await?;
+    }
+    #[cfg(windows)]
+    if progress.visible() && !background {
+        wait_for_native_browser_window(&mut child, Duration::from_secs(60)).await?;
+        // Apply branding before handing the browser to the tray loop.
+        icon::stamp_firefox_windows(&firefox);
     }
     progress.report(startup::Stage::Ready);
 
@@ -372,6 +380,31 @@ async fn boot(
         i2p_on,
     };
     Ok((ready, child))
+}
+
+/// A live browser must not be killed just because startup presentation could
+/// not confirm its window. Slow starts can continue with the node and tray up.
+#[cfg(windows)]
+async fn wait_for_native_browser_window(
+    child: &mut Option<std::process::Child>,
+    deadline: Duration,
+) -> Result<(), String> {
+    let child = child.as_mut().ok_or("Epix Browser did not start.")?;
+    let until = tokio::time::Instant::now() + deadline;
+    loop {
+        if let Some(status) = child.try_wait().map_err(|e| format!("Check Epix Browser: {e}"))? {
+            return Err(format!("Epix Browser closed during startup ({status}). Reopen EpixNet to try again."));
+        }
+        if !browser_process::visible_windows(child).is_empty() {
+            println!("· startup: detected the Epix Browser window");
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= until {
+            eprintln!("· browser window detection timed out; keeping the running browser and node available from the tray");
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 async fn wait_for_browser_window(
@@ -1252,6 +1285,76 @@ mod startup_tests {
         tray::close_browser(&mut child);
         assert!(result.unwrap_err().contains("did not show its startup page"));
         assert!(reaped, "failed startup left its browser process running");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    #[ignore = "requires EPIX_TEST_FIREFOX and an interactive Windows desktop"]
+    async fn native_browser_window_is_detected_without_a_page_acknowledgement() {
+        let firefox = PathBuf::from(std::env::var_os("EPIX_TEST_FIREFOX").expect("set EPIX_TEST_FIREFOX"));
+        let profile = tempfile::tempdir().unwrap();
+        std::fs::write(profile.path().join("user.js"),
+            "user_pref(\"browser.aboutwelcome.enabled\", false);\nuser_pref(\"browser.shell.checkDefaultBrowser\", false);\n").unwrap();
+        let mut child = Some(browser_process::browser_command(&firefox, profile.path())
+            .arg("about:blank").spawn().unwrap());
+        let result = wait_for_native_browser_window(&mut child, Duration::from_secs(20)).await;
+        let visible = !browser_process::visible_windows(child.as_mut().unwrap()).is_empty();
+        // Firefox can expose its window before it services icon messages.
+        // Exercise the tray's repeated stamping instead of requiring the
+        // browser's UI thread to be responsive on its first visible frame.
+        let until = tokio::time::Instant::now() + Duration::from_secs(10);
+        let mut branded = false;
+        while tokio::time::Instant::now() < until {
+            icon::stamp_firefox_windows(&firefox);
+            let windows = browser_process::visible_windows(child.as_mut().unwrap());
+            // SAFETY: these are live test-owned windows. Bound cross-process
+            // sends so an unresponsive browser cannot hang the test.
+            branded = !windows.is_empty() && windows.iter().all(|&hwnd| unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{
+                    SendMessageTimeoutW, WM_GETICON, ICON_BIG, ICON_SMALL, SMTO_ABORTIFHUNG,
+                };
+                [ICON_BIG, ICON_SMALL].into_iter().all(|kind| {
+                    let mut icon = 0;
+                    SendMessageTimeoutW(hwnd, WM_GETICON, kind as usize, 0,
+                        SMTO_ABORTIFHUNG, 200, &mut icon) != 0 && icon != 0
+                })
+            });
+            if branded { break; }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        }
+        let alive = child.as_mut().unwrap().try_wait().unwrap().is_none();
+        tray::close_browser(&mut child);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(visible, "must detect the browser child, not just let the deadline expire");
+        assert!(alive);
+        assert!(branded, "browser window and taskbar icons must be present");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_detection_reports_an_early_browser_exit() {
+        use std::os::windows::process::CommandExt;
+        let mut process = Command::new("cmd.exe").args(["/C", "exit", "7"])
+            .creation_flags(0x08000000).spawn().unwrap();
+        process.wait().unwrap();
+        let mut child = Some(process);
+        let result = wait_for_native_browser_window(&mut child, Duration::from_secs(1)).await;
+        assert!(result.unwrap_err().contains("closed during startup"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_detection_timeout_preserves_a_live_owned_process() {
+        use std::os::windows::process::CommandExt;
+        let mut child = Some(Command::new("ping.exe")
+            .args(["-n", "30", "127.0.0.1"])
+            .creation_flags(0x08000000)
+            .stdout(std::process::Stdio::null()).spawn().unwrap());
+        let result = wait_for_native_browser_window(&mut child, Duration::ZERO).await;
+        let alive = child.as_mut().unwrap().try_wait().unwrap().is_none();
+        tray::close_browser(&mut child);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(alive, "a presentation timeout must not kill a running browser");
     }
 
     #[test]

@@ -14,9 +14,15 @@ retrying a failed start resets it.
 
 ## Desktop lifecycle
 
-The splash closes after a visible top-level browser tab has painted its
-one-time loopback startup page. That page acknowledges the launcher and replaces
-itself with the requested xite. The acknowledgement uses an unpredictable launch
+On Windows, the launcher opens the requested xite directly and closes the
+splash when a visible Firefox window appears in its owned process tree. This
+includes Firefox's child browser process and excludes unrelated profiles.
+A detection timeout keeps a still-running browser and the node alive, with the
+tray available. A browser that exits during startup reports an error.
+
+On macOS and Linux, the splash closes after a visible top-level browser tab has
+painted its one-time loopback startup page. That page acknowledges the launcher
+and replaces itself with the requested xite. The acknowledgement uses an unpredictable launch
 token and exact Host/Origin checks. Its fetch uses CORS mode with no referrer:
 Firefox otherwise sends an opaque Origin for a same-origin-mode POST under this
 referrer policy, preventing acknowledgement even though the browser opens.
@@ -24,10 +30,13 @@ referrer policy, preventing acknowledgement even though the browser opens.
 The native event loop continues into the tray so closing the splash does not
 stop the node. Closing and reopening the browser continues to use that node.
 Quitting allows blocking runtime work a bounded two-second shutdown grace.
-Failed browser handoffs stop and reap the owned browser before showing an error,
+Failed macOS/Linux browser handoffs stop and reap the owned browser before showing an error,
 so the failed launch cannot retain the managed profile lock.
 
-The splash has a minimize control and no close control. Escape minimizes it
+The Windows splash has no caption buttons and uses a thin, smoothly animated
+progress bar. Its native control retains an accessible progress range. The
+splash and owned browser windows display the Epix icon. Other desktop platforms
+retain their native minimize control. Escape minimizes it
 while starting and dismisses an error. Errors restore a minimized splash and
 also appear in the launcher log. Background launches, secondary launches into an
 existing node, and hosts without a display skip the splash. `EPIX_NO_SPLASH=1`
@@ -103,3 +112,41 @@ disposable data directories, stopped their own processes, and restored the share
 Mozilla certificate and native messaging files. Android tests used a fresh AVD
 and left existing emulator data unchanged. Local macOS lacked an iOS SDK; the
 native iOS fixture runs on GitHub's macOS runner.
+
+## Windows startup checks
+
+Run on Windows with the bundled Firefox ESR installed:
+
+```powershell
+cargo test -p epix-browser --release --locked
+$env:EPIX_TEST_FIREFOX = "$env:LOCALAPPDATA\Epix\firefox\firefox.exe"
+cargo test -p epix-browser --release --locked native_browser_window_is_detected_without_a_page_acknowledgement -- --ignored --nocapture
+cargo run -p epix-browser --release --locked --example splash_preview -- --verify
+```
+
+The browser regression uses a disposable profile and an `about:blank` tab. It
+checks that the native child window is found without a page acknowledgement,
+then closes only its own process tree. The timeout regression checks that a
+live process survives a presentation deadline. The preview checks the native
+window icon and absence of the minimize style, then exercises indeterminate,
+determinate, complete, and error presentation.
+
+The Windows native preview passed with both small and taskbar icon handles set
+and `WS_MINIMIZEBOX` absent. A separate live check opened two disposable Firefox
+ESR 140.16 profiles. Both browser windows were detected through their launcher
+process trees, and neither profile's enumeration included the other window.
+The installed Firefox also acknowledged the existing loopback page in a clean
+profile. The installed application log still recorded handoff timeouts in the
+managed profile, so the Windows fix removes that profile-dependent startup gate.
+
+The browser suite passed 57 tests on Windows, with its two optional Firefox
+checks skipped in that command. The native browser-window check was then run
+explicitly against the installed Firefox and passed, including eventual small
+and taskbar icon assignment. Icon assertions allow the browser UI thread to
+finish initializing and exercise the repeated tray update. The PAC-routing
+regression and the release build also passed.
+
+The installed launcher was backed up and replaced with the release build. With
+the existing managed profile, the Dashboard opened, the splash dismissed, and
+the launcher logged successful window detection and tray creation. The launcher
+and browser remained running beyond the previous 60-second handoff deadline.

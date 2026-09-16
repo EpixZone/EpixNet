@@ -126,6 +126,7 @@ impl Session {
             }
         };
 
+        println!("· system tray ready");
         let snap = Arc::new(Mutex::new(Snapshot::default()));
         spawn_stats_refresh(&ctx.rt, ctx.ready.state.clone(), snap.clone());
         Ok(Self {
