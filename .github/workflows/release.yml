@@ -266,7 +266,7 @@ jobs:
           ref: ${{ steps.snowflake.outputs.revision }}
           path: .store-build/snowflake
 
-      - uses: actions/setup-go@v6
+      - uses: actions/setup-go@v7
         with:
           go-version-file: .store-build/snowflake/go.mod
           cache-dependency-path: .store-build/snowflake/go.sum
