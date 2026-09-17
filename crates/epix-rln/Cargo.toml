@@ -25,3 +25,6 @@ hex = "0.4"
 
 [dev-dependencies]
 rand = "0.10"
+ark-relations = { version = "0.5.1", features = ["std"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["registry"] }

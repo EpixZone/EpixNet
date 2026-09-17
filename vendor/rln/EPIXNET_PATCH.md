@@ -36,3 +36,11 @@ doc comments, so gating the sled backend off is sufficient. Enabling the
     cargo download rln==3.0.0   # or fetch the .crate from static.crates.io
     diff -ru <upstream>/ vendor/rln/   # expect only Cargo.toml, src/lib.rs,
                                        # src/prelude.rs, and this file
+
+## Workspace dependency resolution
+
+The upstream library's unused `Cargo.lock` is omitted. EpixNet resolves this
+vendor library through the root workspace lockfile, including the documented
+ark-relations diagnostic-layer patch in `../ark-relations/EPIXNET_PATCH.md`.
+Keeping a second, unused upstream lockfile made scanners report dependencies
+that are not used by the application build.

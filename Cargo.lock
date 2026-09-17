@@ -333,13 +333,11 @@ dependencies = [
 [[package]]
 name = "ark-relations"
 version = "0.5.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ec46ddc93e7af44bcab5230937635b06fb5744464dd6a7e7b083e80ebd274384"
 dependencies = [
  "ark-ff",
  "ark-std",
  "tracing",
- "tracing-subscriber 0.2.25",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2548,7 +2546,6 @@ dependencies = [
  "hyper-util",
  "image",
  "include_dir",
- "muda",
  "objc2",
  "objc2-app-kit",
  "objc2-foundation",
@@ -2884,7 +2881,7 @@ dependencies = [
  "sha2 0.11.0",
  "tempfile",
  "tokio",
- "tracing-subscriber 0.3.23",
+ "tracing-subscriber",
  "windows-sys 0.61.2",
 ]
 
@@ -2986,12 +2983,15 @@ dependencies = [
 name = "epix-rln"
 version = "0.1.0"
 dependencies = [
+ "ark-relations",
  "hex",
  "rand 0.10.2",
  "rand_chacha 0.10.0",
  "rand_core 0.6.4",
  "rln",
  "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
  "zerokit_utils",
 ]
 
@@ -9614,15 +9614,6 @@ dependencies = [
 
 [[package]]
 name = "tracing-subscriber"
-version = "0.2.25"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0e0d2eaa99c3c2e41547cfa109e910a68ea03823cccad4a0525dcbc9b01e8c71"
-dependencies = [
- "tracing-core",
-]
-
-[[package]]
-name = "tracing-subscriber"
 version = "0.3.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "cb7f578e5945fb242538965c2d0b04418d38ec25c79d160cd279bf0731c8d319"
@@ -9646,7 +9637,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "19a4c448db514d4f24c5ddb9f73f2ee71bfb24c526cf0c570ba142d1119e0051"
 dependencies = [
  "tracing-core",
- "tracing-subscriber 0.3.23",
+ "tracing-subscriber",
  "tracing-test-macro",
 ]
 

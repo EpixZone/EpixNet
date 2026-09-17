@@ -195,7 +195,7 @@ async fn cross_origin_gate_and_cors_permission() {
 
 #[tokio::test]
 async fn backup_page_is_gated() {
-    // /Backup serves the node's keys, so unlike /Config it must NOT be exempt
+    // /Backup serves the node's keys, so like /Config it must NOT be exempt
     // from the cross-origin gate, and it must not exist at all on a
     // restricted / NoNewSites (public gateway) node.
     let dir = tempfile::tempdir().unwrap();
@@ -226,7 +226,7 @@ async fn backup_page_is_gated() {
     let resp = router.clone().oneshot(xite_fetch("/Backup")).await.unwrap();
     assert_eq!(resp.status(), 403, "xite fetch to /Backup blocked");
 
-    // An untraceable request is blocked too (unlike /Config, which is public).
+    // An untraceable request is blocked too.
     let resp = router.clone().oneshot(get("/Backup", &[host])).await.unwrap();
     assert_eq!(resp.status(), 403, "untraceable /Backup request blocked");
 
@@ -316,4 +316,71 @@ async fn proxy_mode_subresource_with_epix_in_query_referer_passes() {
     ));
     let resp = router.clone().oneshot(cross).await.unwrap();
     assert_eq!(resp.status(), 403, "cross-xite proxy-mode read still blocked");
+}
+
+#[tokio::test]
+async fn xite_origin_cannot_read_or_submit_node_configuration() {
+    let (state, router) = test_server().await;
+    // This must hold even when an operator disables the general xite CORS gate.
+    state.config_set("ui_check_cors", json!(false)).await;
+    let response = router.clone().oneshot(get("/Config", &[
+        ("host", "untrusted.epix"),
+        ("referer", "https://untrusted.epix/index.html"),
+        ("sec-fetch-mode", "cors"),
+    ])).await.unwrap();
+    assert_ne!(response.status(), 200, "An untrusted xite must not receive the node CSRF token");
+
+    let request = axum::extract::Request::builder()
+        .uri("/Config").method("POST")
+        .header("host", "untrusted.epix")
+        .header("origin", "https://untrusted.epix")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!("csrf={}&language=fr", state.ui_csrf_token())))
+        .unwrap();
+    let response = router.oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 403, "Even a leaked token must not authorize a xite-origin write");
+    assert_ne!(state.config_get("language").await, Some(json!("fr")));
+}
+
+#[tokio::test]
+async fn configuration_navigation_uses_node_origin_and_preserves_valid_posts() {
+    let (state, router) = test_server().await;
+    state.set_ui_port(45678).await;
+    let response = router.clone().oneshot(get("/Config", &[
+        ("host", "dashboard.epix"), ("sec-fetch-mode", "navigate"),
+    ])).await.unwrap();
+    assert_eq!(response.status(), 307);
+    assert_eq!(response.headers()["location"], "http://127.0.0.1:45678/Config");
+
+    let response = router.clone().oneshot(get("/Config", &[
+        ("host", "127.0.0.1:45678"), ("sec-fetch-mode", "navigate"),
+    ])).await.unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()["x-frame-options"], "DENY");
+    assert_eq!(response.headers()["content-security-policy"], "frame-ancestors 'none'");
+    assert_eq!(response.headers()["cache-control"], "no-store");
+
+    let request = axum::extract::Request::builder()
+        .uri("/Config").method("POST")
+        .header("host", "127.0.0.1:45678")
+        .header("origin", "http://127.0.0.1:45678")
+        .header("referer", "http://127.0.0.1:45678/Config")
+        .header("content-type", "application/x-www-form-urlencoded")
+        .body(axum::body::Body::from(format!("csrf={}&language=fr", state.ui_csrf_token())))
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 303);
+    assert_eq!(state.config_get("language").await, Some(json!("fr")));
+
+    state.config_set("ui_check_cors", json!(false)).await;
+    let response = router.clone().oneshot(get("/Config", &[
+        ("host", "127.0.0.1:45678"), ("referer", "http://127.0.0.1:45678/1Source/"),
+    ])).await.unwrap();
+    assert_eq!(response.status(), 403, "Path-form xites cannot read the token either");
+
+    state.config_set("ui_restrict", json!(true)).await;
+    let response = router.oneshot(get("/Config", &[
+        ("host", "127.0.0.1:45678"), ("sec-fetch-mode", "navigate"),
+    ])).await.unwrap();
+    assert_eq!(response.status(), 403, "Public gateways cannot expose node configuration");
 }

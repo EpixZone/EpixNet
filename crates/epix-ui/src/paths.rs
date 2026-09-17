@@ -5,7 +5,62 @@
 //! install carries over.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+
+/// Resolve an operator-selected data directory, including a not-yet-created
+/// suffix. Resolve symlinks in the existing prefix before overlap checks. Never
+/// accept parent traversal or control characters that could inject INI entries.
+pub(crate) fn resolve_data_directory(path: &Path) -> std::io::Result<PathBuf> {
+    use std::io::{Error, ErrorKind};
+
+    if !path.is_absolute()
+        || path.components().any(|c| matches!(c, Component::ParentDir))
+        || path
+            .as_os_str()
+            .to_string_lossy()
+            .chars()
+            .any(char::is_control)
+    {
+        return Err(Error::new(
+            ErrorKind::InvalidInput,
+            "The data directory must be an absolute path without '..' or control characters",
+        ));
+    }
+    let mut ancestor = path;
+    let mut suffix = Vec::new();
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => {
+                let mut resolved = ancestor.canonicalize()?;
+                if !resolved.is_dir() {
+                    return Err(Error::new(
+                        ErrorKind::InvalidInput,
+                        "The data directory is not a directory",
+                    ));
+                }
+                for name in suffix.into_iter().rev() {
+                    resolved.push(name);
+                }
+                return Ok(resolved);
+            }
+            Err(e) if e.kind() == ErrorKind::NotFound => {
+                suffix.push(ancestor.file_name().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "The data directory has no existing parent",
+                    )
+                })?);
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::InvalidInput,
+                        "The data directory has no existing parent",
+                    )
+                })?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
 
 /// The conventional per-OS data root: `~/Library/Application Support/EpixNet`
 /// on macOS, `%APPDATA%\EpixNet` on Windows, `$XDG_DATA_HOME/EpixNet` or
@@ -139,6 +194,46 @@ fn home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn data_directory_resolves_missing_suffix_and_rejects_unsafe_input() {
+        let root = tempfile::tempdir().unwrap();
+        assert_eq!(
+            resolve_data_directory(&root.path().join("new/nested")).unwrap(),
+            root.path().canonicalize().unwrap().join("new/nested")
+        );
+        for input in [
+            PathBuf::from("relative"),
+            root.path().join("../other"),
+            root.path().join("bad\nui_ip=0.0.0.0"),
+            root.path().join("bad\rname"),
+            root.path().join("bad\0name"),
+        ] {
+            assert!(resolve_data_directory(&input).is_err(), "{input:?}");
+        }
+        let file = root.path().join("file");
+        std::fs::write(&file, b"existing").unwrap();
+        assert!(resolve_data_directory(&file).is_err());
+        assert!(resolve_data_directory(&file.join("child")).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_directory_resolves_aliases_and_rejects_dangling_links() {
+        use std::os::unix::fs::symlink;
+        let root = tempfile::tempdir().unwrap();
+        let actual = root.path().join("actual");
+        std::fs::create_dir(&actual).unwrap();
+        let alias = root.path().join("alias");
+        symlink(&actual, &alias).unwrap();
+        assert_eq!(
+            resolve_data_directory(&alias.join("new")).unwrap(),
+            actual.canonicalize().unwrap().join("new")
+        );
+        let dangling = root.path().join("dangling");
+        symlink(root.path().join("missing"), &dangling).unwrap();
+        assert!(resolve_data_directory(&dangling).is_err());
+    }
 
     #[test]
     fn conf_data_dir_round_trips_and_preserves_other_keys() {

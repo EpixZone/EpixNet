@@ -70,7 +70,9 @@ fn uncompressed_pubkey(scalar: &Scalar) -> Vec<u8> {
 /// out   = (priv1 + priv2) mod n          (32-byte big-endian)
 /// ```
 pub fn derive_child(seed: &[u8], child: u32) -> [u8; 32] {
-    // Round 1
+    // Public BIP32/sslcrypto domain label, not a secret encryption key. Entropy
+    // comes from `seed`; changing this label would change existing identities.
+    // https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki#master-key-generation
     let mut mac = HmacSha512::new_from_slice(b"Bitcoin seed").unwrap();
     mac.update(seed);
     let h = mac.finalize().into_bytes();
