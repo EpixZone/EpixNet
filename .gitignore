@@ -41,6 +41,7 @@ PLAN.md
 # cargo mutants
 **/mutants.out*/
 dist/
+/.store-build/
 app-icon.png
 ios/Generated/
 # Xcode per-user / generated state
@@ -63,3 +64,6 @@ ios/**/project.xcworkspace/
 
 # xcodebuild derived data (-derivedDataPath build)
 /ios/build/
+
+# Python validation scripts
+/scripts/__pycache__/

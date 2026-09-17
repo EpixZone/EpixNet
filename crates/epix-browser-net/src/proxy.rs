@@ -18,6 +18,7 @@
 
 use crate::ca::{EpixCertResolver, LocalCa};
 use axum::extract::Request;
+use axum::response::IntoResponse;
 use hyper::body::Incoming;
 use hyper_util::rt::{TokioExecutor, TokioIo};
 use hyper_util::server::conn::auto::Builder as ConnBuilder;
@@ -166,7 +167,9 @@ where
                      Content-Length: 0\r\n\
                      Connection: close\r\n\r\n"
                 );
-                sock.write_all(resp.as_bytes()).await.map_err(|e| e.to_string())?;
+                sock.write_all(resp.as_bytes())
+                    .await
+                    .map_err(|e| e.to_string())?;
                 let _ = sock.shutdown().await;
                 return Ok(());
             }
@@ -244,6 +247,9 @@ where
         let mut app = app.clone();
         async move {
             let req = req.map(axum::body::Body::new);
+            if let Some(location) = canonical_xite_location(&req) {
+                return Ok(axum::response::Redirect::temporary(&location).into_response());
+            }
             let resp = app.call(req).await?;
             Ok::<_, Infallible>(resp)
         }
@@ -252,4 +258,149 @@ where
         .serve_connection_with_upgrades(io, svc)
         .await
         .map_err(|e| format!("serve: {e}"))
+}
+
+/// Path-form links must change origin even for iframe/file requests. Serving
+/// another xite's HTML under a trusted host would inherit that host's wallet
+/// permissions. The loopback UI keeps its existing path routing.
+fn canonical_xite_location(req: &Request) -> Option<String> {
+    let host = req
+        .headers()
+        .get("host")?
+        .to_str()
+        .ok()?
+        .split(':')
+        .next()?;
+    if !crate::ca::is_epix_host(host) {
+        return None;
+    }
+    let path = req.uri().path().trim_start_matches('/');
+    let (target, rest) = path.split_once('/').unwrap_or((path, ""));
+    if !crate::ca::is_epix_host(target) {
+        return None;
+    }
+    let origin = if target.ends_with(".epix") {
+        target.to_string()
+    } else {
+        format!("{target}.epix")
+    };
+    let query = req
+        .uri()
+        .query()
+        .map(|q| format!("?{q}"))
+        .unwrap_or_default();
+    Some(format!("//{origin}/{rest}{query}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn tls_proxy_serves_only_private_origins_with_its_own_anchor() {
+        use rustls::{pki_types::ServerName, ClientConfig, RootCertStore};
+        use tokio::net::TcpStream;
+        use tokio_rustls::TlsConnector;
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(LocalCa::load_or_create(dir.path()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().route("/", axum::routing::get(|| async { "private xite" }));
+        let server = tokio::spawn(serve(
+            listener,
+            app,
+            ca.clone(),
+            Arc::new(AtomicBool::new(true)),
+        ));
+        let mut roots = RootCertStore::empty();
+        roots
+            .add(rustls::pki_types::CertificateDer::from(
+                ca.cert_der().to_vec(),
+            ))
+            .unwrap();
+        let config =
+            ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+                .with_safe_default_protocol_versions()
+                .unwrap()
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+        let connector = TlsConnector::from(Arc::new(config));
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for host in [
+                "dashboard.epix",
+                "example.com",
+                "epix1abcdefghijklmnopqrstuv.example",
+            ] {
+                let mut socket = TcpStream::connect(address).await.unwrap();
+                socket
+                    .write_all(
+                        format!("CONNECT {host}:443 HTTP/1.1\r\nHost: {host}:443\r\n\r\n")
+                            .as_bytes(),
+                    )
+                    .await
+                    .unwrap();
+                let response = consume_headers(&mut socket).await.unwrap();
+                assert!(response.starts_with(b"HTTP/1.1 200"));
+                let result = connector
+                    .connect(ServerName::try_from(host.to_string()).unwrap(), socket)
+                    .await;
+                if host != "dashboard.epix" {
+                    assert!(result.is_err(), "must not issue certificates for {host}");
+                    continue;
+                }
+                let mut tls =
+                    result.expect("private origin must validate against the installation CA");
+                tls.write_all(
+                    b"GET / HTTP/1.1\r\nHost: dashboard.epix\r\nConnection: close\r\n\r\n",
+                )
+                .await
+                .unwrap();
+                let mut response = Vec::new();
+                tls.read_to_end(&mut response).await.unwrap();
+                let text = String::from_utf8(response).unwrap();
+                assert!(text.starts_with("HTTP/1.1 200"));
+                assert!(text.contains("private xite"));
+            }
+        })
+        .await
+        .expect("TLS regression timed out");
+        server.abort();
+    }
+
+    #[test]
+    fn nested_xite_files_cannot_inherit_host_permissions() {
+        let request = |host, path| {
+            Request::builder()
+                .uri(path)
+                .header("host", host)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for path in [
+            "/evil.epix/",
+            "/evil.epix/index.html",
+            "/evil.epix/a%20b?q=a%2Fb",
+        ] {
+            assert_eq!(
+                canonical_xite_location(&request("xid.epix", path)),
+                Some(format!("/{}", path))
+            );
+        }
+        assert_eq!(
+            canonical_xite_location(&request("xid.epix", "//evil.epix/index.html")),
+            Some("//evil.epix/index.html".into())
+        );
+        assert_eq!(
+            canonical_xite_location(&request("dashboard.epix", "/dashboard.epix/")),
+            Some("//dashboard.epix/".into())
+        );
+        for (host, path) in [
+            ("127.0.0.1:43110", "/talk.epix/index.html"),
+            ("talk.epix", "/index.html"),
+            ("talk.epix", "/uimedia/all.js"),
+            ("talk.epix", "/evil.example/index.html"),
+        ] {
+            assert_eq!(canonical_xite_location(&request(host, path)), None);
+        }
+    }
 }

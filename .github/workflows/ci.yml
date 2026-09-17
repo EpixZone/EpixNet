@@ -71,6 +71,9 @@ jobs:
           cargo test -p epix-browser startup_cache --locked
       - name: Test generated proxy routes and wrapper behavior
         run: |
+          cargo test -p epix-browser-net --locked
+          python3 scripts/test_android_native.py
+          python3 scripts/test_mobile_wallet.py
           node --test crates/epix-browser/tests/pac-routing.test.cjs
           node --test ui/tests/*.test.cjs
       # Run the deterministic crypto vectors (sslcrypto + Python interop), so a
@@ -137,14 +140,21 @@ jobs:
         run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery --locked
       - name: Android profile (BitTorrent included)
         run: cargo build -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery,bittorrent --locked
-      # The App-Store guarantee, machine-checked: the iOS feature profile must
-      # NOT pull the BitTorrent engine crate. Passes today (epix-bt does not
-      # exist yet) and becomes load-bearing the moment it does - a stray
-      # `bittorrent`/`epix-bt` edge reachable from the iOS profile fails CI.
-      - name: Assert no BitTorrent in the iOS profile
+      # Check each product separately: a workspace build unifies features and
+      # cannot prove that iOS excludes BT or that Android/desktop retain it.
+      - name: Assert platform BitTorrent boundaries
+        run: python3 scripts/check-platform-features.py
+      - name: Test tracker discovery with and without BitTorrent
         run: |
-          if cargo tree -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery --locked -e features 2>/dev/null | grep -qiE '\bepix-bt\b'; then
-            echo "::error::epix-bt reached the iOS feature profile - BitTorrent must be excluded from the iOS build (App Store 5.2.3)"
-            exit 1
-          fi
-          echo "iOS profile is BitTorrent-free."
+          cargo test -p epix-discovery -p epix-xite --locked
+          cargo test -p epix-discovery -p epix-xite --features epix-xite/bittorrent --locked
+
+  ios-bridge-regressions:
+    name: iOS bridge authorization regressions
+    runs-on: macos-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 shells/ios/tests/run-regressions.py

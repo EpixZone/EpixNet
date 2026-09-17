@@ -28,7 +28,10 @@ rustix = { version = "1.1", features = ["fs"] }
 epix-fs = { path = "../epix-fs" }
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
+[features]
+bittorrent = ["epix-discovery/bittorrent"]
+
 [dev-dependencies]
 epix-crypt = { path = "../epix-crypt" }
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "macros"] }
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util", "time"] }

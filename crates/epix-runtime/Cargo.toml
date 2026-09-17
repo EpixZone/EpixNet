@@ -63,13 +63,10 @@ i2p-embedded = ["i2p", "epix-i2p/embedded"]
 # Reticulum mesh: dial + serve peers over mesh links (TCP interfaces now,
 # LoRa/BLE radios later). All platforms.
 mesh = ["dep:epix-reticulum"]
-# BitTorrent bridge: stream open-licensed media referenced by magnet links
-# (web seeds now; swarm/peer-wire next). Desktop and Android only - the iOS
-# build omits this feature entirely (App Store 5.2.3: no general-purpose
-# torrenting), so the `epix-bt` engine is absent from the iOS binary by
-# construction. The node fetches through its own transport (Tor-routed), so no
-# BT code ever runs in a xite page.
-bittorrent = ["dep:epix-bt"]
+# BitTorrent media engine and tracker discovery. Desktop and Android enable
+# this; the iOS release profile excludes it as a product restriction.
+# Content rights and the rest of the store policies still apply independently.
+bittorrent = ["dep:epix-bt", "epix-discovery/bittorrent", "epix-xite/bittorrent"]
 
 [dev-dependencies]
 base64 = "0.23"

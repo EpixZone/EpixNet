@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		E00000000000000000000029 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000017 /* PrivacyInfo.xcprivacy */; };
 		E00000000000000000000020 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000010 /* AppDelegate.swift */; };
 		E00000000000000000000023 /* epix-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000015 /* epix-icon.png */; };
 		E00000000000000000000026 /* epix-mark-white.png in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000025 /* epix-mark-white.png */; };
@@ -17,6 +18,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		E00000000000000000000017 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		E00000000000000000000010 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = "../../shells/ios/EpixBrowser/AppDelegate.swift"; sourceTree = "<group>"; };
 		E00000000000000000000015 /* epix-icon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; name = "epix-icon.png"; path = "../../shells/ios/EpixBrowser/epix-icon.png"; sourceTree = "<group>"; };
 		E00000000000000000000025 /* epix-mark-white.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; name = "epix-mark-white.png"; path = "../../shells/ios/EpixBrowser/epix-mark-white.png"; sourceTree = "<group>"; };
@@ -48,6 +50,7 @@
 				E00000000000000000000016 /* wallet-ext */,
 				E00000000000000000000012 /* Assets.xcassets */,
 				E00000000000000000000011 /* Info.plist */,
+				E00000000000000000000017 /* PrivacyInfo.xcprivacy */,
 			);
 			path = EpixNet;
 			sourceTree = "<group>";
@@ -125,6 +128,7 @@
 				E00000000000000000000026 /* epix-mark-white.png in Resources */,
 				E00000000000000000000028 /* epix-badge-white.png in Resources */,
 				E00000000000000000000024 /* wallet-ext in Resources */,
+				E00000000000000000000029 /* PrivacyInfo.xcprivacy in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -234,13 +238,18 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				"EPIX_RUST_LIBRARY[sdk=iphoneos*]" = "$(SRCROOT)/../target/aarch64-apple-ios/release/libepix_ffi.a";
+				"EPIX_RUST_LIBRARY[sdk=iphonesimulator*]" = "$(SRCROOT)/../target/aarch64-apple-ios-sim/release/libepix_ffi.a";
 				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/../target/aarch64-apple-ios/release";
 				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(SRCROOT)/../target/aarch64-apple-ios-sim/release";
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
-					"-lepix_ffi",
+					"$(EPIX_RUST_LIBRARY)",
 					"-lepix_snowflake",
 					"-liconv",
+					"-lz",
+					"-framework",
+					SystemConfiguration,
 					"-framework",
 					Security,
 					"-framework",
@@ -265,13 +274,18 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
+				"EPIX_RUST_LIBRARY[sdk=iphoneos*]" = "$(SRCROOT)/../target/aarch64-apple-ios/release/libepix_ffi.a";
+				"EPIX_RUST_LIBRARY[sdk=iphonesimulator*]" = "$(SRCROOT)/../target/aarch64-apple-ios-sim/release/libepix_ffi.a";
 				"LIBRARY_SEARCH_PATHS[sdk=iphoneos*]" = "$(SRCROOT)/../target/aarch64-apple-ios/release";
 				"LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*]" = "$(SRCROOT)/../target/aarch64-apple-ios-sim/release";
 				MARKETING_VERSION = 0.1.0;
 				OTHER_LDFLAGS = (
-					"-lepix_ffi",
+					"$(EPIX_RUST_LIBRARY)",
 					"-lepix_snowflake",
 					"-liconv",
+					"-lz",
+					"-framework",
+					SystemConfiguration,
 					"-framework",
 					Security,
 					"-framework",

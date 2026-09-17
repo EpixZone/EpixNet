@@ -56,16 +56,23 @@ struct WKScriptMessage {
     var webView: WKWebView?
     var frameInfo: WKFrameInfo
 }
+struct Tab { var webView: WKWebView }
 final class Shell {
+    var currentTab: Tab?
+    var dappRequest: (id: UUID, reply: (Any?, String?) -> Void)?
+    var failSave = false
     var nodeBase = "http://127.0.0.1:42222"
     var currentDisplay = "dashboard.epix"
     var webView: WKWebView? = WKWebView("about:blank")
     var walletWebView: WKWebView? = WKWebView("http://127.0.0.1:42222/EpixWallet/mobile.html")
     var walletStore: [String: String] = [:]
+    var walletStoreError: String?
+    var walletVC: Int?
+    func showWallet() {}
     var nativeCalls = 0
     var nativeReplies: [([String: Any]) -> Void] = []
     var closeCalls = 0
-    func persistWalletStore() {}
+    func persistWalletStore(_ next: [String: String]) throws { if failSave { throw NSError(domain: "fixture", code: 1) } }
     func handleNmh(_ message: [String: Any], reply: @escaping ([String: Any]) -> Void) {
         nativeCalls += 1
         nativeReplies.append(reply)
@@ -165,7 +172,7 @@ wallet.url = URL(string: trusted)
 
 for address in ["epix://talk.epix/posts/42?sort=new#reply", "epix://talk.epix/a%20b?q=a%2Fb#c%20d"] {
     shell.navigate(address)
-    let expected = address.replacingOccurrences(of: "epix://", with: shell.nodeBase + "/")
+    let expected = address.replacingOccurrences(of: "epix://", with: "https://")
     check(shell.webView?.loaded?.absoluteString == expected,
           "typed deep link preserves path/query/fragment: \(address) -> \(shell.webView?.loaded?.absoluteString ?? "nil")")
     let target = shell.targetFrom(URL(string: address)!)!
@@ -175,11 +182,60 @@ check(shell.xiteRewrite(URL(string: "https://example.com/path")!) == nil,
       "ordinary web URLs stay on the web")
 check(shell.targetFrom(URL(string: "https://example.com")!) == nil,
       "external non-Epix URLs are rejected")
+
+// A failed save must not report success or mutate the in-memory vault.
+shell.walletStore = ["owned": "before"]
+shell.failSave = true
+wallet.scripts = []
+send("epixStore", url: trusted)
+RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+check(shell.walletStore["owned"] == "before", "failed writes preserve the previous vault")
+check(wallet.scripts.last?.contains("Wallet could not be saved") == true, "failed writes reach the caller")
+shell.failSave = false
+shell.walletStoreError = "unreadable vault"
+wallet.scripts = []
+send("epixStore", url: trusted)
+RunLoop.main.run(until: Date(timeIntervalSinceNow: 0.01))
+check(shell.walletStore["owned"] == "before" && wallet.scripts.last?.contains("unreadable vault") == true,
+      "unreadable storage cannot be overwritten")
+shell.walletStoreError = nil
+
+let tab = WKWebView("https://talk.epix/")
+shell.currentTab = Tab(webView: tab)
+func caller(_ url: String, host: String = "talk.epix", port: Int = 0,
+            web: WKWebView? = tab) -> String? {
+    shell.dappOrigin(WKScriptMessage(name: "epixDapp", body: [:], webView: web,
+        frameInfo: WKFrameInfo(isMainFrame: false, request: URLRequest(url: URL(string: url)!),
+            securityOrigin: WKSecurityOrigin(protocol: "https", host: host, port: port))))
+}
+check(caller("https://talk.epix/frame") == "https://talk.epix", "same-origin frames can request a connection")
+check(caller("https://talk.epix:443/frame", port: 443) == "https://talk.epix", "default HTTPS ports normalize")
+check(caller("https://evil.epix/", host: "evil.epix") == nil, "cross-origin frames cannot request a connection")
+check(caller("https://talk.epix/", host: "evil.epix") == nil, "native security origin controls identity")
+check(caller("https://talk.epix/", web: WKWebView("https://talk.epix/")) == nil, "background tabs cannot request a connection")
+check(caller("http://talk.epix/") == nil, "insecure origins cannot request a connection")
+tab.url = URL(string: "https://talk.epix:8443/")
+check(caller("https://talk.epix:8443/", port: 0) == nil, "default security port cannot authorize another port")
+check(caller("https://talk.epix:8443/", port: 8443) == "https://talk.epix:8443", "explicit ports stay isolated")
+tab.url = URL(string: "https://127.0.0.1/")
+check(caller("https://127.0.0.1/", host: "127.0.0.1") == nil, "loopback cannot use the public wallet provider")
+
+
+var rejections = 0
+shell.dappRequest = (UUID(), { _, error in
+    rejections += 1
+    check(error == "cancelled", "cancellation explains the reason")
+})
+wallet.scripts = []
+shell.cancelDappRequest("cancelled")
+shell.cancelDappRequest("cancelled again")
+check(rejections == 1 && shell.dappRequest == nil, "cancellation resolves native request exactly once")
+check(wallet.scripts.count == 1 && wallet.scripts[0].contains("epix-wallet-closed"), "cancellation also stops the wallet approval flow")
 print("\(failures) regression failure(s)")
 exit(failures == 0 ? 0 : 1)
 '''
 
-methods = ["userContentController", "handleStore", "replyStore", "navigate", "searchUrl", "nodeUrl", "targetFrom", "xiteRewrite"]
+methods = ["userContentController", "handleStore", "replyStore", "navigate", "searchUrl", "nodeUrl", "targetFrom", "xiteRewrite", "dappOrigin", "cancelDappRequest"]
 swift = stub + "\n".join(method(name) for name in methods)
 swift += "\n" + method("isWalletFrame", optional=True)
 swift += "\n" + method("acceptsWalletMessage", optional=True)

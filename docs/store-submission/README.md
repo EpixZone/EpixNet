@@ -1,0 +1,58 @@
+# Mobile submission package
+
+Updated 2026-09-16. **Engineering fixes and QA artifacts are prepared; release gates remain open. Do not submit the current artifacts.**
+Apple and Google organization enrollment is confirmed by the owner. No store
+forms have been submitted. The owner has signed and published the dashboard
+changes; the iPad simulator node has downloaded the updated files.
+
+## Decisions preserved
+
+- Dashboard remains the homepage on iOS, Android and desktop. Neither store
+  requires users to find it through a search engine.
+- iOS excludes BitTorrent media and tracker discovery at compile time.
+  Android and desktop retain those features.
+- The DeFlix dashboard tile removal and empty-feed mobile **Discover** label
+  are merged in [EpixDash PR #37](https://github.com/EpixZone/EpixDash-Xite/pull/37)
+  and published. Its community search listing remains available. No infringement
+  finding is implied; catalog labels do not substitute for rights evidence.
+- The company website must not lead visitors to EpixNet. Its app policies and
+  support use unlisted public `/epixnet/…` URLs, linked from the app and store
+  records after publication; the pages remain identical for all visitors.
+- Reviewers must see the same product behavior as other users.
+
+## Prepared materials
+
+| File | Use |
+| --- | --- |
+| [Engineering review](engineering-review.md) | Cross-repository changes and security boundaries |
+| [Listing and reviewer notes](store-listing.md) | Copy-ready product text and a review walkthrough, with unresolved fields marked |
+| [Privacy/data inventory](privacy-data-inventory.md) | Evidence for privacy policy, App Privacy and Data safety answers |
+| [Policy drafts](policy-drafts.md) | Privacy, support, deletion and terms text for the operator to finalize and publish |
+| [Moderation runbook](moderation-runbook.md) | Report handling, ownership and publication requirements |
+| [Rights ledger](deflix-rights-ledger.json) | All 1,142 catalog entries, each requiring evidence and territory review |
+| [Release validation](release-validation.md) | Local test evidence, reproduction and gaps |
+| [Release decisions](release-decisions.md) | Wallet, payment, deletion, encryption and audience decisions |
+| [Configuration worksheet](submission-config.example.json) | Missing business details, URLs and distribution choices |
+
+## Release blockers
+
+1. Legal operator confirmed: **TechSonix, Inc.** Confirm public support/abuse
+   contact and release countries. The redesigned TechSonix website and policy
+   pages are prepared in [TechSonix PR #1](https://github.com/TechSonix/techsonix.com/pull/1); verify operational
+   facts, publish the pages and configure wallet CI variables.
+2. Commit/review/publish the wallet changes, then update EpixNet's wallet
+   revision and SHA-256 to that immutable release. Local QA uses an explicitly
+   uncommitted wallet build; it is not a release pin.
+3. Publish signed Epix Sites changes through its normal signing workflow.
+   Validate reporting, blocking, filtering and private complaints across all
+   promoted social xites; designate the people operating those controls.
+4. Resolve content-rights evidence, paid xID classification, account-deletion
+   scope, age/audience, countries and encryption/export declarations.
+5. Complete signed physical-device testing, wallet approve/reject/sign/recovery,
+   iPad layout and permission-denial checks. Produce exact release screenshots.
+6. Supply iOS App Store signing/access and inspect the store records. Run
+   TestFlight and Play internal testing, complete declarations from evidence,
+   then submit the actual validated builds.
+
+The engineering guards intentionally fail for missing policy configuration or
+an uncommitted wallet. Do not bypass them to label a QA artifact submission-ready.

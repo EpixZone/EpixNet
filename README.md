@@ -2,18 +2,18 @@
 
 EpixNet lets you **visit and build websites that live on people's own computers** instead of on a big company's servers.
 
-When you open an EpixNet site, your computer downloads its own copy and then helps share it with the next person. So the more people who visit a site, the stronger and faster it gets, and no single company can quietly take it down or watch who is reading it.
+When you open an EpixNet site, your computer downloads content and can share it with other peers. More available copies can improve access, but speed and availability depend on reachable peers, bandwidth, and the content they retain.
 
-Privacy comes built in. EpixNet can send your traffic through **Tor** and **I2P** (two networks that hide where you are), and both are turned on for you out of the box.
+EpixNet supports **Tor** and **I2P** in builds that include those features. Routing depends on the build and your settings: enabling Tor does not send every connection through Tor. Direct peers and services can see your IP address, and destinations may record requests. These features do not guarantee anonymity.
 
 ## What you get
 
-- **A web that nobody owns.** Sites (EpixNet calls them *xites*) are signed by their author and copied from person to person, so they stay online even when computers switch off.
-- **Privacy without the setup.** Tor and I2P run inside EpixNet and are on by default. There is nothing extra to download or configure.
+- **Peer-hosted websites.** Sites (EpixNet calls them *xites*) use signed content and peer replication. A copy must remain available locally or from a reachable peer to load it. A valid signature does not establish that content is safe or lawful.
+- **Routing choices.** Supported builds include embedded Tor and I2P. The default Tor `enable` mode supports onion peers while allowing other peer connections to go directly. Browser traffic has separate routing controls. Check your platform's settings before relying on a route.
 - **You help hold it up.** Your node shares the xites you have visited and helps other people find each other, like a tiny piece of the network living on your machine.
 - **A dashboard.** See the xites you keep, live network activity, and a world map of the people you are connected to.
-- **Built-in apps.** A chat board, mail, and a newsfeed that all run on the network, with no account on anyone's server.
-- **Runs almost anywhere.** Windows, macOS, Linux, Android, and iOS.
+- **Network applications.** Discover a chat board, mail, and a newsfeed. Identity or wallet requirements depend on the application and the action you take.
+- **Desktop and mobile projects.** Source and build guides are available for Windows, macOS, Linux, Android, and iOS. Features and distribution availability vary by platform; mobile store releases are in preparation.
 
 ## Get started
 
@@ -124,7 +124,7 @@ Set these before you start EpixNet to change how it runs:
 | --- | --- | --- |
 | `EPIX_HEADLESS=1` | Serve the network but never open a browser (for servers). | off |
 | `EPIX_UI_ADDR` | The address the dashboard listens on. | `127.0.0.1:42222` |
-| `EPIX_TOR` | Tor mode: `enable`, `disable`, or `always` (route everything through Tor). | `enable` |
+| `EPIX_TOR` | Node Tor mode: `enable`, `disable`, or `always`. `always` requires Tor for node peer traffic; browser and wallet routing have separate controls. | `enable` |
 | `EPIX_DATA_DIR` | Where EpixNet keeps its data (xites, keys, settings). | see below |
 
 If port `42222` is already taken, EpixNet falls back to `43110`.

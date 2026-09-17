@@ -15,13 +15,13 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
-mod ca;
+use epix_browser_net::ca;
 mod eepsite;
 mod ext;
 #[cfg(windows)]
 mod icon;
 mod ipc;
-mod proxy;
+use epix_browser_net::proxy;
 mod tray;
 #[cfg(test)]
 #[path = "../wallet_stage.rs"]

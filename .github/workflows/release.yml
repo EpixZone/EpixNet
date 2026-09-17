@@ -208,7 +208,8 @@ jobs:
   android:
     runs-on: ubuntu-latest
     env:
-      NDK_VERSION: "27.2.12479018"
+      NDK_VERSION: "28.2.13676358"
+      CARGO_TARGET_AARCH64_LINUX_ANDROID_RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -230,7 +231,7 @@ jobs:
       - name: Install SDK + NDK packages
         run: |
           sdkmanager --install \
-            "platforms;android-36" \
+            "platforms;android-37" \
             "build-tools;36.0.0" \
             "ndk;${NDK_VERSION}" \
             "platform-tools"
@@ -252,14 +253,26 @@ jobs:
       - name: Build Rust core into jniLibs
         run: |
           cargo ndk -t arm64-v8a -o shells/android/app/src/main/jniLibs \
-            build -p epix-ffi --release --features bridges,bittorrent
+            build -p epix-ffi --release --features bridges,bittorrent --locked
 
-      - name: Bundle the Snowflake bridge library into jniLibs
+      - name: Read pinned Android Snowflake source
+        id: snowflake
         run: |
-          REV=$(cat crates/iptproxy-sys/iptproxy.rev)
-          curl -fL --retry 3 \
-            -o shells/android/app/src/main/jniLibs/arm64-v8a/libepix_snowflake.so \
-            "https://github.com/EpixZone/epix-iptproxy/releases/download/$REV/epix_snowflake-aarch64-linux-android.so"
+          echo "revision=$(cat crates/iptproxy-sys/iptproxy-android.rev)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v7.0.1
+        with:
+          repository: EpixZone/epix-iptproxy
+          ref: ${{ steps.snowflake.outputs.revision }}
+          path: .store-build/snowflake
+
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: .store-build/snowflake/go.mod
+          cache-dependency-path: .store-build/snowflake/go.sum
+
+      - name: Build Snowflake with 16 KB alignment
+        run: bash scripts/build-android-snowflake.sh .store-build/snowflake
 
       - name: Generate Kotlin UniFFI bindings
         run: |
@@ -298,6 +311,11 @@ jobs:
         run: |
           echo "sdk.dir=$ANDROID_SDK_ROOT" > local.properties
           ./gradlew assembleRelease
+          if [ -n "$EPIX_KEYSTORE_FILE" ]; then
+            ./gradlew bundleRelease
+            cp app/build/outputs/bundle/release/app-release.aab \
+              "$GITHUB_WORKSPACE/epix-android-${{ steps.v.outputs.version }}.aab"
+          fi
           mv app/build/outputs/apk/release/app-release.apk \
             "$GITHUB_WORKSPACE/epix-android-${{ steps.v.outputs.version }}.apk"
 
@@ -307,10 +325,20 @@ jobs:
           "$ANDROID_SDK_ROOT"/build-tools/36.0.0/apksigner verify --print-certs \
             "$GITHUB_WORKSPACE/epix-android-${{ steps.v.outputs.version }}.apk"
 
+      - name: Verify all packaged native libraries support 16 KB pages
+        shell: bash
+        run: |
+          shopt -s nullglob
+          packages=(epix-android-*.apk epix-android-*.aab)
+          python3 scripts/check-android-native.py \
+            --require libepix_ffi.so --require libepix_snowflake.so "${packages[@]}"
+
       - uses: actions/upload-artifact@v7
         with:
           name: epix-android
-          path: epix-android-*.apk
+          path: |
+            epix-android-*.apk
+            epix-android-*.aab
 
   release:
     needs: [macos, linux, windows, android]
@@ -324,11 +352,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
+          shopt -s nullglob
           files=(
             artifacts/epix-macos/*.dmg
             artifacts/epix-linux/*.tar.gz
             artifacts/epix-windows/*.exe
             artifacts/epix-android/*.apk
+            artifacts/epix-android/*.aab
           )
           # A release may already exist for this tag: creating one in the GitHub
           # UI makes the tag (which triggers this workflow), and a re-run finds

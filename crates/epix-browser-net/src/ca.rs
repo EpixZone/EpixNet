@@ -12,9 +12,7 @@
 //! we sign validates against the trusted copy regardless of serial).
 
 use base64::Engine as _;
-use rcgen::{
-    BasicConstraints, CertificateParams, DnType, Issuer, IsCa, KeyPair, KeyUsagePurpose,
-};
+use rcgen::{BasicConstraints, CertificateParams, DnType, IsCa, Issuer, KeyPair, KeyUsagePurpose};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
@@ -43,12 +41,23 @@ impl LocalCa {
 
         let ca_key = match std::fs::read_to_string(&key_path) {
             Ok(pem) => KeyPair::from_pem(&pem).map_err(|e| format!("parse ca key: {e}"))?,
-            Err(_) => {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 let key = KeyPair::generate().map_err(|e| format!("ca key: {e}"))?;
-                std::fs::write(&key_path, key.serialize_pem())
+                let mut options = std::fs::OpenOptions::new();
+                options.write(true).create_new(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    options.mode(0o600);
+                }
+                use std::io::Write;
+                options
+                    .open(&key_path)
+                    .and_then(|mut file| file.write_all(key.serialize_pem().as_bytes()))
                     .map_err(|e| format!("write ca key: {e}"))?;
                 key
             }
+            Err(e) => return Err(format!("read ca key: {e}")),
         };
 
         // Generate the CA cert ONCE, then reuse the persisted bytes. Regenerating
@@ -73,7 +82,11 @@ impl LocalCa {
             }
         };
         let ca_cert_der = pem_to_der(&ca_cert_pem)?;
-        Ok(Self { ca_key, ca_cert_pem, ca_cert_der })
+        Ok(Self {
+            ca_key,
+            ca_cert_pem,
+            ca_cert_der,
+        })
     }
 
     fn ca_params() -> Result<CertificateParams, String> {
@@ -81,8 +94,12 @@ impl LocalCa {
             CertificateParams::new(Vec::new()).map_err(|e| format!("ca params: {e}"))?;
         params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
         params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
-        params.distinguished_name.push(DnType::CommonName, "Epix Local CA");
-        params.distinguished_name.push(DnType::OrganizationName, "EpixNet");
+        params
+            .distinguished_name
+            .push(DnType::CommonName, "Epix Local CA");
+        params
+            .distinguished_name
+            .push(DnType::OrganizationName, "EpixNet");
         Ok(params)
     }
 
@@ -103,6 +120,14 @@ impl LocalCa {
         let leaf_key = KeyPair::generate().map_err(|e| format!("leaf key: {e}"))?;
         let mut params = CertificateParams::new(vec![host.to_string()])
             .map_err(|e| format!("leaf params: {e}"))?;
+        // WebKit applies modern TLS server certificate requirements even to
+        // a private trust anchor. rcgen's defaults span centuries and omit
+        // the explicit server-auth purpose.
+        let now = time::OffsetDateTime::now_utc();
+        params.not_before = now - time::Duration::days(1);
+        params.not_after = now + time::Duration::days(90);
+        params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        params.extended_key_usages = vec![rcgen::ExtendedKeyUsagePurpose::ServerAuth];
         params.distinguished_name.push(DnType::CommonName, host);
         // rcgen 0.14 signs against an Issuer (CA params + key) rather than the
         // CA cert + key directly. Rebuild it from the same deterministic params.
@@ -133,7 +158,6 @@ fn pem_to_der(pem: &str) -> Result<CertificateDer<'static>, String> {
     Ok(CertificateDer::from(der))
 }
 
-
 /// A rustls cert resolver that mints (and caches) a leaf per SNI host on the
 /// fly, so any `*.epix` host gets a valid cert without pre-provisioning.
 #[derive(Clone)]
@@ -144,15 +168,26 @@ pub struct EpixCertResolver {
 
 impl EpixCertResolver {
     pub fn new(ca: Arc<LocalCa>) -> Self {
-        Self { ca, cache: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            ca,
+            cache: Arc::new(Mutex::new(HashMap::new())),
+        }
     }
 
     fn cert_for(&self, host: &str) -> Option<Arc<CertifiedKey>> {
+        if !is_epix_host(host) {
+            return None;
+        }
         if let Some(k) = self.cache.lock().unwrap().get(host) {
             return Some(k.clone());
         }
         let key = Arc::new(self.ca.leaf_for(host).ok()?);
-        self.cache.lock().unwrap().insert(host.to_string(), key.clone());
+        let mut cache = self.cache.lock().unwrap();
+        // Visiting arbitrary names must not grow the certificate cache forever.
+        if cache.len() >= 256 {
+            cache.clear();
+        }
+        cache.insert(host.to_string(), key.clone());
         Some(key)
     }
 }
@@ -165,11 +200,24 @@ impl std::fmt::Debug for EpixCertResolver {
 
 impl ResolvesServerCert for EpixCertResolver {
     fn resolve(&self, client_hello: ClientHello) -> Option<Arc<CertifiedKey>> {
-        // No SNI (some clients omit it for unusual hosts): fall back to a
-        // generic name; the leaf then won't match, surfacing as a cert error.
-        let host = client_hello.server_name().unwrap_or("epix").to_string();
-        self.cert_for(&host)
+        self.cert_for(client_hello.server_name()?)
     }
+}
+
+/// This CA never impersonates a public website or a loopback wallet origin.
+pub(crate) fn is_epix_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
+    let label = host.strip_suffix(".epix").unwrap_or(&host);
+    let epix = host.ends_with(".epix")
+        || (host.starts_with("epix1") && host.len() > 20 && !host.contains('.'));
+    epix && host.len() <= 253
+        && label.split('.').all(|part| {
+            !part.is_empty()
+                && part.len() <= 63
+                && !part.starts_with('-')
+                && !part.ends_with('-')
+                && part.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        })
 }
 
 #[cfg(test)]
@@ -189,13 +237,46 @@ mod tests {
         let first = LocalCa::load_or_create(dir).expect("first load");
         let second = LocalCa::load_or_create(dir).expect("second load reuses persisted cert");
 
-        assert_eq!(first.cert_pem(), second.cert_pem(), "CA PEM changed across loads");
-        assert_eq!(first.ca_cert_der, second.ca_cert_der, "CA DER changed across loads");
+        assert_eq!(
+            first.cert_pem(),
+            second.cert_pem(),
+            "CA PEM changed across loads"
+        );
+        assert_eq!(
+            first.ca_cert_der, second.ca_cert_der,
+            "CA DER changed across loads"
+        );
         // The reused DER must match what we persisted on disk.
         let on_disk = std::fs::read_to_string(dir.join("ca-cert.pem")).unwrap();
         assert_eq!(pem_to_der(&on_disk).unwrap(), second.ca_cert_der);
         // A freshly minted leaf still chains to the reused CA (issuer name + key).
         let leaf = second.leaf_for("dashboard.epix").expect("leaf mint");
         assert_eq!(leaf.cert.len(), 2, "leaf chain should be [leaf, ca]");
+    }
+
+    #[test]
+    fn certificates_are_limited_to_xite_origins() {
+        for host in [
+            "dashboard.epix",
+            "sub.talk.epix",
+            "epix1abcdefghijklmnopqrstuv",
+        ] {
+            assert!(is_epix_host(host), "{host}");
+        }
+        for host in [
+            "epix",
+            ".epix",
+            "localhost",
+            "127.0.0.1",
+            "apple.com",
+            "epix1abcdefghijklmnopqrstuv.example",
+            "x.epix.evil",
+            "x..epix",
+            "-x.epix",
+            "x/.epix",
+            "x:443.epix",
+        ] {
+            assert!(!is_epix_host(host), "{host}");
+        }
     }
 }

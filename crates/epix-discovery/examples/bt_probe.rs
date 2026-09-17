@@ -1,8 +1,8 @@
 //! Probe BitTorrent trackers with a real announce for the dashboard xite and
 //! report which ones answer with peers - used to pick the built-in defaults.
 //!
-//!     cargo run -p epix-discovery --example bt_probe
-//!     cargo run -p epix-discovery --example bt_probe -- udp://host:port/announce ...
+//!     cargo run -p epix-discovery --features bittorrent --example bt_probe
+//!     cargo run -p epix-discovery --features bittorrent --example bt_probe -- udp://host:port/announce ...
 
 const DASHBOARD: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 

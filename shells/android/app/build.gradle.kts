@@ -1,5 +1,6 @@
 import java.io.FileInputStream
 import java.util.Properties
+import java.security.MessageDigest
 
 plugins {
     id("com.android.application")
@@ -24,14 +25,31 @@ val keystoreProps = Properties().apply {
 // higher versionName always yields a higher code). BuildConfig.VERSION_NAME
 // carries the name into the app so the node reports the tagged version too.
 val epixVersion = System.getenv("EPIX_VERSION")?.takeIf { it.isNotBlank() } ?: "0.3.0"
-val epixVersionCode = run {
+val epixVersionCode = System.getenv("EPIX_VERSION_CODE")?.let { value ->
+    value.toIntOrNull()?.takeIf { it in 1..2_100_000_000 }
+        ?: throw GradleException("EPIX_VERSION_CODE must be an integer from 1 to 2100000000")
+} ?: run {
     val n = Regex("""\d+""").findAll(epixVersion).map { it.value.toIntOrNull() ?: 0 }.toList()
     (n.getOrElse(0) { 0 }) * 1_000_000 + (n.getOrElse(1) { 0 }) * 1_000 + (n.getOrElse(2) { 0 })
 }
 
+// Play uploads must never silently use an unsigned bundle or a debug key.
+val validatePlaySigning by tasks.registering {
+    doLast {
+        val cfg = android.signingConfigs.getByName("release")
+        if (cfg.storeFile?.isFile != true || cfg.storePassword.isNullOrBlank() ||
+            cfg.keyAlias.isNullOrBlank() || cfg.keyPassword.isNullOrBlank()) {
+            throw GradleException("Configure release signing before building a Play bundle; see RELEASE-SIGNING.md")
+        }
+        if (epixVersionCode !in 1..2_100_000_000) {
+            throw GradleException("Set a valid, increasing EPIX_VERSION_CODE for the Play upload")
+        }
+    }
+}
+
 android {
     namespace = "zone.epix.app"
-    compileSdk = 36
+    compileSdk = 37
 
     buildFeatures {
         buildConfig = true
@@ -136,6 +154,16 @@ val stageWalletExt by tasks.registering {
             uri(walletDistUrl(walletRev)).toURL().openStream().use { input ->
                 zip.outputStream().use { input.copyTo(it) }
             }
+            val checksumFile = layout.projectDirectory.file("../../wallet-ext.sha256").asFile
+            val expected = checksumFile.readLines().firstOrNull {
+                it.trim().endsWith("epix-wallet-firefox.zip")
+            }?.trim()?.substringBefore(' ')
+            val actual = MessageDigest.getInstance("SHA-256")
+                .digest(zip.readBytes()).joinToString("") { "%02x".format(it) }
+            if (expected == null || actual != expected) {
+                zip.delete()
+                throw GradleException("Wallet archive does not match shells/wallet-ext.sha256")
+            }
             copy {
                 from(zipTree(zip))
                 into(dest)
@@ -154,12 +182,21 @@ val stageWalletExt by tasks.registering {
     }
 }
 tasks.named("preBuild") { dependsOn(stageWalletExt) }
+val validateStoreWallet by tasks.registering(Exec::class) {
+    dependsOn(stageWalletExt)
+    commandLine("python3", "../../../scripts/check-mobile-wallet.py",
+        "src/main/assets/extensions/wallet", "--release")
+    workingDir(layout.projectDirectory)
+}
+tasks.matching { it.name == "bundleRelease" }.configureEach {
+    dependsOn(validatePlaySigning, validateStoreWallet)
+}
 
 dependencies {
     implementation("androidx.appcompat:appcompat:1.7.0")
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
     // The browser surface (Firefox engine as a library).
-    implementation("org.mozilla.geckoview:geckoview:152.0.20260629141727")
+    implementation("org.mozilla.geckoview:geckoview:155.0.20260903215306")
     // The UniFFI-generated Kotlin bindings load the core through JNA.
-    implementation("net.java.dev.jna:jna:5.15.0@aar")
+    implementation("net.java.dev.jna:jna:5.19.1@aar")
 }

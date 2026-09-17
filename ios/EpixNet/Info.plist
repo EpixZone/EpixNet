@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>$(MARKETING_VERSION)</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>UILaunchScreen</key>
 	<dict>
 		<key>UIColorName</key>
@@ -33,11 +33,29 @@
 		<string>UIInterfaceOrientationLandscapeLeft</string>
 		<string>UIInterfaceOrientationLandscapeRight</string>
 	</array>
+	<key>UISupportedInterfaceOrientations~ipad</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+		<string>UIInterfaceOrientationPortraitUpsideDown</string>
+		<string>UIInterfaceOrientationLandscapeLeft</string>
+		<string>UIInterfaceOrientationLandscapeRight</string>
+	</array>
 	<key>NSAppTransportSecurity</key>
 	<dict>
 		<!-- The UI is the embedded node's HTTP server on 127.0.0.1. -->
 		<key>NSAllowsLocalNetworking</key>
 		<true/>
+		<!-- Private .epix hosts use the in-process TLS proxy and an app-only CA.
+		     The navigation delegate still validates hostname, dates and chain
+		     against that CA, and always normalizes these URLs to HTTPS. -->
+		<key>NSExceptionDomains</key>
+		<dict>
+			<key>epix</key>
+			<dict>
+				<key>NSIncludesSubdomains</key><true/>
+				<key>NSExceptionAllowsInsecureHTTPLoads</key><true/>
+			</dict>
+		</dict>
 	</dict>
 	<!--
 	  LAN peer discovery (AnnounceLocal, the local_discovery config key). iOS 14+
@@ -47,6 +65,8 @@
 	-->
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>EpixNet uses the local network to find other EpixNet peers nearby, so xites can sync directly between your devices - including with no internet connection. This is off unless you turn on local network discovery in Config.</string>
+	<key>NSCameraUsageDescription</key>
+	<string>EpixNet uses the camera to scan QR codes when pairing or signing with a Keystone hardware wallet.</string>
 	<!-- epix:// links open the app directly (the Android intent-filter). -->
 	<key>CFBundleURLTypes</key>
 	<array>

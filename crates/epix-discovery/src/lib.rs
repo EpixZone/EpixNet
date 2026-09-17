@@ -7,10 +7,12 @@
 //! [`tracker_pc`] is the announce payload (postcard); [`tracker`] is the
 //! two-call challenge-sign flow over whatever link the caller injects.
 
+#[cfg(feature = "bittorrent")]
 pub mod bittorrent;
 pub mod tracker;
 pub mod tracker_pc;
 
+#[cfg(feature = "bittorrent")]
 pub use bittorrent::announce_bittorrent;
 
 use epix_core::PeerAddr;

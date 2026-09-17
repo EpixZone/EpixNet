@@ -249,16 +249,13 @@ panel. The wallet runs as a served web app (`/EpixWallet/`) with the host app
 bridging its storage and native-host commands over `WKScriptMessageHandler`.
 `epix://` is registered via `CFBundleURLTypes` in `Info.plist`.
 
-**Not yet on iOS - the dApp provider.** The desktop and Android shells expose
-`window.keplr` / `window.ethereum` to browsed pages via the WebExtension; on
-iOS that needs the provider injected into the browsed page's WebView and
-bridged to the wallet's background (a separate WebView) through the host app,
-with approval UIs presented from the background. The wallet itself works (send,
-receive, stake); the browsed-page provider is the remaining iOS wallet work and
-needs on-device testing against a real dApp.
+**iOS dApp provider:** the browsed page gets a page-only provider bundle.
+Native WebKit checks authenticate its origin, port and visible tab, then forward
+external requests into the wallet's existing permission/interaction router.
+Wallet keys never enter the page. Onboarding/cancellation is verified locally;
+approval/signing/recovery still require signed-device QA before submission.
 
-**Open spike (Phase 8b #1):** custom-scheme pages in WKWebView are not secure
-contexts. This scaffold loads the loopback origin directly (sidesteps the custom
-scheme, exposes the port). The three escapes - the `com.apple.developer.web-browser`
-entitlement, iOS 17 `proxyConfigurations`, or accepting degraded xites - are in
-PLAN.md.
+**iOS secure origins:** iOS 17+ proxy configurations route `.epix` to the
+in-process TLS proxy. The app validates these connections against a per-install
+CA inside its browser views; it does not install a system root. Xites receive
+separate HTTPS origins instead of sharing the wallet's loopback origin.
