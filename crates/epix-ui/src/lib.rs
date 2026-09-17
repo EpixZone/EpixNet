@@ -468,6 +468,12 @@ Add it to the ui_host config key, or access the UI                  by IP."
             .into_response();
     }
 
+    if is_config_path(req.uri().path()) {
+        if let Some(response) = config_origin_gate(&ctx, req.headers(), req.uri().path(), req.method(), &host_raw).await {
+            return response;
+        }
+    }
+
     if req.method() == axum::http::Method::OPTIONS {
         return (
             [
@@ -505,7 +511,45 @@ Add it to the ui_host config key, or access the UI                  by IP."
         return (StatusCode::FORBIDDEN, "Cross-origin request blocked").into_response();
     }
 
-    next.run(req).await
+    let config_page = is_config_path(req.uri().path());
+    let mut response = next.run(req).await;
+    if config_page {
+        // Configuration includes the node-wide CSRF token and must never be
+        // embedded as a script-readable frame in xite content.
+        response.headers_mut().insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
+        response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'".parse().unwrap());
+        response.headers_mut().insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+    }
+    response
+}
+
+fn is_config_path(path: &str) -> bool {
+    matches!(path, "/Config" | "/Config/")
+}
+
+/// A same-origin xite request is not a node-operator request: proxy hosts have
+/// their own origin. Move settings navigation to the node origin, and refuse
+/// writes on xite hosts even when a caller knows the node's CSRF token.
+async fn config_origin_gate(
+    ctx: &Ctx,
+    headers: &header::HeaderMap,
+    path: &str,
+    method: &axum::http::Method,
+    host: &str,
+) -> Option<Response> {
+    if ctx.state.ui_restrict().await {
+        return Some((StatusCode::FORBIDDEN, "Configuration is disabled on this gateway").into_response());
+    }
+    if is_proxy_host(strip_port(host)) {
+        return Some(if matches!(method, &axum::http::Method::GET | &axum::http::Method::HEAD) {
+            Redirect::temporary(&format!("http://127.0.0.1:{}/Config", ctx.state.ui_port().await)).into_response()
+        } else {
+            (StatusCode::FORBIDDEN, "Open configuration on the node's own origin").into_response()
+        });
+    }
+    // Always protect the token, even if general cross-xite CORS checks are off.
+    is_cross_origin_request(ctx, headers, path, host).await
+        .then(|| (StatusCode::FORBIDDEN, "Xite access to configuration blocked").into_response())
 }
 
 /// Whether a state-changing request came from this node's own UI.
@@ -613,12 +657,13 @@ async fn is_cross_origin_request(
 }
 
 /// Routes that identify no xite (safe to answer regardless of referer).
+/// /Config is protected because its forms include the node-wide CSRF token.
 /// /Backup is deliberately NOT public even though it is a global path: its
 /// responses hold the node's keys, so a xite's same-origin fetch() to it must
 /// hit the full cross-origin gate (user navigation and the page's own form
 /// posts still pass as `sec-fetch-mode: navigate`).
 fn is_public_ui_path(path: &str) -> bool {
-    (path == "/" || is_global_path(path)) && !is_backup_path(path)
+    (path == "/" || is_global_path(path)) && !is_backup_path(path) && !is_config_path(path)
 }
 
 /// The Backup & Restore wizard's routes.

@@ -49,6 +49,15 @@ are removed, so the advisory is checked normally again.
   Tests cover legitimate relocation, aliases, configuration injection,
   overlapping roots, existing files, and linked identities.
 
+Reviewing that path also exposed an authorization gap: `/Config` was treated as
+a public route on every xite origin, so a xite could fetch the node's CSRF token
+and make a same-origin settings POST. A regression test reproduced the token
+disclosure before the fix. Settings now redirect from xite hosts to the node's
+own loopback origin, refuse xite-origin writes even with a valid token, and
+reject xite subresource reads regardless of the general CORS setting. Settings
+responses cannot be framed or cached, and restricted gateways refuse them.
+Tests also preserve normal settings navigation and submission on the node origin.
+
 The new diagnostic-layer regression captures nested constraint spans through
 subscriber 0.3. Existing crypto, pairwise known-answer, RLN identity, proof and
 pool-admission tests verify compatibility. Exact validation results are recorded
