@@ -2540,12 +2540,15 @@ name = "epix-browser"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.23.1",
  "epix-browser-net",
  "epix-build",
  "epix-i2p",
  "epix-node",
  "epix-ui",
  "gtk",
+ "hyper",
+ "hyper-util",
  "image",
  "include_dir",
  "muda",

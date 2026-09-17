@@ -24,8 +24,9 @@ prebuilt artifact, so you do not need a wallet checkout to build them.
 - The wallet's CI builds the Firefox WebExtension on every push to `epix` and
   publishes it to a versioned `wallet-<rev>` GitHub release
   (`epix-wallet-firefox.zip`), one per commit.
-- `shells/wallet-ext.rev` pins which wallet commit to embed. Bumping it (a
-  one-line PR) is how EpixNet adopts a new wallet, keeping builds reproducible.
+- `shells/wallet-ext.rev` pins which wallet commit to embed and
+  `shells/wallet-ext.sha256` pins the published archive checksum. Updating both
+  in a PR is how EpixNet adopts a new wallet, keeping builds reproducible.
 - `shells/wallet-ext/` is the staging directory (gitignored except its
   README). `epix-browser`'s `build.rs` downloads the pinned release into it
   before compiling (skipped when the staged copy already matches the pin); the
@@ -132,7 +133,7 @@ end on macOS: Firefox loads `dashboard.epix` through the node's proxy.
 
 What works now (all verified on macOS):
 - **Secure origins**: the node serves `.epix` over real https via a per-install
-  local CA (`crates/epix-browser/src/ca.rs` + `proxy.rs`); xites are secure
+  local CA (`crates/epix-browser-net/src/ca.rs` + `proxy.rs`); xites are secure
   contexts, no warning.
 - **Epix Wallet + native host**: the staged wallet WebExtension provides live
   direct/Tor routing for general clearnet and the Tor/I2P controls, with a Rust

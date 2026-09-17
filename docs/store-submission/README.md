@@ -38,16 +38,21 @@ changes; the iPad simulator node has downloaded the updated files.
 
 1. Legal operator confirmed: **TechSonix, Inc.** Confirm public support/abuse
    contact and release countries. The redesigned TechSonix website and policy
-   pages are prepared in [TechSonix PR #1](https://github.com/TechSonix/techsonix.com/pull/1); verify operational
-   facts, publish the pages and configure wallet CI variables.
+   pages from [TechSonix PR #1](https://github.com/TechSonix/techsonix.com/pull/1)
+   are deployed. Live HTML matches the validated export, app pages retain
+   noindex and are omitted from company navigation, and HTTP redirects to HTTPS.
+   Wallet CI now has the published terms/privacy URLs and store-build mode.
+   Confirm the contact inbox and actual operational practices before submission.
 2. Commit/review/publish the wallet changes, then update EpixNet's wallet
    revision and SHA-256 to that immutable release. Local QA uses an explicitly
    uncommitted wallet build; it is not a release pin.
 3. Publish signed Epix Sites changes through its normal signing workflow.
    Validate reporting, blocking, filtering and private complaints across all
    promoted social xites; designate the people operating those controls.
-4. Resolve content-rights evidence, paid xID classification, account-deletion
-   scope, age/audience, countries and encryption/export declarations.
+4. Resolve content-rights evidence, paid xID classification, age/audience,
+   countries and encryption/export declarations. Determine whether the integrated
+   xID/profile flows constitute app accounts under store rules; no separate
+   TechSonix account or blockchain-erasure capability has been established.
 5. Complete signed physical-device testing, wallet approve/reject/sign/recovery,
    iPad layout and permission-denial checks. Produce exact release screenshots.
 6. Supply iOS App Store signing/access and inspect the store records. Run

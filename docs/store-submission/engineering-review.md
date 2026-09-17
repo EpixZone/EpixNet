@@ -2,8 +2,11 @@
 
 This work spans four repositories. EpixDash changes were committed, pushed and
 merged in [PR #37](https://github.com/EpixZone/EpixDash-Xite/pull/37), then signed
-and published by the owner. EpixNet, epix-wallet and EpixSites-Xite changes
-remain local and uncommitted. No store uploads have been made.
+and published by the owner. EpixNet mobile changes are committed on `codex/mobile-store-release`, with
+current main-branch startup/navigation changes merged. Wallet changes were merged in
+[PR #18](https://github.com/EpixZone/epix-wallet/pull/18), at
+`c31832e1aabd89ee29691951ac673cfe961a3f1a`. EpixSites-Xite changes
+remain local and unpublished. No store uploads have been made.
 
 ## EpixNet
 
