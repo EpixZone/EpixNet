@@ -7608,7 +7608,7 @@ impl AppState {
             .and_then(std::ffi::OsStr::to_str)
             .ok_or_else(|| format!("{} has no portable file name", path.display()))?;
         XiteStorage::new(parent)
-            .write_atomic_durable_private(name, bytes)
+            .write_atomic_durable(name, bytes)
             .map_err(|error| format!("could not durably replace {}: {error}", path.display()))
     }
 
