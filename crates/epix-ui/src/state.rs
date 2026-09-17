@@ -6406,7 +6406,9 @@ impl AppState {
         if let (Some(conf), Some(root)) = (conf, &self.data_root) {
             let staged = crate::paths::read_conf_data_dir(&conf)
                 .unwrap_or_else(crate::paths::default_data_root);
-            if &staged != root {
+            if crate::paths::resolve_data_directory(&staged).ok()
+                != crate::paths::resolve_data_directory(root).ok()
+            {
                 pending.push("data_dir".to_string());
             }
         }
@@ -6491,7 +6493,8 @@ impl AppState {
             .unwrap()
             .clone()
             .ok_or("The data directory is fixed for this node (set via EPIX_DATA_DIR or the embedding app)")?;
-        let current = self.data_root.clone().ok_or("This node keeps no data on disk")?;
+        let current = self.data_root.as_ref().ok_or("This node keeps no data on disk")?
+            .canonicalize().map_err(|e| format!("Could not resolve the current data directory: {e}"))?;
 
         // Resolve the input: empty resets to the default; "~" expands.
         let mut input = new_dir.trim().to_string();
@@ -6500,11 +6503,11 @@ impl AppState {
                 input = format!("{}/{}", home.trim_end_matches('/'), rest);
             }
         }
-        let default = crate::paths::default_data_root();
+        let default = crate::paths::resolve_data_directory(&crate::paths::default_data_root())
+            .map_err(|e| format!("Could not resolve the default data directory: {e}"))?;
         let target = if input.is_empty() { default.clone() } else { PathBuf::from(&input) };
-        if !target.is_absolute() {
-            return Err(format!("The data directory must be an absolute path (got: {input})"));
-        }
+        let target = crate::paths::resolve_data_directory(&target)
+            .map_err(|e| format!("Invalid data directory: {e}"))?;
         if target == current {
             // Nothing to copy, but the conf must still match (e.g. resetting a
             // stale data_dir line while already running on the default root).
@@ -6517,6 +6520,8 @@ impl AppState {
             return Err("The new data directory can't be inside the current one (or contain it)".to_string(),
             );
         }
+
+        validate_data_destination(&target)?;
 
         // Copy the node's data over unless the target already holds an
         // identity of its own (then switching must not overwrite it).
@@ -33087,25 +33092,88 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
     }
 }
 
-/// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
-/// current directory). Uses `statvfs` on unix.
-/// Recursively copy a directory (for `set_data_dir`'s move to a new root).
-/// Follows the file tree only - no symlink chasing surprises are expected in
-/// a data dir the node wrote itself.
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    std::fs::create_dir_all(dst)?;
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let to = dst.join(entry.file_name());
-        if entry.file_type()?.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else {
-            std::fs::copy(entry.path(), &to)?;
+/// An existing identity must be inside the selected root, not behind a link.
+fn validate_data_destination(target: &std::path::Path) -> Result<(), String> {
+    for (sub, directory) in [("private", true), ("data", true), ("private/users.json", false)] {
+        match std::fs::symlink_metadata(target.join(sub)) {
+            Ok(meta) => {
+                let kind = meta.file_type();
+                let valid = if directory { kind.is_dir() } else { kind.is_file() };
+                if !valid {
+                    return Err(format!("The destination {sub} must not be a link or special file"));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("Could not inspect destination {sub}: {e}")),
         }
     }
     Ok(())
 }
 
+/// Recursively copy a directory (for `set_data_dir`'s move to a new root).
+/// Reject links and special files, and never overwrite destination files.
+/// A selected directory may already contain entries not written by the node.
+fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    if !std::fs::symlink_metadata(src)?.file_type().is_dir() {
+        return Err(Error::new(ErrorKind::InvalidInput, "Source must be a directory, not a link"));
+    }
+    match std::fs::symlink_metadata(dst) {
+        Ok(meta) if !meta.file_type().is_dir() => {
+            return Err(Error::new(ErrorKind::InvalidInput, "Destination must be a directory, not a link"));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir_all(dst)?,
+        Err(e) => return Err(e),
+    }
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let to = dst.join(entry.file_name());
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            copy_dir_all(&entry.path(), &to)?;
+        } else if file_type.is_file() {
+            copy_data_file(src, &entry.file_name(), &to)?;
+        } else {
+            return Err(Error::new(ErrorKind::InvalidInput, "Data directories cannot contain links or special files"));
+        }
+    }
+    Ok(())
+}
+
+/// Copy one regular file without following a source link or replacing a target.
+fn copy_data_file(src: &std::path::Path, name: &std::ffi::OsStr, to: &std::path::Path) -> std::io::Result<()> {
+    use std::io::{Error, ErrorKind};
+    #[cfg(unix)]
+    let mut input = {
+        use rustix::fs::{Mode, OFlags};
+        let fd = rustix::fs::open(src.join(name),
+            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK, Mode::empty())?;
+        std::fs::File::from(fd)
+    };
+    #[cfg(windows)]
+    let mut input = epix_fs::open_regular_file_beneath(src, std::path::Path::new(name))?;
+    #[cfg(not(any(unix, windows)))]
+    let mut input = std::fs::File::open(src.join(name))?;
+    if !input.metadata()?.is_file() {
+        return Err(Error::new(ErrorKind::InvalidInput, "Source must be a regular file"));
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Keep private keys owner-only throughout the copy.
+        options.mode(0o600);
+    }
+    let mut output = options.open(to)?;
+    std::io::copy(&mut input, &mut output)?;
+    output.set_permissions(input.metadata()?.permissions())?;
+    Ok(())
+}
+
+/// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
+/// current directory). Uses `statvfs` on unix.
 fn free_space(path: Option<&std::path::Path>) -> i64 {
     #[cfg(unix)]
     {
@@ -43221,9 +43289,78 @@ mod tests {
         s.set_data_dir(target.to_str().unwrap()).await.unwrap();
         // The identity was copied and the choice recorded Python-style.
         assert!(target.join("private/users.json").exists());
-        assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(target.clone()));
+        assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(target.canonicalize().unwrap()));
         // The old root stays in place as a backup.
         assert!(old.path().join("private/users.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_data_dir_rejects_aliased_overlap_and_config_injection() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let current = root.path().join("current");
+        let state = AppState::with_data_dir("test", &current);
+        let conf = root.path().join("epixnet.conf");
+        state.set_data_dir_conf(&conf);
+        state.snapshot_boot_config().await;
+        let alias = root.path().join("alias");
+        symlink(&current, &alias).unwrap();
+
+        for target in [alias.join("nested"), root.path().join("../other"),
+            root.path().join("new\nui_ip=0.0.0.0"), root.path().to_path_buf()] {
+            assert!(state.set_data_dir(target.to_str().unwrap()).await.is_err(), "{target:?}");
+            assert!(!conf.exists(), "Rejected paths must not change configuration");
+        }
+        // An alias of the current root is a no-op, not a recursive copy or a
+        // spurious restart requirement caused by /var vs /private/var on macOS.
+        state.set_data_dir(alias.to_str().unwrap()).await.unwrap();
+        assert!(state.restart_pending_keys().await.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn set_data_dir_rejects_an_identity_behind_a_symlink() {
+        let old = tempdir().unwrap();
+        let new = tempdir().unwrap();
+        let conf_dir = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", old.path());
+        let conf = conf_dir.path().join("epixnet.conf");
+        state.set_data_dir_conf(&conf);
+        std::os::unix::fs::symlink(old.path().join("private"), new.path().join("private")).unwrap();
+        assert!(state.set_data_dir(new.path().to_str().unwrap()).await.is_err());
+        assert!(!conf.exists());
+    }
+
+    #[test]
+    fn data_directory_copy_preserves_existing_files() {
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        std::fs::write(source.path().join("data"), b"new").unwrap();
+        std::fs::write(target.path().join("data"), b"existing").unwrap();
+        assert!(copy_dir_all(source.path(), target.path()).is_err());
+        assert_eq!(std::fs::read(target.path().join("data")).unwrap(), b"existing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn data_directory_copy_rejects_source_and_destination_links() {
+        use std::os::unix::fs::symlink;
+        let source = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let outside = tempdir().unwrap();
+        let external_file = outside.path().join("secret");
+        std::fs::write(&external_file, b"external").unwrap();
+        symlink(&external_file, source.path().join("link")).unwrap();
+        assert!(copy_dir_all(source.path(), target.path()).is_err());
+        assert!(!target.path().join("link").exists());
+        std::fs::remove_file(source.path().join("link")).unwrap();
+
+        std::fs::create_dir(source.path().join("private")).unwrap();
+        std::fs::write(source.path().join("private/secret"), b"node").unwrap();
+        symlink(outside.path(), target.path().join("private")).unwrap();
+        assert!(copy_dir_all(source.path(), target.path()).is_err());
+        assert_eq!(std::fs::read(external_file).unwrap(), b"external");
     }
 
     #[tokio::test]

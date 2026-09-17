@@ -19,7 +19,9 @@ use std::process::{Child, Command};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use muda::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+// Use the menu types paired with tray-icon. A separately versioned muda
+// dependency can produce incompatible ContextMenu types after an update.
+use tray_icon::menu::{self as muda, CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
 use tao::event_loop::{ControlFlow, EventLoop, EventLoopBuilder};
 use tray_icon::{Icon, TrayIconBuilder};
 
