@@ -16,11 +16,13 @@ import android.widget.EditText
 import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
+import android.widget.ProgressBar
 import android.widget.Switch
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -38,6 +40,7 @@ import org.mozilla.geckoview.WebRequestError
 import uniffi.epix_ffi.EpixNode
 import uniffi.epix_ffi.NodeConfig
 import uniffi.epix_ffi.NodeState
+import uniffi.epix_ffi.StartupStage as NodeStartupStage
 import uniffi.epix_ffi.TorStatus
 
 /**
@@ -121,20 +124,27 @@ class MainActivity : AppCompatActivity() {
     private var pendingFileResult: GeckoResult<GeckoSession.PromptDelegate.PromptResponse>? = null
     /// Retries left for a failed load of the node's own UI (see onLoadError).
     private var nodeLoadRetries = 0
-    /// Full-screen loading splash (spinning white Epix mark) shown over the
-    /// chrome while the node boots and the first page paints; removed on the
-    /// first page stop. Mirrors the desktop toolbar spin (EpixNet PR #231).
+    /// Native startup stages cover the page area until our requested page
+    /// loads; other tabs and the initial about:blank cannot complete startup.
     private var splashOverlay: View? = null
+    private var splashMark: android.widget.ImageView? = null
+    private var splashStatus: TextView? = null
+    private var splashDetail: TextView? = null
+    private var splashProgress: ProgressBar? = null
+    private var splashProgressLabel: TextView? = null
+    private val startupPresentation = StartupPresentation()
+    private var startupProgressJob: Job? = null
+    private var startupGeneration = 0
+    private var startupSession: GeckoSession? = null
+    private var startupPageUrl: String? = null
+    private var startupPageStarted = false
+    private var splashAnimationsActive = false
     /// The frame around the page (GeckoView); the boot splash is put in here,
     /// over the page area only, and put back for a boot retry.
     private lateinit var pageFrame: FrameLayout
     /// One-line notice under the address bar while the phone has no network.
     private lateinit var offlineBanner: TextView
     private var networkOnline = true
-    /// Set once we ask the session to load the actual node page. The session
-    /// opens at about:blank and fires an immediate page-stop for it; without
-    /// this guard the splash would vanish before the real page even loads.
-    private var nodePageRequested = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -173,11 +183,26 @@ class MainActivity : AppCompatActivity() {
     }
 
     override fun onDestroy() {
+        startupGeneration++
+        startupProgressJob?.cancel()
+        splashMark?.clearAnimation()
         // Not reference-counted, so this is safe even if the lock was never
         // taken (discovery off) or the activity is recreated.
         runCatching { multicastLock?.release() }
         multicastLock = null
         super.onDestroy()
+    }
+
+    override fun onPause() {
+        splashAnimationsActive = false
+        splashMark?.clearAnimation()
+        super.onPause()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        splashAnimationsActive = true
+        animateSplashMark()
     }
 
     /**
@@ -268,9 +293,27 @@ class MainActivity : AppCompatActivity() {
                 if (uri == null || !uri.startsWith(NODE_BASE)) return null
                 if (nodeLoadRetries < MAX_NODE_LOAD_RETRIES) {
                     nodeLoadRetries++
+                    val generation = startupGeneration
+                    val startupLoad = session === startupSession
                     scope.launch {
                         awaitUiPort()
-                        session.loadUri(uri)
+                        if (startupLoad) {
+                            if (generation == startupGeneration && session === startupSession) {
+                                loadStartupPage(session, uri)
+                            }
+                        } else {
+                            session.loadUri(uri)
+                        }
+                    }
+                    return null
+                }
+                if (session === startupSession) {
+                    showStartupError("The local browser connection did not become ready.")
+                    val generation = startupGeneration
+                    geckoView.post {
+                        if (generation == startupGeneration && session === startupSession) {
+                            loadStartupPage(session, errorPage(null))
+                        }
                     }
                     return null
                 }
@@ -278,14 +321,22 @@ class MainActivity : AppCompatActivity() {
             }
         }
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
+            override fun onPageStart(session: GeckoSession, url: String) {
+                if (session === startupSession && url == startupPageUrl) {
+                    startupPageStarted = true
+                }
+            }
+
             override fun onPageStop(session: GeckoSession, success: Boolean) {
                 // A page made it through: later transient errors get a fresh
                 // retry budget.
                 if (success) nodeLoadRetries = 0
-                // The first real page (dashboard or the error page) is up, so
-                // the boot/connect wait is over - drop the loading splash. Skip
-                // the session's initial about:blank stop (nodePageRequested).
-                if (nodePageRequested) hideSplash()
+                if (session === startupSession && startupPageStarted && success) {
+                    if (!startupPresentation.failed) updateSplash(SplashStage.READY)
+                    hideSplash()
+                    startupSession = null
+                    startupPageStarted = false
+                }
             }
         }
         // GeckoView draws no UI of its own for content prompts: without a
@@ -763,9 +814,8 @@ class MainActivity : AppCompatActivity() {
         }
         root.addView(offlineBanner, LinearLayout.LayoutParams(-1, -2))
         geckoView = GeckoView(this)
-        // Painted in the page's own background until its first paint, so the
-        // boot splash, the cover and the node's loading screen all share one
-        // colour and nothing flashes between them.
+        // The page cover follows the saved theme beneath the separate branded
+        // startup overlay, so it matches the node's loading screen.
         geckoView.coverUntilFirstPaint(pageBackground())
         // The splash sits over the page area only; the chrome stays visible
         // around it, exactly as it will once the page is up.
@@ -830,47 +880,118 @@ class MainActivity : AppCompatActivity() {
         return bar
     }
 
-    /**
-     * The loading splash: the white Epix mark spinning on the dark chrome
-     * background, shown from launch until the first page paints. Mirrors the
-     * desktop browser's spinning toolbar icon (EpixNet PR #231) - on a cold
-     * start the node bootstraps Tor for tens of seconds, so this covers that
-     * wait instead of a blank dark screen.
-     */
+    /** Native branding and real lifecycle progress, independent of the page theme. */
     private fun buildSplash(): View {
-        val background = pageBackground()
-        val overlay = FrameLayout(this).apply {
-            setBackgroundColor(background)
-            // Swallow taps on the page area while it shows.
+        val overlay = android.widget.ScrollView(this).apply {
+            setBackgroundColor(COLOR_CHROME_BG)
+            isFillViewport = true
             isClickable = true
         }
-        val mark = android.widget.ImageView(this).apply {
-            setImageResource(R.drawable.epix_mark_white)
-            // The mark is white; on the light page background tint it to the
-            // page's ink colour.
-            if (background == COLOR_PAGE_LIGHT) {
-                imageTintList = android.content.res.ColorStateList.valueOf(COLOR_PAGE_DARK)
-            }
-            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
-            // A steady continuous spin (compositor-driven), one turn every
-            // 1.2s, for as long as the node is coming up.
-            startAnimation(
-                android.view.animation.RotateAnimation(
-                    0f,
-                    360f,
-                    android.view.animation.Animation.RELATIVE_TO_SELF,
-                    0.5f,
-                    android.view.animation.Animation.RELATIVE_TO_SELF,
-                    0.5f,
-                ).apply {
-                    duration = 1200
-                    repeatCount = android.view.animation.Animation.INFINITE
-                    interpolator = android.view.animation.LinearInterpolator()
-                },
-            )
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER
+            setPadding(dp(24), dp(32), dp(24), dp(32))
         }
-        overlay.addView(mark, FrameLayout.LayoutParams(dp(96), dp(96), Gravity.CENTER))
+        overlay.addView(content, FrameLayout.LayoutParams(-1, -2))
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+        }
+        content.addView(card, LinearLayout.LayoutParams(
+            minOf(resources.displayMetrics.widthPixels - dp(48), dp(360)), -2,
+        ))
+        splashMark = android.widget.ImageView(this).apply {
+            setImageResource(R.drawable.epix_mark_white)
+            scaleType = android.widget.ImageView.ScaleType.FIT_CENTER
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+        }
+        card.addView(splashMark, LinearLayout.LayoutParams(dp(96), dp(96)).apply {
+            bottomMargin = dp(28)
+        })
+        splashStatus = TextView(this).apply {
+            textSize = 24f
+            setTextColor(Color.parseColor("#f8fafc"))
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            gravity = Gravity.CENTER
+            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
+        }
+        card.addView(splashStatus, LinearLayout.LayoutParams(-1, -2))
+        splashDetail = TextView(this).apply {
+            textSize = 14f
+            setTextColor(Color.parseColor("#94a3b8"))
+            gravity = Gravity.CENTER
+            maxLines = 4
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }
+        card.addView(splashDetail, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(12)
+            bottomMargin = dp(24)
+        })
+        splashProgress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
+            isIndeterminate = false
+            max = startupPresentation.total
+            progressTintList = android.content.res.ColorStateList.valueOf(Color.parseColor("#a78bfa"))
+            progressBackgroundTintList = android.content.res.ColorStateList.valueOf(COLOR_FIELD_BG)
+        }
+        card.addView(splashProgress, LinearLayout.LayoutParams(-1, dp(6)))
+        splashProgressLabel = TextView(this).apply {
+            textSize = 12f
+            setTextColor(Color.parseColor("#94a3b8"))
+            gravity = Gravity.CENTER
+        }
+        card.addView(splashProgressLabel, LinearLayout.LayoutParams(-1, -2).apply {
+            topMargin = dp(12)
+        })
         return overlay
+    }
+
+    private fun animateSplashMark() {
+        val mark = splashMark ?: return
+        if (!splashAnimationsActive || startupPresentation.failed ||
+            !android.animation.ValueAnimator.areAnimatorsEnabled()) {
+            mark.clearAnimation()
+            return
+        }
+        if (mark.animation != null) return
+        mark.startAnimation(android.view.animation.RotateAnimation(
+            0f, 360f,
+            android.view.animation.Animation.RELATIVE_TO_SELF, 0.5f,
+            android.view.animation.Animation.RELATIVE_TO_SELF, 0.5f,
+        ).apply {
+            duration = 1200
+            repeatCount = android.view.animation.Animation.INFINITE
+            interpolator = android.view.animation.LinearInterpolator()
+        })
+    }
+
+    private fun updateSplash(stage: SplashStage) {
+        startupPresentation.advance(stage)
+        if (splashStatus?.text?.toString() != startupPresentation.status) {
+            splashStatus?.text = startupPresentation.status
+        }
+        if (splashDetail?.text?.toString() != startupPresentation.detail) {
+            splashDetail?.text = startupPresentation.detail
+        }
+        splashDetail?.contentDescription = startupPresentation.detail
+        if (splashProgress?.progress != startupPresentation.completed) {
+            splashProgress?.progress = startupPresentation.completed
+        }
+        splashProgress?.visibility = if (startupPresentation.failed) View.GONE else View.VISIBLE
+        val progressLabel = if (startupPresentation.failed) {
+            "Opening recovery options…"
+        } else {
+            "${startupPresentation.completed} of ${startupPresentation.total} steps complete"
+        }
+        if (splashProgressLabel?.text?.toString() != progressLabel) {
+            splashProgressLabel?.text = progressLabel
+        }
+        animateSplashMark()
+    }
+
+    private fun showStartupError(message: String) {
+        startupProgressJob?.cancel()
+        startupPresentation.fail(message)
+        updateSplash(startupPresentation.stage)
     }
 
     /** Put the loading splash over the page area. Idempotent. */
@@ -879,13 +1000,45 @@ class MainActivity : AppCompatActivity() {
         splashOverlay = buildSplash().also {
             pageFrame.addView(it, FrameLayout.LayoutParams(-1, -1))
         }
+        updateSplash(startupPresentation.stage)
+    }
+
+    private fun observeStartup(generation: Int) {
+        startupProgressJob?.cancel()
+        startupProgressJob = scope.launch {
+            while (splashOverlay != null && generation == startupGeneration) {
+                val stage = withContext(Dispatchers.IO) {
+                    when (node.state()) {
+                        NodeState.STARTING, NodeState.SERVING -> runCatching { node.startupStage() }.getOrNull()
+                        else -> null
+                    }
+                }
+                if (generation != startupGeneration || splashOverlay == null) break
+                when (stage) {
+                    NodeStartupStage.PREPARING_DATA -> updateSplash(SplashStage.PREPARING)
+                    NodeStartupStage.LOADING_SETTINGS -> updateSplash(SplashStage.SETTINGS)
+                    NodeStartupStage.RESTORING_XITES -> updateSplash(SplashStage.XITES)
+                    NodeStartupStage.REBUILDING_DATABASES -> updateSplash(SplashStage.DATABASES)
+                    NodeStartupStage.STARTING_SERVICES -> updateSplash(SplashStage.SERVICES)
+                    NodeStartupStage.PREPARED -> updateSplash(SplashStage.CONNECTING)
+                    null -> Unit
+                }
+                delay(250)
+            }
+        }
+    }
+
+    private fun loadStartupPage(session: GeckoSession, url: String) {
+        startupSession = session
+        startupPageUrl = url
+        startupPageStarted = false
+        session.loadUri(url)
     }
 
     /**
      * The wrapper's page background for the saved theme (light unless the
      * user picked dark in the node's settings), read straight from the node's
-     * users.json so the splash and the first-paint cover match the loading
-     * screen that follows them.
+     * users.json so the first-paint cover matches the loading screen.
      */
     private fun pageBackground(): Int {
         val dark = runCatching {
@@ -916,9 +1069,7 @@ class MainActivity : AppCompatActivity() {
 
     /** Bring the splash back and boot again (the error page's "Try again"). */
     private fun retryBoot() {
-        nodePageRequested = false
         nodeLoadRetries = 0
-        showSplash()
         bootAndOpen(currentDisplay.ifEmpty { "dashboard.epix" })
     }
 
@@ -970,6 +1121,14 @@ class MainActivity : AppCompatActivity() {
     private fun hideSplash() {
         val overlay = splashOverlay ?: return
         splashOverlay = null
+        startupProgressJob?.cancel()
+        startupProgressJob = null
+        splashMark?.clearAnimation()
+        splashMark = null
+        splashStatus = null
+        splashDetail = null
+        splashProgress = null
+        splashProgressLabel = null
         overlay.animate()
             .alpha(0f)
             .setDuration(250)
@@ -1113,6 +1272,14 @@ class MainActivity : AppCompatActivity() {
      * FFI start() runs again after a failed boot.
      */
     private fun bootAndOpen(target: String) {
+        val generation = ++startupGeneration
+        startupSession = null
+        startupPageUrl = null
+        startupPageStarted = false
+        startupPresentation.reset()
+        showSplash()
+        updateSplash(SplashStage.PREPARING)
+        observeStartup(generation)
         scope.launch {
             // Apply the saved clearnet-through-Tor routing before the first page
             // load, so clearnet requests are proxied from the start. Loopback
@@ -1120,17 +1287,16 @@ class MainActivity : AppCompatActivity() {
             // set before the node is up.
             applyClearnetRouting()
             val display = bootNode(target)
+            if (generation != startupGeneration) return@launch
             // Load the dashboard even if boot reported a problem: the node
             // serves its own loading/error wrapper on loopback, which is more
             // useful than a blank page and lets the user retry.
             currentDisplay = display ?: target
-            // From here the next page-stop is a real page, so let it drop the
-            // splash (about:blank already came and went).
-            nodePageRequested = true
             if (node.state() == NodeState.FAILED) {
                 // Nothing is listening: waiting for the port only added ~15s
                 // of spinner. Show what went wrong and offer a retry.
-                currentTab.session.loadUri(errorPage(node.lastError()))
+                showStartupError(node.lastError() ?: "The built-in node did not start.")
+                loadStartupPage(currentTab.session, errorPage(node.lastError()))
                 return@launch
             }
             // Don't hand GeckoView the URL until loopback actually accepts
@@ -1138,10 +1304,15 @@ class MainActivity : AppCompatActivity() {
             // connection renders as a silent blank page. The node binds
             // before start() returns, so this passes immediately - it guards
             // anything else that delays the bind.
-            if (awaitUiPort()) {
-                currentTab.session.loadUri(nodeUrl(currentDisplay))
+            updateSplash(SplashStage.CONNECTING)
+            val ready = awaitUiPort()
+            if (generation != startupGeneration) return@launch
+            if (ready) {
+                updateSplash(SplashStage.OPENING)
+                loadStartupPage(currentTab.session, nodeUrl(currentDisplay))
             } else {
-                currentTab.session.loadUri(errorPage(null))
+                showStartupError("The local browser connection did not become ready.")
+                loadStartupPage(currentTab.session, errorPage(null))
             }
         }
     }

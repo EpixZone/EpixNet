@@ -736,6 +736,19 @@ pub fn aliased_origin(xite_ref: &str) -> String {
     }
 }
 
+/// An untrusted path segment may become an origin only when it names a
+/// supported xite. Decoded URL delimiters must never enter the authority.
+fn cross_xite_origin(xite_ref: &str) -> Option<String> {
+    let normalized = xite_ref.to_ascii_lowercase();
+    if epix_core::classify_label(&normalized) == epix_core::LabelClass::Address {
+        return Some(aliased_origin(&normalized));
+    }
+    if address_alias(&normalized).is_some() {
+        return Some(normalized);
+    }
+    state::xite_domain_name(&normalized).filter(|name| name == &normalized)
+}
+
 /// Rewrite a transparent-proxy request into the path form the router uses.
 /// Marks a request whose path was prefixed by [`rewrite_proxy_host`]. Lets the
 /// wrapper tell a rewritten `GET /` (serve it) apart from a URL that LITERALLY
@@ -1111,9 +1124,16 @@ async fn serve_wrapper(
     State(ctx): State<Ctx>,
     Path(requested): Path<String>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    render_wrapper(ctx, requested, "index.html".to_string(), raw_query, headers).await
+    render_wrapper(ctx, requested, "index.html".to_string(), wrapper_request_path(&uri), raw_query, headers).await
+}
+
+/// The raw document path after its routing address. Axum's `Path` has already
+/// decoded escapes; redirects must retain these bytes and explicit index files.
+fn wrapper_request_path(uri: &axum::http::Uri) -> String {
+    uri.path().splitn(3, '/').nth(2).unwrap_or_default().to_string()
 }
 
 /// The inner file a wrapper request points its iframe at, for a `/:address/path`
@@ -1143,6 +1163,7 @@ async fn render_wrapper(
     ctx: Ctx,
     requested: String,
     inner_path: String,
+    requested_path: String,
     raw_query: Option<String>,
     headers: axum::http::HeaderMap,
 ) -> Response {
@@ -1164,14 +1185,14 @@ async fn render_wrapper(
     // Loopback (path) serving is untouched - the mobile shells and the node's
     // own UI address xites by path on one origin.
     if is_proxy_host(&host) && !headers.contains_key(PROXY_REWRITE_MARKER) {
-        // Keep the directory the document was asked for, not the implied
-        // index.html; keep the query. Scheme-relative, so http/https carries.
-        // A bare address becomes its dotted alias, so the browser never
-        // navigates a single-label host.
-        let origin = aliased_origin(&requested);
-        let dir = inner_path.strip_suffix("index.html").unwrap_or(&inner_path);
+        // Keep the exact encoded document path and query. Scheme-relative,
+        // so http/https carries. A bare address becomes its dotted alias,
+        // so the browser never navigates a single-label host.
+        let Some(origin) = cross_xite_origin(&requested) else {
+            return (StatusCode::BAD_REQUEST, "invalid xite navigation target").into_response();
+        };
         let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
-        return Redirect::temporary(&format!("//{origin}/{dir}{query}")).into_response();
+        return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
     }
     let proxy_mode = host == requested;
 
@@ -1313,54 +1334,25 @@ async fn render_wrapper(
         )
             .into_response();
     }
-    let content = ctx.state.content(&address).await;
-    // Reverse xID: a xite reached by its bech32 address (bare, or the dotted
-    // `<addr>.epix` alias) whose content.json claims a `.epix` domain is sent
-    // to that domain, so the address bar shows `talk.epix` instead of
-    // `epix1talk…`, like DNS resolving a name for a link you clicked. The claim
-    // is only trusted after the chain confirms the claimed name resolves BACK
-    // to this exact address (via the XidResolver Merkle-proof path), so a xite
-    // cannot hijack another's name. Only the top-level document redirects; a
-    // failed/absent verification serves the address unchanged (fail closed).
-    // Host (proxy) mode goes to the domain's origin; path mode (the mobile
-    // shells and the loopback UI address xites by path) goes to the domain's
-    // path on the same origin - the shells' address bars then show the name
-    // via their friendly-URL mapping. Temporary redirect, so a changed xID
-    // record takes effect on the next visit. The verified name is cache-hit
-    // on repeat loads.
-    let address_form = (requested.starts_with("epix1") && !requested.contains('.'))
+    // Reverse lookup is independent of address discovery, including before
+    // content.json arrives. Only a verified name-to-this-address binding may
+    // change the visible origin; saved display metadata is not proof.
+    let address_form = epix_core::classify_label(&requested) == epix_core::LabelClass::Address
         || address_alias(&requested).is_some();
     if address_form {
-        if let Some(domain) = content
-            .as_ref()
-            .and_then(|c| c.get("domain"))
-            .and_then(|v| v.as_str())
-            .map(|d| d.trim().to_lowercase())
-            .filter(|d| d.ends_with(".epix"))
-        {
-            // Local state only: a chain lookup here would hold every
-            // address-form page load for an RPC timeout when the network is
-            // down. An unverified (saved) mapping is enough to show the name;
-            // the address serves unchanged when nothing local maps it.
-            if ctx.state.canonical_key(&domain).await == address {
-                // Keep the directory the document asked for and its query; the
-                // implied index.html is dropped. Scheme-relative in host mode,
-                // so https carries.
-                let dir = inner_path.strip_suffix("index.html").unwrap_or(&inner_path);
-                let query = raw_query
-                    .as_deref()
-                    .filter(|q| !q.is_empty())
-                    .map(|q| format!("?{q}"))
-                    .unwrap_or_default();
-                let target = if proxy_mode {
-                    format!("//{domain}/{dir}{query}")
-                } else {
-                    format!("/{domain}/{dir}{query}")
-                };
-                return Redirect::temporary(&target).into_response();
-            }
+        ctx.state.request_xite_domain(&address).await;
+        if let Some(domain) = ctx.state.verified_xite_domain(&address).await {
+            let query = raw_query.as_deref().filter(|q| !q.is_empty())
+                .map(|q| format!("?{q}")).unwrap_or_default();
+            let target = if proxy_mode {
+                format!("//{domain}/{requested_path}{query}")
+            } else {
+                format!("/{domain}/{requested_path}{query}")
+            };
+            return Redirect::temporary(&target).into_response();
         }
     }
+    let content = ctx.state.content(&address).await;
     let title = content
         .as_ref()
         .and_then(|c| c.get("title"))
@@ -1928,7 +1920,7 @@ fn render_restarting_page(theme: &str) -> String {
     page_shell("Restarting", "Restarting EpixNet", "", body, "", theme)
 }
 
-/// Percent-encode a string for use as a query-parameter value.
+/// Percent-encode a query-parameter value or one URL path segment.
 fn url_encode(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -2442,9 +2434,11 @@ async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) ->
 
 /// Render the file browser for a xite directory.
 fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &str) -> String {
-    let esc = |s: &str| {
-        s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;").replace('"', "&quot;")
-    };
+    let esc = attr_escape;
+    // Escape URL segments independently so literal '#', '%', quotes and
+    // non-ASCII filenames survive navigation without becoming markup.
+    let url_path = |path: &str| path.split('/').map(url_encode).collect::<Vec<_>>().join("/");
+    let url_address = url_encode(address);
     let human = |n: u64| {
         if n >= 1 << 20 {
             format!("{:.1} MB", n as f64 / (1 << 20) as f64)
@@ -2460,8 +2454,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         let parent = inner.rsplit_once('/').map(|(p, _)| p).unwrap_or("");
         rows.push_str(&format!(
             "<div class='row'><a class='name dir' href='/list/{address}/{parent}'>../</a></div>",
-            address = esc(address),
-            parent = esc(parent),
+            address = url_address,
+            parent = url_path(parent),
         ));
     }
     for e in entries {
@@ -2471,8 +2465,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         if is_dir {
             rows.push_str(&format!(
                 "<div class='row'><a class='name dir' href='/list/{address}/{child}'>{name}/</a></div>",
-                address = esc(address),
-                child = esc(&child),
+                address = url_address,
+                child = url_path(&child),
                 name = esc(name),
             ));
         } else {
@@ -2480,8 +2474,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
             rows.push_str(&format!(
                 "<div class='row'><a class='name' href='/{address}/{child}'>{name}</a>\
                  <span class='size'>{size}</span></div>",
-                address = esc(address),
-                child = esc(&child),
+                address = url_address,
+                child = url_path(&child),
                 name = esc(name),
             ));
         }
@@ -2492,7 +2486,7 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         format!("Files: {}", esc(address))
     } else {
         let mut heading =
-            format!("Files: <a href='/list/{a}'>{a}</a>", a = esc(address));
+            format!("Files: <a href='/list/{url_address}'>{}</a>", esc(address));
         let segs: Vec<&str> = inner.split('/').filter(|s| !s.is_empty()).collect();
         let mut prefix = String::new();
         for (i, seg) in segs.iter().enumerate() {
@@ -2505,8 +2499,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
             } else {
                 heading.push_str(&format!(
                     "/<a href='/list/{}/{}'>{}</a>",
-                    esc(address),
-                    esc(&prefix),
+                    url_address,
+                    url_path(&prefix),
                     esc(seg),
                 ));
             }
@@ -2792,6 +2786,7 @@ async fn serve_file(
     Path((address, mut path)): Path<(String, String)>,
     Query(q): Query<FileQuery>,
     axum::extract::RawQuery(raw_query): axum::extract::RawQuery,
+    uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Response {
     // A top-level navigation to a directory or HTML page (no wrapper_nonce)
@@ -2811,7 +2806,7 @@ async fn serve_file(
                 .map(strip_wrapper_nonce)
                 .filter(|s| !s.is_empty())
                 .map(String::from);
-            return render_wrapper(ctx, address, inner, outer_query, headers).await;
+            return render_wrapper(ctx, address, inner, wrapper_request_path(&uri), outer_query, headers).await;
         }
     }
     // Release a one-time wrapper nonce if the inner frame passed one (tracks

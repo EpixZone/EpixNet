@@ -2545,9 +2545,14 @@ dependencies = [
  "epix-i2p",
  "epix-node",
  "epix-ui",
+ "gtk",
  "image",
  "include_dir",
  "muda",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
+ "objc2-quartz-core",
  "reqwest",
  "serde_json",
  "sha2 0.11.0",
@@ -2556,6 +2561,7 @@ dependencies = [
  "tokio",
  "tower",
  "tray-icon",
+ "uuid",
  "windows-sys 0.61.2",
  "winreg",
  "winresource",
@@ -2790,6 +2796,7 @@ dependencies = [
  "epix-core",
  "epix-node",
  "epix-ui",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tower",
@@ -2856,6 +2863,8 @@ name = "epix-node"
 version = "0.3.0"
 dependencies = [
  "async-trait",
+ "base64 0.23.1",
+ "ed25519-dalek 3.0.0",
  "epix-blob",
  "epix-bt",
  "epix-chain",
@@ -2870,7 +2879,9 @@ dependencies = [
  "epix-worker",
  "epix-xite",
  "fslock-guard",
+ "hex",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "tokio",
  "tracing-subscriber 0.3.23",
@@ -5517,6 +5528,7 @@ dependencies = [
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
+ "objc2-quartz-core",
 ]
 
 [[package]]
