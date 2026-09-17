@@ -1,7 +1,59 @@
 # Release validation record
 
-Local work on 2026-09-16. Source remains uncommitted across EpixNet, epix-wallet
-and EpixSites-Xite. Local artifacts are QA builds, not approved store candidates.
+Local work on 2026-09-16. EpixNet source is committed in
+[PR #490](https://github.com/EpixZone/EpixNet/pull/490), and wallet
+[PR #18](https://github.com/EpixZone/epix-wallet/pull/18) is merged and published.
+The artifacts below are packaging candidates, not approved for store submission.
+Epix Sites publication and the remaining device/operational checks are still open.
+
+## Published wallet and exact package builds
+
+- EpixNet built source: `829c6536e29f4fb18f52bdef46acc415afbcc956`, clean at build
+  time. Later documentation-only commits do not change this recorded revision.
+- Wallet source: `c31832e1aabd89ee29691951ac673cfe961a3f1a`, immutable release
+  [`wallet-c31832e1aabd`](https://github.com/EpixZone/epix-wallet/releases/tag/wallet-c31832e1aabd).
+  Release workflow [35167624281](https://github.com/EpixZone/epix-wallet/actions/runs/35167624281)
+  passed. The SHA-256 matches GitHub's asset digest:
+  `30d2c66ef1e0f9c49322f117f0a1a82c43b12a0634a0c6b9fb662370c6fe0fdc`.
+  Build metadata confirms clean source, provider protocol 1, the live TechSonix
+  terms/privacy URLs and analytics disabled. The release wallet guard passes.
+- The wallet's final Sonar fix uses a raw Windows Git path. Its quality gate
+  passes with zero new issues and zero security hotspots; all PR checks passed.
+- Local artifact directory: `dist/mobile/0.5.11-829c653/` (ignored by Git).
+  `release-manifest.json` records versions, hashes, provenance and limitations;
+  `ios-unsigned-archive-files.json` records every archive file's hash.
+
+| Artifact | Result |
+| --- | --- |
+| `EpixNet-0.5.11-5011.apk` | Signed with the existing Android release key; 401,468,554 bytes; SHA-256 `22a138e1e6c85abb8d59d8a1591e3725d2cdea8ec1686a2767c7548e19a338d6` |
+| `EpixNet-0.5.11-5011.aab` | Signed with the existing Android release key; 225,364,291 bytes; SHA-256 `b70efbc4a1010917d488a73e2dbcfba1aea5a9a1ce5dbfe653b67a355f35af35` |
+| `EpixNet-unsigned.xcarchive` | Release archive succeeds; iOS 0.5.11 build 1, `zone.epix.EpixNet`; package scan passes; unsigned and not installable/uploadable as supplied |
+
+Android is `zone.epix.app`, version 0.5.11 / code 5011, arm64-v8a, target SDK 36.
+Both packages contain 17 native libraries passing the 16 KB checks; APK native
+entries are ZIP-aligned. `apksigner`, `jarsigner` and official bundletool 1.18.3
+validation pass. The certificate SHA-256 is
+`a756664ccbb4ff4f4168e27ea56e62f4dac045103d4e89c0e7118007df0c5326`.
+Java reports the Android certificate as self-signed without a timestamp, and
+reports a JarInputStream manifest warning because of ZIP entry order; JarFile
+signature verification and bundletool structural validation pass.
+
+All 108 published wallet files were checked inside each Android package and the
+iOS archive. Android's manifest differs only by the required `geckoViewAddons`
+permission; the remaining files match byte-for-byte. All iOS wallet files match.
+The iOS archive has one native executable, no external non-system library links,
+the required permission text and privacy resources, and no BitTorrent feature.
+
+The signed iOS archive attempt failed: Xcode found no development provisioning
+profile for `zone.epix.EpixNet` and reported no registered team devices. The only
+installed signing identity is a macOS Developer ID certificate. The owner is
+configuring iOS signing; an Apple Distribution certificate and App Store profile
+can be used for distribution. The unsigned archive verifies compilation and
+packaging only. No IPA, TestFlight upload or Play upload has been produced.
+Confirm that the proposed build numbers are unused in the store records.
+
+## Earlier interactive QA
+
 The isolated Android QA emulator was shut down and its generated data/cache
 removed after testing; the pre-existing user emulator was left alone.
 
@@ -71,7 +123,7 @@ cargo test -p epix-browser-net --locked
 python3 shells/ios/tests/run-regressions.py
 python3 scripts/check-mobile-wallet.py shells/wallet-ext
 python3 scripts/check-ios-package.py /path/to/EpixNet.app
-# Required for a submission candidate; expected to fail on the current local wallet:
+# Required for a submission candidate; passes with the current published pin:
 python3 scripts/check-mobile-wallet.py shells/wallet-ext --release
 python3 scripts/check-android-native.py --require libepix_ffi.so \
   --require libepix_snowflake.so \
@@ -88,9 +140,9 @@ Sites: `node --test tests/store-safety.test.cjs` in the EpixSites-Xite repositor
 
 ## Still required for the exact candidate
 
-- Rebuild every package after final source and wallet pin changes. Record source
-  revisions, artifact hashes, versions, signing identity and successful checks. Local Android QA hashes and
-  artifact limitations are recorded in `.store-build/android-qa-artifacts.json`.
+- Review the committed source and rebuild if application code or the wallet pin
+  changes. The exact current package hashes and versions are recorded above.
+  Earlier Android QA hashes and limitations remain in `.store-build/android-qa-artifacts.json`.
 - Simulator package scan confirms no developer-machine library paths and all
   four current required-reason categories are bundled. Unsigned device compile also passes. Finish
   device archive/privacy/signing validation and test installation on a physical device.
@@ -102,17 +154,16 @@ Sites: `node --test tests/store-safety.test.cjs` in the EpixSites-Xite repositor
   rights/payment assessments, TestFlight and Play internal/pre-launch reports.
 - Capture screenshots from the exact final builds, not the development simulator.
 
-The signed Android AAB generated earlier in this session predates later shared
-proxy changes and uses the previously pinned wallet. Keep it as a packaging-test
-artifact only. A release gate now correctly prevents rebuilding it as a store
-candidate until the new wallet is published and pinned.
+The earlier Android QA AAB predates the shared proxy changes and uses the older
+wallet. It is superseded by the exact packages above. The release gate now passes
+with the published wallet pin; this does not waive the remaining submission work.
 
-## Final local build outcomes
+## Historical Debug build outcomes
 
 Both simulator and generic-device Debug builds passed after the iPad orientation
 metadata fix. The device build is unsigned. Both packages pass
 `check-ios-package.py`; their wallet bundles match the latest local QA output.
-The Android `validateStoreWallet` task fails as intended on the old published
-wallet (missing new provider/provenance metadata). The local iOS wallet release
-check fails as intended for modified source and missing policy URLs. These are
-explicit release blockers, not ignored test failures.
+At that stage, Android `validateStoreWallet` failed as intended on the old
+published wallet, and the iOS wallet release check rejected modified source and
+missing policy URLs. Publishing and pinning the new wallet resolved those
+specific blockers; both current Release builds pass the wallet guard.

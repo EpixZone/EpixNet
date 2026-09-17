@@ -1,6 +1,6 @@
 # Mobile submission package
 
-Updated 2026-09-16. **Engineering fixes and QA artifacts are prepared; release gates remain open. Do not submit the current artifacts.**
+Updated 2026-09-16. **The wallet is published and pinned; signed Android packages and an unsigned iOS Release archive are built. Release gates remain open. Do not submit the current artifacts.**
 Apple and Google organization enrollment is confirmed by the owner. No store
 forms have been submitted. The owner has signed and published the dashboard
 changes; the iPad simulator node has downloaded the updated files.
@@ -43,9 +43,12 @@ changes; the iPad simulator node has downloaded the updated files.
    noindex and are omitted from company navigation, and HTTP redirects to HTTPS.
    Wallet CI now has the published terms/privacy URLs and store-build mode.
    Confirm the contact inbox and actual operational practices before submission.
-2. Commit/review/publish the wallet changes, then update EpixNet's wallet
-   revision and SHA-256 to that immutable release. Local QA uses an explicitly
-   uncommitted wallet build; it is not a release pin.
+2. Wallet [PR #18](https://github.com/EpixZone/epix-wallet/pull/18) is merged and
+   its immutable `wallet-c31832e1aabd` release is published and pinned, with live
+   policy URLs and analytics disabled. Signed Android APK/AAB packages and an
+   unsigned iOS Release archive were built from `829c6536e29f4fb18f52bdef46acc415afbcc956`.
+   Review [EpixNet PR #490](https://github.com/EpixZone/EpixNet/pull/490) and
+   finish iOS distribution signing. See the validation record for artifact hashes.
 3. Publish signed Epix Sites changes through its normal signing workflow.
    Validate reporting, blocking, filtering and private complaints across all
    promoted social xites; designate the people operating those controls.
