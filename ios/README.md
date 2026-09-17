@@ -2,12 +2,13 @@
 
 The EpixNet node as a native iOS app: the whole Rust node (peer network,
 DHT, Tor, chain resolver, UI server) compiles into the app via the
-`epix-ffi` crate, and a SwiftUI shell points a WKWebView at the node's
-local UI (`http://127.0.0.1:43210`). One process, no external server.
+`epix-ffi` crate, and a UIKit shell displays xites in WKWebView at separate HTTPS `.epix` origins
+through a loopback TLS proxy. The wallet uses a restricted loopback document.
+One process, no external server.
 
 ## Requirements
 
-- Xcode 15 or newer, with the active developer directory pointing at
+- Xcode 26 or newer for current store submissions, with the active developer directory pointing at
   Xcode (not the Command Line Tools):
 
       sudo xcode-select --switch /Applications/Xcode.app/Contents/Developer
@@ -17,6 +18,11 @@ local UI (`http://127.0.0.1:43210`). One process, no external server.
       rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 
 ## Build and run
+
+Stage a wallet build containing `mobileProvider.bundle.js` and
+`epix-mobile-build.json` in `shells/wallet-ext` (see the wallet source repository
+and [submission package](../docs/store-submission/README.md)). Debug accepts a
+local build; Release requires the pinned immutable source and real policy URLs.
 
 Open `ios/EpixNet.xcodeproj` in Xcode, pick a simulator, press Run.
 
@@ -56,6 +62,8 @@ machine.
 - Foreground-only: iOS suspends the process shortly after backgrounding,
   so the node syncs and seeds only while the app is open. Background
   refresh tasks are future work.
-- Tor is off by default in the shell (`torMode: "disable"`); flip to
-  `enable`/`always` in `EpixNet/App.swift` to route through Arti.
+- Tor is enabled by the active UIKit shell; clearnet routing defaults on and
+  is user-configurable. The legacy SwiftUI sample is not the app entry point.
+- Full wallet signing, permission-denial and physical-device QA remain release
+  gates; simulator onboarding alone does not establish those flows.
 - Device (non-simulator) builds need a signing team configured in Xcode.

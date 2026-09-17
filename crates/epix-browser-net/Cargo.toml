@@ -1,0 +1,20 @@
+[package]
+name = "epix-browser-net"
+version = "0.1.0"
+edition = "2021"
+description = "Per-install TLS origins for embedded Epix browsers"
+
+[dependencies]
+rcgen = "0.14"
+rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = "0.26"
+base64 = "0.23"
+time = "0.3"
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "service"] }
+tower = { version = "0.5", features = ["util"] }
+axum = "0.8"
+tokio = { version = "1", features = ["net", "io-util", "rt", "macros", "time"] }
+
+[dev-dependencies]
+tempfile = "3"

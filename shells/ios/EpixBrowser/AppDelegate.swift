@@ -1,4 +1,5 @@
 import Network
+import Security
 import UIKit
 import WebKit
 // The node API (EpixNode, NodeConfig, TorStatus, NodeState) comes from the
@@ -17,12 +18,8 @@ import WebKit
 /// through Tor) and opens the Epix panel - current xite, Tor status, our onion
 /// address - when tapped.
 ///
-/// KNOWN SPIKE (Phase 8b #1): custom-scheme pages in WKWebView are NOT secure
-/// contexts (no service workers, no crypto.subtle). This scaffold loads the
-/// loopback `http://127.0.0.1` origin directly, which sidesteps the custom
-/// scheme but exposes the port. The three escapes to evaluate - the
-/// com.apple.developer.web-browser entitlement, iOS 17 proxyConfigurations, or
-/// accepting degraded xites - are tracked in PLAN.md (Workstream C correction).
+/// Each xite has its own HTTPS origin through an in-process loopback proxy.
+/// The per-install CA is trusted only for `.epix` within these browser views.
 @main
 class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     WKScriptMessageHandler
@@ -86,10 +83,20 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// from `uiUrl()` after boot (the simulator shares the Mac's loopback, so
     /// the app may fall back to an ephemeral port there).
     var nodeBase = "http://127.0.0.1:42222"
+    var browserProxy: BrowserProxy?
     /// The wallet sheet (the forked Keplr web app served by the node).
     var walletVC: UIViewController?
     var walletWebView: WKWebView?
-    let walletUIDelegate = WalletUIDelegate()
+    lazy var walletUIDelegate: WalletUIDelegate = {
+        let delegate = WalletUIDelegate()
+        delegate.allowsCamera = { [weak self] web, frame in
+            guard let self, web === self.walletWebView else { return false }
+            return self.isWalletFrame(frame)
+        }
+        return delegate
+    }()
+    var dappRequest: (id: UUID, reply: (Any?, String?) -> Void)?
+
 
     // The node's local Tor SOCKS listener (epix-node boot: 43111).
     static let socksPort: UInt16 = 43111
@@ -380,6 +387,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         // 503 on a cold seek as a fatal asset error with no retry.
         config.allowsInlineMediaPlayback = true
         config.mediaTypesRequiringUserActionForPlayback = []
+        if configuration == nil,
+            let path = Bundle.main.path(forResource: "mobileProvider.bundle", ofType: "js", inDirectory: "wallet-ext"),
+            let provider = try? String(contentsOfFile: path, encoding: .utf8)
+        {
+            config.userContentController.addScriptMessageHandler(self, contentWorld: .page, name: "epixDapp")
+            config.userContentController.addUserScript(WKUserScript(
+                source: provider, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        }
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = self
         web.uiDelegate = self
@@ -413,6 +428,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// Put tab `index` on screen and sync the chrome to it.
     func showTab(_ index: Int) {
         guard tabs.indices.contains(index), let container = webContainer else { return }
+        if index != currentTabIndex { cancelDappRequest("Request cancelled: browser tab changed") }
         currentTabIndex = index
         setChromeHidden(false)
         let web = tabs[index].webView
@@ -429,6 +445,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// Close tab `index`. The browser always keeps at least one tab.
     func closeTab(_ index: Int) {
         guard tabs.indices.contains(index) else { return }
+        if index == currentTabIndex { cancelDappRequest("Request cancelled: browser tab closed") }
         if tabs.count == 1 {
             // Last tab: reuse it for a fresh dashboard rather than going blank.
             currentDisplay = "dashboard.epix"
@@ -603,7 +620,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                     target: target.components(separatedBy: "/")[0],
                     uiAddr: uiAddr,
                     torMode: "enable",
-                    version: "0.1.0"
+                    version: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
                 )
             }
             do {
@@ -625,6 +642,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                     self.nodeBase = "http://\(host):\(port)"
                 }
                 DispatchQueue.main.async {
+                    self.browserProxy = self.node.browserProxy()
+                    self.applyClearnetRouting()
                     self.stopStartupPolling()
                     self.setStartupProgress(
                         title: "Opening Epix Browser", detail: "Waiting for your first page to appear.",
@@ -766,6 +785,33 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         }
     }
 
+    func applicationWillResignActive(_ application: UIApplication) {
+        // Keep wallet balances/seed screens out of the app-switcher snapshot.
+        if let view = walletVC?.view {
+            let cover = UIView(frame: view.bounds)
+            cover.backgroundColor = Self.chromeBg
+            cover.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+            cover.tag = 73491
+            view.addSubview(cover)
+        }
+    }
+
+    func applicationDidBecomeActive(_ application: UIApplication) {
+        walletVC?.view.viewWithTag(73491)?.removeFromSuperview()
+    }
+
+    func applicationDidEnterBackground(_ application: UIApplication) {
+        // The mobile wallet background lives in its document. Destroy it when
+        // backgrounded so decrypted keys and unfinished approvals don't linger.
+        cancelDappRequest("Wallet locked because EpixNet moved to the background")
+        walletVC?.dismiss(animated: false)
+        walletVC = nil
+        walletWebView?.removeFromSuperview()
+        walletWebView?.configuration.userContentController.removeAllScriptMessageHandlers()
+        walletWebView?.stopLoading()
+        walletWebView = nil
+    }
+
     // MARK: - The Epix Wallet sheet
 
     /// Open the wallet: the forked Keplr web app, served by the embedded node
@@ -784,7 +830,55 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             return
         }
 
+        let web = walletWebView ?? makeWalletWebView(url: url)
+        web.removeFromSuperview()
+
+        let vc = UIViewController()
+        vc.view.backgroundColor = Self.chromeBg
+
+        // A slim header with an explicit close control (parity with the
+        // Android sheet): the sheet covers the browser, and the pull-down
+        // gesture alone is not discoverable.
+        let title = UILabel()
+        title.text = "Epix Wallet"
+        title.textColor = Self.fieldText
+        title.font = .systemFont(ofSize: 15, weight: .semibold)
+        title.translatesAutoresizingMaskIntoConstraints = false
+        let close = UIButton(type: .system)
+        close.setTitle("✕", for: .normal)
+        close.setTitleColor(Self.fieldText, for: .normal)
+        close.titleLabel?.font = .systemFont(ofSize: 17)
+        close.accessibilityLabel = "Close wallet"
+        close.addTarget(self, action: #selector(dismissWallet), for: .touchUpInside)
+        close.translatesAutoresizingMaskIntoConstraints = false
+
+        vc.view.addSubview(title)
+        vc.view.addSubview(close)
+        vc.view.addSubview(web)
+        let safe = vc.view.safeAreaLayoutGuide
+        NSLayoutConstraint.activate([
+            title.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
+            title.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor, constant: 16),
+            close.centerYAnchor.constraint(equalTo: title.centerYAnchor),
+            close.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -16),
+            close.widthAnchor.constraint(equalToConstant: 44),
+            close.heightAnchor.constraint(equalToConstant: 36),
+            web.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
+            web.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor),
+            web.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor),
+            web.bottomAnchor.constraint(equalTo: vc.view.bottomAnchor),
+        ])
+
+        vc.modalPresentationStyle = .pageSheet
+        vc.presentationController?.delegate = self
+        walletVC = vc
+        window?.rootViewController?.present(vc, animated: true)
+    }
+
+    private func makeWalletWebView(url: URL) -> WKWebView {
         let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        config.userContentController.add(self, name: "epixDappUI")
         // The wallet page's shim bridges native-host commands (Tor/I2P
         // status, the clearnet toggle), persistent storage (the keyring
         // vault - WKWebView's localStorage is unreliable), and close
@@ -837,7 +931,9 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         // still shows the first time).
         config.allowsInlineMediaPlayback = true
         let web = WKWebView(frame: .zero, configuration: config)
+        #if DEBUG
         if #available(iOS 16.4, *) { web.isInspectable = true }
+        #endif
         web.uiDelegate = walletUIDelegate
         web.translatesAutoresizingMaskIntoConstraints = false
         // Dark behind the wallet page until its inline splash paints; the
@@ -846,54 +942,18 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         web.backgroundColor = Self.chromeBg
         web.scrollView.backgroundColor = Self.chromeBg
         walletWebView = web
-
-        let vc = UIViewController()
-        vc.view.backgroundColor = Self.chromeBg
-
-        // A slim header with an explicit close control (parity with the
-        // Android sheet): the sheet covers the browser, and the pull-down
-        // gesture alone is not discoverable.
-        let title = UILabel()
-        title.text = "Epix Wallet"
-        title.textColor = Self.fieldText
-        title.font = .systemFont(ofSize: 15, weight: .semibold)
-        title.translatesAutoresizingMaskIntoConstraints = false
-        let close = UIButton(type: .system)
-        close.setTitle("✕", for: .normal)
-        close.setTitleColor(Self.fieldText, for: .normal)
-        close.titleLabel?.font = .systemFont(ofSize: 17)
-        close.accessibilityLabel = "Close wallet"
-        close.addTarget(self, action: #selector(dismissWallet), for: .touchUpInside)
-        close.translatesAutoresizingMaskIntoConstraints = false
-
-        vc.view.addSubview(title)
-        vc.view.addSubview(close)
-        vc.view.addSubview(web)
-        let safe = vc.view.safeAreaLayoutGuide
-        NSLayoutConstraint.activate([
-            title.topAnchor.constraint(equalTo: safe.topAnchor, constant: 10),
-            title.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor, constant: 16),
-            close.centerYAnchor.constraint(equalTo: title.centerYAnchor),
-            close.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor, constant: -16),
-            close.widthAnchor.constraint(equalToConstant: 44),
-            close.heightAnchor.constraint(equalToConstant: 36),
-            web.topAnchor.constraint(equalTo: title.bottomAnchor, constant: 8),
-            web.leadingAnchor.constraint(equalTo: vc.view.leadingAnchor),
-            web.trailingAnchor.constraint(equalTo: vc.view.trailingAnchor),
-            web.bottomAnchor.constraint(equalTo: vc.view.bottomAnchor),
-        ])
-
-        vc.modalPresentationStyle = .pageSheet
-        vc.presentationController?.delegate = nil
-        walletVC = vc
-        window?.rootViewController?.present(vc, animated: true)
+        applyClearnetRouting()
+        web.navigationDelegate = self
         web.load(URLRequest(url: url))
+        return web
+
     }
 
     @objc private func dismissWallet() {
+        walletWebView?.evaluateJavaScript("window.dispatchEvent(new Event('epix-wallet-closed'))")
+        cancelDappRequest("Request rejected: wallet closed")
         walletVC?.dismiss(animated: true)
         walletVC = nil
-        walletWebView = nil
     }
 
     /// The wallet shim's native bridge: `epixNmh` carries the desktop native
@@ -908,6 +968,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         // visible to subframes too. Only the wallet document may access its
         // vault and native settings, including after a sheet is replaced.
         guard acceptsWalletMessage(message) else { return }
+        if message.name == "epixDappUI" {
+            if walletVC == nil { showWallet() }
+            return
+        }
         if message.name == "epixClose" {
             dismissWallet()
             return
@@ -1045,30 +1109,34 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     /// localStorage comes back null in this shell and the keyring vault must
     /// survive, so it is kept in a JSON file in the app's Application Support
     /// directory. Loaded once, written through on every set.
-    private var walletStore: [String: String] = {
-        guard
-            let url = try? FileManager.default.url(
-                for: .applicationSupportDirectory, in: .userDomainMask,
-                appropriateFor: nil, create: true
-            ).appendingPathComponent("wallet-store.json"),
-            let data = try? Data(contentsOf: url),
-            let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: String]
-        else { return [:] }
-        return obj
+    private var walletStoreError: String?
+    private lazy var walletStore: [String: String] = {
+        do {
+            let url = try walletStoreURL()
+            guard FileManager.default.fileExists(atPath: url.path) else { return [:] }
+            let data = try Data(contentsOf: url)
+            guard let values = try JSONSerialization.jsonObject(with: data) as? [String: String]
+            else { throw CocoaError(.fileReadCorruptFile) }
+            try FileManager.default.setAttributes([.protectionKey: FileProtectionType.complete], ofItemAtPath: url.path)
+            return values
+        } catch {
+            // Refuse to overwrite an unreadable vault with an empty wallet.
+            walletStoreError = "Wallet storage could not be opened. Unlock the device and retry. Your saved wallet has been kept."
+            return [:]
+        }
     }()
 
-    private func walletStoreURL() -> URL? {
-        try? FileManager.default.url(
+    private func walletStoreURL() throws -> URL {
+        try FileManager.default.url(
             for: .applicationSupportDirectory, in: .userDomainMask,
             appropriateFor: nil, create: true
         ).appendingPathComponent("wallet-store.json")
     }
 
-    private func persistWalletStore() {
-        guard let url = walletStoreURL(),
-            let data = try? JSONSerialization.data(withJSONObject: walletStore)
-        else { return }
-        try? data.write(to: url, options: .atomic)
+    private func persistWalletStore(_ next: [String: String]) throws {
+        let url = try walletStoreURL()
+        let data = try JSONSerialization.data(withJSONObject: next)
+        try data.write(to: url, options: [.atomic, .completeFileProtection])
     }
 
     /// One storage op from the shim (`{id, op:{cmd, key?, value?}}`). Values
@@ -1081,7 +1149,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             let id = obj["id"] as? Int,
             let op = obj["op"] as? [String: Any]
         else { return }
+        _ = walletStore // Load and validate before checking a cached read error.
+        if let error = walletStoreError {
+            replyStore(id: id, result: NSNull(), error: error, to: message)
+            return
+        }
         let cmd = op["cmd"] as? String ?? ""
+        var next = walletStore
+        var changed = false
         var result: Any = NSNull()
         switch cmd {
         case "get":
@@ -1090,23 +1165,32 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             }
         case "set":
             if let key = op["key"] as? String, let value = op["value"] as? String {
-                walletStore[key] = value
-                persistWalletStore()
+                next[key] = value
+                changed = true
             }
         case "remove":
             if let key = op["key"] as? String {
-                walletStore.removeValue(forKey: key)
-                persistWalletStore()
+                next.removeValue(forKey: key)
+                changed = true
             }
         case "keys":
             result = Array(walletStore.keys)
         default:
             break
         }
+        if changed {
+            do {
+                try persistWalletStore(next)
+                walletStore = next
+            } catch {
+                replyStore(id: id, result: NSNull(), error: "Wallet could not be saved. Check available storage and unlock the device, then retry.", to: message)
+                return
+            }
+        }
         replyStore(id: id, result: result, to: message)
     }
 
-    private func replyStore(id: Int, result: Any, to message: WKScriptMessage) {
+    private func replyStore(id: Int, result: Any, error: String? = nil, to message: WKScriptMessage) {
         // A JSON string, a JSON array (keys), or null - all valid JS literals
         // for __epixStoreReply's second argument.
         let json: String
@@ -1125,9 +1209,11 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         } else {
             json = "null"
         }
+        let errorJSON = error.flatMap { try? JSONSerialization.data(withJSONObject: [$0]) }
+            .flatMap { String(data: $0, encoding: .utf8) }.map { String($0.dropFirst().dropLast()) } ?? "null"
         DispatchQueue.main.async {
             guard self.acceptsWalletMessage(message), let web = message.webView else { return }
-            web.evaluateJavaScript("window.__epixStoreReply(\(id), \(json))")
+            web.evaluateJavaScript("window.__epixStoreReply(\(id), \(json), \(errorJSON))")
         }
     }
 
@@ -1145,26 +1231,29 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         torBadge?.backgroundColor = on ? Self.torRouted : Self.torReady
     }
 
-    /// Point the web view's proxy at the node's Tor SOCKS listener (or clear
-    /// it). When on, clearnet requests go through Tor; the node's own loopback
-    /// - the UI and every `.epix` page served from 127.0.0.1 - is excluded, so
-    /// xites keep loading directly. This is the runtime equivalent of the
-    /// desktop launcher's file PAC. iOS 17+ only (WKWebsiteDataStore proxy).
+    /// Separate TLS origins for xites; optionally route ordinary web traffic
+    /// through Tor. Neither route falls back to a direct network connection.
     private func applyClearnetRouting() {
         guard #available(iOS 17.0, *) else { return }
-        for tab in tabs {
-            let store = tab.webView.configuration.websiteDataStore
-            if torClearnet {
-                let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.socksPort)!)
-                var config = ProxyConfiguration(socksv5Proxy: endpoint)
-                // Never proxy the node's own loopback: the UI and .epix pages load
-                // from 127.0.0.1 and Tor would refuse a private address anyway.
-                config.excludedDomains = ["127.0.0.1", "localhost"]
-                store.proxyConfigurations = [config]
-            } else {
-                store.proxyConfigurations = []
-            }
+        var proxies: [ProxyConfiguration] = []
+        if let proxy = browserProxy {
+            let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: proxy.port)!)
+            var local = ProxyConfiguration(httpCONNECTProxy: endpoint)
+            local.matchDomains = ["epix"]
+            local.allowFailover = false
+            proxies.append(local)
         }
+        if torClearnet {
+            let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.socksPort)!)
+            var tor = ProxyConfiguration(socksv5Proxy: endpoint)
+            tor.excludedDomains = ["epix", "127.0.0.1", "localhost"]
+            tor.allowFailover = false
+            proxies.append(tor)
+        }
+        for tab in tabs {
+            tab.webView.configuration.websiteDataStore.proxyConfigurations = proxies
+        }
+        walletWebView?.configuration.websiteDataStore.proxyConfigurations = proxies
     }
 
     private func load(display: String) {
@@ -1460,7 +1549,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     private func targetFrom(_ url: URL) -> String? {
         guard url.scheme?.lowercased() == "epix", let rewritten = xiteRewrite(url)
         else { return nil }
-        return String(rewritten.absoluteString.dropFirst("\(nodeBase)/".count))
+        return String(rewritten.absoluteString.dropFirst("https://".count))
     }
 }
 
@@ -1469,12 +1558,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 /// splash is idempotent, so extra navigations are harmless. Also intercepts
 /// navigations only EpixNet can resolve and reroutes them to the local node.
 extension AppDelegate: WKNavigationDelegate {
-    /// The loopback path-form URL for a link only EpixNet resolves: an
-    /// `epix://` link, a `https://….epix` host, or a bare `epix1…` address
-    /// host. The desktop Epix Browser follows these through its PAC; here the
-    /// node serves the same xite in path form off loopback, so rewrite
-    /// `https://talk.epix/some/page` to `http://127.0.0.1:…/talk.epix/some/page`.
-    /// Nil for ordinary URLs.
+    /// Normalize links to the xite's distinct HTTPS origin. The local proxy
+    /// serves these hosts; arbitrary websites retain ordinary system trust.
     func xiteRewrite(_ url: URL) -> URL? {
         let scheme = url.scheme?.lowercased() ?? ""
         var host: String?
@@ -1490,13 +1575,17 @@ extension AppDelegate: WKNavigationDelegate {
                 host = h
             }
         }
-        guard let host, !host.isEmpty else { return nil }
+        guard var host = host?.lowercased(), !host.isEmpty,
+            url.user == nil, url.password == nil, url.port == nil,
+            host.range(of: "^[a-z0-9]+[a-z0-9.-]*$", options: .regularExpression) != nil
+        else { return nil }
+        if !host.hasSuffix(".epix") { host += ".epix" }
         let comps = URLComponents(url: url, resolvingAgainstBaseURL: false)
         var path = comps?.percentEncodedPath ?? "/"
         if path.isEmpty { path = "/" }
         let query = (comps?.percentEncodedQuery).map { "?\($0)" } ?? ""
         let fragment = (comps?.percentEncodedFragment).map { "#\($0)" } ?? ""
-        return URL(string: "\(nodeBase)/\(host)\(path)\(query)\(fragment)")
+        return URL(string: "https://\(host)\(path)\(query)\(fragment)")
     }
 
     func webView(
@@ -1504,6 +1593,31 @@ extension AppDelegate: WKNavigationDelegate {
         decidePolicyFor navigationAction: WKNavigationAction,
         decisionHandler: @escaping (WKNavigationActionPolicy) -> Void
     ) {
+        if webView === walletWebView, let url = navigationAction.request.url {
+            let base = URLComponents(string: nodeBase)
+            let page = URLComponents(url: url, resolvingAgainstBaseURL: false)
+            let allowed = page?.scheme == base?.scheme && page?.host == base?.host
+                && page?.port == base?.port
+                && ["/EpixWallet/mobile.html", "/EpixWallet/mobile-register.html"].contains(page?.path ?? "")
+            if !allowed {
+                decisionHandler(.cancel)
+                if ["https", "http", "epix"].contains(url.scheme ?? "") {
+                    makeTab().webView.load(URLRequest(url: xiteRewrite(url) ?? url))
+                }
+                return
+            }
+            if let old = webView.url, walletDocumentURL(old) != walletDocumentURL(url) {
+                cancelDappRequest("Wallet page changed; finish setup and connect again")
+            }
+            decisionHandler(.allow)
+            return
+        }
+        if webView === currentTab?.webView,
+            navigationAction.targetFrame?.isMainFrame == true,
+            let old = webView.url, let next = navigationAction.request.url,
+            walletDocumentURL(old) != walletDocumentURL(next) {
+            cancelDappRequest("Request cancelled: browser page changed")
+        }
         // The error page's "Try again": boot the node again in-process.
         if navigationAction.request.url?.absoluteString == Self.retryUrl {
             decisionHandler(.cancel)
@@ -1515,7 +1629,7 @@ extension AppDelegate: WKNavigationDelegate {
             resetConfigAndRetry()
             return
         }
-        if let url = navigationAction.request.url, let rewritten = xiteRewrite(url) {
+        if let url = navigationAction.request.url, let rewritten = xiteRewrite(url), rewritten != url {
             decisionHandler(.cancel)
             // Load top-level even when the click came from the wrapper's
             // content iframe: another xite is a page change.
@@ -1523,6 +1637,45 @@ extension AppDelegate: WKNavigationDelegate {
             return
         }
         decisionHandler(.allow)
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        let space = challenge.protectionSpace
+        guard space.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+            space.host.lowercased().hasSuffix(".epix")
+        else { completionHandler(.performDefaultHandling, nil); return }
+        guard tabs.contains(where: { $0.webView === webView }),
+            let der = browserProxy?.caDer,
+            let ca = SecCertificateCreateWithData(nil, Data(der) as CFData),
+            let trust = space.serverTrust
+        else {
+            completionHandler(.cancelAuthenticationChallenge, nil); return
+        }
+        // Evaluate a separate trust object. Mutating WebKit's challenge trust
+        // changes the credential it passes back to the networking process.
+        var localTrust: SecTrust?
+        guard let chain = SecTrustCopyCertificateChain(trust),
+            SecTrustCreateWithCertificates(chain, SecPolicyCreateSSL(true, space.host as CFString), &localTrust) == errSecSuccess,
+            let localTrust
+        else { completionHandler(.cancelAuthenticationChallenge, nil); return }
+        SecTrustSetAnchorCertificates(localTrust, [ca] as CFArray)
+        SecTrustSetAnchorCertificatesOnly(localTrust, true)
+        // This is a private CA; do not send its certificate/hosts to network
+        // revocation responders or fetch any other certificates.
+        SecTrustSetNetworkFetchAllowed(localTrust, false)
+        var trustError: CFError?
+        if SecTrustEvaluateWithError(localTrust, &trustError) {
+            completionHandler(.useCredential, URLCredential(trust: trust))
+        } else {
+            #if DEBUG
+            NSLog("Local xite TLS validation failed: %@", String(describing: trustError))
+            #endif
+            completionHandler(.cancelAuthenticationChallenge, nil)
+        }
     }
 
     /// The splash comes down only once a page we asked for has settled: the
@@ -1547,6 +1700,7 @@ extension AppDelegate: WKNavigationDelegate {
         _ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
+        if (error as NSError).code == NSURLErrorCancelled { return }
         // A request to the node that never connected renders as nothing in
         // WKWebView. Show the shell's page with a retry instead of a blank
         // view (Android has the same fallback after its port wait).
@@ -1555,6 +1709,25 @@ extension AppDelegate: WKNavigationDelegate {
             nodePageRequested = true
             showError(node.lastError() ?? "The node is not answering on \(nodeBase).")
             return
+        }
+        if webView !== walletWebView {
+            func escape(_ text: String) -> String {
+                text.replacingOccurrences(of: "&", with: "&amp;")
+                    .replacingOccurrences(of: "<", with: "&lt;")
+                    .replacingOccurrences(of: ">", with: "&gt;")
+                    .replacingOccurrences(of: "\"", with: "&quot;")
+            }
+            let target = URL(string: failed)
+            let retry = ["https", "http"].contains(target?.scheme ?? "")
+                ? "<p><a href=\"\(escape(failed))\">Try again</a></p>" : ""
+            let html = """
+                <meta name="viewport" content="width=device-width,initial-scale=1">
+                <body style="background:#0b0e14;color:#cbd5e1;font:17px -apple-system;padding:36px">
+                <h2>Page could not load</h2><p>\(escape(error.localizedDescription))</p>
+                \(retry)<p>You can also enter another address above.</p></body>
+                """
+            webView.loadHTMLString(html, baseURL: nil)
+            nodePageRequested = true
         }
         pageSettled()
     }
@@ -1596,6 +1769,7 @@ extension AppDelegate: WKUIDelegate {
 /// on the node's loopback origin; everything else is denied. The OS-level
 /// camera prompt (NSCameraUsageDescription) still shows once per install.
 final class WalletUIDelegate: NSObject, WKUIDelegate {
+    var allowsCamera: ((WKWebView, WKFrameInfo) -> Bool)?
     @available(iOS 15.0, *)
     func webView(
         _ webView: WKWebView,
@@ -1604,7 +1778,91 @@ final class WalletUIDelegate: NSObject, WKUIDelegate {
         type: WKMediaCaptureType,
         decisionHandler: @escaping (WKPermissionDecision) -> Void
     ) {
-        let isLoopback = origin.host == "127.0.0.1" || origin.host == "localhost"
-        decisionHandler(type == .camera && isLoopback ? .grant : .deny)
+        decisionHandler(type == .camera && allowsCamera?(webView, frame) == true ? .prompt : .deny)
+    }
+}
+
+extension AppDelegate: WKScriptMessageHandlerWithReply, UIAdaptivePresentationControllerDelegate {
+    /// WebKit's security origin identifies the caller. Paths and values in
+    /// JavaScript messages never establish wallet identity. Restrict iframes
+    /// to the visible tab's origin so embedded third parties cannot ask.
+    func dappOrigin(_ message: WKScriptMessage) -> String? {
+        guard let web = message.webView, web === currentTab?.webView,
+            let top = web.url, let frameURL = message.frameInfo.request.url,
+            top.scheme == "https", frameURL.scheme == "https",
+            let host = frameURL.host?.lowercased(), host == top.host?.lowercased(),
+            !["localhost", "127.0.0.1", "::1"].contains(host),
+            (frameURL.port ?? 443) == (top.port ?? 443),
+            message.frameInfo.securityOrigin.protocol == "https",
+            message.frameInfo.securityOrigin.host.lowercased() == host,
+            (message.frameInfo.securityOrigin.port == 0 ? 443 : message.frameInfo.securityOrigin.port) == (frameURL.port ?? 443)
+        else { return nil }
+        return "https://\(host)" + (frameURL.port.map { $0 == 443 ? "" : ":\($0)" } ?? "")
+    }
+
+    func cancelDappRequest(_ reason: String) {
+        let request = dappRequest
+        dappRequest = nil
+        if request != nil {
+            walletWebView?.evaluateJavaScript("window.dispatchEvent(new Event('epix-wallet-closed'))")
+        }
+        request?.reply(nil, reason)
+    }
+
+    func userContentController(
+        _ userContentController: WKUserContentController,
+        didReceive message: WKScriptMessage,
+        replyHandler: @escaping (Any?, String?) -> Void
+    ) {
+        guard message.name == "epixDapp", node.state() == .serving,
+            let origin = dappOrigin(message),
+            var payload = message.body as? [String: Any],
+            payload["port"] as? String == "background",
+            var body = payload["msg"] as? [String: Any],
+            let bytes = try? JSONSerialization.data(withJSONObject: payload), bytes.count <= 262144
+        else { replyHandler(nil, "Wallet request from this document is not allowed"); return }
+        guard dappRequest == nil else {
+            replyHandler(nil, "Another wallet request is pending"); return
+        }
+        guard let url = URL(string: "\(nodeBase)/EpixWallet/mobile.html") else {
+            replyHandler(nil, "Wallet is unavailable"); return
+        }
+        // Ignore page-supplied origin, extension identity and router metadata.
+        body["origin"] = origin
+        body["routerMeta"] = [:]
+        payload["msg"] = body
+        let wallet = walletWebView ?? makeWalletWebView(url: url)
+        let id = UUID()
+        dappRequest = (id, replyHandler)
+        let script = """
+            for (let i = 0; i < 100 && !window.__epixMobileBackgroundReady; i++) {
+                await new Promise(resolve => setTimeout(resolve, 100));
+            }
+            if (!window.__epixMobileBackgroundReady || !window.__epixDappReceive) {
+                throw new Error('Open Epix Wallet and finish setup before connecting');
+            }
+            return await window.__epixDappReceive(payload, {url: origin + '/'});
+            """
+        wallet.callAsyncJavaScript(script, arguments: ["payload": payload, "origin": origin],
+                                  in: nil, in: .page) { [weak self] result in
+            guard let self, self.dappRequest?.id == id else { return }
+            self.dappRequest = nil
+            guard self.dappOrigin(message) == origin else {
+                replyHandler(nil, "The requesting tab changed"); return
+            }
+            switch result {
+            case .success(let response): replyHandler(response, nil)
+            case .failure: replyHandler(nil, "Wallet request failed. Open Epix Wallet, finish setup or unlock, then try again.")
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 180) { [weak self] in
+            guard let self, self.dappRequest?.id == id else { return }
+            self.walletWebView?.evaluateJavaScript("window.dispatchEvent(new Event('epix-wallet-closed'))")
+            self.cancelDappRequest("Wallet request expired")
+        }
+    }
+
+    func presentationControllerDidDismiss(_ presentationController: UIPresentationController) {
+        if presentationController.presentedViewController === walletVC { dismissWallet() }
     }
 }

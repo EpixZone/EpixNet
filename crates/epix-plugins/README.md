@@ -18,7 +18,7 @@ UI is already local to the device.
 | UiFileManager | `epix-ui` `/list` route | always on |
 | AnnounceLocal | `epix-runtime` UDP LAN discovery | `local-discovery` (off on mobile) |
 | AnnounceShare | `epix-ui` state (`shared_trackers`) | always on |
-| AnnounceBitTorrent | `epix-discovery` (`announce_bittorrent`) | always on |
+| AnnounceBitTorrent | `epix-discovery` (`announce_bittorrent`) | `bittorrent` (desktop/Android; excluded on iOS) |
 | NoNewSites | `epix-ui` dispatch gate (`no_new_sites`) | always on |
 | UiPassword | `epix-ui` login gate + `/Login` `/Logout` | `ui-password` (off on mobile) |
 | Multiuser | `epix-ui` identity store + user commands | `multiuser` (off on mobile) |

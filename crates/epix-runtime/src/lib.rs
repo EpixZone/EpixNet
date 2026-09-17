@@ -504,6 +504,7 @@ async fn announce_loop(
         while passes.join_next().await.is_some() {}
         // AnnounceBitTorrent: also announce to any configured HTTP(S) BT
         // trackers and fold their peers in.
+        #[cfg(feature = "bittorrent")]
         if let Some(bt) = state.config_get("bt_trackers").await.and_then(|v| v.as_array().cloned()) {
             for url in bt.iter().filter_map(|v| v.as_str()) {
                 for address in state.xite_addresses().await {

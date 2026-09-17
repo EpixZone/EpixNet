@@ -11,6 +11,14 @@ set -euo pipefail
 
 cd "$(dirname "$0")/.." # repo root
 
+# Debug can use a local source build. Release must use the immutable wallet
+# revision and real legal-page configuration before it can become a candidate.
+if [ "${CONFIGURATION:-Debug}" = "Release" ]; then
+  python3 scripts/check-mobile-wallet.py shells/wallet-ext --release
+else
+  python3 scripts/check-mobile-wallet.py shells/wallet-ext
+fi
+
 PLATFORM="${PLATFORM_NAME:-iphonesimulator}"
 case "$PLATFORM" in
   iphonesimulator) TRIPLE=aarch64-apple-ios-sim ;;
@@ -35,12 +43,13 @@ rustup target add "$TRIPLE" >/dev/null 2>&1 || true
 # Release: debug builds of the deep async stacks (Tor, reqwest) overflow
 # thread stacks on iOS.
 #
-# Explicit feature list (matches epix-ffi's default, but stated so the App
-# Store guarantee is legible and can't drift): the iOS binary is built WITHOUT
-# the `bittorrent` feature, so it contains no BitTorrent code (App Store
-# 5.2.3). Magnet-referenced media plays from HTTPS web seeds instead. Do NOT
+# Explicit feature list (matches epix-ffi's default plus bridges, so the iOS
+# release restriction is legible and can't drift): the iOS binary is built
+# WITHOUT the `bittorrent` feature (media engine AND tracker discovery).
+# This alone does not establish App Store compliance: content rights still
+# apply, including when magnet-referenced media uses HTTPS web seeds. Do NOT
 # add `bittorrent` here - the Android build (docs/install/android.md) is where
-# it belongs. CI's "Assert no BitTorrent in the iOS profile" step enforces this.
+# it belongs. CI checks both the engine dependency and discovery features.
 #
 # `mesh` and `local-discovery` are included: they are the only transports that
 # work with no internet, and both are config-gated off, so the shipped app
@@ -48,7 +57,7 @@ rustup target add "$TRIPLE" >/dev/null 2>&1 || true
 # needs NSLocalNetworkUsageDescription in Info.plist or iOS silently drops the
 # broadcasts.
 cargo build -p epix-ffi --release --target "$TRIPLE" \
-  --no-default-features --features tor,i2p-embedded,bridges,mesh,local-discovery
+  --locked --no-default-features --features tor,i2p-embedded,bridges,mesh,local-discovery
 
 # Swift bindings, generated from the metadata baked into the built library.
 cargo run -q -p epix-ffi --features cli --bin uniffi-bindgen -- \

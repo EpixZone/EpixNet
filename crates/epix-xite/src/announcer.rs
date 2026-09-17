@@ -78,7 +78,19 @@ async fn ask_tracker(
         Tracker::Epix(addr) => discover_via_epix_tracker(sender, addr, params)
             .await
             .map_err(|e| e.to_string()),
-        Tracker::Bt(url) => epix_discovery::announce_bittorrent(url, xite_address, port).await,
+        Tracker::Bt(url) => {
+            #[cfg(feature = "bittorrent")]
+            {
+                epix_discovery::announce_bittorrent(url, xite_address, port).await
+            }
+            #[cfg(not(feature = "bittorrent"))]
+            {
+                // Imported configs and xite manifests may still contain BT
+                // URLs. A build without BT must never contact those trackers.
+                let _ = (url, xite_address, port);
+                Err("BitTorrent tracker discovery is not available in this build".into())
+            }
+        }
     }
 }
 
@@ -198,6 +210,92 @@ mod tests {
 
     fn one_tracker() -> Vec<Tracker> {
         vec![Tracker::Epix(PeerAddr::parse("1.2.3.4:26959").unwrap())]
+    }
+
+    #[cfg(not(feature = "bittorrent"))]
+    #[tokio::test]
+    async fn disabled_bittorrent_rejects_configured_trackers_without_network_access() {
+        use std::time::Duration;
+        use tokio::net::{TcpListener, UdpSocket};
+        use tokio::time::timeout;
+
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let udp = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let trackers = vec![
+            Tracker::Bt(format!("http://{}/announce", http.local_addr().unwrap())),
+            Tracker::Bt(format!("udp://{}/announce", udp.local_addr().unwrap())),
+        ];
+        for tracker in &trackers {
+            let err = timeout(
+                Duration::from_secs(1),
+                announce(
+                    &Dead,
+                    "epix1xyz",
+                    std::slice::from_ref(tracker),
+                    &SelfAdvert::default(),
+                ),
+            )
+            .await
+            .expect("unsupported trackers must fail without waiting for the network")
+            .unwrap_err();
+            assert!(err.contains("not available in this build"));
+        }
+        assert!(timeout(Duration::from_millis(20), http.accept())
+            .await
+            .is_err());
+        let mut packet = [0; 128];
+        assert!(
+            timeout(Duration::from_millis(20), udp.recv_from(&mut packet))
+                .await
+                .is_err()
+        );
+
+        // A leftover BT URL must not prevent ordinary Epix discovery.
+        let mut mixed = trackers;
+        mixed.extend(one_tracker());
+        let peers = announce(
+            &Answering(vec![vec![1, 2, 3, 4, 0x67, 0x2B]]),
+            "epix1xyz",
+            &mixed,
+            &SelfAdvert::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(peers, vec![PeerAddr::parse("1.2.3.4:11111").unwrap()]);
+    }
+
+    #[cfg(feature = "bittorrent")]
+    #[tokio::test]
+    async fn enabled_bittorrent_still_announces_to_http_trackers() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+        use tokio::time::timeout;
+
+        let http = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let tracker = Tracker::Bt(format!("http://{}/announce", http.local_addr().unwrap()));
+        timeout(Duration::from_secs(5), async {
+            let respond = async {
+                let (mut stream, _) = http.accept().await.unwrap();
+                let mut request = Vec::new();
+                while !request.ends_with(b"\r\n\r\n") {
+                    request.push(stream.read_u8().await.unwrap());
+                    assert!(request.len() < 8192);
+                }
+                let request = String::from_utf8(request).unwrap();
+                assert!(request.starts_with("GET /announce?info_hash="));
+                assert!(request.contains("&port=26552&"));
+                stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 11\r\nConnection: close\r\n\r\nd5:peers0:e").await.unwrap();
+            };
+            let advert = SelfAdvert { port: 26552, ..Default::default() };
+            let (result, ()) = tokio::join!(
+                announce(&Dead, "epix1xyz", std::slice::from_ref(&tracker), &advert),
+                respond,
+            );
+            assert!(result.unwrap().is_empty());
+        })
+        .await
+        .expect("local tracker announce timed out");
     }
 
     /// The distinction the whole health scoring rests on: a tracker that

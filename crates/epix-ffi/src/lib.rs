@@ -9,6 +9,7 @@
 //! The bindings are generated at mobile-build time by `uniffi-bindgen` from
 //! this crate's exported types (proc-macro mode - no UDL).
 
+use epix_browser_net::{ca::LocalCa, proxy};
 use epix_node::{boot_with_progress, AppState, NodeOptions, RunningNode};
 extern "C" { #[link_name = "dup2"] fn libc_dup2(oldfd: i32, newfd: i32) -> i32; }
 use std::sync::{
@@ -96,6 +97,15 @@ struct Inner {
     ui_addr: Option<std::net::SocketAddr>,
     /// The display name (`dashboard.epix` or the raw address) the node opened.
     display: Option<String>,
+    browser_proxy: Option<BrowserProxy>,
+}
+
+/// Loopback TLS proxy and public trust anchor. Only the in-app browser trusts
+/// this certificate; it is never installed in the device trust store.
+#[derive(uniffi::Record, Clone)]
+pub struct BrowserProxy {
+    pub port: u16,
+    pub ca_der: Vec<u8>,
 }
 
 /// The embedded Epix node. One per app; `start()` boots it on its own runtime.
@@ -136,6 +146,7 @@ impl EpixNode {
                 error: None,
                 ui_addr: None,
                 display: None,
+                browser_proxy: None,
             }),
         })
     }
@@ -163,12 +174,12 @@ impl EpixNode {
         // native-stderr.log. The file must stay open for the process
         // lifetime - stderr writes through it from here on - so ownership of
         // the descriptor is released instead of letting drop close it.
-        unsafe { std::env::set_var("EPIX_TRACE_CLONE", "1") };
         let log_dir = std::path::PathBuf::from(&config.data_dir);
         if let Ok(file) = std::fs::File::create(log_dir.join("native-stderr.log")) {
             use std::os::unix::io::IntoRawFd;
             unsafe { libc_dup2(file.into_raw_fd(), 2) };
         }
+        let ca_dir = log_dir.join("browser-ca");
         let opts = NodeOptions {
             data_root: config.data_dir.into(),
             target: config.target,
@@ -183,21 +194,33 @@ impl EpixNode {
         // Boot synchronously so the shell knows the UI listener is already
         // owned before it points a web view at ui_url. Boot retains that
         // listener inside UiServer; the background task only starts accepting.
-        let booted: Result<RunningNode, String> = self.rt.block_on(async {
+        let booted: Result<(RunningNode, BrowserProxy), String> = self.rt.block_on(async {
             let (server, running) = boot_with_progress(opts, |stage| {
                 self.startup_stage
                     .store(StartupStage::from(stage) as u8 + 1, Ordering::Relaxed);
             })
             .await?;
             let ui_addr = running.ui_addr;
+            let ca = Arc::new(LocalCa::load_or_create(&ca_dir)?);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+                .await.map_err(|e| format!("browser proxy: {e}"))?;
+            let browser_proxy = BrowserProxy {
+                port: listener.local_addr().map_err(|e| e.to_string())?.port(),
+                ca_der: ca.cert_der().to_vec(),
+            };
+            let app = tower::ServiceExt::<axum::extract::Request>::map_request(
+                server.router(), epix_ui::rewrite_proxy_host);
+            tokio::spawn(proxy::serve(listener, app, ca,
+                Arc::new(std::sync::atomic::AtomicBool::new(true))));
             tokio::spawn(async move {
                 let _ = server.serve(ui_addr).await;
             });
-            Ok(running)
+            Ok((running, browser_proxy))
         });
         let mut inner = self.inner.lock().unwrap();
         match booted {
-            Ok(running) => {
+            Ok((running, browser_proxy)) => {
+                inner.browser_proxy = Some(browser_proxy);
                 inner.ui_addr = Some(running.ui_addr);
                 inner.display = Some(running.display.clone());
                 inner.node = Some(running.state);
@@ -250,6 +273,11 @@ impl EpixNode {
         let addr = inner.ui_addr?;
         let display = inner.display.as_deref()?;
         Some(format!("http://{addr}/{display}/"))
+    }
+
+    /// HTTPS proxy for distinct `.epix` origins, available after boot.
+    pub fn browser_proxy(&self) -> Option<BrowserProxy> {
+        self.inner.lock().unwrap().browser_proxy.clone()
     }
 
     /// Our onion address (no `.onion` suffix), once the onion service has

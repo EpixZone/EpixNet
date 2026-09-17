@@ -24,8 +24,9 @@ prebuilt artifact, so you do not need a wallet checkout to build them.
 - The wallet's CI builds the Firefox WebExtension on every push to `epix` and
   publishes it to a versioned `wallet-<rev>` GitHub release
   (`epix-wallet-firefox.zip`), one per commit.
-- `shells/wallet-ext.rev` pins which wallet commit to embed. Bumping it (a
-  one-line PR) is how EpixNet adopts a new wallet, keeping builds reproducible.
+- `shells/wallet-ext.rev` pins which wallet commit to embed and
+  `shells/wallet-ext.sha256` pins the published archive checksum. Updating both
+  in a PR is how EpixNet adopts a new wallet, keeping builds reproducible.
 - `shells/wallet-ext/` is the staging directory (gitignored except its
   README). `epix-browser`'s `build.rs` downloads the pinned release into it
   before compiling (skipped when the staged copy already matches the pin); the
@@ -132,7 +133,7 @@ end on macOS: Firefox loads `dashboard.epix` through the node's proxy.
 
 What works now (all verified on macOS):
 - **Secure origins**: the node serves `.epix` over real https via a per-install
-  local CA (`crates/epix-browser/src/ca.rs` + `proxy.rs`); xites are secure
+  local CA (`crates/epix-browser-net/src/ca.rs` + `proxy.rs`); xites are secure
   contexts, no warning.
 - **Epix Wallet + native host**: the staged wallet WebExtension provides live
   direct/Tor routing for general clearnet and the Tor/I2P controls, with a Rust
@@ -249,16 +250,13 @@ panel. The wallet runs as a served web app (`/EpixWallet/`) with the host app
 bridging its storage and native-host commands over `WKScriptMessageHandler`.
 `epix://` is registered via `CFBundleURLTypes` in `Info.plist`.
 
-**Not yet on iOS - the dApp provider.** The desktop and Android shells expose
-`window.keplr` / `window.ethereum` to browsed pages via the WebExtension; on
-iOS that needs the provider injected into the browsed page's WebView and
-bridged to the wallet's background (a separate WebView) through the host app,
-with approval UIs presented from the background. The wallet itself works (send,
-receive, stake); the browsed-page provider is the remaining iOS wallet work and
-needs on-device testing against a real dApp.
+**iOS dApp provider:** the browsed page gets a page-only provider bundle.
+Native WebKit checks authenticate its origin, port and visible tab, then forward
+external requests into the wallet's existing permission/interaction router.
+Wallet keys never enter the page. Onboarding/cancellation is verified locally;
+approval/signing/recovery still require signed-device QA before submission.
 
-**Open spike (Phase 8b #1):** custom-scheme pages in WKWebView are not secure
-contexts. This scaffold loads the loopback origin directly (sidesteps the custom
-scheme, exposes the port). The three escapes - the `com.apple.developer.web-browser`
-entitlement, iOS 17 `proxyConfigurations`, or accepting degraded xites - are in
-PLAN.md.
+**iOS secure origins:** iOS 17+ proxy configurations route `.epix` to the
+in-process TLS proxy. The app validates these connections against a per-install
+CA inside its browser views; it does not install a system root. Xites receive
+separate HTTPS origins instead of sharing the wallet's loopback origin.

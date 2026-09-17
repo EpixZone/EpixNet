@@ -15,14 +15,14 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
-mod ca;
+use epix_browser_net::ca;
 mod eepsite;
 mod browser_process;
 mod ext;
 #[cfg(windows)]
 mod icon;
 mod ipc;
-mod proxy;
+use epix_browser_net::proxy;
 mod shutdown;
 mod splash_view;
 mod startup;

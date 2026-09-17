@@ -18,6 +18,10 @@ required-features = ["cli"]
 epix-build = { path = "../epix-build" }
 
 [dependencies]
+epix-browser-net = { path = "../epix-browser-net" }
+epix-ui = { path = "../epix-ui", default-features = false }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }
 epix-core = { path = "../epix-core" }
 epix-node = { path = "../epix-node", default-features = false }
 uniffi = { version = "0.32", features = ["tokio"] }
@@ -61,9 +65,8 @@ bridges = ["epix-node/bridges"]
 i2p = ["epix-node/i2p"]
 i2p-embedded = ["i2p", "epix-node/i2p-embedded", "epix-node/i2p-autostart"]
 # BitTorrent bridge. Deliberately NOT in `default`: the Android build script
-# opts in (`--features tor,i2p-embedded,bittorrent`), the iOS build script
-# never does, so the iOS staticlib is BT-free by construction (App Store
-# 5.2.3). CI builds the iOS profile and fails if a BT symbol appears.
+# opts in; the iOS build script never does, excluding both the media engine
+# and tracker clients under our iOS release policy. CI checks both boundaries.
 bittorrent = ["epix-node/bittorrent"]
 # Generate the `uniffi-bindgen` CLI entry point (used by the mobile build
 # scripts to emit Kotlin/Swift). Kept behind a feature so the library builds

@@ -2541,6 +2541,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "base64 0.23.1",
+ "epix-browser-net",
  "epix-build",
  "epix-i2p",
  "epix-node",
@@ -2555,15 +2556,12 @@ dependencies = [
  "objc2-app-kit",
  "objc2-foundation",
  "objc2-quartz-core",
- "rcgen",
  "reqwest",
- "rustls",
  "serde_json",
  "sha2 0.11.0",
  "tao",
  "tempfile",
  "tokio",
- "tokio-rustls",
  "tower",
  "tray-icon",
  "uuid",
@@ -2571,6 +2569,23 @@ dependencies = [
  "winreg",
  "winresource",
  "zip 8.6.0",
+]
+
+[[package]]
+name = "epix-browser-net"
+version = "0.1.0"
+dependencies = [
+ "axum",
+ "base64 0.23.1",
+ "hyper",
+ "hyper-util",
+ "rcgen",
+ "rustls",
+ "tempfile",
+ "time",
+ "tokio",
+ "tokio-rustls",
+ "tower",
 ]
 
 [[package]]
@@ -2778,12 +2793,16 @@ dependencies = [
 name = "epix-ffi"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "epix-browser-net",
  "epix-build",
  "epix-core",
  "epix-node",
+ "epix-ui",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tower",
  "uniffi",
 ]
 
