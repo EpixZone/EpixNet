@@ -279,8 +279,19 @@ pub fn create_parent_directories_durable(parent: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Creation mode for served xite files: world-readable, owner-writable,
+/// further limited by the process umask.
+const PUBLIC_FILE_MODE: u32 = 0o644;
+/// Creation mode for node-private files: owner only.
+const PRIVATE_FILE_MODE: u32 = 0o600;
+
 #[cfg(unix)]
-fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomic_durable_beneath(
+    root: &Path,
+    inner_path: &str,
+    bytes: &[u8],
+    mode: u32,
+) -> std::io::Result<()> {
     use rustix::fs::{Mode, OFlags};
     use std::io::Write;
     use std::os::unix::fs::MetadataExt;
@@ -347,7 +358,7 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
             &directory,
             &temporary,
             OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::from_bits_truncate(0o600),
+            Mode::from_bits_truncate(mode as rustix::fs::RawMode),
         );
         let mut file = match opened {
             Ok(file) => std::fs::File::from(file),
@@ -429,7 +440,12 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
 }
 
 #[cfg(windows)]
-fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomic_durable_beneath(
+    root: &Path,
+    inner_path: &str,
+    bytes: &[u8],
+    _mode: u32,
+) -> std::io::Result<()> {
     use std::io::{Read, Write};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -610,7 +626,12 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
 }
 
 #[cfg(not(any(unix, windows)))]
-fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> std::io::Result<()> {
+fn write_atomic_durable_beneath(
+    root: &Path,
+    inner_path: &str,
+    bytes: &[u8],
+    _mode: u32,
+) -> std::io::Result<()> {
     use std::io::Write;
 
     let destination = root.join(inner_path);
@@ -850,9 +871,26 @@ impl XiteStorage {
     /// a crash, such as the anonymous channel outbox, use this seam; a
     /// transient rename failure is returned so the caller can retain and retry
     /// its durable source record.
+    ///
+    /// Xite content is public data, so the file is created with the ordinary
+    /// `0644` (less the umask): a reverse proxy or another local user in the
+    /// data dir's group can serve it straight from disk. The first durable
+    /// writer created every file `0600`, and a gateway whose nginx served the
+    /// landing xite from the node's data dir answered 403 after the xite's
+    /// next update. Node-private state goes through
+    /// [`Self::write_atomic_durable_private`] instead.
     pub fn write_atomic_durable(&self, inner_path: &str, bytes: &[u8]) -> Result<()> {
         self.path(inner_path)?;
-        write_atomic_durable_beneath(&self.root, inner_path, bytes).map_err(Error::Io)
+        write_atomic_durable_beneath(&self.root, inner_path, bytes, PUBLIC_FILE_MODE)
+            .map_err(Error::Io)
+    }
+
+    /// [`Self::write_atomic_durable`] for files only this node may read
+    /// (`private/` registries, journals, keys): created `0600`.
+    pub fn write_atomic_durable_private(&self, inner_path: &str, bytes: &[u8]) -> Result<()> {
+        self.path(inner_path)?;
+        write_atomic_durable_beneath(&self.root, inner_path, bytes, PRIVATE_FILE_MODE)
+            .map_err(Error::Io)
     }
 
     /// Delete a stored file, pruning any directories the removal left empty.
@@ -1180,5 +1218,31 @@ mod tests {
             s.list_files().unwrap().iter().all(|path| !path.contains(".tmp")),
             "the rename leaves no temporary shard"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod file_mode_tests {
+    use super::XiteStorage;
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn served_content_is_readable_by_others_and_private_state_is_not() {
+        let root = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(root.path());
+        storage.write_atomic_durable("index.html", b"<h1>hi</h1>").unwrap();
+        storage.write_atomic_durable("data/users/a/content.json", b"{}").unwrap();
+        storage.write_atomic_durable_private("xites.json", b"{}").unwrap();
+
+        // A reverse proxy in the data dir's group (or anyone, subject to the
+        // umask) can read what the node serves ...
+        assert_eq!(mode(&root.path().join("index.html")), 0o644);
+        assert_eq!(mode(&root.path().join("data/users/a/content.json")), 0o644);
+        // ... and nobody but the node reads its registries.
+        assert_eq!(mode(&root.path().join("xites.json")), 0o600);
     }
 }
