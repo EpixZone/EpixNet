@@ -64,6 +64,19 @@ cargo build --release -p epix-server
 
 The first build downloads a lot and can take several minutes, that is normal. It is finished when you see `Finished`.
 
+`-p epix-server` builds the node and nothing else, which is all this guide
+needs. Building the WHOLE workspace (`cargo build --release`, with no `-p`)
+also builds the Ledger hardware-wallet bridge, and that one talks to the device
+over HID, which on Linux goes through udev. For that you need the udev
+DEVELOPMENT package as well, and having `libudev.so.1` already on your system
+is not enough:
+
+```sh
+sudo apt install -y libudev-dev        # Debian or Ubuntu
+sudo dnf install -y systemd-devel      # Fedora
+sudo pacman -S --needed systemd-libs   # Arch
+```
+
 ## 5. Run it
 
 ```sh
@@ -200,7 +213,25 @@ Then visit **http://127.0.0.1:42222/** from a browser (use an SSH tunnel if the 
 
 ## The full desktop app (managed Firefox)
 
-On a machine with a screen, EpixNet can run inside a managed copy of Firefox that understands `.epix` names directly. Install Firefox with your package manager first, then:
+On a machine with a screen, EpixNet can run inside a managed copy of Firefox that understands `.epix` names directly. Install Firefox with your package manager first.
+
+This part draws a window and a tray icon, so unlike the node it needs the
+desktop development libraries. Install those too, or the build fails at the
+LINK step with a bare `unable to find library -lxdo`, which does not say what
+wants it:
+
+```sh
+# Debian or Ubuntu
+sudo apt install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+
+# Fedora
+sudo dnf install -y gtk3-devel libxdo-devel libayatana-appindicator-gtk3-devel
+
+# Arch
+sudo pacman -S --needed gtk3 xdotool libayatana-appindicator
+```
+
+Then:
 
 ```sh
 cargo run -p epix-browser
@@ -221,4 +252,14 @@ EpixNet keeps your sites, keys, and settings in:
 - **`cc` or `linker` not found:** step 1 did not finish. Re-run the install command for your distribution.
 - **`cargo: command not found`:** run `source "$HOME/.cargo/env"`, or open a new terminal.
 - **The build stops asking for a library:** install its development package (for example `sudo apt install -y zlib1g-dev`) and build again.
+- **`unable to find library -lxdo`:** you are building the desktop app, which
+  needs the desktop development libraries listed under "The full desktop app
+  (managed Firefox)" above. The node itself needs none of them.
+- **`Unable to find libudev` / `Package 'libudev' was not found`:** you are
+  building the whole workspace, which includes the `hidapi` crate behind the
+  Ledger bridge. It needs the udev DEVELOPMENT package: having `libudev.so.1`
+  is not enough, the build wants the headers and the `libudev.pc` file. Install
+  it as shown under step 4, or build just what you need instead, for example
+  `cargo build --release -p epix-server`, which does not depend on `hidapi` at
+  all.
 - **Port already in use:** EpixNet automatically tries `43110` if `42222` is taken. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server`.

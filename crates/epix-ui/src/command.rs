@@ -1813,6 +1813,11 @@ impl WsCommand for XidResolve {
     }
 }
 
+/// How many xID lookups may be in flight at once. Enough to turn a page's
+/// worth of names into roughly one round trip, without pointing a burst of
+/// sockets at the chain endpoint.
+pub(crate) const XID_RESOLVE_CONCURRENCY: usize = 8;
+
 /// `xidResolveBatch(addresses)` - resolve up to 50 addresses / dotted names
 /// in one call; returns `{key: result-or-null}`.
 struct XidResolveBatch;
@@ -1828,18 +1833,30 @@ impl WsCommand for XidResolveBatch {
             .or_else(|| p.get("addresses"))
             .and_then(|v| v.as_array())
             .ok_or("xidResolveBatch: addresses must be a list")?;
+        // Resolve CONCURRENTLY. This was a serial loop, so a page that asked
+        // for its feed's authors paid one full chain round trip after another
+        // - measured at about a second each, so twelve names took twelve
+        // seconds before anything rendered. `buffered` preserves the caller's
+        // order in the response; the cap keeps a 50-name request from opening
+        // 50 sockets to the chain at once.
+        use futures_util::StreamExt as _;
+        let keys: Vec<String> =
+            list.iter().take(50).filter_map(|v| v.as_str().map(str::to_string)).collect();
+        let resolved: Vec<(String, Value)> = futures_util::stream::iter(keys)
+            .map(|key| async move {
+                let info = if key.contains('.') {
+                    epix_chain::xid_identity::resolve_name(&key).await
+                } else {
+                    epix_chain::xid_identity::resolve_identity(&key).await
+                };
+                (key, info.map(|i| xid_info_value(&i)).unwrap_or(Value::Null))
+            })
+            .buffered(XID_RESOLVE_CONCURRENCY)
+            .collect()
+            .await;
         let mut out = serde_json::Map::new();
-        for v in list.iter().take(50) {
-            let Some(key) = v.as_str() else { continue };
-            let resolved = if key.contains('.') {
-                epix_chain::xid_identity::resolve_name(key).await
-            } else {
-                epix_chain::xid_identity::resolve_identity(key).await
-            };
-            out.insert(
-                key.to_string(),
-                resolved.map(|i| xid_info_value(&i)).unwrap_or(Value::Null),
-            );
+        for (key, value) in resolved {
+            out.insert(key, value);
         }
         Ok(Value::Object(out))
     }

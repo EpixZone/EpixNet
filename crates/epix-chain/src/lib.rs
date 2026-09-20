@@ -1830,7 +1830,7 @@ pub mod xid_signers {
 /// this is what stops xites from hammering the chain once per render.
 pub mod xid_identity {
     use super::DEFAULT_RPC_URL;
-    use std::collections::HashMap;
+    use std::collections::{HashMap, HashSet};
     use std::sync::RwLock;
     use std::time::{Duration, Instant};
 
@@ -1895,6 +1895,12 @@ pub mod xid_identity {
     }
 
     fn store(key: String, info: Option<XidInfo>, finality_binding: Option<(u64, String)>) {
+        // Write through to disk for the entries that may outlive this process.
+        if let (Some(resolved), Some(binding)) = (info.as_ref(), finality_binding.as_ref()) {
+            if durable_eligible(&key) {
+                durable_store(&key, resolved, binding);
+            }
+        }
         if let Ok(mut guard) = CACHE.write() {
             guard.get_or_insert_with(HashMap::new).insert(
                 key,
@@ -1907,8 +1913,178 @@ pub mod xid_identity {
         }
     }
 
-    /// Drop every cached identity lookup (see [`super::clear_xid_caches`]).
+    // ---- durable profile cache ------------------------------------------
+    //
+    // The in-memory TTLs above are deliberately short, which means every cold
+    // open re-asked the chain for data this node had already proven - one
+    // serial round trip per name, and a merger over a busy hub resolves every
+    // signer before its database is usable. `xid_signers` already persists
+    // finality-proven answers across restarts; profiles did not, so they paid
+    // the chain on every boot.
+    //
+    // Same trust rule as the signer cache: an entry is served only while the
+    // pinned checkpoint still covers the height it was proven at, so a restored
+    // answer carries the same lineage it was verified under. Nothing here can
+    // manufacture a positive that was never chain-proven.
+    //
+    // What is NOT persisted, on purpose:
+    //   * negatives - "no such name" must recover the moment one is registered
+    //   * `active?:` entries - that key is the revocation question, and
+    //     `name_has_active_identity` documents that callers gate authorization
+    //     on it. It stays chain-fresh on its 3 second TTL.
+    // So only display data (name, owner, avatar, bio) survives a restart.
+
+    static DURABLE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    static DURABLE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// One durable profile, plus the finality binding it was proven against.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct DurableEntry {
+        name: String,
+        tld: String,
+        owner: String,
+        active: bool,
+        revoked_at: u64,
+        revoked_at_time: u64,
+        avatar: String,
+        bio: String,
+        height: u64,
+        digest: String,
+    }
+
+    /// Set once at boot, before anything resolves. Unset = no durable cache
+    /// (tests, embedded uses), and every lookup behaves exactly as before.
+    pub fn set_durable_cache_path(path: std::path::PathBuf) {
+        let _ = DURABLE_PATH.set(path);
+    }
+
+    /// Whether a key may be written to disk. See the note above.
+    fn durable_eligible(key: &str) -> bool {
+        !key.starts_with("active?:")
+    }
+
+    fn durable_store(key: &str, info: &XidInfo, binding: &(u64, String)) {
+        let Some(path) = DURABLE_PATH.get() else { return };
+        let Ok(_guard) = DURABLE_LOCK.lock() else { return };
+        let mut map: HashMap<String, DurableEntry> = std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default();
+        map.insert(
+            key.to_string(),
+            DurableEntry {
+                name: info.name.clone(),
+                tld: info.tld.clone(),
+                owner: info.owner.clone(),
+                active: info.active,
+                revoked_at: info.revoked_at,
+                revoked_at_time: info.revoked_at_time,
+                avatar: info.avatar.clone(),
+                bio: info.bio.clone(),
+                height: binding.0,
+                digest: binding.1.clone(),
+            },
+        );
+        if let Ok(bytes) = serde_json::to_vec(&map) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    fn durable_cached(key: &str) -> Option<XidInfo> {
+        let path = DURABLE_PATH.get()?;
+        let _guard = DURABLE_LOCK.lock().ok()?;
+        let map: HashMap<String, DurableEntry> =
+            serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
+        let entry = map.get(key)?;
+        crate::finality_checkpoint_covers(entry.height).then(|| XidInfo {
+            name: entry.name.clone(),
+            tld: entry.tld.clone(),
+            owner: entry.owner.clone(),
+            active: entry.active,
+            revoked_at: entry.revoked_at,
+            revoked_at_time: entry.revoked_at_time,
+            avatar: entry.avatar.clone(),
+            bio: entry.bio.clone(),
+        })
+    }
+
+    /// Drop the durable entries for one address and the name it resolved to.
+    /// `forget` exists so the xID xite can poll a freshly linked identity into
+    /// view; without this the on-disk answer would keep serving the pre-link
+    /// state long after the in-memory one was dropped.
+    fn durable_forget(address: &str) {
+        let Some(path) = DURABLE_PATH.get() else { return };
+        let Ok(_guard) = DURABLE_LOCK.lock() else { return };
+        let Ok(bytes) = std::fs::read(path) else { return };
+        let Ok(mut map) = serde_json::from_slice::<HashMap<String, DurableEntry>>(&bytes) else {
+            return;
+        };
+        let fqdn = map.get(address).map(|e| format!("{}.{}", e.name, e.tld));
+        let mut changed = map.remove(address).is_some();
+        if let Some(fqdn) = fqdn {
+            changed |= map.remove(&fqdn).is_some();
+        }
+        if !changed {
+            return;
+        }
+        if let Ok(bytes) = serde_json::to_vec(&map) {
+            let tmp = path.with_extension("json.tmp");
+            if std::fs::write(&tmp, bytes).is_ok() {
+                let _ = std::fs::rename(&tmp, path);
+            }
+        }
+    }
+
+    /// Keys with a refresh already in flight. Twelve callers asking for the
+    /// same name at boot must produce ONE chain fetch, not twelve.
+    static REFRESHING: RwLock<Option<HashSet<String>>> = RwLock::new(None);
+
+    fn begin_refresh(key: &str) -> bool {
+        let Ok(mut guard) = REFRESHING.write() else { return false };
+        guard.get_or_insert_with(HashSet::new).insert(key.to_string())
+    }
+
+    fn end_refresh(key: &str) {
+        if let Ok(mut guard) = REFRESHING.write() {
+            if let Some(set) = guard.as_mut() {
+                set.remove(key);
+            }
+        }
+    }
+
+    /// Serve `info` from disk now and re-ask the chain off the critical path,
+    /// so the answer is fresh for the next caller without this one waiting.
+    /// A no-op outside a Tokio runtime, and deduplicated per key.
+    fn refresh_in_background(key: &str) {
+        let Ok(handle) = tokio::runtime::Handle::try_current() else { return };
+        if !begin_refresh(key) {
+            return;
+        }
+        let key = key.to_string();
+        handle.spawn(async move {
+            // Bypass every cache layer: this call exists to replace them.
+            let by_name = key.contains('.');
+            if by_name {
+                resolve_name_fresh(&key).await;
+            } else {
+                resolve_identity_fresh(&key).await;
+            }
+            end_refresh(&key);
+        });
+    }
+
+    /// Drop every cached identity lookup (see [`super::clear_xid_caches`]),
+    /// the durable file included - a trust change invalidates everything it
+    /// proved.
     pub fn clear() {
+        if let Some(path) = DURABLE_PATH.get() {
+            if let Ok(_guard) = DURABLE_LOCK.lock() {
+                let _ = std::fs::remove_file(path);
+            }
+        }
         if let Ok(mut guard) = CACHE.write() {
             *guard = None;
         }
@@ -1919,6 +2095,7 @@ pub mod xid_identity {
     /// this right after a linking transaction; unlike [`clear`] it touches
     /// nothing else.
     pub fn forget(address: &str) {
+        durable_forget(address);
         let Ok(mut guard) = CACHE.write() else { return };
         let Some(map) = guard.as_mut() else { return };
         let fqdn = map
@@ -1937,6 +2114,16 @@ pub mod xid_identity {
         if let Some(hit) = cached(address) {
             return hit;
         }
+        // As in `resolve_name`: serve the proven answer, refresh behind.
+        if let Some(info) = durable_cached(address) {
+            refresh_in_background(address);
+            return Some(info);
+        }
+        resolve_identity_fresh(address).await
+    }
+
+    /// [`resolve_identity`] with every cache layer bypassed.
+    async fn resolve_identity_fresh(address: &str) -> Option<XidInfo> {
         // Refuse to egress over clearnet before Tor is ready in Always mode
         // (returns without caching, so the next call retries once Tor is up).
         if super::chain_egress_ok().is_err() {
@@ -1994,6 +2181,20 @@ pub mod xid_identity {
         if let Some(hit) = cached(fqdn) {
             return hit;
         }
+        // Proven earlier and still covered by the pinned checkpoint: answer
+        // from disk at once and re-ask the chain behind the caller, so a cold
+        // open renders immediately instead of waiting on a round trip per name.
+        if let Some(info) = durable_cached(fqdn) {
+            refresh_in_background(fqdn);
+            return Some(info);
+        }
+        resolve_name_fresh(fqdn).await
+    }
+
+    /// [`resolve_name`] with every cache layer bypassed - what the background
+    /// refresh runs, and the fall-through when nothing is cached.
+    async fn resolve_name_fresh(fqdn: &str) -> Option<XidInfo> {
+        let (name, tld) = fqdn.rsplit_once('.')?;
         let (domain, binding) = match super::shared_resolver()
             .resolve_fresh_bound(name, tld)
             .await
@@ -2095,6 +2296,20 @@ pub mod xid_identity {
             }
         }
 
+        /// `DURABLE_PATH` is a `OnceLock`, so whichever test sets it first
+        /// wins for the rest of the binary. A per-test `TempDir` would be
+        /// deleted when that test ended and leave the shared path dangling, so
+        /// the directory has to outlive every test. Returns the path actually
+        /// in force, and starts each caller from an empty file.
+        fn durable_test_path() -> std::path::PathBuf {
+            static DIR: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+            let dir = DIR.get_or_init(|| tempfile::tempdir().expect("tempdir"));
+            set_durable_cache_path(dir.path().join("profiles.json"));
+            let path = DURABLE_PATH.get().expect("durable path").clone();
+            let _ = std::fs::remove_file(&path);
+            path
+        }
+
         fn info(active: bool) -> XidInfo {
             XidInfo {
                 name: "x".into(),
@@ -2106,6 +2321,73 @@ pub mod xid_identity {
                 avatar: String::new(),
                 bio: String::new(),
             }
+        }
+
+        /// The revocation question must never be answered from disk: a
+        /// persisted "active" would outlive the revocation that cancelled it.
+        #[test]
+        fn durable_cache_refuses_the_revocation_key() {
+            assert!(durable_eligible("alice.epix"));
+            assert!(durable_eligible("epix1abc"));
+            assert!(!durable_eligible("active?:alice.epix"));
+        }
+
+        /// A restored profile is only as trustworthy as the lineage it was
+        /// proven under, so with verification off the durable layer must serve
+        /// nothing at all - even with an entry sitting in the file.
+        #[tokio::test]
+        async fn durable_cache_fails_closed_without_finality_verification() {
+            let _serialized = CACHE_TEST_LOCK.lock().await;
+            let previous = crate::verify_finality_enabled();
+            let _restore = VerifyFinalityReset(previous);
+            let _cache_reset = CacheReset;
+
+            let path = durable_test_path();
+
+            durable_store("alice.epix", &info(true), &(1, "digest".into()));
+            assert!(path.exists(), "the entry was written");
+
+            crate::set_verify_finality(true);
+            let covered = crate::finality_checkpoint_covers(1);
+
+            crate::set_verify_finality(false);
+            assert!(
+                durable_cached("alice.epix").is_none(),
+                "verification off must serve nothing, regardless of what is stored \
+                 (covered-with-verification-on was {covered})"
+            );
+        }
+
+        /// The xID xite polls `forget` right after a linking transaction so the
+        /// user comes back already linked. A durable copy that survived it
+        /// would keep serving the pre-link answer, so the link would look like
+        /// it never happened.
+        #[tokio::test]
+        async fn forget_drops_the_durable_copy_too() {
+            let _serialized = CACHE_TEST_LOCK.lock().await;
+            let _cache_reset = CacheReset;
+
+            let path = durable_test_path();
+
+            let mut profile = info(true);
+            profile.name = "alice".into();
+            profile.tld = "epix".into();
+            durable_store("epix1alice", &profile, &(1, "digest".into()));
+            durable_store("alice.epix", &profile, &(1, "digest".into()));
+
+            let stored: HashMap<String, DurableEntry> =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+            assert!(stored.contains_key("epix1alice") && stored.contains_key("alice.epix"));
+
+            forget("epix1alice");
+
+            let after: HashMap<String, DurableEntry> =
+                serde_json::from_slice(&std::fs::read(&path).expect("read")).expect("parse");
+            assert!(!after.contains_key("epix1alice"), "the address entry is gone");
+            assert!(
+                !after.contains_key("alice.epix"),
+                "and so is the name it resolved to, or the next lookup serves the old link"
+            );
         }
 
         #[test]
