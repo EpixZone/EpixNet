@@ -521,6 +521,13 @@ pub async fn boot_with_progress(
     epix_chain::xid_signers::set_durable_cache_path(
         opts.data_root.join("xid-identity-cache.json"),
     );
+    // Display profiles (name, owner, avatar, bio) persist the same way, in
+    // their own file. Without this every cold open re-asked the chain for
+    // data already proven, one serial round trip per name - which is what a
+    // merger over a busy hub pays before its database is usable.
+    epix_chain::xid_identity::set_durable_cache_path(
+        opts.data_root.join("xid-profile-cache.json"),
+    );
 
     // Parse the startup network policy strictly, arm its egress gate, and only
     // then select the launch target from local state. Boot never touches the

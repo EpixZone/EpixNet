@@ -22445,25 +22445,38 @@ impl AppState {
     async fn resolve_xid_names_checked(
         mut names: Vec<String>,
     ) -> Result<epix_content::XidMap, String> {
+        use futures_util::StreamExt as _;
         names.sort();
         names.dedup();
+        // Resolve CONCURRENTLY. This was a serial loop, and it runs for EVERY
+        // signer a hub's merge files name before the merger database can be
+        // built - so opening a merger over a twelve-user hub waited on twelve
+        // chain round trips in a row, about a second each. `buffered` keeps
+        // the results in `names` order so the map is built identically to
+        // before; the cap bounds how many sockets point at the chain at once.
+        let resolved: Vec<(String, Result<(Vec<_>, bool), epix_chain::ChainError>)> =
+            futures_util::stream::iter(names)
+                .map(|name| async move {
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(identities) = xid_test::lookup(&name) {
+                        return (name, Ok((identities, false)));
+                    }
+                    let (label, tld) =
+                        name.rsplit_once('.').unwrap_or((name.as_str(), "epix"));
+                    // Cache-backed like every other verification path: a
+                    // transient chain failure (or one malformed RPC answer)
+                    // must not scrap an entire xite's DB when this node
+                    // already holds a checkpoint-covered proof for the name.
+                    let outcome =
+                        epix_chain::xid_signers::resolve_identities_or_cached(label, tld).await;
+                    (name, outcome)
+                })
+                .buffered(crate::command::XID_RESOLVE_CONCURRENCY)
+                .collect()
+                .await;
         let mut xid_map = epix_content::XidMap::new();
-        for name in names {
-            #[cfg(any(test, feature = "test-support"))]
-            if let Some(identities) = xid_test::lookup(&name) {
-                let mut identities = chain_xid_identities(identities);
-                identities.sort_by(|a, b| a.address.cmp(&b.address));
-                xid_map.insert(name, identities);
-                continue;
-            }
-            let (label, tld) = name
-                .rsplit_once('.')
-                .unwrap_or((name.as_str(), "epix"));
-            // Cache-backed like every other verification path: a transient
-            // chain failure (or one malformed RPC answer) must not scrap an
-            // entire xite's DB when this node already holds a
-            // checkpoint-covered proof for the name.
-            match epix_chain::xid_signers::resolve_identities_or_cached(label, tld).await {
+        for (name, outcome) in resolved {
+            match outcome {
                 Ok((identities, _from_cache)) => {
                     let mut identities = chain_xid_identities(identities);
                     identities.sort_by(|a, b| a.address.cmp(&b.address));
