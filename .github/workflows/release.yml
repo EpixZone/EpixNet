@@ -230,8 +230,13 @@ jobs:
 
       - name: Install SDK + NDK packages
         run: |
+          # API 37 is packaged under its MINOR version: the SDK repository
+          # offers android-37.0/37.1/37.2 and no plain "android-37", so the
+          # old naming resolves to nothing and sdkmanager exits 1 with only a
+          # "Failed to find package" warning. build-tools stays 36.0.0: that
+          # is the revision AGP 9.1.1 pins, not a mirror of compileSdk.
           sdkmanager --install \
-            "platforms;android-37" \
+            "platforms;android-37.0" \
             "build-tools;36.0.0" \
             "ndk;${NDK_VERSION}" \
             "platform-tools"
