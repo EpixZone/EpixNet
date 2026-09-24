@@ -87,7 +87,15 @@ VIAddVersionKey /LANG=1033 "LegalCopyright"  "Copyright (c) Epix"
 ; LAUNCHER is a launcher that understands --quit: the NEW one during install,
 ; the installed one during uninstall.
 !macro EPIX_RUN_CLOSER MODE LAUNCHER
-  nsExec::ExecToStack '"$SYSDIR\WindowsPowerShell\v1.0\powershell.exe" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\close-epixnet.ps1" -InstallDir "$INSTDIR" -Mode ${MODE} -Launcher "${LAUNCHER}"'
+  ; Prefer the 64-bit PowerShell. This installer is a 32-bit process, so
+  ; $SYSDIR is SysWOW64 and its PowerShell is 32-bit; Sysnative escapes the
+  ; WOW64 redirect on 64-bit Windows and is absent on 32-bit Windows, where
+  ; $SYSDIR is already right. The closer script no longer depends on the
+  ; host's bitness, so this is defense in depth, not the fix itself.
+  StrCpy $1 "$SYSDIR\WindowsPowerShell\v1.0\powershell.exe"
+  IfFileExists "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe" 0 +2
+    StrCpy $1 "$WINDIR\Sysnative\WindowsPowerShell\v1.0\powershell.exe"
+  nsExec::ExecToStack '"$1" -NoProfile -NonInteractive -ExecutionPolicy Bypass -File "$PLUGINSDIR\close-epixnet.ps1" -InstallDir "$INSTDIR" -Mode ${MODE} -Launcher "${LAUNCHER}"'
   Pop $0   ; exit code ("error"/"timeout" when powershell itself did not run)
   Pop $1   ; output (unused)
 !macroend
