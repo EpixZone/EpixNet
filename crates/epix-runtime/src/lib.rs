@@ -1139,6 +1139,11 @@ async fn resync_loop(
                 // held uncommitted (the previous version keeps serving);
                 // re-fetch their missing files and commit the completed ones.
                 state.retry_pending_updates().await;
+                // A child manifest stored in a tree but missing from its
+                // verified index (withheld during a chain outage, restored
+                // from a backup, a legacy copy no peer re-serves) is not
+                // re-walked by anything above: re-verify those xites.
+                state.reverify_incomplete_indexes().await;
                 // Anti-entropy for merge files (posts.json): re-pull + merge
                 // from peers so a node that missed a live push still converges.
                 state.resync_merge_files().await;

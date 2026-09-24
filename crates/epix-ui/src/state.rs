@@ -4312,6 +4312,10 @@ pub struct AppState {
     /// arrives; a later complete pass clears the entry from
     /// [`Self::install_verified_xite_index`].
     xid_deferred_xites: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Per canonical, the (stored manifest set, missing manifest set)
+    /// fingerprint the last [`Self::reverify_incomplete_indexes`] pass acted
+    /// on, so a child the chain rejects for good is not re-walked every tick.
+    incomplete_index_checks: std::sync::Mutex<HashMap<String, (u64, u64)>>,
     /// Guards [`Self::retry_deferred_xid_xites`] so the Tor-egress and
     /// light-client triggers - which can fire seconds apart - cannot both walk
     /// the set at once.
@@ -5537,6 +5541,7 @@ impl AppState {
             #[cfg(test)]
             db_query_after_receipt_pause: std::sync::Mutex::new(None),
             xid_deferred_xites: std::sync::Mutex::new(std::collections::HashSet::new()),
+            incomplete_index_checks: std::sync::Mutex::new(HashMap::new()),
             xid_retry_in_flight: std::sync::atomic::AtomicBool::new(false),
             xid_retry_last: std::sync::Mutex::new(None),
             xid_retry_backoff_secs: std::sync::atomic::AtomicU64::new(
@@ -15137,6 +15142,99 @@ impl AppState {
         targets
     }
 
+    /// Re-verify every xite whose installed verified index covers fewer
+    /// child manifests than its tree stores. A manifest that is on disk but
+    /// not in the index was either withheld by a walk that ran while the
+    /// chain was unreachable (a node that booted before Tor), or arrived in
+    /// the tree without a walk (a restore, a legacy copy no peer re-serves).
+    /// Either way nothing else re-walks it: child commits only insert
+    /// themselves and a plain rebuild reuses the installed authority.
+    ///
+    /// Marks each such xite deferred and runs one retry pass, so the fresh
+    /// walk goes through the same floor, backoff and offline gates as a
+    /// chain-outage retry. A child the chain rejects for good stays missing;
+    /// the (stored, missing) fingerprint recorded here keeps it from being
+    /// walked again until the stored set changes. Returns how many xites
+    /// were marked.
+    pub async fn reverify_incomplete_indexes(self: &Arc<Self>) -> usize {
+        use std::hash::{Hash, Hasher};
+        if self.offline_by_policy() {
+            return 0;
+        }
+        let candidates = {
+            let xites = self.xites.read().await;
+            let mut seen = std::collections::HashSet::new();
+            xites
+                .iter()
+                .filter(|(_, xite)| xite.content.is_some())
+                .filter_map(|(key, xite)| {
+                    let canonical = canonical_address(xite.content.as_ref(), key);
+                    seen.insert(canonical.clone())
+                        .then(|| (canonical, xite.storage.clone()))
+                })
+                .collect::<Vec<_>>()
+        };
+        let mut marked = 0usize;
+        for (canonical, storage) in candidates {
+            let stored = match tokio::task::spawn_blocking(move || {
+                Self::stored_manifest_paths_bounded(&storage)
+            })
+            .await
+            {
+                Ok(Ok(paths)) => paths,
+                _ => continue,
+            };
+            let missing = {
+                let contents = self
+                    .verified_manifest_contents
+                    .read()
+                    .expect("verified_manifest_contents");
+                let installed = contents.get(&canonical);
+                stored
+                    .iter()
+                    .filter(|path| !installed.is_some_and(|index| index.contains_key(*path)))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            };
+            if missing.is_empty() {
+                if let Ok(mut checks) = self.incomplete_index_checks.lock() {
+                    checks.remove(&canonical);
+                }
+                continue;
+            }
+            let fingerprint = {
+                let mut stored_hash = std::collections::hash_map::DefaultHasher::new();
+                stored.hash(&mut stored_hash);
+                let mut missing_hash = std::collections::hash_map::DefaultHasher::new();
+                missing.hash(&mut missing_hash);
+                (stored_hash.finish(), missing_hash.finish())
+            };
+            {
+                let Ok(mut checks) = self.incomplete_index_checks.lock() else { continue };
+                if checks.get(&canonical) == Some(&fingerprint) {
+                    continue;
+                }
+                checks.insert(canonical.clone(), fingerprint);
+            }
+            self.log(
+                "INFO",
+                format!(
+                    "{canonical}: {} stored child manifest(s) missing from the verified \
+                     index, re-verifying: {}",
+                    missing.len(),
+                    counted_manifest_sample(&missing)
+                ),
+            )
+            .await;
+            self.mark_xid_deferred(&canonical);
+            marked += 1;
+        }
+        if marked > 0 {
+            self.retry_deferred_xid_xites().await;
+        }
+        marked
+    }
+
     /// Next follow-up delay after a pass that started with `deferred_before`
     /// xites deferred, or `None` when no follow-up is needed (set drained, or
     /// offline by policy). Progress resets the backoff to the floor; a
@@ -20390,15 +20488,16 @@ impl AppState {
         .map_err(|error| format!("verified registration task failed: {error}"))??;
         let warnings = {
             let _ownership = self.manifest_ownership_lock.lock().unwrap();
-            self.replace_verified_manifest_chains(
-                &candidate.canonical,
-                index.manifest_chains,
-            );
-            self.replace_verified_manifest_contents(&candidate.canonical, &index.manifests);
-            self.replace_verified_object_paths(
-                &candidate.canonical,
-                index.declarations,
-            );
+            // Through the one install site that records withheld verdicts.
+            // This walk runs early in boot, before Tor has bootstrapped, so
+            // the chain is usually unreachable and every xID-certified child
+            // is withheld. Installing the result with the raw replace calls
+            // dropped those children for good: nothing marked the xite for
+            // the trust-anchored retry, later child commits only ever added
+            // themselves, and dbRebuild reused the installed authority. A
+            // hub's users vanished from every merger page until a restart
+            // happened to walk with the chain up.
+            self.install_verified_xite_index(&candidate.canonical, index);
             let desired = self
                 .edx_paths
                 .read()
@@ -20423,6 +20522,16 @@ impl AppState {
         let mut chains = HashMap::new();
         let mut contents = HashMap::new();
         for (canonical, index) in indexes {
+            // Store activation walks every xite early in boot, before Tor
+            // has bootstrapped, so the chain is usually unreachable and
+            // every xID-certified child is withheld. Publishing those
+            // walks without the deferred bookkeeping dropped the children
+            // for good: nothing marked the xite for the trust-anchored
+            // retry, later child commits only ever added themselves, and
+            // dbRebuild reused the installed authority. A hub's users
+            // vanished from every merger page until a restart happened to
+            // walk with the chain up.
+            self.record_index_completeness(&canonical, &index);
             contents.insert(
                 canonical.clone(),
                 index
@@ -21783,11 +21892,12 @@ impl AppState {
         Ok(declarations)
     }
 
-    fn install_verified_xite_index(&self, canonical: &str, index: VerifiedXiteIndex) {
-        // Every install site funnels through here, so this is the one place
-        // that has to know whether the index it is publishing was complete.
-        // Recorded on install rather than at the walk so a later good pass
-        // clears the mark by itself - no separate invalidation to forget.
+    /// Record whether the index being published for `canonical` was
+    /// complete. Every install site calls this, so it is the one place that
+    /// has to know. Recorded on install rather than at the walk so a later
+    /// good pass clears the mark by itself - no separate invalidation to
+    /// forget.
+    fn record_index_completeness(&self, canonical: &str, index: &VerifiedXiteIndex) {
         if let Ok(mut pending) = self.xid_deferred_xites.lock() {
             if index.deferred.is_empty() && !index.stale {
                 pending.remove(canonical);
@@ -21798,6 +21908,10 @@ impl AppState {
                 pending.insert(canonical.to_string());
             }
         }
+    }
+
+    fn install_verified_xite_index(&self, canonical: &str, index: VerifiedXiteIndex) {
+        self.record_index_completeness(canonical, &index);
         self.replace_verified_manifest_chains(canonical, index.manifest_chains);
         self.replace_verified_manifest_contents(canonical, &index.manifests);
         self.replace_verified_object_paths(canonical, index.declarations);
@@ -33609,6 +33723,16 @@ fn pick_favicon_file(files: &serde_json::Map<String, Value>) -> Option<String> {
         .cloned()
 }
 
+/// Up to five of `paths` for a log line, with a count for the rest.
+fn counted_manifest_sample(paths: &[String]) -> String {
+    const SHOWN: usize = 5;
+    let shown = paths.iter().take(SHOWN).cloned().collect::<Vec<_>>().join(", ");
+    match paths.len().checked_sub(SHOWN) {
+        Some(rest) if rest > 0 => format!("{shown} (+{rest} more)"),
+        _ => shown,
+    }
+}
+
 /// `getNextSizeLimit`: the smallest tier (MB) that fits `size * 1.2`.
 fn next_size_limit(size_bytes: i64) -> i64 {
     const TIERS: [i64; 13] =
@@ -42255,6 +42379,179 @@ mod tests {
         assert_eq!(fixture.storage_a.read("content.json").unwrap(), newer_bytes);
         assert_eq!(fixture.storage_a.read(".sign-cache.json").unwrap(), cache);
         assert_eq!(fixture.store.read_bytes(cache_id, 3).unwrap(), cache);
+    }
+
+    /// A hub whose user dirs need a chain-delegated xID cert: root, user
+    /// governor, nothing else. Returns the hub address, its storage and key.
+    fn write_chain_cert_hub(root: &Path) -> (String, XiteStorage, String) {
+        let hub_key = epix_crypt::new_seed();
+        let hub = epix_crypt::privatekey_to_address(&hub_key).unwrap();
+        let storage = XiteStorage::new(root.join("data").join(&hub));
+        let mut users_content = json!({
+            "address": hub,
+            "inner_path": "data/users/content.json",
+            "modified": 1.0,
+            "files": {},
+            "user_contents": {
+                "permissions": { ".*": { "files_allowed": ".*", "max_size": 100000 } },
+                "cert_signers": { "xid.epix": ["chain"] },
+            }
+        });
+        epix_content::sign(&mut users_content, &hub_key).unwrap();
+        storage
+            .write(
+                "data/users/content.json",
+                &serde_json::to_vec(&users_content).unwrap(),
+            )
+            .unwrap();
+        let mut hub_root = json!({
+            "address": hub,
+            "modified": 1.0,
+            "files": {},
+            "includes": { "data/users/content.json": {} }
+        });
+        epix_content::sign(&mut hub_root, &hub_key).unwrap();
+        storage
+            .write("content.json", &serde_json::to_vec(&hub_root).unwrap())
+            .unwrap();
+        (hub, storage, hub_key)
+    }
+
+    /// One user child under `data/users/<name>.epix`, certified as `name`
+    /// by a fresh identity key and signed by it. The name is NOT linked in
+    /// the chain stand-in; the caller decides when (or whether) it resolves.
+    /// Returns the child manifest path and the identity address.
+    fn write_chain_certified_child(
+        storage: &XiteStorage,
+        hub: &str,
+        name: &str,
+    ) -> (String, String) {
+        let key = epix_crypt::new_seed();
+        let addr = epix_crypt::privatekey_to_address(&key).unwrap();
+        let cert_sign = epix_crypt::sign_keccak(&format!("{addr}#xid/{name}"), &key).unwrap();
+        let data = br#"{"post":[]}"#;
+        let dir = format!("data/users/{name}.epix");
+        storage.write(&format!("{dir}/data.json"), data).unwrap();
+        let child_path = format!("{dir}/content.json");
+        let mut child = json!({
+            "address": hub,
+            "inner_path": child_path,
+            "modified": 1.0,
+            "cert_auth_type": "xid",
+            "cert_user_id": format!("{name}@xid.epix"),
+            "cert_sign": cert_sign,
+            "files": { "data.json": {
+                "size": data.len(), "sha512": XiteStorage::hash_bytes(data)
+            } }
+        });
+        epix_content::sign(&mut child, &key).unwrap();
+        storage
+            .write(&child_path, &serde_json::to_vec(&child).unwrap())
+            .unwrap();
+        (child_path, addr)
+    }
+
+    fn child_is_installed(state: &AppState, hub: &str, child_path: &str) -> bool {
+        state
+            .verified_manifest_contents
+            .read()
+            .unwrap()
+            .get(hub)
+            .is_some_and(|index| index.contains_key(child_path))
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn store_activation_records_withheld_verdicts_for_retry() {
+        // Store activation walks every xite early in boot, when the chain is
+        // usually unreachable, and used to install the result without the
+        // deferred bookkeeping: a hub's xID-certified users were dropped and
+        // nothing ever re-walked them. The withheld verdict must land in the
+        // retry set, and the retry must restore the child once the name
+        // resolves.
+        // An unlinked name must fail like a chain outage (non-authoritative),
+        // not reach the real chain and come back "not found".
+        epix_chain::set_chain_require_tor(true);
+        let dir = tempdir().unwrap();
+        let state = Arc::new(AppState::new("test"));
+        let (hub, storage, _hub_key) = write_chain_cert_hub(dir.path());
+        let (child_path, addr) =
+            write_chain_certified_child(&storage, &hub, "activationbob");
+        let content = serde_json::from_slice(&storage.read("content.json").unwrap()).unwrap();
+        state
+            .add_xite(&hub, XiteEntry { storage: storage.clone(), content: Some(content) })
+            .await;
+        // Only the activation walk below may mark the hub.
+        state.xid_deferred_xites.lock().unwrap().clear();
+        let store = Arc::new(
+            epix_blob::store::Store::open_with(
+                dir.path().join("store"),
+                epix_blob::store::StoreConfig {
+                    xite_root: Some(dir.path().join("data")),
+                    ..Default::default()
+                },
+            )
+            .unwrap(),
+        );
+        state.set_edx_store(store).await.unwrap();
+        assert!(
+            !child_is_installed(&state, &hub, &child_path),
+            "a child whose name cannot be resolved must not verify"
+        );
+        assert!(
+            state.xid_deferred_xites.lock().unwrap().contains(&hub),
+            "activation must record the withheld verdict for the retry"
+        );
+
+        xid_test::link("activationbob", &addr);
+        assert_eq!(state.retry_deferred_xid_xites().await, 1);
+        assert!(
+            child_is_installed(&state, &hub, &child_path),
+            "the retry must restore the child once the name resolves"
+        );
+        assert_eq!(state.xid_deferred_count(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resync_reverifies_a_stored_child_missing_from_the_index() {
+        // A child manifest that sits in the tree but not in the installed
+        // index (restored from a backup, a legacy copy no peer re-serves)
+        // is picked up by the completeness pass, and a pass that changes
+        // nothing does not re-walk the same gap.
+        epix_chain::set_chain_require_tor(true);
+        let dir = tempdir().unwrap();
+        let state = Arc::new(AppState::new("test"));
+        let (hub, storage, _hub_key) = write_chain_cert_hub(dir.path());
+        let content = serde_json::from_slice(&storage.read("content.json").unwrap()).unwrap();
+        state
+            .add_xite(&hub, XiteEntry { storage: storage.clone(), content: Some(content) })
+            .await;
+        state
+            .refresh_verified_object_paths(&hub, &hub, &storage)
+            .await
+            .unwrap();
+        assert_eq!(state.reverify_incomplete_indexes().await, 0);
+
+        let (child_path, addr) =
+            write_chain_certified_child(&storage, &hub, "resyncalice");
+        xid_test::link("resyncalice", &addr);
+        assert!(!child_is_installed(&state, &hub, &child_path));
+        assert_eq!(state.reverify_incomplete_indexes().await, 1);
+        assert!(
+            child_is_installed(&state, &hub, &child_path),
+            "the completeness pass must re-walk the stored child into the index"
+        );
+        assert_eq!(state.xid_deferred_count(), 0);
+        assert_eq!(state.reverify_incomplete_indexes().await, 0);
+
+        // The same gap is not marked twice: a child whose name cannot be
+        // resolved stays missing, the walk that withheld it keeps the hub in
+        // the chain-outage retry set, and this pass moves on until the
+        // stored set changes.
+        let (stuck_path, _) = write_chain_certified_child(&storage, &hub, "resyncstuck");
+        assert_eq!(state.reverify_incomplete_indexes().await, 1);
+        assert!(!child_is_installed(&state, &hub, &stuck_path));
+        assert_eq!(state.xid_deferred_count(), 1, "the withheld verdict stays queued");
+        assert_eq!(state.reverify_incomplete_indexes().await, 0);
     }
 
     #[tokio::test]
