@@ -27,11 +27,16 @@ $ErrorActionPreference = 'SilentlyContinue'
 
 $root = [System.IO.Path]::GetFullPath($InstallDir).TrimEnd('\') + '\'
 
+# Enumerate through WMI, not Get-Process: the installer runs this under the
+# 32-bit PowerShell (NSIS is 32-bit, $SYSDIR is SysWOW64), where $p.Path
+# (MainModule.FileName) throws for every 64-bit process. EpixNet is 64-bit,
+# so a Get-Process pass sees an empty install tree and the close step
+# silently no-ops. Win32_Process answers out-of-process, so ExecutablePath
+# is visible regardless of the caller's bitness.
 function Get-EpixProcesses {
     $found = @()
-    foreach ($p in Get-Process) {
-        $path = $null
-        try { $path = $p.Path } catch { $path = $null }
+    foreach ($p in Get-CimInstance Win32_Process) {
+        $path = $p.ExecutablePath
         if ($path -and $path.StartsWith($root, [System.StringComparison]::OrdinalIgnoreCase)) {
             $found += $p
         }
@@ -68,8 +73,8 @@ if ($Launcher -and (Test-Path -LiteralPath $Launcher)) {
 # Still there: an older launcher without --quit, a tray-less run, or a stuck
 # process. Stop the launcher first so it cannot reopen the browser, then
 # whatever remains under the install tree.
-foreach ($p in (Get-EpixProcesses | Sort-Object { $_.ProcessName -ne 'epix-browser' })) {
-    try { Stop-Process -Id $p.Id -Force } catch {}
+foreach ($p in (Get-EpixProcesses | Sort-Object { $_.Name -ne 'epix-browser.exe' })) {
+    try { Stop-Process -Id $p.ProcessId -Force } catch {}
 }
 if (Wait-EpixGone 15) { exit 0 }
 exit 1
