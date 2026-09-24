@@ -3822,6 +3822,12 @@ impl WsCommand for XiteSetAutodownloadoptional {
 }
 
 /// `dbReload`/`dbRebuild` - rebuild the xite's database from its files.
+///
+/// Forced: the operator asked for a rebuild because the database looks
+/// wrong, and the usual cause is an installed verified index that withheld
+/// children while the chain was unreachable. Reusing that index (the plain
+/// rebuild) reproduces exactly the rows they are looking at; only a fresh
+/// walk can bring the missing manifests back.
 struct DbRebuild {
     cmd: &'static str,
 }
@@ -3832,7 +3838,7 @@ impl WsCommand for DbRebuild {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = target_address(s, p)?;
-        if s.state.rebuild_xite_db(&address).await {
+        if s.state.rebuild_xite_db_reverify(&address).await {
             Ok(Value::from("ok"))
         } else {
             Err(format!("Unknown xite: {address}"))
