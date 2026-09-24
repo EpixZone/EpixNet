@@ -40,7 +40,7 @@ pub struct TrayContext {
     pub rt: tokio::runtime::Handle,
     /// Open-requests from later launches (single-instance): each is the raw
     /// launch argument to open in the running browser.
-    pub open_rx: std::sync::mpsc::Receiver<String>,
+    pub open_rx: std::sync::mpsc::Receiver<crate::ipc::Request>,
 }
 
 /// A snapshot of node stats the menu shows, refreshed on a background task so
@@ -94,7 +94,7 @@ pub(crate) struct Session {
     _menu: Menu,
     handles: Handles,
     snap: Arc<Mutex<Snapshot>>,
-    open_rx: std::sync::mpsc::Receiver<String>,
+    open_rx: std::sync::mpsc::Receiver<crate::ipc::Request>,
     child: Option<Child>,
     firefox: PathBuf,
     profile: PathBuf,
@@ -163,9 +163,20 @@ impl Session {
         crate::icon::stamp_firefox_windows(&self.firefox);
 
         // Later launches hand their targets to this running node.
-        while let Ok(arg) = self.open_rx.try_recv() {
-            let url = target_url(&self.scheme, &arg);
-            reopen_browser(&mut self.child, &self.firefox, &self.profile, &url);
+        while let Ok(request) = self.open_rx.try_recv() {
+            match request {
+                crate::ipc::Request::Open(arg) => {
+                    let url = target_url(&self.scheme, &arg);
+                    reopen_browser(&mut self.child, &self.firefox, &self.profile, &url);
+                }
+                // `epix-browser --quit` (the installer, a script): the same
+                // exit as the tray's Quit item, browser first.
+                crate::ipc::Request::Quit => {
+                    println!("· quit requested over the control channel");
+                    close_browser(&mut self.child);
+                    return true;
+                }
+            }
         }
 
         while let Ok(ev) = MenuEvent::receiver().try_recv() {

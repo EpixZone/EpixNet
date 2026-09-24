@@ -20,6 +20,39 @@ repo. Regenerate the bitmaps with `python scripts/generate-installer-bmps.py`
 there (needs Pillow; writes into this directory). The finish page offers a
 "Launch EpixNet" checkbox, checked by default.
 
+## Upgrading over a running EpixNet
+
+The launcher owns the node and keeps running in the tray after the browser
+window closes, so an upgrade usually finds the previous version still running
+from `%LOCALAPPDATA%\Epix`. Its DLLs are locked. Earlier installers let the
+user skip a locked file, which left a new `firefox.exe` next to an old
+`xul.dll`: Firefox then prints "Couldn't load XPCOM", exits at once with 255,
+and the launcher reports "Epix Browser closed during startup". Reinstalling
+was the only way out.
+
+`installer.nsi` now closes EpixNet before it touches the tree, and refuses to
+continue while anything from the install directory runs:
+
+1. `close-epixnet.ps1` (extracted to the installer's temp dir) lists every
+   process whose executable lives under the install directory: the launcher,
+   the native host, the bundled Firefox and its children. Nothing else is
+   touched, so a user's own Firefox stays up.
+2. If anything runs, setup asks to close EpixNet (silent installs, `/S`,
+   answer yes). The script first runs the NEW `epix-browser.exe --quit`, which
+   asks the running instance over its single-instance channel to close its
+   browser and shut the node down cleanly. Versions without `--quit` ignore
+   that, so the script then stops the remaining processes, launcher first.
+3. Still running afterwards: a Retry/Cancel prompt; cancel aborts setup.
+4. `AllowSkipFiles off` removes the Ignore button from a write failure, so a
+   half-copied tree is impossible even when the check above could not run.
+5. After the copy, setup verifies `firefox\xul.dll` exists (when the stage
+   bundled Firefox) and aborts with a clear message if not.
+
+The uninstaller runs the same close step before removing the tree.
+
+`epix-browser.exe --quit` exits 0 when EpixNet closed or was not running, and
+2 when the running instance acknowledged but did not exit within 30 seconds.
+
 ## Layout
 
 Ship a self-contained install directory:

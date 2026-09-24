@@ -95,6 +95,28 @@ fn main() {
     let args: Vec<String> =
         std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let background = args.iter().any(|a| a == "--background");
+    // `--quit`: ask a running EpixNet to close its browser and shut its node
+    // down, wait for it, and exit. The Windows installer runs this before it
+    // replaces the install tree (packaging/windows/close-epixnet.ps1): a
+    // browser or node still running from that tree keeps its DLLs locked, and
+    // a half-replaced Firefox exits at once at the next launch.
+    if args.iter().any(|a| a == "--quit") {
+        let code = match ipc::request_quit() {
+            ipc::QuitOutcome::NotRunning => {
+                println!("· EpixNet is not running");
+                0
+            }
+            ipc::QuitOutcome::Stopped => {
+                println!("· EpixNet closed");
+                0
+            }
+            ipc::QuitOutcome::StillRunning => {
+                eprintln!("· EpixNet acknowledged the quit but is still running");
+                2
+            }
+        };
+        std::process::exit(code);
+    }
     let raw_arg = args
         .iter()
         .find(|a| !a.starts_with("--"))
@@ -661,14 +683,41 @@ fn launch_browser(
             // Firefox, which still locks the profile.
             std::thread::sleep(Duration::from_millis(700));
             if let Ok(Some(status)) = child.try_wait() {
-                return Err(format!(
-                    "Epix Browser closed during startup ({status}). Close any other EpixNet browser and try again."
-                ));
+                return Err(early_exit_message(firefox, status));
             }
             Ok(Some(child))
         }
         Err(e) => Err(format!("Could not open Epix Browser: {e}")),
     }
+}
+
+/// The startup-window text for a browser that exited within its first second.
+/// A profile another Firefox holds is one cause. The field cause is a
+/// half-replaced install: EpixNet upgraded while it was running (the old
+/// installer let a locked xul.dll be skipped), or an antivirus quarantined a
+/// file under `firefox\`. Firefox then prints "Couldn't load XPCOM" and exits
+/// at once with 255. A missing xul.dll is the cheap tell; either way the log
+/// holds the browser's own line, so name it.
+fn early_exit_message(firefox: &Path, status: std::process::ExitStatus) -> String {
+    let mut message = format!("Epix Browser closed during startup ({status}).");
+    let core = firefox.with_file_name(if cfg!(windows) { "xul.dll" } else { "libxul.so" });
+    if cfg!(any(windows, target_os = "linux")) && !core.exists() {
+        let dir = firefox.parent().map(|p| p.display().to_string()).unwrap_or_default();
+        message.push_str(&format!(
+            " The bundled browser in {dir} is incomplete ({} is missing): reinstall EpixNet.",
+            core.file_name().and_then(|n| n.to_str()).unwrap_or("xul.dll")
+        ));
+    } else {
+        message.push_str(
+            " Close any other EpixNet browser and try again. If it keeps happening, reinstall EpixNet.",
+        );
+    }
+    #[cfg(windows)]
+    message.push_str(&format!(
+        " Details: {}",
+        epix_node::data_root().join("log").join("epix-browser.log").display()
+    ));
+    message
 }
 
 /// Locate a Firefox executable: `EPIX_FIREFOX`, a Firefox bundled inside our own
@@ -1328,6 +1377,28 @@ mod startup_tests {
         assert!(visible, "must detect the browser child, not just let the deadline expire");
         assert!(alive);
         assert!(branded, "browser window and taskbar icons must be present");
+    }
+
+    #[test]
+    fn early_exit_names_an_incomplete_browser_install() {
+        let dir = tempfile::tempdir().unwrap();
+        let firefox = dir.path().join(if cfg!(windows) { "firefox.exe" } else { "firefox" });
+        std::fs::write(&firefox, b"").unwrap();
+        let status = Command::new(if cfg!(windows) { "cmd.exe" } else { "sh" })
+            .args(if cfg!(windows) { ["/C", "exit 255"] } else { ["-c", "exit 255"] })
+            .status()
+            .unwrap();
+        let message = early_exit_message(&firefox, status);
+        assert!(message.contains("closed during startup"), "{message}");
+        if cfg!(any(windows, target_os = "linux")) {
+            assert!(message.contains("incomplete"), "{message}");
+            assert!(message.contains("reinstall EpixNet"), "{message}");
+            let core = if cfg!(windows) { "xul.dll" } else { "libxul.so" };
+            std::fs::write(dir.path().join(core), b"").unwrap();
+            let message = early_exit_message(&firefox, status);
+            assert!(!message.contains("incomplete"), "{message}");
+            assert!(message.contains("Close any other EpixNet browser"), "{message}");
+        }
     }
 
     #[cfg(windows)]
