@@ -23,6 +23,9 @@ import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 BUNDLE_ID = "zone.epix.startupfixture"
+# Fresh hosted simulators can take over two minutes to install or launch an
+# app even after bootstatus finishes. The native assertion deadline is separate.
+SIMULATOR_APP_TIMEOUT = 300
 METHODS = (
     "presentSplash", "setStartupProgress", "startStartupPolling",
     "stopStartupPolling", "pollStartupProgress", "hideSplash", "retryBoot", "pageSettled",
@@ -279,8 +282,11 @@ def prepare(output):
 
 
 def command(output, *args, timeout=120, check=True):
+    started = time.monotonic()
+    description = ' '.join(map(str, args))
+    print(f"Running: {description} (timeout {timeout}s)", flush=True)
     with (output / "commands.log").open("a") as log:
-        log.write(f"$ {' '.join(map(str, args))}\n")
+        log.write(f"$ {description}\n")
         log.flush()
         try:
             result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
@@ -291,6 +297,7 @@ def command(output, *args, timeout=120, check=True):
             log.write(f"{partial}\nTimed out after {timeout} seconds\n")
             raise
         log.write(f"{result.stdout}\n")
+        log.write(f"Finished in {time.monotonic() - started:.1f}s (exit {result.returncode})\n")
     if check and result.returncode:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(map(str, args))}\n{result.stdout}")
     return result.stdout.strip()
@@ -339,9 +346,10 @@ def run(output, app):
     try:
         command(output, "xcrun", "simctl", "boot", udid)
         command(output, "xcrun", "simctl", "bootstatus", udid, "-b", timeout=240)
-        command(output, "xcrun", "simctl", "install", udid, str(app))
+        command(output, "xcrun", "simctl", "install", udid, str(app), timeout=SIMULATOR_APP_TIMEOUT)
         for scenario in ("portrait", "landscape"):
-            command(output, "xcrun", "simctl", "launch", "--terminate-running-process", udid, BUNDLE_ID, scenario)
+            command(output, "xcrun", "simctl", "launch", "--terminate-running-process", udid, BUNDLE_ID, scenario,
+                    timeout=SIMULATOR_APP_TIMEOUT)
             container = pathlib.Path(command(output, "xcrun", "simctl", "get_app_container", udid, BUNDLE_ID, "data"))
             result_path = container / "Documents" / f"{scenario}.json"
             deadline = time.monotonic() + 45
@@ -361,7 +369,8 @@ def run(output, app):
     finally:
         try:
             command(output, "xcrun", "simctl", "spawn", udid, "log", "show", "--last", "5m", "--style", "compact",
-                    "--predicate", 'process == "EpixStartupFixture"', timeout=30, check=False)
+                    "--predicate", 'process IN {"EpixStartupFixture", "SpringBoard", "runningboardd", "installd"}',
+                    timeout=30, check=False)
         finally:
             try:
                 command(output, "xcrun", "simctl", "shutdown", udid, timeout=30, check=False)
