@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Run production startup widgets in UIKit, without Rust or release signing.
 
-Requires Xcode and an installed iOS simulator runtime. Creates and deletes its
-own iPhone simulator; never boots or changes an existing device. JSON checks,
+Requires Xcode and an iOS simulator runtime matching its SDK release. Creates
+and deletes its own iPhone simulator; never changes an existing device. JSON checks,
 compiler output, extracted Swift and simctl screenshots remain in --output.
 This validates the native splash, not a complete node or WKWebView boot.
 
@@ -279,20 +279,36 @@ def prepare(output):
 
 
 def command(output, *args, timeout=120, check=True):
-    result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
     with (output / "commands.log").open("a") as log:
-        log.write(f"$ {' '.join(map(str, args))}\n{result.stdout}\n")
+        log.write(f"$ {' '.join(map(str, args))}\n")
+        log.flush()
+        try:
+            result = subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=timeout)
+        except subprocess.TimeoutExpired as error:
+            partial = error.stdout or ""
+            if isinstance(partial, bytes):
+                partial = partial.decode(errors="replace")
+            log.write(f"{partial}\nTimed out after {timeout} seconds\n")
+            raise
+        log.write(f"{result.stdout}\n")
     if check and result.returncode:
         raise RuntimeError(f"Command failed ({result.returncode}): {' '.join(map(str, args))}\n{result.stdout}")
     return result.stdout.strip()
 
 
 def select_device(output):
+    sdk_version = command(output, "xcrun", "--sdk", "iphonesimulator", "--show-sdk-version")
+    sdk_release = tuple(map(int, sdk_version.split(".")[:2]))
     inventory = json.loads(command(output, "xcrun", "simctl", "list", "--json"))
-    runtimes = [r for r in inventory["runtimes"] if r.get("isAvailable") and ".iOS-" in r["identifier"]]
+    # Hosted runners contain runtimes for several Xcode versions. The newest
+    # installed runtime can belong to a different toolchain than xcrun's SDK.
+    runtimes = [r for r in inventory["runtimes"]
+                if r.get("isAvailable") and ".iOS-" in r["identifier"]
+                and tuple(map(int, r["version"].split(".")[:2])) == sdk_release]
     runtimes.sort(key=lambda r: tuple(map(int, r["version"].split("."))), reverse=True)
     if not runtimes:
-        raise RuntimeError("No available iOS simulator runtime. Install one in Xcode before running this fixture.")
+        raise RuntimeError(f"No available iOS simulator runtime matching SDK {sdk_version}. "
+                           "Install a matching runtime in the selected Xcode before running this fixture.")
     phones = [d for d in inventory["devicetypes"] if d["name"].startswith("iPhone")]
     # Prefer an SE-sized viewport; otherwise use an available ordinary iPhone.
     phones.sort(key=lambda d: ("SE (3rd" not in d["name"], "Pro" in d["name"], d["name"]))
@@ -301,7 +317,8 @@ def select_device(output):
         for device in phones:
             try:
                 udid = command(output, "xcrun", "simctl", "create", name, device["identifier"], runtime["identifier"])
-                (output / "simulator.json").write_text(json.dumps({"udid": udid, "runtime": runtime,
+                (output / "simulator.json").write_text(json.dumps({"udid": udid, "sdk_version": sdk_version,
+                                                                  "runtime": runtime,
                                                                   "device": device}, indent=2) + "\n")
                 return udid
             except RuntimeError:
