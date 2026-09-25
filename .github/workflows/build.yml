@@ -45,22 +45,46 @@ jobs:
 
   linux:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
+    env:
+      EPIX_RELEASE_BUILD: "1"
     steps:
       - uses: actions/checkout@v7.0.1
+        with:
+          fetch-depth: 0
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge; GTK/AppIndicator for the system tray)
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+        run: sudo bash packaging/linux/install-build-deps.sh
       - name: Fetch Firefox ESR to bundle
         run: packaging/fetch-firefox-esr.sh linux
-      - name: Build Linux tarball
+      - name: Build Linux desktop installers
         env:
           EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
         run: packaging/linux/build-linux.sh
+      - name: Validate Linux packaging
+        run: |
+          python3 packaging/linux/test-packaging.py
+          shellcheck packaging/linux/*.sh packaging/linux/AppRun packaging/fetch-firefox-esr.sh
+          desktop-file-validate packaging/linux/epix.desktop
+          sudo apt-get install -y ./dist/*.deb
+          EPIX_DATA_DIR="$(mktemp -d)" epix-browser --quit
+          /opt/epixnet/firefox/firefox --headless --version
+          xvfb-run -a python3 packaging/linux/smoke-desktop.py /usr/bin/epix-browser
+          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a python3 packaging/linux/smoke-desktop.py dist/*.AppImage
       - uses: actions/upload-artifact@v7
         with:
           name: epix-linux
-          path: dist/epix-linux-*.tar.gz
+          path: |
+            dist/epix-linux-*.tar.gz
+            dist/*.deb
+            dist/*.rpm
+            dist/*.AppImage
+            dist/enable-epixnet-sandbox.sh
+            dist/SHA256SUMS
+
+  linux-package-tests:
+    needs: linux
+    uses: ./.github/workflows/linux-package-tests.yml
 
   windows:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}

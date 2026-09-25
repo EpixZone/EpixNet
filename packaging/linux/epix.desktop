@@ -1,0 +1,11 @@
+[Desktop Entry]
+Name=EpixNet
+Comment=Browse the decentralized web
+Exec=epix-browser %u
+Icon=epix
+Type=Application
+Terminal=false
+Categories=Network;WebBrowser;
+MimeType=x-scheme-handler/epix;
+StartupWMClass=EpixNet
+StartupNotify=true

@@ -22,6 +22,8 @@ mod ext;
 #[cfg(windows)]
 mod icon;
 mod ipc;
+#[cfg(target_os = "linux")]
+mod linux_sandbox;
 use epix_browser_net::proxy;
 mod shutdown;
 mod splash_view;
@@ -246,6 +248,8 @@ async fn boot(
     let firefox = find_firefox().ok_or_else(|| {
         "The Epix Browser engine was not found. Reinstall EpixNet.".to_string()
     })?;
+    #[cfg(target_os = "linux")]
+    linux_sandbox::prepare(&firefox, background, &progress)?;
 
     // The local CA for secure `https://*.epix` origins.
     let ca = Arc::new(
@@ -903,11 +907,11 @@ fn find_certutil() -> Option<PathBuf> {
 }
 
 /// Trust the local CA in the Firefox that will run the managed profile, so
-/// `https://*.epix` loads without a warning. Two mechanisms, tried in order:
+/// `https://*.epix` loads without a warning. Two supported mechanisms:
 ///
 /// 1. NSS `certutil` into the profile's `cert9.db` - scoped to the managed
-///    profile alone. Used on Linux, where `certutil` is the same NSS the distro
-///    Firefox is built against.
+///    profile alone. A fallback on Linux for a system Firefox without our
+///    packaged certificate policy.
 /// 2. Firefox **enterprise policies** (`Certificates.Install`): write the CA
 ///    PEM where the policy engine searches for bare filenames, and make sure
 ///    the install's `distribution/policies.json` references it. Our shipped
@@ -916,15 +920,17 @@ fn find_certutil() -> Option<PathBuf> {
 ///    the install dir is user-writable, like the per-user Windows bundle under
 ///    `%LOCALAPPDATA%\Epix`.
 ///
-/// macOS uses ONLY mechanism 2. A Mac with `certutil` almost always got it from
-/// Homebrew, which ships a NEWER NSS than the one our bundled Firefox is built
+/// Linux prefers mechanism 2 and macOS uses ONLY mechanism 2. A Mac with
+/// `certutil` almost always got it from Homebrew, which ships a NEWER NSS than
+/// the one our bundled Firefox is built
 /// against; the trust that newer certutil writes into `cert9.db` is not honored
 /// by the bundled Firefox's mozilla::pkix - it reports SEC_ERROR_UNKNOWN_ISSUER
 /// even though `vfychain` accepts the exact same chain. Worse, `certutil` still
 /// exits 0, so we would wrongly believe the CA is trusted and serve https that
 /// Firefox rejects with a cert warning. The policy import is Firefox's own, so
 /// it is always honored - the same path that already works on Windows (and on
-/// Macs without `certutil`, which is most end users).
+/// Macs without `certutil`, which is most end users). The same mismatch occurs
+/// between a newer Linux host's NSS tools and our bundled Firefox ESR.
 fn install_ca(profile: &Path, firefox: &Path, ca: &LocalCa) -> Result<(), String> {
     let pem = ca.cert_pem();
     #[cfg(target_os = "macos")]
@@ -934,6 +940,13 @@ fn install_ca(profile: &Path, firefox: &Path, ca: &LocalCa) -> Result<(), String
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // The host's NSS may write trust records our bundled Firefox cannot
+        // use, despite certutil succeeding and the DER appearing in cert9.db.
+        // Import through Firefox itself before considering that fallback.
+        #[cfg(target_os = "linux")]
+        if install_ca_policies(firefox, &pem).is_ok() {
+            return Ok(());
+        }
         // Why the mechanism failed: "not found", an io error, or an exit
         // status - never key or certificate material (install_ca_certutil
         // deliberately drops certutil's stderr). Named without "cert" so
