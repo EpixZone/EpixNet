@@ -82,11 +82,17 @@ class PackagingTests(unittest.TestCase):
     def test_sandbox_rule_quotes_reserved_path_characters(self):
         profile = self.sandbox_profile('/tmp/space "quote" [a]*?@{x}\\path/firefox')
         self.assertIn(r'/tmp/space \"quote\" \[a\]\*\?\@\{x\}\\path/firefox{,-bin}', profile)
-        if shutil.which("apparmor_parser"):
-            rule = self.root / "rule"
-            rule.write_text(profile)
-            subprocess.run(["apparmor_parser", "--skip-kernel-load", "--skip-read-cache", str(rule)],
-                           check=True, capture_output=True)
+
+    def test_sandbox_rule_parses_with_apparmor4(self):
+        # Match the install helper's prerequisites. Ubuntu 22.04 has a parser
+        # but cannot compile the AppArmor 4 user-namespace permission rule.
+        if not shutil.which("apparmor_parser") or not Path("/etc/apparmor.d/abi/4.0").is_file():
+            self.skipTest("AppArmor 4 parser and policy ABI are not installed")
+        rule = self.root / "rule"
+        rule.write_text(self.sandbox_profile('/tmp/space "quote" [a]*?@{x}\\path/firefox'))
+        result = subprocess.run(["apparmor_parser", "--skip-kernel-load", "--skip-read-cache", str(rule)],
+                                capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_sandbox_rule_rejects_invalid_paths(self):
         for path in ("relative/firefox", "/tmp/foo\nbar/firefox", "/tmp/foo/bash"):

@@ -15,6 +15,25 @@ on:
 permissions: {}
 
 jobs:
+  linux-packaging:
+    name: Linux packaging (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, ubuntu-24.04]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install packaging test dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends apparmor python3 xz-utils desktop-file-utils libglib2.0-bin
+      - name: Test Linux packaging and sandbox rules
+        run: python3 packaging/linux/test-packaging.py -v
+
   build-test:
     name: Build & test
     runs-on: ubuntu-latest
