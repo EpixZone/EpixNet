@@ -15,6 +15,7 @@ use crate::splash_view::SplashView;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Stage {
     Preparing,
+    Sandbox,
     Settings,
     Xites,
     Databases,
@@ -30,6 +31,7 @@ impl Stage {
     fn label(self) -> &'static str {
         match self {
             Self::Preparing => "Starting EpixNet",
+            Self::Sandbox => "Approve browser setup",
             Self::Settings => "Loading your settings",
             Self::Xites => "Restoring your xites",
             Self::Databases => "Preparing local databases",
@@ -45,6 +47,7 @@ impl Stage {
     fn detail(self) -> &'static str {
         match self {
             Self::Preparing => "Getting your local workspace ready.",
+            Self::Sandbox => "Approve the system password prompt to enable the browser sandbox. This is only needed once.",
             Self::Settings => "Loading your saved preferences and identities.",
             Self::Xites => "Checking the xites saved on this device.",
             Self::Databases => "Preparing your saved content for browsing.",

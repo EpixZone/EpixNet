@@ -41,6 +41,8 @@ PLAN.md
 # cargo mutants
 **/mutants.out*/
 dist/
+/packaging/firefox-esr/
+/packaging/linux/__pycache__/
 /.store-build/
 app-icon.png
 ios/Generated/

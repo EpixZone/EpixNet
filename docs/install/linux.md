@@ -1,5 +1,53 @@
 # Install EpixNet on Linux
 
+## Desktop installer
+
+Download the package for your system from [EpixNet releases](https://github.com/EpixZone/EpixNet/releases).
+The desktop packages include Firefox ESR and the Epix Wallet; you do not need
+Rust or a separate Firefox installation. These packages target 64-bit Intel/AMD
+PCs. See the release notes for the platforms validated for a particular build.
+
+| Your system | Package |
+| --- | --- |
+| Ubuntu 22.04+, Zorin 17/18, Mint 21/22, Pop!_OS 22.04+, Debian 12+ | `.deb` |
+| Current Fedora | `.rpm` |
+| openSUSE, Arch, Manjaro, EndeavourOS and other current glibc desktops | `.AppImage` |
+
+**Ubuntu, Zorin, Mint, Pop!_OS, Debian:** open the downloaded `.deb` with your
+software installer, or install it with `sudo apt install ./epixnet_*.deb` from
+the download folder. APT installs any missing desktop libraries automatically.
+
+**Fedora:** run `sudo dnf install ./epixnet-*.rpm`.
+
+After installation, choose **EpixNet** from the applications menu. `epix://`
+links can open it directly. The install does not change your default web browser.
+
+**AppImage:** mark `EpixNet-*-x86_64.AppImage` executable in your file manager
+(or run `chmod +x EpixNet-*-x86_64.AppImage`), then open it. Keep it in a
+permanent folder. If your desktop cannot mount AppImages, run it with
+`--appimage-extract-and-run`. This format requires glibc 2.35 or newer; Alpine
+Linux's musl C library is not supported.
+
+On Ubuntu 24.04 and newer, the AppImage asks for administrator approval on
+first launch if the browser sandbox needs permission. Approve the system
+password prompt and EpixNet continues automatically. Later launches reuse
+that permission. No separate script or restart is needed. Native packages
+set this up during installation. Removing the permission or changing the
+AppImage's name or temporary folder may require approval again.
+
+Before upgrading, use **Quit** in EpixNet's tray menu. Upgrade by installing the
+new package or replacing the AppImage. To remove a native package, use your
+software manager, `sudo apt remove epixnet`, `sudo dnf remove epixnet`, or
+delete the AppImage file. Profiles, keys, wallets and sites remain in your
+user data directory; uninstalling does not erase them.
+
+If a release only has the older `.tar.gz`, extract the entire archive into a
+permanent folder and run its `install.sh`. Keep the `firefox` folder alongside
+`epix-browser`. Moving/deleting the extracted tree breaks its menu shortcut;
+run `install.sh` again after moving it.
+
+## Build from source
+
 This guide starts from a fresh Linux machine with nothing installed. Follow the steps in order. You only do steps 1 to 3 once; after that, building again is just step 5.
 
 Type the commands into your terminal.

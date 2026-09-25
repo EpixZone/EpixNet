@@ -1,0 +1,51 @@
+name: Linux package compatibility
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  install:
+    name: Install on ${{ matrix.name }}
+    runs-on: ubuntu-22.04
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Ubuntu 24.04 (Zorin 18 base)
+            image: ubuntu:24.04
+            format: deb
+            gui: "1"
+          - name: Debian 12
+            image: debian:12
+            format: deb
+          - name: Fedora 44
+            image: registry.fedoraproject.org/fedora:44
+            format: rpm-fedora
+          - name: openSUSE Tumbleweed (AppImage)
+            image: registry.opensuse.org/opensuse/tumbleweed:latest
+            format: appimage-suse
+          - name: Arch Linux (AppImage)
+            image: archlinux:base
+            format: appimage
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/download-artifact@v8
+        with:
+          name: epix-linux
+          path: packages
+      - name: Verify and test the published package contents
+        env:
+          TEST_IMAGE: ${{ matrix.image }}
+          TEST_FORMAT: ${{ matrix.format }}
+          TEST_GUI: ${{ matrix.gui || '0' }}
+        run: |
+          (cd packages && sha256sum -c SHA256SUMS)
+          docker run --rm \
+            -e EPIX_TEST_GUI="$TEST_GUI" \
+            -v "$PWD/packages:/packages:ro" \
+            -v "$PWD/packaging/linux:/tests:ro" \
+            "$TEST_IMAGE" bash /tests/test-install.sh "$TEST_FORMAT"

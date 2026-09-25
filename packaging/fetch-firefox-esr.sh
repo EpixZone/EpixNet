@@ -9,11 +9,21 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OS="${1:-osx}"
+MOZILLA_OS="$OS"
+# Mozilla's `linux` product is i686, even on a 64-bit host. Never bundle it
+# with our 64-bit Rust executables (the old Linux release did exactly that).
+if [ "$OS" = linux ]; then
+  case "${EPIX_ARCH:-$(uname -m)}" in
+    x86_64|amd64) MOZILLA_OS=linux64 ;;
+    aarch64|arm64) MOZILLA_OS=linux64-aarch64 ;;
+    *) echo "unsupported Linux architecture: ${EPIX_ARCH:-$(uname -m)}" >&2; exit 1 ;;
+  esac
+fi
 LANG_="${EPIX_FF_LANG:-en-US}"
 OUT="$REPO_ROOT/packaging/firefox-esr"
 mkdir -p "$OUT"
 
-URL="https://download.mozilla.org/?product=firefox-esr-latest&os=${OS}&lang=${LANG_}"
+URL="https://download.mozilla.org/?product=firefox-esr-latest&os=${MOZILLA_OS}&lang=${LANG_}"
 echo "· downloading Firefox ESR ($OS, $LANG_)"
 
 case "$OS" in
@@ -30,8 +40,15 @@ case "$OS" in
     echo "  build with: EPIX_BUNDLE_FIREFOX=\"$OUT/Firefox.app\" packaging/macos/build-app.sh"
     ;;
   linux)
-    curl -L -o "$OUT/firefox-esr.tar.xz" "$URL"
-    tar -C "$OUT" -xf "$OUT/firefox-esr.tar.xz"
+    curl --fail --location --retry 3 -o "$OUT/firefox-esr.tar.xz" "$URL"
+    # Extract into an empty tree so a new ESR cannot retain obsolete files.
+    TMP="$(mktemp -d "$OUT/.firefox-XXXXXX")"
+    trap 'rm -rf "$TMP"' EXIT
+    tar -C "$TMP" -xf "$OUT/firefox-esr.tar.xz"
+    test -x "$TMP/firefox/firefox"
+    test -f "$TMP/firefox/libxul.so"
+    rm -rf "$OUT/firefox"
+    mv "$TMP/firefox" "$OUT/firefox"
     rm -f "$OUT/firefox-esr.tar.xz"
     echo "· ready: $OUT/firefox/ (Linux)"
     ;;
