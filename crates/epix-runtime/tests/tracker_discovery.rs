@@ -18,6 +18,7 @@ use serde_json::json;
 struct Network {
     routes: Mutex<HashMap<PeerAddr, EdxHook>>,
     dials: Mutex<Vec<PeerAddr>>,
+    fail_primary: std::sync::atomic::AtomicBool,
 }
 
 struct Endpoint {
@@ -29,6 +30,13 @@ struct Endpoint {
 impl Transport for Endpoint {
     fn scheme(&self) -> &'static str {
         "test-network"
+    }
+
+    async fn dial_lane(&self, target: &PeerAddr, lane: u8) -> Result<PeerStream> {
+        if lane == 0 && self.network.fail_primary.load(std::sync::atomic::Ordering::Relaxed) {
+            return Err(epix_core::Error::Protocol("first circuit unavailable".into()));
+        }
+        self.dial(target).await
     }
 
     async fn dial(&self, target: &PeerAddr) -> Result<PeerStream> {
@@ -91,9 +99,14 @@ impl Node {
                     state.set_fileserver_port(sa.port()).await;
                     state.set_clearnet_listener(Some(*sa)).await;
                 }
+                PeerAddr::Onion { host, port } => {
+                    state.set_fileserver_port(*port).await;
+                    state.set_tor_status(true, "OK").await;
+                    state.set_onion_address(host).await;
+                }
                 _ => unreachable!(),
             }
-            let hook = if i2p {
+            let hook = if listen.is_overlay() {
                 serve.overlay_hook()
             } else {
                 serve.clearnet_hook(None)
@@ -104,7 +117,7 @@ impl Node {
     }
 
     async fn register(&self, address: &str) -> XiteStorage {
-        let storage = XiteStorage::new(self._data.path().join(address));
+        let storage = XiteStorage::new(self._data.path().join("data").join(address));
         self.state
             .add_xite(
                 address,
@@ -116,6 +129,102 @@ impl Node {
             .await;
         storage
     }
+}
+
+/// A hub peer can serve its manifest without holding its optional images.
+/// The only holder must be reached even when it is outside the first session.
+async fn rare_optional_image(i2p: bool, fail_primary: bool) {
+    let network = Arc::new(Network::default());
+    network.fail_primary.store(fail_primary, std::sync::atomic::Ordering::Relaxed);
+    let client = Node::new(&network, None, i2p, !i2p).await;
+    if i2p {
+        client.state.set_i2p_status(json!({ "phase": "Ready" })).await;
+    } else {
+        client.state.set_tor_status(true, "OK").await;
+    }
+    let key = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&key).unwrap();
+    let bytes: Vec<u8> = (0..41_949).map(|i| (i % 251) as u8).collect();
+    let mut manifest = json!({
+        "address": address, "modified": 100.0, "files": {},
+        "optional": ".*jpg",
+        "files_optional": { "photo.jpg": {
+            "size": bytes.len(), "sha512": XiteStorage::hash_bytes(&bytes),
+            "b3": ObjId::of(&bytes).to_string()
+        }}
+    });
+    epix_content::sign(&mut manifest, &key).unwrap();
+    let signed = serde_json::to_vec(&manifest).unwrap();
+    let destination = client.register(&address).await;
+    destination.write("content.json", &signed).unwrap();
+    assert!(client.state.load_content_from_disk(&address).await);
+
+    let mut nodes = Vec::new();
+    for i in 0..24 {
+        let host = format!("{}{}", (b'a' + i) as char, "a".repeat(if i2p { 51 } else { 55 }));
+        let peer = if i2p {
+            PeerAddr::I2p { dest: format!("{host}.b32"), port: 26552 }
+        } else {
+            PeerAddr::Onion { host, port: 26552 }
+        };
+        let node = Node::new(&network, Some(peer.clone()), i2p, !i2p).await;
+        if i2p {
+            node.state.set_i2p_status(json!({ "phase": "Ready" })).await;
+        }
+        let storage = node.register(&address).await;
+        storage.write("content.json", &signed).unwrap();
+        assert!(node.state.load_content_from_disk(&address).await);
+        client.state.add_peers(&address, [peer.clone()]).await;
+        nodes.push((peer, node, storage));
+    }
+
+    let first = client.state.fetch_session_peers(&address, 8).await;
+    assert_eq!(first.len(), 8);
+    let ranked = client.state.fetch_session_peers(&address, usize::MAX).await;
+    let selected = if fail_primary { &first[0] } else {
+        ranked.iter().rev().find(|peer| !first.contains(peer)).unwrap()
+    };
+    if !fail_primary {
+        assert!(!ranked[..8].contains(selected), "the test must require expanding the search");
+    }
+    let (holder, node, storage) = nodes.iter().find(|(peer, _, _)| peer == selected).unwrap();
+    storage.write("photo.jpg", &bytes).unwrap();
+    node.state.edx_register_xite(&address).await.unwrap();
+    assert!(node.state.edx_store().await.unwrap().is_complete(ObjId::of(&bytes)).unwrap(),
+        "the holder must have a verified, serveable image before the request");
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.state.edx_fetch_file(&address, "photo.jpg", false),
+    ).await.expect("a responsive rare image holder should be found promptly");
+    assert!(result.unwrap().unwrap(), "optional image should download");
+    assert_eq!(destination.read("photo.jpg").unwrap(), bytes);
+    let dials = network.dials.lock().unwrap();
+    assert!(dials.contains(holder), "the lower-ranked holder was actually dialed");
+    assert!(dials.iter().all(|peer| if i2p {
+        matches!(peer, PeerAddr::I2p { .. })
+    } else {
+        matches!(peer, PeerAddr::Onion { .. })
+    }), "no direct TCP fallback");
+}
+
+#[tokio::test]
+async fn onion_optional_image_holder_beyond_first_eight() {
+    rare_optional_image(false, false).await;
+}
+
+#[tokio::test]
+async fn i2p_optional_image_holder_beyond_first_eight() {
+    rare_optional_image(true, false).await;
+}
+
+#[tokio::test]
+async fn onion_optional_image_survives_failed_first_lane() {
+    rare_optional_image(false, true).await;
+}
+
+#[tokio::test]
+async fn i2p_optional_image_survives_failed_first_lane() {
+    rare_optional_image(true, true).await;
 }
 
 async fn discover_and_download(i2p: bool, base: bool, mixed_tracker: bool) {
