@@ -17819,15 +17819,40 @@ impl AppState {
         // doesn't read "undefined"). try_read because this is called from
         // sync per-file progress callbacks: under momentary write contention
         // the title just rides the next event instead.
-        let title = self
+        // For an installed xite carry the same content summary and settings
+        // the full site info sends: xites read `content.settings` (EpixTalk's
+        // admins and sticky topics) and `settings.own` from every event.
+        let (content, settings) = self
             .xites
             .try_read()
             .ok()
-            .and_then(|xites| xites.get(address)?.content.as_ref()?.get("title").cloned());
-        let content = match title {
-            Some(t) => json!({ "title": t }),
-            None => json!({}),
-        };
+            .and_then(|xites| {
+                let entry = xites.get(address)?;
+                Some((
+                    entry.content.as_ref().map(summarize_content),
+                    serde_json::to_value(&entry.settings).ok(),
+                ))
+            })
+            .unwrap_or((None, None));
+        let content = content.unwrap_or_else(|| json!({}));
+        let settings = settings.unwrap_or_else(|| json!({ "size": 0 }));
+        // The wrapper relays every `setSiteInfo` into the page, and xites
+        // (EpixTalk, EpixPost) replace their `site_info` with whatever arrives
+        // and re-read `auth_address` from it. These events are not clone-only:
+        // the user-content sync of an installed xite reports through the same
+        // path, so an event without the identity fields logged the visitor
+        // out of the forum mid-sync. Carry the trio the full site info sends.
+        // try_read because this is called from sync per-file callbacks; the
+        // identity store is only written on identity changes, so it is almost
+        // never contended, and when it is, a full site info follows.
+        let identity = self.user.try_read().ok().map(|user| {
+            let identity = user.identity_for(address);
+            (
+                identity.map(|i| Value::from(i.auth_address.clone())).unwrap_or(Value::Null),
+                identity.map(|i| Value::from(i.cert_user_id())).unwrap_or(Value::Null),
+                identity.map(|i| Value::from(i.xid())).unwrap_or(Value::Null),
+            )
+        });
         let mut params = json!({
             "address": address,
             "clone_status": self.clone_status(address),
@@ -17836,19 +17861,35 @@ impl AppState {
             "started_task_num": 0,
             "bad_files": 0,
             "size_limit": DEFAULT_SIZE_LIMIT_MB,
-            "settings": { "size": 0 },
+            "settings": settings,
             // Always an object - dashboard rows read `content.title` unchecked.
             "content": content,
             "event": event,
         });
         if let (Value::Object(p), Value::Object(f)) = (&mut params, fields) {
             p.extend(retained_progress);
+            if let Some((auth_address, cert_user_id, xid_directory)) = &identity {
+                p.insert("auth_address".to_string(), auth_address.clone());
+                p.insert("cert_user_id".to_string(), cert_user_id.clone());
+                p.insert("xid_directory".to_string(), xid_directory.clone());
+            }
             for (k, v) in f {
                 p.insert(k, v);
             }
         }
         self.push_event("setSiteInfo", params, Some("siteChanged"), Some(address.to_string()),
         );
+        if identity.is_none() {
+            // The identity store was being written: the page must not be left
+            // holding an identity-less event, so a full site info follows.
+            if let (Ok(handle), Some(state)) = (
+                tokio::runtime::Handle::try_current(),
+                self.self_weak.get().and_then(std::sync::Weak::upgrade),
+            ) {
+                let address = address.to_string();
+                handle.spawn(async move { state.push_xite_info(&address).await });
+            }
+        }
     }
 
     /// Whether an on-demand resolver is installed (the browser/node wires one;
@@ -48595,6 +48636,58 @@ mod tests {
         s.push_clone_event("epix1x", json!(["file_done", "content.json"]), json!({}));
         let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
         assert_eq!(p["params"]["content"]["title"], "xID");
+    }
+
+    /// The user-content sync of an installed xite reports progress through
+    /// the same `setSiteInfo` events the clone uses, and the wrapper relays
+    /// each one into the page. A xite replaces its `site_info` with whatever
+    /// arrives, so an event without the identity fields logs the visitor out
+    /// of the forum mid-sync ("Please connect to EpixNet first" on the xID
+    /// button). Every clone event must carry the identity the full site info
+    /// would.
+    #[tokio::test]
+    async fn clone_events_carry_the_installed_xites_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::new("test");
+        s.add_xite(
+            "epix1x",
+            XiteEntry { storage: XiteStorage::new(dir.path()), content: None },
+        )
+        .await;
+        let alice = s.test_link_identity("alice").await;
+        s.update_content(
+            "epix1x",
+            Some(json!({ "title": "Talk", "settings": { "admins": ["epix1admin"] } })),
+        )
+        .await;
+        let full = s.xite_info("epix1x").await;
+        assert_eq!(full["auth_address"], alice, "fixture: the xite inherits the identity");
+
+        let mut events = s.subscribe_events();
+        s.push_clone_event(
+            "epix1x",
+            json!(["file_done", "data/users/bob.epix/content.json"]),
+            json!({ "peers": 3, "bad_files": 2 }),
+        );
+        let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
+        assert_eq!(p["params"]["auth_address"], full["auth_address"]);
+        assert_eq!(p["params"]["cert_user_id"], full["cert_user_id"]);
+        assert_eq!(p["params"]["xid_directory"], full["xid_directory"]);
+        assert_eq!(p["params"]["bad_files"], 2, "progress fields still ride along");
+        // The admin settings a forum reads from `content.settings` ride along
+        // too, as does `settings` (the wrapper and xites read `settings.own`).
+        assert_eq!(p["params"]["content"]["settings"]["admins"][0], "epix1admin");
+        assert_eq!(p["params"]["content"], full["content"]);
+        assert_eq!(p["params"]["settings"], full["settings"]);
+
+        // Browsed anonymously: the fields are present and null, as in the full
+        // site info, so a page can tell "logged out" from "not reported".
+        s.identity_select("epix1x", Some("")).await.unwrap();
+        let _ = events.try_recv();
+        s.push_clone_event("epix1x", json!(["peers_added", 1]), json!({}));
+        let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
+        assert!(p["params"].get("auth_address").is_some(), "field present");
+        assert!(p["params"]["auth_address"].is_null());
     }
 
     #[tokio::test]
