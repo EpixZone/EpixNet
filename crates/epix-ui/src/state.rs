@@ -5278,6 +5278,9 @@ impl Transport for OverlayTransport {
         "overlay"
     }
     async fn dial(&self, addr: &PeerAddr) -> Result<epix_transport::PeerStream, epix_core::Error> {
+        self.dial_lane(addr, 0).await
+    }
+    async fn dial_lane(&self, addr: &PeerAddr, lane: u8) -> Result<epix_transport::PeerStream, epix_core::Error> {
         let transport = match addr {
             PeerAddr::I2p { .. } => self.i2p.as_ref().or(self.base.as_ref()),
             PeerAddr::Rns(_) => self.rns.as_ref().or(self.base.as_ref()),
@@ -5285,7 +5288,7 @@ impl Transport for OverlayTransport {
         };
         transport
             .ok_or_else(|| epix_core::Error::Protocol(format!("no {} transport", addr.scheme())))?
-            .dial(addr)
+            .dial_lane(addr, lane)
             .await
     }
 }
@@ -34453,6 +34456,35 @@ mod tests {
         // File present without the key: default on (opt-out).
         std::fs::write(&path, br#"{"clearnet_allow": {}}"#).unwrap();
         assert_eq!(state.browser_settings().await, (true, true));
+    }
+
+    #[tokio::test]
+    async fn composed_transport_preserves_transfer_lanes() {
+        struct LaneTransport(&'static str);
+        #[async_trait::async_trait]
+        impl Transport for LaneTransport {
+            fn scheme(&self) -> &'static str { self.0 }
+            async fn dial(&self, _: &PeerAddr) -> Result<epix_transport::PeerStream, epix_core::Error> {
+                Err(epix_core::Error::Protocol("lane information lost".into()))
+            }
+            async fn dial_lane(&self, _: &PeerAddr, lane: u8) -> Result<epix_transport::PeerStream, epix_core::Error> {
+                Err(epix_core::Error::Protocol(format!("{} lane {lane}", self.0)))
+            }
+        }
+        let state = AppState::new("lanes");
+        state.set_transport(Arc::new(LaneTransport("tor"))).await;
+        state.set_i2p_transport(Arc::new(LaneTransport("i2p"))).await;
+        let transport = state.transport().await.unwrap();
+        for (address, name) in [
+            (format!("{}.onion:26552", "a".repeat(56)), "tor"),
+            (format!("{}.b32.i2p:26552", "a".repeat(52)), "i2p"),
+        ] {
+            let peer = PeerAddr::parse(&address).unwrap();
+            for lane in 0..3 {
+                let error = transport.dial_lane(&peer, lane).await.err().unwrap();
+                assert!(error.to_string().contains(&format!("{name} lane {lane}")));
+            }
+        }
     }
 
     #[tokio::test]

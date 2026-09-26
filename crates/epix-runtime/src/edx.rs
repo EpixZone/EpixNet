@@ -822,6 +822,37 @@ const SESSION_MAX_AGE: u64 = 90;
 /// from flooding the Tor/I2P client.
 const SESSION_DIAL_CONCURRENCY: usize = 4;
 
+// Search beyond the first eight hub peers when they do not hold this object.
+// These are candidates, not concurrent dials. Later attempts start with peers
+// this object has not tried, so a large hub cannot pin every retry to one set.
+const SESSION_SEARCH_CANDIDATES: usize = 64;
+const SESSION_SEARCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90);
+const SESSION_SEARCH_FILES: usize = 64;
+const SESSION_SEARCH_HISTORY: usize = 256;
+
+#[derive(Default)]
+struct ObjectPeerSearch {
+    touched: u64,
+    sequence: u64,
+    tried: HashMap<PeerAddr, u64>,
+    holders: std::collections::HashSet<PeerAddr>,
+}
+
+impl ObjectPeerSearch {
+    fn note(&mut self, peer: PeerAddr) {
+        self.touched = now_secs();
+        self.sequence = self.sequence.saturating_add(1);
+        self.holders.remove(&peer);
+        self.tried.insert(peer, self.sequence);
+        if self.tried.len() > SESSION_SEARCH_HISTORY {
+            if let Some(oldest) = self.tried.iter().min_by_key(|(_, seq)| *seq).map(|(p, _)| p.clone()) {
+                self.tried.remove(&oldest);
+                self.holders.remove(&oldest);
+            }
+        }
+    }
+}
+
 /// Bound on a cached-session revalidation round trip (one GetBitfield per
 /// live link). Much tighter than EDX_FETCH_TIMEOUT: a healthy overlay link
 /// answers in a couple of seconds, and a dead one must not stall the serve
@@ -1852,6 +1883,7 @@ struct RuntimeEdxFetcher {
     /// overlay. Hits are revalidated and dead links evicted (`peers_for`),
     /// so reuse is only ever a shortcut, never a wrong answer.
     peer_cache: Arc<Mutex<HashMap<ObjId, CachedPeers>>>,
+    peer_search: Arc<Mutex<HashMap<ObjId, ObjectPeerSearch>>>,
     /// One async preparation cell per merge-delta object currently fanning out
     /// to peers. Concurrent pushes hash-check and insert the shared payload
     /// once, then each keeps its own eviction hold through its Update RPC.
@@ -2136,6 +2168,7 @@ impl RuntimeEdxFetcher {
             link_pool: Arc::default(),
             streaming: Arc::default(),
             peer_cache: Arc::default(),
+            peer_search: Arc::default(),
             merge_prepare: Arc::default(),
             xfer: Arc::default(),
             inline_wire_memo: Arc::default(),
@@ -2784,6 +2817,39 @@ impl RuntimeEdxFetcher {
         Ok(self.state.edx_resolve(address, inner_path).await)
     }
 
+    async fn session_candidates(&self, address: &str, id: ObjId) -> Vec<PeerAddr> {
+        let mut peers = self.state.fetch_session_peers(address, usize::MAX).await;
+        let mut searches = self.peer_search.lock().expect("peer search");
+        searches.retain(|_, s| now_secs().saturating_sub(s.touched) < 300);
+        if let Some(search) = searches.get(&id) {
+            // Keep known holders first when a partial transfer resumes. Try
+            // new contacts before repeating peers that lacked this image.
+            peers.sort_by_key(|peer| {
+                let rank = if search.holders.contains(peer) { 0 }
+                    else if !search.tried.contains_key(peer) { 1 } else { 2 };
+                (rank, search.tried.get(peer).copied().unwrap_or(0))
+            });
+        }
+        peers.truncate(SESSION_SEARCH_CANDIDATES);
+        peers
+    }
+
+    fn note_search_peer(&self, id: ObjId, peer: &PeerAddr) {
+        let mut searches = self.peer_search.lock().expect("peer search");
+        if searches.len() >= SESSION_SEARCH_FILES && !searches.contains_key(&id) {
+            if let Some(oldest) = searches.iter().min_by_key(|(_, s)| s.touched).map(|(id, _)| *id) {
+                searches.remove(&oldest);
+            }
+        }
+        searches.entry(id).or_default().note(peer.clone());
+    }
+
+    fn note_search_holder(&self, id: ObjId, peer: &PeerAddr) {
+        if let Some(search) = self.peer_search.lock().expect("peer search").get_mut(&id) {
+            search.holders.insert(peer.clone());
+        }
+    }
+
     /// Dial the xite's connectable peers as EDX links and learn what each
     /// holds of `id`. One link per peer, reused for the whole fetch. Also
     /// returns each peer label's authenticated node key, for crediting.
@@ -2812,16 +2878,13 @@ impl RuntimeEdxFetcher {
         ),
         String,
     > {
-        // Data-session slots: peers with data history for this xite first
-        // (see fetch_session_peers) - the gateway-style non-seeder must not
-        // occupy one of the 8 dials while a byte source waits below the cut.
-        let peers = self.state.fetch_session_peers(address, 8).await;
+        let peers = self.session_candidates(address, id).await;
         if peers.is_empty() {
             return Err("no peers".into());
         }
         let total = peers.len();
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
-        self.spawn_dial_driver(peers, address.to_string(), id, tx);
+        let attempted = self.spawn_dial_driver(peers, address.to_string(), id, tx);
 
         let mut handles: Vec<PeerHandle> = Vec::new();
         let mut node_pks: HashMap<String, Vec<u8>> = HashMap::new();
@@ -2829,9 +2892,11 @@ impl RuntimeEdxFetcher {
         // Armed by the first usable handle: from then on the collection is
         // bounded by the grace, not by the slowest dial.
         let mut grace: Option<tokio::time::Instant> = None;
+        let search_deadline = tokio::time::Instant::now() + SESSION_SEARCH_TIMEOUT;
         while resolved < total {
             let next = tokio::select! {
                 r = rx.recv() => r,
+                _ = tokio::time::sleep_until(search_deadline), if grace.is_none() => break,
                 _ = async { tokio::time::sleep_until(grace.unwrap()).await },
                     if grace.is_some() => break,
             };
@@ -2857,24 +2922,16 @@ impl RuntimeEdxFetcher {
         // in the link pool, it reaches the object's cached session via
         // add_cached_lane, and the bulk path joins it into the running fetch
         // through the returned channel.
-        self.xfer.note_session(id, address, now_secs(), total as u64, handles.len() as u64);
+        self.xfer.note_session(
+            id, address, now_secs(), attempted.load(std::sync::atomic::Ordering::Relaxed) as u64,
+            handles.len() as u64,
+        );
         if handles.is_empty() {
             return Err("no EDX peer holds this object".into());
         }
         Ok((handles, node_pks, rx))
     }
 
-    /// Open this peer's extra transfer lanes and hand each one to the session
-    /// as it lands.
-    ///
-    /// The bitfield is NOT re-fetched per lane: a lane is another path to the
-    /// same node, which holds the same bytes, so asking again would cost a
-    /// round trip per lane to learn what we already know. They dial
-    /// concurrently, and each is announced the moment it is up so the fetch
-    /// widens while the rest are still building.
-    ///
-    /// Only overlay peers get lanes ([`lanes_for`]); for anything else this
-    /// returns without dialing.
     /// Dial `peers` for a session in the background, reporting every usable
     /// link on `tx` as it lands and feeding each peer's outcome back to the
     /// xite's registry when the last one settles.
@@ -2889,20 +2946,30 @@ impl RuntimeEdxFetcher {
         address: String,
         id: ObjId,
         tx: tokio::sync::mpsc::UnboundedSender<LaneResult>,
-    ) {
+    ) -> Arc<std::sync::atomic::AtomicUsize> {
         let this = self.clone();
+        let attempted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dial_count = attempted.clone();
         tokio::spawn(async move {
             let mut outcomes: Vec<(PeerAddr, bool)> = Vec::new();
             let mut join = tokio::task::JoinSet::new();
             let mut pending = peers.into_iter();
+            let found = Arc::new(std::sync::atomic::AtomicBool::new(false));
             loop {
-                while join.len() < SESSION_DIAL_CONCURRENCY {
+                while join.len() < SESSION_DIAL_CONCURRENCY
+                    && !tx.is_closed()
+                    && (dial_count.load(std::sync::atomic::Ordering::Relaxed) < 8
+                        || !found.load(std::sync::atomic::Ordering::Relaxed))
+                {
                     let Some(peer) = pending.next() else { break };
+                    this.note_search_peer(id, &peer);
+                    dial_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let this = this.clone();
                     let address = address.clone();
                     let tx = tx.clone();
+                    let found = found.clone();
                     join.spawn(async move {
-                        this.dial_peer_for_session(peer, address, id, tx).await
+                        this.dial_peer_for_session(peer, address, id, tx, &found).await
                     });
                 }
                 let Some(res) = join.join_next().await else { break };
@@ -2918,10 +2985,11 @@ impl RuntimeEdxFetcher {
             drop(tx);
             this.state.note_edx_dials(&address, outcomes).await;
         });
+        attempted
     }
 
-    /// Dial one peer for a session - lane 0, its bitfield, and its extra
-    /// lanes - reporting each usable link on `tx`. Returns the peer's dial
+    /// Dial a peer's lanes and fetch its bitfield on the first working link.
+    /// Report each usable link on `tx`. Returns the peer's dial
     /// outcome for the registry: `true` when it answered at all, whatever it
     /// then turned out to hold.
     async fn dial_peer_for_session(
@@ -2930,22 +2998,28 @@ impl RuntimeEdxFetcher {
         address: String,
         id: ObjId,
         tx: tokio::sync::mpsc::UnboundedSender<LaneResult>,
+        found: &std::sync::atomic::AtomicBool,
     ) -> (PeerAddr, bool) {
-        // Start the extra lanes' circuit builds NOW, next to lane 0's rather
-        // than after it. Building them afterwards put them a whole circuit
-        // build behind the session's 2s first-handle grace, so they always
-        // missed the session that wanted them. In parallel they finish
-        // alongside lane 0, and lane 0 still owes a bitfield round trip after
-        // that, which is the slack they land in.
-        let mut lanes = self.start_extra_lanes(&peer);
-        // A peer that cannot be reached, or that answers and then has nothing
-        // for us, takes its half-built lanes down with it: leaving circuits to
-        // finish for a node that is no use to this fetch is exactly the churn
-        // that gets guards disabled.
-        let Ok((conn, identity, reg, _activity)) = self.link(&peer).await else {
-            lanes.abort_all();
-            let _ = tx.send((peer.clone(), None, true));
-            return (peer, false);
+        // Any authenticated lane can start the image. Waiting specifically for
+        // lane 0 discarded working Tor/I2P paths whenever that one circuit
+        // failed, even though another lane had already completed its handshake.
+        let mut lanes = self.start_session_lanes(&peer);
+        let (conn, identity, reg, _activity) = loop {
+            match lanes.join_next().await {
+                Some(Ok(Ok(link))) => break link,
+                Some(Ok(Err(error))) => {
+                    // Preserve the actual failure instead of replacing it with
+                    // the cache-hit message from the next immediate retry.
+                    if error != "recent dial failure (negative cache)" {
+                        self.xfer.note_error(id, &address, now_secs(), &format!("{peer}: {error}"));
+                    }
+                }
+                Some(Err(_)) => continue,
+                None => {
+                    let _ = tx.send((peer.clone(), None, true));
+                    return (peer, false);
+                }
+            }
         };
         reg.note_cmd_sent("GetBitfield", Some(&address));
         let bits = match tokio::time::timeout(
@@ -2954,9 +3028,15 @@ impl RuntimeEdxFetcher {
         )
         .await
         {
-            Ok(Ok((_sz, bits))) => bits,
+            Ok(Ok((size, bits))) if size == 0 || !bits.is_empty() => bits,
+            Ok(Ok(_)) => {
+                lanes.abort_all();
+                let _ = tx.send((peer.clone(), None, true));
+                return (peer, true);
+            }
             // A quick refusal: reachable, just nothing usable for this object.
-            Ok(Err(_)) => {
+            Ok(Err(error)) => {
+                self.xfer.note_error(id, &address, now_secs(), &format!("{peer}: {error}"));
                 lanes.abort_all();
                 let _ = tx.send((peer.clone(), None, true));
                 return (peer, true);
@@ -2966,29 +3046,27 @@ impl RuntimeEdxFetcher {
             // as reachable and re-burning this timeout at the top of every cold
             // session.
             Err(_) => {
+                self.xfer.note_error(id, &address, now_secs(), &format!("{peer}: bitfield request timed out"));
+                self.link_pool.evict(&peer);
                 lanes.abort_all();
                 let _ = tx.send((peer.clone(), None, true));
                 return (peer, false);
             }
         };
-        // Lane 0 goes out FIRST so the fetch can start on it; the extra lanes
-        // follow as they land.
+        found.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.note_search_holder(id, &peer);
+        // The first working lane starts the fetch; the others follow as they land.
         let _ = tx.send((peer.clone(), Some((conn, identity.clone(), bits.clone())), true));
         self.collect_extra_lanes(lanes, id, &peer, &identity, &bits, &tx).await;
         (peer, true)
     }
 
-    fn start_extra_lanes(&self, peer: &PeerAddr) -> tokio::task::JoinSet<Option<Conn>> {
+    fn start_session_lanes(&self, peer: &PeerAddr) -> tokio::task::JoinSet<Result<Link, String>> {
         let mut join = tokio::task::JoinSet::new();
-        for lane in 1..lanes_for(peer) {
+        for lane in 0..lanes_for(peer) {
             let this = self.clone();
             let peer = peer.clone();
-            join.spawn(async move {
-                this.link_lane(&peer, lane)
-                    .await
-                    .ok()
-                    .map(|(conn, _, _, _)| conn)
-            });
+            join.spawn(async move { this.link_lane(&peer, lane).await });
         }
         join
     }
@@ -3007,7 +3085,7 @@ impl RuntimeEdxFetcher {
     /// until the sweep takes it.
     async fn collect_extra_lanes(
         &self,
-        mut lanes: tokio::task::JoinSet<Option<Conn>>,
+        mut lanes: tokio::task::JoinSet<Result<Link, String>>,
         id: ObjId,
         peer: &PeerAddr,
         identity: &PeerIdentity,
@@ -3015,7 +3093,8 @@ impl RuntimeEdxFetcher {
         tx: &tokio::sync::mpsc::UnboundedSender<LaneResult>,
     ) {
         while let Some(res) = lanes.join_next().await {
-            let Ok(Some(conn)) = res else { continue };
+            let Ok(Ok((conn, lane_identity, _, _))) = res else { continue };
+            if lane_identity.node_pk != identity.node_pk { continue; }
             let handle = PeerHandle {
                 conn: conn.clone(),
                 class: Class::of_addr(peer),
@@ -10340,6 +10419,34 @@ mod tests {
         store.ensure_sparse(id, Ns::Plain, 4096, 1).unwrap();
         drop(fetcher.claim_object(&store, id, Ns::Plain, 4096, 1).unwrap());
         assert!(store.contains(id).unwrap(), "a pre-existing record is left alone");
+    }
+
+    #[tokio::test]
+    async fn object_search_advances_without_affecting_other_images() {
+        let (state, address, _, _, _dir) = staged_only_node(serde_json::json!({})).await;
+        let peers = (1..=80).map(|i| PeerAddr::parse(&format!("8.8.4.{i}:26552")).unwrap());
+        state.add_peers(&address, peers).await;
+        let fetcher = RuntimeEdxFetcher::new(state, epix_crypt::new_seed(), None);
+        let id = ObjId([1; 32]);
+        let first = fetcher.session_candidates(&address, id).await;
+        assert_eq!(first.len(), SESSION_SEARCH_CANDIDATES);
+        for peer in &first { fetcher.note_search_peer(id, peer); }
+        let next = fetcher.session_candidates(&address, id).await;
+        assert_eq!(next.len(), SESSION_SEARCH_CANDIDATES);
+        assert!(next[..16].iter().all(|peer| !first.contains(peer)));
+        assert_eq!(fetcher.session_candidates(&address, ObjId([2; 32])).await, first);
+        fetcher.note_search_holder(id, &first[0]);
+        assert_eq!(fetcher.session_candidates(&address, id).await[0], first[0],
+            "resuming a partial image should reuse its known holder");
+
+        for port in 1000..1400 {
+            fetcher.note_search_peer(id, &PeerAddr::parse(&format!("8.8.8.8:{port}")).unwrap());
+        }
+        assert_eq!(fetcher.peer_search.lock().unwrap()[&id].tried.len(), SESSION_SEARCH_HISTORY);
+        for byte in 2..100 {
+            fetcher.note_search_peer(ObjId([byte; 32]), &first[0]);
+        }
+        assert_eq!(fetcher.peer_search.lock().unwrap().len(), SESSION_SEARCH_FILES);
     }
 
     /// Build a state whose only xite declares `files`, staged (nothing on
