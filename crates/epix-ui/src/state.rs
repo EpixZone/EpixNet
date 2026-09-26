@@ -516,6 +516,9 @@ struct ManifestLease {
 /// Global Store-activation read authority plus the per-manifest mutex. The
 /// activation guard is outermost, so Store exposure can take the write side
 /// and observe a quiescent, complete xite registry and filesystem snapshot.
+/// A committed transaction releases its activation read before the ingest
+/// that follows its commit ([`ManifestLease::release_activation`]), so the
+/// ingest's own read is never nested inside the transaction's.
 struct ManifestGuard {
     _activation: Option<tokio::sync::OwnedRwLockReadGuard<()>>,
     _manifest: Option<tokio::sync::OwnedMutexGuard<()>>,
@@ -1235,6 +1238,26 @@ impl ManifestLease {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if let Some(guard) = guard.as_mut() {
             guard._manifest.take();
+        }
+    }
+
+    /// Release the Store-activation read while the lease itself lives on.
+    /// A committed transaction calls this before the ingest that follows its
+    /// commit: `ingest_file_from` takes its own activation read and re-checks
+    /// that the xite is still registered and unchanged, so nothing after the
+    /// commit needs the transaction's read, and keeping it only nests the
+    /// ingest's inside it. That nesting is what keeps the activation writer
+    /// off tokio's write-preferring queue (see `acquire_activation_write`);
+    /// with it gone, a pending writer can land between commit and ingest.
+    /// Release after the manifest mutex: the activation read is the outer
+    /// authority.
+    fn release_activation(&self) {
+        let mut guard = self
+            .guard
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(guard) = guard.as_mut() {
+            guard._activation.take();
         }
     }
 
@@ -12596,6 +12619,9 @@ impl AppState {
             .await;
             return None;
         }
+        // The ingest takes its own activation read; release the transaction's
+        // first so the ingest's is not nested inside it.
+        transaction.lease.release_activation();
         self.ingest_file_from(&pending.keys[0], &pending.inner_path, None).await;
         for file in &pending.files {
             self.ingest_file_from(&pending.keys[0], &file.inner_path, None).await;
@@ -27149,6 +27175,9 @@ impl AppState {
         self.verify_current_store_xite_activated(address, &canonical, &storage)
             .await?;
         self.log("INFO", format!("Signed {content_inner_path} on {address}")).await;
+        // The Store check above still needs the activation read; the ingest
+        // takes its own, so the transaction's goes first.
+        transaction.lease.release_activation();
         self.ingest_file_from(address, content_inner_path, origin).await;
         Ok(())
     }
@@ -29149,6 +29178,9 @@ impl AppState {
             return;
         }
         let key = &finish.keys[0];
+        // As in the pending-child promote: the ingest's own activation read
+        // must not nest inside the transaction's.
+        finish.transaction.lease.release_activation();
         self.ingest_file_from(key, &finish.inner_path, None).await;
         for path in arrived {
             if finish.xite.storage.exists(path) {
@@ -38663,6 +38695,139 @@ mod tests {
             .await
             .expect("writer never landed after the reads released")
             .unwrap();
+    }
+
+    /// The nesting itself: a manifest transaction carries the activation read
+    /// through commit, and the ingest after the commit takes a second read on
+    /// the same task. The transaction now releases its read on its own, so a
+    /// pending writer lands while the transaction is still alive and the
+    /// ingest's read is an ordinary fresh one.
+    #[tokio::test]
+    async fn committed_transaction_releases_its_activation_read_for_the_ingest() {
+        let dir = tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path().join("xite"));
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let mut content = json!({ "address": address, "modified": 1.0, "files": {} });
+        epix_content::sign(&mut content, &key).unwrap();
+        storage
+            .write("content.json", &serde_json::to_vec(&content).unwrap())
+            .unwrap();
+        let state = AppState::new("test");
+        state
+            .add_xite(
+                &address,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(content),
+                },
+            )
+            .await;
+
+        let activation = state.xite_activation_gate.clone().read_owned().await;
+        let transaction = AppState::bind_stored_manifest_transaction(
+            &storage,
+            &address,
+            "content.json",
+            ManifestGuard {
+                _activation: Some(activation),
+                _manifest: None,
+            },
+        )
+        .unwrap();
+        let writer_state = state.clone();
+        let writer = tokio::spawn(async move {
+            let _write = writer_state.acquire_activation_write().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!writer.is_finished(), "writer bypassed the transaction's read");
+
+        transaction.lease.release_activation();
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("writer never landed after the transaction released its read")
+            .unwrap();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            state.ingest_file_from(&address, "content.json", None),
+        )
+        .await
+        .expect("ingest deadlocked while the transaction was alive");
+        drop(transaction);
+    }
+
+    /// The report behind the polling writer, end to end: a user-content sign
+    /// is pinned between its activation read and its commit, a removal of the
+    /// same xite starts waiting for the gate behind that read, and the sign
+    /// then commits and ingests. Both complete: the removal lands once the
+    /// transaction releases its read, and the sign's ingest either runs first
+    /// or finds the xite gone and returns.
+    #[tokio::test]
+    async fn user_content_sign_completes_while_a_xite_removal_is_queued() {
+        let root = tempdir().unwrap();
+        let xite_key = epix_crypt::new_seed();
+        let state = AppState::with_data_dir("test", root.path());
+        let xite = epix_crypt::privatekey_to_address(&xite_key).unwrap();
+        let storage = XiteStorage::new(root.path().join("data").join(&xite));
+        let (_, signed_root) = write_signed_user_governor(&storage, &xite_key);
+        state
+            .add_xite(
+                &xite,
+                XiteEntry {
+                    storage: storage.clone(),
+                    content: Some(signed_root),
+                },
+            )
+            .await;
+        link_test_identity(&state, "alice").await;
+        let data_path = "data/users/alice.epix/data.json";
+        state
+            .write_file(&xite, data_path, br#"{"topic":[{"topic_id":1}]}"#)
+            .await
+            .unwrap();
+        let content_path = state.content_inner_path(&xite, data_path).await;
+
+        // The sign takes its activation read first and the manifest mutex
+        // next: holding the mutex pins it with the read held.
+        let manifest = state.merge_path_lock(&xite, &content_path).lock_owned().await;
+        let sign_state = state.clone();
+        let sign_xite = xite.clone();
+        let sign_path = content_path.clone();
+        let sign = tokio::spawn(async move {
+            sign_state.sign_user_content(&sign_xite, &sign_path, None, None).await
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while state.xite_activation_gate.clone().try_write_owned().is_ok() {
+            assert!(std::time::Instant::now() < deadline, "sign never took its activation read");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        let remove_state = state.clone();
+        let remove_address = xite.clone();
+        let remove = tokio::spawn(async move { remove_state.remove_xite(&remove_address).await });
+        while state
+            .activation_writers_waiting
+            .load(std::sync::atomic::Ordering::SeqCst)
+            == 0
+        {
+            assert!(std::time::Instant::now() < deadline, "removal never waited for the gate");
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert!(!sign.is_finished());
+        assert!(!remove.is_finished());
+        drop(manifest);
+
+        let removed = tokio::time::timeout(std::time::Duration::from_secs(10), remove)
+            .await
+            .expect("xite removal never landed behind the sign's transaction")
+            .unwrap();
+        assert!(removed);
+        let signed = tokio::time::timeout(std::time::Duration::from_secs(10), sign)
+            .await
+            .expect("sign never completed alongside the removal")
+            .unwrap();
+        assert!(signed.is_ok(), "the sign committed before the removal landed: {signed:?}");
+        assert!(!state.has_xite(&xite).await);
+        assert!(!storage.root().exists());
     }
 
     #[tokio::test]
