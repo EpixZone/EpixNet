@@ -6675,7 +6675,7 @@ impl AppState {
     }
 
     async fn add_xite_owned(&self, address: String, mut entry: XiteEntry) {
-        let _activation = self.xite_activation_gate.clone().write_owned().await;
+        let _activation = self.acquire_activation_write().await;
         let mut settings = XiteSettings::new(now_secs());
         // A xite starts with no permissions. ADMIN (and other permissions) are
         // granted only when the xite requests one and the user approves the
@@ -19292,7 +19292,7 @@ impl AppState {
         &self,
         store: Arc<epix_blob::store::Store>,
     ) -> Result<RegisterTally, String> {
-        let activation = self.xite_activation_gate.clone().write_owned().await;
+        let activation = self.acquire_activation_write().await;
         self.set_edx_store_with_activation(
             store,
             StoreActivationGuard::Write(activation),
@@ -31712,7 +31712,7 @@ impl AppState {
     }
 
     async fn retry_pending_xite_removal_once(&self, canonical: &str) -> bool {
-        let _activation = self.xite_activation_gate.clone().write_owned().await;
+        let _activation = self.acquire_activation_write().await;
         if self.xites.read().await.iter().any(|(key, xite)| {
             canonical_address(xite.content.as_ref(), key) == canonical
         }) {
@@ -31835,6 +31835,28 @@ impl AppState {
         });
     }
 
+    /// Take the activation gate's write authority without joining its queue.
+    ///
+    /// tokio's RwLock is write-preferring: once a writer is queued, every
+    /// later reader waits behind it. Several holders here take a second read
+    /// while their first is still held: a manifest transaction carries the
+    /// activation read through commit, and the ingest that follows it
+    /// (`ingest_file_from`) takes its own. With a queued writer that nested
+    /// read waits on the writer, which waits on the outer read: a xite
+    /// deletion sat on "Deleting..." forever and every ingest on the node
+    /// froze behind it. Polling `try_write` never queues, so readers keep
+    /// flowing and the writer lands in the next gap between them.
+    async fn acquire_activation_write(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        let mut delay = std::time::Duration::from_millis(5);
+        loop {
+            if let Ok(guard) = self.xite_activation_gate.clone().try_write_owned() {
+                return guard;
+            }
+            tokio::time::sleep(delay).await;
+            delay = delay.saturating_mul(2).min(std::time::Duration::from_millis(100));
+        }
+    }
+
     pub async fn remove_xite(&self, address: &str) -> bool {
         let canonical = self.canonical_key(address).await;
         let address = canonical.as_str();
@@ -31879,7 +31901,7 @@ impl AppState {
         if let Some(resolver) = self.on_demand.read().await.clone() {
             resolver.cancel(&canonical).await;
         }
-        let _activation = self.xite_activation_gate.clone().write_owned().await;
+        let _activation = self.acquire_activation_write().await;
         let registry = self.xite_registry_lock.lock().await;
         let target = {
             let xites = self.xites.read().await;
@@ -38524,6 +38546,36 @@ mod tests {
 
         // An empty node says nothing alarming.
         assert_eq!(RegisterTally::default().to_string(), "0 object(s) from 0 xite(s)");
+    }
+
+    /// A manifest transaction carries the activation read through commit and
+    /// the ingest after it takes a second read on the same task. tokio's
+    /// RwLock is write-preferring, so a queued writer (a xite deletion) would
+    /// block that nested read and deadlock the node: the deletion waits on
+    /// the outer read, the outer read waits on the deletion. The writer must
+    /// therefore never queue.
+    #[tokio::test]
+    async fn activation_writer_never_blocks_a_nested_read() {
+        let state = AppState::new("test");
+        let outer = state.xite_activation_gate.clone().read_owned().await;
+        let writer_state = state.clone();
+        let writer = tokio::spawn(async move {
+            let _write = writer_state.acquire_activation_write().await;
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!writer.is_finished(), "writer landed while a read was held");
+        let nested = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            state.xite_activation_gate.clone().read_owned(),
+        )
+        .await
+        .expect("a nested read deadlocked behind the waiting writer");
+        drop(nested);
+        drop(outer);
+        tokio::time::timeout(std::time::Duration::from_secs(2), writer)
+            .await
+            .expect("writer never landed after the reads released")
+            .unwrap();
     }
 
     #[tokio::test]
