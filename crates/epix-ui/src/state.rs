@@ -4284,6 +4284,16 @@ pub struct AppState {
     /// `set_edx_store` holds the write guard through verification,
     /// reconciliation, index installation, and final exposure.
     xite_activation_gate: Arc<tokio::sync::RwLock<()>>,
+    /// Writers to the activation gate line up here, so they land in the order
+    /// they were requested even though none of them queues on the gate itself
+    /// (see [`Self::acquire_activation_write`]).
+    activation_writer_turnstile: tokio::sync::Mutex<()>,
+    /// How many writers are polling for the gate right now. A fresh mutation
+    /// (a file write, delete or sign) waits while this is non-zero, which is
+    /// the barrier a pending delete or Store swap relies on.
+    activation_writers_waiting: std::sync::atomic::AtomicUsize,
+    /// Woken each time a polling writer lands.
+    activation_writer_landed: tokio::sync::Notify,
     /// Verified root content.json updates whose declared files have not all
     /// landed yet, keyed by canonical address. The on-disk content.json (the
     /// completeness marker) stays at the previous consistent version until the
@@ -5536,6 +5546,9 @@ impl AppState {
             merge_path_locks: std::sync::Mutex::new(HashMap::new()),
             tree_mutation_locks: std::sync::Mutex::new(HashMap::new()),
             xite_activation_gate: Arc::new(tokio::sync::RwLock::new(())),
+            activation_writer_turnstile: tokio::sync::Mutex::new(()),
+            activation_writers_waiting: std::sync::atomic::AtomicUsize::new(0),
+            activation_writer_landed: tokio::sync::Notify::new(),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
             db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -16304,7 +16317,7 @@ impl AppState {
     /// Delete a downloaded optional file. `optionalFileDelete`.
     pub async fn optional_file_delete(&self, address: &str, inner_path: &str,
     ) -> Result<Value, String> {
-        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        let _activation = self.activation_read_fresh().await;
         let (info, optional) =
             self.file_info_any(address, inner_path).await.ok_or("file not declared")?;
         // file_info_any resolves required files too. Deleting one durably
@@ -24509,7 +24522,7 @@ impl AppState {
         bytes: &[u8],
         enforce_identity: bool,
     ) -> Result<(), String> {
-        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        let _activation = self.activation_read_fresh().await;
         let (storage, canonical) = {
             let xites = self.xites.read().await;
             let xite = xites.get(address).ok_or("unknown xite")?;
@@ -24654,7 +24667,7 @@ impl AppState {
         inner_path: &str,
         origin: Option<u64>,
     ) -> Result<(), String> {
-        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        let _activation = self.activation_read_fresh().await;
         let (storage, canonical) = {
             let x = self.xites.read().await;
             let e = x.get(address).ok_or("unknown xite")?;
@@ -24813,7 +24826,7 @@ impl AppState {
         privatekey: &str,
         opts: epix_xite::SignOpts,
     ) -> Result<Vec<u8>, String> {
-        let activation = self.xite_activation_gate.clone().read_owned().await;
+        let activation = self.activation_read_fresh().await;
         let (storage, canonical) = {
             let xites = self.xites.read().await;
             let xite = xites.get(address).ok_or("unknown xite")?;
@@ -31887,15 +31900,48 @@ impl AppState {
     /// deletion sat on "Deleting..." forever and every ingest on the node
     /// froze behind it. Polling `try_write` never queues, so readers keep
     /// flowing and the writer lands in the next gap between them.
+    ///
+    /// Not queuing must not mean not ordering. A pending writer is still a
+    /// barrier for the mutations that start after it: a file write that
+    /// begins after a delete is pending must land after the delete (and
+    /// fail), and a delete that begins after a Store swap is pending must
+    /// see the Store. Writers therefore take a turnstile so they land in
+    /// request order, and count themselves while polling so
+    /// [`Self::activation_read_fresh`] can hold fresh mutations back.
     async fn acquire_activation_write(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
+        use std::sync::atomic::Ordering;
+        let _turn = self.activation_writer_turnstile.lock().await;
+        self.activation_writers_waiting.fetch_add(1, Ordering::SeqCst);
         let mut delay = std::time::Duration::from_millis(5);
-        loop {
+        let guard = loop {
             if let Ok(guard) = self.xite_activation_gate.clone().try_write_owned() {
-                return guard;
+                break guard;
             }
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(std::time::Duration::from_millis(100));
+        };
+        self.activation_writers_waiting.fetch_sub(1, Ordering::SeqCst);
+        self.activation_writer_landed.notify_waiters();
+        guard
+    }
+
+    /// An activation read for a mutation that starts fresh, holding no other
+    /// activation read on its task: it waits for any writer that is already
+    /// pending, then reads. This is the barrier the polling writer gave up.
+    /// Only for entry points that never run under a held activation read
+    /// (a nested read waiting here would recreate the deadlock the polling
+    /// writer exists to avoid); everything nested keeps taking the gate
+    /// directly.
+    async fn activation_read_fresh(&self) -> tokio::sync::OwnedRwLockReadGuard<()> {
+        use std::sync::atomic::Ordering;
+        loop {
+            let landed = self.activation_writer_landed.notified();
+            if self.activation_writers_waiting.load(Ordering::SeqCst) == 0 {
+                break;
+            }
+            landed.await;
         }
+        self.xite_activation_gate.clone().read_owned().await
     }
 
     pub async fn remove_xite(&self, address: &str) -> bool {
