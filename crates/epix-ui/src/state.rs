@@ -4365,6 +4365,12 @@ pub struct AppState {
     activation_writers_waiting: std::sync::atomic::AtomicUsize,
     /// Woken each time a polling writer lands.
     activation_writer_landed: tokio::sync::Notify,
+    /// Xites a `mergerSiteAdd` is bringing in right now. A merger page asks
+    /// for its hub again on every file that lands while the hub's clone
+    /// runs, and every call that reached the node before the entry
+    /// registered used to count the hub as newly added: one "Added 1 new
+    /// xite" per call. Only the call that owns the add announces it.
+    merger_adds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Legacy user-content files (declared without a b3, so no peer can
     /// serve them until their author re-signs) that a fetch pass just failed
     /// on, keyed by xite and `path#sha512`, with the time they may be tried
@@ -5628,6 +5634,7 @@ impl AppState {
             activation_writer_turnstile: tokio::sync::Mutex::new(()),
             activation_writers_waiting: std::sync::atomic::AtomicUsize::new(0),
             activation_writer_landed: tokio::sync::Notify::new(),
+            merger_adds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
             legacy_unavailable: std::sync::Mutex::new(HashMap::new()),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
@@ -29605,6 +29612,21 @@ impl AppState {
                 x.settings.cache.bad_files.retain(|path, _| !landed.contains(path.as_str()));
             }
         }
+    }
+
+    /// Claim the add of `target` for one `mergerSiteAdd` call. True when this
+    /// call brings the xite in: it is not registered yet and no other call is
+    /// adding it. The owner calls [`Self::end_merger_add`] when its add ends.
+    pub async fn begin_merger_add(&self, target: &str) -> bool {
+        if self.has_xite(target).await {
+            return false;
+        }
+        self.merger_adds_in_flight.lock().unwrap().insert(target.to_string())
+    }
+
+    /// Release the claim taken by [`Self::begin_merger_add`].
+    pub fn end_merger_add(&self, target: &str) {
+        self.merger_adds_in_flight.lock().unwrap().remove(target);
     }
 
     /// How long a legacy user-content file that no peer served stays out of

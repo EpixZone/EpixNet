@@ -3464,8 +3464,19 @@ impl WsCommand for MergerXiteAdd {
             }
             let mut added = 0;
             for target in &targets {
-                if state.ensure_xite(target).await {
-                    added += 1;
+                // Only the call that brings the xite in announces it. A merger
+                // page re-asks for its hub on every file that lands while the
+                // hub's clone is still running, and each answer used to pop
+                // "Added 1 new xite" again (see `begin_merger_add`).
+                let owns_add = state.begin_merger_add(target).await;
+                let ok = state.ensure_xite(target).await;
+                if owns_add {
+                    state.end_merger_add(target);
+                }
+                if ok {
+                    if owns_add {
+                        added += 1;
+                    }
                 } else {
                     state.push_notification(
                         "error",
@@ -5254,6 +5265,87 @@ mod tests {
 
         // A missing non-optional file errors.
         assert!(FileDelete.handle(&session, &json!(["nope.txt"])).await.is_err());
+    }
+
+    /// A merger page re-asks for its hub on every file that lands while the
+    /// hub's clone is still running; each answer popped "Added 1 new xite".
+    /// Only the call that brought the xite in announces it.
+    #[tokio::test]
+    async fn merger_site_add_announces_a_xite_once() {
+        struct Adder {
+            state: std::sync::Weak<AppState>,
+            dir: std::path::PathBuf,
+        }
+        #[async_trait::async_trait]
+        impl crate::state::OnDemandResolver for Adder {
+            async fn ensure(&self, host: &str) -> Result<(), String> {
+                let state = self.state.upgrade().unwrap();
+                if !state.has_xite(host).await {
+                    state
+                        .add_xite(
+                            host,
+                            crate::state::XiteEntry {
+                                storage: epix_xite::XiteStorage::new(self.dir.join(host)),
+                                content: Some(json!({ "address": host, "files": {} })),
+                            },
+                        )
+                        .await;
+                }
+                Ok(())
+            }
+            async fn resolve(&self, _: &str) -> Option<crate::state::ResolvedHost> {
+                None
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let merger = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state
+            .add_xite(
+                &merger,
+                crate::state::XiteEntry {
+                    storage: epix_xite::XiteStorage::new(dir.path().join("merger")),
+                    content: Some(json!({ "address": merger, "files": {} })),
+                },
+            )
+            .await;
+        state.add_permission(&merger, "Merger:EpixPost").await;
+        state
+            .set_on_demand(Arc::new(Adder { state: Arc::downgrade(&state), dir: dir.path().to_path_buf() }))
+            .await;
+        let hub = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let mut events = state.subscribe_events();
+        let session = WsSession::new(state.clone(), Some(merger.clone()));
+
+        // The page asks four times, as it did once per landed hub file.
+        for _ in 0..4 {
+            assert_eq!(MergerXiteAdd.handle(&session, &json!([hub.clone()])).await.unwrap(), "ok");
+        }
+        // Every add ends with a site_done for its target; wait for all four.
+        let mut site_done = 0;
+        let mut announced = 0;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while site_done < 4 && std::time::Instant::now() < deadline {
+            match events.try_recv() {
+                Ok(ev) => {
+                    let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+                    if payload["cmd"] == "notification"
+                        && payload["params"][1].as_str().is_some_and(|m| m.contains("new xite"))
+                    {
+                        announced += 1;
+                    }
+                    if payload["cmd"] == "setSiteInfo"
+                        && payload["params"]["event"][0] == "site_done"
+                    {
+                        site_done += 1;
+                    }
+                }
+                Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+            }
+        }
+        assert_eq!(site_done, 4, "every add reports it finished");
+        assert_eq!(announced, 1, "only the add that brought the hub in announces it");
+        assert!(state.has_xite(&hub).await);
     }
 
     #[tokio::test]
