@@ -2060,6 +2060,7 @@ async fn verify_current_child_manifests(
     }
     for path in paths {
         let Some(parent) = stored_child_parent(xite, progress, walk, &path).await else {
+            trace_clone!(std::time::Instant::now(), "stored child {path}: no verified parent, skipped");
             continue;
         };
         let child: Option<serde_json::Value> = xite
@@ -2080,11 +2081,23 @@ async fn verify_current_child_manifests(
                         state.mark_xid_deferred(xite.address.as_str());
                     }
                 }
-                files.extend(manifest.files());
+                let declared = manifest.files();
+                trace_clone!(
+                    std::time::Instant::now(),
+                    "stored child {path}: verified, {} declared file(s) queued",
+                    declared.len()
+                );
+                files.extend(declared);
                 includes.extend(manifest.includes());
             }
-            Ok(None) => {}
+            Ok(None) => {
+                trace_clone!(std::time::Instant::now(), "stored child {path}: skipped by the walk");
+            }
             Err(error) => {
+                trace_clone!(
+                    std::time::Instant::now(),
+                    "stored child {path}: verification failed (unresolved={unresolved}): {error}"
+                );
                 log_child_verification_failure(xite, progress, &path, &error, unresolved).await;
             }
         }
@@ -2683,14 +2696,14 @@ async fn sync_included_content(
         (child_files, arrived)
     };
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
-    // A committed child's declared file that changed without changing size
-    // is not re-walked above (its manifest is current) and passes every
-    // presence check, so it stayed stale for good. The registry still lists
-    // it as bad: re-queue those by hash.
+    // The levels above cover only the manifests the peer listed, so a
+    // committed child's missing or mismatched file is retried only when some
+    // peer happens to list that child. Re-check the manifests already on
+    // disk and queue what does not match (see `stale_verified_child_files`).
     if let Some(state) = progress {
-        let stale = state.stale_bad_files(address).await;
+        let stale = state.stale_verified_child_files(address).await;
         if !stale.is_empty() {
-            trace_clone!(t0, "{} bad file(s) re-queued by hash", stale.len());
+            trace_clone!(t0, "{} stale/missing declared file(s) re-queued from disk", stale.len());
             child_files.extend(stale);
         }
     }
@@ -2721,6 +2734,10 @@ async fn sync_included_content(
         sync_declared_child_data(xite, progress, address, &peers, child_files, arrived).await;
     if let Some(state) = progress {
         state.clear_bad_files(address, &arrived).await;
+        let pruned = state.prune_verified_bad_files(address).await;
+        if !pruned.is_empty() {
+            trace_clone!(t0, "{} bad-file counter(s) pruned: files verify", pruned.len());
+        }
     }
     trace_clone!(t0, "declared data done");
     sync_deferred_children(xite, progress, address, &peers, t0).await;

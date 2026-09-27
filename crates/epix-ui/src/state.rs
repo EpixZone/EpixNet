@@ -29524,28 +29524,71 @@ impl AppState {
         Some(out)
     }
 
-    /// The xite's bad files whose on-disk bytes do not match their declared
-    /// hash, as fetchable entries. A user's data.json that changed without
-    /// changing size passes every presence check, and its manifest is
-    /// already committed, so the user-content pass never looked at it again:
-    /// likes and follows stayed stale for good. The pass re-queues these by
-    /// hash instead.
-    pub async fn stale_bad_files(&self, address: &str) -> Vec<FileEntry> {
+    /// Required files of the xite's verified child manifests that are not
+    /// what the manifest declares, as fetchable entries: missing, at the
+    /// wrong size, or older than their manifest and failing the hash.
+    ///
+    /// The user-content pass walks only the manifests the answering peer
+    /// lists (observed live: 7 of a hub's 14 users on one pass), so a
+    /// committed manifest whose file is still missing is only retried when
+    /// some peer happens to list it. This queues from the manifests on disk
+    /// instead. Files older than their manifest are the only ones that can
+    /// have been written before it, so only those are hashed; anything above
+    /// the size cap is left to the normal path.
+    pub async fn stale_verified_child_files(&self, address: &str) -> Vec<FileEntry> {
+        let (storage, canonical) = {
+            let xites = self.xites.read().await;
+            let Some(x) = self.resolve_xite(&xites, address) else { return Vec::new() };
+            (x.storage.clone(), canonical_address(x.content.as_ref(), address))
+        };
+        let manifests: Vec<(String, Value)> = {
+            let contents = self
+                .verified_manifest_contents
+                .read()
+                .expect("verified_manifest_contents");
+            let Some(contents) = contents.get(&canonical) else { return Vec::new() };
+            contents
+                .iter()
+                .filter(|(path, _)| path.as_str() != "content.json" && path.ends_with("/content.json"))
+                .map(|(path, content)| (path.clone(), content.clone()))
+                .collect()
+        };
+        // Metadata reads and hashing block: keep them off the async workers.
+        tokio::task::spawn_blocking(move || scan_stale_child_files(&storage, manifests))
+            .await
+            .unwrap_or_default()
+    }
+
+    /// Forget bad-file counters whose file now matches its declaration. A
+    /// file can land outside the fetch pass that marked it bad (a peer's
+    /// push, the Store materializing it at boot), and the counter then sat
+    /// on the dashboard's bad-file count for good. Returns the paths pruned.
+    pub async fn prune_verified_bad_files(&self, address: &str) -> Vec<String> {
         let storage = {
             let xites = self.xites.read().await;
             let Some(x) = self.resolve_xite(&xites, address) else { return Vec::new() };
             x.storage.clone()
         };
-        let mut stale = Vec::new();
+        let mut candidates = Vec::new();
         for path in self.bad_files(address).await {
-            let Some((entry, _optional)) = self.file_info_any(address, &path).await else {
-                continue;
-            };
-            if !storage.verify(&path, &entry.sha512) {
-                stale.push(entry);
+            if let Some((entry, _)) = self.file_info_any(address, &path).await {
+                if !entry.sha512.is_empty() {
+                    candidates.push((path, entry.sha512));
+                }
             }
         }
-        stale
+        // Hashing blocks: keep it off the async workers.
+        let verified = tokio::task::spawn_blocking(move || {
+            candidates
+                .into_iter()
+                .filter(|(path, sha512)| storage.verify(path, sha512))
+                .map(|(path, _)| path)
+                .collect::<Vec<String>>()
+        })
+        .await
+        .unwrap_or_default();
+        self.clear_bad_files(address, &verified).await;
+        verified
     }
 
     /// Forget bad-file counters for paths that just landed.
@@ -33974,6 +34017,70 @@ fn canonical_address(content: Option<&Value>, serving_key: &str) -> String {
         .and_then(Value::as_str)
         .unwrap_or(serving_key)
         .to_string()
+}
+
+/// The blocking half of [`AppState::stale_verified_child_files`]: every
+/// required file of `manifests` (verified child manifests, `path -> content`)
+/// that is missing, at the wrong size, or older than its manifest and failing
+/// the hash. Files above the size cap are left to the normal path.
+fn scan_stale_child_files(storage: &XiteStorage, manifests: Vec<(String, Value)>) -> Vec<FileEntry> {
+    const MAX_RECHECK_BYTES: i64 = 4 * 1024 * 1024;
+    let stat = |inner: &str| {
+        storage
+            .path(inner)
+            .ok()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .map(|m| (m.len(), m.modified().ok()))
+    };
+    let trace = std::env::var_os("EPIX_TRACE_CLONE").is_some();
+    if trace {
+        eprintln!("[clonetrace] stale re-check: {} verified child manifest(s) in the index", manifests.len());
+    }
+    let mut stale = Vec::new();
+    for (path, content) in manifests {
+        let Some(files) = content.get("files").and_then(Value::as_object) else { continue };
+        if trace {
+            let declared: Vec<String> = files
+                .iter()
+                .map(|(name, info)| {
+                    let sha = info.get("sha512").and_then(Value::as_str).unwrap_or("-");
+                    format!("{name}@{}", &sha[..sha.len().min(12)])
+                })
+                .collect();
+            eprintln!(
+                "[clonetrace] stale re-check {path}: index modified={} declares {declared:?}",
+                content.get("modified").cloned().unwrap_or(Value::Null)
+            );
+        }
+        let dir = path.strip_suffix("/content.json").unwrap_or("");
+        let manifest_modified = stat(&path).and_then(|(_, modified)| modified);
+        for (name, info) in files {
+            let Some(size) = info.get("size").and_then(epix_content::verify::exact_nonnegative_size)
+            else {
+                continue;
+            };
+            let Some(sha512) = info.get("sha512").and_then(Value::as_str) else { continue };
+            if size > MAX_RECHECK_BYTES {
+                continue;
+            }
+            let inner_path = if dir.is_empty() { name.clone() } else { format!("{dir}/{name}") };
+            let entry = FileEntry { inner_path: inner_path.clone(), size, sha512: sha512.to_string() };
+            match stat(&inner_path) {
+                None => stale.push(entry),
+                Some((len, _)) if len != size as u64 => stale.push(entry),
+                Some((_, modified)) => {
+                    let older = match (modified, manifest_modified) {
+                        (Some(file), Some(manifest)) => file < manifest,
+                        _ => true,
+                    };
+                    if older && !storage.verify(&inner_path, sha512) {
+                        stale.push(entry);
+                    }
+                }
+            }
+        }
+    }
+    stale
 }
 
 fn summarize_content(content: &Value) -> Value {
@@ -49013,11 +49120,13 @@ mod tests {
     /// staged that root, so nothing marked the xite downloaded: the page
     /// served, but every child manifest was refused with "Xite not yet
     /// downloaded" until a restart re-registered the entry with content.
-    /// A user's data.json that changed without changing size: every presence
-    /// check passes, but the bytes no longer match the manifest. The pass
-    /// must get it back as a fetchable entry, and forget it once it lands.
+    /// A declared file whose bytes do not match its manifest (here: same
+    /// size, different content, written before the manifest) is queued from
+    /// the manifests on disk, whatever the peer listed; a missing one too. A
+    /// bad-file counter is pruned once its file verifies and kept while it
+    /// does not.
     #[tokio::test]
-    async fn stale_bad_files_lists_declared_files_whose_bytes_no_longer_match() {
+    async fn stale_verified_child_files_lists_files_older_than_their_manifest() {
         let dir = tempfile::tempdir().unwrap();
         let storage = XiteStorage::new(dir.path());
         let privatekey = epix_crypt::new_seed();
@@ -49046,9 +49155,29 @@ mod tests {
         });
         epix_content::sign(&mut root, &privatekey).unwrap();
         storage.write("content.json", &serde_json::to_vec(&root).unwrap()).unwrap();
+        // The stale file predates its manifest, as a file the fetch never
+        // replaced always does.
+        let old_time = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(storage.path("data/users/u1/data.json").unwrap())
+            .unwrap()
+            .set_modified(old_time)
+            .unwrap();
         let s = AppState::new("test");
         s.add_xite(&address, XiteEntry { storage: storage.clone(), content: Some(root) }).await;
-        assert!(s.stale_bad_files(&address).await.is_empty(), "nothing is bad yet");
+
+        let stale = s.stale_verified_child_files(&address).await;
+        assert_eq!(stale.len(), 1, "the same-size stale file is re-queued: {stale:?}");
+        assert_eq!(stale[0].inner_path, "data/users/u1/data.json");
+        assert_eq!(stale[0].sha512, XiteStorage::hash_bytes(new_bytes));
+
+        // The new version lands (written after the manifest): nothing stale.
+        storage.write("data/users/u1/data.json", new_bytes).unwrap();
+        assert!(s.stale_verified_child_files(&address).await.is_empty());
+
+        // A counter left behind for a file that now verifies is pruned; one
+        // for a file that is still wrong stays.
         s.xites
             .write()
             .await
@@ -49058,15 +49187,23 @@ mod tests {
             .cache
             .bad_files
             .insert("data/users/u1/data.json".to_string(), 1);
+        assert_eq!(s.prune_verified_bad_files(&address).await, vec!["data/users/u1/data.json".to_string()]);
+        assert!(s.bad_files(&address).await.is_empty());
 
-        let stale = s.stale_bad_files(&address).await;
-        assert_eq!(stale.len(), 1, "the same-size stale file is re-queued");
-        assert_eq!(stale[0].inner_path, "data/users/u1/data.json");
-        assert_eq!(stale[0].sha512, XiteStorage::hash_bytes(new_bytes));
-
-        // The new version lands: no longer stale, and the counter is cleared.
-        storage.write("data/users/u1/data.json", new_bytes).unwrap();
-        assert!(s.stale_bad_files(&address).await.is_empty());
+        // A missing required file is queued too, and its counter is kept.
+        std::fs::remove_file(storage.path("data/users/u1/data.json").unwrap()).unwrap();
+        assert_eq!(s.stale_verified_child_files(&address).await.len(), 1);
+        s.xites
+            .write()
+            .await
+            .get_mut(&address)
+            .unwrap()
+            .settings
+            .cache
+            .bad_files
+            .insert("data/users/u1/data.json".to_string(), 1);
+        assert!(s.prune_verified_bad_files(&address).await.is_empty());
+        assert_eq!(s.bad_files(&address).await, vec!["data/users/u1/data.json".to_string()]);
         s.clear_bad_files(&address, &["data/users/u1/data.json".to_string()]).await;
         assert!(s.bad_files(&address).await.is_empty());
     }
