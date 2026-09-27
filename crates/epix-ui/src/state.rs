@@ -1571,8 +1571,56 @@ fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
         }
         Err(error) => return Err(format!("could not inspect {}: {error}", path.display())),
     }
-    rename_recovery_path(path, &quarantine)?;
-    remove_xite_directory_tree_path(&quarantine)
+    // Windows refuses to rename a directory while any handle is open below
+    // it (ERROR_ACCESS_DENIED, or a sharing violation), and a serve, a sync
+    // or the Store can hold one for a moment. The refusal used to abort the
+    // removal outright: the tree stayed at its served path, the merger
+    // re-added the xite over it, and the half-removed tree was then resumed
+    // as an interrupted clone with no way to fetch its child manifests. Retry
+    // briefly, then fall back to removing the tree in place: the xite is
+    // already unregistered, so nothing serves from the path any more.
+    let mut delay = std::time::Duration::from_millis(25);
+    for attempt in 0..8 {
+        match rename_recovery_path_windows(path, &quarantine) {
+            Ok(()) => return remove_xite_directory_tree_path(&quarantine),
+            Err(error) if attempt + 1 < 8 && rename_refused_by_open_handle(&error) => {
+                std::thread::sleep(delay);
+                delay = (delay * 2).min(std::time::Duration::from_millis(200));
+            }
+            Err(error) => {
+                return remove_xite_directory_tree_path(path).map_err(|in_place| {
+                    format!(
+                        "could not restore {} to {}: {error}; in-place removal failed too: {in_place}",
+                        path.display(),
+                        quarantine.display()
+                    )
+                });
+            }
+        }
+    }
+    unreachable!("the last attempt returns")
+}
+
+/// [`rename_recovery_path`]'s Windows body with the OS error kept, so the
+/// removal can tell a transient open handle from a real failure.
+#[cfg(windows)]
+fn rename_recovery_path_windows(source: &Path, destination: &Path) -> std::io::Result<()> {
+    let parent = destination.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("promotion destination has no parent: {}", destination.display()),
+        )
+    })?;
+    epix_fs::create_parent_directories_write_through(parent)
+        .and_then(|()| epix_fs::replace_file_write_through(source, destination))
+}
+
+/// ERROR_ACCESS_DENIED (5), ERROR_SHARING_VIOLATION (32) and
+/// ERROR_LOCK_VIOLATION (33): what MoveFileExW reports when a handle is open
+/// on the directory or anything beneath it.
+#[cfg(windows)]
+fn rename_refused_by_open_handle(error: &std::io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5) | Some(32) | Some(33))
 }
 
 #[cfg(not(any(unix, windows)))]
@@ -48856,6 +48904,32 @@ mod tests {
     /// of the forum mid-sync ("Please connect to EpixNet first" on the xID
     /// button). Every clone event must carry the identity the full site info
     /// would.
+    /// Windows refuses to rename a directory while a handle is open below it.
+    /// A serve or a sync holds one for a moment; the removal must wait it out
+    /// instead of leaving the tree at its served path.
+    #[cfg(windows)]
+    #[test]
+    fn windows_removal_waits_out_an_open_handle_below_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("epix1x");
+        let user_dir = root.join("data").join("users").join("a.epix");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let file = user_dir.join("data.json");
+        std::fs::write(&file, b"{}").unwrap();
+        std::fs::write(root.join("content.json"), b"{}").unwrap();
+        // Default share mode (no FILE_SHARE_DELETE): the directory rename is
+        // refused with ERROR_ACCESS_DENIED while this stays open.
+        let held = std::fs::File::open(&file).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        remove_xite_directory_durable(&root).expect("removal waits for the handle");
+        releaser.join().unwrap();
+        assert!(!root.exists());
+        assert!(!dir.path().join(".epix1x.epix-remove").exists());
+    }
+
     #[tokio::test]
     async fn clone_events_carry_the_installed_xites_identity() {
         let dir = tempfile::tempdir().unwrap();
