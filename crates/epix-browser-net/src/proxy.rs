@@ -263,6 +263,16 @@ where
 /// Path-form links must change origin even for iframe/file requests. Serving
 /// another xite's HTML under a trusted host would inherit that host's wallet
 /// permissions. The loopback UI keeps its existing path routing.
+///
+/// An opaque subresource is exempt: an image, font or media element loaded
+/// from `dashboard.epix/epix1talk…/img/favicon.ico` is a byte stream, not a
+/// document, so nothing in it can run under the host's origin. Redirecting it
+/// broke every such load: the redirected request crosses origins, the inner
+/// page's `referrer-policy: same-origin` strips its Referer, and the node's
+/// cross-origin gate refuses an untraceable xite request - the dashboard's
+/// favicons all fell back to their letter tiles. Served nested, the request
+/// keeps its same-origin Referer and the gate applies its normal cross-xite
+/// rule (the dashboard's ADMIN permission, or a `Cors:` grant).
 fn canonical_xite_location(req: &Request) -> Option<String> {
     let host = req
         .headers()
@@ -272,6 +282,9 @@ fn canonical_xite_location(req: &Request) -> Option<String> {
         .split(':')
         .next()?;
     if !crate::ca::is_epix_host(host) {
+        return None;
+    }
+    if is_opaque_subresource(req) {
         return None;
     }
     let path = req.uri().path().trim_start_matches('/');
@@ -290,6 +303,23 @@ fn canonical_xite_location(req: &Request) -> Option<String> {
         .map(|q| format!("?{q}"))
         .unwrap_or_default();
     Some(format!("//{origin}/{rest}{query}"))
+}
+
+/// Whether the browser is fetching bytes it will only display, never execute:
+/// `Sec-Fetch-Dest` of an `<img>`, `@font-face`, `<audio>`/`<video>` or a
+/// text track. Everything else - a document, frame, script, stylesheet,
+/// worker, `fetch()`, or a client that sends no fetch metadata at all - keeps
+/// the canonical redirect.
+fn is_opaque_subresource(req: &Request) -> bool {
+    req.headers()
+        .get("sec-fetch-dest")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|dest| {
+            matches!(
+                dest.trim().to_ascii_lowercase().as_str(),
+                "image" | "font" | "audio" | "video" | "track"
+            )
+        })
 }
 
 #[cfg(test)]
@@ -402,5 +432,70 @@ mod tests {
         ] {
             assert_eq!(canonical_xite_location(&request(host, path)), None);
         }
+    }
+
+    /// The dashboard's favicon rows: `<img src="/epix1talk…/img/favicon.ico">`
+    /// on `https://dashboard.epix/`. Served nested, not redirected, because an
+    /// image cannot run under the host's origin, and a redirect lost the
+    /// Referer the node's gate needs (see `canonical_xite_location`).
+    #[test]
+    fn opaque_subresources_are_served_nested_instead_of_redirected() {
+        let request = |host: &str, path: &str, dest: &str| {
+            Request::builder()
+                .uri(path)
+                .header("host", host)
+                .header("sec-fetch-dest", dest)
+                .header("sec-fetch-mode", "no-cors")
+                .header("sec-fetch-site", "same-origin")
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let talk = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+        for dest in ["image", "font", "audio", "video", "track", "Image"] {
+            assert_eq!(
+                canonical_xite_location(&request(
+                    "dashboard.epix",
+                    &format!("/{talk}/img/favicon.ico"),
+                    dest
+                )),
+                None,
+                "{dest} must be served nested"
+            );
+        }
+        assert_eq!(
+            canonical_xite_location(&request("dashboard.epix", "/talk.epix/img/logo.png", "image")),
+            None
+        );
+    }
+
+    /// Anything that can execute, embed a document, or be read by script keeps
+    /// the redirect - including a client that sends no fetch metadata.
+    #[test]
+    fn executable_and_readable_requests_keep_the_canonical_redirect() {
+        let talk = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+        let with_dest = |dest: &str| {
+            Request::builder()
+                .uri(format!("/{talk}/index.html"))
+                .header("host", "dashboard.epix")
+                .header("sec-fetch-dest", dest)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        for dest in ["document", "iframe", "frame", "script", "style", "empty", "worker", "object", "embed"] {
+            assert_eq!(
+                canonical_xite_location(&with_dest(dest)),
+                Some(format!("//{talk}.epix/index.html")),
+                "{dest} must redirect"
+            );
+        }
+        let no_metadata = Request::builder()
+            .uri(format!("/{talk}/img/favicon.ico"))
+            .header("host", "dashboard.epix")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        assert_eq!(
+            canonical_xite_location(&no_metadata),
+            Some(format!("//{talk}.epix/img/favicon.ico"))
+        );
     }
 }
