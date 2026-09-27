@@ -2154,30 +2154,56 @@ impl WsCommand for XitePublish {
         let sign = p.get("sign").and_then(|v| v.as_bool()).unwrap_or(true);
         let inner_path = s.state.content_inner_path(&address, &inner_path).await;
         if sign {
-            // `"stored"` = use the xite key saved in users.json (see sign_for).
-            let privatekey = match sign_privatekey(p) {
-                Some(pk) if pk == "stored" => Some(
-                    s.state
-                        .xite_privatekey(&address)
-                        .await
-                        .ok_or("Xite sign failed: Private key not found in users.json")?,
-                ),
-                other => other,
+            // Signing re-registers the xite's objects and rebuilds its
+            // database, a second or two on a big xite, and the page hears
+            // nothing until the publish starts. Open the publish toast now,
+            // under the key publish_progress uses, so its "Publishing"
+            // message replaces this one in place.
+            let progress = |message: &str, percent: i64| {
+                s.state.push_event_routed(
+                    "progress",
+                    json!(["publish", message, percent]),
+                    None,
+                    Some(address.clone()),
+                    None,
+                    Some(s.id),
+                );
             };
-            if inner_path == "content.json" {
-                // Root: sign with the given key or the saved xite key; with
-                // neither, the file is assumed already signed.
-                let key = match privatekey {
-                    Some(pk) => Some(pk),
-                    None => s.state.xite_privatekey(&address).await,
+            progress("Signing changes...", 0);
+            let signed: Result<(), String> = async {
+                // `"stored"` = use the xite key saved in users.json (see sign_for).
+                let privatekey = match sign_privatekey(p) {
+                    Some(pk) if pk == "stored" => Some(
+                        s.state
+                            .xite_privatekey(&address)
+                            .await
+                            .ok_or("Xite sign failed: Private key not found in users.json")?,
+                    ),
+                    other => other,
                 };
-                if let Some(pk) = key {
-                    s.state.sign_xite(&address, &pk).await?;
+                if inner_path == "content.json" {
+                    // Root: sign with the given key or the saved xite key; with
+                    // neither, the file is assumed already signed.
+                    let key = match privatekey {
+                        Some(pk) => Some(pk),
+                        None => s.state.xite_privatekey(&address).await,
+                    };
+                    if let Some(pk) = key {
+                        s.state.sign_xite(&address, &pk).await?;
+                    }
+                } else {
+                    s.state
+                        .sign_user_content(&address, &inner_path, privatekey, Some(s.id))
+                        .await?;
                 }
-            } else {
-                s.state
-                    .sign_user_content(&address, &inner_path, privatekey, Some(s.id))
-                    .await?;
+                Ok(())
+            }
+            .await;
+            if let Err(error) = signed {
+                // A negative percent closes the toast as a failure; the
+                // command's error reaches the page as well.
+                progress("Signing failed.", -1);
+                return Err(error);
             }
         }
         // Exhaustive: a user is watching this publish fail, so walk past the
