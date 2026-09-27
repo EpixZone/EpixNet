@@ -24549,6 +24549,36 @@ impl AppState {
         Ok(())
     }
 
+    /// Record that a xite's core set is verified on disk. The marker gates
+    /// inbound updates and child-manifest exposure ("Xite not yet
+    /// downloaded"), and it is normally set when a staged root commits or when
+    /// an entry registers with content. A clone that completes by resuming
+    /// over a root already on disk does neither: the entry registered empty
+    /// and the root never went through a staged commit, so the xite served
+    /// its page while every user manifest stayed unexposed until a restart.
+    /// Returns whether anything changed; persists when it did.
+    pub async fn mark_downloaded(&self, address: &str) -> bool {
+        let canonical = self.canonical_key(address).await;
+        let keys = self.alias_keys(&canonical, address).await;
+        let changed = {
+            let mut xites = self.xites.write().await;
+            let mut changed = false;
+            for key in &keys {
+                if let Some(xite) = xites.get_mut(key) {
+                    if xite.content.is_some() && xite.settings.downloaded.is_none() {
+                        xite.settings.downloaded = Some(now_secs());
+                        changed = true;
+                    }
+                }
+            }
+            changed
+        };
+        if changed {
+            self.persist_xites().await;
+        }
+        changed
+    }
+
     /// Write a file into a xite's storage (`fileWrite`). Under `data/users/`
     /// the xite must have an identity selected (posting needs an xID).
     pub async fn write_file(&self, address: &str, inner_path: &str, bytes: &[u8],
@@ -30580,6 +30610,7 @@ impl AppState {
         tokio::spawn(async move {
             if state.ensure_xite(&addr).await && state.xite_core_complete(&addr).await {
                 state.set_clone_status(&addr, "complete", None, None);
+                state.mark_downloaded(&addr).await;
                 state.push_notification("done", &format!("Downloaded xite {addr}."), 12000);
                 // Its optional files may be wanted next (the toggles
                 // default on): check without delay.
@@ -48897,13 +48928,28 @@ mod tests {
         assert_eq!(p["params"]["content"]["title"], "xID");
     }
 
-    /// The user-content sync of an installed xite reports progress through
-    /// the same `setSiteInfo` events the clone uses, and the wrapper relays
-    /// each one into the page. A xite replaces its `site_info` with whatever
-    /// arrives, so an event without the identity fields logs the visitor out
-    /// of the forum mid-sync ("Please connect to EpixNet first" on the xID
-    /// button). Every clone event must carry the identity the full site info
-    /// would.
+    /// A clone that completes by resuming over a root already on disk never
+    /// staged that root, so nothing marked the xite downloaded: the page
+    /// served, but every child manifest was refused with "Xite not yet
+    /// downloaded" until a restart re-registered the entry with content.
+    #[tokio::test]
+    async fn mark_downloaded_sets_the_marker_once_content_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::new("test");
+        // Registered empty, as an on-demand clone starts.
+        s.add_xite("epix1x", XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        assert!(!s.mark_downloaded("epix1x").await, "no content yet: nothing to mark");
+        assert!(s.xite_info("epix1x").await["settings"]["downloaded"].is_null());
+
+        s.update_content("epix1x", Some(json!({ "title": "Hub", "files": {} }))).await;
+        assert!(s.xite_info("epix1x").await["settings"]["downloaded"].is_null(), "fixture");
+        assert!(s.mark_downloaded("epix1x").await);
+        assert!(s.xite_info("epix1x").await["settings"]["downloaded"].is_u64());
+        assert!(!s.mark_downloaded("epix1x").await, "idempotent");
+        assert!(!s.mark_downloaded("epix1unknown").await);
+    }
+
     /// Windows refuses to rename a directory while a handle is open below it.
     /// A serve or a sync holds one for a moment; the removal must wait it out
     /// instead of leaving the tree at its served path.
@@ -48930,6 +48976,13 @@ mod tests {
         assert!(!dir.path().join(".epix1x.epix-remove").exists());
     }
 
+    /// The user-content sync of an installed xite reports progress through
+    /// the same `setSiteInfo` events the clone uses, and the wrapper relays
+    /// each one into the page. A xite replaces its `site_info` with whatever
+    /// arrives, so an event without the identity fields logs the visitor out
+    /// of the forum mid-sync ("Please connect to EpixNet first" on the xID
+    /// button). Every clone event must carry the identity the full site info
+    /// would.
     #[tokio::test]
     async fn clone_events_carry_the_installed_xites_identity() {
         let dir = tempfile::tempdir().unwrap();
