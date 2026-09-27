@@ -400,6 +400,14 @@ pub struct Store {
     /// A prefix promotion must freeze creation of previously unseen extern
     /// rows below that prefix before it collects and locks the known ids.
     extern_mutation_gate: RwLock<()>,
+    /// One read handle per slab, opened on first use and kept for the
+    /// Store's life. On-access antivirus (Windows Defender) scans a modified
+    /// file the next time a new handle opens it, and a slab is modified by
+    /// every small insert: measured 7 s per reopen of a 78 MB slab, growing
+    /// with the slab. A handle opened once sees every later append without
+    /// reopening, so reads never pay that scan. Dropped when the slab is
+    /// compacted away.
+    slab_readers: Mutex<HashMap<u32, Arc<File>>>,
 }
 
 /// Registration of one in-flight sparse decode (see `Store::sparse_writers`).
@@ -636,6 +644,7 @@ impl Store {
             evict_holds: Mutex::new(HashMap::new()),
             object_mutation_locks: Mutex::new(HashMap::new()),
             extern_mutation_gate: RwLock::new(()),
+            slab_readers: Mutex::new(HashMap::new()),
         })
     }
 
@@ -3519,10 +3528,28 @@ impl Store {
     }
 
     fn read_slab(&self, slab: u32, off: u64, size: u64) -> io::Result<Vec<u8>> {
-        let f = File::open(self.slab_path(slab))?;
+        let f = self.slab_reader(slab)?;
         let mut buf = vec![0u8; size as usize];
-        positioned_io::ReadAt::read_exact_at(&f, off, &mut buf)?;
+        positioned_io::ReadAt::read_exact_at(&*f, off, &mut buf)?;
         Ok(buf)
+    }
+
+    /// The long-lived read handle for `slab` (see `slab_readers`).
+    fn slab_reader(&self, slab: u32) -> io::Result<Arc<File>> {
+        let mut readers = self.slab_readers.lock().expect("slab readers");
+        if let Some(f) = readers.get(&slab) {
+            return Ok(Arc::clone(f));
+        }
+        let f = Arc::new(File::open(self.slab_path(slab))?);
+        readers.insert(slab, Arc::clone(&f));
+        Ok(f)
+    }
+
+    /// Forget the cached read handle before a slab file goes away, so the
+    /// unlink is not held off by an open handle and a later slab of the
+    /// same number is never read through a handle to the old inode.
+    fn forget_slab_reader(&self, slab: u32) {
+        self.slab_readers.lock().expect("slab readers").remove(&slab);
     }
 
     /// Bump / drop manifest references. An object with refcount 0 is
@@ -3539,7 +3566,23 @@ impl Store {
     /// A legacy idempotent `pin` with no typed feed owner is migrated into
     /// manifest ownership without inflation. If the persistent feed marker is
     /// present, this atomically adds a distinct manifest reference instead.
+    /// Whether a manifest already holds `id`. A read transaction: no commit.
+    pub fn manifest_claimed(&self, id: ObjId) -> io::Result<bool> {
+        let txn = self.db.begin_read().map_err(db_err)?;
+        // A store that has never had a manifest claim has no table yet; that
+        // is "not claimed", not an error.
+        let Ok(owners) = txn.open_table(MANIFEST_OWNERS) else { return Ok(false) };
+        Ok(owners.get(id.0.as_slice()).map_err(db_err)?.is_some())
+    }
+
     pub fn claim_manifest(&self, id: ObjId) -> io::Result<bool> {
+        // Already owned: nothing to record, so no write transaction. Every
+        // sign of a user manifest re-registers every declared object of the
+        // xite, and each redb commit is a durable fsync, so a held claim
+        // answers from a read transaction instead.
+        if self.manifest_claimed(id)? {
+            return Ok(false);
+        }
         let txn = self.db.begin_write().map_err(db_err)?;
         let claimed = {
             let mut objects = txn.open_table(OBJECTS).map_err(db_err)?;
@@ -4334,6 +4377,7 @@ impl Store {
             slabs.remove(victim).map_err(db_err)?;
         }
         txn.commit().map_err(db_err)?;
+        self.forget_slab_reader(victim);
         remove_file_durable(&self.slab_path(victim))?;
         Ok(())
     }
@@ -6301,6 +6345,31 @@ mod tests {
         assert_eq!(store.ref_delta(id, 0).unwrap(), 0);
     }
 
+    /// A claim that is already held must not touch the index at all: every
+    /// sign re-claims every object the xite declares, and each index commit
+    /// is a durable fsync.
+    #[test]
+    fn repeated_manifest_claims_do_not_write_the_index() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = Store::open(store_dir.path()).unwrap();
+        let data = test_data(1024);
+        let id = ObjId::of(&data);
+        store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+        assert!(!store.manifest_claimed(id).unwrap());
+        assert!(store.claim_manifest(id).unwrap());
+        assert!(store.manifest_claimed(id).unwrap());
+
+        let index = store_dir.path().join("index.redb");
+        let before = std::fs::metadata(&index).unwrap().modified().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        for _ in 0..5 {
+            assert!(!store.claim_manifest(id).unwrap());
+        }
+        let after = std::fs::metadata(&index).unwrap().modified().unwrap();
+        assert_eq!(before, after, "a held claim must not write the index");
+        assert_eq!(store.ref_delta(id, 0).unwrap(), 1);
+    }
+
     #[test]
     fn manifest_claim_migrates_one_legacy_pin_without_inflation() {
         let store_dir = tempfile::tempdir().unwrap();
@@ -6718,6 +6787,40 @@ mod tests {
         drop(again);
         store.enforce_quota(0).unwrap();
         assert!(!store.contains(id).unwrap(), "released, it is ordinary cache again");
+    }
+
+    /// Reads open a slab once and keep the handle: a reopen per read pays
+    /// an on-access antivirus scan of the whole slab after every append
+    /// (seconds per sign on Windows). The handle opened before an append
+    /// still sees the appended bytes, and compaction drops the victim's.
+    #[test]
+    fn slab_reads_reuse_one_handle_and_see_later_appends() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = StoreConfig { slab_seal_bytes: 8 << 10, ..Default::default() };
+        let store = Store::open_with(dir.path(), cfg).unwrap();
+
+        let first = test_data(300);
+        let first_id = ObjId::of(&first);
+        store.insert_bytes(first_id, Ns::Plain, &first, 1).unwrap();
+        assert_eq!(store.read_bytes(first_id, 2).unwrap(), first);
+        assert_eq!(store.slab_readers.lock().unwrap().len(), 1);
+
+        let second = test_data(301);
+        let second_id = ObjId::of(&second);
+        store.insert_bytes(second_id, Ns::Plain, &second, 3).unwrap();
+        assert_eq!(store.read_bytes(second_id, 4).unwrap(), second);
+        assert_eq!(store.slab_readers.lock().unwrap().len(), 1, "same slab, same handle");
+
+        for i in 0..40usize {
+            let data = test_data(400 + i);
+            store.insert_bytes(ObjId::of(&data), Ns::Plain, &data, 10 + i as u64).unwrap();
+        }
+        assert_ne!(store.open_slab.lock().unwrap().0, 0, "slab 0 must have sealed");
+        store.compact_slab(0).unwrap();
+        assert!(!store.slab_readers.lock().unwrap().contains_key(&0), "victim handle kept");
+        assert!(!store.slab_path(0).exists(), "victim slab still on disk");
+        assert_eq!(store.read_bytes(first_id, 100).unwrap(), first);
+        assert_eq!(store.read_bytes(second_id, 100).unwrap(), second);
     }
 
     #[test]
