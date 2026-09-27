@@ -4365,6 +4365,14 @@ pub struct AppState {
     activation_writers_waiting: std::sync::atomic::AtomicUsize,
     /// Woken each time a polling writer lands.
     activation_writer_landed: tokio::sync::Notify,
+    /// Legacy user-content files (declared without a b3, so no peer can
+    /// serve them until their author re-signs) that a fetch pass just failed
+    /// on, keyed by xite and `path#sha512`, with the time they may be tried
+    /// again. Peers gossip a hub hint about once a minute, and every hint
+    /// re-fetched the same permanently unavailable files: pointless dials,
+    /// a warning per pass, and a `file_added` event that kept every open
+    /// page's sync banner up with nothing ever landing.
+    legacy_unavailable: std::sync::Mutex<HashMap<String, HashMap<String, i64>>>,
     /// Verified root content.json updates whose declared files have not all
     /// landed yet, keyed by canonical address. The on-disk content.json (the
     /// completeness marker) stays at the previous consistent version until the
@@ -5620,6 +5628,7 @@ impl AppState {
             activation_writer_turnstile: tokio::sync::Mutex::new(()),
             activation_writers_waiting: std::sync::atomic::AtomicUsize::new(0),
             activation_writer_landed: tokio::sync::Notify::new(),
+            legacy_unavailable: std::sync::Mutex::new(HashMap::new()),
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
             db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -29515,6 +29524,78 @@ impl AppState {
         Some(out)
     }
 
+    /// The xite's bad files whose on-disk bytes do not match their declared
+    /// hash, as fetchable entries. A user's data.json that changed without
+    /// changing size passes every presence check, and its manifest is
+    /// already committed, so the user-content pass never looked at it again:
+    /// likes and follows stayed stale for good. The pass re-queues these by
+    /// hash instead.
+    pub async fn stale_bad_files(&self, address: &str) -> Vec<FileEntry> {
+        let storage = {
+            let xites = self.xites.read().await;
+            let Some(x) = self.resolve_xite(&xites, address) else { return Vec::new() };
+            x.storage.clone()
+        };
+        let mut stale = Vec::new();
+        for path in self.bad_files(address).await {
+            let Some((entry, _optional)) = self.file_info_any(address, &path).await else {
+                continue;
+            };
+            if !storage.verify(&path, &entry.sha512) {
+                stale.push(entry);
+            }
+        }
+        stale
+    }
+
+    /// Forget bad-file counters for paths that just landed.
+    pub async fn clear_bad_files(&self, address: &str, paths: &[String]) {
+        if paths.is_empty() {
+            return;
+        }
+        let landed: std::collections::HashSet<&str> = paths.iter().map(String::as_str).collect();
+        let canonical = self.canonical_key(address).await;
+        let keys = self.alias_keys(&canonical, address).await;
+        let mut xites = self.xites.write().await;
+        for key in &keys {
+            if let Some(x) = xites.get_mut(key) {
+                x.settings.cache.bad_files.retain(|path, _| !landed.contains(path.as_str()));
+            }
+        }
+    }
+
+    /// How long a legacy user-content file that no peer served stays out of
+    /// the hint-driven passes. The slow resync tick still retries it.
+    pub const LEGACY_RETRY_SECS: i64 = 600;
+
+    /// Record that `inner_path` at `sha512` (a legacy entry without a b3)
+    /// could not be fetched: the hint-driven passes skip it for
+    /// [`Self::LEGACY_RETRY_SECS`]. Keyed by version, so a re-signed file
+    /// with a new hash is fetched at once.
+    pub fn defer_legacy_unavailable(&self, address: &str, inner_path: &str, sha512: &str) {
+        let mut map = self.legacy_unavailable.lock().unwrap();
+        map.entry(address.to_string())
+            .or_default()
+            .insert(format!("{inner_path}#{sha512}"), now_secs() + Self::LEGACY_RETRY_SECS);
+    }
+
+    /// Whether a fetch pass should skip this file version for now.
+    pub fn legacy_deferred(&self, address: &str, inner_path: &str, sha512: &str) -> bool {
+        let map = self.legacy_unavailable.lock().unwrap();
+        map.get(address)
+            .and_then(|files| files.get(&format!("{inner_path}#{sha512}")))
+            .is_some_and(|&until| until > now_secs())
+    }
+
+    #[cfg(test)]
+    fn expire_legacy_deferrals(&self, address: &str) {
+        if let Some(files) = self.legacy_unavailable.lock().unwrap().get_mut(address) {
+            for until in files.values_mut() {
+                *until = 0;
+            }
+        }
+    }
+
     /// A xite's known bad (missing/failed) files (`siteBadFiles`): inner paths
     /// still needed. Empty if the xite is unknown or fully downloaded.
     pub async fn bad_files(&self, address: &str) -> Vec<String> {
@@ -48932,6 +49013,78 @@ mod tests {
     /// staged that root, so nothing marked the xite downloaded: the page
     /// served, but every child manifest was refused with "Xite not yet
     /// downloaded" until a restart re-registered the entry with content.
+    /// A user's data.json that changed without changing size: every presence
+    /// check passes, but the bytes no longer match the manifest. The pass
+    /// must get it back as a fetchable entry, and forget it once it lands.
+    #[tokio::test]
+    async fn stale_bad_files_lists_declared_files_whose_bytes_no_longer_match() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let privatekey = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&privatekey).unwrap();
+        let new_bytes = b"{\"post_like\":{\"b\":2}}";
+        let old_bytes = b"{\"post_like\":{\"a\":1}}";
+        assert_eq!(new_bytes.len(), old_bytes.len(), "fixture: same size");
+        let child_path = "data/users/u1/content.json";
+        let mut child = json!({
+            "address": address,
+            "inner_path": child_path,
+            "modified": 1.0,
+            "files": { "data.json": {
+                "size": new_bytes.len(),
+                "sha512": XiteStorage::hash_bytes(new_bytes),
+            } },
+        });
+        epix_content::sign(&mut child, &privatekey).unwrap();
+        storage.write(child_path, &serde_json::to_vec(&child).unwrap()).unwrap();
+        storage.write("data/users/u1/data.json", old_bytes).unwrap();
+        let mut root = json!({
+            "address": address,
+            "modified": 1.0,
+            "files": {},
+            "includes": { child_path: {} },
+        });
+        epix_content::sign(&mut root, &privatekey).unwrap();
+        storage.write("content.json", &serde_json::to_vec(&root).unwrap()).unwrap();
+        let s = AppState::new("test");
+        s.add_xite(&address, XiteEntry { storage: storage.clone(), content: Some(root) }).await;
+        assert!(s.stale_bad_files(&address).await.is_empty(), "nothing is bad yet");
+        s.xites
+            .write()
+            .await
+            .get_mut(&address)
+            .unwrap()
+            .settings
+            .cache
+            .bad_files
+            .insert("data/users/u1/data.json".to_string(), 1);
+
+        let stale = s.stale_bad_files(&address).await;
+        assert_eq!(stale.len(), 1, "the same-size stale file is re-queued");
+        assert_eq!(stale[0].inner_path, "data/users/u1/data.json");
+        assert_eq!(stale[0].sha512, XiteStorage::hash_bytes(new_bytes));
+
+        // The new version lands: no longer stale, and the counter is cleared.
+        storage.write("data/users/u1/data.json", new_bytes).unwrap();
+        assert!(s.stale_bad_files(&address).await.is_empty());
+        s.clear_bad_files(&address, &["data/users/u1/data.json".to_string()]).await;
+        assert!(s.bad_files(&address).await.is_empty());
+    }
+
+    /// A legacy file that no peer served is skipped by the hint-driven passes
+    /// for a while, per version: a re-signed file with a new hash is not.
+    #[test]
+    fn legacy_deferral_is_per_version_and_expires() {
+        let s = AppState::new("test");
+        assert!(!s.legacy_deferred("epix1x", "data/users/a.epix/data.json", "old"));
+        s.defer_legacy_unavailable("epix1x", "data/users/a.epix/data.json", "old");
+        assert!(s.legacy_deferred("epix1x", "data/users/a.epix/data.json", "old"));
+        assert!(!s.legacy_deferred("epix1x", "data/users/a.epix/data.json", "resigned"));
+        assert!(!s.legacy_deferred("epix1other", "data/users/a.epix/data.json", "old"));
+        s.expire_legacy_deferrals("epix1x");
+        assert!(!s.legacy_deferred("epix1x", "data/users/a.epix/data.json", "old"));
+    }
+
     #[tokio::test]
     async fn mark_downloaded_sets_the_marker_once_content_is_present() {
         let dir = tempfile::tempdir().unwrap();
