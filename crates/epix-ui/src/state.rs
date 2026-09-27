@@ -48904,6 +48904,32 @@ mod tests {
     /// of the forum mid-sync ("Please connect to EpixNet first" on the xID
     /// button). Every clone event must carry the identity the full site info
     /// would.
+    /// Windows refuses to rename a directory while a handle is open below it.
+    /// A serve or a sync holds one for a moment; the removal must wait it out
+    /// instead of leaving the tree at its served path.
+    #[cfg(windows)]
+    #[test]
+    fn windows_removal_waits_out_an_open_handle_below_the_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("epix1x");
+        let user_dir = root.join("data").join("users").join("a.epix");
+        std::fs::create_dir_all(&user_dir).unwrap();
+        let file = user_dir.join("data.json");
+        std::fs::write(&file, b"{}").unwrap();
+        std::fs::write(root.join("content.json"), b"{}").unwrap();
+        // Default share mode (no FILE_SHARE_DELETE): the directory rename is
+        // refused with ERROR_ACCESS_DENIED while this stays open.
+        let held = std::fs::File::open(&file).unwrap();
+        let releaser = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(held);
+        });
+        remove_xite_directory_durable(&root).expect("removal waits for the handle");
+        releaser.join().unwrap();
+        assert!(!root.exists());
+        assert!(!dir.path().join(".epix1x.epix-remove").exists());
+    }
+
     #[tokio::test]
     async fn clone_events_carry_the_installed_xites_identity() {
         let dir = tempfile::tempdir().unwrap();
