@@ -1,0 +1,18 @@
+# Posts a one-time scam warning on issues and PRs that mention wallets,
+# seed phrases or private keys. Logic lives in EpixZone/.github.
+name: Scam warning
+
+on:
+  issues:
+    types: [opened]
+  issue_comment:
+    types: [created]
+
+permissions: {}
+
+jobs:
+  warn:
+    permissions:
+      issues: write
+      pull-requests: write
+    uses: EpixZone/.github/.github/workflows/scam-warning.yml@main
