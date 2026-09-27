@@ -3820,6 +3820,9 @@ impl OnDemand {
         };
         self.state.update_content(address, content.clone()).await;
         self.state.set_clone_status(address, "complete", None, None);
+        // A resumed clone whose root was already on disk never staged that
+        // root, so nothing else marks it downloaded (see `mark_downloaded`).
+        self.state.mark_downloaded(address).await;
         self.state.add_transfer(address, bytes, 0).await;
         // Rebuild the db now that the included / per-user data files are on
         // disk, so a user_contents xite's topics/comments are queryable.
