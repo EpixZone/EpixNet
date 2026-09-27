@@ -2257,16 +2257,19 @@ struct UnavailableChildFiles {
 }
 
 impl UnavailableChildFiles {
-    async fn record(&mut self, state: &Arc<AppState>, address: &str, inner_path: String) {
+    async fn record(&mut self, state: &Arc<AppState>, address: &str, file: epix_xite::FileEntry) {
         const SAMPLE_LIMIT: usize = 10;
         self.count += 1;
         if self.sample.len() < SAMPLE_LIMIT {
-            self.sample.push(inner_path.clone());
+            self.sample.push(file.inner_path.clone());
         }
-        if !state.file_has_b3(address, &inner_path).await {
+        if !state.file_has_b3(address, &file.inner_path).await {
+            // Nothing serves this version until its author re-signs it: keep
+            // it out of the hint-driven passes for a while.
+            state.defer_legacy_unavailable(address, &file.inner_path, &file.sha512);
             self.legacy_count += 1;
             if self.legacy_sample.len() < SAMPLE_LIMIT {
-                self.legacy_sample.push(inner_path);
+                self.legacy_sample.push(file.inner_path);
             }
         }
     }
@@ -2416,7 +2419,7 @@ async fn fetch_child_data_files(
         // failed would light the dashboard's failure pill for a normal clone.
         if staged.is_none() {
             for file in page_unavailable {
-                unavailable.record(state, address, file.inner_path).await;
+                unavailable.record(state, address, file).await;
             }
         }
     }
@@ -2591,16 +2594,20 @@ async fn sync_declared_child_data(
 
     let mut unique = HashSet::new();
     child_files.retain(|file| unique.insert(file.inner_path.clone()));
+    let Some(state) = progress else {
+        return arrived;
+    };
+    // Legacy files a recent pass could not get are left to the slow tick:
+    // with only those outstanding there is no fetch, no warning and no
+    // `file_added` event for this pass.
     let needed = child_files
         .into_iter()
         .filter(|file| !xite.storage().verify(&file.inner_path, &file.sha512))
+        .filter(|file| !state.legacy_deferred(address, &file.inner_path, &file.sha512))
         .collect::<Vec<_>>();
     if needed.is_empty() {
         return arrived;
     }
-    let Some(state) = progress else {
-        return arrived;
-    };
     let mut data_arrived = fetch_child_data_files(xite, state, address, peers, needed, None).await;
     arrived.append(&mut data_arrived);
     arrived
@@ -2665,7 +2672,7 @@ async fn sync_included_content(
     }
     let (child_files, arrived) =
         sync_child_manifest_levels(xite, &peers, progress, address, ordered.clone(), t0).await;
-    let (child_files, arrived) = if arrived.is_empty()
+    let (mut child_files, arrived) = if arrived.is_empty()
         && child_files.is_empty()
         && single_live
         && swarm.len() > 1
@@ -2676,6 +2683,17 @@ async fn sync_included_content(
         (child_files, arrived)
     };
     trace_clone!(t0, "all levels done, {} manifest(s) arrived", arrived.len());
+    // A committed child's declared file that changed without changing size
+    // is not re-walked above (its manifest is current) and passes every
+    // presence check, so it stayed stale for good. The registry still lists
+    // it as bad: re-queue those by hash.
+    if let Some(state) = progress {
+        let stale = state.stale_bad_files(address).await;
+        if !stale.is_empty() {
+            trace_clone!(t0, "{} bad file(s) re-queued by hash", stale.len());
+            child_files.extend(stale);
+        }
+    }
     // The merge sweep is best-effort freshness, not correctness: committed
     // children's merge files ride the declared-data batch below, deferred
     // children carry their merge payloads into the promote, and the periodic
@@ -2701,6 +2719,9 @@ async fn sync_included_content(
     }
     let arrived =
         sync_declared_child_data(xite, progress, address, &peers, child_files, arrived).await;
+    if let Some(state) = progress {
+        state.clear_bad_files(address, &arrived).await;
+    }
     trace_clone!(t0, "declared data done");
     sync_deferred_children(xite, progress, address, &peers, t0).await;
     if let Some(state) = progress {
