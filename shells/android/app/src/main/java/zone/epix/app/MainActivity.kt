@@ -20,6 +20,7 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.Switch
 import android.widget.TextView
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
@@ -92,6 +93,14 @@ class MainActivity : AppCompatActivity() {
     private val tabs = mutableListOf<Tab>()
     private var currentTabIndex = 0
     private val currentTab: Tab get() = tabs[currentTabIndex]
+    // Android 16+ does not dispatch the deprecated Activity.onBackPressed.
+    // Only intercept system Back while the selected tab has page history;
+    // otherwise leave Android's normal back-to-home behavior enabled.
+    private val browserBackCallback = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            goBackInCurrentTab()
+        }
+    }
     private lateinit var backButton: TextView
     private lateinit var forwardButton: TextView
     private lateinit var tabCountView: TextView
@@ -169,6 +178,7 @@ class MainActivity : AppCompatActivity() {
         runtime.settings.remoteDebuggingEnabled = true
         installWallet()
         newTab(GeckoSession().apply { open(runtime) })
+        onBackPressedDispatcher.addCallback(this, browserBackCallback)
         // The page, not the address bar, starts focused - otherwise the
         // keyboard pops over the app on every launch.
         geckoView.requestFocus()
@@ -233,7 +243,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onCanGoBack(session: GeckoSession, value: Boolean) {
                 tab.canGoBack = value
-                if (tab === currentTab) backButton.alpha = if (value) 1f else DISABLED_ALPHA
+                if (tab === currentTab) refreshBackNavigation()
             }
 
             override fun onCanGoForward(session: GeckoSession, value: Boolean) {
@@ -371,11 +381,12 @@ class MainActivity : AppCompatActivity() {
         setChromeHidden(false)
         val tab = currentTab
         if (geckoView.session !== tab.session) {
+            leaveAddressEditing()
             geckoView.releaseSession()
             geckoView.setSession(tab.session)
         }
         if (!addressBar.hasFocus()) addressBar.setText(friendlyUrl(tab.url))
-        backButton.alpha = if (tab.canGoBack) 1f else DISABLED_ALPHA
+        refreshBackNavigation()
         forwardButton.alpha = if (tab.canGoForward) 1f else DISABLED_ALPHA
         tabCountView.text = tabs.size.toString()
     }
@@ -705,14 +716,25 @@ class MainActivity : AppCompatActivity() {
         refreshOfflineBanner()
     }
 
-    /** Hardware/gesture back navigates the page history first. */
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        if (currentTab.canGoBack) {
-            currentTab.session.goBack()
-        } else {
-            @Suppress("DEPRECATION") super.onBackPressed()
-        }
+    /** Keep toolbar and hardware/gesture Back tied to the selected tab. */
+    private fun refreshBackNavigation() {
+        val canGoBack = currentTab.canGoBack
+        backButton.alpha = if (canGoBack) 1f else DISABLED_ALPHA
+        browserBackCallback.isEnabled = canGoBack
+    }
+
+    private fun goBackInCurrentTab() {
+        if (!currentTab.canGoBack) return
+        leaveAddressEditing()
+        currentTab.session.goBack()
+    }
+
+    /** Navigation ends address editing so the bar can reflect the new page. */
+    private fun leaveAddressEditing() {
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(addressBar.windowToken, 0)
+        addressBar.clearFocus()
+        geckoView.requestFocus()
     }
 
     /** A second epix:// link while running: navigate the current tab. */
@@ -850,10 +872,13 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(COLOR_CHROME_BG)
         }
         backButton = button("‹", "Back") {
-            if (currentTab.canGoBack) currentTab.session.goBack()
+            goBackInCurrentTab()
         }
         forwardButton = button("›", "Forward") {
-            if (currentTab.canGoForward) currentTab.session.goForward()
+            if (currentTab.canGoForward) {
+                leaveAddressEditing()
+                currentTab.session.goForward()
+            }
         }
         val reload = button("⟳", "Reload") { currentTab.session.reload() }
         backButton.alpha = DISABLED_ALPHA

@@ -38,6 +38,26 @@ are test doubles. It checks typed and external deep links, encoded path/query/
 fragment preservation, ordinary HTTPS URLs, and search. Full APK launch,
 GeckoView rendering, wallet onboarding, and the Rust core need separate tests.
 
+### Browser system Back on Android 16+
+
+With the full APK running on an API 36+ emulator:
+
+1. From Dashboard, open the xID xite. Press Android Back (also test an edge
+   gesture). It must return to Dashboard without leaving the app. The toolbar's
+   Back/Forward buttons and system Back must navigate the same page history.
+2. Open another xID page, navigate within it, and go Back one entry at a time.
+   At Dashboard with no earlier page, Android Back may return to the launcher.
+3. Switch between a tab with history and a fresh tab. System Back handling must
+   reflect the selected tab, not history changes in background tabs.
+4. With the on-screen keyboard open, Back must dismiss it before navigating.
+   Navigating or switching tabs after editing the address must show the reached
+   page's address. Repeat with the wallet open: wallet Back must stay inside its
+   dialog history.
+
+The app uses the lifecycle-aware AndroidX Back dispatcher. An Activity-level
+`onBackPressed` override is not dispatched when targeting Android 16+ with
+predictive Back enabled, even if the current Gecko session has history.
+
 ## Android wallet keyboard (issue #531)
 
 On a disposable Android emulator with the debug APK installed and no wallet:
