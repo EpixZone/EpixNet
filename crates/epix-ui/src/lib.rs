@@ -1402,6 +1402,7 @@ async fn render_wrapper(
         .as_ref()
         .and_then(|c| c.get("title"))
         .and_then(|t| t.as_str())
+        .filter(|t| !t.trim().is_empty())
         .unwrap_or(&requested)
         .to_string();
     // A xite's content.json can opt into strict postMessage nonce checks
@@ -1466,22 +1467,22 @@ async fn render_wrapper(
         let mut meta = String::new();
         let mut style = String::new();
         if let Some(content) = ctx.state.content(&address).await {
+            // Empty authoring placeholders leave the wrapper defaults intact.
+            let hint = |key: &str| content.get(key).and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty());
             let theme = themeclass.trim_start_matches("theme-");
             let themed_key = format!("background-color-{theme}");
-            let background = content
-                .get(&themed_key)
-                .or_else(|| content.get("background-color"))
-                .and_then(|v| v.as_str());
+            let background = hint(&themed_key).or_else(|| hint("background-color"));
             if let Some(color) = background {
                 style.push_str(&format!("background-color: {};", html_escape(color)));
             }
-            if let Some(viewport) = content.get("viewport").and_then(|v| v.as_str()) {
+            if let Some(viewport) = hint("viewport") {
                 meta.push_str(&format!(
                     "<meta name=\"viewport\" id=\"viewport\" content=\"{}\">",
                     html_escape(viewport)
                 ));
             }
-            if let Some(favicon) = content.get("favicon").and_then(|v| v.as_str()) {
+            if let Some(favicon) = hint("favicon") {
                 let root = if proxy_mode { "/".to_string() } else { format!("/{requested}/") };
                 meta.push_str(&format!(
                     "<link rel=\"icon\" href=\"{root}{}\">",

@@ -238,7 +238,8 @@ fn render_sidebar(
     includes: &[String],
 ) -> String {
     let content = &info["content"];
-    let title = content.get("title").and_then(|v| v.as_str()).unwrap_or(address);
+    let title = content.get("title").and_then(|v| v.as_str())
+        .filter(|title| !title.trim().is_empty()).unwrap_or(address);
     let files = content.get("files").and_then(|v| v.as_i64()).unwrap_or(0);
     let size_bytes = info["settings"]["size"].as_i64().unwrap_or(0);
     let size_mb = size_bytes as f64 / 1024.0 / 1024.0;
@@ -514,6 +515,12 @@ mod tests {
         assert!(html2.contains("id='checkbox-owned' />"), "owned checkbox unchecked when not owned");
         assert!(html2.contains("button-sign-publish"), "owner panel always present; CSS toggles it");
         assert!(html2.contains("class='settings-owned'"));
+
+        for title in ["", "  "] {
+            info2["content"]["title"] = json!(title);
+            let html = render_sidebar("1abc.epix", &info2, counts, 0, 0, &[]);
+            assert!(html.contains("<h1>1abc.epix</h1>"), "blank title keeps the address fallback");
+        }
     }
 
     #[test]

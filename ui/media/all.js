@@ -2434,7 +2434,7 @@ if (window.getComputedStyle(document.body).transform) {
       }
       if (this.ws.ws.readyState === 1 && !this.xite_info) {
         return this.reloadXiteInfo();
-      } else if (this.xite_info && (((ref = this.xite_info.content) != null ? ref.title : void 0) != null) && !this.is_title_changed) {
+      } else if (this.xite_info && (ref = this.xite_info.content) && typeof ref.title === "string" && ref.title.trim() && !this.is_title_changed) {
         window.document.title = this.xite_info.content.title + " - EpixNet";
         return this.log("Setting title to", window.document.title);
       }
@@ -2588,7 +2588,7 @@ if (window.getComputedStyle(document.body).transform) {
               });
             });
           }
-          if ((((ref = xite_info.content) != null ? ref.title : void 0) != null) && !_this.is_title_changed) {
+          if ((ref = xite_info.content) && typeof ref.title === "string" && ref.title.trim() && !_this.is_title_changed) {
             window.document.title = xite_info.content.title + " - EpixNet";
             return _this.log("Setting title to", window.document.title);
           }
@@ -2678,7 +2678,7 @@ if (window.getComputedStyle(document.body).transform) {
             if (!this.xite_info) {
               this.reloadXiteInfo();
             }
-            if (xite_info.content && xite_info.content.title && !this.is_title_changed) {
+            if (xite_info.content && typeof xite_info.content.title === "string" && xite_info.content.title.trim() && !this.is_title_changed) {
               window.document.title = xite_info.content.title + " - EpixNet";
               this.log("Required file " + window.file_inner_path + " done, setting title to", window.document.title);
             }

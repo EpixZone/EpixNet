@@ -49,7 +49,7 @@ function fixture() {
     RateLimit(delay, fn) { fn(); },
   });
   const loading = source.slice(source.indexOf('/* ---- Loading.coffee ---- */'), source.indexOf('/* ---- Notifications.coffee ---- */'));
-  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'loadingDocumentReady', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
+  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'loadingDocumentReady', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
   const wrapper = Object.assign(Object.create(context.Wrapper.prototype), {
     xite_info: null, inner, inner_loaded: false, inner_ready: true,
     event_xite_info: { resolve() {} }, noteContentSync() {}, log() {}, reloadXiteInfo() {},
@@ -80,6 +80,25 @@ function info(event, extra = {}) {
     size_limit: 10, started_task_num: 4, tasks: 2, bad_files: 2, peers: 1,
     event, ...extra };
 }
+
+test('blank manifest titles preserve the wrapper title on load and siteInfo updates', () => {
+  for (const title of ['', '  ', 'My xite']) {
+    for (const update of ['onPageLoad', 'reloadXiteInfo', 'file_done']) {
+      const f = fixture();
+      f.context.window.document.title = 'test.epix - EpixNet';
+      const snapshot = info(null, { content: { title } });
+      f.wrapper.xite_info = snapshot;
+      f.wrapper.ws.cmd = (cmd, params, callback) => callback(snapshot);
+      if (update === 'file_done') {
+        f.wrapper.setXiteInfo({ ...snapshot, event: ['file_done', 'index.html'] });
+      } else {
+        f.context.Wrapper.prototype[update].call(f.wrapper);
+      }
+      assert.equal(f.context.window.document.title,
+        title.trim() ? 'My xite - EpixNet' : 'test.epix - EpixNet', `${update}: ${JSON.stringify(title)}`);
+    }
+  }
+});
 
 test('a slow discovery round does not diagnose a connection problem after 30 seconds', () => {
   const f = fixture(); f.load.startWatchdog(); f.advance(30000);

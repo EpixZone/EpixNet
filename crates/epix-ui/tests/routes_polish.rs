@@ -9,6 +9,15 @@ use serde_json::json;
 use tower::ServiceExt;
 
 async fn router_with_xite() -> axum::Router {
+    router_with_hints(json!({
+        "background-color": "#101418",
+        "viewport": "width=device-width, initial-scale=1",
+        "favicon": "img/icon.png",
+    })).await
+}
+
+async fn router_with_hints(mut hints: serde_json::Value) -> axum::Router {
+    hints["address"] = json!("1Polish");
     let state = AppState::new("polish-test");
     let dir = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(dir.path());
@@ -17,12 +26,7 @@ async fn router_with_xite() -> axum::Router {
     state
         .add_xite("1Polish", XiteEntry {
             storage,
-            content: Some(json!({
-                "address": "1Polish",
-                "background-color": "#101418",
-                "viewport": "width=device-width, initial-scale=1",
-                "favicon": "img/icon.png",
-            })),
+            content: Some(hints),
         })
         .await;
     std::mem::forget(dir);
@@ -81,4 +85,44 @@ async fn wrapper_carries_content_json_page_hints() {
         "viewport meta"
     );
     assert!(html.contains(r#"<link rel="icon" href="/1Polish/img/icon.png">"#), "favicon link");
+}
+
+#[tokio::test]
+async fn empty_page_hints_keep_default_wrapper_behavior() {
+    for blank in ["", "  "] {
+        let router = router_with_hints(json!({
+            "title": blank, "favicon": blank, "viewport": blank,
+            "background-color": blank, "background-color-light": blank, "background-color-dark": blank,
+        })).await;
+        let response = router.oneshot(get("/1Polish/")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let html = String::from_utf8(axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(html.contains("<title>1Polish - EpixNet</title>"));
+        assert!(!html.contains("<link rel=\"icon\""), "an empty favicon must not request the wrapper as an image");
+        assert!(!html.contains("id=\"viewport\""), "keep the default viewport");
+        assert!(!html.contains(&format!("background-color: {blank};")));
+    }
+}
+
+#[tokio::test]
+async fn empty_theme_background_falls_back_to_the_shared_background() {
+    let router = router_with_hints(json!({
+        "background-color": "#123456", "background-color-light": "", "background-color-dark": "",
+    })).await;
+    let response = router.oneshot(get("/1Polish/")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let html = String::from_utf8(axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+    assert!(html.contains("background-color: #123456;"));
+}
+
+#[tokio::test]
+async fn theme_background_overrides_the_shared_background() {
+    let router = router_with_hints(json!({
+        "background-color": "#123456", "background-color-light": "#abcdef", "background-color-dark": "#abcdef",
+    })).await;
+    let response = router.oneshot(get("/1Polish/")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let html = String::from_utf8(axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+    assert!(html.contains("background-color: #abcdef;"));
+    assert!(!html.contains("background-color: #123456;"));
 }
