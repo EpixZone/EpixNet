@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
@@ -19,7 +20,10 @@ import android.widget.LinearLayout
 import android.widget.ProgressBar
 import android.widget.Switch
 import android.widget.TextView
+import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -89,6 +93,14 @@ class MainActivity : AppCompatActivity() {
     private val tabs = mutableListOf<Tab>()
     private var currentTabIndex = 0
     private val currentTab: Tab get() = tabs[currentTabIndex]
+    // Android 16+ does not dispatch the deprecated Activity.onBackPressed.
+    // Only intercept system Back while the selected tab has page history;
+    // otherwise leave Android's normal back-to-home behavior enabled.
+    private val browserBackCallback = object : OnBackPressedCallback(false) {
+        override fun handleOnBackPressed() {
+            goBackInCurrentTab()
+        }
+    }
     private lateinit var backButton: TextView
     private lateinit var forwardButton: TextView
     private lateinit var tabCountView: TextView
@@ -166,6 +178,7 @@ class MainActivity : AppCompatActivity() {
         runtime.settings.remoteDebuggingEnabled = true
         installWallet()
         newTab(GeckoSession().apply { open(runtime) })
+        onBackPressedDispatcher.addCallback(this, browserBackCallback)
         // The page, not the address bar, starts focused - otherwise the
         // keyboard pops over the app on every launch.
         geckoView.requestFocus()
@@ -230,7 +243,7 @@ class MainActivity : AppCompatActivity() {
 
             override fun onCanGoBack(session: GeckoSession, value: Boolean) {
                 tab.canGoBack = value
-                if (tab === currentTab) backButton.alpha = if (value) 1f else DISABLED_ALPHA
+                if (tab === currentTab) refreshBackNavigation()
             }
 
             override fun onCanGoForward(session: GeckoSession, value: Boolean) {
@@ -368,11 +381,12 @@ class MainActivity : AppCompatActivity() {
         setChromeHidden(false)
         val tab = currentTab
         if (geckoView.session !== tab.session) {
+            leaveAddressEditing()
             geckoView.releaseSession()
             geckoView.setSession(tab.session)
         }
         if (!addressBar.hasFocus()) addressBar.setText(friendlyUrl(tab.url))
-        backButton.alpha = if (tab.canGoBack) 1f else DISABLED_ALPHA
+        refreshBackNavigation()
         forwardButton.alpha = if (tab.canGoForward) 1f else DISABLED_ALPHA
         tabCountView.text = tabs.size.toString()
     }
@@ -702,14 +716,25 @@ class MainActivity : AppCompatActivity() {
         refreshOfflineBanner()
     }
 
-    /** Hardware/gesture back navigates the page history first. */
-    @Deprecated("Deprecated in Java")
-    override fun onBackPressed() {
-        if (currentTab.canGoBack) {
-            currentTab.session.goBack()
-        } else {
-            @Suppress("DEPRECATION") super.onBackPressed()
-        }
+    /** Keep toolbar and hardware/gesture Back tied to the selected tab. */
+    private fun refreshBackNavigation() {
+        val canGoBack = currentTab.canGoBack
+        backButton.alpha = if (canGoBack) 1f else DISABLED_ALPHA
+        browserBackCallback.isEnabled = canGoBack
+    }
+
+    private fun goBackInCurrentTab() {
+        if (!currentTab.canGoBack) return
+        leaveAddressEditing()
+        currentTab.session.goBack()
+    }
+
+    /** Navigation ends address editing so the bar can reflect the new page. */
+    private fun leaveAddressEditing() {
+        (getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager)
+            .hideSoftInputFromWindow(addressBar.windowToken, 0)
+        addressBar.clearFocus()
+        geckoView.requestFocus()
     }
 
     /** A second epix:// link while running: navigate the current tab. */
@@ -847,10 +872,13 @@ class MainActivity : AppCompatActivity() {
             setBackgroundColor(COLOR_CHROME_BG)
         }
         backButton = button("‹", "Back") {
-            if (currentTab.canGoBack) currentTab.session.goBack()
+            goBackInCurrentTab()
         }
         forwardButton = button("›", "Forward") {
-            if (currentTab.canGoForward) currentTab.session.goForward()
+            if (currentTab.canGoForward) {
+                leaveAddressEditing()
+                currentTab.session.goForward()
+            }
         }
         val reload = button("⟳", "Reload") { currentTab.session.reload() }
         backButton.alpha = DISABLED_ALPHA
@@ -1716,6 +1744,13 @@ class MainActivity : AppCompatActivity() {
         walletDialog?.dismiss()
         val popupSession = GeckoSession().apply { open(runtime) }
         popupSession.permissionDelegate = walletPermissionDelegate
+        popupSession.promptDelegate = buildPromptDelegate()
+        var canGoBack = false
+        popupSession.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onCanGoBack(session: GeckoSession, value: Boolean) {
+                canGoBack = value
+            }
+        }
         val view = GeckoView(this).apply {
             setSession(popupSession)
             // Dark until the wallet page paints (it flashes white otherwise
@@ -1750,14 +1785,41 @@ class MainActivity : AppCompatActivity() {
             )
             addView(closeButton)
         }
-        // The wallet popup lays out at the extension-popup size; give it most
-        // of the screen (minus the header), dashboard-dark behind it.
-        val height = (resources.displayMetrics.heightPixels * heightFraction).toInt() - dp(40)
-        val holder = LinearLayout(this).apply {
+        // Give the wallet most of the screen, dashboard-dark behind it.
+        val maxPopupHeight = (resources.displayMetrics.heightPixels * heightFraction).toInt()
+        val holder = object : LinearLayout(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val availableHeight =
+                    if (View.MeasureSpec.getMode(heightMeasureSpec) == View.MeasureSpec.UNSPECIFIED) {
+                        maxPopupHeight
+                    } else {
+                        minOf(maxPopupHeight, View.MeasureSpec.getSize(heightMeasureSpec))
+                    }
+                super.onMeasure(
+                    widthMeasureSpec,
+                    View.MeasureSpec.makeMeasureSpec(availableHeight, View.MeasureSpec.EXACTLY),
+                )
+            }
+        }.apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(COLOR_CHROME_BG)
             addView(header, LinearLayout.LayoutParams(-1, -2))
-            addView(view, LinearLayout.LayoutParams(-1, height))
+            // Let the browser viewport shrink when the keyboard is visible.
+            addView(view, LinearLayout.LayoutParams(-1, 0, 1f))
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(holder) { _, insets ->
+            // Resize the Gecko viewport itself. On edge-to-edge Android,
+            // adjustResize can clip a dialog without remeasuring its content.
+            val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars()).bottom
+            val keyboardPadding = if (android.os.Build.VERSION.SDK_INT >= 30) {
+                (keyboard - systemBars).coerceAtLeast(0)
+            } else {
+                // Older Android resizes the dialog window itself.
+                0
+            }
+            holder.setPadding(0, 0, 0, keyboardPadding)
+            insets
         }
         popupSession.contentDelegate = object : GeckoSession.ContentDelegate {
             override fun onCloseRequest(session: GeckoSession) {
@@ -1783,6 +1845,30 @@ class MainActivity : AppCompatActivity() {
         val dialog = AlertDialog.Builder(this)
             .setView(holder)
             .create()
+        val navigateBack = {
+            // These are trusted wallet UI steps, including modal history
+            // entries added after an async render. Do not skip them as browser
+            // anti-abuse navigation would skip non-interacted web pages.
+            if (canGoBack) popupSession.goBack(false) else dialog.dismiss()
+        }
+        // Newer Android dispatches both key and gesture Back through the
+        // window callback. Use one dispatch path on each Android version.
+        if (android.os.Build.VERSION.SDK_INT < 33) {
+            // This handler is only for API 26–32; API 33+ uses the window's
+            // predictive-back callback registered below.
+            @android.annotation.SuppressLint("GestureBackNavigation")
+            val legacyBackListener = android.content.DialogInterface.OnKeyListener { _, keyCode, event ->
+                if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
+                    if (event.action == android.view.KeyEvent.ACTION_UP && !event.isCanceled) {
+                        navigateBack()
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            dialog.setOnKeyListener(legacyBackListener)
+        }
         dialog.setOnDismissListener {
             popupSession.close()
             // Only clear the field if it still points at this dialog: when one
@@ -1797,9 +1883,28 @@ class MainActivity : AppCompatActivity() {
         }
         walletDialog = dialog
         dialog.show()
-        // Full width: the wallet pages are laid out for a browser surface, not
-        // a margined dialog.
-        dialog.window?.setLayout(-1, -2)
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            dialog.onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            ) { navigateBack() }
+        }
+        // AlertDialog checks for native text editors while creating its view.
+        // GeckoView's HTML inputs load later, so the dialog gets marked as
+        // unable to use the IME. Clear that flag after show() so wallet fields
+        // (recovery words, passwords, etc.) can open the Android keyboard.
+        dialog.window?.apply {
+            clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+            setSoftInputMode(
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                } else {
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                },
+            )
+            // Full width: the wallet pages are laid out for a browser surface,
+            // not a margined dialog.
+            setLayout(-1, -2)
+        }
         return popupSession
     }
 
