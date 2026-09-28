@@ -90,6 +90,10 @@ cargo build --release -p epix-browser
 
 ## Command line actions
 
+New and re-signed xites include editable metadata fields in `content.json`.
+See the [content.json authoring reference](docs/content-json.md) for titles,
+favicons, background colors, and file patterns.
+
 The same binary doubles as the authoring and diagnostics CLI, with the
 action name as the first argument (the EpixNet CLI shape):
 

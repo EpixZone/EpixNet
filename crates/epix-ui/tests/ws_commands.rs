@@ -10,6 +10,28 @@ use std::sync::Arc;
 
 const WRAPPER_ID: i64 = 1_000_000;
 
+fn assert_empty_authoring_fields(content: &Value) {
+    for field in [
+        "description", "domain", "favicon", "background-color",
+        "background-color-light", "background-color-dark", "viewport",
+        "ignore", "optional", "shard",
+    ] {
+        assert_eq!(content.get(field), Some(&json!("")), "missing editable field {field}");
+    }
+}
+
+#[tokio::test]
+async fn new_xite_contains_editable_metadata_defaults() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("create-test", root.path());
+    let (address, _key) = state.create_xite().await.unwrap();
+    let bytes = std::fs::read(root.path().join("data").join(&address).join("content.json")).unwrap();
+    let content: Value = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(content["title"], "My new xite");
+    assert_empty_authoring_fields(&content);
+    assert!(epix_content::verify_signer(&content, &address));
+}
+
 /// A data-dir-backed state with one owned, signed xite holding a template
 /// layout (data-default/ + live data/) for the clone test.
 async fn state_with_xite() -> (Arc<AppState>, tempfile::TempDir, String, String) {
@@ -278,7 +300,18 @@ async fn xite_clone_from_template_root_uses_root_content() {
     assert_eq!(content["clone_root"], "template-new");
     // A `template-*` root gets the generic title, not "My <source title>".
     assert_eq!(content["title"], "My New Epix Xite");
+    assert_empty_authoring_fields(&content);
     assert!(epix_content::verify_signer(&content, &new_address), "signature verifies");
+}
+
+#[tokio::test]
+async fn xite_clone_with_blank_title_uses_default_title() {
+    let (state, root, address, _key) = state_with_xite().await;
+    XiteStorage::new(root.path().join("data").join(&address))
+        .write("content.json-default", br#"{"title":"","files":{}}"#)
+        .unwrap();
+    let cloned = state.clone_xite(&address, "", None).await.unwrap();
+    assert_eq!(state.content(&cloned).await.unwrap()["title"], "My New Epix Xite");
 }
 
 /// "Upgrade code" (siteClone with a `target_address`) re-copies the source

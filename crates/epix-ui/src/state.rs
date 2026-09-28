@@ -6308,6 +6308,7 @@ impl AppState {
                             .as_ref()
                             .and_then(|c| c.get("title"))
                             .and_then(|t| t.as_str())
+                            .filter(|title| !title.trim().is_empty())
                             .unwrap_or(address)
                             .to_string(),
                         x.content
@@ -9964,7 +9965,8 @@ impl AppState {
         let new_title = if root.starts_with("template-") {
             "My New Epix Xite".to_string()
         } else {
-            let title = map.get("title").and_then(|v| v.as_str()).unwrap_or("New Epix Xite");
+            let title = map.get("title").and_then(|v| v.as_str())
+                .filter(|title| !title.trim().is_empty()).unwrap_or("New Epix Xite");
             format!("My {title}")
         };
         map.insert("title".into(), json!(new_title));
@@ -14088,6 +14090,7 @@ impl AppState {
                             .as_ref()
                             .and_then(|root| root.get("title"))
                             .and_then(Value::as_str)
+                            .filter(|title| !title.trim().is_empty())
                             .unwrap_or(&address)
                             .to_string(),
                     ))

@@ -1816,6 +1816,16 @@ impl Xite {
         let map = content.as_object_mut().ok_or_else(|| {
             Error::Protocol("content.json is not a JSON object".into())
         })?;
+        // Keep editable root fields discoverable without overwriting an
+        // author's values. Add them only while signing, never while loading
+        // a received manifest whose signature covers the original contents.
+        for field in [
+            "title", "description", "domain", "favicon", "background-color",
+            "background-color-light", "background-color-dark", "viewport",
+            "ignore", "optional", "shard",
+        ] {
+            map.entry(field).or_insert_with(|| json!(""));
+        }
         map.insert("files".into(), Value::Object(files));
         Self::merge_files_optional(map, files_optional, declared_optional);
         // EpixNet signs an integer `modified` (int(time.time())); keep whole
