@@ -122,6 +122,10 @@ android {
 val walletRev =
     layout.projectDirectory.file("../../wallet-ext.rev").asFile
         .takeIf { it.exists() }?.readText()?.trim().orEmpty()
+// Match the desktop development override. Its content is tracked as a task
+// input, and removing the override restores the pinned release on the next build.
+val walletDist = providers.environmentVariable("EPIX_WALLET_DIST").orNull
+    ?.takeIf { it.isNotBlank() }?.let { file(it) }
 
 fun walletDistUrl(rev: String) =
     "https://github.com/EpixZone/epix-wallet/releases/download/wallet-$rev/epix-wallet-firefox.zip"
@@ -134,19 +138,26 @@ val stageWalletExt by tasks.registering {
     val destStamp = File(dest.parentFile, "wallet.rev-stamp")
     outputs.dir(dest)
     inputs.property("walletRev", walletRev)
+    inputs.property("walletDist", walletDist?.absolutePath.orEmpty())
+    walletDist?.let { inputs.dir(it) }
     doLast {
         if (walletRev.isEmpty())
             throw GradleException("wallet pin ../../wallet-ext.rev is missing or empty")
         val manifest = File(dest, "manifest.json")
         val current = destStamp.takeIf { it.exists() }?.readText()?.trim()
-        if (manifest.exists() && current == walletRev) return@doLast
+        if (walletDist == null && manifest.exists() && current == walletRev) return@doLast
+        if (walletDist != null && !File(walletDist, "manifest.json").isFile) {
+            throw GradleException("EPIX_WALLET_DIST must contain a built Firefox wallet manifest")
+        }
 
         dest.deleteRecursively()
         dest.mkdirs()
         // Reuse shells/wallet-ext only when it already holds the pinned rev.
         val stagedOk = File(staged, "manifest.json").exists() &&
             stagedStamp.takeIf { it.exists() }?.readText()?.trim() == walletRev
-        if (stagedOk) {
+        if (walletDist != null) {
+            walletDist.copyRecursively(dest, overwrite = true)
+        } else if (stagedOk) {
             staged.copyRecursively(dest, overwrite = true)
             File(dest, "README.md").delete()
         } else {
@@ -176,9 +187,25 @@ val stageWalletExt by tasks.registering {
         val perms = (json["permissions"] as MutableList<String>)
         if (!perms.contains("geckoViewAddons")) {
             perms.add("geckoViewAddons")
-            manifest.writeText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(json)))
         }
-        destStamp.writeText(walletRev)
+        if (walletDist != null) {
+            // ensureBuiltIn reuses an extension with the same version, including
+            // its cached scripts. Give local builds a stable content version so
+            // editing the wallet refreshes it without deleting profile data.
+            val digest = MessageDigest.getInstance("SHA-256")
+            walletDist.walkTopDown().filter { it.isFile }
+                .sortedBy { it.relativeTo(walletDist).invariantSeparatorsPath }
+                .forEach { source ->
+                    digest.update(source.relativeTo(walletDist).invariantSeparatorsPath.toByteArray())
+                    digest.update(0.toByte())
+                    digest.update(source.readBytes())
+                }
+            val hash = digest.digest().joinToString("") { "%02x".format(it) }
+            json["version"] = "0." + hash.take(12).chunked(4)
+                .joinToString(".") { it.toInt(16).toString() }
+        }
+        manifest.writeText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(json)))
+        destStamp.writeText(walletDist?.let { "local:${it.absolutePath}" } ?: walletRev)
     }
 }
 tasks.named("preBuild") { dependsOn(stageWalletExt) }

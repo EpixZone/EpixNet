@@ -10,6 +10,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
 import android.view.View
+import android.view.WindowManager
 import android.view.inputmethod.EditorInfo
 import android.view.inputmethod.InputMethodManager
 import android.widget.EditText
@@ -20,6 +21,8 @@ import android.widget.ProgressBar
 import android.widget.Switch
 import android.widget.TextView
 import androidx.appcompat.app.AppCompatActivity
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -1716,6 +1719,13 @@ class MainActivity : AppCompatActivity() {
         walletDialog?.dismiss()
         val popupSession = GeckoSession().apply { open(runtime) }
         popupSession.permissionDelegate = walletPermissionDelegate
+        popupSession.promptDelegate = buildPromptDelegate()
+        var canGoBack = false
+        popupSession.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onCanGoBack(session: GeckoSession, value: Boolean) {
+                canGoBack = value
+            }
+        }
         val view = GeckoView(this).apply {
             setSession(popupSession)
             // Dark until the wallet page paints (it flashes white otherwise
@@ -1750,14 +1760,41 @@ class MainActivity : AppCompatActivity() {
             )
             addView(closeButton)
         }
-        // The wallet popup lays out at the extension-popup size; give it most
-        // of the screen (minus the header), dashboard-dark behind it.
-        val height = (resources.displayMetrics.heightPixels * heightFraction).toInt() - dp(40)
-        val holder = LinearLayout(this).apply {
+        // Give the wallet most of the screen, dashboard-dark behind it.
+        val maxPopupHeight = (resources.displayMetrics.heightPixels * heightFraction).toInt()
+        val holder = object : LinearLayout(this) {
+            override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                val availableHeight =
+                    if (View.MeasureSpec.getMode(heightMeasureSpec) == View.MeasureSpec.UNSPECIFIED) {
+                        maxPopupHeight
+                    } else {
+                        minOf(maxPopupHeight, View.MeasureSpec.getSize(heightMeasureSpec))
+                    }
+                super.onMeasure(
+                    widthMeasureSpec,
+                    View.MeasureSpec.makeMeasureSpec(availableHeight, View.MeasureSpec.EXACTLY),
+                )
+            }
+        }.apply {
             orientation = LinearLayout.VERTICAL
             setBackgroundColor(COLOR_CHROME_BG)
             addView(header, LinearLayout.LayoutParams(-1, -2))
-            addView(view, LinearLayout.LayoutParams(-1, height))
+            // Let the browser viewport shrink when the keyboard is visible.
+            addView(view, LinearLayout.LayoutParams(-1, 0, 1f))
+        }
+        ViewCompat.setOnApplyWindowInsetsListener(holder) { _, insets ->
+            // Resize the Gecko viewport itself. On edge-to-edge Android,
+            // adjustResize can clip a dialog without remeasuring its content.
+            val keyboard = insets.getInsets(WindowInsetsCompat.Type.ime()).bottom
+            val systemBars = insets.getInsets(WindowInsetsCompat.Type.systemBars()).bottom
+            val keyboardPadding = if (android.os.Build.VERSION.SDK_INT >= 30) {
+                (keyboard - systemBars).coerceAtLeast(0)
+            } else {
+                // Older Android resizes the dialog window itself.
+                0
+            }
+            holder.setPadding(0, 0, 0, keyboardPadding)
+            insets
         }
         popupSession.contentDelegate = object : GeckoSession.ContentDelegate {
             override fun onCloseRequest(session: GeckoSession) {
@@ -1783,6 +1820,30 @@ class MainActivity : AppCompatActivity() {
         val dialog = AlertDialog.Builder(this)
             .setView(holder)
             .create()
+        val navigateBack = {
+            // These are trusted wallet UI steps, including modal history
+            // entries added after an async render. Do not skip them as browser
+            // anti-abuse navigation would skip non-interacted web pages.
+            if (canGoBack) popupSession.goBack(false) else dialog.dismiss()
+        }
+        // Newer Android dispatches both key and gesture Back through the
+        // window callback. Use one dispatch path on each Android version.
+        if (android.os.Build.VERSION.SDK_INT < 33) {
+            // This handler is only for API 26–32; API 33+ uses the window's
+            // predictive-back callback registered below.
+            @android.annotation.SuppressLint("GestureBackNavigation")
+            val legacyBackListener = android.content.DialogInterface.OnKeyListener { _, keyCode, event ->
+                if (keyCode == android.view.KeyEvent.KEYCODE_BACK) {
+                    if (event.action == android.view.KeyEvent.ACTION_UP && !event.isCanceled) {
+                        navigateBack()
+                    }
+                    true
+                } else {
+                    false
+                }
+            }
+            dialog.setOnKeyListener(legacyBackListener)
+        }
         dialog.setOnDismissListener {
             popupSession.close()
             // Only clear the field if it still points at this dialog: when one
@@ -1797,9 +1858,28 @@ class MainActivity : AppCompatActivity() {
         }
         walletDialog = dialog
         dialog.show()
-        // Full width: the wallet pages are laid out for a browser surface, not
-        // a margined dialog.
-        dialog.window?.setLayout(-1, -2)
+        if (android.os.Build.VERSION.SDK_INT >= 33) {
+            dialog.onBackInvokedDispatcher.registerOnBackInvokedCallback(
+                android.window.OnBackInvokedDispatcher.PRIORITY_DEFAULT,
+            ) { navigateBack() }
+        }
+        // AlertDialog checks for native text editors while creating its view.
+        // GeckoView's HTML inputs load later, so the dialog gets marked as
+        // unable to use the IME. Clear that flag after show() so wallet fields
+        // (recovery words, passwords, etc.) can open the Android keyboard.
+        dialog.window?.apply {
+            clearFlags(WindowManager.LayoutParams.FLAG_ALT_FOCUSABLE_IM)
+            setSoftInputMode(
+                if (android.os.Build.VERSION.SDK_INT >= 30) {
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_NOTHING
+                } else {
+                    WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE
+                },
+            )
+            // Full width: the wallet pages are laid out for a browser surface,
+            // not a margined dialog.
+            setLayout(-1, -2)
+        }
         return popupSession
     }
 
