@@ -2994,10 +2994,17 @@ async fn serve_file(
                         // the clone data directory. Their accepted manifest
                         // still distinguishes an absent path from a declared
                         // file waiting to download, including optional files.
+                        // Pending was observed before the completeness check:
+                        // the last file may have arrived in between. A clone
+                        // can also finish its disk writes before adopting its
+                        // manifest, so a missing declaration is inconclusive
+                        // until that metadata is loaded.
                         if ctx.state.has_xite(&k).await
                             && (ctx.state.xite_owned(&k).await
                                 || ctx.state.xite_core_complete(&k).await)
+                            && ctx.state.content(&k).await.is_some()
                             && ctx.state.file_info_any(&k, &path).await.is_none()
+                            && !ctx.state.xite_file_exists(&k, &path).await
                         {
                             return (StatusCode::NOT_FOUND, "not found").into_response();
                         }
