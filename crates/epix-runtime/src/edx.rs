@@ -6857,6 +6857,28 @@ mod tests {
         (state, dir)
     }
 
+    /// Revert must replace an edited file even when the object store still
+    /// remembers its original download. Exercise both bundle and extern files.
+    #[tokio::test]
+    async fn owned_file_revert_recovers_cached_and_peer_bytes() {
+        let (address, cb, content, movie, addr, _pk) = spawn_seeder().await;
+        let (state, dir) = client_for(&address, &cb, &content, addr).await;
+        state.set_owned(&address, true).await;
+
+        for (inner, original) in [("index.html", vec![b'h'; 5_000]), ("movie.bin", movie)] {
+            assert!(state.file_need(&address, inner).await.unwrap());
+            let path = dir.path().join(inner);
+            assert_eq!(std::fs::read(&path).unwrap(), original);
+
+            // An external editor can change bytes without changing the size.
+            let edited = vec![b'x'; original.len()];
+            std::fs::write(&path, &edited).unwrap();
+            assert!(state.file_need(&address, inner).await.unwrap());
+            assert!(std::fs::read(&path).unwrap() == original, "restored {inner}");
+            assert_eq!(std::fs::read(dir.path().join("content.json")).unwrap(), cb);
+        }
+    }
+
     /// The user deletes a materialized file. The extern record then claims
     /// bytes no file backs; a fetch must notice, retire, and REFETCH -
     /// not report success forever with nothing on disk (the eternal

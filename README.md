@@ -94,6 +94,14 @@ New and re-signed xites include editable metadata fields in `content.json`.
 See the [content.json authoring reference](docs/content-json.md) for titles,
 favicons, background colors, and file patterns.
 
+To discard unsigned edits, open your xite's file browser at
+`http://127.0.0.1:42222/list/<address>/`, choose **Revert** beside the file,
+and confirm. This restores the version recorded in the signed `content.json`
+from a verified local copy or a reachable peer. It keeps your edited file
+until a verified replacement is available. Revert is available for files
+declared in xites you own; it cannot undo changes that have already been signed
+or restore `content.json` itself.
+
 The same binary doubles as the authoring and diagnostics CLI, with the
 action name as the first argument (the EpixNet CLI shape):
 
