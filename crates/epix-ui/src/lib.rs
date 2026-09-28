@@ -14,6 +14,7 @@ pub mod command;
 pub mod config_schema;
 pub mod conn_pool;
 pub mod feed;
+mod file_revert;
 pub mod geoip;
 pub mod local_feed;
 mod nmh_auth;
@@ -180,6 +181,7 @@ impl UiServer {
             .route("/EpixWallet/", get(|| async { Redirect::permanent("/EpixWallet/mobile.html") }))
             .route("/EpixWallet/{*path}", get(serve_wallet))
             .route("/list/{*path}", get(serve_file_manager))
+            .route("/EpixNet-Internal/Revert/{*path}", get(file_revert::confirm).post(file_revert::restore))
             // Browsers ask for /favicon.ico at the origin root.
             .route(
                 "/favicon.ico",
@@ -468,8 +470,8 @@ Add it to the ui_host config key, or access the UI                  by IP."
             .into_response();
     }
 
-    if is_config_path(req.uri().path()) {
-        if let Some(response) = config_origin_gate(&ctx, req.headers(), req.uri().path(), req.method(), &host_raw).await {
+    if is_operator_path(req.uri().path()) {
+        if let Some(response) = operator_origin_gate(&ctx, req.headers(), req.uri().path(), req.method(), &host_raw).await {
             return response;
         }
     }
@@ -511,10 +513,10 @@ Add it to the ui_host config key, or access the UI                  by IP."
         return (StatusCode::FORBIDDEN, "Cross-origin request blocked").into_response();
     }
 
-    let config_page = is_config_path(req.uri().path());
+    let operator_page = is_operator_path(req.uri().path());
     let mut response = next.run(req).await;
-    if config_page {
-        // Configuration includes the node-wide CSRF token and must never be
+    if operator_page {
+        // Operator forms include the node-wide CSRF token and must never be
         // embedded as a script-readable frame in xite content.
         response.headers_mut().insert(header::X_FRAME_OPTIONS, "DENY".parse().unwrap());
         response.headers_mut().insert(header::CONTENT_SECURITY_POLICY, "frame-ancestors 'none'".parse().unwrap());
@@ -523,14 +525,14 @@ Add it to the ui_host config key, or access the UI                  by IP."
     response
 }
 
-fn is_config_path(path: &str) -> bool {
-    matches!(path, "/Config" | "/Config/")
+fn is_operator_path(path: &str) -> bool {
+    matches!(path, "/Config" | "/Config/") || path.starts_with(file_revert::PREFIX)
 }
 
 /// A same-origin xite request is not a node-operator request: proxy hosts have
-/// their own origin. Move settings navigation to the node origin, and refuse
+/// their own origin. Move operator navigation to the node origin, and refuse
 /// writes on xite hosts even when a caller knows the node's CSRF token.
-async fn config_origin_gate(
+async fn operator_origin_gate(
     ctx: &Ctx,
     headers: &header::HeaderMap,
     path: &str,
@@ -538,18 +540,19 @@ async fn config_origin_gate(
     host: &str,
 ) -> Option<Response> {
     if ctx.state.ui_restrict().await {
-        return Some((StatusCode::FORBIDDEN, "Configuration is disabled on this gateway").into_response());
+        return Some((StatusCode::FORBIDDEN, "Node controls are disabled on this gateway").into_response());
     }
     if is_proxy_host(strip_port(host)) {
         return Some(if matches!(method, &axum::http::Method::GET | &axum::http::Method::HEAD) {
-            Redirect::temporary(&format!("http://127.0.0.1:{}/Config", ctx.state.ui_port().await)).into_response()
+            let target = if path.starts_with(file_revert::PREFIX) { path } else { "/Config" };
+            Redirect::temporary(&format!("http://127.0.0.1:{}{target}", ctx.state.ui_port().await)).into_response()
         } else {
-            (StatusCode::FORBIDDEN, "Open configuration on the node's own origin").into_response()
+            (StatusCode::FORBIDDEN, "Open node controls on the node's own origin").into_response()
         });
     }
     // Always protect the token, even if general cross-xite CORS checks are off.
     is_cross_origin_request(ctx, headers, path, host).await
-        .then(|| (StatusCode::FORBIDDEN, "Xite access to configuration blocked").into_response())
+        .then(|| (StatusCode::FORBIDDEN, "Xite access to node controls blocked").into_response())
 }
 
 /// Whether a state-changing request came from this node's own UI.
@@ -657,13 +660,13 @@ async fn is_cross_origin_request(
 }
 
 /// Routes that identify no xite (safe to answer regardless of referer).
-/// /Config is protected because its forms include the node-wide CSRF token.
+/// Operator pages are protected because their forms include the node-wide CSRF token.
 /// /Backup is deliberately NOT public even though it is a global path: its
 /// responses hold the node's keys, so a xite's same-origin fetch() to it must
 /// hit the full cross-origin gate (user navigation and the page's own form
 /// posts still pass as `sec-fetch-mode: navigate`).
 fn is_public_ui_path(path: &str) -> bool {
-    (path == "/" || is_global_path(path)) && !is_backup_path(path) && !is_config_path(path)
+    (path == "/" || is_global_path(path)) && !is_backup_path(path) && !is_operator_path(path)
 }
 
 /// The Backup & Restore wizard's routes.
@@ -2470,9 +2473,18 @@ async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) ->
     };
     // A `.epix` name in the URL resolves to the bech32 serving key.
     let address = ctx.state.canonical_key(&address).await;
-    let Some(entries) = ctx.state.list_dir(&address, &inner).await else {
+    let Some(mut entries) = ctx.state.list_dir(&address, &inner).await else {
         return (StatusCode::NOT_FOUND, "unknown xite or path").into_response();
     };
+    if !ctx.state.ui_restrict().await && ctx.state.xite_owned(&address).await {
+        for entry in &mut entries {
+            if entry["is_dir"].as_bool() == Some(false) {
+                let name = entry["name"].as_str().unwrap_or("");
+                let child = if inner.is_empty() { name.to_string() } else { format!("{inner}/{name}") };
+                entry["can_revert"] = json!(file_revert::can_revert(&ctx.state, &address, &child).await);
+            }
+        }
+    }
     let theme = ctx.state.theme_class().await;
     ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_file_manager(&address, &inner, &entries, &theme))
         .into_response()
@@ -2517,9 +2529,13 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
             ));
         } else {
             let size = human(e["size"].as_u64().unwrap_or(0));
+            let revert = if e["can_revert"].as_bool() == Some(true) {
+                format!("<a class='revert' href='{}' title='Restore signed version'>Revert</a>",
+                    esc(&file_revert::url(address, &child)))
+            } else { String::new() };
             rows.push_str(&format!(
                 "<div class='row'><a class='name' href='/{address}/{child}'>{name}</a>\
-                 <span class='size'>{size}</span></div>",
+                 {revert}<span class='size'>{size}</span></div>",
                 address = url_address,
                 child = url_path(&child),
                 name = esc(name),
@@ -2556,7 +2572,8 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
     let body = format!(
         "<style>.row{{padding:10px 0;border-bottom:1px solid var(--epix-border);overflow:hidden}}\
           .name{{font-size:15px;overflow-wrap:anywhere}} .name.dir{{font-weight:600}}\
-          .size{{float:right;color:var(--epix-text-low);font-size:13px;margin-left:12px}}</style>\
+          .size{{float:right;color:var(--epix-text-low);font-size:13px;margin-left:12px}}\
+          .revert{{float:right;margin-left:16px;font-size:13px}}</style>\
          <div class='files'>{rows}</div>"
     );
     // From the file browser, the fixbutton returns to the xite being browsed.

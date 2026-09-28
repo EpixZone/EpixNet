@@ -1589,6 +1589,8 @@ impl Store {
     /// filesystems without hard links fall back to a synced copy. This order
     /// makes a crash before the index commit retryable as a sparse object,
     /// instead of leaving the index pointed at bytes that were already moved.
+    /// An existing regular file with different bytes is replaced atomically
+    /// only after the complete replacement has verified.
     pub fn materialize(&self, id: ObjId, dst: &std::path::Path, now: u64) -> io::Result<()> {
         let _externs = self.extern_mutation_gate.write().expect("extern mutation");
         let object_lock = self.object_mutation_lock(id);
@@ -1677,7 +1679,7 @@ impl Store {
     /// Materialize `dst` for an object that is ALREADY extern at its
     /// canonical path. Three cases:
     ///
-    /// - `dst` IS the canonical path and the file is there: idempotent no-op
+    /// - `dst` IS the canonical path and the file still verifies: idempotent no-op
     ///   (a concurrent fetch won the race, or the caller retried).
     /// - `dst` is a different path and the canonical file still verifies:
     ///   copy it out, so the second xite's tree is self-contained too. The
@@ -1698,11 +1700,12 @@ impl Store {
         if normalized_extern_key(self.rel_of(&cur)?)?
             == normalized_extern_key(self.rel_of(dst)?)?
         {
-            // The canonical path itself: cheap existence check, not a full
-            // re-hash - this is the hot idempotent-retry case, and an edited
-            // file at its own path is revalidate's job, as it always was.
-            match self.open_xite_file(&cur) {
-                Ok(_) => {
+            // The user may have edited the file since it was materialized.
+            // Existence alone would report a successful recovery while keeping
+            // the edited bytes. The verified metadata stamp makes unchanged
+            // retries cheap; changed files must still match the object hash.
+            match self.extern_still_matches(id, rec) {
+                Ok(true) => {
                     let sparse = self.sparse_path(id);
                     if sparse.is_file() {
                         // Source-preserving materialization committed the extern
@@ -1722,7 +1725,7 @@ impl Store {
                 {
                     return Err(error);
                 }
-                Err(_) => {}
+                Ok(false) | Err(_) => {}
             }
         } else {
             match self.extern_still_matches(id, rec) {
@@ -4966,13 +4969,15 @@ fn copy_regular_file_beneath(
     use std::io::{Seek, SeekFrom};
     use rustix::fs::{AtFlags, Mode, OFlags};
 
-    match open_regular_beneath(root, relative) {
-        Ok(installed) => {
-            return verify_open_file_complete(installed, expected_size, expected_id);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    let replace_existing = match open_regular_beneath(root, relative) {
+        Ok(installed) => match verify_open_file_complete(installed, expected_size, expected_id) {
+            Ok(outboard) => return Ok(outboard),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => true,
+            Err(error) => return Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
-    }
+    };
     let (directory, final_name) = unix_parent_beneath(root, relative, true)?;
     let sequence = STORE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     let temporary_name = std::ffi::OsString::from(format!(
@@ -5046,6 +5051,15 @@ fn copy_regular_file_beneath(
                 format!("materialized bytes do not hash to {expected_id}"),
             ));
         }
+        if replace_existing {
+            // Keep an edited destination until the replacement has verified,
+            // then swap atomically within the already-open parent directory.
+            rustix::fs::renameat(&directory, &temporary_name, &directory, &final_name)
+                .map_err(io::Error::from)?;
+            directory.sync_all()?;
+            let installed = open_regular_beneath(root, relative)?;
+            return verify_open_file_complete(installed, expected_size, expected_id);
+        }
         let verify_existing_and_drop_temporary = |directory: &File| -> io::Result<OutboardBytes> {
             let installed = open_regular_beneath(root, relative)?;
             let outboard = verify_open_file_complete(installed, expected_size, expected_id)?;
@@ -5118,13 +5132,15 @@ fn copy_regular_file_beneath(
     expected_id: ObjId,
 ) -> io::Result<OutboardBytes> {
     use std::io::{Seek, SeekFrom};
-    match open_regular_beneath(root, relative) {
-        Ok(installed) => {
-            return verify_open_file_complete(installed, expected_size, expected_id);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    let replace_existing = match open_regular_beneath(root, relative) {
+        Ok(installed) => match verify_open_file_complete(installed, expected_size, expected_id) {
+            Ok(outboard) => return Ok(outboard),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => true,
+            Err(error) => return Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
-    }
+    };
     validate_no_symlink_components(root, relative)?;
     let directory = windows_root_directory(root)?;
     let parent = relative.parent().unwrap_or_else(|| std::path::Path::new(""));
@@ -5170,10 +5186,12 @@ fn copy_regular_file_beneath(
             ));
         }
         drop(output);
-        match epix_fs::install_file_write_through(
-            &root.join(&temporary),
-            &root.join(relative),
-        ) {
+        let install = if replace_existing {
+            epix_fs::replace_file_write_through(&root.join(&temporary), &root.join(relative))
+        } else {
+            epix_fs::install_file_write_through(&root.join(&temporary), &root.join(relative))
+        };
+        match install {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
                 let installed = open_regular_beneath(root, relative)?;
@@ -5207,13 +5225,15 @@ fn copy_regular_file_beneath(
     expected_id: ObjId,
 ) -> io::Result<OutboardBytes> {
     use std::io::{Seek, SeekFrom};
-    match open_regular_beneath(root, relative) {
-        Ok(installed) => {
-            return verify_open_file_complete(installed, expected_size, expected_id);
-        }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+    let replace_existing = match open_regular_beneath(root, relative) {
+        Ok(installed) => match verify_open_file_complete(installed, expected_size, expected_id) {
+            Ok(outboard) => return Ok(outboard),
+            Err(error) if error.kind() == io::ErrorKind::InvalidData => true,
+            Err(error) => return Err(error),
+        },
+        Err(error) if error.kind() == io::ErrorKind::NotFound => false,
         Err(error) => return Err(error),
-    }
+    };
     validate_no_symlink_components(root, relative)?;
     let destination = root.join(relative);
     if let Some(parent) = destination.parent() {
@@ -5251,7 +5271,13 @@ fn copy_regular_file_beneath(
             format!("materialized bytes do not hash to {expected_id}"),
         ));
     }
-    match epix_fs::install_file_write_through(&temporary, &destination) {
+    drop(output);
+    let install = if replace_existing {
+        epix_fs::replace_file_write_through(&temporary, &destination)
+    } else {
+        epix_fs::install_file_write_through(&temporary, &destination)
+    };
+    match install {
         Ok(()) => {}
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let _ = fs::remove_file(&temporary);
@@ -5913,6 +5939,33 @@ mod tests {
         assert!(store.materialize(id, &destination, 3).is_err());
         assert_eq!(std::fs::read(destination).unwrap(), b"sentinel");
         assert!(!store.is_extern(id).unwrap());
+    }
+
+    #[test]
+    fn materialization_retires_an_edited_canonical_file_without_deleting_it() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let store = rooted_store(&store_dir, &tree);
+        let bytes = test_data(120_000);
+        let (id, size, slice) = slice_for(&bytes, &[0..bytes.len() as u64]);
+        store.ensure_sparse(id, Ns::Plain, size, 1).unwrap();
+        store.write_slice(id, &[0..size], &slice[..], 2).unwrap();
+        let path = tree.path().join("site/asset.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        store.materialize(id, &path, 3).unwrap();
+        store.materialize(id, &path, 4).unwrap();
+
+        let edited = vec![b'x'; bytes.len()];
+        std::fs::write(&path, &edited).unwrap();
+        let error = store.materialize(id, &path, 5).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::NotFound);
+        assert!(!store.contains(id).unwrap(), "retired so the file can be fetched again");
+        assert!(std::fs::read(&path).unwrap() == edited, "keep local edits until recovery");
+
+        store.ensure_sparse(id, Ns::Plain, size, 6).unwrap();
+        store.write_slice(id, &[0..size], &slice[..], 7).unwrap();
+        store.materialize(id, &path, 8).unwrap();
+        assert!(std::fs::read(&path).unwrap() == bytes, "verified replacement installed");
     }
 
     #[test]
