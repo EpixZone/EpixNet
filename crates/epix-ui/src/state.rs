@@ -9903,6 +9903,8 @@ impl AppState {
     /// they are copied with the suffix stripped, and the source's live
     /// counterparts (e.g. `data/` next to `data-default/`) are NOT copied, so
     /// a cloned blog starts empty instead of with the author's posts.
+    /// Upgrades keep the target's content.json and existing default-backed
+    /// data. Keep the defaults too, so this clone can be cloned again.
     /// Returns the new xite's address.
     pub async fn clone_xite(
         self: &Arc<Self>,
@@ -9912,11 +9914,16 @@ impl AppState {
     ) -> Result<String, String> {
         let src_storage = {
             let xites = self.xites.read().await;
-            self.resolve_xite(&xites, source).map(|x| x.storage.clone()).ok_or("Unknown xite")?
+            self.resolve_xite(&xites, source)
+                .map(|x| x.storage.clone())
+                .ok_or("Unknown xite")?
         };
         // Refuse mid-sync sources (EpixNet: "Xite still in sync").
         let bad = self.bad_files(source).await;
-        if bad.iter().any(|f| !f.ends_with("content.json") && !f.contains("data/users/")) {
+        if bad
+            .iter()
+            .any(|f| !f.ends_with("content.json") && !f.contains("data/users/"))
+        {
             return Err("Site still in sync".into());
         }
         let root = root_inner_path.trim_matches('/');
@@ -9924,7 +9931,11 @@ impl AppState {
         // as the root, or the `<root>/` prefix below matches no source file and
         // an "Upgrade code" rewrites content.json while copying nothing.
         let root = if root == "." { "" } else { root };
-        let prefix = if root.is_empty() { String::new() } else { format!("{root}/") };
+        let prefix = if root.is_empty() {
+            String::new()
+        } else {
+            format!("{root}/")
+        };
 
         // The new owner's key: a fresh derivation, or the target's saved key.
         let is_upgrade = target_address.is_some();
@@ -9943,78 +9954,94 @@ impl AppState {
             }
         };
 
-        // The template content.json: `<root>/content.json-default` wins (template
-        // xites ship their clean copy there); otherwise fall back to the ROOT
-        // content.json, NOT `<root>/content.json`. EpixNet's `Site.clone` does the
-        // same - a clone root like `template-new/` holds only page files
-        // (index.html), never its own content.json, so keying off the sub-path
-        // there fails with "Source has no content.json".
-        let template = src_storage
-            .read(&format!("{prefix}content.json-default"))
-            .or_else(|_| src_storage.read("content.json"))
-            .map_err(|_| "Source has no content.json".to_string())?;
-        let mut content: Value =
-            serde_json::from_slice(&template).map_err(|_| "Invalid template content.json")?;
-        let map = content.as_object_mut().ok_or("Invalid template content.json")?;
-        for key in ["domain", "xid_name", "signs", "signers_sign", "address_index", "inner_path",
-        ] {
-            map.remove(key);
-        }
-        // A `template-*` clone root is a blank starter, so it gets a generic
-        // title rather than "My <source title>" (EpixNet's `Site.clone`).
-        let new_title = if root.starts_with("template-") {
-            "My New Epix Xite".to_string()
-        } else {
-            let title = map.get("title").and_then(|v| v.as_str())
-                .filter(|title| !title.trim().is_empty()).unwrap_or("New Epix Xite");
-            format!("My {title}")
-        };
-        map.insert("title".into(), json!(new_title));
-        // An upgrade refreshes the code but keeps the xite's own identity: the
-        // owner's title/description and any domain / xid_name claim (all were
-        // just reset to the template's above, and a lost domain claim would
-        // un-name the xite until the owner re-claimed it).
-        if is_upgrade {
-            if let Some(existing) = self.content(&address).await.and_then(|c| c.as_object().cloned()) {
-                for key in ["title", "description", "domain", "xid_name"] {
-                    match existing.get(key) {
-                        Some(v) => {
-                            map.insert(key.into(), v.clone());
-                        }
-                        None => {
-                            map.remove(key);
-                        }
-                    }
-                }
+        let dst_dir = self.xite_dir(&address).ok_or("No data root")?;
+        let dst_storage = XiteStorage::new(&dst_dir);
+
+        // An upgrade keeps the complete target manifest, including unpublished
+        // edits, ignore rules, includes, and optional/merged file declarations.
+        // Read it before copying anything; an unreadable target must never fall
+        // back to the template's metadata.
+        let content: Value = if is_upgrade {
+            let bytes = dst_storage
+                .read("content.json")
+                .map_err(|e| format!("Could not read target content.json: {e}"))?;
+            let content: Value = serde_json::from_slice(&bytes)
+                .map_err(|e| format!("Invalid target content.json: {e}"))?;
+            if !content.is_object() {
+                return Err("Invalid target content.json: expected an object".into());
             }
-        }
-        map.insert("cloned_from".into(), json!(source));
-        if !root.is_empty() {
-            map.insert("clone_root".into(), json!(root));
-        }
-        map.insert("address".into(), json!(address));
-        map.insert("files".into(), json!({}));
+            content
+        } else {
+            // The template content.json: `<root>/content.json-default` wins (template
+            // xites ship their clean copy there); otherwise fall back to the ROOT
+            // content.json, NOT `<root>/content.json`. EpixNet's `Site.clone` does the
+            // same - a clone root like `template-new/` holds only page files
+            // (index.html), never its own content.json, so keying off the sub-path
+            // there fails with "Source has no content.json".
+            let template = src_storage
+                .read(&format!("{prefix}content.json-default"))
+                .or_else(|_| src_storage.read("content.json"))
+                .map_err(|_| "Source has no content.json".to_string())?;
+            let mut content: Value =
+                serde_json::from_slice(&template).map_err(|_| "Invalid template content.json")?;
+            let map = content
+                .as_object_mut()
+                .ok_or("Invalid template content.json")?;
+            for key in [
+                "domain",
+                "xid_name",
+                "signs",
+                "signers_sign",
+                "address_index",
+                "inner_path",
+            ] {
+                map.remove(key);
+            }
+            // A `template-*` clone root is a blank starter, so it gets a generic
+            // title rather than "My <source title>" (EpixNet's `Site.clone`).
+            let new_title = if root.starts_with("template-") {
+                "My New Epix Xite".to_string()
+            } else {
+                let title = map
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .filter(|title| !title.trim().is_empty())
+                    .unwrap_or("New Epix Xite");
+                format!("My {title}")
+            };
+            map.insert("title".into(), json!(new_title));
+            map.insert("cloned_from".into(), json!(source));
+            if !root.is_empty() {
+                map.insert("clone_root".into(), json!(root));
+            }
+            map.insert("address".into(), json!(address));
+            map.insert("files".into(), json!({}));
+            content
+        };
 
         // Copy the files. Normal files are skipped when a `-default` variant
-        // owns their target path; `-default` paths land de-suffixed.
-        let dst_dir = self.xite_dir(&address).ok_or("No data root")?;
+        // owns their target path; defaults only initialize missing data.
         std::fs::create_dir_all(&dst_dir).map_err(|e| e.to_string())?;
-        let dst_storage = XiteStorage::new(&dst_dir);
         // A walk error must abort the clone: proceeding with a partial (or
         // empty) listing would sign and publish a silently gutted copy.
         let files = src_storage
             .list_files()
             .map_err(|e| format!("Failed to list source xite files: {e}"))?;
-        // Target prefixes owned by -default sources (e.g. `data-default/…`
-        // owns `data/…`).
-        let default_roots: Vec<String> = files
+        // Target paths owned by -default sources (e.g. `data-default/…`
+        // owns `data/…`, but not `database.js`). Track directory boundaries
+        // separately from single-file defaults such as `settings.json-default`.
+        let default_roots: Vec<(String, bool)> = files
             .iter()
             .filter_map(|f| f.strip_prefix(&prefix))
-            .filter(|rel| rel.contains("-default"))
-            .filter_map(|rel| rel.split("-default").next().map(|head| format!("{head}")))
+            .filter_map(|rel| {
+                let marker = rel.find("-default")?;
+                let end = rel[marker..].find('/').map_or(rel.len(), |i| marker + i);
+                Some((rel[..end].replace("-default", ""), end < rel.len()))
+            })
             .collect();
         for inner in &files {
-            let Some(rel) = inner.strip_prefix(&prefix) else { continue;
+            let Some(rel) = inner.strip_prefix(&prefix) else {
+                continue;
             };
             if rel == "content.json"
                 || rel == "content.json-default"
@@ -10023,33 +10050,76 @@ impl AppState {
             {
                 continue;
             }
-            let target_rel = if rel.contains("-default") {
-                rel.replace("-default", "")
-            } else if default_roots.iter().any(|d| !d.is_empty() && rel.starts_with(d.as_str())) {
+            let is_default = rel.contains("-default");
+            if default_roots.iter().any(|(path, is_dir)| {
+                rel == path
+                    || (*is_dir
+                        && rel
+                            .strip_prefix(path.as_str())
+                            .is_some_and(|rest| rest.starts_with('/')))
+            }) {
                 continue; // the -default variant supplies this tree
-            } else {
-                rel.to_string()
-            };
-            if let Ok(bytes) = src_storage.read(inner) {
-                let _ = dst_storage.write(&target_rel, &bytes);
+            }
+            let bytes = src_storage
+                .read(inner)
+                .map_err(|e| format!("Could not read source file {inner}: {e}"))?;
+            // Retain the original defaults so a later clone starts with the
+            // template data rather than this owner's posts.
+            dst_storage
+                .write(rel, &bytes)
+                .map_err(|e| format!("Could not copy {inner} to {rel}: {e}"))?;
+            if is_default {
+                let target_rel = rel.replace("-default", "");
+                // An evicted optional file still belongs to the owner. Do not
+                // replace its signed declaration with a starter image or post.
+                let declared_optional = is_upgrade
+                    && content
+                        .get("files_optional")
+                        .and_then(Value::as_object)
+                        .is_some_and(|files| files.contains_key(&target_rel));
+                if !dst_storage.exists(&target_rel) && !declared_optional {
+                    dst_storage
+                        .write(&target_rel, &bytes)
+                        .map_err(|e| format!("Could not initialize {target_rel}: {e}"))?;
+                }
             }
         }
         if !dst_storage.exists("index.html") {
             let _ = dst_storage.write("index.html", b"<h1>My new xite</h1>");
         }
         dst_storage
-            .write("content.json", epix_content::dumps_content(&content).as_bytes(),
+            .write(
+                "content.json",
+                epix_content::dumps_content(&content).as_bytes(),
             )
             .map_err(|e| e.to_string())?;
 
         // Serve it, sign it as the new owner, and mark it ours.
-        self.add_xite(&address, XiteEntry { storage: dst_storage, content: Some(content),
+        self.add_xite(
+            &address,
+            XiteEntry {
+                storage: dst_storage,
+                content: Some(content),
             },
-        ).await;
-        self.sign_xite(&address, &privatekey).await?;
+        )
+        .await;
+        // A code upgrade must not remove optional media just because this node
+        // has evicted its local copy.
+        self.sign_xite_with(
+            &address,
+            &privatekey,
+            epix_xite::SignOpts {
+                keep_missing_optional: is_upgrade,
+                ..Default::default()
+            },
+        )
+        .await?;
         self.set_owned(&address, true).await;
-        self.log("INFO", format!("Cloned {source} -> {address} (root: {root:?})"),
-        ).await;
+        self.log(
+            "INFO",
+            format!("Cloned {source} -> {address} (root: {root:?})"),
+        )
+        .await;
         Ok(address)
     }
 
