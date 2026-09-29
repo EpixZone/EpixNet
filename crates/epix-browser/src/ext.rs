@@ -49,8 +49,8 @@ static WALLET_TOOLBAR_48: &[u8] = include_bytes!("../assets/wallet-toolbar-48.pn
 /// transform, JS patches) but the wallet build itself does not. Folded into the
 /// version stamp so an otherwise-unchanged wallet still repacks and reloads once,
 /// picking up the new packing.
-// Version 12 also repairs wallets installed before startup-cache invalidation.
-const WALLET_PACK_VERSION: u32 = 12;
+// Version 13 restores URL-bar integration in minified wallet background pages.
+const WALLET_PACK_VERSION: u32 = 13;
 
 /// The extension id (must match the wallet `manifest.json`'s Firefox gecko id).
 pub const EXT_ID: &str = "wallet@epix.zone";
@@ -511,17 +511,29 @@ const EPIX_URLBAR_JS: &[u8] = concat!(
 .as_bytes();
 
 /// Add the URL-bar script to the wallet's background page, right after the
-/// polyfill so it registers before the wallet's own bundles. A no-op when the
-/// anchor isn't present exactly once (a changed wallet build) - the search
-/// then simply keeps its default behaviour, never breaks.
+/// polyfill so it registers before the wallet's own bundles. Accept the quoted
+/// and unquoted src forms emitted by the wallet's HTML minifier. A no-op when
+/// the anchor isn't present exactly once, or the script is already included.
 fn patch_background_html(contents: &[u8]) -> Option<Vec<u8>> {
     let text = std::str::from_utf8(contents).ok()?;
-    let anchor = "<script src=\"browser-polyfill.js\"></script>";
-    if text.matches(anchor).count() != 1 {
+    if text.contains("epix-urlbar.js") {
         return None;
     }
-    let replacement = format!("{anchor}<script src=\"epix-urlbar.js\"></script>");
-    Some(text.replacen(anchor, &replacement, 1).into_bytes())
+    let anchors = [
+        "<script src=\"browser-polyfill.js\"></script>",
+        "<script src='browser-polyfill.js'></script>",
+        "<script src=browser-polyfill.js></script>",
+    ];
+    let mut ends = anchors.iter().flat_map(|anchor| {
+        text.match_indices(anchor).map(|(start, _)| start + anchor.len())
+    });
+    let end = ends.next()?;
+    if ends.next().is_some() {
+        return None;
+    }
+    let mut patched = text.to_owned();
+    patched.insert_str(end, "<script src=\"epix-urlbar.js\"></script>");
+    Some(patched.into_bytes())
 }
 
 /// A stable short hash of a byte slice (same family as [`ext_content_hash`]).
@@ -1355,15 +1367,16 @@ mod tests {
     // and before the wallet's own bundles; a changed page is left untouched.
     #[test]
     fn patch_background_html_inserts_urlbar_script() {
-        let src = b"<html><head><script src=\"browser-polyfill.js\"></script><script defer=\"defer\" src=\"background.bundle.js\"></script></head></html>";
-        let out = patch_background_html(src).unwrap();
-        let s = std::str::from_utf8(&out).unwrap();
-        let poly = s.find("browser-polyfill.js").unwrap();
-        let urlbar = s.find("epix-urlbar.js").unwrap();
-        let bundle = s.find("background.bundle.js").unwrap();
-        assert!(poly < urlbar && urlbar < bundle, "script order polyfill < urlbar < bundles: {s}");
-        // No anchor -> untouched.
-        assert!(patch_background_html(b"<html>changed build</html>").is_none());
+        for quote in ["\"", "'"] {
+            let src = format!("<html><head><script src={quote}browser-polyfill.js{quote}></script><script defer=\"defer\" src=\"background.bundle.js\"></script></head></html>");
+            let out = patch_background_html(src.as_bytes()).unwrap();
+            let s = std::str::from_utf8(&out).unwrap();
+            let poly = s.find("browser-polyfill.js").unwrap();
+            let urlbar = s.find("epix-urlbar.js").unwrap();
+            let bundle = s.find("background.bundle.js").unwrap();
+            assert!(poly < urlbar && urlbar < bundle, "script order polyfill < urlbar < bundles: {s}");
+            assert_eq!(s.replace("<script src=\"epix-urlbar.js\"></script>", ""), src);
+        }
         // The injected script only rewrites bech32-address searches and hosts.
         let js = std::str::from_utf8(EPIX_URLBAR_JS).unwrap();
         assert!(js.contains("*://*/*"), "engine-agnostic: watches all main-frame navigations");
@@ -1371,6 +1384,46 @@ mod tests {
         assert!(js.contains("^epix1[a-z0-9]{20,80}$"), "exact bech32 match");
         assert!(js.contains(".epix/"), "search terms go to the dotted alias, never a dotless host");
         assert!(js.contains("u.hostname + \".epix\""), "bare-address hosts rewrite to the alias");
+    }
+
+    #[test]
+    fn patch_background_html_supports_minified_wallet_page() {
+        // The wallet-4167c6e12926 artifact omits optional quotes and the body.
+        let src = concat!(
+            "<!doctype html><html lang=en><head><meta charset=UTF-8>",
+            "<meta name=viewport content=\"width=device-width,initial-scale=1\">",
+            "<title>Keplr background service</title>",
+            "<script src=browser-polyfill.js></script>",
+            "<script defer src=605.bundle.js></script><script defer src=817.bundle.js></script>",
+            "<script defer src=727.bundle.js></script><script defer src=297.bundle.js></script>",
+            "<script defer src=78.bundle.js></script><script defer src=762.bundle.js></script>",
+            "<script defer src=background.bundle.js></script></head></html>",
+        );
+        let out = patch_background_html(src.as_bytes()).unwrap();
+        let patched = std::str::from_utf8(&out).unwrap();
+        assert!(patched.contains(concat!(
+            "<script src=browser-polyfill.js></script>",
+            "<script src=\"epix-urlbar.js\"></script>",
+            "<script defer src=605.bundle.js></script>",
+        )), "URL-bar integration must load after the polyfill and before every wallet bundle");
+        assert_eq!(patched.matches("epix-urlbar.js").count(), 1);
+        assert_eq!(patched.replace("<script src=\"epix-urlbar.js\"></script>", ""), src);
+        assert!(patch_background_html(&out).is_none(), "do not inject the script twice");
+    }
+
+    #[test]
+    fn patch_background_html_leaves_missing_or_ambiguous_anchors_untouched() {
+        for src in [
+            "<html>changed build</html>",
+            "<script src=other-browser-polyfill.js></script>",
+            "<script src=browser-polyfill.js.map></script>",
+            "<script src=browser-polyfill.js></script><script src=browser-polyfill.js></script>",
+            "<script src=\"browser-polyfill.js\"></script><script src=browser-polyfill.js></script>",
+            "<script src=browser-polyfill.js></script><script src=epix-urlbar.js></script>",
+        ] {
+            assert!(patch_background_html(src.as_bytes()).is_none(), "unexpected patch: {src}");
+        }
+        assert!(patch_background_html(&[0xff]).is_none());
     }
 
     // The packed wallet XPI carries the URL-bar script and loads it from the
@@ -1393,5 +1446,10 @@ mod tests {
         let mut html = String::new();
         std::io::Read::read_to_string(&mut entry, &mut html).unwrap();
         assert!(html.contains("epix-urlbar.js"), "background page loads the script: {html}");
+        assert_eq!(html.matches("epix-urlbar.js").count(), 1, "load the URL-bar script exactly once");
+        let polyfill = html.find("browser-polyfill.js").unwrap();
+        let urlbar = html.find("epix-urlbar.js").unwrap();
+        let first_bundle = html.find(".bundle.js").unwrap();
+        assert!(polyfill < urlbar && urlbar < first_bundle, "packed script order polyfill < urlbar < bundles: {html}");
     }
 }
