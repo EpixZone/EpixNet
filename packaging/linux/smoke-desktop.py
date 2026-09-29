@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 
 
 def browser_running(profile):
@@ -26,7 +27,39 @@ def browser_running(profile):
     return False
 
 
-def check_dashboard(port, check_sandbox=False):
+def wallet_page(profile):
+    """Read only the disposable profile created by this smoke test."""
+    wallet_id = "wallet@epix.zone"
+    deadline = time.monotonic() + 15
+    detail = "wallet registration is missing"
+    while time.monotonic() < deadline:
+        try:
+            addons = json.loads((profile / "extensions.json").read_text())["addons"]
+            wallet = next((addon for addon in addons if addon["id"] == wallet_id), None)
+            if wallet:
+                state = {key: wallet.get(key) for key in ("active", "appDisabled", "userDisabled")}
+                detail = f"wallet state: {state}"
+                if state == {"active": True, "appDisabled": False, "userDisabled": False}:
+                    match = re.search(r'^user_pref\("extensions\.webextensions\.uuids", (.+)\);$',
+                                      (profile / "prefs.js").read_text(), re.MULTILINE)
+                    uuids = json.loads(json.loads(match[1])) if match else {}
+                    if wallet_id in uuids:
+                        with zipfile.ZipFile(profile / "extensions" / f"{wallet_id}.xpi") as archive:
+                            manifest = json.loads(archive.read("manifest.json"))
+                        action = manifest.get("browser_action", manifest.get("action", {}))
+                        popup = action.get("default_popup")
+                        if not popup:
+                            raise RuntimeError("Wallet manifest has no popup page")
+                        return f"moz-extension://{uuids[wallet_id]}/{popup.lstrip('/')}"
+                    detail = "active wallet has no persisted extension UUID"
+        except (FileNotFoundError, json.JSONDecodeError):
+            # Firefox writes its add-on database and preferences asynchronously.
+            pass
+        time.sleep(0.25)
+    raise RuntimeError(f"Wallet did not become active: {detail}")
+
+
+def check_dashboard(port, check_sandbox=False, wallet_profile=None):
     # Marionette is enabled only for this isolated test profile. Certificate
     # errors must fail navigation, not be accepted by WebDriver's test defaults.
     with socket.create_connection(("127.0.0.1", port), timeout=10) as connection:
@@ -74,6 +107,31 @@ def check_dashboard(port, check_sandbox=False):
                 or "Dashboard" not in page["title"]):
             raise RuntimeError(f"HTTPS dashboard did not load: {page}")
         print("PASS: HTTPS dashboard loads with certificate verification enabled")
+        if wallet_profile is not None:
+            command("WebDriver:Navigate", {"url": wallet_page(wallet_profile)})
+            # No sandbox means the actual extension page's global scope. A
+            # WebDriver sandbox would hide its browser.runtime extension APIs.
+            bridge = command("WebDriver:ExecuteAsyncScript", {
+                "script": """
+                    const done = arguments[arguments.length - 1];
+                    (async () => {
+                        const id = browser.runtime.id;
+                        if (id !== "wallet@epix.zone") throw new Error("Wrong extension: " + id);
+                        const status = await browser.runtime.sendNativeMessage("zone.epix.nmh", {cmd: "status"});
+                        const tor = await browser.runtime.sendNativeMessage("zone.epix.nmh", {cmd: "getTorClearnet"});
+                        done({id, status, tor, text: document.body.innerText});
+                    })().catch(error => done({error: String(error)}));
+                """,
+                "args": [], "newSandbox": True, "sandbox": None,
+            })["value"]
+            expected_port = int((wallet_profile.parent / "ui_port").read_text().strip())
+            if (bridge.get("error") or bridge.get("id") != "wallet@epix.zone"
+                    or bridge.get("status", {}).get("serving") is not True
+                    or bridge.get("status", {}).get("ui_port") != expected_port
+                    or not isinstance(bridge.get("tor", {}).get("on"), bool)
+                    or not bridge.get("text", "").strip()):
+                raise RuntimeError(f"Wallet or native messaging failed: {bridge}")
+            print("PASS: wallet is active, renders its popup, and reaches the native messaging host")
         if check_sandbox:
             command("WebDriver:Navigate", {"url": "about:support"})
             # about:support gathers its platform diagnostics asynchronously.
@@ -96,6 +154,8 @@ def main():
                         help="also test tray IPC shutdown; requires a working desktop session bus")
     parser.add_argument("--check-sandbox", action="store_true",
                         help="also check Firefox user namespaces; run on the desktop host")
+    parser.add_argument("--check-wallet", action="store_true",
+                        help="also check wallet loading and read-only native messaging")
     parser.add_argument("--expect-sandbox-setup", choices=("requested", "skipped"),
                         help="assert whether this launch needed administrator approval")
     args = parser.parse_args()
@@ -104,6 +164,10 @@ def main():
         env = dict(os.environ, EPIX_DATA_DIR=str(root / "data"), HOME=str(root / "home"),
                    XDG_DATA_HOME=str(root / "share"), XDG_CONFIG_HOME=str(root / "config"),
                    XDG_CACHE_HOME=str(root / "cache"), EPIX_TOR="disable", MOZ_MARIONETTE="1")
+        if args.check_wallet:
+            # Firefox restricts WebDriver navigation to extension pages. Enable
+            # that access only in this disposable browser's test environment.
+            env["MOZ_REMOTE_ALLOW_SYSTEM_ACCESS"] = "1"
         Path(env["HOME"]).mkdir()
         profile = root / "data/firefox-profile"
         profile.mkdir(parents=True)
@@ -129,7 +193,7 @@ def main():
             ports = re.findall(r"Marionette\s+INFO\s+Listening on port (\d+)", log.read_text())
             if not ports:
                 raise RuntimeError("Firefox did not expose its test port")
-            check_dashboard(int(ports[-1]), args.check_sandbox)
+            check_dashboard(int(ports[-1]), args.check_sandbox, profile if args.check_wallet else None)
             if args.expect_sandbox_setup:
                 requested = "requesting the one-time Firefox sandbox permission" in log.read_text()
                 if requested != (args.expect_sandbox_setup == "requested"):

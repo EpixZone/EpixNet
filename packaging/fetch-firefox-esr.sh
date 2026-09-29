@@ -4,10 +4,18 @@
 # it honors the unsigned-extension pref the bundled Epix Wallet needs).
 #
 # Usage: packaging/fetch-firefox-esr.sh [os]   (os: osx | linux | win64)
+# EPIX_FF_VERSION overrides the pinned release (include the esr suffix).
 # Writes into packaging/firefox-esr/. build-app.sh picks it up automatically.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Pin the release: firefox-esr-latest can still select the previous ESR series
+# during Mozilla's overlap period, leaving new bundles on the retiring branch.
+VERSION="${EPIX_FF_VERSION:-153.4.0esr}"
+if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?esr$ ]]; then
+  echo "invalid EPIX_FF_VERSION '$VERSION' (expected a release such as 153.4.0esr)" >&2
+  exit 1
+fi
 OS="${1:-osx}"
 MOZILLA_OS="$OS"
 # Mozilla's `linux` product is i686, even on a 64-bit host. Never bundle it
@@ -23,13 +31,13 @@ LANG_="${EPIX_FF_LANG:-en-US}"
 OUT="$REPO_ROOT/packaging/firefox-esr"
 mkdir -p "$OUT"
 
-URL="https://download.mozilla.org/?product=firefox-esr-latest&os=${MOZILLA_OS}&lang=${LANG_}"
-echo "· downloading Firefox ESR ($OS, $LANG_)"
+URL="https://download.mozilla.org/?product=firefox-${VERSION}-ssl&os=${MOZILLA_OS}&lang=${LANG_}"
+echo "· downloading Firefox $VERSION ($OS, $LANG_)"
 
 case "$OS" in
   osx)
     DMG="$OUT/firefox-esr.dmg"
-    curl -L -o "$DMG" "$URL"
+    curl --fail --location --retry 3 -o "$DMG" "$URL"
     MP="$(mktemp -d)"
     hdiutil attach "$DMG" -nobrowse -mountpoint "$MP" >/dev/null
     rm -rf "$OUT/Firefox.app"
@@ -53,7 +61,7 @@ case "$OS" in
     echo "· ready: $OUT/firefox/ (Linux)"
     ;;
   win64)
-    curl -L -o "$OUT/firefox-esr.exe" "$URL"
+    curl --fail --location --retry 3 -o "$OUT/firefox-esr.exe" "$URL"
     # The ESR installer is a 7z self-extractor; the browser lives under core/.
     if command -v 7z >/dev/null 2>&1; then
       rm -rf "$OUT/extract" "$OUT/firefox"

@@ -144,6 +144,11 @@ What works now (all verified on macOS):
 **Packaging (self-contained install).** The shipping app bundles Firefox, so
 the user does not need Firefox installed:
 
+`packaging/fetch-firefox-esr.sh` pins Firefox ESR 153.4.0 for all desktop
+platforms. Mozilla's generic ESR download can still select the retiring series
+during the overlap period. Update the pin when adopting an ESR security release;
+use `EPIX_FF_VERSION=153.4.0esr` to select an explicit release for a test build.
+
 ```
 packaging/macos/build-app.sh          # -> dist/Epix.app (bundles Firefox)
 ```

@@ -63,14 +63,15 @@ jobs:
         run: packaging/linux/build-linux.sh
       - name: Validate Linux packaging
         run: |
+          python3 packaging/test-firefox-download.py
           python3 packaging/linux/test-packaging.py
           shellcheck packaging/linux/*.sh packaging/linux/AppRun packaging/fetch-firefox-esr.sh
           desktop-file-validate packaging/linux/epix.desktop
           sudo apt-get install -y ./dist/*.deb
           EPIX_DATA_DIR="$(mktemp -d)" epix-browser --quit
           /opt/epixnet/firefox/firefox --headless --version
-          xvfb-run -a python3 packaging/linux/smoke-desktop.py /usr/bin/epix-browser
-          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a python3 packaging/linux/smoke-desktop.py dist/*.AppImage
+          xvfb-run -a python3 packaging/linux/smoke-desktop.py /usr/bin/epix-browser --check-wallet
+          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a python3 packaging/linux/smoke-desktop.py dist/*.AppImage --check-wallet
       - uses: actions/upload-artifact@v7
         with:
           name: epix-linux
