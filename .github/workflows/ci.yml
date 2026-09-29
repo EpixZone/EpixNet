@@ -32,7 +32,9 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends apparmor python3 xz-utils desktop-file-utils libglib2.0-bin
       - name: Test Linux packaging and sandbox rules
-        run: python3 packaging/linux/test-packaging.py -v
+        run: |
+          python3 packaging/test-firefox-download.py -v
+          python3 packaging/linux/test-packaging.py -v
 
   build-test:
     name: Build & test

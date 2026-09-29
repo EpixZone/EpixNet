@@ -102,6 +102,7 @@ option and arrange output-directory ownership for your user.
 ## Validate
 
 ```sh
+python3 packaging/test-firefox-download.py
 python3 packaging/linux/test-packaging.py
 shellcheck packaging/linux/*.sh packaging/linux/AppRun packaging/fetch-firefox-esr.sh
 desktop-file-validate packaging/linux/epix.desktop
@@ -121,7 +122,10 @@ openSUSE Tumbleweed. Ubuntu 24.04 also runs the desktop startup test.
 The smoke test uses an isolated profile and checks that the actual Firefox
 window process stays running and loads `https://dashboard.epix/`. It enables
 Marionette only for that test and explicitly keeps certificate verification
-enabled, so a certificate error fails the test. `--check-quit` additionally tests shutdown IPC
+enabled, so a certificate error fails the test. `--check-wallet` also verifies
+that the wallet loads, renders its popup, and can read status and routing settings
+through the native messaging host. Build and release workflows enable this check
+for both the installed package and AppImage. `--check-quit` additionally tests shutdown IPC
 when a working desktop session bus is available. These checks do not replace
 testing Zorin's complete desktop session. Issue #511's exit status 255 alone
 does not prove its cause.
