@@ -136,7 +136,10 @@ val stageWalletExt by tasks.registering {
     val stagedStamp = layout.projectDirectory.file("../../wallet-ext.rev-stamp").asFile
     // The rev this assets copy was staged from (assets/extensions is gitignored).
     val destStamp = File(dest.parentFile, "wallet.rev-stamp")
+    // The prefix also invalidates assets staged before pin-based manifest versions.
+    val pinnedStamp = "manifest-v1:$walletRev"
     outputs.dir(dest)
+    outputs.file(destStamp)
     inputs.property("walletRev", walletRev)
     inputs.property("walletDist", walletDist?.absolutePath.orEmpty())
     walletDist?.let { inputs.dir(it) }
@@ -145,7 +148,7 @@ val stageWalletExt by tasks.registering {
             throw GradleException("wallet pin ../../wallet-ext.rev is missing or empty")
         val manifest = File(dest, "manifest.json")
         val current = destStamp.takeIf { it.exists() }?.readText()?.trim()
-        if (walletDist == null && manifest.exists() && current == walletRev) return@doLast
+        if (walletDist == null && manifest.exists() && current == pinnedStamp) return@doLast
         if (walletDist != null && !File(walletDist, "manifest.json").isFile) {
             throw GradleException("EPIX_WALLET_DIST must contain a built Firefox wallet manifest")
         }
@@ -188,10 +191,10 @@ val stageWalletExt by tasks.registering {
         if (!perms.contains("geckoViewAddons")) {
             perms.add("geckoViewAddons")
         }
-        if (walletDist != null) {
-            // ensureBuiltIn reuses an extension with the same version, including
-            // its cached scripts. Give local builds a stable content version so
-            // editing the wallet refreshes it without deleting profile data.
+        // ensureBuiltIn reuses an extension with the same manifest version,
+        // including cached scripts. Releases need a version tied to the pin;
+        // development overrides need one tied to their actual file contents.
+        val hash = if (walletDist != null) {
             val digest = MessageDigest.getInstance("SHA-256")
             walletDist.walkTopDown().filter { it.isFile }
                 .sortedBy { it.relativeTo(walletDist).invariantSeparatorsPath }
@@ -200,12 +203,17 @@ val stageWalletExt by tasks.registering {
                     digest.update(0.toByte())
                     digest.update(source.readBytes())
                 }
-            val hash = digest.digest().joinToString("") { "%02x".format(it) }
-            json["version"] = "0." + hash.take(12).chunked(4)
-                .joinToString(".") { it.toInt(16).toString() }
+            digest.digest().joinToString("") { "%02x".format(it) }
+        } else {
+            MessageDigest.getInstance("SHA-256").digest(walletRev.toByteArray())
+                .joinToString("") { "%02x".format(it) }
         }
+        // Four numeric components fit the WebExtension version format. Keep
+        // pinned and local versions distinct even if their hash prefixes match.
+        json["version"] = (if (walletDist == null) "1." else "0.") +
+            hash.take(12).chunked(4).joinToString(".") { it.toInt(16).toString() }
         manifest.writeText(groovy.json.JsonOutput.prettyPrint(groovy.json.JsonOutput.toJson(json)))
-        destStamp.writeText(walletDist?.let { "local:${it.absolutePath}" } ?: walletRev)
+        destStamp.writeText(walletDist?.let { "local:${it.absolutePath}" } ?: pinnedStamp)
     }
 }
 tasks.named("preBuild") { dependsOn(stageWalletExt) }
