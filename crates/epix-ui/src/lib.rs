@@ -1207,6 +1207,39 @@ fn wrapper_inner_path(path: &str, top_level_document: bool) -> Option<String> {
     }
 }
 
+/// A relative xite link on a path-form page resolves under its source address:
+/// `/source.epix/target.epix/`. Host-form pages already route `target.epix/` to
+/// that xite. Give browser navigations the same meaning in path mode, without
+/// treating file requests or ordinary inner directories as xite links.
+fn relative_xite_navigation(
+    requested: &str,
+    uri: &axum::http::Uri,
+    headers: &header::HeaderMap,
+    top_level_document: bool,
+) -> Option<String> {
+    let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
+    if is_proxy_host(strip_port(host))
+        || cross_xite_origin(requested).is_none()
+        || headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) != Some("navigate")
+        || !matches!(
+            headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok()),
+            None | Some("document" | "iframe" | "frame")
+        )
+    {
+        return None;
+    }
+    // Split the encoded path, so a decoded slash cannot change the boundary
+    // between the validated target and the suffix copied into the redirect.
+    let inner = wrapper_request_path(uri);
+    let (target, path) = inner.split_once('/').unwrap_or((&inner, ""));
+    let target = cross_xite_origin(target)?;
+    // Match the existing wrapper rules: iframe HTML file links stay within
+    // their current wrapper, while root and directory links leave it.
+    wrapper_inner_path(path, top_level_document)?;
+    let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
+    Some(format!("/{target}/{path}{query}"))
+}
+
 async fn render_wrapper(
     ctx: Ctx,
     requested: String,
@@ -2862,6 +2895,9 @@ async fn serve_file(
             .get("sec-fetch-dest")
             .and_then(|v| v.to_str().ok())
             .is_some_and(|d| d.eq_ignore_ascii_case("document"));
+        if let Some(target) = relative_xite_navigation(&address, &uri, &headers, top_level_document) {
+            return Redirect::temporary(&target).into_response();
+        }
         if let Some(inner) = wrapper_inner_path(&path, top_level_document) {
             // Strip the wrapper_nonce we would append back; the caller had none.
             let outer_query = raw_query

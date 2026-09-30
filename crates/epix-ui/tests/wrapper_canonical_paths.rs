@@ -192,3 +192,80 @@ async fn cross_xite_normalization_requires_an_exact_valid_hostname() {
         rejects_external_target(target).await;
     }
 }
+
+async fn loopback_request(
+    router: &axum::Router,
+    uri: &str,
+    mode: &str,
+    destination: Option<&str>,
+) -> axum::response::Response {
+    let mut request = Request::builder()
+        .uri(uri)
+        .header("host", "127.0.0.1:42222")
+        .header("sec-fetch-mode", mode)
+        .header("referer", "http://127.0.0.1:42222/talk.epix/index.html");
+    if let Some(destination) = destination {
+        request = request.header("sec-fetch-dest", destination);
+    }
+    router.clone().oneshot(request.body(Body::empty()).unwrap()).await.unwrap()
+}
+
+#[tokio::test]
+async fn loopback_relative_xite_links_leave_the_source_xite() {
+    let (_directory, router, source) = fixture().await;
+    let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+    for destination in [Some("document"), Some("iframe"), None] {
+        let mut suffixes = vec!["/", "", "/docs/a%23b%252Fc/?view=a%2Fb"];
+        if destination == Some("document") {
+            suffixes.push("/docs/a%23b%252Fc.html?view=a%2Fb");
+        }
+        for (target, expected) in [
+            (format!("{address}.epix"), format!("{address}.epix")),
+            (address.clone(), format!("{address}.epix")),
+            ("Blocktone.epix".to_string(), "blocktone.epix".to_string()),
+        ] {
+            for suffix in &suffixes {
+                let uri = format!("/{source}/{target}{suffix}");
+                let response = loopback_request(&router, &uri, "navigate", destination).await;
+                assert_eq!(response.status(), 307, "{uri} ({destination:?})");
+                let suffix = if suffix.is_empty() { "/" } else { *suffix };
+                assert_eq!(response.headers()["location"], format!("/{expected}{suffix}"));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn loopback_relative_xite_links_do_not_retarget_files_or_ordinary_directories() {
+    let (directory, router, address) = fixture().await;
+    let storage = XiteStorage::new(directory.path().join("data").join(&address));
+    storage.write("blocktone.epix/page.html", b"local file").unwrap();
+    for (uri, mode, destination) in [
+        ("/talk.epix/blocktone.epix/page.html", "same-origin", Some("empty")),
+        ("/talk.epix/blocktone.epix/page.html", "navigate", Some("iframe")),
+        ("/talk.epix/blocktone.epix/page.html?wrapper_nonce=fixture", "navigate", Some("document")),
+    ] {
+        let response = loopback_request(&router, uri, mode, destination).await;
+        assert_eq!(response.status(), 200, "{uri}");
+        assert!(!response.headers().contains_key("location"));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&body[..], b"local file");
+    }
+    // These destinations would otherwise qualify for cross-xite navigation.
+    for (mode, destination) in [("same-origin", "document"), ("navigate", "empty")] {
+        let response = loopback_request(
+            &router, "/talk.epix/blocktone.epix/", mode, Some(destination),
+        ).await;
+        assert_eq!(response.status(), 200);
+        assert!(!response.headers().contains_key("location"));
+    }
+    for directory in [
+        "docs", "nested/blocktone.epix", "bad%40host.epix", "nested.talk.epix",
+        "talk.epix%2Fother", "bad%23host.epix", "bad%5Chost.epix",
+    ] {
+        let uri = format!("/talk.epix/{directory}/");
+        let response = loopback_request(&router, &uri, "navigate", Some("iframe")).await;
+        assert_eq!(response.status(), 200, "{uri}");
+        assert!(!response.headers().contains_key("location"), "{uri}");
+    }
+}
