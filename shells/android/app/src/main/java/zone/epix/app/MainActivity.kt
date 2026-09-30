@@ -36,6 +36,7 @@ import org.mozilla.gecko.util.GeckoBundle
 import org.mozilla.geckoview.GeckoPreferenceController
 import org.mozilla.geckoview.GeckoResult
 import org.mozilla.geckoview.GeckoRuntime
+import org.mozilla.geckoview.GeckoRuntimeSettings
 import org.mozilla.geckoview.GeckoSession
 import org.mozilla.geckoview.GeckoView
 import org.mozilla.geckoview.WebExtension
@@ -172,7 +173,14 @@ class MainActivity : AppCompatActivity() {
         setContentView(container)
         watchConnectivity()
 
-        runtime = GeckoRuntime.getDefault(this)
+        runtime = browserRuntime ?: GeckoRuntime.create(
+            applicationContext,
+            GeckoRuntimeSettings.Builder()
+                // Gecko's media permission observer runs in child processes.
+                // Set this before persisted wallet pages can start loading.
+                .extensionsProcessEnabled(true)
+                .build(),
+        ).also { browserRuntime = it }
         // DEBUG (local): page console + JS errors to logcat, DevTools socket
         runtime.settings.consoleOutputEnabled = true
         runtime.settings.remoteDebuggingEnabled = true
@@ -1969,6 +1977,10 @@ class MainActivity : AppCompatActivity() {
     }
 
     companion object {
+        // Created on the UI thread and retained across Activity recreation.
+        // Gecko permits only one runtime per process; retain no Activity here.
+        private var browserRuntime: GeckoRuntime? = null
+
         init {
             // The Rust core (libepix_ffi.so, one per ABI) packaged in jniLibs.
             System.loadLibrary("epix_ffi")
