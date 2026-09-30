@@ -38,3 +38,18 @@ build. Discard the vendor lockfile created by this standalone test command.
 Startup must also be exercised on an x86_64 Android
 emulator running the ARM64 APK through its native bridge, because a host-only
 test cannot reproduce the rejected register instruction.
+
+The upstream and patched ARM64 unit test binaries were also run through
+`/system/bin/ndk_translation_program_runner_arm64` on the API 37 x86_64
+emulator with 16 KiB pages. The upstream `test::rdrand_works` terminates with
+SIGILL (exit 132), logging the same rejected `0xd5380608` instruction as the
+app. The patched binary passes all eight upstream tests; `RdRand::new`
+returns `UnsupportedInstruction` on this emulator. Its generated Android
+assembly calls `getauxval` and tests bit 16, without the feature-register probe.
+
+The rebuilt ARM64 debug APK also passed all 17 packaged native-library checks
+and ran for more than seven minutes on the same emulator without the original
+native crash. The requested browser page rendered successfully. Wallet camera
+testing is separate: this translated debug build subsequently hit a JavaScript
+startup timeout in elliptic initialization, so native startup success alone
+does not establish that the QR import flow works.
