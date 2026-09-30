@@ -116,3 +116,27 @@ Use a small phone viewport (the regression was verified at 328 CSS pixels wide):
 - With a disposable, unfunded account, check Deposit/QR, settings, history, and
   return navigation. Do not submit transactions. Remove only that test account
   afterward and restore emulator keyboard/display settings.
+
+### Wallet extension tab lifecycle
+
+Use the pinned GeckoView build and a disposable profile. These checks require
+the real extension and GeckoView controller; a view or session test double
+cannot verify that the extension's pending tab ID is attached correctly.
+
+1. Launch with no wallet. The wallet's unsolicited first-run tab must stay
+   hidden. Open the wallet button and enter registration or import. Its
+   `tabs.create` request must replace the small popup with the taller sheet.
+2. Check logcat for `tabs.create is not supported` and session-opening
+   exceptions. Neither should appear for that user-requested tab. Previously
+   the app opened and navigated a different session itself, so the register
+   page appeared even though Gecko rejected the extension's tab request.
+3. Navigate back within the wallet, close it, and reopen it. Check the normal
+   toolbar popup and extension action popups as well as full registration
+   pages. There must be one visible wallet sheet and one navigation per tab.
+4. With Android camera permission unset, use the QR import page's **Open
+   camera** button. Check the actual permission prompt and scan a disposable
+   wallet transfer. Denying permission must show the scanner error. Do not
+   pregrant camera permission to make this check pass.
+5. Complete registration with an unfunded test account. When the wallet
+   closes its registration tab using `tabs.remove`, its sheet must close and
+   normal browser input must still work.

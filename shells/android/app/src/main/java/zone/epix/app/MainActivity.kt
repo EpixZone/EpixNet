@@ -1518,9 +1518,9 @@ class MainActivity : AppCompatActivity() {
                 ext.setActionDelegate(walletActionDelegate)
                 // The wallet opens full pages (register, sign approvals) with
                 // tabs.create; render those as near-full-screen sheets. The
-                // app loads the URL itself (GeckoView hands it over raw, and
-                // extension-relative paths like "/register.html" need the
-                // moz-extension base put back).
+                // controller must open the returned session with its pending
+                // tab ID. Gecko resolves extension-relative URLs and loads
+                // the requested document after attaching that session.
                 ext.tabDelegate = object : WebExtension.TabDelegate {
                     override fun onNewTab(
                         source: WebExtension,
@@ -1533,17 +1533,9 @@ class MainActivity : AppCompatActivity() {
                         if (!walletUserEngaged) {
                             return null
                         }
-                        val session = openPopupSession(heightFraction = 0.95)
-                        val url = details.url ?: ""
-                        val resolved = when {
-                            url.isEmpty() -> null
-                            url.contains("://") -> url
-                            else ->
-                                source.metaData.baseUrl.trimEnd('/') +
-                                    (if (url.startsWith("/")) url else "/$url")
-                        }
-                        resolved?.let { session.loadUri(it) }
-                        return GeckoResult.fromValue(session)
+                        return GeckoResult.fromValue(
+                            openPopupSession(heightFraction = 0.95, openSession = false),
+                        )
                     }
                 }
             }, { e ->
@@ -1737,12 +1729,15 @@ class MainActivity : AppCompatActivity() {
         openPopupSession().loadUri("${base}popup.html")
     }
 
-    /** A popup-sized dialog holding a fresh GeckoSession for the wallet UI. */
-    private fun openPopupSession(heightFraction: Double = 0.82): GeckoSession {
+    /** A wallet dialog; tabs.create leaves opening and navigation to Gecko. */
+    private fun openPopupSession(
+        heightFraction: Double = 0.82,
+        openSession: Boolean = true,
+    ): GeckoSession {
         // One wallet surface at a time: a tab opened from the popup (register,
         // sign approval) replaces the popup's dialog.
         walletDialog?.dismiss()
-        val popupSession = GeckoSession().apply { open(runtime) }
+        val popupSession = GeckoSession()
         popupSession.permissionDelegate = walletPermissionDelegate
         popupSession.promptDelegate = buildPromptDelegate()
         var canGoBack = false
@@ -1881,6 +1876,9 @@ class MainActivity : AppCompatActivity() {
                 walletDialog = null
             }
         }
+        // Install the delegates and view before opening. GeckoView accepts an
+        // unopened session, which its tabs.create controller opens on return.
+        if (openSession) popupSession.open(runtime)
         walletDialog = dialog
         dialog.show()
         if (android.os.Build.VERSION.SDK_INT >= 33) {
