@@ -76,7 +76,7 @@ The first build downloads a lot and can take several minutes, that is normal. It
 .\target\release\epix-server.exe
 ```
 
-Your browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**.
+Your browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
 
 To open a specific site, add its name:
 
@@ -131,4 +131,4 @@ Paste that into the File Explorer address bar to open it.
 - **`link.exe` not found` or a C++ error:** step 1 did not finish. Re-open the Visual Studio Build Tools installer and make sure **Desktop development with C++** is checked.
 - **An error mentioning `protoc` or "Could not find protoc":** step 4 did not finish, or PowerShell has not picked it up yet - open a new window and check `protoc --version`.
 - **`cargo` or `git` not recognized:** close PowerShell and open a new one so it picks up the new programs.
-- **Port already in use:** EpixNet automatically tries `43110` if `42222` is taken. You can also pick your own: `$env:EPIX_UI_ADDR = "127.0.0.1:9000"` before running.
+- **Port already in use:** If dashboard port `42222` is taken, EpixNet tries `42223`, `42224`, and so on until one is available. The selected port is saved in `ui_port` inside your data folder. The file server does the same from its configured port, `26552` by default; use the selected port from the node log for port forwarding. You can also pick your own: `$env:EPIX_UI_ADDR = "127.0.0.1:9000"` before running. A non-default dashboard port must be available or startup fails.

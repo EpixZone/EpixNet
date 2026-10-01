@@ -122,7 +122,7 @@ async fn runtime_resyncs_a_published_update() {
         }
     });
 
-    runtime.start();
+    runtime.start().await;
 
     // The loop should fetch the newer content.json over EDX, verify it, and
     // download the file. Wait for both the applied content and the file.

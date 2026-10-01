@@ -131,7 +131,7 @@ sudo pacman -S --needed systemd-libs   # Arch
 ./target/release/epix-server
 ```
 
-Your browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**.
+Your browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
 
 To open a specific site, add its name:
 
@@ -209,7 +209,7 @@ WantedBy=multi-user.target
 UNIT
 ```
 
-`EPIX_HEADLESS=1` stops it from trying to open a browser. `EPIX_UI_ADDR` sets the address the dashboard listens on (change the port if `42222` is taken). `LimitNOFILE=65536` gives the node room for many peer connections; the default limit is low enough that a busy public node can hit it.
+`EPIX_HEADLESS=1` stops it from trying to open a browser. `EPIX_UI_ADDR` sets the address the dashboard listens on. The default port `42222` increases one at a time if taken; a non-default port must be available. `LimitNOFILE=65536` gives the node room for many peer connections; the default limit is low enough that a busy public node can hit it.
 
 ### 4. Start it and check it
 
@@ -220,7 +220,7 @@ systemctl status epix
 journalctl -u epix -f
 ```
 
-You can also ask the node itself. `/StatsJson` is exempt from the origin check, so it answers a plain request:
+You can also ask the node itself. `/StatsJson` is exempt from the origin check, so it answers a plain request. If the dashboard selected another port, replace `42222` with the port saved in `/var/lib/epix/.local/share/EpixNet/ui_port`:
 
 ```sh
 curl -s http://127.0.0.1:42222/StatsJson
@@ -228,7 +228,7 @@ curl -s http://127.0.0.1:42222/StatsJson
 
 ### 5. Reach the dashboard
 
-The node listens on `127.0.0.1:42222` on the server itself. From your own machine, open an SSH tunnel and then visit **http://127.0.0.1:42222/** in a browser:
+The node listens on `127.0.0.1:42222` on the server itself by default. If it selected another port, use that port for the remote end of the tunnel and any reverse proxy below. From your own machine, open an SSH tunnel and then visit **http://127.0.0.1:42222/** in a browser:
 
 ```sh
 ssh -L 42222:127.0.0.1:42222 you@server
@@ -310,4 +310,4 @@ EpixNet keeps your sites, keys, and settings in:
   it as shown under step 4, or build just what you need instead, for example
   `cargo build --release -p epix-server`, which does not depend on `hidapi` at
   all.
-- **Port already in use:** EpixNet automatically tries `43110` if `42222` is taken. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server`.
+- **Port already in use:** If dashboard port `42222` is taken, EpixNet tries `42223`, `42224`, and so on until one is available. The selected port is saved in `ui_port` inside your data folder. The file server does the same from its configured port, `26552` by default; use the selected port from the node log for port forwarding. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server`. A non-default dashboard port must be available or startup fails.

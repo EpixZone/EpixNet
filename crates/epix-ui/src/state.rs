@@ -4092,7 +4092,7 @@ pub struct AppState {
     /// Short git commit of this build, reported in `serverInfo.rev` (the
     /// dashboard shows it next to the version). Set by the binary after boot.
     rev: RwLock<String>,
-    /// The UI port actually bound (default 42222, or 43110 fallback), reported
+    /// The UI port actually bound (42222 or the next available port), reported
     /// in `serverInfo.ui_port` so the dashboard builds correct links.
     ui_port: RwLock<u16>,
     xites: RwLock<HashMap<String, ManagedXite>>,
