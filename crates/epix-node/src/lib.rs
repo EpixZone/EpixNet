@@ -994,7 +994,7 @@ impl PexSpawner {
         };
         if self
             .budget
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |budget| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |budget| {
                 budget.checked_sub(1)
             })
             .is_err()
