@@ -72,8 +72,7 @@ macro_rules! trace_clone {
 
 /// Epix's default UI port.
 pub const DEFAULT_UI_PORT: u16 = 42222;
-/// Legacy EpixNet UI port, used as a fallback when the default is taken (so a
-/// fresh Epix and an old EpixNet can coexist, and old 43110 links still resolve).
+/// Historical EpixNet UI port, retained for callers supporting older nodes.
 pub const LEGACY_UI_PORT: u16 = 43110;
 /// The default UI bind (loopback, Epix's port).
 pub const DEFAULT_UI_ADDR: &str = "127.0.0.1:42222";
@@ -94,7 +93,7 @@ pub struct NodeOptions {
     pub data_root: PathBuf,
     /// A raw `epix1…` xite address or a `.epix` name (or bare label) to open.
     pub target: String,
-    /// The UI HTTP/WebSocket bind, e.g. `127.0.0.1:43110`.
+    /// The UI HTTP/WebSocket bind, e.g. `127.0.0.1:42222`.
     pub ui_addr: String,
     /// Tor routing mode: `disable` / `enable` / `always`. Empty means "no
     /// explicit choice": boot uses the Config page's persisted `tor` value,
@@ -836,29 +835,34 @@ where
     Ok((launch, policy))
 }
 
-/// Acquire and retain the requested UI listener. Only the default port falls
-/// back to the legacy EpixNet port. This attempts the real bind once per port,
-/// instead of probing and dropping a socket before the server starts.
+/// Acquire and retain the requested UI listener. When the default port is in
+/// use, try successive ports until one binds. Explicit non-default ports stay
+/// fixed. Retain the real socket instead of probing before the server starts.
 fn bind_ui_listener_with<T>(
     requested: std::net::SocketAddr,
     default_port: u16,
-    fallback_port: u16,
     mut bind: impl FnMut(std::net::SocketAddr) -> std::io::Result<T>,
 ) -> std::io::Result<T> {
-    match bind(requested) {
-        Ok(listener) => Ok(listener),
-        Err(requested_error) if requested.port() == default_port => {
-            let fallback = std::net::SocketAddr::new(requested.ip(), fallback_port);
-            bind(fallback).map_err(|fallback_error| {
-                std::io::Error::new(
-                    fallback_error.kind(),
-                    format!(
-                        "cannot bind UI on {requested} ({requested_error}) or fallback {fallback} ({fallback_error})"
-                    ),
-                )
-            })
+    let mut candidate = requested;
+    loop {
+        match bind(candidate) {
+            Ok(listener) => return Ok(listener),
+            Err(error)
+                if requested.port() == default_port
+                    && error.kind() == std::io::ErrorKind::AddrInUse =>
+            {
+                let Some(port) = candidate.port().checked_add(1) else {
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "cannot bind UI: all ports from {requested} through {candidate} are in use"
+                        ),
+                    ));
+                };
+                candidate.set_port(port);
+            }
+            Err(error) => return Err(error),
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -869,15 +873,10 @@ fn bind_ui_listener_with<T>(
 fn bind_and_publish_ui_endpoint_with<T>(
     requested: std::net::SocketAddr,
     default_port: u16,
-    fallback_port: u16,
     publish: impl FnOnce(std::net::SocketAddr) -> T,
 ) -> std::io::Result<(std::net::TcpListener, std::net::SocketAddr, T)> {
-    let listener = bind_ui_listener_with(
-        requested,
-        default_port,
-        fallback_port,
-        std::net::TcpListener::bind,
-    )?;
+    let listener =
+        bind_ui_listener_with(requested, default_port, std::net::TcpListener::bind)?;
     listener.set_nonblocking(true)?;
     let bind = listener.local_addr()?;
     let published = publish(bind);
@@ -4653,9 +4652,6 @@ async fn serve(
         Some(p) => Some(p as u16),
         None => Some(DEFAULT_FILESERVER_PORT),
     };
-    if let Some(port) = fileserver_port {
-        state.set_fileserver_port(port).await;
-    }
 
     // Tor mode: an explicit option (EPIX_TOR / a shell's own setting) wins;
     // otherwise the Config page's persisted choice; otherwise enable. Without
@@ -4804,7 +4800,7 @@ async fn serve(
     {
         runtime = runtime.with_data_dir(opts.data_root.clone());
     }
-    runtime.start();
+    runtime.start().await;
 
     // Tor-always: once the Arti SOCKS listener is up (tor_status == "Always"),
     // route all chain RPC through it, so name resolution never exposes the
@@ -4883,7 +4879,7 @@ async fn serve(
         .parse()
         .map_err(|_| format!("invalid ui_addr '{}'", opts.ui_addr))?;
     let (ui_listener, bind, nmh_warnings) =
-        bind_and_publish_ui_endpoint_with(requested, DEFAULT_UI_PORT, LEGACY_UI_PORT, |bind| {
+        bind_and_publish_ui_endpoint_with(requested, DEFAULT_UI_PORT, |bind| {
             publish_nmh_endpoint(&opts.data_root, bind, state.nmh_token())
         })
         .map_err(|error| format!("bind UI endpoint: {error}"))?;
@@ -5955,61 +5951,100 @@ mod tests {
     }
 
     #[test]
-    fn ui_bind_prefers_default_and_falls_back_to_legacy() {
-        let addr = |p: u16| std::net::SocketAddr::from(([127, 0, 0, 1], p));
-
-        // Default port free -> use it.
-        assert_eq!(
-            bind_ui_listener_with(
-                addr(DEFAULT_UI_PORT),
-                DEFAULT_UI_PORT,
-                LEGACY_UI_PORT,
-                |candidate| Ok::<_, std::io::Error>(candidate),
-            )
-            .unwrap(),
-            addr(DEFAULT_UI_PORT)
-        );
-
-        // Default port taken -> fall back to the legacy EpixNet port.
-        assert_eq!(
-            bind_ui_listener_with(
-                addr(DEFAULT_UI_PORT),
-                DEFAULT_UI_PORT,
-                LEGACY_UI_PORT,
-                |candidate| {
-                    if candidate.port() == DEFAULT_UI_PORT {
+    fn ui_bind_uses_first_available_port_without_skipping() {
+        for ip in [std::net::Ipv4Addr::LOCALHOST.into(), std::net::Ipv6Addr::LOCALHOST.into()] {
+            for occupied in [0, 1, 9] {
+                let requested = std::net::SocketAddr::new(ip, DEFAULT_UI_PORT);
+                let available = DEFAULT_UI_PORT + occupied;
+                let mut attempts = Vec::new();
+                let bound = bind_ui_listener_with(requested, DEFAULT_UI_PORT, |candidate| {
+                    attempts.push(candidate);
+                    if candidate.port() < available {
                         Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
                     } else {
                         Ok(candidate)
                     }
-                },
-            )
-            .unwrap(),
-            addr(LEGACY_UI_PORT)
-        );
+                })
+                .unwrap();
+                assert_eq!(bound, std::net::SocketAddr::new(ip, available));
+                assert_eq!(
+                    attempts,
+                    (DEFAULT_UI_PORT..=available)
+                        .map(|port| std::net::SocketAddr::new(ip, port))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
 
-        // Default and legacy both taken -> fail before publishing endpoint
-        // metadata instead of returning an address that is not owned.
-        assert!(bind_ui_listener_with(
-            addr(DEFAULT_UI_PORT),
-            DEFAULT_UI_PORT,
-            LEGACY_UI_PORT,
-            |_candidate| Err::<std::net::SocketAddr, _>(std::io::Error::from(
-                std::io::ErrorKind::AddrInUse
-            )),
-        )
-        .is_err());
+    #[test]
+    fn ui_bind_does_not_retry_explicit_ports_or_other_errors() {
+        use std::io::ErrorKind::{AddrInUse, AddrNotAvailable, PermissionDenied};
 
-        // An explicitly chosen (non-default) port never jumps to 43110.
+        for (port, kind, busy_first) in [
+            (9999, AddrInUse, false),
+            (0, AddrInUse, false),
+            (DEFAULT_UI_PORT, PermissionDenied, false),
+            (DEFAULT_UI_PORT, AddrNotAvailable, false),
+            (DEFAULT_UI_PORT, PermissionDenied, true),
+        ] {
+            let requested = std::net::SocketAddr::from(([127, 0, 0, 1], port));
+            let mut attempts = Vec::new();
+            let error = bind_ui_listener_with(requested, DEFAULT_UI_PORT, |candidate| {
+                attempts.push(candidate.port());
+                let error_kind = if busy_first && candidate == requested { AddrInUse } else { kind };
+                Err::<(), _>(std::io::Error::from(error_kind))
+            })
+            .unwrap_err();
+            assert_eq!(error.kind(), kind);
+            assert_eq!(attempts, if busy_first { vec![port, port + 1] } else { vec![port] });
+        }
+    }
+
+    #[test]
+    fn ui_bind_stops_at_port_limit_without_wrapping() {
+        let requested = std::net::SocketAddr::from(([127, 0, 0, 1], u16::MAX - 1));
         let mut attempts = Vec::new();
-        assert!(
-            bind_ui_listener_with(addr(9999), DEFAULT_UI_PORT, LEGACY_UI_PORT, |candidate| {
-                attempts.push(candidate);
-                Err::<std::net::SocketAddr, _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
-            },)
-            .is_err()
-        );
-        assert_eq!(attempts, vec![addr(9999)]);
+        let error = bind_ui_listener_with(requested, requested.port(), |candidate| {
+            attempts.push(candidate.port());
+            Err::<(), _>(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(attempts, vec![u16::MAX - 1, u16::MAX]);
+    }
+
+    fn ui_test_listener_with_headroom() -> std::net::TcpListener {
+        (30_000..60_000)
+            .find_map(|port| {
+                std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).ok()
+            })
+            .expect("a free loopback port with room for subsequent listeners")
+    }
+
+    #[test]
+    fn ui_bind_retains_ports_for_ten_instances() {
+        let first = ui_test_listener_with_headroom();
+        let requested = first.local_addr().unwrap();
+        let mut listeners = vec![first];
+        for _ in 1..10 {
+            let listener = bind_ui_listener_with(
+                requested,
+                requested.port(),
+                std::net::TcpListener::bind,
+            )
+            .unwrap();
+            assert!(listener.local_addr().unwrap().port() > requested.port());
+            listeners.push(listener);
+        }
+        let ports: std::collections::HashSet<_> = listeners
+            .iter()
+            .map(|listener| listener.local_addr().unwrap().port())
+            .collect();
+        assert_eq!(ports.len(), 10);
+        for listener in &listeners {
+            assert!(std::net::TcpListener::bind(listener.local_addr().unwrap()).is_err());
+        }
     }
 
     #[test]
@@ -6017,7 +6052,7 @@ mod tests {
         use std::cell::Cell;
 
         let dir = tempfile::tempdir().unwrap();
-        let hijacker = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let hijacker = ui_test_listener_with_headroom();
         let requested = hijacker.local_addr().unwrap();
         std::fs::write(dir.path().join("ui_port"), requested.port().to_string()).unwrap();
         write_nmh_auth_token(dir.path(), &"11".repeat(32)).unwrap();
@@ -6025,8 +6060,8 @@ mod tests {
         let published = Cell::new(false);
         let token = "22".repeat(32);
         let (listener, bound, warnings) =
-            bind_and_publish_ui_endpoint_with(requested, requested.port(), 0, |bound| {
-                assert_ne!(bound, requested, "the occupied port must use fallback");
+            bind_and_publish_ui_endpoint_with(requested, requested.port(), |bound| {
+                assert!(bound.port() > requested.port(), "the occupied port must increment");
                 assert!(
                     std::net::TcpListener::bind(bound).is_err(),
                     "publication must run only while the node owns the selected port"

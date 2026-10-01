@@ -119,7 +119,7 @@ async fn propagation_poll_triggers_resync_of_a_hinted_xite() {
             ..Default::default()
         },
     );
-    runtime.start();
+    runtime.start().await;
 
     // The propagation poll should learn of the hint, resync the xite (fetch the
     // newer content.json over EDX), and download the file - all without a resync

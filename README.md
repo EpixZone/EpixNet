@@ -43,7 +43,7 @@ cargo run -p epix-server
 EPIX_HEADLESS=1 cargo run -p epix-server
 ```
 
-The dashboard lives at **http://127.0.0.1:42222/**. Open a specific xite by passing its name:
+The dashboard uses **http://127.0.0.1:42222/** by default. If that port is taken, it tries `42223`, `42224`, and so on until one is available. Open a specific xite by passing its name:
 
 ```sh
 cargo run -p epix-server talk.epix
@@ -139,7 +139,9 @@ Set these before you start EpixNet to change how it runs:
 | `EPIX_TOR` | Node Tor mode: `enable`, `disable`, or `always`. `always` requires Tor for node peer traffic; browser and wallet routing have separate controls. | `enable` |
 | `EPIX_DATA_DIR` | Where EpixNet keeps its data (xites, keys, settings). | see below |
 
-If port `42222` is already taken, EpixNet falls back to `43110`.
+If dashboard port `42222` is already taken, EpixNet tries each next port in order until one is available. A non-default port set through `EPIX_UI_ADDR` must be available or startup fails. The selected dashboard port is saved in `ui_port` inside your data folder.
+
+The file server also tries each next port if its configured `fileserver_port` is taken, starting at `26552` by default. Setting `fileserver_port` to `0` still disables seeding. Use the selected file-server port from the node log for port forwarding.
 
 Your data folder by default:
 

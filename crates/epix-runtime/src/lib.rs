@@ -50,8 +50,9 @@ pub struct RuntimeConfig {
     pub propagation_interval: Duration,
     pub chart_interval: Duration,
     pub connection_interval: Duration,
-    /// TCP port for the inbound file server (seeding). `None` disables it (the
-    /// node stays download-only). Ignored without the `inbound-seeding` feature.
+    /// First TCP port to try for the inbound file server (seeding). Occupied
+    /// ports are skipped one at a time. `None` disables it (the node stays
+    /// download-only). Ignored without the `inbound-seeding` feature.
     pub fileserver_port: Option<u16>,
     /// Offline mode: skip every peer-networking loop (announce, connections,
     /// re-sync, seeding). Only the local chart collector keeps running.
@@ -185,10 +186,10 @@ impl NodeRuntime {
         self
     }
 
-    /// Spawn the background loops. Idempotent per instance (call once). The local
-    /// chart collector always runs; the peer-networking loops are skipped in
-    /// offline mode.
-    pub fn start(&mut self) {
+    /// Bind the file server and spawn the background loops. Call once per
+    /// instance. The local chart collector always runs; peer-networking loops
+    /// are skipped in offline mode.
+    pub async fn start(&mut self) {
         // Share the propagation hint store with the app state, so a received
         // EDX update records a gossip hint into the same book the EDX control
         // plane serves and `propagation_loop` polls.
@@ -211,6 +212,32 @@ impl NodeRuntime {
         let tor_always = self.config.tor_mode == epix_tor::TorMode::Always;
         #[cfg(not(feature = "tor"))]
         let tor_always = false;
+        // Bind before starting port consumers so every advertisement, onion
+        // service and router mapping uses the same port, including port 0.
+        #[cfg(feature = "inbound-seeding")]
+        let seed_listener = if let Some(port) = self.config.fileserver_port {
+            match bind_seed_listener(port, !tor_always).await.and_then(|listener| {
+                let bound = listener.local_addr()?;
+                Ok((listener, bound))
+            }) {
+                Ok(listener) => Some(listener),
+                Err(e) => {
+                    self.state
+                        .log("ERROR", format!("File server bind starting at port {port} failed: {e}"))
+                        .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(feature = "inbound-seeding")]
+        let tcp_port = seed_listener.as_ref().map(|(_, bound)| bound.port());
+        #[cfg(not(feature = "inbound-seeding"))]
+        let tcp_port = None::<u16>;
+        // Overlays can still serve if TCP binding fails or is compiled out.
+        let fileserver_port = tcp_port.or(self.config.fileserver_port);
+        self.state.set_fileserver_port(fileserver_port.unwrap_or(0)).await;
         // Seed the self-advertisement (Phase 6): an outbound EDX Hello offers
         // our dial-back address so an inbound overlay peer becomes
         // dialable at first contact instead of waiting on PEX/trackers. The
@@ -218,7 +245,7 @@ impl NodeRuntime {
         // flips when an inbound public peer confirms the port (seed_loop).
         epix_protocol::set_self_advert(epix_protocol::SelfAdvert {
             version: self.state.version.clone(),
-            fileserver_port: self.config.fileserver_port.unwrap_or(0),
+            fileserver_port: fileserver_port.unwrap_or(0),
             port_opened: false,
             tor_always,
             onion: None,
@@ -274,7 +301,8 @@ impl NodeRuntime {
         self.handles.push(tokio::spawn(dht_loop(
             self.state.clone(),
             self.dht.clone(),
-            self.config.fileserver_port,
+            fileserver_port,
+            tcp_port.is_some(),
             tor_always,
             self.shutdown.clone(),
             self.config.announce_interval,
@@ -311,24 +339,22 @@ impl NodeRuntime {
         // Inbound file server: let peers pull our files (seeding), and try to
         // open that port through the home router with UPnP so it's reachable.
         #[cfg(feature = "inbound-seeding")]
-        if let Some(port) = self.config.fileserver_port {
+        if let Some((listener, bound)) = seed_listener {
             // Tor-always binds the fileserver to loopback, so clearnet is
             // deliberately closed - don't report a public port in that mode,
             // whether from a public interface IP or an inbound peer.
-            #[cfg(feature = "tor")]
-            let clearnet_seeding = self.config.tor_mode != epix_tor::TorMode::Always;
-            #[cfg(not(feature = "tor"))]
-            let clearnet_seeding = true;
+            let clearnet_seeding = !tor_always;
             self.handles.push(tokio::spawn(seed_loop(
                 self.state.clone(),
-                port,
+                listener,
+                bound,
                 clearnet_seeding,
                 edx_cell.clone(),
                 self.shutdown.clone(),
             )));
             self.handles.push(tokio::spawn(upnp_loop(
                 self.state.clone(),
-                port,
+                bound.port(),
                 clearnet_seeding,
                 self.shutdown.clone(),
             )));
@@ -345,7 +371,7 @@ impl NodeRuntime {
                     dir.join("i2p"),
                     self.config.i2p_mode.clone(),
                     self.config.i2p_sam_port,
-                    self.config.fileserver_port,
+                    fileserver_port,
                     edx_cell.clone(),
                     self.shutdown.clone(),
                 )));
@@ -378,7 +404,7 @@ impl NodeRuntime {
                     self.state.clone(),
                     dir,
                     self.config.tor_mode,
-                    self.config.fileserver_port,
+                    fileserver_port,
                     self.config.tor_socks_port,
                     self.config.tor_use_bridges,
                     edx_cell.clone(),
@@ -413,7 +439,7 @@ impl NodeRuntime {
         if self.config.local_discovery {
             self.handles.push(tokio::spawn(local::local_discovery_loop(
                 self.state.clone(),
-                self.config.fileserver_port.unwrap_or(0),
+                tcp_port.unwrap_or(0),
                 self.shutdown.clone(),
                 Duration::from_secs(5 * 60),
             )));
@@ -583,9 +609,9 @@ fn dialable_dht_peer(p: &PeerAddr) -> bool {
 /// doubles as the onion/i2p virtual port, so a portless node has no inbound
 /// service to claim on any network.
 ///
-/// `include_clearnet` is false in Tor-Always mode: our announce reaches peers
-/// from a Tor exit, so a `0.0.0.0` claim would be rewritten to the exit IP
-/// (useless, and it re-introduces a correlation). There we claim overlays only.
+/// `include_clearnet` is false without a TCP listener and in Tor-Always mode:
+/// our announce reaches peers from a Tor exit, so a `0.0.0.0` claim would be
+/// rewritten to the exit IP. In either case we claim overlays only.
 fn dht_self_claims(
     port: u16,
     include_clearnet: bool,
@@ -655,6 +681,7 @@ async fn dht_loop(
     state: Arc<AppState>,
     dht: Arc<epix_dht::Node>,
     fileserver_port: Option<u16>,
+    tcp_listening: bool,
     tor_always: bool,
     shutdown: Arc<Notify>,
     period: Duration,
@@ -693,7 +720,8 @@ async fn dht_loop(
         // Wait for the transport (set by the node just before the runtime
         // starts). A NAT'd node doesn't know its public IP; it claims 0.0.0.0
         // and the serving side substitutes the connection's source IP (see
-        // DhtService). The port is our real listening port.
+        // DhtService). Without a TCP listener, port 0 makes this contact
+        // non-dialable while overlay self-claims keep their virtual port.
         loop {
             if state.transport().await.is_some() {
                 break;
@@ -703,7 +731,8 @@ async fn dht_loop(
                 _ = tokio::time::sleep(Duration::from_secs(1)) => {}
             }
         }
-        PeerAddr::parse(&format!("0.0.0.0:{port}")).expect("addr")
+        let tcp_port = if tcp_listening { port } else { 0 };
+        PeerAddr::parse(&format!("0.0.0.0:{tcp_port}")).expect("addr")
     };
 
     let me = epix_dht::Contact::new(dht.id, me_addr);
@@ -765,11 +794,11 @@ async fn dht_loop(
         // Self-claims are rebuilt every round: the onion service, I2P session,
         // and mesh come up minutes after start, and this is where they become
         // discoverable (Phase 4 - a Tor/I2P-only publisher is invisible to
-        // clearnet-NAT'd nodes otherwise). Clearnet is excluded in Tor-Always
-        // mode, where we claim overlays only (see dht_self_claims).
+        // clearnet-NAT'd nodes otherwise). Clearnet requires a TCP listener
+        // and is excluded in Tor-Always mode (see dht_self_claims).
         let claims = Arc::new(dht_self_claims(
             port,
-            !tor_always,
+            !tor_always && tcp_listening,
             state.onion_address().await,
             state.i2p_address().await,
             state.rns_address().await,
@@ -1268,33 +1297,44 @@ async fn propagation_loop(
     }
 }
 
-/// Bind the file server according to the node's clearnet policy.
+/// Bind the first available file-server port according to the clearnet policy.
 #[cfg(feature = "inbound-seeding")]
 async fn bind_seed_listener(
     port: u16,
     clearnet: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
     let host = if clearnet { "0.0.0.0" } else { "127.0.0.1" };
-    tokio::net::TcpListener::bind((host, port)).await
+    bind_seed_port(port, |port| tokio::net::TcpListener::bind((host, port))).await
 }
 
-/// Serve inbound peers (seeding) on `port` until shutdown. Peers bring up an
-/// EDX link and pull verified ranges over it.
+#[cfg(feature = "inbound-seeding")]
+async fn bind_seed_port<T, F, Fut>(mut port: u16, mut bind: F) -> std::io::Result<T>
+where
+    F: FnMut(u16) -> Fut,
+    Fut: std::future::Future<Output = std::io::Result<T>>,
+{
+    loop {
+        match bind(port).await {
+            Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
+                let Some(next) = port.checked_add(1) else { return Err(e) };
+                port = next;
+            }
+            result => return result,
+        }
+    }
+}
+
+/// Serve inbound peers (seeding) on the bound listener until shutdown. Peers
+/// bring up an EDX link and pull verified ranges over it.
 #[cfg(feature = "inbound-seeding")]
 async fn seed_loop(
     state: Arc<AppState>,
-    port: u16,
+    listener: tokio::net::TcpListener,
+    bound: std::net::SocketAddr,
     clearnet: bool,
     edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
 ) {
-    let listener = match bind_seed_listener(port, clearnet).await {
-        Ok(l) => l,
-        Err(e) => {
-            state.log("ERROR", format!("File server bind on port {port} failed: {e}")).await;
-            return;
-        }
-    };
     // Open the content-addressed object store + the verified-streaming fetcher
     // (shared across every transport via edx_cell) and register the loaded
     // xites. Without a data dir there is nowhere to put the store, so such a
@@ -1340,14 +1380,12 @@ async fn seed_loop(
         }) as epix_protocol::InboundHook);
     }
     let server = epix_protocol::PeerServer::new(es.clearnet_hook(on_inbound));
-    if let Ok(bound) = listener.local_addr() {
-        // The configured port may be zero (an ephemeral listener). Publish the
-        // bound port, and only advertise a source IP when clearnet is enabled.
-        state.set_fileserver_port(bound.port()).await;
-        if clearnet {
-            state.set_clearnet_listener(Some(bound)).await;
-        }
+    // The bound port was published before startup; advertise a source IP only
+    // once the clearnet accept handler is ready.
+    if clearnet {
+        state.set_clearnet_listener(Some(bound)).await;
     }
+    let port = bound.port();
     state.log("INFO", format!("Seeding files (+ DHT + propagation) on port {port}")).await;
     tokio::select! {
         _ = shutdown.notified() => {}
@@ -1359,6 +1397,26 @@ async fn seed_loop(
 #[cfg(all(test, feature = "inbound-seeding"))]
 mod seed_binding_tests {
     use super::*;
+
+    async fn reserve_consecutive_ports(count: u16, clearnet: bool) -> Vec<tokio::net::TcpListener> {
+        let host = if clearnet { "0.0.0.0" } else { "127.0.0.1" };
+        for _ in 0..100 {
+            let first = tokio::net::TcpListener::bind((host, 0)).await.unwrap();
+            let base = first.local_addr().unwrap().port();
+            let Some(end) = base.checked_add(count - 1) else { continue };
+            let mut listeners = vec![first];
+            for port in base + 1..=end {
+                match tokio::net::TcpListener::bind((host, port)).await {
+                    Ok(listener) => listeners.push(listener),
+                    Err(_) => break,
+                }
+            }
+            if listeners.len() == usize::from(count) {
+                return listeners;
+            }
+        }
+        panic!("could not reserve {count} consecutive TCP ports");
+    }
 
     #[tokio::test]
     async fn tor_always_seed_listener_is_limited_to_loopback_host() {
@@ -1373,6 +1431,102 @@ mod seed_binding_tests {
     async fn clearnet_seed_listener_accepts_external_interfaces() {
         let listener = bind_seed_listener(0, true).await.unwrap();
         assert!(listener.local_addr().unwrap().ip().is_unspecified());
+    }
+
+    #[tokio::test]
+    async fn ten_seed_instances_use_consecutive_ports() {
+        for clearnet in [false, true] {
+            let mut reserved: Vec<_> = reserve_consecutive_ports(10, clearnet)
+                .await
+                .into_iter()
+                .map(Some)
+                .collect();
+            let base = reserved[0].as_ref().unwrap().local_addr().unwrap().port();
+            let mut listeners = Vec::new();
+            for (offset, reservation) in reserved.iter_mut().enumerate() {
+                drop(reservation.take());
+                let listener = bind_seed_listener(base, clearnet).await.unwrap();
+                let bound = listener.local_addr().unwrap();
+                assert_eq!(bound.port(), base + offset as u16);
+                assert_eq!(bound.ip().is_unspecified(), clearnet);
+                assert_eq!(bound.ip().is_loopback(), !clearnet);
+                listeners.push(listener);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_binding_stops_on_other_errors() {
+        use std::io::{Error, ErrorKind};
+        for kind in [
+            ErrorKind::PermissionDenied,
+            ErrorKind::AddrNotAvailable,
+            ErrorKind::InvalidInput,
+        ] {
+            let mut attempts = Vec::new();
+            let result: std::io::Result<()> = bind_seed_port(26552, |port| {
+                attempts.push(port);
+                std::future::ready(Err(Error::new(kind, "bind failed")))
+            })
+            .await;
+            assert_eq!(result.unwrap_err().kind(), kind);
+            assert_eq!(attempts, [26552]);
+        }
+    }
+
+    #[tokio::test]
+    async fn seed_binding_never_wraps_or_retries_ephemeral_ports() {
+        for (start, expected) in [
+            (u16::MAX - 2, vec![u16::MAX - 2, u16::MAX - 1, u16::MAX]),
+            (0, vec![0]),
+        ] {
+            let mut attempts = Vec::new();
+            let result: std::io::Result<()> = bind_seed_port(start, |port| {
+                attempts.push(port);
+                std::future::ready(Err(std::io::Error::from(std::io::ErrorKind::AddrInUse)))
+            })
+            .await;
+            assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+            assert_eq!(attempts, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn startup_publishes_the_bound_port_before_returning() {
+        let mut reserved = reserve_consecutive_ports(2, true).await;
+        let occupied_port = reserved[0].local_addr().unwrap().port();
+        drop(reserved.pop());
+        for requested in [occupied_port, 0] {
+            let data = tempfile::tempdir().unwrap();
+            let state = AppState::with_data_dir("seed-port-test", data.path());
+            let mut runtime = NodeRuntime::with_config(
+                state.clone(),
+                vec![],
+                RuntimeConfig {
+                    fileserver_port: Some(requested),
+                    #[cfg(feature = "tor")]
+                    tor_mode: epix_tor::TorMode::Disable,
+                    ..Default::default()
+                },
+            );
+            runtime.start().await;
+            let actual = state.fileserver_port().await;
+            assert_ne!(actual, 0);
+            if requested != 0 {
+                assert_eq!(actual, occupied_port + 1);
+            }
+            assert_eq!(state.self_advert().await.port, actual);
+            let conflict = tokio::net::TcpListener::bind(("127.0.0.1", actual)).await;
+            assert_eq!(conflict.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+            // These assertions need no peer or router traffic. Stop tasks
+            // before yielding to their network setup on the test runtime.
+            for handle in &runtime.handles {
+                handle.abort();
+            }
+            for handle in runtime.handles {
+                let _ = handle.await;
+            }
+        }
     }
 }
 
@@ -2468,14 +2622,14 @@ mod tests {
             ]
         );
 
-        // Tor-Always mode (include_clearnet=false): overlays only, no 0.0.0.0
-        // (which would be rewritten to a useless, correlating Tor exit IP).
+        // Tor-Always mode or no TCP listener: preserve every overlay claim
+        // without advertising an unserved clearnet port.
         let claims = dht_self_claims(
             48333,
             false,
             Some("expyuzz4wqqyqhjn".into()),
             Some("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32".into()),
-            None,
+            Some("00112233445566778899aabbccddeeff".into()),
         );
         let strings: Vec<String> = claims.iter().map(|c| c.to_string()).collect();
         assert_eq!(
@@ -2483,8 +2637,9 @@ mod tests {
             vec![
                 "expyuzz4wqqyqhjn.onion:48333",
                 "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:48333",
+                "rns:00112233445566778899aabbccddeeff",
             ],
-            "no 0.0.0.0 claim in Always mode"
+            "no clearnet claim without an allowed TCP listener"
         );
         // An Always-mode node with no overlay address yet claims nothing.
         assert!(dht_self_claims(48333, false, None, None, None).is_empty());
