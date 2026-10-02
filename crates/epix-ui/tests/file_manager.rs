@@ -307,6 +307,22 @@ async fn evx_fixture(
     signed: bool,
     evx: serde_json::Value,
 ) -> (tempfile::TempDir, Arc<AppState>, axum::Router, String, serde_json::Value) {
+    evx_fixture_edited(signed, evx, |_| {}).await
+}
+
+/// The stored content.json of an `evx_fixture` xite, as bytes.
+fn stored_root(directory: &tempfile::TempDir) -> Vec<u8> {
+    std::fs::read(directory.path().join("xite/content.json")).unwrap()
+}
+
+/// `evx_fixture` with `edit` applied to the root before it is signed, so a
+/// test can shape the manifest (move a file to `files_optional`, change a
+/// declared size) and still get a validly signed document.
+async fn evx_fixture_edited(
+    signed: bool,
+    evx: serde_json::Value,
+    edit: impl FnOnce(&mut serde_json::Value),
+) -> (tempfile::TempDir, Arc<AppState>, axum::Router, String, serde_json::Value) {
     let directory = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(directory.path().join("xite"));
     let index = b"<html>presence</html>";
@@ -330,6 +346,7 @@ async fn evx_fixture(
         },
         "evx": evx
     });
+    edit(&mut root);
     if let Some(key) = key {
         epix_content::sign(&mut root, &key).unwrap();
     }
@@ -365,8 +382,8 @@ async fn evx_panel_renders_the_signed_declaration_with_digest_hashes_and_statuse
     for (path, bytes) in [("evx/presence.wasm", ENTRY), ("evx/lib.wasm", LIB)] {
         assert!(html.contains(&XiteStorage::hash_bytes(bytes)), "sha512 of {path}");
         assert!(
-            html.contains(&format!("<a href='/{address}/{path}' download>{path}</a>")),
-            "download link for {path}: {html}"
+            html.contains(&format!("<a href='/raw/{address}/{path}' download>{path}</a>")),
+            "download link for {path} on the raw route: {html}"
         );
         assert!(html.contains(&format!("<td>{} B</td>", bytes.len())), "size of {path}");
     }
@@ -475,7 +492,7 @@ async fn evx_panel_reads_the_grant_through_the_installed_source() {
     let (_directory, state, router, address, _) = evx_fixture(true, baseline_evx()).await;
     let expected = address.clone();
     state.set_evx_grant_summary_source(Box::new(move |xite| {
-        (xite == expected).then(|| json!({ "enabled": true, "label": "<b>me</b>" }))
+        (xite == expected).then(|| grant_record(true))
     }));
     let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
     assert!(
@@ -483,6 +500,267 @@ async fn evx_panel_reads_the_grant_through_the_installed_source() {
         "{html}"
     );
     assert!(html.contains("<h3>Stored grant</h3>"), "{html}");
-    assert!(html.contains("&lt;b&gt;me&lt;/b&gt;"), "grant strings escaped: {html}");
-    assert!(!html.contains("<b>me</b>"));
+    for expected in [
+        "<dt>Enabled</dt><dd>yes</dd>",
+        "<dt>Authority generation</dt><dd>7</dd>",
+        "<dt>Expires</dt><dd>at unix time 1800000000</dd>",
+    ] {
+        assert!(html.contains(expected), "grant status fact {expected:?}: {html}");
+    }
+    assert_no_grant_record(&html);
+}
+
+/// A stored grant as the service's reader would render it: the status facts
+/// the view may show next to the record fields it must not (the operator's
+/// device label, the consent history, the capability and profile sets).
+fn grant_record(enabled: bool) -> serde_json::Value {
+    json!({
+        "xite": "whatever",
+        "publisher": "epix1publisher",
+        "enabled": enabled,
+        "generation": 7,
+        "limits_generation": 3,
+        "expires_unix": 1_800_000_000_u64,
+        "created_unix": 1_700_000_000_u64,
+        "label": "<b>brad's laptop</b>",
+        "capabilities": ["workspace.read", "workspace.write"],
+        "runtime_profiles": ["wasm-core-v1"],
+        "limits": { "memory_bytes": 2_097_152, "fuel": 500_000 },
+        "allow_run_once": true,
+        "allow_background": false
+    })
+}
+
+/// None of the record's fields reach the page, raw or escaped.
+fn assert_no_grant_record(html: &str) {
+    for leaked in [
+        "brad",
+        "laptop",
+        "&lt;b&gt;",
+        "<b>",
+        "epix1publisher",
+        "1700000000",
+        "created_unix",
+        "allow_background",
+        "runtime_profiles",
+        "limits_generation",
+        "evx-grant'>{",
+        "\"enabled\"",
+    ] {
+        assert!(!html.contains(leaked), "grant record field {leaked:?} reached the page: {html}");
+    }
+}
+
+#[tokio::test]
+async fn evx_panel_reports_a_disabled_grant_without_printing_it() {
+    let (_directory, state, router, address, _) = evx_fixture(true, baseline_evx()).await;
+    let expected = address.clone();
+    state.set_evx_grant_summary_source(Box::new(move |xite| {
+        (xite == expected).then(|| grant_record(false))
+    }));
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(
+        html.contains("<dt>EVX enabled for this xite</dt><dd class='bad'>no: the stored grant is disabled</dd>"),
+        "{html}"
+    );
+    assert!(html.contains("<h3>Stored grant</h3>"), "{html}");
+    assert!(html.contains("<dt>Enabled</dt><dd>no</dd>"), "{html}");
+    assert!(!html.contains("<dd class='ok'>yes</dd>"), "{html}");
+    assert_no_grant_record(&html);
+}
+
+#[tokio::test]
+async fn evx_panel_on_a_restricted_gateway_says_nothing_about_the_grant() {
+    let (_directory, state, router, address, _) = evx_fixture(true, baseline_evx()).await;
+    let expected = address.clone();
+    state.set_evx_grant_summary_source(Box::new(move |xite| {
+        (xite == expected).then(|| grant_record(true))
+    }));
+    state.config_set("ui_restrict", json!(true)).await;
+    let (status, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert_eq!(status, 200, "{html}");
+    // The panel still inspects the declaration...
+    assert!(html.contains("id='evx-panel'"), "{html}");
+    assert!(html.contains("<dd class='ok'>verified</dd>"), "{html}");
+    assert!(html.contains(&XiteStorage::hash_bytes(ENTRY)), "{html}");
+    // ...but carries no grant row, no grant section and no grant field.
+    for absent in ["EVX enabled for this xite", "Stored grant", "grant", "Authority generation", "Expires"] {
+        assert!(!html.contains(absent), "restricted gateway mentions the grant ({absent:?}): {html}");
+    }
+    assert_no_grant_record(&html);
+    // Lifting the restriction brings the status back, so the gate is the
+    // restriction and not a missing source.
+    state.config_set("ui_restrict", json!(false)).await;
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(html.contains("<dt>EVX enabled for this xite</dt><dd class='ok'>yes</dd>"), "{html}");
+}
+
+#[tokio::test]
+async fn evx_panel_reports_a_declared_file_missing_on_disk_as_incomplete() {
+    let (directory, _state, router, address, _) = evx_fixture(true, baseline_evx()).await;
+    std::fs::remove_file(directory.path().join("xite/evx/lib.wasm")).unwrap();
+    let (status, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(
+        html.contains("<dt>Integrity verified</dt><dd class='bad'>incomplete: a declared file is missing on this node</dd>"),
+        "incomplete status: {html}"
+    );
+    assert!(!html.contains("<dd class='ok'>verified</dd>"), "{html}");
+    // The declaration and its manifest pins are still shown: the signed
+    // manifest says what the missing file must be.
+    assert!(html.contains("<dd class='ok'>valid</dd>"), "{html}");
+    assert!(html.contains(&XiteStorage::hash_bytes(LIB)), "{html}");
+}
+
+#[tokio::test]
+async fn evx_panel_does_not_link_a_program_whose_closure_cannot_bind_to_the_manifest() {
+    // An entry or dependency listed only in files_optional is not part of
+    // what every node downloads, so the manifest does not pin it.
+    let (_directory, _state, router, address, _) =
+        evx_fixture_edited(true, baseline_evx(), |root| {
+            let pinned = root["files"].as_object_mut().unwrap().remove("evx/lib.wasm").unwrap();
+            root["files_optional"] = json!({ "evx/lib.wasm": pinned });
+        })
+        .await;
+    let (status, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("<p class='reason'>Cannot bind to the manifest: "), "{html}");
+    assert!(html.contains("<li>entry <code>evx/presence.wasm</code></li>"), "{html}");
+    assert!(html.contains("<li>dependency <code>evx/lib.wasm</code></li>"), "{html}");
+    assert!(!html.contains(" download>"), "an unbound closure is never linked: {html}");
+    assert!(!html.contains(&format!("/raw/{address}/evx/")), "no href to an unbound file: {html}");
+    assert!(!html.contains("<th>sha512</th>"), "no pinned table: {html}");
+    // The statuses are unaffected: the document is signed, complete and valid.
+    assert!(html.contains("<dd class='ok'>verified</dd>"), "{html}");
+    assert!(html.contains("<dd class='ok'>valid</dd>"), "{html}");
+
+    // A declared size over evx_activation::MAX_ARTIFACT (1 MiB) fails the
+    // bind the same way.
+    let (_directory, _state, router, address, _) =
+        evx_fixture_edited(true, baseline_evx(), |root| {
+            root["files"]["evx/lib.wasm"]["size"] = json!(1_048_576 + 1);
+        })
+        .await;
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(html.contains("<p class='reason'>Cannot bind to the manifest: "), "{html}");
+    assert!(html.contains("exceeds 1048576 bytes"), "the bound is the activation loader's: {html}");
+    assert!(!html.contains(" download>"), "an oversized closure is never linked: {html}");
+    assert!(!html.contains(&format!("/raw/{address}/evx/")), "{html}");
+}
+
+#[tokio::test]
+async fn evx_panel_reports_a_content_json_with_duplicate_keys_as_malformed_without_a_digest() {
+    let (directory, _state, router, address, root) = evx_fixture(true, baseline_evx()).await;
+    // Publisher signs the benign baseline, then publishes bytes carrying a
+    // decoy `evx` first and the signed section last. A last-wins decoder
+    // (serde_json, hence AppState::content) sees the signed section and the
+    // signature verifies on it; a first-wins reader sees the decoy.
+    let mut decoy = baseline_evx();
+    decoy["programs"]["presence"]["entry"] = json!("evx/decoy.wasm");
+    let signed = serde_json::to_string(&root).unwrap();
+    let bytes = format!("{{\"evx\": {decoy}, {}", &signed[1..]).into_bytes();
+    let collapsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    assert!(
+        epix_content::verify_signer(&collapsed, &address),
+        "the decoy document verifies once the duplicate has collapsed"
+    );
+    assert_eq!(collapsed["evx"], root["evx"]);
+    XiteStorage::new(directory.path().join("xite")).write("content.json", &bytes).unwrap();
+    assert_eq!(stored_root(&directory), bytes);
+
+    let (status, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("id='evx-panel'"), "the panel explains the malformed section: {html}");
+    assert!(
+        html.contains("<dt>EVX profile valid</dt><dd class='bad'>malformed: "),
+        "duplicate keys are malformed: {html}"
+    );
+    assert!(html.contains("duplicate keys"), "the reason names duplicate keys: {html}");
+    assert!(!html.contains("<dd class='ok'>valid</dd>"), "{html}");
+    assert!(!html.contains("<dd class='ok'>verified</dd>"), "{html}");
+    assert!(
+        html.contains("<dt>Integrity verified</dt><dd class='bad'>unverifiable: "),
+        "no signature verdict on a document that does not decode strictly: {html}"
+    );
+    assert!(!html.contains("evx-digest"), "no digest row: {html}");
+    let digest = evx_declaration::declaration_digest(&collapsed).unwrap();
+    assert!(!html.contains(&digest), "the collapsed section's digest is not shown: {html}");
+    assert!(!html.contains(" download>"), "nothing is bound or linked: {html}");
+    assert!(!html.contains("evx/decoy.wasm"), "nor is the decoy shown as a program: {html}");
+}
+
+/// A GET with `Sec-Fetch-Dest: document`: what a middle-click, a new tab or a
+/// typed URL sends, where the anchor's `download` hint does not apply.
+async fn document_navigation(
+    router: &axum::Router,
+    host: &str,
+    uri: &str,
+) -> (u16, axum::http::HeaderMap, String) {
+    let request = axum::extract::Request::builder()
+        .uri(uri)
+        .header("host", host)
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .header("referer", format!("http://{host}/list/{ADDRESS}"))
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let response = router
+        .clone()
+        .oneshot(rewrite_proxy_host(request))
+        .await
+        .unwrap();
+    let status = response.status().as_u16();
+    let headers = response.headers().clone();
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    (status, headers, String::from_utf8_lossy(&bytes).into_owned())
+}
+
+#[tokio::test]
+async fn evx_panel_program_links_never_navigate_into_the_wrapper() {
+    let mut evx = baseline_evx();
+    evx["programs"]["presence"]["entry"] = json!("index.html");
+    let (_directory, _state, router, address, _) = evx_fixture(true, evx).await;
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    let href = format!("/raw/{address}/index.html");
+    assert!(
+        html.contains(&format!("<a href='{href}' download>index.html</a>")),
+        "the entry is linked on the raw route: {html}"
+    );
+    assert!(
+        !panel(&html).contains(&format!("href='/{address}/index.html'")),
+        "the panel never links the wrapper route: {html}"
+    );
+
+    // The same URL as a top-level document navigation on the wrapper route
+    // renders the wrapper; that is what the panel must never link.
+    let (status, _, body) = document_navigation(&router, "127.0.0.1:42222", &format!("/{address}/index.html")).await;
+    assert_eq!(status, 200);
+    assert!(body.contains("id='inner-iframe'"), "control: the wrapper route wraps a .html document: {body}");
+
+    // The panel's link, navigated the same way, serves the bytes inert.
+    let (status, headers, body) = document_navigation(&router, "127.0.0.1:42222", &href).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body, "<html>presence</html>", "raw bytes, no wrapper");
+    assert!(!body.contains("id='inner-iframe'"));
+    let csp = headers.get("content-security-policy").unwrap().to_str().unwrap();
+    assert!(csp.starts_with("default-src 'none'; sandbox"), "noscript sandbox policy: {csp}");
+
+    // On a transparent proxy host every path naming another xite is sent to
+    // that xite's own origin, so there is no inert route to link: the panel
+    // shows the paths as text next to their hashes and links nothing.
+    let (_, html) = request(&router, "dashboard.epix", &format!("/list/{address}?evx=1")).await;
+    let panel = panel(&html);
+    assert!(panel.contains("<td><code>index.html</code></td>"), "path as text: {html}");
+    assert!(panel.contains(&XiteStorage::hash_bytes(b"<html>presence</html>")), "{html}");
+    assert!(!panel.contains(" download>"), "no link on a proxy host: {html}");
+    assert!(!panel.contains("href="), "no href at all in the panel on a proxy host: {html}");
+}
+
+/// The EVX panel's own markup, without the listing below it.
+fn panel(html: &str) -> &str {
+    let (_, rest) = html.split_once("id='evx-panel'").expect("panel present");
+    let (panel, _) = rest.split_once("</section>").expect("panel closed");
+    panel
 }
