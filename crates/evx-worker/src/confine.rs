@@ -30,7 +30,14 @@ pub fn apply_rlimits(cpu_seconds: u64, open_files: u64) -> Result<(), String> {
     Ok(())
 }
 
-fn set_limit(kind: libc::c_int, value: u64) -> Result<(), String> {
+/// libc's rlimit resource constants are `c_int` on macOS and the unsigned
+/// `__rlimit_resource_t` on Linux glibc; take whichever the platform uses.
+#[cfg(target_os = "linux")]
+type RlimitResource = libc::__rlimit_resource_t;
+#[cfg(not(target_os = "linux"))]
+type RlimitResource = libc::c_int;
+
+fn set_limit(kind: RlimitResource, value: u64) -> Result<(), String> {
     let mut current = libc::rlimit {
         rlim_cur: 0,
         rlim_max: 0,

@@ -33171,6 +33171,12 @@ impl AppState {
         nonce
     }
 
+    /// Whether a wrapper nonce is outstanding, without consuming it (the file
+    /// request it rides on consumes it).
+    pub fn wrapper_nonce_outstanding(&self, nonce: &str) -> bool {
+        self.wrapper_nonces.lock().unwrap().contains(nonce)
+    }
+
     /// Consume a wrapper nonce; true if it was outstanding (valid). Matches
     /// EpixNet's remove-on-use.
     pub fn consume_wrapper_nonce(&self, nonce: &str) -> bool {

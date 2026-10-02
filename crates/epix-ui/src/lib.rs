@@ -4051,6 +4051,30 @@ async fn ui_password_gate(
     if uipassword::session_valid(&uipassword::cookie_session_id(cookie)) {
         return next.run(request).await;
     }
+    // Host mode: the wrapper on the chrome host holds the session cookie, but
+    // the xite page lives on its content host, which the browser scopes that
+    // host-only cookie away from. The wrapper's iframe document request
+    // carries a wrapper nonce that was issued only to a wrapper render this
+    // gate already admitted, so it proves the session: answer it and hand
+    // the content host a session of its own for the page's later requests.
+    if request.headers().contains_key(CONTENT_HOST_MARKER) {
+        let nonce = request
+            .uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("wrapper_nonce="))
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
+        if nonce.as_deref().is_some_and(|n| ctx.state.wrapper_nonce_outstanding(n)) {
+            let mut response = next.run(request).await;
+            let sid = uipassword::session_create();
+            if let Ok(value) = format!("session_id={sid}; path=/; max-age=2592000").parse() {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            return response;
+        }
+    }
     login_page(false)
 }
 

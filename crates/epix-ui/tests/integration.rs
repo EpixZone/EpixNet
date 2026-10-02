@@ -696,3 +696,109 @@ async fn handles_epixframe_websocket_commands() {
     assert_eq!(unknown["to"], 5);
     assert!(unknown["result"].is_null());
 }
+
+/// With a UI password set, the chrome host's session cookie is host-only and
+/// never reaches the content host; the wrapper's iframe document request
+/// proves the session with its wrapper nonce and gets the content host a
+/// session of its own. Nothing else on the content host passes without one.
+#[cfg(feature = "ui-password")]
+#[tokio::test]
+async fn host_mode_hands_the_password_session_to_the_content_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(dir.path());
+    storage.write("index.html", b"<h1>inner</h1>").unwrap();
+    storage.write("app.js", b"1").unwrap();
+    let state = AppState::new("0.1.0");
+    state
+        .add_xite(
+            "talk.epix",
+            XiteEntry {
+                storage,
+                content: Some(json!({ "title": "Talk", "files": { "index.html": {}, "app.js": {} } })),
+            },
+        )
+        .await;
+    state.config_set("ui_password", json!("pw")).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let server = UiServer::new(state);
+    tokio::spawn(async move {
+        let _ = server.serve(addr).await;
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+    // Log in on the chrome host.
+    let login = client
+        .post(format!("http://{addr}/Login"))
+        .header("host", "talk.epix")
+        .header("sec-fetch-site", "same-origin")
+        .form(&[("password", "pw")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303, "login accepted");
+    let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    let wrapper = client
+        .get(format!("http://{addr}/"))
+        .header("host", "talk.epix")
+        .header("cookie", &cookie)
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    let html = wrapper.text().await.unwrap();
+    let nonce = html
+        .split("//talk.content.epix/index.html?wrapper_nonce=")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .expect("the frame loads from the content host with a nonce")
+        .to_string();
+
+    // The iframe document request: content host, the nonce, no cookie.
+    let inner = client
+        .get(format!("http://{addr}/index.html?wrapper_nonce={nonce}"))
+        .header("host", "talk.content.epix")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inner.status(), 200);
+    let content_cookie = inner.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    assert!(content_cookie.starts_with("session_id="), "content host gets a session");
+    assert_ne!(content_cookie, cookie, "a session of its own");
+    assert_eq!(inner.text().await.unwrap(), "<h1>inner</h1>");
+
+    // The page's later requests carry that cookie...
+    let js = client
+        .get(format!("http://{addr}/app.js"))
+        .header("host", "talk.content.epix")
+        .header("cookie", &content_cookie)
+        .header("sec-fetch-mode", "no-cors")
+        .header("sec-fetch-dest", "script")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(js.status(), 200);
+    assert_eq!(js.text().await.unwrap(), "1");
+    // ...and without one, or with a spent or made-up nonce, nothing passes.
+    for uri in ["/app.js", &format!("/index.html?wrapper_nonce={nonce}"), "/index.html?wrapper_nonce=bogus"] {
+        let locked = client
+            .get(format!("http://{addr}{uri}"))
+            .header("host", "talk.content.epix")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "iframe")
+            .send()
+            .await
+            .unwrap();
+        let body = locked.text().await.unwrap();
+        assert!(body.contains("/Login"), "{uri} served the login page, not the file: {body}");
+    }
+}
