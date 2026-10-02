@@ -2713,6 +2713,7 @@ async fn serve_file_manager(
     State(ctx): State<Ctx>,
     Path(path): Path<String>,
     Query(query): Query<FileManagerQuery>,
+    headers: axum::http::HeaderMap,
 ) -> Response {
     if !ctx.state.plugin_enabled("UiFileManager").await {
         return (StatusCode::NOT_FOUND, "UiFileManager plugin is disabled").into_response();
@@ -2736,21 +2737,45 @@ async fn serve_file_manager(
         }
     }
     let theme = ctx.state.theme_class().await;
-    // The EVX panel reads the loaded root and the node's verdicts on it. All
-    // of it is display: nothing here opens a program file or links the
-    // runtime, so the panel is as safe to serve as the listing itself.
+    // The EVX panel reads the stored root content.json BYTES, as the EVX
+    // service does (`docs/evx-milestone-2.md` section 4): the decoded
+    // `AppState::content` value has already collapsed a duplicated key, and
+    // the panel must not call verified and valid what the service refuses as
+    // malformed. All of it is display: nothing here opens a program file or
+    // links the runtime, so the panel is as safe to serve as the listing
+    // itself. The grant is left out entirely on a restricted (public
+    // gateway) node, like the revert links above.
     let content = ctx.state.content(&address).await;
     let evx = if query.evx.as_deref() == Some("1") {
-        let grant = ctx.state.evx_grant_summary(&address);
-        let facts = evx_view::XiteFacts {
-            address: &address,
-            signed: content.as_ref().is_some_and(|content| epix_content::verify_signer(content, &address)),
-            complete: ctx.state.xite_core_complete(&address).await,
-            grant: grant.as_ref(),
+        let restricted = ctx.state.ui_restrict().await;
+        let grant = if restricted { None } else { ctx.state.evx_grant_summary(&address) };
+        // The root is bounded by the xite's own size limit, the guard it was
+        // stored under; a read failure (no root on disk) is no declaration.
+        let limit = u64::try_from(ctx.state.size_limit_bytes(&address).await).unwrap_or(0);
+        let raw = match ctx.state.xite_storage(&address).await {
+            Some(storage) => storage.read_bounded("content.json", limit).ok(),
+            None => None,
         };
-        evx_view::render(content.as_ref(), &facts)
-            .map(EvxBlock::Panel)
-            .unwrap_or(EvxBlock::None)
+        // Program links go to `/raw/<xite>/<path>`, which only the loopback
+        // origin serves as itself: on a transparent proxy host that path is
+        // routed under the host's own xite and sent to its content host, so
+        // there the panel shows the paths as text.
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(strip_port).unwrap_or("");
+        match raw {
+            Some(raw) => {
+                let facts = evx_view::XiteFacts {
+                    address: &address,
+                    complete: ctx.state.xite_core_complete(&address).await,
+                    grant: grant.as_ref(),
+                    restricted,
+                    linkable: !is_proxy_host(host),
+                };
+                evx_view::render(&raw, &facts)
+                    .map(EvxBlock::Panel)
+                    .unwrap_or(EvxBlock::None)
+            }
+            None => EvxBlock::None,
+        }
     } else if evx_view::declares_evx(content.as_ref()) {
         EvxBlock::Link
     } else {

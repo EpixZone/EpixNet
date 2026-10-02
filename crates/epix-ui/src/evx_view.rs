@@ -10,24 +10,34 @@
 //! cannot honour with its reason, and whether a grant is stored.
 //!
 //! It is a view and nothing else. It parses the declaration with
-//! `evx-declaration`, which performs no I/O, and reads the already-loaded
-//! `AppState::content` value; it never opens a program file, never links
-//! `evx-runtime`, and links programs as downloads so that following a link
-//! cannot navigate into active content. That is what lets the file manager
-//! show it on any node, including a public gateway: there is nothing on this
-//! page a visitor could make the node run.
+//! `evx-declaration`, which performs no I/O, from the stored `content.json`
+//! bytes the caller read; it never opens a program file, never links
+//! `evx-runtime`, and links programs through the `/raw/` route, which serves
+//! bytes under the noscript sandbox policy and never renders the wrapper, so
+//! that following a link cannot navigate into active content. That is what
+//! lets the file manager show it on any node, including a public gateway:
+//! there is nothing on this page a visitor could make the node run.
 //!
-//! The declaration is parsed from the decoded value, not the stored bytes,
-//! so a duplicated key that `evx_declaration::parse_bytes` would refuse has
-//! already collapsed here. The panel is advisory; the EVX service, which
-//! decides what runs, reads the bytes (see `docs/evx-milestone-2.md` section
-//! 4). The two cannot disagree on anything the user acts on, because a grant
-//! is bound to the service's digest and the `evxGrant` command refuses any
-//! other.
+//! The declaration and its digest come from the stored bytes
+//! (`evx_declaration::parse_bytes` / `declaration_digest_bytes`), exactly as
+//! the EVX service reads them (`docs/evx-milestone-2.md` section 4), and not
+//! from the decoded `AppState::content` value, in which a duplicated key has
+//! already collapsed to its last value. A `content.json` carrying two `evx`
+//! keys, a decoy first and the signed one last, is therefore shown as
+//! malformed with no digest here, as the service reports it, rather than as
+//! verified and valid. The signature check and the manifest binding use the
+//! value re-decoded from bytes the strict decode accepted.
+//!
+//! The stored grant is never printed. The page says whether a grant is
+//! stored and enabled, its authority generation and its expiry, and nothing
+//! else: the record carries the operator's device label and consent history,
+//! which are not the publisher's or a visitor's business. On a public gateway
+//! (`ui_restrict`) the panel says nothing about the grant at all, mirroring
+//! the file manager's `can_revert` gate.
 //!
 //! Every string that reaches the page, whether from the declaration, the
-//! manifest, a parser message or the grant, goes through
-//! [`super::html_escape`]; the publisher wrote all of them.
+//! manifest or a parser message, goes through [`super::html_escape`]; the
+//! publisher wrote all of them.
 
 use serde_json::Value;
 
@@ -39,20 +49,30 @@ use super::{html_escape, url_encode};
 pub(crate) const INTEGRITY_LABEL: &str = "Integrity verified";
 /// See [`INTEGRITY_LABEL`].
 pub(crate) const PROFILE_LABEL: &str = "EVX profile valid";
-/// See [`INTEGRITY_LABEL`].
+/// See [`INTEGRITY_LABEL`]. Absent on a restricted gateway.
 pub(crate) const ENABLED_LABEL: &str = "EVX enabled for this xite";
 
-/// What the node knows about the xite besides its declaration.
+/// What the node knows about the xite besides its stored root.
 pub(crate) struct XiteFacts<'a> {
-    /// The bech32 address the xite is served under.
+    /// The bech32 address the xite is served under; the root's signature is
+    /// verified against it.
     pub address: &'a str,
-    /// `epix_content::verify_signer(content, address)`: the root is signed by
-    /// the xite owner.
-    pub signed: bool,
     /// `AppState::xite_core_complete(address)`: every declared file is on disk.
     pub complete: bool,
-    /// `AppState::evx_grant_summary(address)`: the stored grant, if any.
+    /// `AppState::evx_grant_summary(address)`: the stored grant, if any. The
+    /// view reads three fields of it and prints nothing else: `enabled`
+    /// (bool), `generation` (the authority generation, integer) and
+    /// `expires_unix` (integer seconds, or absent/null for never).
     pub grant: Option<&'a Value>,
+    /// `AppState::ui_restrict()`: a public gateway. The panel then carries
+    /// no grant row and no grant section.
+    pub restricted: bool,
+    /// Whether program files may be linked at all: true on the loopback UI
+    /// origin, where `/raw/<xite>/<path>` is served inert. On a transparent
+    /// proxy host (`dashboard.epix`) every path naming another xite is sent
+    /// to that xite's own origin, so there is no inert same-origin route to
+    /// link and the paths are shown as text next to their pinned hashes.
+    pub linkable: bool,
 }
 
 /// Whether the normal listing should offer the panel: the loaded root has an
@@ -62,21 +82,44 @@ pub(crate) fn declares_evx(content: Option<&Value>) -> bool {
     content.is_some_and(|content| content.get("evx").is_some())
 }
 
-/// Render the panel, or `None` when the xite has no loaded root or its root
-/// has no `evx` section: a xite that declares nothing gets no panel, not an
-/// empty one, so the listing stays as it was before EVX existed.
-pub(crate) fn render(content: Option<&Value>, facts: &XiteFacts<'_>) -> Option<String> {
-    let content = content?;
-    content.get("evx")?;
+/// Render the panel from the stored root `content.json` bytes, or `None`
+/// when the root has no `evx` section: a xite that declares nothing gets no
+/// panel, not an empty one, so the listing stays as it was before EVX
+/// existed. A root that does not decode strictly (duplicate keys) gets the
+/// panel with the malformed status, since that is what the service would
+/// refuse a grant for.
+pub(crate) fn render(raw: &[u8], facts: &XiteFacts<'_>) -> Option<String> {
     let esc = html_escape;
 
-    let integrity = match (facts.signed, facts.complete) {
-        (true, true) => Status::ok("verified"),
-        (false, _) => Status::bad("unsigned: content.json does not carry a valid signature from the xite owner"),
-        (true, false) => Status::bad("incomplete: a declared file is missing on this node"),
+    let parsed = match evx_declaration::parse_bytes(raw) {
+        Ok(None) => return None,
+        Ok(Some(decl)) => Ok(decl),
+        Err(error) => Err(error),
+    };
+    let digest = evx_declaration::declaration_digest_bytes(raw);
+    // The document decoded strictly (no duplicate key anywhere in it) when
+    // either byte-level entry point got as far as the section. Only then is
+    // a re-decoded value the same document the signature and manifest
+    // describe, so only then is it verified and bound.
+    let strict: Option<Value> = if parsed.is_ok() || digest.is_ok() {
+        serde_json::from_slice(raw).ok()
+    } else {
+        None
+    };
+    let signed = strict
+        .as_ref()
+        .is_some_and(|content| epix_content::verify_signer(content, facts.address));
+
+    let integrity = match (&strict, &parsed, signed, facts.complete) {
+        (None, Err(error), _, _) => Status::bad(format!("unverifiable: {error}")),
+        (None, Ok(_), _, _) => Status::bad("unverifiable: content.json could not be re-decoded"),
+        (Some(_), _, false, _) => {
+            Status::bad("unsigned: content.json does not carry a valid signature from the xite owner")
+        }
+        (Some(_), _, true, false) => Status::bad("incomplete: a declared file is missing on this node"),
+        (Some(_), _, true, true) => Status::ok("verified"),
     };
 
-    let parsed = evx_declaration::parse(content);
     let profile = match &parsed {
         Ok(decl) if decl.unsupported.is_empty() => Status::ok("valid"),
         Ok(decl) => Status::warn(format!(
@@ -88,19 +131,14 @@ pub(crate) fn render(content: Option<&Value>, facts: &XiteFacts<'_>) -> Option<S
         Err(error) => Status::bad(format!("malformed: {error}")),
     };
 
-    let enabled = match facts.grant {
-        None => Status::bad("no: no grant is stored for this xite"),
-        Some(grant) if grant.get("enabled") == Some(&Value::Bool(true)) => Status::ok("yes"),
-        Some(_) => Status::bad("no: the stored grant is disabled"),
-    };
+    let mut rows = vec![(INTEGRITY_LABEL, integrity), (PROFILE_LABEL, profile)];
+    if !facts.restricted {
+        rows.push((ENABLED_LABEL, grant_enabled(facts.grant)));
+    }
 
     let mut body = String::new();
     body.push_str("<dl class='evx-status'>");
-    for (label, status) in [
-        (INTEGRITY_LABEL, &integrity),
-        (PROFILE_LABEL, &profile),
-        (ENABLED_LABEL, &enabled),
-    ] {
+    for (label, status) in &rows {
         body.push_str(&format!(
             "<dt>{label}</dt><dd class='{class}'>{value}</dd>",
             label = esc(label),
@@ -112,10 +150,12 @@ pub(crate) fn render(content: Option<&Value>, facts: &XiteFacts<'_>) -> Option<S
 
     match &parsed {
         Ok(decl) => {
-            let digest = match evx_declaration::declaration_digest(content) {
-                Ok(digest) => esc(&digest),
-                // The digest decodes the same section `parse` just accepted,
-                // so this cannot fail without a bug; say so rather than hide it.
+            let digest = match digest {
+                Ok(Some(digest)) => esc(&digest),
+                // The digest decodes the same bytes `parse_bytes` just
+                // accepted, so neither arm can happen without a bug; say so
+                // rather than hide it.
+                Ok(None) => "unavailable: no evx section".to_string(),
                 Err(error) => format!("unavailable: {}", esc(&error.to_string())),
             };
             body.push_str(&format!(
@@ -126,7 +166,7 @@ pub(crate) fn render(content: Option<&Value>, facts: &XiteFacts<'_>) -> Option<S
             // The same payload `evxInspect` embeds, so this page and the
             // consent prompt cannot drift apart on what is usable and why.
             let summary = evx_declaration::summary(decl);
-            render_programs(&mut body, decl, &summary, content, facts.address);
+            render_programs(&mut body, decl, &summary, strict.as_ref(), facts);
             render_jobs(&mut body, decl, &summary);
             render_unsupported(&mut body, decl);
         }
@@ -138,12 +178,10 @@ pub(crate) fn render(content: Option<&Value>, facts: &XiteFacts<'_>) -> Option<S
         }
     }
 
-    if let Some(grant) = facts.grant {
-        let rendered = serde_json::to_string_pretty(grant).unwrap_or_else(|_| grant.to_string());
-        body.push_str(&format!(
-            "<h3>Stored grant</h3><pre class='evx-grant'>{}</pre>",
-            esc(&rendered)
-        ));
+    if !facts.restricted {
+        if let Some(grant) = facts.grant {
+            render_grant(&mut body, grant);
+        }
     }
 
     Some(format!(
@@ -183,14 +221,57 @@ impl Status {
     }
 }
 
+/// Whether the stored grant is enabled.
+fn grant_is_enabled(grant: &Value) -> bool {
+    grant.get("enabled") == Some(&Value::Bool(true))
+}
+
+/// The `EVX enabled for this xite` row.
+fn grant_enabled(grant: Option<&Value>) -> Status {
+    match grant {
+        None => Status::bad("no: no grant is stored for this xite"),
+        Some(grant) if grant_is_enabled(grant) => Status::ok("yes"),
+        Some(_) => Status::bad("no: the stored grant is disabled"),
+    }
+}
+
+/// The stored grant's status facts and nothing else: enabled or disabled,
+/// the authority generation and the expiry. The record itself (label,
+/// timestamps, limits, capability sets) never reaches the page; `evxInspect`
+/// exposes grant status, not the record, and so does this view.
+fn render_grant(body: &mut String, grant: &Value) {
+    let generation = match grant.get("generation").and_then(Value::as_u64) {
+        Some(generation) => generation.to_string(),
+        None => "unknown".to_string(),
+    };
+    let expiry = match grant.get("expires_unix") {
+        None | Some(Value::Null) => "never".to_string(),
+        Some(value) => match value.as_u64() {
+            Some(seconds) => format!("at unix time {seconds}"),
+            None => "unknown".to_string(),
+        },
+    };
+    body.push_str(&format!(
+        "<h3>Stored grant</h3><dl class='evx-grant'>\
+         <dt>Enabled</dt><dd>{enabled}</dd>\
+         <dt>Authority generation</dt><dd>{generation}</dd>\
+         <dt>Expires</dt><dd>{expiry}</dd></dl>",
+        enabled = if grant_is_enabled(grant) { "yes" } else { "no" },
+        generation = html_escape(&generation),
+        expiry = html_escape(&expiry),
+    ));
+}
+
 /// The programs table: usable programs with their pinned closure, requested
 /// capabilities and limits; unsupported programs with their reasons only.
+/// `content` is the root re-decoded from strictly accepted bytes, or `None`
+/// when no such value exists, in which case nothing can be bound.
 fn render_programs(
     body: &mut String,
     decl: &evx_declaration::Declaration,
     summary: &Value,
-    content: &Value,
-    address: &str,
+    content: Option<&Value>,
+    facts: &XiteFacts<'_>,
 ) {
     let esc = html_escape;
     let Some(programs) = summary.get("programs").and_then(Value::as_object) else {
@@ -212,7 +293,13 @@ fn render_programs(
             body.push_str("</ul>");
             continue;
         };
-        match evx_declaration::bind(decl, id, content) {
+        let bound = match content {
+            Some(content) => evx_declaration::bind(decl, id, content),
+            None => Err(evx_declaration::DeclarationError::Manifest(
+                "content.json could not be re-decoded".to_string(),
+            )),
+        };
+        match bound {
             Ok(bound) => {
                 body.push_str(
                     "<table><tr><th>Role</th><th>Path</th><th>Size</th><th>sha512</th></tr>",
@@ -220,11 +307,18 @@ fn render_programs(
                 let mut files = vec![("entry", &bound.entry)];
                 files.extend(bound.dependencies.iter().map(|file| ("dependency", file)));
                 for (role, file) in files {
+                    let path = if facts.linkable {
+                        format!(
+                            "<a href='{href}' download>{path}</a>",
+                            href = file_href(facts.address, &file.path),
+                            path = esc(&file.path),
+                        )
+                    } else {
+                        format!("<code>{}</code>", esc(&file.path))
+                    };
                     body.push_str(&format!(
-                        "<tr><td>{role}</td><td><a href='{href}' download>{path}</a></td>\
+                        "<tr><td>{role}</td><td>{path}</td>\
                          <td>{size} B</td><td><code>{sha512}</code></td></tr>",
-                        href = file_href(address, &file.path),
-                        path = esc(&file.path),
                         size = file.size,
                         sha512 = esc(&file.sha512),
                     ));
@@ -368,11 +462,15 @@ fn reasons(entry: &Value) -> impl Iterator<Item = &str> {
         .filter_map(Value::as_str)
 }
 
-/// A link to the raw file, percent-encoded segment by segment exactly like
-/// the listing's own links, carried in a single-quoted attribute. The file
-/// route serves it as a plain file; the `download` attribute on the anchor
-/// keeps a click from navigating into it.
+/// A link to the file on the `/raw/<xite>/<path>` route, percent-encoded
+/// segment by segment exactly like the listing's own links, carried in a
+/// single-quoted attribute. That route serves the bytes with no wrapper and
+/// under the noscript sandbox policy whatever the file is called and however
+/// it is opened, so a `.html` entry middle-clicked or opened in a new tab
+/// (a top-level document navigation, which ignores `download`) still never
+/// renders the wrapper or runs the xite. The `download` attribute is a hint
+/// for the ordinary click, not what keeps the link inert.
 fn file_href(address: &str, path: &str) -> String {
     let encoded = path.split('/').map(url_encode).collect::<Vec<_>>().join("/");
-    html_escape(&format!("/{}/{encoded}", url_encode(address)))
+    html_escape(&format!("/raw/{}/{encoded}", url_encode(address)))
 }
