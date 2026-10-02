@@ -14,6 +14,8 @@ pub mod command;
 pub mod config_schema;
 pub mod conn_pool;
 pub mod feed;
+/// The inert `/list/<xite>/?evx=1` EVX inspection panel.
+mod evx_view;
 mod file_revert;
 pub mod geoip;
 pub mod local_feed;
@@ -2695,9 +2697,23 @@ apply();\
 apply();\
 })();</script>";
 
+/// Query of the file manager. `evx=1` adds the EVX inspection panel
+/// (`docs/evx-milestone-2.md` section 6); that exact value and nothing else,
+/// so a link cannot half-ask for it.
+#[derive(Deserialize)]
+struct FileManagerQuery {
+    evx: Option<String>,
+}
+
 /// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
-/// directory inside a xite with links to navigate and open files.
-async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+/// directory inside a xite with links to navigate and open files. With
+/// `?evx=1` the listing is headed by the inert EVX inspection panel when the
+/// xite's root declares an `evx` section (see [`evx_view`]).
+async fn serve_file_manager(
+    State(ctx): State<Ctx>,
+    Path(path): Path<String>,
+    Query(query): Query<FileManagerQuery>,
+) -> Response {
     if !ctx.state.plugin_enabled("UiFileManager").await {
         return (StatusCode::NOT_FOUND, "UiFileManager plugin is disabled").into_response();
     }
@@ -2720,12 +2736,46 @@ async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) ->
         }
     }
     let theme = ctx.state.theme_class().await;
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_file_manager(&address, &inner, &entries, &theme))
+    // The EVX panel reads the loaded root and the node's verdicts on it. All
+    // of it is display: nothing here opens a program file or links the
+    // runtime, so the panel is as safe to serve as the listing itself.
+    let content = ctx.state.content(&address).await;
+    let evx = if query.evx.as_deref() == Some("1") {
+        let grant = ctx.state.evx_grant_summary(&address);
+        let facts = evx_view::XiteFacts {
+            address: &address,
+            signed: content.as_ref().is_some_and(|content| epix_content::verify_signer(content, &address)),
+            complete: ctx.state.xite_core_complete(&address).await,
+            grant: grant.as_ref(),
+        };
+        evx_view::render(content.as_ref(), &facts)
+            .map(EvxBlock::Panel)
+            .unwrap_or(EvxBlock::None)
+    } else if evx_view::declares_evx(content.as_ref()) {
+        EvxBlock::Link
+    } else {
+        EvxBlock::None
+    };
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        render_file_manager(&address, &inner, &entries, &theme, evx),
+    )
         .into_response()
 }
 
+/// What the file manager shows about EVX above the listing.
+enum EvxBlock {
+    /// The xite declares nothing, or the panel was asked for and there is
+    /// nothing to inspect: the listing exactly as before EVX existed.
+    None,
+    /// The xite declares an `evx` section: a link to the inspection view.
+    Link,
+    /// The rendered inspection panel.
+    Panel(String),
+}
+
 /// Render the file browser for a xite directory.
-fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &str) -> String {
+fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &str, evx: EvxBlock) -> String {
     let esc = attr_escape;
     // Escape URL segments independently so literal '#', '%', quotes and
     // non-ASCII filenames survive navigation without becoming markup.
@@ -2803,12 +2853,20 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         }
         heading
     };
+    let evx = match evx {
+        EvxBlock::None => String::new(),
+        EvxBlock::Link => format!(
+            "<p class='evx-link'><a href='/list/{url_address}?evx=1'>EVX declaration</a></p>"
+        ),
+        EvxBlock::Panel(panel) => panel,
+    };
     let body = format!(
         "<style>.row{{padding:10px 0;border-bottom:1px solid var(--epix-border);overflow:hidden}}\
           .name{{font-size:15px;overflow-wrap:anywhere}} .name.dir{{font-weight:600}}\
           .size{{float:right;color:var(--epix-text-low);font-size:13px;margin-left:12px}}\
-          .revert{{float:right;margin-left:16px;font-size:13px}}</style>\
-         <div class='files'>{rows}</div>"
+          .revert{{float:right;margin-left:16px;font-size:13px}}\
+          .evx-link{{margin:0 0 12px;font-size:13px}}</style>\
+         {evx}<div class='files'>{rows}</div>"
     );
     // From the file browser, the fixbutton returns to the xite being browsed.
     page_shell("Files", &heading, "", &body, address, theme)

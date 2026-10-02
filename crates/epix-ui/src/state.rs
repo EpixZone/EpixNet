@@ -4084,6 +4084,10 @@ const XID_RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// chain stays unreachable re-checks every half hour, not every minute.
 const XID_RETRY_BACKOFF_MAX_SECS: u64 = 30 * 60;
 
+/// The reader [`AppState::set_evx_grant_summary_source`] installs: from a
+/// xite's bech32 address to its stored EVX grant as JSON, or `None`.
+pub type EvxGrantSummarySource = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
+
 pub struct AppState {
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
@@ -4217,6 +4221,15 @@ pub struct AppState {
     /// commands can retrieve it from the bound `AppState`, keeping the core free
     /// of any per-feature fields. See [`Self::install_capability`].
     capabilities: std::sync::RwLock<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Where the `/list/<xite>/?evx=1` inspection view reads a xite's stored
+    /// EVX grant from, installed by the node's EVX service (Milestone 2 stage
+    /// 3). The grant lives in the service's own SQLite file outside every
+    /// served root, and this crate must not link the state crate that opens
+    /// it, so the service hands in a reader instead. `None` until installed:
+    /// the view then reports that no grant is stored, which is also the
+    /// truth on a node built without the service. See
+    /// [`Self::set_evx_grant_summary_source`].
+    evx_grant_summary_source: std::sync::RwLock<Option<EvxGrantSummarySource>>,
     /// Generic local (never-shared) feed/notification sources contributed by
     /// plugins. `feedQuery`/`notification_query` fold these in after the shared
     /// queries so private data (like decrypted mail) reaches the dashboard and
@@ -5620,6 +5633,7 @@ impl AppState {
             pool_events: tokio::sync::broadcast::channel(1024).0,
             pool_admission: RwLock::new(None),
             capabilities: std::sync::RwLock::new(HashMap::new()),
+            evx_grant_summary_source: std::sync::RwLock::new(None),
             local_sources: RwLock::new(Vec::new()),
             link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
@@ -17561,6 +17575,29 @@ impl AppState {
         if let Ok(mut caps) = self.capabilities.write() {
             caps.insert(key.to_string(), cap);
         }
+    }
+
+    /// Install the reader the EVX inspection view asks for a xite's stored
+    /// grant. The node's EVX service calls this once at startup with a closure
+    /// over its durable state; the closure takes the xite's bech32 address and
+    /// returns the grant rendered as JSON, or `None` when no grant is stored.
+    /// The view only displays the value (every string in it is HTML-escaped),
+    /// so the shape is the service's to choose; `enabled` is the one field the
+    /// view reads, for the `EVX enabled for this xite` status. Replaces any
+    /// reader installed earlier.
+    pub fn set_evx_grant_summary_source(&self, source: EvxGrantSummarySource) {
+        if let Ok(mut slot) = self.evx_grant_summary_source.write() {
+            *slot = Some(source);
+        }
+    }
+
+    /// The stored EVX grant for `address` as the installed reader renders
+    /// it, or `None` when no reader is installed or it has no grant for this
+    /// xite. Synchronous: the reader is a bounded local lookup and the lock
+    /// is never held across an await.
+    pub fn evx_grant_summary(&self, address: &str) -> Option<Value> {
+        let source = self.evx_grant_summary_source.read().ok()?;
+        source.as_ref()?(address)
     }
 
     /// Retrieve typed plugin state installed under `key`, if present and of type
