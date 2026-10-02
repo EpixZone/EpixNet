@@ -132,4 +132,5 @@ browsers' proxy for a real-browser check.
 - Path mode cannot give a xite a real origin of its own; a xite that needs
   storage or a service worker there needs `NOSANDBOX` or the Epix browser.
 - A wrapper can be framed by another page (no `frame-ancestors` yet); the
-  framing page cannot script it, but a dialog could be overlaid. Pre-existing.
+  framing page cannot script it or send it commands (the wrapper accepts
+  messages only from its own inner frame), but a dialog could be overlaid.

@@ -1636,11 +1636,19 @@ if (window.getComputedStyle(document.body).transform) {
         }
       }
       message = e.data;
+      // Only the inner frame commands this chrome. Any other window that
+      // holds a reference to it (a page that framed or opened the wrapper)
+      // could otherwise forward page commands as the bound xite or raise
+      // its dialogs. A nested frame inside the xite talks to its own parent.
+      if (e.source !== this.inner) {
+        this.log("Ignoring message from a window that is not the inner frame");
+        return false;
+      }
       // The xID xite announces a finished on-chain link this way. Only the
       // inner frame itself may say so, and the node re-verifies the link on
       // chain (and needs the address's key) before recording anything, so a
       // forged message can at most re-link an identity the user already has.
-      if (message && typeof message === "object" && message.type === "xid-identity-linked" && typeof message.address === "string" && e.source === this.inner) {
+      if (message && typeof message === "object" && message.type === "xid-identity-linked" && typeof message.address === "string") {
         this.ws.cmd("identityLinkComplete", { "auth_address": message.address });
         return false;
       }

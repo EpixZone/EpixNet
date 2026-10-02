@@ -3446,6 +3446,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "evx-declaration"
+version = "0.1.0"
+dependencies = [
+ "evx-activation",
+ "evx-api",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+]
+
+[[package]]
 name = "evx-host"
 version = "0.1.0"
 dependencies = [

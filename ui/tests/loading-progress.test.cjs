@@ -340,3 +340,16 @@ test('a nonce-secured xite still hears its placeholder announce itself', () => {
   assert.equal(reloads, 1, 'the signed announce reaches the recovery');
   assert.equal(f.wrapper.inner_loaded, false);
 });
+
+test('only the inner frame may command the wrapper', () => {
+  const f = fixture(); let reloads = 0;
+  f.wrapper.opener_tested = true;
+  f.wrapper.reloadIframe = () => { reloads++; };
+  f.wrapper.xite_info = info(['clone_status', 'complete'], { clone_status: { state: 'complete', attempt: 1 } });
+  const stranger = {};
+  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting' }, source: stranger });
+  assert.equal(f.wrapper.inner_load_state, undefined, 'a message from another window is ignored');
+  assert.equal(reloads, 0);
+  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting' }, source: f.wrapper.inner });
+  assert.equal(f.wrapper.inner_load_state, 'waiting');
+});
