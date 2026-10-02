@@ -1,0 +1,18 @@
+[package]
+name = "evx-worker"
+version = "0.1.0"
+edition = "2021"
+description = "EVX sandboxed worker binary: run, compile and file-helper modes. Confines itself before reading any untrusted bytes."
+
+[[bin]]
+name = "evx-worker"
+path = "src/main.rs"
+
+[dependencies]
+evx-api = { path = "../evx-api" }
+evx-runtime = { path = "../evx-runtime" }
+evx-workspace = { path = "../evx-workspace" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+libc = "0.2"
+rustix = { version = "1", features = ["fs", "process", "pipe"] }
