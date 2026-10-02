@@ -3449,6 +3449,8 @@ dependencies = [
 name = "evx-declaration"
 version = "0.1.0"
 dependencies = [
+ "epix-content",
+ "epix-crypt",
  "evx-activation",
  "evx-api",
  "hex",
