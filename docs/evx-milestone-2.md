@@ -30,8 +30,10 @@ pub struct Job { pub program: String, pub schedule: Schedule, pub max_concurrenc
 pub enum Schedule { Interval { seconds: u64, anchor: Anchor, missed: Missed } }
 pub struct Unsupported { pub path: String, pub reason: String }   // e.g. "streams.presence: retained streams not supported"
 
-pub fn parse(content: &serde_json::Value) -> Result<Declaration, DeclarationError>;
-pub fn declaration_digest(content: &serde_json::Value) -> Result<String, DeclarationError>; // sha256 hex of the canonical (sorted-key, compact) `evx` object
+pub fn parse_bytes(raw: &[u8]) -> Result<Option<Declaration>, DeclarationError>;            // PRIMARY: strict decode of the stored content.json bytes (duplicate keys refused)
+pub fn declaration_digest_bytes(raw: &[u8]) -> Result<Option<String>, DeclarationError>;  // sha256 hex of the canonical (sorted-key, compact) `evx` object, same decode
+pub fn parse(content: &serde_json::Value) -> Result<Declaration, DeclarationError>;        // only on a value re-read from bytes the strict decode accepted
+pub fn declaration_digest(content: &serde_json::Value) -> Result<String, DeclarationError>;
 pub struct BoundProgram { pub program: String, pub entry: PinnedFile, pub dependencies: Vec<PinnedFile>, pub total_bytes: u64 }
 pub struct PinnedFile { pub path: String, pub size: u64, pub sha512: String }
 pub fn bind(decl: &Declaration, program: &str, content: &serde_json::Value) -> Result<BoundProgram, DeclarationError>; // entry + deps must be in `files` (required, not optional), sizes within evx_activation::MAX_ARTIFACT / MAX_TOTAL
@@ -102,10 +104,14 @@ others. Owns an `EvxService`:
   the `EVX_WORKER` environment variable. Execution is macOS-only in this
   milestone; elsewhere inspect/grant/revoke work and run reports
   `unsupported host`.
-- Reads the xite's root `content.json` through `AppState::content` and
-  accepts it only when `epix_content::verify_signer(content, address)` holds
-  and `AppState::xite_core_complete(address)` is true; files are read with
-  `XiteStorage::read_bounded` and re-hashed by the activation loader.
+- Reads the xite's root `content.json` BYTES with `XiteStorage::read_bounded`
+  (never the decoded `AppState::content` value, which has already collapsed
+  duplicate keys) and accepts it only when `epix_content::verify_signer`
+  holds for the xite's address on the decoded value and
+  `AppState::xite_core_complete(address)` is true; the declaration and its
+  digest come from `parse_bytes` / `declaration_digest_bytes`, and program
+  files are read with `XiteStorage::read_bounded` and re-hashed by the
+  activation loader.
 
 WebSocket commands (all params are JSON objects; errors use the usual
 `{"error": ...}` convention):
