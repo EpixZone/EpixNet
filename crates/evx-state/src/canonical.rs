@@ -157,6 +157,21 @@ pub fn positive(value: u64, allow_zero: bool) -> Result<u64> {
     Ok(value)
 }
 
+/// Validate a lower-case hex SHA-256 digest (or any 32-byte secret encoded
+/// the same way, such as an allow-once token): exactly 64 characters from
+/// `0-9a-f`. Upper-case hex is rejected so two spellings of one digest can
+/// never both be stored.
+pub fn sha256_hex(value: &str) -> Result<&str> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+    {
+        return Err(Error::invalid("invalid hex digest"));
+    }
+    Ok(value)
+}
+
 /// Validate a workspace-relative publication path.
 ///
 /// Delegates to [`evx_api::validate_relative_path`]; a failure is an input
