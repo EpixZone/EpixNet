@@ -215,6 +215,13 @@ pub struct WsSession {
     /// only the wrapper page receives. Only on such a socket do elevated ids
     /// (>= [`WRAPPER_ID_BASE`]) carry the chrome's authority.
     pub wrapper: bool,
+    /// The session was rebound through `as` by a caller whose own bound
+    /// xite holds ADMIN. It passes the admin gate the way the caller would
+    /// have, and nothing more: it is a page-level session with the page's
+    /// own id, so neither `permissionAdd` nor the EVX grant commands, which
+    /// need the wrapper's prompt, are reachable through it. ADMIN confers no
+    /// wrapper authority.
+    pub admin: bool,
 }
 
 impl WsSession {
@@ -246,6 +253,7 @@ impl WsSession {
             allsite_channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             trusted,
             wrapper,
+            admin: false,
         }
     }
 
@@ -416,10 +424,11 @@ impl CommandRegistry {
         // locked-down node).
         let restrict = session.state.ui_restrict().await && !session.trusted;
         if cmd == "networkRetry" && params.get("address").is_none() && !session.trusted {
-            let admin = match session.xite.as_deref() {
-                Some(address) => session.state.xite_has_admin(address).await,
-                None => false,
-            };
+            let admin = session.admin
+                || match session.xite.as_deref() {
+                    Some(address) => session.state.xite_has_admin(address).await,
+                    None => false,
+                };
             if restrict || (!session.elevated(req_id) && !admin) {
                 return Err("Global network retry requires wrapper or ADMIN authority".into());
             }
@@ -466,12 +475,14 @@ impl CommandRegistry {
                 }
             } else {
                 // Allowed from the trusted admin socket, the wrapper (elevated
-                // id), or when the bound xite actually holds ADMIN.
+                // id), when the bound xite actually holds ADMIN, or when the
+                // session was rebound through `as` by a xite that does.
                 let elevated = session.elevated(req_id);
-                let has_admin = match &session.xite {
-                    Some(addr) => session.state.xite_has_admin(addr).await,
-                    None => false,
-                };
+                let has_admin = session.admin
+                    || match &session.xite {
+                        Some(addr) => session.state.xite_has_admin(addr).await,
+                        None => false,
+                    };
                 if !elevated && !has_admin {
                     return Err(format!("You don't have permission to run {cmd}"));
                 }
@@ -531,9 +542,10 @@ impl CommandRegistry {
             return Err(msg.into());
         }
         // `as`: run another command in the context of a different xite
-        // (EpixNet's actionAs). Allowed for the bound xite itself, or when the
-        // CALLER's bound xite holds ADMIN; the inner command re-enters this
-        // dispatcher on a rebound session, so its own gates still apply.
+        // (EpixNet's actionAs). Allowed for the bound xite itself, for the
+        // wrapper's own elevated-id command or the operator socket, or when
+        // the CALLER's bound xite holds ADMIN; the inner command re-enters
+        // this dispatcher on a rebound session, so its own gates still apply.
         if cmd == "as" {
             let target = params
                 .get("address")
@@ -552,19 +564,32 @@ impl CommandRegistry {
                 .or_else(|| params.as_array().and_then(|a| a.get(2)))
                 .cloned()
                 .unwrap_or_else(|| Value::Array(Vec::new()));
-            let caller_elevated = session.elevated(req_id)
-                || match &session.xite {
-                    Some(addr) => session.state.xite_has_admin(addr).await,
-                    None => false,
-                };
-            let allowed = caller_elevated || session.xite.as_deref() == Some(target.as_str());
+            // Wrapper authority comes from exactly two places: a real wrapper
+            // socket's own elevated-id command, or the operator socket. ADMIN
+            // on the caller's bound xite is not one of them: on a normal node
+            // the dashboard holds ADMIN by default, and were ADMIN to rebind
+            // as a wrapper, any ADMIN xite's page could reach `permissionAdd`
+            // and the EVX grant commands through `as` without a prompt.
+            let wrapper_authority = session.elevated(req_id);
+            let caller_admin = !wrapper_authority
+                && (session.admin
+                    || match &session.xite {
+                        Some(addr) => session.state.xite_has_admin(addr).await,
+                        None => false,
+                    });
+            let allowed =
+                wrapper_authority || caller_admin || session.xite.as_deref() == Some(target.as_str());
             if !allowed {
                 return Err(format!("No permission to run commands as {target}"));
             }
-            // The rebound session carries the caller's authority (and nothing
-            // more): an elevated caller keeps it, a page-level caller stays one.
-            let rebound = WsSession::build(session.state.clone(), Some(target), false, caller_elevated);
-            let inner_id = if caller_elevated { req_id.max(WRAPPER_ID_BASE) } else { req_id };
+            // The rebound session carries the caller's authority and nothing
+            // more: the wrapper or operator keeps wrapper authority and an
+            // elevated id; an ADMIN caller gets a page-level session that
+            // remembers only the ADMIN (for the admin gate) and keeps the
+            // page's id; a page-level caller stays one.
+            let mut rebound = WsSession::build(session.state.clone(), Some(target), false, wrapper_authority);
+            rebound.admin = caller_admin;
+            let inner_id = if wrapper_authority { req_id.max(WRAPPER_ID_BASE) } else { req_id };
             return Box::pin(self.dispatch(&rebound, &inner_cmd, &inner_params, inner_id)).await;
         }
         // A command from a disabled plugin behaves as if unregistered.
@@ -5273,6 +5298,67 @@ mod tests {
         for cmd in ["evxInspect", "evxStatus", "evxRequest"] {
             assert!(!EVX_WRAPPER_COMMANDS.contains(&cmd));
             assert!(registry.dispatch(&session, cmd, &json!({}), 7).await.is_ok(), "{cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admin_xite_page_gains_no_wrapper_authority_through_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let dashboard = "1AdminDashboard";
+        let target = "1EvxTarget";
+        for addr in [dashboard, target] {
+            state
+                .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path().join(addr)), content: None })
+                .await;
+        }
+        // The dashboard holds ADMIN, as it does by default on a normal node.
+        state.add_permission(dashboard, "ADMIN").await;
+        assert!(state.xite_has_admin(dashboard).await);
+        let registry = CommandRegistry::with_defaults();
+        let page = WsSession::new(state.clone(), Some(dashboard.into()));
+        let params = json!({ "xite": target, "declaration_digest": "0".repeat(64), "mode": "enable" });
+
+        // ADMIN grants nothing here: the rebound session is a page-level one
+        // with the page's own id, so the EVX gate refuses it for any target,
+        // the dashboard's own xite included.
+        for cmd in EVX_WRAPPER_COMMANDS {
+            for rebound_to in [target, dashboard] {
+                let via_as = registry.dispatch(&page, "as", &json!([rebound_to, cmd, params.clone()]), 8).await;
+                assert!(via_as.as_ref().unwrap_err().contains("prompt"), "{cmd} as {rebound_to}: {via_as:?}");
+                let keyed = registry
+                    .dispatch(&page, "as", &json!({ "address": rebound_to, "cmd": cmd, "params": params.clone() }), 9)
+                    .await;
+                assert!(keyed.as_ref().unwrap_err().contains("prompt"), "{cmd} as {rebound_to}: {keyed:?}");
+            }
+        }
+        // Nor does ADMIN stand in for the permission prompt on another xite.
+        let via_as = registry.dispatch(&page, "as", &json!([target, "permissionAdd", ["ADMIN"]]), 10).await;
+        assert!(via_as.unwrap_err().contains("prompt"));
+        assert!(!state.xite_has_admin(target).await);
+        assert!(state.xite_permissions(target).await.is_empty());
+
+        // What ADMIN did confer before still holds: admin commands run as
+        // another xite, and a xite that holds no ADMIN still cannot.
+        let detail = registry.dispatch(&page, "as", &json!([target, "permissionDetails", ["ADMIN"]]), 11).await;
+        assert!(detail.unwrap().as_str().unwrap().contains("administrate"));
+        let plain = WsSession::new(state.clone(), Some(target.into()));
+        assert!(registry.dispatch(&plain, "as", &json!([dashboard, "permissionDetails", ["ADMIN"]]), 12).await.is_err());
+        assert!(registry.dispatch(&plain, "permissionDetails", &json!(["ADMIN"]), 13).await.is_err());
+
+        // The wrapper's own command and the operator socket keep wrapper
+        // authority through `as`: they are the only two sources of it.
+        let wrapper = WsSession::new_wrapper(state.clone(), Some(dashboard.into()));
+        assert!(registry.dispatch(&wrapper, "as", &json!([target, "permissionAdd", ["Merger:EpixPost"]]), 7).await.is_err(),
+            "a page command forwarded by the wrapper keeps its small id");
+        let granted = registry
+            .dispatch(&wrapper, "as", &json!([target, "permissionAdd", ["Merger:EpixPost"]]), WRAPPER_ID_BASE + 2)
+            .await;
+        assert_eq!(granted.unwrap(), "ok");
+        assert!(state.xite_permissions(target).await.iter().any(|p| p == "Merger:EpixPost"));
+        let operator = WsSession::new_trusted(state.clone(), None);
+        for cmd in EVX_WRAPPER_COMMANDS {
+            assert!(registry.dispatch(&operator, "as", &json!([target, cmd, params.clone()]), 1).await.is_ok(), "{cmd}");
         }
     }
 

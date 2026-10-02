@@ -13,6 +13,12 @@
 //! bypasses dispatch) is refused too. Neither check replaces the other: the
 //! dispatcher sees the request id, the handler sees the session.
 //!
+//! On a public gateway (`AppState::ui_restrict`) the inert commands answer
+//! a visitor with no consent detail (the grant is reduced to its `enabled`
+//! bit and the run history is left out, as the `/list` panel does there),
+//! and `evxRequest` is refused: no dialog is shown to a visitor and none
+//! may enable execution. The operator socket sees everything.
+//!
 //! Parameters are JSON objects decoded with `deny_unknown_fields`; `null`
 //! stands for the empty object so a page that sends no parameters still
 //! works, and an array or a bare string is refused.
@@ -72,6 +78,37 @@ fn require_wrapper_or_operator(session: &WsSession, cmd: &str) -> Result<(), Str
     }
 }
 
+/// Whether the session is a visitor of a public gateway (`ui_restrict`):
+/// anyone may bind a socket to any xite the gateway serves, so the inert
+/// commands tell such a session no more than the `/list` panel does there.
+/// The operator socket is never a visitor.
+async fn gateway_visitor(session: &WsSession) -> bool {
+    !session.trusted && session.state.ui_restrict().await
+}
+
+/// The consent detail a gateway visitor does not get: the operator's grant
+/// (label, limits, when it was given, its generations) and the run history
+/// are the operator's own. Only whether execution is enabled survives, as
+/// a bare `{"enabled": bool}`, which is what the `/list` panel's rule
+/// leaves as well; the other keys are removed rather than zeroed so that
+/// nothing reads as a fact.
+pub fn redact_for_gateway(mut payload: Value) -> Value {
+    if let Some(object) = payload.as_object_mut() {
+        let enabled = object
+            .get("grant")
+            .and_then(|grant| grant.get("enabled"))
+            .and_then(Value::as_bool);
+        object.insert(
+            "grant".into(),
+            enabled.map(|enabled| json!({ "enabled": enabled })).unwrap_or(Value::Null),
+        );
+        for key in ["generations", "runs", "run_count", "asked_unix"] {
+            object.remove(key);
+        }
+    }
+    payload
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct XiteParams {
@@ -89,7 +126,8 @@ impl WsCommand for EvxInspect {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let params: XiteParams = object_params(p)?;
         let xite = target_xite(s, params.xite.as_deref())?;
-        service(&s.state)?.inspect_json(&s.state, &xite).await
+        let payload = service(&s.state)?.inspect_json(&s.state, &xite).await?;
+        Ok(if gateway_visitor(s).await { redact_for_gateway(payload) } else { payload })
     }
 }
 
@@ -103,12 +141,15 @@ impl WsCommand for EvxStatus {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let params: XiteParams = object_params(p)?;
         let xite = target_xite(s, params.xite.as_deref())?;
-        service(&s.state)?.status(&xite).await
+        let payload = service(&s.state)?.status(&xite).await?;
+        Ok(if gateway_visitor(s).await { redact_for_gateway(payload) } else { payload })
     }
 }
 
 /// `evxRequest {xite?}`: the page asks for consent; the wrapper shows the
-/// dialog from the returned payload. Grants nothing.
+/// dialog from the returned payload. Grants nothing. On a public gateway no
+/// dialog is ever shown and no visitor may enable execution, so the ask is
+/// refused outright rather than recorded.
 pub struct EvxRequest;
 #[async_trait]
 impl WsCommand for EvxRequest {
@@ -116,6 +157,9 @@ impl WsCommand for EvxRequest {
         "evxRequest"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        if gateway_visitor(s).await {
+            return Err(format!("{} is disabled on this gateway", self.name()));
+        }
         let params: XiteParams = object_params(p)?;
         let xite = target_xite(s, params.xite.as_deref())?;
         service(&s.state)?.request(&s.state, &xite).await
@@ -248,6 +292,36 @@ mod tests {
         let operator_unbound = WsSession::new_trusted(state, None);
         assert_eq!(target_xite(&operator_unbound, Some("1B")).unwrap(), "1B");
         assert!(target_xite(&operator_unbound, None).is_err());
+    }
+
+    #[test]
+    fn a_gateway_visitor_learns_only_whether_execution_is_enabled() {
+        let status = json!({
+            "xite": "1A",
+            "grant": { "enabled": true, "label": "laptop", "limits": { "fuel": 1 }, "created_unix": 7, "generation": 3 },
+            "generations": { "generation": 3 },
+            "runs": [{ "status": "ok" }],
+            "run_count": 1,
+            "running": false,
+            "reasons": [],
+            "asked_unix": 9,
+            "host": { "execution": true },
+        });
+        let redacted = redact_for_gateway(status);
+        assert_eq!(redacted["grant"], json!({ "enabled": true }));
+        assert_eq!(redacted["xite"], "1A");
+        assert_eq!(redacted["running"], false);
+        assert_eq!(redacted["host"]["execution"], true);
+        for gone in ["generations", "runs", "run_count", "asked_unix"] {
+            assert!(redacted.get(gone).is_none(), "{gone} survived");
+        }
+        let text = redacted.to_string();
+        for secret in ["laptop", "created_unix", "limits", "generation"] {
+            assert!(!text.contains(secret), "{secret} survived: {text}");
+        }
+        // No grant stays no grant; a non-object payload is left alone.
+        assert!(redact_for_gateway(json!({ "grant": null }))["grant"].is_null());
+        assert_eq!(redact_for_gateway(json!("x")), json!("x"));
     }
 
     #[test]
