@@ -4,6 +4,7 @@
 
 mod activation;
 mod canonical;
+mod content;
 mod cross_language;
 mod shared;
 

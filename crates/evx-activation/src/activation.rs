@@ -29,6 +29,24 @@ const BODY_KEYS: &[&str] = &[
 const MAX_CAPABILITIES: usize = 64;
 const WASM_MAGIC: &[u8] = b"\0asm\x01\0\0\0";
 
+/// Who may publish code for a xite, in the two forms the loader can check.
+///
+/// The envelope path trusts a raw Ed25519 key and verifies every envelope
+/// against it inside [`ActivationLoader::verify`]. The content path trusts
+/// the xite's root address: the owner's secp256k1 signature on `content.json`
+/// is checked by the node (`epix_content::verify_signer`) before
+/// [`ActivationLoader::verify_content`] is called, so the loader holds no key
+/// for it and only records which address the caller vouched for. The enum is
+/// closed on purpose: each activation path refuses a grant of the other kind
+/// instead of guessing what its signature would have meant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PublisherAuthority {
+    /// Raw Ed25519 public key; signed fixture envelopes verify against it.
+    Ed25519([u8; 32]),
+    /// The `epix1…` root address whose content signature the node verified.
+    RootAddress(String),
+}
+
 /// Host-issued authority for one xite: who may publish code for it, which
 /// capabilities and runtime profiles that code may declare, and whether it
 /// may run at all. An accepted code update never replaces its grant.
@@ -36,10 +54,17 @@ const WASM_MAGIC: &[u8] = b"\0asm\x01\0\0\0";
 pub struct XiteGrant {
     /// The xite this grant covers.
     pub xite: String,
-    /// The publisher whose signatures activate code for the xite.
+    /// The publisher whose signatures activate code for the xite: a fixture
+    /// publisher id under [`PublisherAuthority::Ed25519`], the root address
+    /// itself under [`PublisherAuthority::RootAddress`].
     pub publisher: String,
-    /// Raw Ed25519 public key of the publisher.
+    /// Raw Ed25519 public key of the publisher. Meaningful only when
+    /// `authority` is [`PublisherAuthority::Ed25519`]; a root-address grant
+    /// holds all zeros here, which no envelope can verify against, and hosts
+    /// read [`XiteGrant::ed25519_public_key`] instead of this field.
     pub public_key: [u8; 32],
+    /// Which signature the loader trusts for this grant.
+    pub authority: PublisherAuthority,
     /// Capabilities an activation may declare; declarations must be a subset.
     pub capabilities: BTreeSet<Capability>,
     /// Runtime profiles an activation may select.
@@ -72,11 +97,55 @@ impl XiteGrant {
             xite,
             publisher,
             public_key,
+            authority: PublisherAuthority::Ed25519(public_key),
             capabilities,
             runtime_profiles,
             generation: 1,
             enabled: true,
         })
+    }
+
+    /// Build an enabled generation-1 grant for content signed by the owner
+    /// of `publisher`, an `epix1…` root address. `xite` is the xite's own
+    /// address in the real deployment, but only its identifier grammar is
+    /// checked so fixtures can name it freely; `publisher` must be a
+    /// well-formed address because it is what the node's signature check
+    /// was performed against, and a grant naming an impossible address can
+    /// never correspond to a verified signer.
+    pub fn for_root_address(
+        xite: impl Into<String>,
+        publisher: impl Into<String>,
+        capabilities: BTreeSet<Capability>,
+        runtime_profiles: BTreeSet<String>,
+    ) -> Result<Self, AuthenticationError> {
+        let xite = xite.into();
+        let publisher = publisher.into();
+        evx_api::validate_identifier(&xite)
+            .map_err(|_| AuthenticationError::new("invalid fixture identifier"))?;
+        if !epix_crypt::is_valid_address(&publisher) {
+            return Err(AuthenticationError::new("invalid publisher root address"));
+        }
+        Ok(XiteGrant {
+            xite,
+            authority: PublisherAuthority::RootAddress(publisher.clone()),
+            publisher,
+            public_key: [0; 32],
+            capabilities,
+            runtime_profiles,
+            generation: 1,
+            enabled: true,
+        })
+    }
+
+    /// The Ed25519 key envelopes verify against, or `None` for a
+    /// root-address grant. This is what a host pins into an
+    /// [`ActivationContext`] and compares with its broker grant, so the two
+    /// authority forms are never confused with each other.
+    pub fn ed25519_public_key(&self) -> Option<[u8; 32]> {
+        match &self.authority {
+            PublisherAuthority::Ed25519(key) => Some(*key),
+            PublisherAuthority::RootAddress(_) => None,
+        }
     }
 
     /// Set the authority generation; must be in `1..=2**63-1`.
@@ -187,6 +256,8 @@ pub struct FrozenActivation {
     capabilities: BTreeSet<Capability>,
     manifest_digest: String,
     manifest_bytes: Vec<u8>,
+    declaration_digest: Option<String>,
+    program: Option<String>,
     entry: String,
     files: BTreeMap<String, Vec<u8>>,
 }
@@ -232,9 +303,23 @@ impl FrozenActivation {
         &self.manifest_digest
     }
 
-    /// The canonical signed body bytes.
+    /// The canonical signed body bytes: the envelope body for an envelope
+    /// activation, `epix_content::signed_data` for a content activation.
     pub fn manifest_bytes(&self) -> &[u8] {
         &self.manifest_bytes
+    }
+
+    /// SHA-256 of the canonical `evx` section of the signed `content.json`
+    /// for a content activation, the digest a stored grant is pinned to;
+    /// `None` for an envelope activation, which has no declaration.
+    pub fn declaration_digest(&self) -> Option<&str> {
+        self.declaration_digest.as_deref()
+    }
+
+    /// The declared program id a content activation was bound to; `None`
+    /// for an envelope activation.
+    pub fn program(&self) -> Option<&str> {
+        self.program.as_deref()
     }
 
     /// Relative path of the entry artifact within the closure.
@@ -264,11 +349,27 @@ impl FrozenActivation {
     /// profile and capabilities under the grant generation and publisher key
     /// the host verified against.
     pub fn context(&self, grant_generation: u64, public_key: [u8; 32]) -> ActivationContext {
+        self.context_with(grant_generation, Some(public_key))
+    }
+
+    /// [`FrozenActivation::context`] under whichever authority `grant`
+    /// carries: the Ed25519 key for an envelope grant, no key for a
+    /// root-address grant, whose binding the broker checks by publisher
+    /// address alone.
+    pub fn grant_context(&self, grant: &XiteGrant) -> ActivationContext {
+        self.context_with(grant.generation, grant.ed25519_public_key())
+    }
+
+    fn context_with(
+        &self,
+        grant_generation: u64,
+        public_key: Option<[u8; 32]>,
+    ) -> ActivationContext {
         ActivationContext {
             xite: self.xite.clone(),
             generation: grant_generation,
             publisher: self.publisher.clone(),
-            public_key: Some(public_key),
+            public_key,
             runtime_profile: self.runtime_profile.clone(),
             capabilities: self.capabilities.clone(),
         }
@@ -329,6 +430,21 @@ impl PendingActivation {
     /// The context a host compares with its current grant before admitting.
     pub fn context(&self, grant_generation: u64, public_key: [u8; 32]) -> ActivationContext {
         self.activation.context(grant_generation, public_key)
+    }
+
+    /// [`PendingActivation::context`] under `grant`'s own authority form.
+    pub fn grant_context(&self, grant: &XiteGrant) -> ActivationContext {
+        self.activation.grant_context(grant)
+    }
+
+    /// Declaration digest of a content activation; `None` for an envelope.
+    pub fn declaration_digest(&self) -> Option<&str> {
+        self.activation.declaration_digest()
+    }
+
+    /// Declared program id of a content activation; `None` for an envelope.
+    pub fn program(&self) -> Option<&str> {
+        self.activation.program()
     }
 
     /// Captured entry bytes, so a host can compile before admitting and keep
@@ -424,7 +540,15 @@ impl ActivationLoader {
         if !grant.enabled {
             return Err(AuthenticationError::new("xite execution is not enabled"));
         }
-        let signed = envelope::verify_envelope(envelope, &grant.public_key)?;
+        // A root-address grant holds no Ed25519 key; its zeroed `public_key`
+        // would fail every signature anyway, but refusing by authority kind
+        // names the real reason instead of a spurious signature failure.
+        let PublisherAuthority::Ed25519(trusted_key) = &grant.authority else {
+            return Err(AuthenticationError::new(
+                "envelope activation requires an Ed25519 grant",
+            ));
+        };
+        let signed = envelope::verify_envelope(envelope, trusted_key)?;
         let body = &signed.body;
         envelope::shape(body, BODY_KEYS)?;
         if field(body, "kind").as_str() != Some(KIND)
@@ -484,11 +608,69 @@ impl ActivationLoader {
                 capabilities,
                 manifest_digest,
                 manifest_bytes: signed.bytes,
+                declaration_digest: None,
+                program: None,
                 entry: entry.to_string(),
                 files,
             },
         })
     }
+
+    /// Mint a pending content activation from fields `crate::content` has
+    /// verified. Lives here so the frozen fields stay private to this module
+    /// and only the two verification paths can produce one.
+    pub(crate) fn pending_content(&self, verified: VerifiedContent) -> PendingActivation {
+        PendingActivation {
+            activation: FrozenActivation {
+                xite: self.grant.xite.clone(),
+                publisher: self.grant.publisher.clone(),
+                grant_generation: self.grant.generation,
+                version: verified.version,
+                runtime_profile: verified.runtime_profile,
+                artifact_format: ArtifactFormat::WasmCoreV1,
+                capabilities: verified.capabilities,
+                manifest_digest: verified.manifest_digest,
+                manifest_bytes: verified.manifest_bytes,
+                declaration_digest: Some(verified.declaration_digest),
+                program: Some(verified.program),
+                entry: verified.entry,
+                files: verified.files,
+            },
+        }
+    }
+
+    /// Whether `version` with `manifest_digest` passes the version floor
+    /// right now; shared by both verification paths.
+    pub(crate) fn admits(&self, version: u64, manifest_digest: &str) -> bool {
+        self.checkpoint.admits(version, manifest_digest)
+    }
+}
+
+/// Everything the content path verified, handed to
+/// [`ActivationLoader::pending_content`] in one piece.
+pub(crate) struct VerifiedContent {
+    pub(crate) version: u64,
+    pub(crate) runtime_profile: String,
+    pub(crate) capabilities: BTreeSet<Capability>,
+    pub(crate) manifest_digest: String,
+    pub(crate) manifest_bytes: Vec<u8>,
+    pub(crate) declaration_digest: String,
+    pub(crate) program: String,
+    pub(crate) entry: String,
+    pub(crate) files: BTreeMap<String, Vec<u8>>,
+}
+
+impl ArtifactFormat {
+    /// The encoding check, for the content path.
+    pub(crate) fn check_bytes(self, data: &[u8]) -> Result<(), AuthenticationError> {
+        self.check(data)
+    }
+}
+
+/// The error both paths report for a version below or conflicting with the
+/// floor.
+pub(crate) fn rollback_error() -> AuthenticationError {
+    rollback()
 }
 
 /// The declared capability list: at most 64 well-formed, distinct, known

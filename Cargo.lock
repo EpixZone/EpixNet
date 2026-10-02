@@ -3424,6 +3424,8 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 3.0.0",
+ "epix-content",
+ "epix-crypt",
  "evx-api",
  "hex",
  "rand 0.9.4",
@@ -3465,8 +3467,11 @@ version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
  "ed25519-dalek 3.0.0",
+ "epix-content",
+ "epix-crypt",
  "evx-activation",
  "evx-api",
+ "evx-declaration",
  "evx-runtime",
  "evx-supervisor",
  "hex",

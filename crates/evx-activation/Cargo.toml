@@ -11,6 +11,12 @@ fixtures = []
 
 [dependencies]
 evx-api = { path = "../evx-api" }
+# The content path digests exactly the bytes the owner signed
+# (`epix_content::signed_data`) and names the owner by root address
+# (`epix_crypt::is_valid_address`). Neither crate verifies anything here;
+# the node does that before calling the loader.
+epix-content = { path = "../epix-content" }
+epix-crypt = { path = "../epix-crypt" }
 ed25519-dalek = { version = "3", default-features = false }
 sha2 = "0.10"
 hex = "0.4"

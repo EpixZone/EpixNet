@@ -6,11 +6,16 @@
 //! trusted inputs; checkpoints are held in memory here and persisted by the
 //! host.
 //!
-//! # Two-phase admission
+//! # Two paths, one admission
 //!
-//! [`ActivationLoader::verify`] authenticates an envelope, captures its signed
-//! closure through confined descriptors and checks the declared version
-//! against the loader's checkpoint without mutating anything. It returns a
+//! [`ActivationLoader::verify`] authenticates an Ed25519 fixture envelope
+//! and captures its signed closure through confined descriptors.
+//! [`ActivationLoader::verify_content`] takes the real authority chain
+//! instead: a root `content.json` the node has already verified against the
+//! xite owner's address, a [`BoundProgram`] pinned to that manifest, and a
+//! reader for the stored files. Which one a grant admits is fixed by its
+//! [`PublisherAuthority`]. Both check the declared version against the
+//! loader's checkpoint without mutating anything and return a
 //! [`PendingActivation`] exposing the identity, runtime profile and
 //! capabilities the host must compare with its *current* grant.
 //! [`ActivationLoader::admit`] then re-checks the checkpoint, which a
@@ -34,6 +39,7 @@
 mod activation;
 pub mod canonical;
 mod capture;
+mod content;
 mod envelope;
 mod shared;
 #[cfg(test)]
@@ -43,9 +49,10 @@ use sha2::{Digest as _, Sha256};
 
 pub use activation::{
     ActivationCheckpoint, ActivationLoader, ArtifactFormat, FrozenActivation, PendingActivation,
-    XiteGrant,
+    PublisherAuthority, XiteGrant,
 };
 pub use canonical::canonical_bytes;
+pub use content::{sha512_prefix, BoundProgram, ContentReadFn, PinnedFile};
 #[cfg(any(test, feature = "fixtures"))]
 pub use envelope::sign_envelope;
 pub use shared::{SharedDataVerifier, SharedReadGrant, VerifiedRecord};

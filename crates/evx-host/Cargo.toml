@@ -23,6 +23,11 @@ hex = "0.4"
 
 [dev-dependencies]
 evx-activation = { path = "../evx-activation", features = ["fixtures"] }
+# The content tests sign a root content.json with a real owner key and bind
+# the program from the stored bytes, exactly as the node does.
+evx-declaration = { path = "../evx-declaration" }
+epix-content = { path = "../epix-content" }
+epix-crypt = { path = "../epix-crypt" }
 ed25519-dalek = { version = "3", default-features = false }
 rand = "0.9"
 tempfile = "3"
