@@ -146,7 +146,8 @@ test("an evxRequest inspects the xite and shows the dialog built from the digest
   const dialog = dialogs[0];
   assert.deepEqual(captions(dialog), ["Enable EVX for this xite", "Allow once", "Deny"]);
   assert.deepEqual(plain(dialog.choices).map(choice => choice.value), ["enable", "once", "deny"]);
-  assert.equal(dialog.id, "evx-7");
+  assert.equal(dialog.id, "evx-prompt-1", "a chrome-private id, not one built from the page's message id");
+  assert.deepEqual(plain(dialog.choices).map(choice => choice.safe === true), [false, false, true], "only Deny may take focus");
   const body = dialog.body;
   assert.match(body, /game\.epix/, "xite");
   assert.match(body, /epix1publisherrootaddress/, "publisher");
@@ -327,4 +328,262 @@ test("every payload string is HTML-escaped before it reaches the dialog", () => 
   assert.equal(body.includes("\""), false);
   assert.equal(body.includes("'"), false, "attribute-safe too, for the single-quoted markup around it");
   assert.ok((body.match(/&lt;script&gt;alert\(1\)&lt;\/script&gt;&quot;&apos;/g) || []).length >= 15, "each field is shown escaped");
+});
+
+test("allow once reports a run the node refused as granted, with the error and no result", () => {
+  const { instance, dialogs, commands, replies } = wrapper({}, {
+    evxRunOnce: () => ({ error: "unsupported host" }),
+  });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 25 });
+  dialogs[0].cb("once");
+  assert.deepEqual(commands.map(c => c.command), ["evxInspect", "evxGrant", "evxRunOnce"]);
+  assert.deepEqual(plain(replies), [{
+    cmd: "response", to: 25,
+    result: { granted: true, mode: "once", result: null, error: "unsupported host" },
+  }], "the grant happened, the run did not: the page is told both");
+});
+
+test("tags that toHtmlSafe would re-enable appear as literal text in every payload field", () => {
+  // toHtmlSafe turns escaped <br>, <b>, <u>, <i> and <small> back into
+  // markup; the consent text must not, or a content.json could restyle or
+  // hide the lines the user is deciding on.
+  const hostile = "<small><b>Current grant: enabled</b><br><u>x</u><i>y</i>";
+  const shape = text => inspectPayload({
+    xite: text,
+    publisher: text,
+    integrity: text,
+    programs: {
+      [text]: {
+        usable: true,
+        entry: { path: text, sha512: ENTRY_HASH },
+        dependencies: [text, { path: text, sha512: ENTRY_HASH }],
+        capabilities: [text, text],
+        limits: { [text]: text },
+        allow_run_once: true,
+        reasons: [],
+      },
+      broken: { usable: false, reasons: [text, text] },
+    },
+    jobs: {
+      [text]: { usable: true, program: text, schedule: { type: "interval", seconds: text, anchor: text, missed: text }, max_concurrency: text, reasons: [] },
+      other: { usable: true, program: text, schedule: { type: text }, max_concurrency: 1, reasons: [] },
+      bad: { usable: false, reasons: [text] },
+    },
+    unsupported: [{ path: text, reason: text }],
+    effective_limits: { [text]: text },
+  });
+  const benign = wrapper({}, { evxInspect: () => shape("plain") });
+  benign.instance.handleMessage({ cmd: "evxRequest", params: { program: "plain" }, id: 26 });
+  const attacked = wrapper({}, { evxInspect: () => shape(hostile) });
+  attacked.instance.handleMessage({ cmd: "evxRequest", params: { program: hostile }, id: 26 });
+  const body = attacked.dialogs[0].body;
+  assert.equal(body.includes("<small><b>"), false);
+  assert.equal(body.includes("<b>Current grant: enabled</b>"), false, "no chrome-looking status line from the payload");
+  assert.equal(body.includes("<u>"), false);
+  assert.equal(body.includes("<i>"), false);
+  const literal = "&lt;small&gt;&lt;b&gt;Current grant: enabled&lt;/b&gt;&lt;br&gt;&lt;u&gt;x&lt;/u&gt;&lt;i&gt;y&lt;/i&gt;";
+  assert.ok((body.match(new RegExp(literal.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "g")) || []).length >= 24, "each field is shown as literal text");
+  for (const tag of ["<small>", "<b>", "<br>"]) {
+    const count = text => (text.match(new RegExp(tag, "g")) || []).length;
+    assert.equal(count(body), count(benign.dialogs[0].body), `the payload adds no ${tag} beyond the chrome's own`);
+  }
+});
+
+test("every rendered payload string is capped at 200 characters, each list item on its own", () => {
+  const long = "a".repeat(1000);
+  const { instance, dialogs } = wrapper({}, {
+    evxInspect: () => inspectPayload({
+      xite: long,
+      programs: {
+        [long]: { usable: false, reasons: ["x".repeat(300), "y".repeat(300)] },
+        presence: inspectPayload().programs.presence,
+      },
+    }),
+  });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: long }, id: 27 });
+  const body = dialogs[0].body;
+  assert.equal(body.includes("a".repeat(201)), false, "the id and the xite are cut");
+  assert.ok(body.includes("a".repeat(200) + "…"), "a cut string says so");
+  assert.ok(body.includes("x".repeat(200) + "…; " + "y".repeat(200) + "…"), "reasons are capped one by one, not as a joined whole");
+  assert.equal(body.includes("x".repeat(201)), false);
+});
+
+// The real dialog, on a minimal stand-in for jQuery: elements record what
+// is appended to them, the handlers bound on them and whether they were
+// focused, and `trigger` runs the handlers in binding order, honouring
+// stopImmediatePropagation the way jQuery does.
+function fakeDom() {
+  const focused = [];
+  class Elem {
+    constructor(selector) {
+      this.selector = selector;
+      this.handlers = {};
+      this.children = [];
+      this.parts = {};
+      this.length = 1;
+      this[0] = this;
+    }
+    append(child) { this.children.push(child); return this; }
+    text(value) { this.content = value; return this; }
+    html() { return this; }
+    on(event, handler) { (this.handlers[event] = this.handlers[event] || []).push(handler); return this; }
+    first() { return this.children[0] || new Elem("empty"); }
+    focus() { focused.push(this); return this; }
+    scrollLeft() { return this; }
+    trigger(event, fields) {
+      let stopped = false;
+      const e = Object.assign({ currentTarget: this, stopImmediatePropagation() { stopped = true; } }, fields || {});
+      for (const handler of this.handlers[event] || []) {
+        if (stopped) break;
+        handler.call(this, e);
+      }
+      return !stopped;
+    }
+  }
+  const $ = function (selector, within) {
+    if (within instanceof Elem && within.parts[selector]) return within.parts[selector];
+    return new Elem(selector);
+  };
+  $.when = value => value;
+  $.extend = Object.assign;
+  return { $, Elem, focused };
+}
+
+const GUARD_MS = Number((source.match(/Wrapper\.prototype\.CHOICE_GUARD_MS = (\d+);/) || [])[1]);
+const sanitised = id => "notification-" + id.replace(/[^A-Za-z0-9-]/g, "");
+
+// A wrapper whose dialogs are the production displayChoice and displayConfirm
+// over fakeDom, with a Notifications stand-in that keys the shown
+// notifications by their sanitised id exactly as Notifications.add does and
+// binds its close-on-click to every button after the dialog's own handlers.
+function dialogWrapper(results) {
+  const dom = fakeDom();
+  const clock = { now: 100000 };
+  const context = vm.createContext({
+    window: { is_homepage: false },
+    $: dom.$,
+    Date: { now: () => clock.now },
+  });
+  vm.runInContext(`var Wrapper = function() {}; var indexOf = [].indexOf;
+    Wrapper.prototype.CHOICE_GUARD_MS = ${GUARD_MS};
+    ${method("setXiteInfo")}
+    ${method("handleMessage")}
+    ${method("actionEvxRequest")}
+    ${method("evxRunnableOnce")}
+    ${method("evxGrantOutcome")}
+    ${method("evxPromptBody")}
+    ${method("toHtmlSafe")}
+    ${method("displayChoice")}
+    ${method("displayConfirm")}
+    ${method("actionNotification")}
+    ${method("actionConfirm")}
+    ${method("actionProgress")}
+    ${method("pageNotificationId")}
+  `, context);
+  const instance = Object.create(context.Wrapper.prototype);
+  const shown = [];
+  const closed = [];
+  const commands = [];
+  const replies = [];
+  const progress = [];
+  const answers = Object.assign({
+    evxInspect: () => inspectPayload(),
+    evxGrant: params => ({ granted: true, mode: params.mode, token: params.mode === "once" ? "one-shot-token" : undefined }),
+    evxRunOnce: () => ({ ok: true, exit: 0 }),
+  }, results || {});
+  Object.assign(instance, {
+    xite_info: null,
+    event_xite_info: deferred(),
+    inner_loaded: false,
+    loading: { screen_visible: true, noteProgress() {}, printLine() {}, setStage() {} },
+    noteContentSync() {},
+    verifyEvent() {},
+    displayProgress(type) { progress.push(type); },
+    notifications: {
+      add(id, type, body) {
+        const key = sanitised(id);
+        for (const open of shown) {
+          if (open.key === key && !open.closed) { open.closed = true; closed.push(key); }
+        }
+        const elem = new dom.Elem("notification");
+        elem.parts[".close"] = new dom.Elem(".close");
+        const entry = { id, key, type, body, elem, closed: false };
+        const buttons = body instanceof dom.Elem ? body.children.find(child => child.selector.includes("buttons")) : null;
+        for (const button of buttons ? buttons.children : []) {
+          button.on("click", () => { entry.closed = true; closed.push(key); return false; });
+        }
+        shown.push(entry);
+        return elem;
+      },
+    },
+    ws: {
+      cmd(command, params, callback) {
+        commands.push({ command, params });
+        const answer = answers[command];
+        assert.ok(answer, `unexpected command ${command}`);
+        callback(answer(params));
+      },
+      send() {},
+      ws: { readyState: 0 },
+    },
+    sendInner(message) { replies.push(message); },
+    log() {},
+  });
+  instance.setXiteInfo({
+    address: "game.epix", auth_address: "test-identity", peers: 2,
+    size_limit: 10, content: {}, settings: { size: 0, own: false, permissions: [] },
+  });
+  const buttons = entry => entry.body.children.find(child => child.selector.includes("buttons")).children;
+  return { instance, shown, closed, commands, replies, progress, focused: dom.focused, clock, buttons };
+}
+
+test("the consent dialog gives focus to Deny and never to a granting button", () => {
+  const { instance, shown, focused, buttons } = dialogWrapper();
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 30 });
+  assert.equal(shown.length, 1);
+  const [enable, once, deny] = buttons(shown[0]);
+  assert.deepEqual([enable.content, once.content, deny.content], ["Enable EVX for this xite", "Allow once", "Deny"]);
+  assert.deepEqual(focused, [deny], "Deny alone is focused");
+});
+
+test("a button activation within the guard window after the dialog appears is not honoured and the dialog stays open", () => {
+  assert.ok(GUARD_MS >= 500, "the guard window is at least half a second");
+  const { instance, shown, closed, commands, replies, clock, buttons } = dialogWrapper();
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 31 });
+  const [enable, once] = buttons(shown[0]);
+  clock.now += GUARD_MS - 1;
+  assert.equal(enable.trigger("click"), false, "the notification's own close-on-click is stopped too");
+  assert.equal(once.trigger("click"), false);
+  assert.deepEqual(commands.map(c => c.command), ["evxInspect"], "nothing granted");
+  assert.equal(replies.length, 0, "the page is still waiting");
+  assert.deepEqual(closed, [], "the dialog is still open");
+  clock.now += 1;
+  assert.equal(enable.trigger("click"), true);
+  assert.deepEqual(commands.map(c => c.command), ["evxInspect", "evxGrant"], "a deliberate activation after the window grants");
+  assert.deepEqual(plain(replies), [{ cmd: "response", to: 31, result: { granted: true, mode: "enable" } }]);
+  assert.deepEqual(closed, [shown[0].key], "and closes the dialog");
+});
+
+test("no page notification, confirm or progress can close or replace the open EVX prompt", () => {
+  const { instance, shown, closed, progress, replies } = dialogWrapper();
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 7 });
+  const prompt = shown[0];
+  assert.equal(prompt.id, "notification-evx-prompt-1");
+  assert.equal(prompt.id.includes("7"), false, "the page's message id is not part of the notification id");
+  for (const id of ["evx-7", "evx-prompt-1", "notification-evx-prompt-1", "", "page-evx-prompt-1"]) {
+    instance.handleMessage({ cmd: "wrapperNotification", params: ["info", "decoy"], id });
+    instance.handleMessage({ cmd: "wrapperConfirm", params: ["decoy", id], id: 99 });
+    instance.handleMessage({ cmd: "wrapperProgress", params: [id, "decoy", 50], id: 99 });
+  }
+  const pageKeys = shown.slice(1).map(entry => entry.key).concat(progress.map(type => sanitised(type)));
+  assert.ok(pageKeys.length >= 10);
+  for (const key of pageKeys) {
+    assert.ok(/^notification-(notification-)?page-/.test(key), `page-chosen ids are namespaced: ${key}`);
+    assert.notEqual(key, prompt.key);
+  }
+  assert.equal(closed.includes(prompt.key), false, "the prompt was neither closed nor replaced (a page may replace its own)");
+  assert.equal(prompt.closed, false);
+  assert.equal(replies.length, 0, "and it is still unsettled");
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 7 });
+  assert.equal(shown[shown.length - 1].id, "notification-evx-prompt-2", "the counter is the chrome's, whatever the page's ids");
 });
