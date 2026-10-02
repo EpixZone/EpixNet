@@ -11,17 +11,23 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The wrapper chrome (all.js) numbers its own WebSocket commands from this
-/// base; the inner xite page numbers from 1. Commands at or above this id are
-/// treated as coming from the trusted wrapper and may run ADMIN actions.
+/// base; the inner xite page numbers from 1. On a wrapper socket (one opened
+/// with the xite's secret `wrapper_key`), commands at or above this id come
+/// from the chrome itself and may run ADMIN actions; the wrapper forwards a
+/// page's messages with the page's own small ids and drops any inner message
+/// that claims an elevated one. The id alone proves nothing: a socket opened
+/// by anything other than the wrapper can pick any number, so
+/// [`WsSession::elevated`] also requires the socket to be a wrapper socket.
 pub const WRAPPER_ID_BASE: i64 = 1_000_000;
 
-/// Whether a connection may act as the trusted wrapper chrome: the operator's
-/// admin socket, or a request numbered from the wrapper's elevated range. An
-/// inner xite page can never reach this: the wrapper forwards a page's
-/// messages with the page's own small ids and drops any inner message that
-/// claims an elevated one.
-pub fn is_wrapper_authority(trusted: bool, req_id: i64) -> bool {
-    trusted || req_id >= WRAPPER_ID_BASE
+/// Whether a request may act as the trusted wrapper chrome: the operator's
+/// admin socket, or an elevated-id request on a socket that authenticated as
+/// the wrapper with the xite's `wrapper_key`. An inner xite page can reach
+/// neither: it runs in an opaque origin (the iframe sandbox has no
+/// `allow-same-origin`), so it cannot read the key from the wrapper, and a
+/// WebSocket it opens itself carries `Origin: null` and is refused.
+pub fn is_wrapper_authority(session: &WsSession, req_id: i64) -> bool {
+    session.elevated(req_id)
 }
 
 /// Permissions a xite may ask the user to grant through the wrapper's prompt.
@@ -192,20 +198,33 @@ pub struct WsSession {
     /// restricted-gateway gates and NoNewSites, since server-side admin is how
     /// a locked-down node is meant to be changed.
     pub trusted: bool,
+    /// The connection authenticated as the wrapper chrome of its bound xite:
+    /// the WebSocket upgrade presented that xite's secret `wrapper_key`, which
+    /// only the wrapper page receives. Only on such a socket do elevated ids
+    /// (>= [`WRAPPER_ID_BASE`]) carry the chrome's authority.
+    pub wrapper: bool,
 }
 
 impl WsSession {
+    /// A page-level session: no operator trust, no wrapper authority. This is
+    /// what a WebSocket without a valid `wrapper_key` gets.
     pub fn new(state: Arc<AppState>, xite: Option<String>) -> Self {
-        Self::build(state, xite, false)
+        Self::build(state, xite, false, false)
     }
 
     /// A trusted session for the local admin socket: full admin, no gateway
     /// restrictions. Only ever created for the filesystem-guarded Unix socket.
     pub fn new_trusted(state: Arc<AppState>, xite: Option<String>) -> Self {
-        Self::build(state, xite, true)
+        Self::build(state, xite, true, false)
     }
 
-    fn build(state: Arc<AppState>, xite: Option<String>, trusted: bool) -> Self {
+    /// The wrapper chrome's own socket for `xite`: created only when the
+    /// upgrade presented the xite's `wrapper_key`.
+    pub fn new_wrapper(state: Arc<AppState>, xite: Option<String>) -> Self {
+        Self::build(state, xite, false, true)
+    }
+
+    fn build(state: Arc<AppState>, xite: Option<String>, trusted: bool, wrapper: bool) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             state,
@@ -214,7 +233,15 @@ impl WsSession {
             channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             allsite_channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             trusted,
+            wrapper,
         }
+    }
+
+    /// Whether a request carries the chrome's authority: the operator socket
+    /// always does; a wrapper socket does for its own (elevated-id) commands
+    /// and never for the page commands it forwards with small ids.
+    pub fn elevated(&self, req_id: i64) -> bool {
+        self.trusted || (self.wrapper && req_id >= WRAPPER_ID_BASE)
     }
 
     /// The xite address bound to this connection, or an error if none.
@@ -381,7 +408,7 @@ impl CommandRegistry {
                 Some(address) => session.state.xite_has_admin(address).await,
                 None => false,
             };
-            if restrict || (req_id < WRAPPER_ID_BASE && !admin) {
+            if restrict || (!session.elevated(req_id) && !admin) {
                 return Err("Global network retry requires wrapper or ADMIN authority".into());
             }
         }
@@ -398,7 +425,7 @@ impl CommandRegistry {
             if restrict {
                 return Err(format!("{cmd} is disabled on this gateway"));
             }
-            if cmd == "permissionAdd" && !is_wrapper_authority(session.trusted, req_id) {
+            if cmd == "permissionAdd" && !is_wrapper_authority(session, req_id) {
                 return Err("permissionAdd requires the wrapper's permission prompt".into());
             }
         }
@@ -413,7 +440,7 @@ impl CommandRegistry {
             } else {
                 // Allowed from the trusted admin socket, the wrapper (elevated
                 // id), or when the bound xite actually holds ADMIN.
-                let elevated = session.trusted || req_id >= WRAPPER_ID_BASE;
+                let elevated = session.elevated(req_id);
                 let has_admin = match &session.xite {
                     Some(addr) => session.state.xite_has_admin(addr).await,
                     None => false,
@@ -498,8 +525,7 @@ impl CommandRegistry {
                 .or_else(|| params.as_array().and_then(|a| a.get(2)))
                 .cloned()
                 .unwrap_or_else(|| Value::Array(Vec::new()));
-            let caller_elevated = session.trusted
-                || req_id >= WRAPPER_ID_BASE
+            let caller_elevated = session.elevated(req_id)
                 || match &session.xite {
                     Some(addr) => session.state.xite_has_admin(addr).await,
                     None => false,
@@ -508,7 +534,9 @@ impl CommandRegistry {
             if !allowed {
                 return Err(format!("No permission to run commands as {target}"));
             }
-            let rebound = WsSession::new(session.state.clone(), Some(target));
+            // The rebound session carries the caller's authority (and nothing
+            // more): an elevated caller keeps it, a page-level caller stays one.
+            let rebound = WsSession::build(session.state.clone(), Some(target), false, caller_elevated);
             let inner_id = if caller_elevated { req_id.max(WRAPPER_ID_BASE) } else { req_id };
             return Box::pin(self.dispatch(&rebound, &inner_cmd, &inner_params, inner_id)).await;
         }
@@ -4630,7 +4658,11 @@ mod tests {
         let commands = CommandRegistry::with_defaults();
         let result = commands.dispatch(&session, "networkRetry", &Value::Null, 1).await;
         assert!(result.is_err(), "an unprivileged page cannot wake every other download");
-        assert_eq!(commands.dispatch(&session, "networkRetry", &Value::Null, WRAPPER_ID_BASE)
+        // An elevated id on a page-level socket (one opened without the
+        // wrapper_key) is just a number the client chose.
+        assert!(commands.dispatch(&session, "networkRetry", &Value::Null, WRAPPER_ID_BASE).await.is_err());
+        let wrapper = WsSession::new_wrapper(session.state.clone(), session.xite.clone());
+        assert_eq!(commands.dispatch(&wrapper, "networkRetry", &Value::Null, WRAPPER_ID_BASE)
             .await.unwrap(), "ok");
     }
 
@@ -5148,9 +5180,19 @@ mod tests {
         assert!(via_as.is_err());
         assert!(!state.xite_has_admin(addr).await);
 
-        // The wrapper, after the user tapped Grant, sends from its own range.
+        // A socket the page opened itself can claim the elevated range, but
+        // it never presented the wrapper_key, so the id proves nothing.
+        let forged = registry.dispatch(&session, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 3).await;
+        assert!(forged.unwrap_err().contains("prompt"));
+        assert!(!state.xite_has_admin(addr).await);
+
+        // The wrapper, after the user tapped Grant, sends from its own range
+        // over the socket it authenticated with the xite's wrapper_key.
+        let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+        assert!(registry.dispatch(&wrapper, "permissionAdd", &json!("ADMIN"), 7).await.is_err(),
+            "a page command forwarded by the wrapper keeps its small id and is still refused");
         assert_eq!(
-            registry.dispatch(&session, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 3).await.unwrap(),
+            registry.dispatch(&wrapper, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 3).await.unwrap(),
             "ok"
         );
         assert!(state.xite_has_admin(addr).await);
@@ -5254,13 +5296,21 @@ mod tests {
 
     #[test]
     fn pushed_prompt_answers_need_wrapper_authority() {
-        // The wrapper answers a server confirm over its own socket from the
-        // elevated id range; a forwarded inner-page answer carries a small id.
-        assert!(is_wrapper_authority(false, WRAPPER_ID_BASE));
-        assert!(is_wrapper_authority(true, 1));
-        assert!(!is_wrapper_authority(false, 1));
-        assert!(!is_wrapper_authority(false, WRAPPER_ID_BASE - 1));
-        assert!(!is_wrapper_authority(false, 0));
+        // The wrapper answers a server confirm over its own socket (one that
+        // presented the xite's wrapper_key) from the elevated id range; a
+        // forwarded inner-page answer carries a small id, and a socket opened
+        // by anything else can pick any id without gaining authority.
+        let state = AppState::new("test");
+        let wrapper = WsSession::new_wrapper(state.clone(), Some("1site".into()));
+        let page = WsSession::new(state.clone(), Some("1site".into()));
+        let operator = WsSession::new_trusted(state, Some("1site".into()));
+        assert!(is_wrapper_authority(&wrapper, WRAPPER_ID_BASE));
+        assert!(!is_wrapper_authority(&wrapper, WRAPPER_ID_BASE - 1));
+        assert!(!is_wrapper_authority(&wrapper, 1));
+        assert!(is_wrapper_authority(&operator, 1));
+        assert!(!is_wrapper_authority(&page, WRAPPER_ID_BASE));
+        assert!(!is_wrapper_authority(&page, i64::MAX));
+        assert!(!is_wrapper_authority(&page, 0));
     }
 
     #[tokio::test]
@@ -5279,8 +5329,14 @@ mod tests {
         assert!(denied.is_err(), "siteList must be denied without ADMIN");
         assert!(denied.unwrap_err().contains("permission"));
 
-        // The trusted wrapper (elevated id) may run it even without a xite grant.
-        assert!(registry.dispatch(&session, "siteList", &json!([]), 1_000_001).await.is_ok());
+        // An elevated id on a page-level socket is not the wrapper.
+        assert!(registry.dispatch(&session, "siteList", &json!([]), 1_000_001).await.is_err());
+        // The wrapper (elevated id on its authenticated socket) may run it
+        // even without a xite grant.
+        let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+        assert!(registry.dispatch(&wrapper, "siteList", &json!([]), 1_000_001).await.is_ok());
+        assert!(registry.dispatch(&wrapper, "siteList", &json!([]), 5).await.is_err(),
+            "a forwarded page command keeps the page's authority");
 
         // Granting the xite ADMIN (as the wrapper does after the user confirms)
         // then lets the inner page run admin commands too.

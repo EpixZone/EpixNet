@@ -100,7 +100,9 @@ const server = http.createServer((req, res) => {
           "Retry-After": "30",
         })
         .end(
-          '<!doctype html><html data-epix-load-state="waiting"><body>Waiting for this xite</body></html>'
+          // Mirrors the node's placeholder (lib.rs download_wait_response):
+          // the frame is an opaque origin, so it announces its state itself.
+          '<!doctype html><html data-epix-load-state="waiting"><head><script>try{parent.postMessage({cmd:"innerLoadState",params:"waiting"},"*")}catch(e){}</script></head><body>Waiting for this xite</body></html>'
         );
     }
     return;
@@ -116,6 +118,7 @@ const server = http.createServer((req, res) => {
       homepage: `/${address}`,
       resolving_host: "",
       is_homepage: "false",
+      ui_restrict: "false",
       site_file_server: "",
       file_url: `/${address}/index.html`,
       query_string: "?wrapper_nonce=waiting",
@@ -330,12 +333,13 @@ wss.on("connection", (ws) => {
       },
     });
     await page.waitForTimeout(2800);
+    // The inner frame is an opaque origin (no allow-same-origin), so the
+    // wrapper page cannot read its document; ask the frame itself.
     results.completedFrame = await page
-      .locator("#inner-iframe")
-      .evaluate(
-        (el) =>
-          el.contentDocument?.querySelector("#xite-ready")?.textContent || null
-      );
+      .frameLocator("#inner-iframe")
+      .locator("#xite-ready")
+      .textContent({ timeout: 5000 })
+      .catch(() => null);
     results.completed = await shot("completed");
     results.overlayDismissed =
       (await page.locator(".loadingscreen").count()) === 0;

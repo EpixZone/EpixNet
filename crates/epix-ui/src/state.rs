@@ -4523,6 +4523,10 @@ pub struct AppState {
     /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
     /// issued when a wrapper is served, consumed on the inner file request.
     wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Wrapper/AJAX keys reserved for xites that are still being added (the
+    /// loading screen renders before the clone lands), keyed by address and
+    /// adopted by `add_xite` so the page already open keeps its authority.
+    pending_wrapper_keys: std::sync::Mutex<HashMap<String, (String, String)>>,
     /// The per-run token that authorizes state-changing UI requests (config
     /// saves, plugin toggles, restart). It is rendered into the mutating forms
     /// and must come back on the POST. A hostile page can navigate the browser
@@ -5408,6 +5412,26 @@ fn random_hex_with(
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Compare two secrets without an early exit on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A xite's settings as pages may see them. The wrapper and AJAX keys are
+/// authority secrets: a page that learned them could open a WebSocket as the
+/// trusted wrapper, so they are stripped from every `siteInfo` and event.
+pub fn public_settings(settings: &XiteSettings) -> Value {
+    let mut value = serde_json::to_value(settings).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut value {
+        map.remove("wrapper_key");
+        map.remove("ajax_key");
+    }
+    value
+}
+
 fn random_hex(bytes: usize) -> String {
     random_hex_with(bytes, &mut |buf| {
         getrandom::fill(buf).map_err(|error| format!("operating-system randomness failed: {error}"))
@@ -5672,6 +5696,7 @@ impl AppState {
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pending_wrapper_keys: std::sync::Mutex::new(HashMap::new()),
             ui_csrf: std::sync::OnceLock::new(),
             nmh_token: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -7066,7 +7091,20 @@ impl AppState {
         // xites. Keep the root stat when the walk found less (mid-clone, the
         // children may not be on disk yet).
         settings.size_optional = settings.size_optional.max(optional_declared);
-        self.xites.write().await.insert(
+        {
+            let mut xites = self.xites.write().await;
+            // A wrapper rendered while this xite was still being added embedded
+            // reserved keys (`wrapper_keys`): the page holding them is the one
+            // open now, so they become the xite's keys.
+            {
+                let mut pending = self.pending_wrapper_keys.lock().unwrap();
+                let reserved = pending.remove(&address).or_else(|| pending.remove(&canonical));
+                if let Some((wrapper_key, ajax_key)) = reserved {
+                    settings.wrapper_key = wrapper_key;
+                    settings.ajax_key = ajax_key;
+                }
+            }
+            xites.insert(
             address.clone(),
             ManagedXite {
                 storage: entry.storage,
@@ -7096,6 +7134,7 @@ impl AppState {
                 check_peers: (0, 0),
             },
         );
+        }
         match verified_index {
             Some(index) => self.install_verified_xite_index(&canonical, index),
             None => {
@@ -18006,7 +18045,7 @@ impl AppState {
                 let entry = xites.get(address)?;
                 Some((
                     entry.content.as_ref().map(summarize_content),
-                    serde_json::to_value(&entry.settings).ok(),
+                    Some(public_settings(&entry.settings)),
                 ))
             })
             .unwrap_or((None, None));
@@ -33046,7 +33085,7 @@ impl AppState {
                 .map(|(done, total)| json!({ "done": done, "total": total }))
                 .unwrap_or(Value::Null),
             "bad_files": settings.cache.bad_files.len(),
-            "settings": serde_json::to_value(settings).unwrap_or(Value::Null),
+            "settings": public_settings(&settings),
             "size_limit": size_limit,
             "next_size_limit": next_size_limit,
             "peers": peers.max(1),
@@ -33130,6 +33169,59 @@ impl AppState {
     /// EpixNet's remove-on-use.
     pub fn consume_wrapper_nonce(&self, nonce: &str) -> bool {
         self.wrapper_nonces.lock().unwrap().remove(nonce)
+    }
+
+    /// The per-xite secrets the wrapper page embeds (EpixNet's
+    /// `site.settings` `wrapper_key` / `ajax_key`): `wrapper_key` authorizes
+    /// the wrapper's WebSocket as the trusted chrome for that xite, `ajax_key`
+    /// lets the sandboxed (opaque-origin) inner page read its own files. Both
+    /// are random, persisted with the xite, and never sent to a page through
+    /// `siteInfo` (see [`public_settings`]). A xite that is still being added
+    /// gets keys reserved here; `add_xite` adopts them, so the loading screen
+    /// already open keeps working once the xite is managed.
+    pub async fn wrapper_keys(&self, address: &str) -> (String, String) {
+        let xites = self.xites.read().await;
+        if let Some(xite) = xites.get(address) {
+            return (xite.settings.wrapper_key.clone(), xite.settings.ajax_key.clone());
+        }
+        // Lock order: xites, then pending (add_xite takes them the same way).
+        let mut pending = self.pending_wrapper_keys.lock().unwrap();
+        pending
+            .entry(address.to_string())
+            .or_insert_with(|| (epix_crypt::new_seed(), epix_crypt::new_seed()))
+            .clone()
+    }
+
+    /// The xite whose `wrapper_key` this is, if any.
+    pub async fn xite_by_wrapper_key(&self, key: &str) -> Option<String> {
+        self.xite_by_key(key, true).await
+    }
+
+    /// The xite whose `ajax_key` this is, if any.
+    pub async fn xite_by_ajax_key(&self, key: &str) -> Option<String> {
+        self.xite_by_key(key, false).await
+    }
+
+    async fn xite_by_key(&self, key: &str, wrapper: bool) -> Option<String> {
+        if key.is_empty() {
+            return None;
+        }
+        let xites = self.xites.read().await;
+        let found = xites.iter().find(|(_, x)| {
+            let candidate = if wrapper { &x.settings.wrapper_key } else { &x.settings.ajax_key };
+            constant_time_eq(candidate.as_bytes(), key.as_bytes())
+        });
+        if let Some((address, _)) = found {
+            return Some(address.clone());
+        }
+        let pending = self.pending_wrapper_keys.lock().unwrap();
+        pending
+            .iter()
+            .find(|(_, keys)| {
+                let candidate = if wrapper { &keys.0 } else { &keys.1 };
+                constant_time_eq(candidate.as_bytes(), key.as_bytes())
+            })
+            .map(|(address, _)| address.clone())
     }
 
     /// This run's CSRF token, generated on first use. Rendered into every
@@ -42502,6 +42594,58 @@ mod tests {
             .unwrap();
         let q = state.notification_query().await;
         assert_eq!(q["results"][0]["count"], 1, "3 total minus 2 seen: {q}");
+    }
+
+    #[tokio::test]
+    async fn wrapper_keys_are_reserved_before_a_xite_lands_and_never_reach_pages() {
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+
+        // A wrapper rendered while the xite is still being added gets keys
+        // reserved for that address, stable across renders, and already
+        // resolvable by the WebSocket upgrade.
+        let (wrapper_key, ajax_key) = state.wrapper_keys("1Pending").await;
+        assert_eq!(wrapper_key.len(), 64);
+        assert_eq!(ajax_key.len(), 64);
+        assert_ne!(wrapper_key, ajax_key);
+        assert_eq!(state.wrapper_keys("1Pending").await, (wrapper_key.clone(), ajax_key.clone()));
+        assert_eq!(state.xite_by_wrapper_key(&wrapper_key).await.as_deref(), Some("1Pending"));
+        assert_eq!(state.xite_by_ajax_key(&ajax_key).await.as_deref(), Some("1Pending"));
+        assert!(state.xite_by_wrapper_key(&ajax_key).await.is_none(), "keys are not interchangeable");
+        assert!(state.xite_by_wrapper_key("").await.is_none());
+        assert!(state.xite_by_wrapper_key("1Pending").await.is_none(), "an address is not a key");
+
+        // Adding the xite adopts the reserved keys, so the page already open
+        // keeps its authority once the xite is managed.
+        let manifest = |address: &str| Some(json!({ "address": address, "files": {} }));
+        state
+            .add_xite("1Pending", XiteEntry { storage: XiteStorage::new(dir.path()), content: manifest("1Pending") })
+            .await;
+        assert_eq!(state.wrapper_keys("1Pending").await, (wrapper_key.clone(), ajax_key.clone()));
+        assert_eq!(state.xite_by_wrapper_key(&wrapper_key).await.as_deref(), Some("1Pending"));
+        assert_eq!(state.xite_by_ajax_key(&ajax_key).await.as_deref(), Some("1Pending"));
+
+        // A xite added with no reservation gets its own fresh keys.
+        let other_dir = tempdir().unwrap();
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(other_dir.path()), content: manifest("1Other") })
+            .await;
+        assert!(state.is_serving("1Other").await);
+        let (other_key, _) = state.wrapper_keys("1Other").await;
+        assert_ne!(other_key, wrapper_key);
+        assert_eq!(state.xite_by_wrapper_key(&other_key).await.as_deref(), Some("1Other"));
+
+        // What a page sees of a xite's settings carries neither secret.
+        for addr in ["1Pending", "1Other"] {
+            let info = state.xite_info(addr).await;
+            assert!(info["settings"].get("permissions").is_some(), "{info}");
+            assert!(info["settings"].get("wrapper_key").is_none(), "{info}");
+            assert!(info["settings"].get("ajax_key").is_none(), "{info}");
+        }
+        let settings = state.xites.read().await.get("1Other").unwrap().settings.clone();
+        let public = public_settings(&settings);
+        assert!(public.get("wrapper_key").is_none() && public.get("ajax_key").is_none());
+        assert_eq!(public["serving"], true);
     }
 
     #[tokio::test]

@@ -40,7 +40,7 @@ function fixture() {
   const context = vm.createContext({
     window: { show_loadingscreen: false, resolving_host: '', file_inner_path: 'index.html',
       location: { reload() { reloaded++; } }, document: {}, },
-    document: { getElementById: () => ({ contentWindow: inner, contentDocument: innerDocument }) },
+    document: { getElementById: () => ({ contentWindow: inner, getAttribute: (name) => name === 'src' ? innerDocument.location.href : null }) },
     $, console, Date: { now: () => now },
     setTimeout(fn, delay) { const id = ++next; timers.set(id, { fn, at: now + delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -49,7 +49,7 @@ function fixture() {
     RateLimit(delay, fn) { fn(); },
   });
   const loading = source.slice(source.indexOf('/* ---- Loading.coffee ---- */'), source.indexOf('/* ---- Notifications.coffee ---- */'));
-  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'loadingDocumentReady', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
+  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'loadingDocumentReady', 'setInnerLoadState', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
   const wrapper = Object.assign(Object.create(context.Wrapper.prototype), {
     xite_info: null, inner, inner_loaded: false, inner_ready: true,
     event_xite_info: { resolve() {} }, noteContentSync() {}, log() {}, reloadXiteInfo() {},
@@ -179,11 +179,21 @@ test('receiving index.html before the other core files does not dismiss the load
 });
 
 test('a retryable error document never counts as the loaded xite', () => {
+  // The placeholder announces itself from inside the opaque frame; the
+  // wrapper cannot read the frame's document.
   const f = fixture(); f.wrapper.xite_info = info(null);
-  f.innerDocument.documentElement.dataset.epixLoadState = 'waiting';
+  f.wrapper.setInnerLoadState('waiting');
   f.wrapper.onPageLoad();
   assert.equal(f.load.screen_visible, true);
   assert.equal(f.wrapper.inner_loaded, false);
+});
+
+test('a frame still on about:blank is not the loaded xite', () => {
+  const f = fixture(); f.wrapper.xite_info = info(null);
+  f.innerDocument.location.href = 'about:blank';
+  f.wrapper.onPageLoad();
+  assert.equal(f.wrapper.inner_loaded, false);
+  assert.equal(f.load.screen_visible, true);
 });
 
 test('automatic retry countdown follows the backend deadline without scheduling a retry itself', () => {
@@ -250,16 +260,27 @@ test('name lookup keeps observing backend recovery without a manual retry comman
 
 test('a completed clone retries a waiting iframe once and dismisses only its real document', () => {
   const f = fixture(); let reloads = 0;
-  f.innerDocument.documentElement.dataset.epixLoadState = 'waiting';
-  f.wrapper.reloadIframe = () => reloads++;
+  f.wrapper.setInnerLoadState('waiting');
+  f.wrapper.reloadIframe = () => { reloads++; f.wrapper.inner_load_state = null; };
   const complete = info(['clone_status', 'complete'], { tasks: 0, bad_files: 0, clone_status: { state: 'complete', attempt: 2 } });
   f.wrapper.setXiteInfo(complete); f.wrapper.setXiteInfo(complete);
   assert.equal(reloads, 1);
   assert.equal(f.load.screen_visible, true);
-  delete f.innerDocument.documentElement.dataset.epixLoadState;
   f.wrapper.onPageLoad();
   assert.equal(f.load.screen_visible, false);
   assert.equal(f.wrapper.inner_loaded, true);
+});
+
+test('a placeholder announcing itself after the clone completed is reloaded once', () => {
+  // The announcement can reach the wrapper after the clone finished (a
+  // slow frame): the recovery must still happen, and only once.
+  const f = fixture(); let reloads = 0;
+  f.wrapper.reloadIframe = () => { reloads++; f.wrapper.inner_load_state = null; };
+  f.wrapper.xite_info = info(['clone_status', 'complete'], { clone_status: { state: 'complete', attempt: 1 } });
+  f.wrapper.setInnerLoadState('waiting');
+  f.wrapper.setInnerLoadState('waiting');
+  assert.equal(reloads, 1);
+  assert.equal(f.wrapper.inner_loaded, false);
 });
 
 test('the first retry event reaches the loader before siteInfo establishes its address', () => {

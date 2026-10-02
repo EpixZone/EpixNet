@@ -97,12 +97,16 @@ else if (window.opener && window.opener.location.toString()) {
 
 
 <!-- Xite Iframe -->
-<iframe src='about:blank' id='inner-iframe' sandbox="allow-forms allow-scripts allow-top-navigation allow-popups allow-modals allow-presentation allow-pointer-lock allow-popups-to-escape-sandbox allow-same-origin {sandbox_permissions}" allowfullscreen="true"></iframe>
+<!-- No allow-same-origin: the xite runs in an opaque origin, so it cannot
+     reach this window, the WebSocket as this origin, or the keys below. The
+     NOSANDBOX grant adds it through {sandbox_permissions}. -->
+<iframe src='about:blank' id='inner-iframe' sandbox="allow-forms allow-scripts allow-top-navigation allow-popups allow-modals allow-presentation allow-pointer-lock allow-popups-to-escape-sandbox {sandbox_permissions}" allowfullscreen="true"></iframe>
 
 <!-- Xite info -->
 <script id="script_init" nonce="{script_nonce}">
 resolving_host = "{resolving_host}"
 is_homepage = {is_homepage}
+ui_restrict = {ui_restrict}
 iframe_src = "{site_file_server}{file_url}{query_string}"
 if (resolving_host) {
 	// Resolving mode: there is no address yet, so the iframe stays blank until

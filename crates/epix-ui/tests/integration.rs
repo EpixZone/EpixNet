@@ -31,9 +31,18 @@ async fn call_params(ws: &mut Ws, cmd: &str, params: Value, id: i64) -> Value {
 /// verified-authority root on disk). Ingest and db authority flow from an
 /// accepted manifest authority, so the root must declare every managed file -
 /// including `data/test.json`, the exact bytes `own_write_is_not_echoed_back`
-/// later writes. Returns the bound address, the xite's bech32 address, and
-/// the tempdir keeping the storage alive.
-async fn start_server() -> (std::net::SocketAddr, String, tempfile::TempDir) {
+/// later writes. Returns the bound address, the xite's bech32 address, the
+/// xite's secret wrapper_key (what the served wrapper page embeds), and the
+/// tempdir keeping the storage alive.
+async fn start_server() -> (std::net::SocketAddr, String, String, tempfile::TempDir) {
+    let (addr, address, key, _state, dir) = start_server_with_state().await;
+    (addr, address, key, dir)
+}
+
+/// [`start_server`] that also hands back the node state, for tests that
+/// change it (grant a permission, flip a config) between requests.
+async fn start_server_with_state(
+) -> (std::net::SocketAddr, String, String, std::sync::Arc<AppState>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(dir.path());
     let index = b"<html>hi from xite</html>";
@@ -68,19 +77,60 @@ async fn start_server() -> (std::net::SocketAddr, String, tempfile::TempDir) {
     state.set_owned(&address, true).await;
     // Seed the chart db so the Stats page has data to query.
     state.collect_chart().await;
+    let (wrapper_key, _ajax_key) = state.wrapper_keys(&address).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = UiServer::new(state).router();
+    let router = UiServer::new(state.clone()).router();
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    (addr, address, dir)
+    (addr, address, wrapper_key, state, dir)
+}
+
+#[tokio::test]
+async fn the_wrapper_runs_the_xite_in_an_opaque_origin() {
+    let (addr, xite, key, state, _dir) = start_server_with_state().await;
+    let wrapper = || async {
+        reqwest::Client::new()
+            .get(format!("http://{addr}/{xite}/"))
+            .header("sec-fetch-mode", "navigate")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    let html = wrapper().await;
+    let sandbox = html
+        .split("id='inner-iframe' sandbox=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the inner iframe carries a sandbox attribute");
+    // The xite page is an opaque origin: it can run scripts and navigate, but
+    // it is not this origin, so it cannot script the wrapper or open the
+    // node's WebSocket as the wrapper's origin.
+    assert!(sandbox.contains("allow-scripts"), "{sandbox}");
+    assert!(!sandbox.contains("allow-same-origin"), "default sandbox is opaque: {sandbox}");
+    // The wrapper's own script receives the xite's secret keys and the
+    // gateway flag; the keys are what its WebSocket authenticates with.
+    assert!(html.contains(&format!("wrapper_key = \"{key}\"")), "wrapper embeds its key");
+    assert!(!html.contains(&format!("wrapper_key = \"{xite}\"")), "the key is not the address");
+    assert!(html.contains("ui_restrict = false"), "{html}");
+    let (_, ajax_key) = state.wrapper_keys(&xite).await;
+    assert!(html.contains(&format!("ajax_key = \"{ajax_key}\"")), "wrapper embeds the ajax key");
+
+    // NOSANDBOX is the user's explicit full-trust grant: only then does the
+    // frame share the wrapper's origin.
+    state.add_permission(&xite, "NOSANDBOX").await;
+    let html = wrapper().await;
+    assert!(html.contains("allow-popups-to-escape-sandbox allow-same-origin\""), "{html}");
 }
 
 #[tokio::test]
 async fn serves_xite_files_over_http() {
-    let (addr, xite, _dir) = start_server().await;
+    let (addr, xite, _key, _dir) = start_server().await;
     let body = reqwest::get(format!("http://{addr}/{xite}/index.html"))
         .await
         .unwrap();
@@ -399,7 +449,7 @@ async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
 
 #[tokio::test]
 async fn rejects_cross_origin_websocket() {
-    let (addr, xite, _dir) = start_server().await;
+    let (addr, xite, _key, _dir) = start_server().await;
     // A WebSocket from a foreign Origin is refused (can't drive the local API).
     use tokio_tungstenite::tungstenite::http;
     let req = http::Request::builder()
@@ -417,12 +467,59 @@ async fn rejects_cross_origin_websocket() {
 }
 
 #[tokio::test]
+async fn a_socket_without_the_wrapper_key_never_gains_wrapper_authority() {
+    use tokio_tungstenite::tungstenite::http;
+    let (addr, xite, _key, _dir) = start_server().await;
+
+    // Binding by address (a manual client, an older wrapper, or a page that
+    // opened its own socket) gives a page-level session: an elevated id is
+    // just a number it chose, so admin commands and grants stay refused and
+    // nothing is persisted.
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let denied = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(denied["result"]["error"].as_str().unwrap().contains("permission"), "{denied}");
+    let denied = call_params(&mut ws, "permissionAdd", json!("ADMIN"), 1_000_002).await;
+    assert!(denied["result"]["error"].as_str().unwrap().contains("prompt"), "{denied}");
+    let info = call(&mut ws, "siteInfo", 1_000_003).await;
+    assert!(info["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
+    // Pushed-dialog answers from such a socket are ignored (no reply at all).
+    ws.send(Message::Text(
+        json!({ "cmd": "response", "id": 1_000_004, "to": 1, "result": true }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let pong = call(&mut ws, "ping", 9).await;
+    assert_eq!(pong["to"], 9, "the ignored answer produced no frame of its own");
+
+    // A random key that matches no xite binds the same way (and to nothing).
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={}", "f".repeat(64));
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let denied = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(denied["result"]["error"].is_string(), "{denied}");
+
+    // The sandboxed inner frame is an opaque origin: a socket it opens says
+    // `Origin: null` and is refused at the upgrade, whatever key it carries.
+    let req = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}"))
+        .header("Host", addr.to_string())
+        .header("Origin", "null")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    assert!(tokio_tungstenite::connect_async(req).await.is_err(), "null-origin WS refused");
+}
+
+#[tokio::test]
 async fn own_write_is_not_echoed_back() {
     // EpixNet notifies `ws != self`: the connection whose fileWrite produced a
     // file_done must not receive the event (an echo re-renders the page
     // mid-interaction), while every other connection on the xite does.
     use base64::Engine;
-    let (addr, xite, _dir) = start_server().await;
+    let (addr, xite, _key, _dir) = start_server().await;
     let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
     let (mut writer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
     let (mut watcher, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -456,8 +553,10 @@ async fn own_write_is_not_echoed_back() {
 
 #[tokio::test]
 async fn handles_epixframe_websocket_commands() {
-    let (addr, xite, _dir) = start_server().await;
-    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
+    let (addr, xite, key, _dir) = start_server().await;
+    // The wrapper page connects with the xite's secret wrapper_key: that is
+    // what makes this socket the trusted chrome for the xite.
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let pong = call(&mut ws, "ping", 1).await;
@@ -472,6 +571,9 @@ async fn handles_epixframe_websocket_commands() {
     assert_eq!(info["result"]["content"]["title"], "Test Xite");
     // A xite holds no permissions until the user grants one.
     assert!(info["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
+    // The wrapper/AJAX secrets never travel to a page in siteInfo.
+    assert!(info["result"]["settings"].get("wrapper_key").is_none(), "{info}");
+    assert!(info["result"]["settings"].get("ajax_key").is_none(), "{info}");
 
     // An admin command from the inner page (small id) is refused...
     let denied = call(&mut ws, "siteList", 4).await;

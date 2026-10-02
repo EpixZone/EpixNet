@@ -32,9 +32,9 @@ function deferred() {
   };
 }
 
-function wrapper() {
+function wrapper(windowOverrides) {
   const context = vm.createContext({
-    window: { is_homepage: true },
+    window: Object.assign({ is_homepage: true }, windowOverrides || {}),
     $: { when: value => value, extend: Object.assign },
   });
   vm.runInContext(`var Wrapper = function() {}; var indexOf = [].indexOf;
@@ -144,4 +144,28 @@ test("a page cannot answer the node's dialogs or claim an elevated id", () => {
   // An ordinary page command with its own small id is still forwarded.
   instance.handleMessage({ cmd: "siteInfo", params: [], id: 6 });
   assert.deepEqual(forwarded, [{ cmd: "siteInfo", params: [], id: 6 }]);
+});
+
+// A public gateway grants nothing to any visitor (the node refuses every
+// grant that is not the operator's), so the chrome answers the page instead
+// of opening a dialog whose Allow could only fail - on every load, for
+// everyone, as the dashboard's unconditional ADMIN request would otherwise do.
+test("on a public gateway the permission prompt is skipped and the page is told", () => {
+  const { instance, prompts, commands, replies } = wrapper({ ui_restrict: true });
+  instance.setXiteInfo(fullInfo([]));
+  instance.actionPermissionAdd({ id: 5, params: "ADMIN" });
+  assert.equal(prompts.length, 0, "no dead-end dialog");
+  assert.equal(commands.length, 0, "nothing is sent to the node");
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].to, 5);
+  assert.match(replies[0].result.error, /gateway/);
+});
+
+test("a grant the operator already made on a gateway keeps the silent contract", () => {
+  const { instance, prompts, commands, replies } = wrapper({ ui_restrict: true });
+  instance.setXiteInfo(fullInfo(["ADMIN"]));
+  instance.actionPermissionAdd({ id: 6, params: "ADMIN" });
+  assert.equal(prompts.length, 0);
+  assert.equal(commands.length, 0);
+  assert.equal(replies.length, 0, "already granted: no answer, as on a normal node");
 });

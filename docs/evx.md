@@ -120,6 +120,9 @@ deliberate: there is no unconfined fallback.
 - RSS is sampled, not capped. A native allocation can overshoot between polls.
 - No scheduler, no background lifecycle, no EpixNet grant or publication
   integration, no management UI. Those are the next milestones in the plan.
-- The existing `permissionAdd` self-grant defect in `epix-ui` is untouched and
-  remains the top prerequisite before any xite can be opted in.
+- The `permissionAdd` self-grant defect in `epix-ui` is fixed: grants need the
+  wrapper's prompt, the wrapper's socket is authenticated by the xite's secret
+  key, and the xite page runs in an opaque origin (see `docs/wrapper-sandbox.md`).
+  An independent review of that boundary is still a prerequisite before any
+  xite is opted in.
 - Not independently reviewed. No fuzzing campaign has been run.

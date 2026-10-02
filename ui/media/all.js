@@ -1744,6 +1744,8 @@ if (window.getComputedStyle(document.body).transform) {
         // Answers to the node's confirm/prompt dialogs come from this chrome
         // over its own socket, never from the page.
         return this.log("Ignoring inner response message");
+      } else if (cmd === "innerLoadState") {
+        return this.setInnerLoadState(message.params);
       } else if (cmd === "wrapperRequestFullscreen") {
         return this.actionRequestFullscreen();
       } else if (cmd === "wrapperWebNotification") {
@@ -1913,6 +1915,16 @@ if (window.getComputedStyle(document.body).transform) {
             // builds already out there run their grant callback as if the
             // user had just tapped Grant, before their settings have loaded.
             return false;
+          }
+          if (window.ui_restrict) {
+            // A public gateway grants nothing to anyone (the node refuses
+            // every grant that is not the operator's), so a dialog here could
+            // only dead-end. Tell the page and show nothing.
+            return _this.sendInner({
+              "cmd": "response",
+              "to": message.id,
+              "result": {"error": "Permissions cannot be granted on a public gateway"}
+            });
           }
           grant = function () {
             return _this.ws.cmd("permissionAdd", permission, function (res) {
@@ -2409,14 +2421,31 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.loadingDocumentReady = function () {
-      try {
-        var frame = document.getElementById("inner-iframe");
-        var doc = frame.contentDocument;
-        if (!doc || doc.location.href === "about:blank" || doc.readyState !== "complete") return false;
-        if (doc.documentElement.dataset.epixLoadState) return false;
-        return true;
-      } catch (_) {
-        return !this.loading.screen_visible; // a loading xite must first produce its real document
+      // The inner frame is an opaque origin (the sandbox has no
+      // allow-same-origin), so its document cannot be read from here. A frame
+      // still on about:blank is not the xite; the placeholder the node serves
+      // while a xite is not ready announces itself from inside the frame
+      // (`innerLoadState`, see setInnerLoadState) and is not the xite either.
+      var frame = document.getElementById("inner-iframe");
+      var src = (frame && frame.getAttribute && frame.getAttribute("src")) || "";
+      if (!src || src === "about:blank") return false;
+      if (this.inner_load_state) return false;
+      return true;
+    };
+
+    Wrapper.prototype.setInnerLoadState = function (state) {
+      // The node's waiting placeholder reports "waiting" from inside the
+      // frame. It is not the xite: keep the loading screen up and, once the
+      // clone is complete, load the real document in its place (once).
+      this.inner_load_state = state === "waiting" ? "waiting" : null;
+      if (!this.inner_load_state) {
+        return;
+      }
+      this.inner_loaded = false;
+      var status = this.xite_info && this.xite_info.clone_status;
+      if (status && status.state === "complete" && !this.iframe_recovery_pending) {
+        this.iframe_recovery_pending = true;
+        return this.reloadIframe();
       }
     };
 
@@ -2743,13 +2772,10 @@ if (window.getComputedStyle(document.body).transform) {
       if (xite_info.clone_status) {
         this.loading.showCloneStatus(xite_info.clone_status);
         if (xite_info.clone_status.state === "complete" && this.loading.screen_visible && !this.inner_loaded) {
-          var frame = document.getElementById("inner-iframe");
-          try {
-            if (frame.contentDocument && frame.contentDocument.documentElement.dataset.epixLoadState && !this.iframe_recovery_pending) {
-              this.iframe_recovery_pending = true;
-              this.reloadIframe();
-            }
-          } catch (_) {}
+          if (this.inner_load_state === "waiting" && !this.iframe_recovery_pending) {
+            this.iframe_recovery_pending = true;
+            this.reloadIframe();
+          }
         }
       }
       if (this.loading.screen_visible && !this.xite_info) {
@@ -2964,6 +2990,9 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.reloadIframe = function () {
       var src;
+      // A new document is coming: forget what the old one reported.
+      this.inner_load_state = null;
+      this.inner_loaded = false;
       src = $("iframe").attr("src");
       return this.ws.cmd("serverGetWrapperNonce", [], (function (_this) {
         return function (wrapper_nonce) {
