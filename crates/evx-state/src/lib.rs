@@ -58,8 +58,8 @@ pub use canonical::{
 };
 pub use destination::{Destination, MockDestination};
 pub use xite::{
-    RunRecord, XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS, MAX_TEXT,
-    XITE_BUDGET_LIMIT,
+    RunRecord, XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS,
+    MAX_RUNTIME_PROFILES, MAX_TEXT, XITE_BUDGET_LIMIT,
 };
 
 /// Layout version recorded in the database's `PRAGMA user_version`.
@@ -561,7 +561,9 @@ pub(crate) fn count(conn: &Connection, sql: &str, args: impl rusqlite::Params) -
 }
 
 /// Check that `xite` holds an enabled, unexpired grant whose schema and
-/// authority generations match the ones supplied (when supplied).
+/// authority generations match the ones supplied (when supplied). When a
+/// xite grant exists it must be enabled too: the policy row alone can never
+/// admit a xite whose consent record says no.
 fn allowed(
     conn: &Connection,
     xite: &str,
@@ -572,9 +574,7 @@ fn allowed(
         Some(grant) if grant.enabled => grant,
         _ => return Err(Error::denied("grant disabled or missing")),
     };
-    if xite::expired(conn, xite, xite::now_unix())? {
-        return Err(Error::denied("grant expired"));
-    }
+    xite::check_xite_grant(conn, xite, xite::now_unix()?)?;
     if schema_generation.is_some_and(|expected| grant.schema_generation != expected) {
         return Err(Error::denied("stale schema generation"));
     }
@@ -703,6 +703,14 @@ impl DurableState {
     /// `enabled` or `publication_prefix` change; `limits_generation` advances
     /// only when `budget_limit` changes. Lowering `schema_generation` is a
     /// [`Error::Conflict`].
+    ///
+    /// For a xite that also holds a [`XiteGrant`], `enabled` can only be
+    /// lowered here: `enabled: false` disables the xite grant as well, so
+    /// [`DurableState::xite_grant`] reads back what the fences enforce, and
+    /// `enabled: true` while the xite grant is disabled is an
+    /// [`Error::Conflict`], since re-enabling is consent and only
+    /// [`DurableState::set_xite_grant`] records consent. Budget, schema
+    /// generation and publication prefix changes are unaffected.
     pub fn set_grant(&self, xite: &str, policy: GrantPolicy) -> Result<Generations> {
         identifier(xite)?;
         positive(policy.budget_limit, true)?;
@@ -717,6 +725,16 @@ impl DurableState {
                 .is_some_and(|old| policy.schema_generation < old.schema_generation)
             {
                 return Err(Error::conflict("schema generation cannot move backwards"));
+            }
+            if let Some(xite_grant) = xite::load_xite_grant(conn, xite)? {
+                if policy.enabled && !xite_grant.enabled {
+                    return Err(Error::conflict(
+                        "xite grant is disabled; re-enable it with set_xite_grant",
+                    ));
+                }
+                if !policy.enabled {
+                    xite::disable_xite_grant_row(conn, xite)?;
+                }
             }
             let (generation, limits_generation, used) = match &old {
                 None => (1, 1, 0),

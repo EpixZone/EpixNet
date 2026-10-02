@@ -6,10 +6,11 @@ use std::collections::BTreeSet;
 use evx_api::{Capability, Limits};
 use serde_json::json;
 
+use crate::xite::check_xite_grant;
 use crate::{
     connect, DeliveryStatus, DurableState, Effect, Error, GrantPolicy, MockDestination, RunRecord,
-    XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS, SCHEMA, SCHEMA_VERSION,
-    XITE_BUDGET_LIMIT,
+    XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS, MAX_RUNTIME_PROFILES, SCHEMA,
+    SCHEMA_VERSION, XITE_BUDGET_LIMIT,
 };
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -691,4 +692,178 @@ fn database_written_by_a_newer_schema_is_refused() {
             .unwrap();
     }
     assert_err!(DurableState::open(&f.db_path), Error::Conflict(_));
+}
+
+#[test]
+fn set_grant_cannot_re_enable_a_revoked_xite_grant() {
+    let f = fixture();
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    f.state.revoke_xite("game-a").unwrap();
+    assert_err!(
+        f.state.set_grant(
+            "game-a",
+            GrantPolicy {
+                enabled: true,
+                budget_limit: XITE_BUDGET_LIMIT,
+                schema_generation: 1,
+                publication_prefix: None,
+            },
+        ),
+        Error::Conflict(_)
+    );
+    assert_err!(f.state.begin("game-a", "one", None, 1), Error::Denied(_));
+    let (stored, read_back) = f.state.xite_grant("game-a").unwrap().unwrap();
+    assert!(!stored.enabled);
+    assert_eq!(read_back.generation, 2, "a refused set_grant moves nothing");
+    assert!(!f.state.snapshot("game-a").unwrap().grant.unwrap().enabled);
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    assert!(f.state.begin("game-a", "one", None, 1).unwrap().fresh);
+}
+
+#[test]
+fn set_grant_disable_is_mirrored_into_the_xite_grant() {
+    let f = fixture();
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    f.state
+        .set_grant(
+            "game-a",
+            GrantPolicy {
+                enabled: false,
+                budget_limit: XITE_BUDGET_LIMIT,
+                schema_generation: 1,
+                publication_prefix: None,
+            },
+        )
+        .unwrap();
+    let (stored, read_back) = f.state.xite_grant("game-a").unwrap().unwrap();
+    assert!(!stored.enabled, "status reports what the fences enforce");
+    assert_eq!(read_back.generation, 2);
+    assert_err!(f.state.begin("game-a", "one", None, 1), Error::Denied(_));
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    assert_eq!(generations(&f.state, "game-a"), (3, 1));
+    assert!(f.state.begin("game-a", "one", None, 1).unwrap().fresh);
+}
+
+#[test]
+fn set_grant_can_still_lower_the_budget_of_a_granted_xite() {
+    let f = fixture();
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    f.state
+        .set_grant(
+            "game-a",
+            GrantPolicy {
+                enabled: true,
+                budget_limit: 10,
+                schema_generation: 1,
+                publication_prefix: None,
+            },
+        )
+        .unwrap();
+    let (stored, _) = f.state.xite_grant("game-a").unwrap().unwrap();
+    assert!(stored.enabled);
+    assert_eq!(generations(&f.state, "game-a"), (1, 2));
+    assert_eq!(
+        f.state
+            .snapshot("game-a")
+            .unwrap()
+            .grant
+            .unwrap()
+            .budget_limit,
+        10
+    );
+    assert!(f.state.begin("game-a", "one", None, 1).unwrap().fresh);
+}
+
+#[test]
+fn fences_consult_the_xite_grant_flag_not_only_the_policy_row() {
+    let f = fixture();
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    {
+        // A torn state no API produces: the policy row says yes, the consent
+        // record says no. The consent record wins.
+        let conn = connect(&f.db_path).unwrap();
+        conn.execute("UPDATE xite_grants SET enabled=0 WHERE xite='game-a'", [])
+            .unwrap();
+    }
+    let error = f.state.begin("game-a", "one", None, 1).unwrap_err();
+    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    assert!(error.to_string().contains("xite grant disabled"), "{error}");
+}
+
+#[test]
+fn expiry_check_fails_closed_when_the_clock_cannot_be_read() {
+    let f = fixture();
+    let mut expiring = grant("game-a");
+    expiring.created_unix = 1;
+    expiring.expires_unix = Some(2);
+    f.state.set_xite_grant(&expiring).unwrap();
+    f.state.set_xite_grant(&grant("game-b")).unwrap();
+    let conn = connect(&f.db_path).unwrap();
+    check_xite_grant(&conn, "game-a", 1).unwrap();
+    let error = check_xite_grant(&conn, "game-a", 0).unwrap_err();
+    assert!(matches!(error, Error::Denied(_)), "{error:?}");
+    assert!(error.to_string().contains("expired"), "{error}");
+    check_xite_grant(&conn, "game-b", 0).unwrap();
+    check_xite_grant(&conn, "never-granted", 0).unwrap();
+}
+
+#[test]
+fn xite_grant_reads_grant_and_generations_from_one_snapshot() {
+    let f = fixture();
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    let mut narrower = grant("game-a");
+    narrower.capabilities = BTreeSet::from([Capability::WorkspaceRead]);
+    let writer = DurableState::open(&f.db_path).unwrap();
+    let between_reads = |point: &str| {
+        if point == "between_reads" {
+            writer.set_xite_grant(&narrower).unwrap();
+        }
+    };
+    let (stored, read_back) = f
+        .state
+        .xite_grant_with_failpoint("game-a", Some(&between_reads))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (stored, read_back.generation),
+        (grant("game-a"), 1),
+        "the pair belongs to one write, never the old body with the new generation"
+    );
+    assert_eq!(
+        f.state.xite_grant("game-a").unwrap().unwrap(),
+        (narrower, writer.xite_grant("game-a").unwrap().unwrap().1)
+    );
+    assert_eq!(generations(&f.state, "game-a"), (2, 1));
+}
+
+#[test]
+fn xite_grant_with_too_many_runtime_profiles_is_rejected() {
+    let f = fixture();
+    let mut full = grant("game-a");
+    full.runtime_profiles = (0..MAX_RUNTIME_PROFILES)
+        .map(|index| format!("profile-{index}"))
+        .collect();
+    f.state.set_xite_grant(&full).unwrap();
+    let mut over = full.clone();
+    over.runtime_profiles.insert("one-more".to_owned());
+    assert_err!(f.state.set_xite_grant(&over), Error::Invalid(_));
+    assert_eq!(f.state.xite_grant("game-a").unwrap().unwrap().0, full);
+}
+
+#[test]
+fn unknown_fields_are_refused_when_decoding_grants_and_runs() {
+    let mut grant_json = serde_json::to_value(grant("game-a")).unwrap();
+    assert_eq!(
+        serde_json::from_value::<XiteGrant>(grant_json.clone()).unwrap(),
+        grant("game-a")
+    );
+    grant_json["enabeld"] = json!(true);
+    assert!(serde_json::from_value::<XiteGrant>(grant_json).is_err());
+    let mut run_json = serde_json::to_value(run("main", 1)).unwrap();
+    assert_eq!(
+        serde_json::from_value::<RunRecord>(run_json.clone()).unwrap(),
+        run("main", 1)
+    );
+    run_json["exit_code"] = json!(0);
+    assert!(serde_json::from_value::<RunRecord>(run_json).is_err());
 }
