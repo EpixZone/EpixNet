@@ -2951,6 +2951,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-evx"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "epix-content",
+ "epix-crypt",
+ "epix-plugin",
+ "epix-ui",
+ "epix-xite",
+ "evx-activation",
+ "evx-api",
+ "evx-declaration",
+ "evx-host",
+ "evx-runtime",
+ "evx-state",
+ "evx-supervisor",
+ "hex",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "epix-feed"
 version = "0.1.0"
 dependencies = [
@@ -3044,6 +3069,7 @@ dependencies = [
  "epix-content",
  "epix-core",
  "epix-crypt",
+ "epix-evx",
  "epix-plugin",
  "epix-plugins",
  "epix-runtime",

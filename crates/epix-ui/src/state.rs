@@ -17561,6 +17561,29 @@ impl AppState {
         self.xites.read().await.get(address).map(|x| x.storage.clone())
     }
 
+    /// Read one stored file of a served xite through
+    /// [`XiteStorage::read_bounded`]: no link is followed and a file whose
+    /// recorded size exceeds `max_bytes` is refused before allocation. This is
+    /// the raw-bytes read the EVX service needs for the root `content.json`
+    /// (the decoded [`AppState::content`] value has already collapsed a
+    /// duplicated key, which the strict declaration parser must still see)
+    /// and for the program files it hands the activation loader. The error
+    /// names the rule, never the host path.
+    pub async fn read_xite_file_bounded(
+        &self,
+        address: &str,
+        inner_path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let storage = self
+            .xite_storage(address)
+            .await
+            .ok_or_else(|| format!("xite {address} is not served by this node"))?;
+        storage
+            .read_bounded(inner_path, max_bytes)
+            .map_err(|_| format!("{inner_path}: unavailable or beyond {max_bytes} bytes"))
+    }
+
     /// The node master seed (hex), for deriving per-consumer identity seeds.
     pub(crate) async fn master_seed(&self) -> String {
         self.user.read().await.master_seed.clone()

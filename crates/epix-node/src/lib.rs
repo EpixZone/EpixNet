@@ -4867,6 +4867,10 @@ async fn serve(
     plugins.register(Arc::new(epix_plugins::SidebarPlugin));
     plugins.register(Arc::new(epix_plugins::BeaconPlugin));
     plugins.register(Arc::new(epix_plugins::ChannelPlugin));
+    // EVX: the `evx*` commands and the grant store under private/evx. The
+    // worker binary is resolved at start (EVX_WORKER, else beside this
+    // executable); without it, or off macOS, runs report `unsupported host`.
+    plugins.register(Arc::new(epix_evx::EvxPlugin::default()));
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
     plugin_names.extend(epix_ui::builtin_plugins().into_iter().map(String::from));
     plugin_names.sort();

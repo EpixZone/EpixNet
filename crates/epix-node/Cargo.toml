@@ -17,6 +17,11 @@ epix-ui = { path = "../epix-ui" }
 epix-chain = { path = "../epix-chain" }
 epix-plugin = { path = "../epix-plugin" }
 epix-plugins = { path = "../epix-plugins" }
+# The EVX service and management API (docs/evx-milestone-2.md section 4):
+# the `Evx` plugin that inspects, grants, runs once and revokes a xite's
+# declared programs. Execution is macOS-only in this milestone; elsewhere the
+# plugin still answers inspect, grant and revoke.
+epix-evx = { path = "../epix-evx" }
 # default-features = false so a download-only embedder (the mobile FFI) does
 # NOT pull the runtime's inbound-seeding / local-discovery loops just by
 # depending on the node. Each is re-exposed as a node feature below and put in

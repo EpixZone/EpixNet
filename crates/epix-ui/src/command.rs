@@ -132,6 +132,18 @@ pub fn is_admin_command(cmd: &str) -> bool {
     ADMIN_COMMANDS.contains(&cmd)
 }
 
+/// The EVX management commands only the wrapper's consent dialog or the
+/// operator socket may send (`docs/evx-milestone-2.md` section 4). They mint,
+/// widen, narrow or spend a xite's execution grant, so they are gated in
+/// [`CommandRegistry::dispatch`] exactly like `permissionAdd`: an elevated id
+/// on a socket that authenticated with the xite's `wrapper_key`, or the
+/// operator socket; refused on a restricted gateway except from the operator
+/// socket. A page's forwarded command keeps its small id and never passes,
+/// and a socket a page opened itself never has wrapper authority whatever
+/// id it picks. The list is checked here rather than inside each handler so
+/// a handler can never be reached by a page id, even through `as`.
+pub const EVX_WRAPPER_COMMANDS: &[&str] = &["evxGrant", "evxRevoke", "evxSetLimits", "evxRunOnce"];
+
 /// Commands that create or clone a new xite - blocked by NoNewSites.
 const NEW_XITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
 
@@ -427,6 +439,21 @@ impl CommandRegistry {
             }
             if cmd == "permissionAdd" && !is_wrapper_authority(session, req_id) {
                 return Err("permissionAdd requires the wrapper's permission prompt".into());
+            }
+        }
+        // The EVX grant commands follow the same rule: the wrapper sends
+        // them from its own elevated id range after the user answered the
+        // EVX consent dialog, and a page's `evxRequest` only ever asks. On a
+        // public gateway no dialog is shown and no visitor may enable
+        // execution, so every one of them is refused there except from the
+        // operator socket. The handlers re-check the session shape too, but
+        // this gate is what makes the rule hold for every handler at once.
+        if EVX_WRAPPER_COMMANDS.contains(&cmd) {
+            if restrict {
+                return Err(format!("{cmd} is disabled on this gateway"));
+            }
+            if !is_wrapper_authority(session, req_id) {
+                return Err(format!("{cmd} requires the wrapper's EVX consent prompt"));
             }
         }
         if is_admin_command(cmd) {
@@ -5204,6 +5231,86 @@ mod tests {
             "ok"
         );
         assert!(state.xite_permissions(addr).await.iter().any(|p| p == "Merger:EpixPost"));
+    }
+
+    #[tokio::test]
+    async fn a_page_cannot_reach_the_evx_grant_commands_without_the_wrapper_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1EvxSelfGrant";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        // The default registry has no EVX handlers (they are the Evx plugin's),
+        // so a request that passes the gate dispatches to `null` and one the
+        // gate refuses never gets that far. That is the distinction this test
+        // pins: a page hits the gate, never a handler.
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        let params = json!({ "xite": addr, "declaration_digest": "0".repeat(64), "mode": "enable" });
+
+        for cmd in EVX_WRAPPER_COMMANDS {
+            // The forwarded inner-page shape: small id, no dialog happened.
+            let denied = registry.dispatch(&session, cmd, &params, 7).await;
+            assert!(denied.as_ref().unwrap_err().contains("prompt"), "{cmd}: {denied:?}");
+            // A socket the page opened itself can claim the elevated range,
+            // but it never presented the wrapper_key, so the id proves nothing.
+            let forged = registry.dispatch(&session, cmd, &params, WRAPPER_ID_BASE + 3).await;
+            assert!(forged.as_ref().unwrap_err().contains("prompt"), "{cmd}: {forged:?}");
+            // Rebinding to itself through `as` keeps the page's id.
+            let via_as = registry.dispatch(&session, "as", &json!([addr, cmd, params.clone()]), 8).await;
+            assert!(via_as.is_err(), "{cmd} reached through as");
+            // The wrapper forwarding a page command keeps the small id too.
+            let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&wrapper, cmd, &params, 7).await.is_err(), "{cmd}");
+            // The wrapper's own dialog answer, and the operator socket, pass
+            // the gate (and reach the plugin's handler on a real node).
+            assert!(registry.dispatch(&wrapper, cmd, &params, WRAPPER_ID_BASE + 3).await.is_ok(), "{cmd}");
+            let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&trusted, cmd, &params, 1).await.is_ok(), "{cmd}");
+        }
+        // The inert commands are not gated: a page may inspect and ask.
+        for cmd in ["evxInspect", "evxStatus", "evxRequest"] {
+            assert!(!EVX_WRAPPER_COMMANDS.contains(&cmd));
+            assert!(registry.dispatch(&session, cmd, &json!({}), 7).await.is_ok(), "{cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn evx_grant_commands_are_refused_on_a_public_gateway_even_with_an_elevated_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1EvxGateway";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        state.config_set("ui_restrict", json!(true)).await;
+        let registry = CommandRegistry::with_defaults();
+        let params = json!({ "xite": addr });
+        for cmd in EVX_WRAPPER_COMMANDS {
+            // Any visitor can send an elevated id to a reverse-proxied node,
+            // and the wrapper page (with its key) is served to every visitor.
+            let page = WsSession::new(state.clone(), Some(addr.into()));
+            let denied = registry.dispatch(&page, cmd, &params, WRAPPER_ID_BASE + 1).await;
+            assert!(denied.unwrap_err().contains("gateway"), "{cmd}");
+            let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+            let denied = registry.dispatch(&wrapper, cmd, &params, WRAPPER_ID_BASE + 1).await;
+            assert!(denied.unwrap_err().contains("gateway"), "{cmd}");
+            // The operator socket is the sanctioned way to change a locked node.
+            let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&trusted, cmd, &params, 1).await.is_ok(), "{cmd}");
+        }
+    }
+
+    /// `EVX` is consent recorded by the Evx plugin's own grant store, never a
+    /// permission string: were `permissionAdd` to accept it, the generic
+    /// permission prompt would stand in for the EVX dialog and a stored
+    /// string would look like execution consent to anything matching on it.
+    #[test]
+    fn evx_is_never_a_grantable_permission() {
+        for spelling in ["EVX", "evx", "Evx", "EVX:run", "EVX:enable", "Evx:once"] {
+            assert!(validate_grantable_permission(spelling).is_err(), "accepted {spelling:?}");
+        }
     }
 
     #[tokio::test]

@@ -1,0 +1,33 @@
+[package]
+name = "epix-evx"
+version = "0.1.0"
+edition = "2021"
+description = "The node's EVX service and management API: inspect, consent to, run once and revoke a xite's declared programs (docs/evx-milestone-2.md section 4)."
+
+[dependencies]
+epix-plugin = { path = "../epix-plugin" }
+epix-ui = { path = "../epix-ui" }
+epix-xite = { path = "../epix-xite" }
+epix-content = { path = "../epix-content" }
+evx-api = { path = "../evx-api" }
+evx-declaration = { path = "../evx-declaration" }
+evx-activation = { path = "../evx-activation" }
+evx-state = { path = "../evx-state" }
+evx-host = { path = "../evx-host" }
+evx-supervisor = { path = "../evx-supervisor" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+async-trait = "0.1"
+tokio = { version = "1", features = ["rt", "sync"] }
+sha2 = "0.10"
+hex = "0.4"
+# An in-memory node (no data root) keeps its EVX state in a throwaway
+# directory that lives as long as the service; nothing is persisted for it.
+tempfile = "3"
+
+[dev-dependencies]
+epix-crypt = { path = "../epix-crypt" }
+# Fixture programs are written as WebAssembly text and compiled to the binary
+# the manifest pins. The service itself never links the text format.
+evx-runtime = { path = "../evx-runtime", features = ["text"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
