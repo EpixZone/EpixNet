@@ -28,9 +28,16 @@
 //! UTC day starts a new count by key, not by deletion, so a reopen on the
 //! same day keeps yesterday's number out of today's.
 //!
-//! Nothing here reads the clock: every operation takes `now` from the host,
-//! so the scheduler's tests run on a fixed time line and the host's single
-//! clock read per tick is the only one in the system.
+//! No scheduling decision here reads the clock: every operation takes
+//! `now` from the host, so the scheduler's tests run on a fixed time line
+//! and the host's single clock read per tick is the only one in the
+//! system. That includes the grant expiry a claim checks:
+//! [`DurableState::claim_occurrence`] checks it at the `now` it is given,
+//! so what [`DurableState::due_jobs`] called due at that moment is
+//! claimable at that moment, never a wall-clock second later. The one
+//! clock read left is inside [`DurableState::finish_occurrence`], whose
+//! commit is the Milestone 1 `commit` and checks the grant the way every
+//! commit does; it decides nothing about the schedule.
 
 use evx_declaration::{Anchor, Schedule};
 use rusqlite::{params, Connection, OptionalExtension as _};
@@ -40,13 +47,19 @@ use serde_json::{json, Value};
 use crate::canonical::{identifier, sha256_hex};
 use crate::xite::{load_xite_grant, text, timestamp};
 use crate::{
-    begin_in, canonical, commit_in, digest, invocation_row, prepare_commit, transaction,
+    begin_in_at, canonical, commit_in, digest, invocation_row, prepare_commit, transaction,
     DurableState, Error, Invocation, InvocationRow, InvocationStatus, Result, INVOCATION_COLUMNS,
     MAX_LIMIT,
 };
 
 /// Seconds in one UTC day; the daily budget's window.
 pub const SECONDS_PER_DAY: u64 = 86_400;
+/// How many UTC days of a xite's daily run counts are kept behind the day
+/// being reserved. A count is dropped only once it is older than this, so
+/// a clock that rolls back into a recent day finds that day's spent budget
+/// rather than a fresh one; a rollback further than a week is a clock
+/// nobody should trust and is not defended against here.
+pub const DAILY_RUN_RETENTION_DAYS: u64 = 7;
 /// Most jobs one `set_jobs` call may register for a xite.
 pub const MAX_JOBS: usize = 64;
 /// Largest `max_concurrency` a job may declare (the declaration's `1..=16`).
@@ -526,20 +539,30 @@ impl DurableState {
     /// is an [`Error::Conflict`], one that was disabled or paused, or whose
     /// grant no longer allows background work, is [`Error::Denied`] (the
     /// grant's own `enabled` and expiry are checked by the reservation as
-    /// for every invocation). A slot earlier than `last_slot` is a clock
-    /// rollback or an out-of-order wake and is an [`Error::Conflict`] with
-    /// nothing changed; the slot equal to `last_slot` is the same occurrence
-    /// again and comes back with `fresh == false`, completed or not, so a
-    /// manual run and the scheduled run of one slot can never both start.
-    /// Only a fresh reservation moves `last_slot` and `last_occurrence`.
+    /// for every invocation, the expiry against `now`, the same tick the
+    /// scheduler passed to [`DurableState::due_jobs`], so the two can never
+    /// disagree about an expiring grant). A slot earlier than `last_slot`
+    /// is a clock rollback or an out-of-order wake and is an
+    /// [`Error::Conflict`] with nothing changed; the slot equal to
+    /// `last_slot` is the same occurrence again and comes back with
+    /// `fresh == false`, completed or not, so a manual run and the scheduled
+    /// run of one slot can never both start. Only a fresh reservation moves
+    /// `last_slot` and `last_occurrence`.
+    ///
+    /// `now` is one parameter more than the spec's signature: the spec has
+    /// the reservation read the clock, which would make the claim's expiry
+    /// check untestable on a fixed time line and able to deny what
+    /// `due_jobs(now)` just admitted.
     pub fn claim_occurrence(
         &self,
         xite: &str,
         job: &JobRow,
         slot: &Slot,
         request: &Value,
+        now: u64,
     ) -> Result<Invocation> {
         identifier(xite)?;
+        timestamp(now, "now")?;
         if job.xite != xite {
             return Err(Error::invalid("job belongs to another xite"));
         }
@@ -585,7 +608,7 @@ impl DurableState {
                     "clock rollback: slot before the last claimed slot",
                 ));
             }
-            let invocation = begin_in(conn, xite, &occurrence, &request_digest, 1)?;
+            let invocation = begin_in_at(conn, xite, &occurrence, &request_digest, 1, now)?;
             if invocation.fresh {
                 update_job(
                     conn,
@@ -612,6 +635,15 @@ impl DurableState {
     /// [`Error::Conflict`]. A job that vanished while its occurrence ran
     /// still gets the occurrence completed, since the reservation must never
     /// be left open; there is then no row to update.
+    ///
+    /// `next_due_unix` was computed from the cadence the occurrence was
+    /// claimed under, so it is stored only while the row still names this
+    /// occurrence as its last one. A `set_jobs` with a new period between
+    /// the claim and the finish restarted the row's slot bookkeeping and
+    /// put its own `next_due_unix` there; writing the old cadence's value
+    /// over it would make the job early or late by an arbitrary amount.
+    /// The failure count is kept or reset either way, since it survives a
+    /// re-registration too.
     pub fn finish_occurrence(
         &self,
         invocation: &Invocation,
@@ -638,11 +670,19 @@ impl DurableState {
             } else {
                 0
             };
-            update_job(
-                conn,
-                "UPDATE jobs SET failures=?1, next_due_unix=?2 WHERE xite=?3 AND job=?4",
-                params![failures, next_due_unix, invocation.xite, job],
-            )
+            if row.last_occurrence.as_deref() == Some(invocation.occurrence.as_str()) {
+                update_job(
+                    conn,
+                    "UPDATE jobs SET failures=?1, next_due_unix=?2 WHERE xite=?3 AND job=?4",
+                    params![failures, next_due_unix, invocation.xite, job],
+                )
+            } else {
+                update_job(
+                    conn,
+                    "UPDATE jobs SET failures=?1 WHERE xite=?2 AND job=?3",
+                    params![failures, invocation.xite, job],
+                )
+            }
         })
     }
 
@@ -685,8 +725,10 @@ impl DurableState {
     /// falls in, or fail with [`Error::BudgetExceeded`] when `limit` runs
     /// are already counted (a limit of 0 admits nothing). The count is a
     /// row keyed on the xite and the day, so a restart keeps it and a new
-    /// day starts at zero by key; the xite's rows for earlier days are
-    /// dropped here since nothing reads them again.
+    /// day starts at zero by key. The xite's rows for the last
+    /// [`DAILY_RUN_RETENTION_DAYS`] days are kept, so a clock that rolls
+    /// back into a day whose budget was spent finds that count and admits
+    /// nothing more; only older rows are dropped here.
     pub fn reserve_daily_run(&self, xite: &str, now: u64, limit: u32) -> Result<()> {
         identifier(xite)?;
         timestamp(now, "now")?;
@@ -694,7 +736,7 @@ impl DurableState {
         transaction(&self.path, |conn| {
             conn.execute(
                 "DELETE FROM daily_runs WHERE xite=?1 AND day<?2",
-                params![xite, day],
+                params![xite, day.saturating_sub(DAILY_RUN_RETENTION_DAYS)],
             )?;
             let runs: u32 = conn
                 .query_row(

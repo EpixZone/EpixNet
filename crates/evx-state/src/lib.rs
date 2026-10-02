@@ -71,8 +71,8 @@ pub use canonical::{
 };
 pub use destination::{Destination, MockDestination};
 pub use jobs::{
-    JobRow, JobSpec, Slot, MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID, OCCURRENCE_SEPARATOR,
-    SECONDS_PER_DAY,
+    JobRow, JobSpec, Slot, DAILY_RUN_RETENTION_DAYS, MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID,
+    OCCURRENCE_SEPARATOR, SECONDS_PER_DAY,
 };
 pub use xite::{
     RunRecord, XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS,
@@ -578,21 +578,24 @@ pub(crate) fn count(conn: &Connection, sql: &str, args: impl rusqlite::Params) -
     Ok(conn.query_row(sql, args, |row| row.get::<_, u64>(0))?)
 }
 
-/// Check that `xite` holds an enabled, unexpired grant whose schema and
-/// authority generations match the ones supplied (when supplied). When a
-/// xite grant exists it must be enabled too: the policy row alone can never
-/// admit a xite whose consent record says no.
+/// Check that `xite` holds an enabled grant, unexpired at `now`, whose
+/// schema and authority generations match the ones supplied (when
+/// supplied). When a xite grant exists it must be enabled too: the policy
+/// row alone can never admit a xite whose consent record says no. `now` is
+/// the caller's: the Milestone 2 operations read the clock, a job claim
+/// passes the scheduler's tick so the claim and `due_jobs` agree.
 fn allowed(
     conn: &Connection,
     xite: &str,
     generation: Option<u64>,
     schema_generation: Option<u64>,
+    now: u64,
 ) -> Result<GrantRow> {
     let grant = match load_grant(conn, xite)? {
         Some(grant) if grant.enabled => grant,
         _ => return Err(Error::denied("grant disabled or missing")),
     };
-    xite::check_xite_grant(conn, xite, xite::now_unix()?)?;
+    xite::check_xite_grant(conn, xite, now)?;
     if schema_generation.is_some_and(|expected| grant.schema_generation != expected) {
         return Err(Error::denied("stale schema generation"));
     }
@@ -615,10 +618,7 @@ fn invocation_from_row(row: InvocationRow, fresh: bool) -> Invocation {
     }
 }
 
-/// The body of [`DurableState::begin`], run inside a caller-owned
-/// `BEGIN IMMEDIATE` transaction so a job claim can reserve the occurrence
-/// and update its job row atomically. Inputs are already validated and
-/// `request_digest` is the digest of the canonical request.
+/// The body of [`DurableState::begin`] at the wall clock's `now`.
 pub(crate) fn begin_in(
     conn: &Connection,
     xite: &str,
@@ -626,7 +626,30 @@ pub(crate) fn begin_in(
     request_digest: &str,
     cost: u64,
 ) -> Result<Invocation> {
-    let grant = allowed(conn, xite, None, None)?;
+    begin_in_at(
+        conn,
+        xite,
+        occurrence,
+        request_digest,
+        cost,
+        xite::now_unix()?,
+    )
+}
+
+/// The body of [`DurableState::begin`], run inside a caller-owned
+/// `BEGIN IMMEDIATE` transaction so a job claim can reserve the occurrence
+/// and update its job row atomically, with the grant's expiry checked at
+/// the caller's `now`. Inputs are already validated and `request_digest`
+/// is the digest of the canonical request.
+pub(crate) fn begin_in_at(
+    conn: &Connection,
+    xite: &str,
+    occurrence: &str,
+    request_digest: &str,
+    cost: u64,
+    now: u64,
+) -> Result<Invocation> {
+    let grant = allowed(conn, xite, None, None, now)?;
     if let Some(prior) = load_invocation(conn, xite, occurrence)? {
         if prior.request_digest != request_digest || prior.cost != cost {
             return Err(Error::conflict("occurrence payload or cost conflict"));
@@ -728,6 +751,7 @@ pub(crate) fn commit_in(
         &invocation.xite,
         Some(row.generation),
         Some(row.schema_generation),
+        xite::now_unix()?,
     )?;
     let mut encoded = prepared
         .effects
@@ -1052,6 +1076,7 @@ impl DurableState {
                 &invocation.xite,
                 Some(invocation.generation),
                 Some(invocation.schema_generation),
+                xite::now_unix()?,
             )?;
             let row = load_invocation(conn, &invocation.xite, &invocation.occurrence)?;
             match row {
@@ -1182,6 +1207,7 @@ impl DurableState {
                     &row.xite,
                     Some(row.generation),
                     Some(row.schema_generation),
+                    xite::now_unix()?,
                 ) {
                     Ok(_) => {}
                     Err(Error::Denied(_)) => {

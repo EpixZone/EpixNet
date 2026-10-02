@@ -11,7 +11,8 @@ use serde_json::{json, Value};
 
 use crate::{
     connect, DurableState, Error, Invocation, InvocationStatus, JobRow, JobSpec, Slot, XiteGrant,
-    MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID, SCHEMA, SCHEMA_VERSION, SECONDS_PER_DAY,
+    DAILY_RUN_RETENTION_DAYS, MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID, SCHEMA, SCHEMA_VERSION,
+    SECONDS_PER_DAY,
 };
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -109,7 +110,7 @@ fn request(row: &JobRow, slot: &Slot) -> Value {
 fn claim(state: &DurableState, xite: &str, name: &str, now: u64) -> crate::Result<Invocation> {
     let row = job(state, xite, name);
     let slot = DurableState::slot_at(&row.schedule, now).unwrap();
-    state.claim_occurrence(xite, &row, &slot, &request(&row, &slot))
+    state.claim_occurrence(xite, &row, &slot, &request(&row, &slot), now)
 }
 
 fn finish(state: &DurableState, invocation: &Invocation, failed: bool) -> crate::Result<()> {
@@ -557,7 +558,7 @@ fn claim_occurrence_reserves_the_current_slot_and_records_it_on_the_job() {
     let slot = DurableState::slot_at(&row.schedule, NOW).unwrap();
     let invocation = f
         .state
-        .claim_occurrence("game-a", &row, &slot, &request(&row, &slot))
+        .claim_occurrence("game-a", &row, &slot, &request(&row, &slot), NOW)
         .unwrap();
     assert!(invocation.fresh);
     assert!(!invocation.completed);
@@ -622,7 +623,7 @@ fn skip_policy_after_a_gap_claims_only_the_current_slot() {
     let missed = DurableState::slot_at(&row.schedule, NOW + 2 * PERIOD).unwrap();
     assert_err!(
         f.state
-            .claim_occurrence("game-a", &row, &missed, &request(&row, &missed)),
+            .claim_occurrence("game-a", &row, &missed, &request(&row, &missed), later),
         Error::Conflict(_)
     );
     assert_eq!(f.state.snapshot("game-a").unwrap().invocations.len(), 2);
@@ -684,7 +685,7 @@ fn claim_occurrence_refuses_a_request_or_slot_that_is_not_the_jobs() {
     wrong_digest["declaration_digest"] = json!(DIGEST_B);
     for bad in [extra, wrong_slot, wrong_digest, json!(null), json!([])] {
         assert_err!(
-            f.state.claim_occurrence("game-a", &row, &slot, &bad),
+            f.state.claim_occurrence("game-a", &row, &slot, &bad, NOW),
             Error::Invalid(_)
         );
     }
@@ -695,12 +696,17 @@ fn claim_occurrence_refuses_a_request_or_slot_that_is_not_the_jobs() {
     };
     assert_err!(
         f.state
-            .claim_occurrence("game-a", &row, &foreign, &request(&row, &foreign)),
+            .claim_occurrence("game-a", &row, &foreign, &request(&row, &foreign), NOW),
         Error::Invalid(_)
     );
     assert_err!(
         f.state
-            .claim_occurrence("game-b", &row, &slot, &request(&row, &slot)),
+            .claim_occurrence("game-b", &row, &slot, &request(&row, &slot), NOW),
+        Error::Invalid(_)
+    );
+    assert_err!(
+        f.state
+            .claim_occurrence("game-a", &row, &slot, &request(&row, &slot), (1 << 53) + 1),
         Error::Invalid(_)
     );
     assert!(f.state.snapshot("game-a").unwrap().invocations.is_empty());
@@ -731,6 +737,113 @@ fn claim_occurrence_denies_a_paused_disabled_or_background_less_job() {
 }
 
 #[test]
+fn claim_occurrence_checks_grant_expiry_at_the_schedulers_now_not_the_clock() {
+    let f = fixture();
+    let mut expiring = grant("game-a");
+    // Long past on the wall clock: a claim that read the clock would deny
+    // every claim below, a claim at `now` denies only the one at or past it.
+    expiring.expires_unix = Some(NOW + 10);
+    f.state.set_xite_grant(&expiring).unwrap();
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    assert_eq!(f.state.due_jobs(NOW + 9).unwrap().len(), 1);
+    let claimed = claim(&f.state, "game-a", "sync", NOW + 9).unwrap();
+    assert!(claimed.fresh, "due at NOW + 9 is claimable at NOW + 9");
+    f.state
+        .set_job_next_due("game-a", "sync", Some(NOW + PERIOD))
+        .unwrap();
+    assert!(f.state.due_jobs(NOW + PERIOD).unwrap().is_empty());
+    assert_err!(
+        claim(&f.state, "game-a", "sync", NOW + PERIOD),
+        Error::Denied(_)
+    );
+    assert_eq!(
+        f.state.snapshot("game-a").unwrap().invocations.len(),
+        1,
+        "an expired claim reserves nothing"
+    );
+    assert_eq!(
+        job(&f.state, "game-a", "sync").last_slot,
+        Some(NOW / PERIOD),
+        "an expired claim records no slot"
+    );
+    // The boundary is the grant's: expiry at `expires_unix` itself.
+    let mut boundary = grant("game-b");
+    boundary.expires_unix = Some(NOW + 10);
+    f.state.set_xite_grant(&boundary).unwrap();
+    f.state
+        .set_jobs(
+            "game-b",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    assert_err!(
+        claim(&f.state, "game-b", "sync", NOW + 10),
+        Error::Denied(_)
+    );
+    assert!(claim(&f.state, "game-b", "sync", NOW + 9).unwrap().fresh);
+}
+
+#[test]
+fn concurrent_claims_of_one_slot_start_it_exactly_once() {
+    let f = fixture();
+    let row = granted_job(&f, "game-a", Missed::Skip);
+    let slot = DurableState::slot_at(&row.schedule, NOW).unwrap();
+    let outcomes = std::thread::scope(|scope| {
+        let workers: Vec<_> = (0..8)
+            .map(|_| {
+                let db_path = f.db_path.clone();
+                let row = row.clone();
+                scope.spawn(move || {
+                    let state = DurableState::open(&db_path).unwrap();
+                    state.claim_occurrence("game-a", &row, &slot, &request(&row, &slot), NOW)
+                })
+            })
+            .collect();
+        workers
+            .into_iter()
+            .map(|worker| worker.join().unwrap())
+            .collect::<Vec<_>>()
+    });
+    let occurrence = DurableState::occurrence_id("sync", &slot);
+    let mut fresh = 0;
+    let mut token = None;
+    for outcome in outcomes {
+        match outcome {
+            Ok(invocation) => {
+                assert_eq!(invocation.occurrence, occurrence);
+                assert!(!invocation.completed);
+                assert_eq!(
+                    *token.get_or_insert(invocation.token.clone()),
+                    invocation.token
+                );
+                if invocation.fresh {
+                    fresh += 1;
+                }
+            }
+            Err(Error::Conflict(_)) => {}
+            Err(error) => panic!("unexpected error: {error:?}"),
+        }
+    }
+    assert_eq!(fresh, 1, "one logical occurrence starts once");
+    let rows = f.state.snapshot("game-a").unwrap().invocations;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].occurrence, occurrence);
+    let stored = job(&f.state, "game-a", "sync");
+    assert_eq!(stored.last_slot, Some(slot.index));
+    assert_eq!(stored.last_occurrence.as_deref(), Some(occurrence.as_str()));
+    assert_eq!(f.state.incomplete_occurrences(None).unwrap().len(), 1);
+}
+
+#[test]
 fn claim_occurrence_refuses_a_stale_job_row() {
     let f = fixture();
     let stale = granted_job(&f, "game-a", Missed::Skip);
@@ -745,7 +858,7 @@ fn claim_occurrence_refuses_a_stale_job_row() {
     let slot = DurableState::slot_at(&stale.schedule, NOW).unwrap();
     assert_err!(
         f.state
-            .claim_occurrence("game-a", &stale, &slot, &request(&stale, &slot)),
+            .claim_occurrence("game-a", &stale, &slot, &request(&stale, &slot), NOW),
         Error::Conflict(_)
     );
     f.state.set_jobs("game-a", DIGEST_B, &[], NOW).unwrap();
@@ -756,7 +869,7 @@ fn claim_occurrence_refuses_a_stale_job_row() {
     };
     assert_err!(
         f.state
-            .claim_occurrence("game-a", &current, &slot, &request(&current, &slot)),
+            .claim_occurrence("game-a", &current, &slot, &request(&current, &slot), NOW),
         Error::Conflict(_)
     );
 }
@@ -909,6 +1022,64 @@ fn finish_occurrence_for_a_vanished_job_still_completes_the_reservation() {
     let again = claim(&f.state, "game-a", "sync", NOW + 2).unwrap();
     assert!(!again.fresh);
     assert!(again.completed);
+}
+
+#[test]
+fn finish_occurrence_keeps_the_next_due_of_a_job_re_registered_with_a_new_period() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let running = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    // The publisher changes the cadence while the occurrence runs.
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_B,
+            &[spec("sync", 3600, Missed::Skip)],
+            NOW + 5,
+        )
+        .unwrap();
+    let registered = (NOW / 3600) * 3600;
+    assert_eq!(
+        job(&f.state, "game-a", "sync").next_due_unix,
+        Some(registered)
+    );
+    finish(&f.state, &running, true).unwrap();
+    assert_eq!(
+        invocation_status(&f.state, "game-a", &running.occurrence),
+        InvocationStatus::Completed
+    );
+    let row = job(&f.state, "game-a", "sync");
+    assert_eq!(
+        row.next_due_unix,
+        Some(registered),
+        "the old cadence's next due does not clobber the fresh registration"
+    );
+    assert_eq!(row.failures, 1, "the failure still counts");
+    assert_eq!(row.last_slot, None);
+    assert_eq!(row.last_occurrence, None);
+    // Re-registered under the same period, the row still names the
+    // occurrence and the finish moves the schedule on as usual.
+    let second = claim(&f.state, "game-a", "sync", NOW + 5).unwrap();
+    assert!(second.fresh);
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", 3600, Missed::Skip)],
+            NOW + 6,
+        )
+        .unwrap();
+    f.state
+        .finish_occurrence(
+            &second,
+            &json!({"status": "ok"}),
+            Some(registered + 3600),
+            false,
+        )
+        .unwrap();
+    let row = job(&f.state, "game-a", "sync");
+    assert_eq!(row.next_due_unix, Some(registered + 3600));
+    assert_eq!(row.failures, 0);
 }
 
 // Reopen
@@ -1079,8 +1250,43 @@ fn daily_budget_resets_on_the_next_utc_day() {
             .unwrap(),
         1
     );
-    // Yesterday's count is collected once a newer day is reserved.
-    assert_eq!(f.state.daily_runs("game-a", day_end - 1).unwrap(), 0);
+    // Yesterday's count is kept: a reservation on a newer day collects only
+    // days older than the retention window.
+    assert_eq!(f.state.daily_runs("game-a", day_end - 1).unwrap(), 1);
+}
+
+#[test]
+fn daily_budget_rolled_back_into_a_spent_day_finds_that_days_count() {
+    let f = fixture();
+    let day_start = (NOW / SECONDS_PER_DAY) * SECONDS_PER_DAY;
+    let next_day = day_start + SECONDS_PER_DAY;
+    f.state.reserve_daily_run("game-a", NOW, 2).unwrap();
+    f.state.reserve_daily_run("game-a", NOW + 1, 2).unwrap();
+    f.state.reserve_daily_run("game-a", next_day, 2).unwrap();
+    // The clock rolls back into the spent day.
+    assert_eq!(f.state.daily_runs("game-a", NOW).unwrap(), 2);
+    assert_err!(
+        f.state.reserve_daily_run("game-a", NOW + 2, 2),
+        Error::BudgetExceeded(_)
+    );
+    // And from the far edge of the window, where the count is still there.
+    let edge = day_start + DAILY_RUN_RETENTION_DAYS * SECONDS_PER_DAY;
+    f.state.reserve_daily_run("game-a", edge, 2).unwrap();
+    assert_eq!(f.state.daily_runs("game-a", next_day).unwrap(), 1);
+    assert_eq!(f.state.daily_runs("game-a", NOW).unwrap(), 2);
+    // One day further collects the oldest day and nothing newer.
+    f.state
+        .reserve_daily_run("game-a", edge + SECONDS_PER_DAY, 2)
+        .unwrap();
+    assert_eq!(f.state.daily_runs("game-a", NOW).unwrap(), 0);
+    assert_eq!(f.state.daily_runs("game-a", next_day).unwrap(), 1);
+    assert_eq!(f.state.daily_runs("game-a", edge).unwrap(), 1);
+    // Another xite's rows are not the collector's business.
+    f.state.reserve_daily_run("game-b", NOW, 1).unwrap();
+    f.state
+        .reserve_daily_run("game-a", edge + 2 * SECONDS_PER_DAY, 2)
+        .unwrap();
+    assert_eq!(f.state.daily_runs("game-b", NOW).unwrap(), 1);
 }
 
 #[test]
