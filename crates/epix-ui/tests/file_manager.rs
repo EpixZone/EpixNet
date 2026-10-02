@@ -261,3 +261,228 @@ async fn an_operator_relocated_xite_root_remains_browsable() {
         vec!["nested/readme.txt"]
     );
 }
+
+// ---------------------------------------------------------------------------
+// The inert EVX inspection panel (`/list/<xite>/?evx=1`).
+// ---------------------------------------------------------------------------
+
+const ENTRY: &[u8] = b"\0asm\x01\0\0\0presence";
+const LIB: &[u8] = b"\0asm\x01\0\0\0lib";
+
+/// The baseline declaration of `crates/evx-declaration`'s tests: one program
+/// with a dependency, a capability set and explicit limits, and one interval
+/// job.
+fn baseline_evx() -> serde_json::Value {
+    json!({
+        "version": 1,
+        "programs": {
+            "presence": {
+                "runtime_profile": "wasm-core-v1",
+                "entry": "evx/presence.wasm",
+                "dependencies": ["evx/lib.wasm"],
+                "allow_run_once": true,
+                "capabilities": [{ "api": "workspace.read" }, { "api": "workspace.write" }],
+                "limits": { "memory_bytes": 2_097_152, "fuel": 500_000 }
+            }
+        },
+        "jobs": {
+            "presence-every-30m": {
+                "program": "presence",
+                "schedule": { "type": "interval", "seconds": 1800, "anchor": "unix_epoch", "missed": "skip" },
+                "max_concurrency": 1
+            }
+        }
+    })
+}
+
+fn manifest_entry(bytes: &[u8]) -> serde_json::Value {
+    json!({ "size": bytes.len(), "sha512": XiteStorage::hash_bytes(bytes) })
+}
+
+/// A xite whose root content.json carries `evx`, with the two program files
+/// on disk. Signed by a fresh owner key when `signed`, else stored as an
+/// unsigned local copy under the fixed test address. Returns the served
+/// address and the root as loaded.
+async fn evx_fixture(
+    signed: bool,
+    evx: serde_json::Value,
+) -> (tempfile::TempDir, Arc<AppState>, axum::Router, String, serde_json::Value) {
+    let directory = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(directory.path().join("xite"));
+    let index = b"<html>presence</html>";
+    storage.write("index.html", index).unwrap();
+    storage.write("evx/presence.wasm", ENTRY).unwrap();
+    storage.write("evx/lib.wasm", LIB).unwrap();
+    let (address, key) = if signed {
+        let key = epix_crypt::new_seed();
+        (epix_crypt::privatekey_to_address(&key).unwrap(), Some(key))
+    } else {
+        (ADDRESS.to_string(), None)
+    };
+    let mut root = json!({
+        "address": address,
+        "title": "Presence",
+        "modified": 1_700_000_000.0_f64,
+        "files": {
+            "index.html": manifest_entry(index),
+            "evx/presence.wasm": manifest_entry(ENTRY),
+            "evx/lib.wasm": manifest_entry(LIB),
+        },
+        "evx": evx
+    });
+    if let Some(key) = key {
+        epix_content::sign(&mut root, &key).unwrap();
+    }
+    storage
+        .write("content.json", epix_content::dumps_content(&root).as_bytes())
+        .unwrap();
+    let state = AppState::new("evx-file-manager-test");
+    state
+        .add_xite(&address, XiteEntry { storage, content: Some(root.clone()) })
+        .await;
+    let router = UiServer::new(state.clone()).router();
+    (directory, state, router, address, root)
+}
+
+#[tokio::test]
+async fn evx_panel_renders_the_signed_declaration_with_digest_hashes_and_statuses() {
+    let (_directory, _state, router, address, root) = evx_fixture(true, baseline_evx()).await;
+    let host = "127.0.0.1:42222";
+    let (status, html) = request(&router, host, &format!("/list/{address}?evx=1")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(html.contains("id='evx-panel'"), "panel present: {html}");
+    for label in ["Integrity verified", "EVX profile valid", "EVX enabled for this xite"] {
+        assert!(html.contains(&format!("<dt>{label}</dt>")), "status row {label}: {html}");
+    }
+    assert!(html.contains("<dd class='ok'>verified</dd>"), "signed and complete: {html}");
+    assert!(html.contains("<dd class='ok'>valid</dd>"), "declaration valid: {html}");
+    assert!(
+        html.contains("<dd class='bad'>no: no grant is stored for this xite</dd>"),
+        "no grant source installed: {html}"
+    );
+    let digest = evx_declaration::declaration_digest(&root).unwrap();
+    assert!(html.contains(&format!("<code>{digest}</code>")), "digest: {html}");
+    for (path, bytes) in [("evx/presence.wasm", ENTRY), ("evx/lib.wasm", LIB)] {
+        assert!(html.contains(&XiteStorage::hash_bytes(bytes)), "sha512 of {path}");
+        assert!(
+            html.contains(&format!("<a href='/{address}/{path}' download>{path}</a>")),
+            "download link for {path}: {html}"
+        );
+        assert!(html.contains(&format!("<td>{} B</td>", bytes.len())), "size of {path}");
+    }
+    assert!(html.contains(&format!("<p>{} B in all.</p>", ENTRY.len() + LIB.len())));
+    for expected in [
+        "<code>workspace.read</code>, <code>workspace.write</code>",
+        "<code>memory_bytes=2097152</code>",
+        "<code>fuel=500000</code>",
+        "<dt>Run once</dt><dd>requested</dd>",
+        "<code>presence-every-30m</code>",
+        "every 1800 s from unix_epoch, missed: skip",
+    ] {
+        assert!(html.contains(expected), "missing {expected:?}: {html}");
+    }
+    // The plain listing offers the panel; the panel does not offer itself.
+    let (_, listing) = request(&router, host, &format!("/list/{address}")).await;
+    let link = format!("href='/list/{address}?evx=1'");
+    assert!(listing.contains(&link), "listing links to the panel: {listing}");
+    assert!(!listing.contains("id='evx-panel'"));
+    assert!(!html.contains(&link));
+}
+
+#[tokio::test]
+async fn evx_panel_reports_an_unsigned_content_json() {
+    let (_directory, _state, router, address, _) = evx_fixture(false, baseline_evx()).await;
+    let (status, html) = request(&router, "dashboard.epix", &format!("/list/{address}?evx=1")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(
+        html.contains("<dt>Integrity verified</dt><dd class='bad'>unsigned: "),
+        "unsigned status: {html}"
+    );
+    assert!(!html.contains("<dd class='ok'>verified</dd>"));
+    // The declaration itself still parses and shows: the status is what
+    // tells the reader not to trust it yet.
+    assert!(html.contains("<dd class='ok'>valid</dd>"), "{html}");
+    assert!(html.contains(&XiteStorage::hash_bytes(ENTRY)));
+}
+
+#[tokio::test]
+async fn evx_panel_lists_unsupported_items_with_their_reasons() {
+    let mut evx = baseline_evx();
+    evx["programs"]["native"] = json!({
+        "runtime_profile": "native-v9",
+        "entry": "bin/native",
+        "capabilities": []
+    });
+    evx["streams"] = json!({ "presence": { "retention": "forever" } });
+    let (_directory, _state, router, address, _) = evx_fixture(true, evx).await;
+    let (status, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert_eq!(status, 200, "{html}");
+    assert!(
+        html.contains("<dd class='warn'>valid, with 2 unsupported items</dd>"),
+        "profile status counts the items: {html}"
+    );
+    for expected in [
+        "<code>programs.native</code>: <span class='reason'>runtime profile &quot;native-v9&quot; not supported</span>",
+        "<code>streams.presence</code>: <span class='reason'>retained streams not supported</span>",
+        "<h4><code>native</code></h4><p class='reason'>Unsupported:</p><ul class='reason'><li>runtime profile &quot;native-v9&quot; not supported</li></ul>",
+    ] {
+        assert!(html.contains(expected), "missing {expected:?}: {html}");
+    }
+    // The usable program is unaffected.
+    assert!(html.contains("<h4><code>presence</code></h4><table>"), "{html}");
+    assert!(!html.contains("bin/native' download"), "an unsupported program is never linked");
+}
+
+#[tokio::test]
+async fn evx_panel_escapes_a_hostile_program_id_and_entry_path() {
+    // A hostile entry path passes the parser (it is a valid relative path) and
+    // reaches the programs table; a hostile id fails it and reaches the page
+    // through the parser's message. Both must come out inert.
+    let hostile_entry = "evx/<img src=x onerror='alert(1)'>.wasm";
+    let mut evx = baseline_evx();
+    evx["programs"]["presence"]["entry"] = json!(hostile_entry);
+    let (_directory, _state, router, address, _) = evx_fixture(true, evx).await;
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(!html.contains("<img"), "entry path became markup: {html}");
+    assert!(!html.contains("onerror='alert"), "entry path became an attribute: {html}");
+    assert!(
+        html.contains("&lt;img src=x onerror=&#x27;alert(1)&#x27;&gt;.wasm"),
+        "entry path shown escaped: {html}"
+    );
+
+    let hostile_id = "<svg onload='alert(1)'>";
+    let mut evx = baseline_evx();
+    evx["programs"][hostile_id] = evx["programs"]["presence"].clone();
+    let (_directory, _state, router, address, _) = evx_fixture(true, evx).await;
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(html.contains("<dd class='bad'>malformed: "), "a bad id fails the section: {html}");
+    assert!(!html.contains("<svg"), "program id became markup: {html}");
+    assert!(html.contains("&lt;svg onload=&#x27;alert(1)&#x27;&gt;"), "id shown escaped: {html}");
+}
+
+#[tokio::test]
+async fn evx_panel_is_absent_for_a_xite_without_an_evx_section() {
+    let (_directory, _state, router) = fixture().await;
+    let (status, html) = request(&router, "dashboard.epix", &format!("/list/{ADDRESS}?evx=1")).await;
+    assert_eq!(status, 200);
+    assert!(!html.contains("evx-panel"), "no panel without a declaration: {html}");
+    assert!(!html.contains("EVX declaration"), "no link either: {html}");
+    assert!(html.contains("part#one.txt"), "the listing is unchanged");
+}
+
+#[tokio::test]
+async fn evx_panel_reads_the_grant_through_the_installed_source() {
+    let (_directory, state, router, address, _) = evx_fixture(true, baseline_evx()).await;
+    let expected = address.clone();
+    state.set_evx_grant_summary_source(Box::new(move |xite| {
+        (xite == expected).then(|| json!({ "enabled": true, "label": "<b>me</b>" }))
+    }));
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(
+        html.contains("<dt>EVX enabled for this xite</dt><dd class='ok'>yes</dd>"),
+        "{html}"
+    );
+    assert!(html.contains("<h3>Stored grant</h3>"), "{html}");
+    assert!(html.contains("&lt;b&gt;me&lt;/b&gt;"), "grant strings escaped: {html}");
+    assert!(!html.contains("<b>me</b>"));
+}
