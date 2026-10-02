@@ -23,6 +23,15 @@
 //!   fixes.)
 //! * `schema_generation`, supplied by the host and checked independently; it
 //!   can never move backwards.
+//!
+//! # Xite grants (Milestone 2)
+//!
+//! Milestone 2 adds the persistent [`XiteGrant`] the wrapper records,
+//! single-use allow-once tokens and a bounded [`RunRecord`] history. A xite
+//! grant is derived into the policy row above, so the same generations fence
+//! everything. The database carries its layout in `PRAGMA user_version`
+//! ([`SCHEMA_VERSION`]); every migration is additive and runs on open, and a
+//! database written by a newer build is refused rather than guessed at.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -31,6 +40,9 @@ mod canonical;
 mod destination;
 #[cfg(test)]
 mod tests;
+mod xite;
+#[cfg(test)]
+mod xite_tests;
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -41,10 +53,23 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub use canonical::{
-    canonical, digest, identifier, positive, relative_path, MAX_DEPTH, MAX_JSON, MAX_LIMIT,
-    MAX_SAFE_INTEGER,
+    canonical, digest, identifier, positive, relative_path, sha256_hex, MAX_DEPTH, MAX_JSON,
+    MAX_LIMIT, MAX_SAFE_INTEGER,
 };
 pub use destination::{Destination, MockDestination};
+pub use xite::{
+    RunRecord, XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS, MAX_TEXT,
+    XITE_BUDGET_LIMIT,
+};
+
+/// Layout version recorded in the database's `PRAGMA user_version`.
+///
+/// Version 1 is the Milestone 1 layout (`grants`, `invocations`, `outbox`,
+/// `checkpoints`; databases written before the version was recorded read as
+/// 0 and are treated as 1). Version 2 adds `xite_grants`, `allow_once` and
+/// `runs`. [`DurableState::open`] applies every step up to this version with
+/// `IF NOT EXISTS` statements only, so an older file keeps all of its rows.
+pub const SCHEMA_VERSION: u32 = 2;
 
 /// Most invocations or outbox rows retained per xite, and most receipts or
 /// published entries retained by the mock destination.
@@ -383,7 +408,9 @@ pub struct Outcome {
     pub response: Option<Value>,
 }
 
-const SCHEMA: &str = "
+/// The Milestone 1 tables; `xite::SCHEMA_V2` adds the rest. Kept separate so
+/// the migration test can create a version 1 file the way the old code did.
+pub(crate) const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS grants (
  xite TEXT PRIMARY KEY, enabled INTEGER NOT NULL, generation INTEGER NOT NULL,
  limits_generation INTEGER NOT NULL DEFAULT 1,
@@ -432,10 +459,15 @@ pub(crate) fn transaction<T>(
     Ok(out)
 }
 
+/// `bytes` random bytes from the process CSPRNG as lower-case hex.
+pub(crate) fn random_hex(bytes: usize) -> String {
+    let mut buffer = vec![0u8; bytes];
+    rand::rng().fill_bytes(&mut buffer);
+    hex::encode(buffer)
+}
+
 fn fresh_token() -> String {
-    let mut bytes = [0u8; 16];
-    rand::rng().fill_bytes(&mut bytes);
-    hex::encode(bytes)
+    random_hex(16)
 }
 
 fn parse_json(text: Option<String>) -> Result<Option<Value>> {
@@ -524,12 +556,12 @@ fn load_outbox(conn: &Connection, xite: &str, key: &str) -> Result<Option<Outbox
     }
 }
 
-fn count(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<u64> {
+pub(crate) fn count(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<u64> {
     Ok(conn.query_row(sql, args, |row| row.get::<_, u64>(0))?)
 }
 
-/// Check that `xite` holds an enabled grant whose schema and authority
-/// generations match the ones supplied (when supplied).
+/// Check that `xite` holds an enabled, unexpired grant whose schema and
+/// authority generations match the ones supplied (when supplied).
 fn allowed(
     conn: &Connection,
     xite: &str,
@@ -540,6 +572,9 @@ fn allowed(
         Some(grant) if grant.enabled => grant,
         _ => return Err(Error::denied("grant disabled or missing")),
     };
+    if xite::expired(conn, xite, xite::now_unix())? {
+        return Err(Error::denied("grant expired"));
+    }
     if schema_generation.is_some_and(|expected| grant.schema_generation != expected) {
         return Err(Error::denied("stale schema generation"));
     }
@@ -631,15 +666,35 @@ pub struct DurableState {
 
 impl DurableState {
     /// Open (creating if needed) the database at `path`, switch it to WAL and
-    /// ensure the schema exists.
+    /// bring the schema up to [`SCHEMA_VERSION`].
+    ///
+    /// Migration is additive only (`CREATE ... IF NOT EXISTS`), runs inside
+    /// one `BEGIN IMMEDIATE` transaction with the version bump, and never
+    /// touches existing rows. A file whose `user_version` is newer than this
+    /// build is an [`Error::Conflict`]: reading it with older assumptions
+    /// could silently drop authority this build does not know about.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let state = DurableState {
             path: path.as_ref().to_path_buf(),
         };
         let conn = connect(&state.path)?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.execute_batch(SCHEMA)?;
+        let version: u32 = conn.query_row("PRAGMA user_version", [], |row| row.get(0))?;
+        if version > SCHEMA_VERSION {
+            return Err(Error::conflict("database schema is newer than this build"));
+        }
+        conn.execute_batch(&format!(
+            "BEGIN IMMEDIATE;{SCHEMA}{}PRAGMA user_version={SCHEMA_VERSION};COMMIT;",
+            xite::SCHEMA_V2
+        ))?;
         Ok(state)
+    }
+
+    /// The layout version the database at this path carries; equals
+    /// [`SCHEMA_VERSION`] after a successful [`DurableState::open`].
+    pub fn schema_version(&self) -> Result<u32> {
+        let conn = connect(&self.path)?;
+        Ok(conn.query_row("PRAGMA user_version", [], |row| row.get(0))?)
     }
 
     /// Trusted configuration operation. Existing usage is never reset.
@@ -705,14 +760,17 @@ impl DurableState {
     }
 
     /// Disable the grant and advance its authority generation, fencing every
-    /// running invocation and queued effect. Unknown xites are a no-op.
+    /// running invocation and queued effect. The xite grant, if one exists,
+    /// reads back disabled and its outstanding allow-once tokens are
+    /// discarded (see [`DurableState::revoke_xite`]). Unknown xites are a
+    /// no-op.
     pub fn revoke(&self, xite: &str) -> Result<()> {
         transaction(&self.path, |conn| {
             conn.execute(
                 "UPDATE grants SET enabled=0, generation=generation+1 WHERE xite=?1",
                 params![xite],
             )?;
-            Ok(())
+            xite::revoke_xite_rows(conn, xite)
         })
     }
 
