@@ -1748,6 +1748,24 @@ if (window.getComputedStyle(document.body).transform) {
           message.params = message.params[0];
         }
         return this.actionPermissionAdd(message);
+      } else if (cmd === "evxRequest") {
+        return this.actionEvxRequest(message);
+      } else if (cmd === "evxGrant" || cmd === "evxRunOnce") {
+        // A page may only ask for EVX; granting it, or running one of its
+        // programs once, is the user's decision in this chrome. Route the raw
+        // wrapper-only command through the same consent prompt instead of
+        // forwarding it (the node refuses it from a page id regardless).
+        return this.actionEvxRequest(message);
+      } else if (cmd === "evxRevoke" || cmd === "evxSetLimits") {
+        // Wrapper-only management with no consent prompt to route through:
+        // nothing a page says can narrow, widen or end a grant. Dropped and
+        // the page told, never forwarded.
+        this.log("Dropping wrapper-only command from the page:", cmd);
+        return this.sendInner({
+          "cmd": "response",
+          "to": message.id,
+          "result": {"error": cmd + " is not available to a page"}
+        });
       } else if (cmd === "response") {
         // Answers to the node's confirm/prompt dialogs come from this chrome
         // over its own socket, never from the page.
@@ -1955,6 +1973,256 @@ if (window.getComputedStyle(document.body).transform) {
       })(this));
     };
 
+    // The page asked for EVX (an inner `evxRequest`, or a raw wrapper-only
+    // command routed here). The node is asked to inspect, never to compile:
+    // `evxInspect` is inert, and what it returns is what the user is shown.
+    // Only a tap on Enable or Allow once sends anything that grants, from
+    // this chrome's own socket (its ids are elevated, so the node accepts
+    // them as the user's), and always with the inspected payload's
+    // `declaration_digest`, so a declaration that changes between the prompt
+    // and the tap is refused by the node's expected-version check rather
+    // than silently covered. Deny, dismissal and every failure answer the
+    // page and send nothing. The answer closure settles once: the dialog's
+    // close cross and its buttons both route through it.
+    Wrapper.prototype.actionEvxRequest = function (message) {
+      var answer, chosen, program, settled;
+      settled = false;
+      chosen = false;
+      answer = (function (_this) {
+        return function (result) {
+          if (settled) {
+            return false;
+          }
+          settled = true;
+          return _this.sendInner({
+            "cmd": "response",
+            "to": message.id,
+            "result": result
+          });
+        };
+      })(this);
+      // The program the page wants run once, if it named one. Only a string
+      // id is a request; anything else is no program, not a guess.
+      program = message.params && typeof message.params === "object" && typeof message.params.program === "string" ? message.params.program : null;
+      if (window.ui_restrict) {
+        // A public gateway grants nothing to anyone (every grant is the
+        // operator's), so a dialog here could only dead-end. Show nothing.
+        return answer({"error": "EVX cannot be enabled on a public gateway"});
+      }
+      return $.when(this.event_xite_info).done((function (_this) {
+        return function () {
+          var xite;
+          xite = _this.xite_info.address;
+          return _this.ws.cmd("evxInspect", {"xite": xite}, function (payload) {
+            var choices, digest, once;
+            if (!payload || typeof payload !== "object" || typeof payload.declaration_digest !== "string" || !payload.declaration_digest) {
+              // Without the digest nothing can be granted at all, so there
+              // is no dialog to show: the page learns why and that is all.
+              _this.log("evxInspect returned no declaration digest:", payload);
+              return answer({"error": payload && typeof payload.error === "string" ? payload.error : "EVX inspection returned no declaration digest"});
+            }
+            digest = payload.declaration_digest;
+            once = program !== null && _this.evxRunnableOnce(payload, program);
+            choices = [{"caption": "Enable EVX for this xite", "value": "enable"}];
+            if (once) {
+              // Allow once is offered only when it could do something: a
+              // named program that is usable and declared run-once. A button
+              // that could only fail would teach the user to tap through.
+              choices.push({"caption": "Allow once", "value": "once"});
+            }
+            choices.push({"caption": "Deny", "value": "deny"});
+            return _this.displayChoice("evx-" + message.id, _this.evxPromptBody(payload, program, once), choices, function (choice) {
+              if (settled || chosen) {
+                // One choice per request: a dialog that fires again (or a
+                // caller that does), even while the first grant is still in
+                // flight, grants nothing more.
+                return false;
+              }
+              chosen = true;
+              if (choice === "enable") {
+                return _this.ws.cmd("evxGrant", {"xite": xite, "declaration_digest": digest, "mode": "enable"}, function (res) {
+                  return answer(_this.evxGrantOutcome(res, "enable"));
+                });
+              } else if (choice === "once") {
+                return _this.ws.cmd("evxGrant", {"xite": xite, "declaration_digest": digest, "mode": "once", "program": program}, function (res) {
+                  var outcome;
+                  outcome = _this.evxGrantOutcome(res, "once");
+                  if (!outcome.granted) {
+                    return answer(outcome);
+                  }
+                  if (typeof res.token !== "string" || !res.token) {
+                    // Granted without the one-shot token is a node bug; say
+                    // so instead of running without one.
+                    return answer({"granted": false, "mode": "once", "error": "evxGrant returned no allow-once token"});
+                  }
+                  // The token is consumed here and never shown to the page:
+                  // the page asked for a run, not for a credential.
+                  return _this.ws.cmd("evxRunOnce", {"xite": xite, "program": program, "token": res.token}, function (result) {
+                    return answer({"granted": true, "mode": "once", "result": result});
+                  });
+                });
+              }
+              // Deny, or the dialog dismissed (null): nothing is sent.
+              return answer({"granted": false});
+            });
+          });
+        };
+      })(this));
+    };
+
+    // Whether the inspect payload lets `program` run once: it must be a
+    // declared, usable program that the publisher marked run-once. Own
+    // properties only, so an id such as `constructor` names nothing.
+    Wrapper.prototype.evxRunnableOnce = function (payload, program) {
+      var entry, programs;
+      programs = payload.programs;
+      if (!programs || typeof programs !== "object" || !Object.prototype.hasOwnProperty.call(programs, program)) {
+        return false;
+      }
+      entry = programs[program];
+      return !!entry && typeof entry === "object" && entry.usable === true && entry.allow_run_once === true;
+    };
+
+    // The page's view of an `evxGrant` answer: granted or not, the mode it
+    // asked for, and the node's reason when it refused. The token and every
+    // other field stay in the chrome.
+    Wrapper.prototype.evxGrantOutcome = function (res, mode) {
+      var outcome;
+      if (res && typeof res === "object" && res.granted === true) {
+        return {"granted": true, "mode": mode};
+      }
+      outcome = {"granted": false, "mode": mode};
+      if (res && typeof res === "object" && typeof res.error === "string") {
+        outcome.error = res.error;
+      }
+      return outcome;
+    };
+
+    // The consent text, built only from the inspect payload and escaped
+    // field by field (toHtmlSafe), so a publisher-chosen string in an id, a
+    // path or an unsupported reason is shown and never rendered. Lists what
+    // the user is deciding on: the xite and its publisher, each program with
+    // its entry hash prefix, capabilities and limits, the declared triggers,
+    // what this node cannot honour, and that enabling also covers the
+    // publisher's authenticated updates within these scopes.
+    Wrapper.prototype.evxPromptBody = function (payload, program, once) {
+      var body, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, schedule, _this;
+      _this = this;
+      esc = function (value) {
+        return _this.toHtmlSafe(value === void 0 || value === null ? "unknown" : value)[0];
+      };
+      // A pinned file is a path and its hash; a bare path is shown as such.
+      file = function (value) {
+        if (typeof value === "string") {
+          return esc(value);
+        }
+        if (value && typeof value === "object" && typeof value.path === "string") {
+          if (typeof value.sha512 === "string" && value.sha512) {
+            return esc(value.path) + " (sha512 " + esc(value.sha512.slice(0, 16)) + "\u2026)";
+          }
+          return esc(value.path);
+        }
+        return "unknown";
+      };
+      limits = function (value) {
+        var k, key, keys, n, parts;
+        if (!value || typeof value !== "object") {
+          return "unknown";
+        }
+        keys = Object.keys(value).sort();
+        parts = [];
+        for (k = 0, n = keys.length; k < n; k++) {
+          key = keys[k];
+          parts.push(esc(key) + " " + esc(value[key]));
+        }
+        return parts.length ? parts.join(", ") : "none";
+      };
+      ids = function (value) {
+        return value && typeof value === "object" ? Object.keys(value).sort() : [];
+      };
+      body = "This xite asks to run EVX programs on this node.";
+      body += "<br><small>Xite: <b>" + esc(payload.xite) + "</b> &middot; Publisher: " + esc(payload.publisher) + "</small>";
+      body += "<br><small>Integrity: " + esc(payload.integrity) + " &middot; Declaration: " + esc(String(payload.declaration_digest).slice(0, 16)) + "\u2026</small>";
+      grant = payload.grant;
+      if (grant && typeof grant === "object") {
+        body += "<br><small>Current grant: " + (grant.enabled === true ? "enabled" : "disabled") + " (generation " + esc(grant.generation) + ")</small>";
+      }
+      body += "<br><br><b>Programs</b>";
+      lines = ids(payload.programs);
+      if (!lines.length) {
+        body += "<br>&bull; none declared";
+      }
+      for (i = 0, len = lines.length; i < len; i++) {
+        id = lines[i];
+        entry = payload.programs[id];
+        if (!entry || typeof entry !== "object") {
+          continue;
+        }
+        body += "<br>&bull; <b>" + esc(id) + "</b>";
+        if (entry.usable !== true) {
+          body += " &mdash; unsupported: " + (Array.isArray(entry.reasons) && entry.reasons.length ? esc(entry.reasons.join("; ")) : "no reason given");
+          continue;
+        }
+        body += " &mdash; entry " + file(entry.entry);
+        if (Array.isArray(entry.dependencies) && entry.dependencies.length) {
+          body += "; depends on ";
+          for (j = 0; j < entry.dependencies.length; j++) {
+            body += (j ? ", " : "") + file(entry.dependencies[j]);
+          }
+        }
+        body += "<br><small>capabilities: " + (Array.isArray(entry.capabilities) && entry.capabilities.length ? esc(entry.capabilities.join(", ")) : "none");
+        body += " &middot; limits: " + limits(entry.limits);
+        body += " &middot; run once: " + (entry.allow_run_once === true ? "allowed" : "not allowed") + "</small>";
+      }
+      body += "<br><br><b>Triggers</b>";
+      lines = ids(payload.jobs);
+      if (!lines.length) {
+        body += "<br>&bull; none declared";
+      }
+      for (i = 0, len = lines.length; i < len; i++) {
+        id = lines[i];
+        job = payload.jobs[id];
+        if (!job || typeof job !== "object") {
+          continue;
+        }
+        body += "<br>&bull; <b>" + esc(id) + "</b>";
+        if (job.usable !== true) {
+          body += " &mdash; unsupported: " + (Array.isArray(job.reasons) && job.reasons.length ? esc(job.reasons.join("; ")) : "no reason given");
+          continue;
+        }
+        schedule = job.schedule;
+        body += " runs " + esc(job.program);
+        if (schedule && typeof schedule === "object" && schedule.type === "interval") {
+          body += " every " + esc(schedule.seconds) + " s from " + esc(schedule.anchor) + ", missed: " + esc(schedule.missed);
+        } else {
+          body += " on a " + esc(schedule && typeof schedule === "object" ? schedule.type : schedule) + " schedule";
+        }
+        body += ", concurrency " + esc(job.max_concurrency);
+      }
+      if (Array.isArray(payload.unsupported) && payload.unsupported.length) {
+        body += "<br><br><b>Not supported on this node</b>";
+        for (i = 0, len = payload.unsupported.length; i < len; i++) {
+          entry = payload.unsupported[i];
+          if (!entry || typeof entry !== "object") {
+            continue;
+          }
+          body += "<br>&bull; " + esc(entry.path) + ": " + esc(entry.reason);
+        }
+      }
+      if (payload.effective_limits && typeof payload.effective_limits === "object") {
+        body += "<br><br><small>Effective limits on this node: " + limits(payload.effective_limits) + "</small>";
+      }
+      body += "<br><br><small>Enabling also covers authenticated updates to this xite from the same publisher within these capabilities and limits, without another prompt. Nothing beyond them runs until you are asked again.</small>";
+      if (program !== null) {
+        if (once) {
+          body += "<br><small>Allow once runs <b>" + esc(program) + "</b> one time now and grants nothing further.</small>";
+        } else {
+          body += "<br><small>The page asked to run <b>" + esc(program) + "</b> once, which this declaration does not allow on this node.</small>";
+        }
+      }
+      return body;
+    };
+
     Wrapper.prototype.actionNotification = function (message) {
       var body;
       message.params = this.toHtmlSafe(message.params);
@@ -1991,6 +2259,51 @@ if (window.getComputedStyle(document.body).transform) {
       }
       body.append(buttons);
       this.notifications.add("notification-" + caption, "ask", body);
+      buttons.first().focus();
+      return $(".notification").scrollLeft(0);
+    };
+
+    // displayConfirm with named choices instead of numbered captions: each
+    // button carries a closed `value` the caller switches on, the close
+    // cross reports `null`, and the callback runs at most once however the
+    // dialog ends. Clicks must be trusted user events (verifyEvent), as for
+    // every grant made from this chrome.
+    Wrapper.prototype.displayChoice = function (id, body, choices, cb) {
+      var answered, button, buttons, choice, elem, fn, i, j, len, outer, settle;
+      outer = $("<span class='message-outer'><span class='message'>" + body + "</span></span>");
+      buttons = $("<span class='buttons'></span>");
+      answered = false;
+      settle = function (value) {
+        if (answered) {
+          return false;
+        }
+        answered = true;
+        return cb(value);
+      };
+      fn = (function (_this) {
+        return function (button, value) {
+          return button.on("click", function (e) {
+            _this.verifyEvent(button, e);
+            settle(value);
+            return false;
+          });
+        };
+      })(this);
+      for (i = j = 0, len = choices.length; j < len; i = ++j) {
+        choice = choices[i];
+        button = $("<a></a>", {
+          href: "#" + choice.value,
+          "class": "button button-confirm button-choice-" + choice.value + " button-" + (i + 1)
+        });
+        button.text(choice.caption);
+        fn(button, choice.value);
+        buttons.append(button);
+      }
+      outer.append(buttons);
+      elem = this.notifications.add("notification-" + id, "ask", outer);
+      $(".close", elem).on("click", function () {
+        return settle(null);
+      });
       buttons.first().focus();
       return $(".notification").scrollLeft(0);
     };
