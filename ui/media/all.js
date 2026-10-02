@@ -1985,9 +1985,15 @@ if (window.getComputedStyle(document.body).transform) {
     // page and send nothing. The answer closure settles once: the dialog's
     // close cross and its buttons both route through it.
     Wrapper.prototype.actionEvxRequest = function (message) {
-      var answer, chosen, program, settled;
+      var answer, chosen, program, prompt_id, settled;
       settled = false;
       chosen = false;
+      // The dialog's notification id comes from a chrome-private counter,
+      // never from the page's message id: a page notification, confirm or
+      // progress cannot name it, so it can neither close the open consent
+      // dialog nor stage a decoy in its slot (page ids are prefixed `page-`).
+      this.evx_prompt_count = (this.evx_prompt_count || 0) + 1;
+      prompt_id = "evx-prompt-" + this.evx_prompt_count;
       answer = (function (_this) {
         return function (result) {
           if (settled) {
@@ -2030,8 +2036,10 @@ if (window.getComputedStyle(document.body).transform) {
               // that could only fail would teach the user to tap through.
               choices.push({"caption": "Allow once", "value": "once"});
             }
-            choices.push({"caption": "Deny", "value": "deny"});
-            return _this.displayChoice("evx-" + message.id, _this.evxPromptBody(payload, program, once), choices, function (choice) {
+            // Deny is the only button that may take keyboard focus: a
+            // keystroke the user is already typing can at worst deny.
+            choices.push({"caption": "Deny", "value": "deny", "safe": true});
+            return _this.displayChoice(prompt_id, _this.evxPromptBody(payload, program, once), choices, function (choice) {
               if (settled || chosen) {
                 // One choice per request: a dialog that fires again (or a
                 // caller that does), even while the first grant is still in
@@ -2058,6 +2066,11 @@ if (window.getComputedStyle(document.body).transform) {
                   // The token is consumed here and never shown to the page:
                   // the page asked for a run, not for a credential.
                   return _this.ws.cmd("evxRunOnce", {"xite": xite, "program": program, "token": res.token}, function (result) {
+                    if (result && typeof result === "object" && result.error !== void 0 && result.error !== null) {
+                      // The grant happened; the run did not. Say both, so
+                      // the page never takes a refusal for a result.
+                      return answer({"granted": true, "mode": "once", "result": null, "error": typeof result.error === "string" ? result.error : String(result.error)});
+                    }
                     return answer({"granted": true, "mode": "once", "result": result});
                   });
                 });
@@ -2099,17 +2112,35 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     // The consent text, built only from the inspect payload and escaped
-    // field by field (toHtmlSafe), so a publisher-chosen string in an id, a
-    // path or an unsupported reason is shown and never rendered. Lists what
-    // the user is deciding on: the xite and its publisher, each program with
-    // its entry hash prefix, capabilities and limits, the declared triggers,
-    // what this node cannot honour, and that enabling also covers the
-    // publisher's authenticated updates within these scopes.
+    // field by field with a strict local escaper (not toHtmlSafe, which
+    // re-enables <br>, <b>, <u>, <i> and <small>), so a publisher-chosen
+    // string in an id, a path, a limit key, a schedule value or an
+    // unsupported reason is shown as literal text and never rendered, and
+    // cannot restyle or hide the chrome's own lines. Each rendered string
+    // is capped at 200 characters. Lists what the user is deciding on: the
+    // xite and its publisher, each program with its entry hash prefix,
+    // capabilities and limits, the declared triggers, what this node cannot
+    // honour, and that enabling also covers the publisher's authenticated
+    // updates within these scopes.
     Wrapper.prototype.evxPromptBody = function (payload, program, once) {
-      var body, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, schedule, _this;
-      _this = this;
+      var body, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, list, max, schedule;
+      max = 200;
       esc = function (value) {
-        return _this.toHtmlSafe(value === void 0 || value === null ? "unknown" : value)[0];
+        var text;
+        text = value === void 0 || value === null ? "unknown" : String(value);
+        if (text.length > max) {
+          text = text.slice(0, max) + "\u2026";
+        }
+        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+      };
+      // A list of payload strings, each escaped and capped on its own.
+      list = function (values, separator) {
+        var k, n, parts;
+        parts = [];
+        for (k = 0, n = values.length; k < n; k++) {
+          parts.push(esc(values[k]));
+        }
+        return parts.join(separator);
       };
       // A pinned file is a path and its hash; a bare path is shown as such.
       file = function (value) {
@@ -2160,7 +2191,7 @@ if (window.getComputedStyle(document.body).transform) {
         }
         body += "<br>&bull; <b>" + esc(id) + "</b>";
         if (entry.usable !== true) {
-          body += " &mdash; unsupported: " + (Array.isArray(entry.reasons) && entry.reasons.length ? esc(entry.reasons.join("; ")) : "no reason given");
+          body += " &mdash; unsupported: " + (Array.isArray(entry.reasons) && entry.reasons.length ? list(entry.reasons, "; ") : "no reason given");
           continue;
         }
         body += " &mdash; entry " + file(entry.entry);
@@ -2170,7 +2201,7 @@ if (window.getComputedStyle(document.body).transform) {
             body += (j ? ", " : "") + file(entry.dependencies[j]);
           }
         }
-        body += "<br><small>capabilities: " + (Array.isArray(entry.capabilities) && entry.capabilities.length ? esc(entry.capabilities.join(", ")) : "none");
+        body += "<br><small>capabilities: " + (Array.isArray(entry.capabilities) && entry.capabilities.length ? list(entry.capabilities, ", ") : "none");
         body += " &middot; limits: " + limits(entry.limits);
         body += " &middot; run once: " + (entry.allow_run_once === true ? "allowed" : "not allowed") + "</small>";
       }
@@ -2187,7 +2218,7 @@ if (window.getComputedStyle(document.body).transform) {
         }
         body += "<br>&bull; <b>" + esc(id) + "</b>";
         if (job.usable !== true) {
-          body += " &mdash; unsupported: " + (Array.isArray(job.reasons) && job.reasons.length ? esc(job.reasons.join("; ")) : "no reason given");
+          body += " &mdash; unsupported: " + (Array.isArray(job.reasons) && job.reasons.length ? list(job.reasons, "; ") : "no reason given");
           continue;
         }
         schedule = job.schedule;
@@ -2227,10 +2258,18 @@ if (window.getComputedStyle(document.body).transform) {
       var body;
       message.params = this.toHtmlSafe(message.params);
       body = $("<span class='message'>" + message.params[1] + "</span>");
-      return this.notifications.add("notification-" + message.id, message.params[0], body, message.params[2]);
+      return this.notifications.add(this.pageNotificationId(message.id), message.params[0], body, message.params[2]);
     };
 
-    Wrapper.prototype.displayConfirm = function (body, captions, cb) {
+    // The notification id for something the page asked to show, under a
+    // `page-` prefix. Chrome-owned ids (the EVX consent dialog's `evx-prompt-N`)
+    // never carry it, so no page-chosen id or progress type can address one.
+    Wrapper.prototype.pageNotificationId = function (id) {
+      return "notification-page-" + id;
+    };
+
+    // `id` is optional: the chrome's own confirms are keyed by their caption.
+    Wrapper.prototype.displayConfirm = function (body, captions, cb, id) {
       var button, buttons, caption, fn, i, j, len;
       body = $("<span class='message-outer'><span class='message'>" + body + "</span></span>");
       buttons = $("<span class='buttons'></span>");
@@ -2258,7 +2297,7 @@ if (window.getComputedStyle(document.body).transform) {
         buttons.append(button);
       }
       body.append(buttons);
-      this.notifications.add("notification-" + caption, "ask", body);
+      this.notifications.add(id != null ? id : "notification-" + caption, "ask", body);
       buttons.first().focus();
       return $(".notification").scrollLeft(0);
     };
@@ -2268,11 +2307,23 @@ if (window.getComputedStyle(document.body).transform) {
     // cross reports `null`, and the callback runs at most once however the
     // dialog ends. Clicks must be trusted user events (verifyEvent), as for
     // every grant made from this chrome.
+    //
+    // Keyboard focus never lands on a granting button: only a choice marked
+    // `safe` (Deny) may take it, otherwise focus stays where it was, so a
+    // keystroke the user is already typing into the page cannot activate a
+    // grant. For the first CHOICE_GUARD_MS after the dialog appears every
+    // button activation is ignored and the dialog stays open (the
+    // notification's own close-on-click is stopped too): a page that
+    // prompts on a keystroke cannot have the next one, or its auto-repeat,
+    // land on a button that has only just appeared.
+    Wrapper.prototype.CHOICE_GUARD_MS = 500;
+
     Wrapper.prototype.displayChoice = function (id, body, choices, cb) {
-      var answered, button, buttons, choice, elem, fn, i, j, len, outer, settle;
+      var answered, button, buttons, choice, elem, fn, i, j, len, outer, safe, settle, shown;
       outer = $("<span class='message-outer'><span class='message'>" + body + "</span></span>");
       buttons = $("<span class='buttons'></span>");
       answered = false;
+      shown = Date.now();
       settle = function (value) {
         if (answered) {
           return false;
@@ -2284,11 +2335,16 @@ if (window.getComputedStyle(document.body).transform) {
         return function (button, value) {
           return button.on("click", function (e) {
             _this.verifyEvent(button, e);
+            if (Date.now() - shown < _this.CHOICE_GUARD_MS) {
+              e.stopImmediatePropagation();
+              return false;
+            }
             settle(value);
             return false;
           });
         };
       })(this);
+      safe = null;
       for (i = j = 0, len = choices.length; j < len; i = ++j) {
         choice = choices[i];
         button = $("<a></a>", {
@@ -2298,13 +2354,18 @@ if (window.getComputedStyle(document.body).transform) {
         button.text(choice.caption);
         fn(button, choice.value);
         buttons.append(button);
+        if (choice.safe === true) {
+          safe = button;
+        }
       }
       outer.append(buttons);
       elem = this.notifications.add("notification-" + id, "ask", outer);
       $(".close", elem).on("click", function () {
         return settle(null);
       });
-      buttons.first().focus();
+      if (safe) {
+        safe.focus();
+      }
       return $(".notification").scrollLeft(0);
     };
 
@@ -2328,7 +2389,7 @@ if (window.getComputedStyle(document.body).transform) {
           });
           return false;
         };
-      })(this));
+      })(this), this.pageNotificationId(caption));
     };
 
     Wrapper.prototype.displayPrompt = function (message, type, caption, placeholder, cb) {
@@ -2453,7 +2514,9 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.actionProgress = function (message) {
       message.params = this.toHtmlSafe(message.params);
-      return this.displayProgress(message.params[0], message.params[1], message.params[2]);
+      // The progress type is the notification id: namespaced like every
+      // other page-chosen id (displayProgress adds the `notification-` part).
+      return this.displayProgress("page-" + message.params[0], message.params[1], message.params[2]);
     };
 
     Wrapper.prototype.actionSetViewport = function (message) {
