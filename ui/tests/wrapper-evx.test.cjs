@@ -442,6 +442,87 @@ test("every rendered payload string is capped at 200 characters, each list item 
   assert.equal(body.includes("x".repeat(201)), false);
 });
 
+// The background paragraph (docs/evx-milestone-3.md section 3): enabling a
+// declaration with a usable job also lets it run with no page open, so the
+// dialog says so in its own paragraph, listing each usable job, and says
+// nothing of the kind when no usable job exists.
+const BACKGROUND_TAIL = ". Enabling lets them run in the background on this node, even when no page of this xite is open.";
+function backgroundParagraph(body) {
+  const match = body.match(/<br><br>This xite also declares (\d+) scheduled job\(s\): (.*?)\. Enabling lets them run in the background on this node, even when no page of this xite is open\./);
+  return match ? { count: Number(match[1]), jobs: match[2].split(", ") } : null;
+}
+
+test("the dialog says in its own paragraph that enabling lets the one usable job run in the background", () => {
+  const { instance, dialogs } = wrapper();
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 30 });
+  const body = dialogs[0].body;
+  const expected = "<br><br>This xite also declares 1 scheduled job(s): refresh runs presence every 1800 s" + BACKGROUND_TAIL;
+  assert.ok(body.includes(expected), "the spec's wording, verbatim: " + body);
+  assert.equal(expected.slice("<br><br>".length).includes("<br>"), false, "one paragraph, no line break inside it");
+  assert.ok(body.slice(body.indexOf(expected) + expected.length).startsWith("<br><br>"), "and nothing shares the paragraph after it");
+  assert.match(body, /<b>refresh<\/b> runs presence every 1800 s from unix_epoch, missed: skip, concurrency 1/, "the trigger line is unchanged");
+});
+
+test("the background paragraph lists both usable jobs with their own programs and periods", () => {
+  const { instance, dialogs } = wrapper({}, {
+    evxInspect: () => inspectPayload({
+      jobs: {
+        refresh: inspectPayload().jobs.refresh,
+        nightly: { usable: true, program: "stats", schedule: { type: "interval", seconds: 86400, anchor: "unix_epoch", missed: "coalesce" }, max_concurrency: 1, reasons: [] },
+      },
+    }),
+  });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 31 });
+  const paragraph = backgroundParagraph(dialogs[0].body);
+  assert.ok(paragraph, dialogs[0].body);
+  assert.equal(paragraph.count, 2);
+  assert.deepEqual(paragraph.jobs, ["nightly runs stats every 86400 s", "refresh runs presence every 1800 s"], "every usable job, in id order");
+  assert.equal((dialogs[0].body.match(/This xite also declares/g) || []).length, 1, "one paragraph for all jobs, not one per job");
+});
+
+test("a declaration with no jobs gets no background paragraph", () => {
+  const { instance, dialogs } = wrapper({}, { evxInspect: () => inspectPayload({ jobs: {} }) });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 32 });
+  const body = dialogs[0].body;
+  assert.equal(backgroundParagraph(body), null, body);
+  assert.equal(body.includes("in the background"), false, "not even an empty paragraph");
+  assert.match(body, /<b>Triggers<\/b><br>&bull; none declared/, "the trigger section still says none");
+  assert.match(body, /Enabling also covers authenticated updates/, "the rest of the dialog is unchanged");
+});
+
+test("a declaration whose only job is unsupported gets no background paragraph", () => {
+  const { instance, dialogs } = wrapper({}, {
+    evxInspect: () => inspectPayload({
+      jobs: { refresh: { usable: false, reasons: ["program: unknown program presence2"] } },
+    }),
+  });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 33 });
+  const body = dialogs[0].body;
+  assert.equal(backgroundParagraph(body), null, body);
+  assert.equal(body.includes("in the background"), false);
+  assert.match(body, /<b>refresh<\/b> &mdash; unsupported: program: unknown program presence2/, "the unsupported job is still listed as such");
+});
+
+test("job ids, programs and periods in the background paragraph are escaped like every other payload string", () => {
+  const hostile = "<script>alert(1)</script>\"'";
+  const { instance, dialogs } = wrapper({}, {
+    evxInspect: () => inspectPayload({
+      jobs: {
+        [hostile]: { usable: true, program: hostile, schedule: { type: "interval", seconds: hostile, anchor: "unix_epoch", missed: "skip" }, max_concurrency: 1, reasons: [] },
+      },
+    }),
+  });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 34 });
+  const body = dialogs[0].body;
+  const paragraph = backgroundParagraph(body);
+  assert.ok(paragraph, body);
+  const literal = "&lt;script&gt;alert(1)&lt;/script&gt;&quot;&apos;";
+  assert.deepEqual(paragraph.jobs, [`${literal} runs ${literal} every ${literal} s`], "id, program and period each shown as literal text");
+  assert.equal(body.includes("<script"), false);
+  assert.equal(body.includes("\""), false);
+  assert.equal(body.includes("'"), false);
+});
+
 // The real dialog, on a minimal stand-in for jQuery: elements record what
 // is appended to them, the handlers bound on them and whether they were
 // focused, and `trigger` runs the handlers in binding order, honouring

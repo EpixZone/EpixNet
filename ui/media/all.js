@@ -2129,9 +2129,15 @@ if (window.getComputedStyle(document.body).transform) {
     // xite and its publisher, each program with its entry hash prefix,
     // capabilities and limits, the declared triggers, what this node cannot
     // honour, and that enabling also covers the publisher's authenticated
-    // updates within these scopes.
+    // updates within these scopes. When the declaration has at least one
+    // usable job, a paragraph of its own says that enabling also lets those
+    // jobs run in the background with no page open (docs/evx-milestone-3.md
+    // section 3): that is the `allow_background` authority `evxGrant`
+    // mode "enable" confers for such a declaration, so the user must read
+    // it before granting; a declaration without a usable job confers none
+    // and the paragraph is absent, not empty.
     Wrapper.prototype.evxPromptBody = function (payload, program, once) {
-      var body, decl, effective, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, list, max, schedule;
+      var background, body, cadence, decl, effective, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, list, max, schedule;
       max = 200;
       esc = function (value) {
         var text;
@@ -2179,6 +2185,18 @@ if (window.getComputedStyle(document.body).transform) {
       ids = function (value) {
         return value && typeof value === "object" ? Object.keys(value).sort() : [];
       };
+      // How often a job runs, from its schedule: the period of an interval
+      // schedule, the only kind the declaration parser admits. Any other
+      // shape in the payload is named by its type so the user still sees
+      // what was declared rather than a line that silently says nothing.
+      // Shared by the trigger line and the background paragraph so the two
+      // never disagree about a job's cadence.
+      cadence = function (value) {
+        if (value && typeof value === "object" && value.type === "interval") {
+          return "every " + esc(value.seconds) + " s";
+        }
+        return "on a " + esc(value && typeof value === "object" ? value.type : value) + " schedule";
+      };
       body = "This xite asks to run EVX programs on this node.";
       body += "<br><small>Xite: <b>" + esc(payload.xite) + "</b> &middot; Publisher: " + esc(payload.publisher) + "</small>";
       body += "<br><small>Integrity: " + esc(payload.integrity) + " &middot; Declaration: " + esc(String(payload.declaration_digest).slice(0, 16)) + "\u2026</small>";
@@ -2215,6 +2233,7 @@ if (window.getComputedStyle(document.body).transform) {
         body += " &middot; run once: " + (entry.allow_run_once === true ? "allowed" : "not allowed") + "</small>";
       }
       body += "<br><br><b>Triggers</b>";
+      background = [];
       lines = ids(decl.jobs);
       if (!lines.length) {
         body += "<br>&bull; none declared";
@@ -2231,11 +2250,10 @@ if (window.getComputedStyle(document.body).transform) {
           continue;
         }
         schedule = job.schedule;
-        body += " runs " + esc(job.program);
+        background.push(esc(id) + " runs " + esc(job.program) + " " + cadence(schedule));
+        body += " runs " + esc(job.program) + " " + cadence(schedule);
         if (schedule && typeof schedule === "object" && schedule.type === "interval") {
-          body += " every " + esc(schedule.seconds) + " s from " + esc(schedule.anchor) + ", missed: " + esc(schedule.missed);
-        } else {
-          body += " on a " + esc(schedule && typeof schedule === "object" ? schedule.type : schedule) + " schedule";
+          body += " from " + esc(schedule.anchor) + ", missed: " + esc(schedule.missed);
         }
         body += ", concurrency " + esc(job.max_concurrency);
       }
@@ -2252,6 +2270,11 @@ if (window.getComputedStyle(document.body).transform) {
       effective = payload.effective && typeof payload.effective === "object" ? payload.effective.limits : payload.effective_limits;
       if (effective && typeof effective === "object") {
         body += "<br><br><small>Effective limits on this node: " + limits(effective) + "</small>";
+      }
+      // Only usable jobs count: an unsupported one never registers with the
+      // scheduler, so it confers no background authority to warn about.
+      if (background.length) {
+        body += "<br><br>This xite also declares " + background.length + " scheduled job(s): " + background.join(", ") + ". Enabling lets them run in the background on this node, even when no page of this xite is open.";
       }
       body += "<br><br><small>Enabling also covers authenticated updates to this xite from the same publisher within these capabilities and limits, without another prompt. Nothing beyond them runs until you are asked again.</small>";
       if (program !== null) {
