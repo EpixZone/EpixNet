@@ -5,7 +5,7 @@ use serde_json::json;
 use sha2::{Digest as _, Sha256};
 
 use super::{content, evx, set, without};
-use crate::{declaration_digest, DeclarationError};
+use crate::{declaration_digest, declaration_digest_bytes, parse, DeclarationError};
 
 #[test]
 fn digest_is_sha256_of_the_sorted_compact_evx_object() {
@@ -101,4 +101,67 @@ fn digest_is_not_the_python_signed_data_digest() {
         "Python separators are not canonical here"
     );
     assert_ne!(digest, hex::encode(Sha256::digest(evx_signed.as_bytes())));
+}
+
+#[test]
+fn digest_from_bytes_refuses_duplicate_keys_a_decoded_value_cannot_see() {
+    // serde_json keeps the last of two `capabilities`; a first-wins reader
+    // and a human see the other. Only the bytes can tell.
+    let raw = br#"{"files":{},"evx":{"version":1,"programs":{"a":{"runtime_profile":"wasm-core-v1","entry":"a.wasm","capabilities":[{"api":"workspace.write"}],"capabilities":[]}}}}"#;
+    assert!(matches!(
+        declaration_digest_bytes(raw),
+        Err(DeclarationError::Malformed(_))
+    ));
+    let collapsed: serde_json::Value = serde_json::from_slice(raw).unwrap();
+    assert!(
+        declaration_digest(&collapsed).is_ok(),
+        "the value API cannot see what serde_json already dropped"
+    );
+    assert!(parse(&collapsed).unwrap().programs["a"]
+        .capabilities
+        .is_empty());
+}
+
+#[test]
+fn digest_from_bytes_matches_the_value_digest_on_the_on_disk_form() {
+    let root = content(evx());
+    let reference = declaration_digest(&root).unwrap();
+    let disk = epix_content::dumps_content(&root);
+    assert_eq!(
+        declaration_digest_bytes(disk.as_bytes()).unwrap(),
+        Some(reference.clone())
+    );
+    let compact = serde_json::to_vec(&root).unwrap();
+    assert_eq!(declaration_digest_bytes(&compact).unwrap(), Some(reference));
+    // The same answers parse_bytes gives for the same documents.
+    assert_eq!(declaration_digest_bytes(br#"{"files":{}}"#), Ok(None));
+    for raw in [&b"[]"[..], b"null", b"{", b"", b"\xff"] {
+        assert!(
+            matches!(
+                declaration_digest_bytes(raw),
+                Err(DeclarationError::Malformed(_))
+            ),
+            "accepted {raw:?}"
+        );
+    }
+    for raw in [
+        &br#"{"evx":null}"#[..],
+        br#"{"evx":[]}"#,
+        br#"{"evx":"x"}"#,
+        br#"{"evx":1}"#,
+    ] {
+        assert_eq!(
+            declaration_digest_bytes(raw),
+            Err(DeclarationError::malformed("evx: must be an object"))
+        );
+    }
+    // A malformed but cleanly decoded section still digests, as through a
+    // value: the inspection view shows what was published either way.
+    let unparseable = br#"{"evx":{"version":2,"network":true}}"#;
+    assert_eq!(
+        declaration_digest_bytes(unparseable).unwrap(),
+        Some(hex::encode(Sha256::digest(
+            br#"{"network":true,"version":2}"#
+        )))
+    );
 }

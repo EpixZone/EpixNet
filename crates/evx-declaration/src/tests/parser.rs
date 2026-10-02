@@ -270,6 +270,66 @@ fn runtime_profile_other_than_wasm_core_v1_is_unsupported() {
 }
 
 #[test]
+fn an_unsupported_runtime_profile_leaves_the_programs_other_fields_uninterpreted() {
+    // A future profile may carry fields this host has no schema for; every
+    // one of these would fail the section under the v1 schema.
+    let future = json!({
+        "runtime_profile": "wasm-core-v2",
+        "entry": "evx/score.wasm",
+        "world": "wasi:cli/command",
+        "dependencies": "evx/lib.wasm",
+        "capabilities": [{ "api": "data.append", "stream": "presence" }],
+        "limits": { "gpu_ms": 10 }
+    });
+    let decl = parse_evx(set(evx(), "/programs/score", future.clone())).unwrap();
+    assert!(!decl.programs.contains_key("score"));
+    assert!(decl.programs.contains_key("presence"));
+    assert_eq!(decl.jobs.len(), 1);
+    assert_eq!(
+        reasons(&decl),
+        vec![(
+            "programs.score".to_string(),
+            "runtime profile \"wasm-core-v2\" not supported".to_string()
+        )]
+    );
+    // The profile and the entry are read for every program: the profile
+    // decides the schema and the entry is what the inspection view names.
+    assert_eq!(
+        malformed(set(
+            evx(),
+            "/programs/score",
+            without(future.clone(), "/entry")
+        )),
+        "programs.score.entry: required"
+    );
+    assert_eq!(
+        malformed(set(
+            evx(),
+            "/programs/score",
+            set(future.clone(), "/entry", json!("../score.wasm"))
+        )),
+        "programs.score.entry: path outside workspace"
+    );
+    assert_eq!(
+        malformed(set(
+            evx(),
+            "/programs/score",
+            set(future, "/entry", json!(1))
+        )),
+        "programs.score.entry: must be a string"
+    );
+    // The v1 profile still sees the v1 schema.
+    assert_eq!(
+        malformed(set(
+            evx(),
+            "/programs/score/world",
+            json!("wasi:cli/command")
+        )),
+        "programs.score: unknown field \"world\""
+    );
+}
+
+#[test]
 fn entry_must_be_a_relative_path_inside_the_xite() {
     for bad in [
         "../presence.wasm",
@@ -380,6 +440,59 @@ fn a_closure_larger_than_max_files_is_unsupported() {
 }
 
 #[test]
+fn an_oversized_dependency_list_is_unsupported_before_its_items_are_inspected() {
+    // Shapes that fail the section in a list within the bound: a path
+    // escape, a repeat of the entry and a duplicate. Past the bound the list
+    // is a requirement this host cannot meet, and its items are not read.
+    let mut deps: Vec<Value> = (0..MAX_FILES - 2)
+        .map(|i| json!(format!("evx/dep{i}.wasm")))
+        .collect();
+    deps.extend([
+        json!("../escape.wasm"),
+        json!("evx/presence.wasm"),
+        json!("evx/dep0.wasm"),
+    ]);
+    assert_eq!(deps.len() + 1, MAX_FILES + 2);
+    let decl = parse_evx(set(evx(), "/programs/presence/dependencies", json!(deps))).unwrap();
+    assert!(!decl.programs.contains_key("presence"));
+    assert!(decl.programs.contains_key("score"));
+    assert_eq!(
+        reasons(&decl),
+        vec![
+            (
+                "programs.presence".to_string(),
+                format!(
+                    "closure of {} files exceeds the {MAX_FILES} files one activation may capture",
+                    MAX_FILES + 2
+                )
+            ),
+            (
+                "jobs.presence-every-30m".to_string(),
+                "program \"presence\" is unsupported".to_string()
+            ),
+        ]
+    );
+    // A list the size of a hostile content.json costs the parser nothing
+    // beyond decoding it: the bound is checked before the first item.
+    let many: Vec<Value> = (0..100_000).map(|i| json!(format!("d/{i}"))).collect();
+    let decl = parse_evx(set(evx(), "/programs/presence/dependencies", json!(many))).unwrap();
+    assert_eq!(
+        reasons(&decl)[0].1,
+        format!("closure of 100001 files exceeds the {MAX_FILES} files one activation may capture")
+    );
+    // Within the bound every item is still inspected.
+    let reason = malformed(set(
+        evx(),
+        "/programs/presence/dependencies",
+        json!(["evx/a.wasm", "evx/b.wasm", "evx/a.wasm"]),
+    ));
+    assert_eq!(
+        reason,
+        "programs.presence.dependencies[2]: duplicate dependency"
+    );
+}
+
+#[test]
 fn allow_run_once_must_be_a_boolean_and_defaults_to_false() {
     for bad in [json!(1), json!("true"), json!(null)] {
         assert_eq!(
@@ -470,6 +583,78 @@ fn unknown_api_is_unsupported_for_that_program_only() {
         ]
     );
     assert!(decl.jobs.is_empty());
+}
+
+#[test]
+fn a_parameterised_capability_with_an_unknown_api_disables_only_its_program() {
+    let decl = parse_evx(set(
+        evx(),
+        "/programs/score/capabilities",
+        json!([
+            { "api": "game.score.get" },
+            { "api": "data.append", "stream": "presence", "retain": { "days": 7 } }
+        ]),
+    ))
+    .unwrap();
+    assert!(!decl.programs.contains_key("score"));
+    assert!(decl.programs.contains_key("presence"));
+    assert_eq!(decl.jobs.len(), 1);
+    assert_eq!(
+        reasons(&decl),
+        vec![(
+            "programs.score".to_string(),
+            "capabilities[1]: api \"data.append\" not supported".to_string()
+        )]
+    );
+    // Two parameterised requests for one unknown api are not a duplicate:
+    // their parameters are not read, so they cannot be told apart.
+    let decl = parse_evx(set(
+        evx(),
+        "/programs/score/capabilities",
+        json!([
+            { "api": "data.append", "stream": "a" },
+            { "api": "data.append", "stream": "b" }
+        ]),
+    ))
+    .unwrap();
+    assert_eq!(
+        reasons(&decl),
+        vec![
+            (
+                "programs.score".to_string(),
+                "capabilities[0]: api \"data.append\" not supported".to_string()
+            ),
+            (
+                "programs.score".to_string(),
+                "capabilities[1]: api \"data.append\" not supported".to_string()
+            ),
+        ]
+    );
+    // The api is still read before anything else, for every capability.
+    assert_eq!(
+        malformed(set(
+            evx(),
+            "/programs/score/capabilities",
+            json!([{ "stream": "presence" }])
+        )),
+        "programs.score.capabilities[0].api: required"
+    );
+    assert!(malformed(set(
+        evx(),
+        "/programs/score/capabilities",
+        json!([{ "api": "data append", "stream": "presence" }])
+    ))
+    .starts_with("programs.score.capabilities[0].api:"));
+    // A known api keeps its exact shape: a parameter it does not take would
+    // otherwise be granted as something other than what was asked.
+    assert_eq!(
+        malformed(set(
+            evx(),
+            "/programs/score/capabilities",
+            json!([{ "api": "game.score.get", "stream": "presence" }])
+        )),
+        "programs.score.capabilities[0]: unknown field \"stream\""
+    );
 }
 
 #[test]

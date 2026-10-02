@@ -23,9 +23,12 @@ type Outcome<T> = Result<T, DeclarationError>;
 /// Parse the `evx` section of an already-decoded root `content.json`.
 ///
 /// The section is re-serialised and decoded through [`evx_api::strict`] so
-/// the same number rules apply as everywhere in EVX. A `serde_json::Value`
-/// has already collapsed duplicate keys, so a caller holding the raw bytes
-/// should prefer [`parse_bytes`], which refuses them.
+/// the same number rules apply as everywhere in EVX. What this cannot do is
+/// refuse a duplicate key: a `serde_json::Value` has already kept the last of
+/// two equal keys and dropped the other, so the rule that duplicates fail
+/// the section can only hold when the value came from bytes that
+/// [`parse_bytes`] (or `evx_api::strict::parse`) accepted. A caller holding
+/// the bytes uses `parse_bytes`.
 ///
 /// A missing section is [`DeclarationError::Missing`]; see [`parse_optional`].
 pub fn parse(content: &serde_json::Value) -> Outcome<Declaration> {
@@ -55,17 +58,28 @@ pub fn parse_optional(content: &serde_json::Value) -> Outcome<Option<Declaration
 /// The whole document goes through [`evx_api::strict`], so a duplicate key
 /// anywhere in it, including two `evx` keys or two `entry` fields, refuses
 /// the declaration. This is the entry point to use when the bytes are at
-/// hand; [`parse`] exists for callers that only hold a decoded value.
+/// hand, and the node has them: the stored `content.json` is what it serves.
+/// [`parse`] exists for callers that only hold a decoded value and know
+/// where it came from. [`crate::declaration_digest_bytes`] is the matching
+/// digest.
 pub fn parse_bytes(raw: &[u8]) -> Outcome<Option<Declaration>> {
+    let document = strict_document(raw)?;
+    match document.get("evx") {
+        None => Ok(None),
+        Some(section) => parse_section(section).map(Some),
+    }
+}
+
+/// Decode a whole root `content.json` strictly into its top-level object.
+/// The byte-level entry points share it so they agree on what a document is
+/// and refuse the same things.
+pub(crate) fn strict_document(raw: &[u8]) -> Outcome<Object> {
     let document = strict::parse(raw).map_err(|_| {
         DeclarationError::malformed("content.json is not valid JSON without duplicate keys")
     })?;
-    let object = document
-        .as_object()
-        .ok_or_else(|| DeclarationError::malformed("content.json is not an object"))?;
-    match object.get("evx") {
-        None => Ok(None),
-        Some(section) => parse_section(section).map(Some),
+    match document {
+        Value::Object(object) => Ok(object),
+        _ => Err(DeclarationError::malformed("content.json is not an object")),
     }
 }
 
@@ -136,12 +150,38 @@ fn parse_section(value: &Value) -> Outcome<Declaration> {
 
 /// Parse one program. `Ok(None)` means the program is well-formed but
 /// unsupported; its reasons have been appended to `unsupported`.
+///
+/// The runtime profile is read first because it decides the schema of
+/// everything else. For a profile other than [`RUNTIME_PROFILE`] only the
+/// `entry` is still required to be a valid path, since the inspection view
+/// names it; the remaining fields are not interpreted, as with an unknown
+/// schedule type: their schema is unknown, so neither accepting nor rejecting
+/// them would be meaningful, and failing the section on them would disable
+/// every other program for a profile this host simply does not have.
 fn parse_program(
     path: &str,
     value: &Value,
     unsupported: &mut Vec<Unsupported>,
 ) -> Outcome<Option<Program>> {
     let program = object(value, path)?;
+
+    let runtime_profile = string(
+        required(program, path, "runtime_profile")?,
+        &format!("{path}.runtime_profile"),
+    )?;
+    identifier(runtime_profile, &format!("{path}.runtime_profile"))?;
+
+    let entry = string(required(program, path, "entry")?, &format!("{path}.entry"))?;
+    relative_path(entry, &format!("{path}.entry"))?;
+
+    if runtime_profile != RUNTIME_PROFILE {
+        unsupported.push(Unsupported {
+            path: path.to_string(),
+            reason: format!("runtime profile {runtime_profile:?} not supported"),
+        });
+        return Ok(None);
+    }
+
     only_fields(
         program,
         path,
@@ -156,43 +196,37 @@ fn parse_program(
     )?;
     let mut reasons = Vec::new();
 
-    let runtime_profile = string(
-        required(program, path, "runtime_profile")?,
-        &format!("{path}.runtime_profile"),
-    )?;
-    identifier(runtime_profile, &format!("{path}.runtime_profile"))?;
-    if runtime_profile != RUNTIME_PROFILE {
-        reasons.push(format!("runtime profile {runtime_profile:?} not supported"));
-    }
-
-    let entry = string(required(program, path, "entry")?, &format!("{path}.entry"))?;
-    relative_path(entry, &format!("{path}.entry"))?;
-
     let mut dependencies = Vec::new();
     if let Some(list) = program.get("dependencies") {
         let items = array(list, &format!("{path}.dependencies"))?;
-        for (index, item) in items.iter().enumerate() {
-            let field = format!("{path}.dependencies[{index}]");
-            let dependency = string(item, &field)?;
-            relative_path(dependency, &field)?;
-            if dependency == entry {
-                return Err(DeclarationError::malformed(format!(
-                    "{field}: dependency repeats the entry"
-                )));
+        // The bound is checked before the first item so a declaration cannot
+        // make the parser do unbounded work, as for capabilities. A list past
+        // it is a requirement this host cannot meet whatever it holds, so
+        // its items are not interpreted.
+        if items.len() + 1 > MAX_FILES {
+            reasons.push(format!(
+                "closure of {} files exceeds the {MAX_FILES} files one activation may capture",
+                items.len() + 1
+            ));
+        } else {
+            let mut seen = BTreeSet::new();
+            for (index, item) in items.iter().enumerate() {
+                let field = format!("{path}.dependencies[{index}]");
+                let dependency = string(item, &field)?;
+                relative_path(dependency, &field)?;
+                if dependency == entry {
+                    return Err(DeclarationError::malformed(format!(
+                        "{field}: dependency repeats the entry"
+                    )));
+                }
+                if !seen.insert(dependency) {
+                    return Err(DeclarationError::malformed(format!(
+                        "{field}: duplicate dependency"
+                    )));
+                }
+                dependencies.push(dependency.to_string());
             }
-            if dependencies.iter().any(|seen: &String| seen == dependency) {
-                return Err(DeclarationError::malformed(format!(
-                    "{field}: duplicate dependency"
-                )));
-            }
-            dependencies.push(dependency.to_string());
         }
-    }
-    if dependencies.len() + 1 > MAX_FILES {
-        reasons.push(format!(
-            "closure of {} files exceeds the {MAX_FILES} files one activation may capture",
-            dependencies.len() + 1
-        ));
     }
 
     let allow_run_once = match program.get("allow_run_once") {
@@ -223,11 +257,16 @@ fn parse_program(
     }
 }
 
-/// A capability is exactly `{"api": "<name>"}`. The shape is strict because a
-/// parameterised capability (`{"api": "data.append", "stream": "presence"}`)
-/// would need a schema this host does not have; silently ignoring the extra
-/// field would grant something other than what was asked. The *name* being
-/// outside the closed set is the one thing that is merely unsupported.
+/// A capability is `{"api": "<name>", ...}`, and the `api` decides what the
+/// rest may be. For a name in the closed [`Capability`] set the object is
+/// exactly `{"api": "<name>"}`: none of those takes a parameter, and
+/// silently ignoring one would grant something other than what was asked.
+/// A name outside the set makes the program unsupported, and the object's
+/// other fields are then not interpreted: a parameterised capability of a
+/// later host (`{"api": "data.append", "stream": "presence"}`) has a schema
+/// this host does not have, and failing the section on it would disable
+/// every other program too. Two such objects with one name are reported
+/// twice, not as a duplicate, because nothing distinguishes them here.
 fn parse_capabilities(
     path: &str,
     value: &Value,
@@ -241,23 +280,20 @@ fn parse_capabilities(
         )));
     }
     let mut capabilities = BTreeSet::new();
-    let mut names = BTreeSet::new();
     for (index, item) in items.iter().enumerate() {
         let field = format!("{field}[{index}]");
         let item = object(item, &field)?;
-        only_fields(item, &field, &["api"])?;
         let api = string(required(item, &field, "api")?, &format!("{field}.api"))?;
         identifier(api, &format!("{field}.api"))?;
-        if !names.insert(api) {
+        let Some(capability) = Capability::parse(api) else {
+            reasons.push(format!("capabilities[{index}]: api {api:?} not supported"));
+            continue;
+        };
+        only_fields(item, &field, &["api"])?;
+        if !capabilities.insert(capability) {
             return Err(DeclarationError::malformed(format!(
                 "{field}: duplicate capability {api:?}"
             )));
-        }
-        match Capability::parse(api) {
-            Some(capability) => {
-                capabilities.insert(capability);
-            }
-            None => reasons.push(format!("capabilities[{index}]: api {api:?} not supported")),
         }
     }
     Ok(capabilities)

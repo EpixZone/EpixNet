@@ -23,7 +23,8 @@
 //! * **Unsupported** requirements are well-formed requests this host cannot
 //!   honour: an `api` outside the closed [`evx_api::Capability`] set, a
 //!   runtime profile other than [`RUNTIME_PROFILE`], a `streams` section,
-//!   a non-interval schedule, limits outside [`evx_api::Limits::validate`].
+//!   a non-interval schedule, limits outside [`evx_api::Limits::validate`],
+//!   a closure of more than `evx_activation::MAX_FILES` files.
 //!   The affected program or job is left out of [`Declaration::programs`] or
 //!   [`Declaration::jobs`] and recorded in [`Declaration::unsupported`] with
 //!   a reason, and the rest of the declaration stays usable. The plan's rule
@@ -34,6 +35,30 @@
 //! There is no permissive fallback anywhere: an unknown schedule type is not
 //! "run manually", an unknown limit is not "use the default", an unknown
 //! capability is not "grant nothing and continue".
+//!
+//! Where a field decides the schema of the fields around it, it is read
+//! first and the rest is left uninterpreted when the host does not know
+//! that schema: the fields of a schedule with an unknown `type`, of a
+//! program with an unknown `runtime_profile` (its `entry` is still required
+//! to be a valid path, for display), of a capability with an unknown `api`,
+//! and the items of a dependency list already past the file bound. Their
+//! schema being unknown, neither accepting nor rejecting them would mean
+//! anything, and failing the section on them would disable every other
+//! program for a feature this host simply does not have yet.
+//!
+//! # Bytes first
+//!
+//! Duplicate keys can only be refused where they still exist. A
+//! `serde_json::Value` has already kept the last of two equal keys and
+//! dropped the other, so [`parse`] and [`declaration_digest`], which take a
+//! value, cannot see one, and the node's `AppState::content` hands out
+//! exactly such a value. [`parse_bytes`] and [`declaration_digest_bytes`]
+//! decode the whole document through `evx_api::strict` and are the primary
+//! entry points: the EVX service reads the stored `content.json` bytes
+//! (`XiteStorage::read_bounded`) and calls them, and uses the value forms
+//! only on a value re-read from bytes those accepted. [`bind`] reads only
+//! the manifest's `files`, which the content signature covers as it was
+//! decoded, so it takes the value the signature was verified on.
 //!
 //! # Binding
 //!
@@ -63,7 +88,7 @@ mod summary;
 mod tests;
 
 pub use bind::{bind, BoundProgram, PinnedFile};
-pub use digest::declaration_digest;
+pub use digest::{declaration_digest, declaration_digest_bytes};
 pub use parse::{parse, parse_bytes, parse_optional};
 pub use summary::summary;
 
