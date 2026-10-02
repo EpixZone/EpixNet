@@ -346,6 +346,9 @@ fn read_stderr(role: Role, mut stderr: impl Read, tx: Sender<Event>) {
 }
 
 enum SampleError {
+    /// Only the macOS sampler can tell a vanished process from an
+    /// unavailable measurement; other platforms fail closed as unavailable.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Gone,
     Unavailable,
 }

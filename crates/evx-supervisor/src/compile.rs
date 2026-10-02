@@ -64,6 +64,18 @@ pub fn compile_module(config: &Config, module: &[u8]) -> Result<CompiledArtifact
             }
         }
     }
+    // The compiler exits on its own right after replying. Give it the rest of
+    // its deadline (bounded) to do so before `close` signals it: on a slow
+    // host the reply arrives while the child is still tearing down its
+    // engine, and our own SIGTERM would otherwise read as a crash after
+    // output. A child that lingers past this is still killed and refused.
+    if reply.is_some() && failure.is_none() {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let exit_deadline = Instant::now() + remaining.clamp(Duration::from_millis(250), Duration::from_secs(3));
+        while Instant::now() < exit_deadline && peer.poll().is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
     let code = peer
         .close(Duration::from_millis(50), Duration::from_secs(2))
         .map_err(|_| Denied::new("compiler termination unconfirmed"))?;
