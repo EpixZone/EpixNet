@@ -800,6 +800,37 @@ fn content_naming_another_xite_is_denied() {
 }
 
 #[test]
+fn content_whose_address_is_not_the_grants_root_address_is_denied() {
+    let mut fx = Fixture::new();
+    let other = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+    // The grant names the document's address as its xite but vouches for a
+    // different owner: the signature the node checked was `other`'s, so
+    // nothing has verified this document, whatever its `address` says.
+    let foreign_owner = XiteGrant::for_root_address(
+        fx.address.clone(),
+        other.clone(),
+        fx.grant.capabilities.clone(),
+        fx.grant.runtime_profiles.clone(),
+    )
+    .unwrap();
+    // The same through the public field, which a host could set directly.
+    let mut edited = fx.grant.clone();
+    edited.authority = PublisherAuthority::RootAddress(other);
+    for grant in [foreign_owner, edited] {
+        fx.loader = ActivationLoader::new(grant);
+        let outcome = fx.activate(&fx.content.clone());
+        assert_eq!(
+            outcome.err().map(|e| e.message().to_string()),
+            Some("content address is not the grant's root address".into())
+        );
+        assert_eq!(fx.loader.checkpoint(), &ActivationCheckpoint::default());
+    }
+    // The grant as issued, naming the owner, admits the same document.
+    fx.loader = ActivationLoader::new(fx.grant.clone());
+    assert!(fx.activate(&fx.content.clone()).is_ok());
+}
+
+#[test]
 fn a_bound_entry_that_is_not_the_declared_entry_is_denied() {
     let mut fx = Fixture::new();
     let floor = fx.admitted_baseline();

@@ -2,6 +2,10 @@
 //! does it (the shape `crates/epix-ui/tests/integration.rs` builds), so the
 //! parser, binder and digest are proven against the real on-disk form.
 
+use std::collections::BTreeMap;
+
+use evx_activation::{ActivationLoader, AuthenticationError, XiteGrant};
+use evx_api::Capability;
 use serde_json::{json, Value};
 
 use super::{evx, file_entry, parse_evx, set, sha512_prefix, ENTRY, LIB, SCORE};
@@ -115,5 +119,44 @@ fn optional_files_in_a_signed_manifest_cannot_be_bound() {
     assert_eq!(
         error.to_string(),
         "manifest binding failed: media/intro.webm: declared in files_optional; only required files can be bound"
+    );
+}
+
+#[test]
+fn a_bound_program_is_what_the_activation_loader_takes_without_conversion() {
+    // What the node does after `verify_signer`: bind from the signed
+    // document and hand the result straight to the loader. `bind` returns
+    // `evx_activation::BoundProgram` itself, so no serde round trip or
+    // field-by-field copy stands between the binder and the loader.
+    let (root, address, _) = signed_root();
+    let decl = parse(&root).unwrap();
+    let bound = bind(&decl, "presence", &root).unwrap();
+    let grant = XiteGrant::for_root_address(
+        address.clone(),
+        address.clone(),
+        [Capability::WorkspaceRead, Capability::WorkspaceWrite]
+            .into_iter()
+            .collect(),
+        ["wasm-core-v1".to_string()].into_iter().collect(),
+    )
+    .unwrap();
+    let files: BTreeMap<&str, &[u8]> = [("evx/presence.wasm", ENTRY), ("evx/lib.wasm", LIB)]
+        .into_iter()
+        .collect();
+    let mut read = |path: &str| {
+        files
+            .get(path)
+            .map(|data| data.to_vec())
+            .ok_or_else(|| AuthenticationError::new("file unavailable"))
+    };
+    let pending = ActivationLoader::new(grant)
+        .verify_content(&root, &bound, &mut read)
+        .unwrap();
+    assert_eq!(pending.xite(), address);
+    assert_eq!(pending.program(), Some("presence"));
+    assert_eq!(pending.version(), 1_700_000_000_123);
+    assert_eq!(
+        pending.declaration_digest(),
+        Some(declaration_digest(&root).unwrap().as_str())
     );
 }

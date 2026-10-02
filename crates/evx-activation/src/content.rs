@@ -20,10 +20,10 @@
 //! `verify_content` requires the caller to have established that `content`
 //! is the root `content.json` signed by the owner of the grant's root
 //! address, and it re-checks what *it* can check: the document names the
-//! granted xite, the bound closure is exactly what the signed manifest
-//! pins, every captured byte matches, and the program's request lies within
-//! the grant. Tests pass unsigned documents on purpose to make the division
-//! visible.
+//! granted xite and that root address, the bound closure is exactly what the
+//! signed manifest pins, every captured byte matches, and the program's
+//! request lies within the grant. Tests pass unsigned documents on purpose
+//! to make the division visible.
 //!
 //! # Why the request is read from the signed section again
 //!
@@ -58,7 +58,9 @@ const MAX_VERSION: u64 = i64::MAX as u64;
 /// Produced by `evx_declaration::bind` from the parsed declaration and the
 /// manifest's required `files` map. It lives in this crate because the
 /// declaration crate depends on this one for the closure bounds, and the
-/// loader must name the type in [`ActivationLoader::verify_content`].
+/// loader must name the type in [`ActivationLoader::verify_content`];
+/// `evx_declaration` re-exports it, so the binder's output is this type and
+/// not a lookalike.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BoundProgram {
@@ -94,11 +96,13 @@ impl ActivationLoader {
     ///
     /// `content` must already be verified by the caller as the root
     /// `content.json` signed by the owner of the grant's root address
-    /// (`epix_content::verify_signer(content, xite)` is true); this
-    /// function does not check the signature. It captures the entry and
-    /// dependencies through `read`, checks each against the size and
-    /// truncated SHA-512 the manifest signed, and yields the same
-    /// [`PendingActivation`] the envelope path does. Nothing is mutated.
+    /// (`epix_content::verify_signer(content, address)` is true, where
+    /// `address` is the [`PublisherAuthority::RootAddress`] in the grant);
+    /// this function does not check the signature, only that the document
+    /// names that address. It captures the entry and dependencies through
+    /// `read`, checks each against the size and truncated SHA-512 the
+    /// manifest signed, and yields the same [`PendingActivation`] the
+    /// envelope path does. Nothing is mutated.
     ///
     /// The activation's version is `content["modified"]` in whole
     /// milliseconds; its manifest digest is the SHA-256 of
@@ -108,11 +112,12 @@ impl ActivationLoader {
     ///
     /// Refuses, in this order and each without touching the checkpoint: a
     /// disabled grant; a grant that is not a root-address grant; a document
-    /// that is not an object or whose `address` is not the granted xite; a
-    /// `modified` that is missing, not a number, non-finite, negative, zero
-    /// or beyond `2**63 - 1` milliseconds; a version the checkpoint does not
-    /// admit; a missing or malformed `evx` section or program entry; a
-    /// runtime profile outside the grant; a capability list that is not
+    /// that is not an object or whose `address` is not the granted xite or
+    /// not the grant's root address; a `modified` that is missing, not a
+    /// number, non-finite, negative, zero or beyond `2**63 - 1`
+    /// milliseconds; a version the checkpoint does not admit; a missing or
+    /// malformed `evx` section or program entry; a runtime profile outside
+    /// the grant; a capability list that is not
     /// exactly `[{"api": name}, ...]` of distinct known names within the
     /// grant; a bound entry or dependency list that differs from the signed
     /// program; a closure beyond [`MAX_FILES`], [`MAX_ARTIFACT`] or
@@ -130,16 +135,25 @@ impl ActivationLoader {
         if !grant.enabled {
             return Err(AuthenticationError::new("xite execution is not enabled"));
         }
-        if !matches!(grant.authority, PublisherAuthority::RootAddress(_)) {
+        let PublisherAuthority::RootAddress(owner) = &grant.authority else {
             return Err(AuthenticationError::new(
                 "content activation requires a root-address grant",
             ));
-        }
+        };
         let document = content
             .as_object()
             .ok_or_else(|| AuthenticationError::new("content.json is not an object"))?;
-        if document.get("address").and_then(Value::as_str) != Some(grant.xite.as_str()) {
+        let address = document.get("address").and_then(Value::as_str);
+        if address != Some(grant.xite.as_str()) {
             return Err(AuthenticationError::new("activation identity mismatch"));
+        }
+        // The caller verified the signature against the address the grant
+        // names; a document naming any other address was not vouched for
+        // by that check, whatever its `address` field says.
+        if address != Some(owner.as_str()) {
+            return Err(AuthenticationError::new(
+                "content address is not the grant's root address",
+            ));
         }
         let version = modified_version(document.get("modified"))?;
         let manifest_bytes = epix_content::signed_data(content).into_bytes();

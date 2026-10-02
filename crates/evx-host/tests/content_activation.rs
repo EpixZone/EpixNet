@@ -156,10 +156,6 @@ impl Harness {
         assert!(epix_content::verify_signer(&content, &self.address));
         let declaration = evx_declaration::parse_bytes(&raw).unwrap().unwrap();
         let bound = evx_declaration::bind(&declaration, PROGRAM_ID, &content).unwrap();
-        // Same shape, defined in evx-activation; evx-declaration re-exports
-        // it once its dependency direction allows.
-        let bound: evx_activation::BoundProgram =
-            serde_json::from_value(serde_json::to_value(&bound).unwrap()).unwrap();
         let files = &self.files;
         let mut read = |path: &str| {
             files

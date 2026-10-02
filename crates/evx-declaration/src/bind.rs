@@ -2,43 +2,23 @@
 //!
 //! The owner's content signature covers `files`, so `size` and `sha512` there
 //! are the only authenticated statement of what the entry and dependencies
-//! should contain. Binding copies those two values out; the activation loader
-//! later reads the real bytes and compares. Nothing is read here.
+//! should contain. Binding copies those two values out into the loader's
+//! [`BoundProgram`]; `evx_activation::ActivationLoader::verify_content` later
+//! reads the real bytes and compares. Nothing is read here.
 
 use std::collections::BTreeSet;
 
 use evx_activation::{MAX_ARTIFACT, MAX_FILES, MAX_TOTAL};
 use evx_api::validate_relative_path;
-use serde::{Deserialize, Serialize};
 
 use crate::{Declaration, DeclarationError};
 
-/// One program whose files are pinned to the manifest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct BoundProgram {
-    /// The program id in the declaration.
-    pub program: String,
-    /// The module exporting `run`.
-    pub entry: PinnedFile,
-    /// Dependencies in declared order.
-    pub dependencies: Vec<PinnedFile>,
-    /// Sum of all pinned sizes, at most [`MAX_TOTAL`].
-    pub total_bytes: u64,
-}
-
-/// A manifest entry: path plus the signed size and digest.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct PinnedFile {
-    /// Manifest-relative path, exactly as it appears in `files`.
-    pub path: String,
-    /// Signed size in bytes, at most [`MAX_ARTIFACT`].
-    pub size: u64,
-    /// Signed digest: 64 lowercase hex characters, the truncated SHA-512
-    /// EpixNet manifests use.
-    pub sha512: String,
-}
+// The bound program is the activation loader's own type, so what `bind`
+// returns is exactly what `ActivationLoader::verify_content` takes: the
+// node never converts between two structs of the same shape, and the two
+// cannot drift apart. The definitions live in `evx-activation` because this
+// crate depends on it for the closure bounds.
+pub use evx_activation::{BoundProgram, PinnedFile};
 
 /// Pin `program`'s entry and dependencies to `content["files"]`.
 ///
