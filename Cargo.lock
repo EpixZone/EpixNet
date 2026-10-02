@@ -3528,6 +3528,7 @@ name = "evx-state"
 version = "0.1.0"
 dependencies = [
  "evx-api",
+ "evx-declaration",
  "hex",
  "rand 0.9.4",
  "rusqlite",

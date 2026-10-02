@@ -6,6 +6,9 @@ description = "EVX host-owned SQLite durable state: grants, reservations, outbox
 
 [dependencies]
 evx-api = { path = "../evx-api" }
+# The typed `Schedule` a job is registered with. evx-declaration depends on
+# evx-activation and evx-api only, never on this crate, so there is no cycle.
+evx-declaration = { path = "../evx-declaration" }
 rusqlite = { version = "0.37", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

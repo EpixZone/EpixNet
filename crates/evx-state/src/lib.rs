@@ -32,12 +32,25 @@
 //! everything. The database carries its layout in `PRAGMA user_version`
 //! ([`SCHEMA_VERSION`]); every migration is additive and runs on open, and a
 //! database written by a newer build is refused rather than guessed at.
+//!
+//! # Job schedules (Milestone 3)
+//!
+//! Milestone 3 adds the persisted schedule: a [`JobRow`] per declared job,
+//! its slot bookkeeping, and the per-day background budget. A scheduled run
+//! is an ordinary invocation whose occurrence id names the job and the slot
+//! ([`DurableState::occurrence_id`]), reserved with
+//! [`DurableState::claim_occurrence`] and completed with
+//! [`DurableState::finish_occurrence`], so every fence above applies to it
+//! unchanged and the same occurrence can never execute twice.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
 mod canonical;
 mod destination;
+mod jobs;
+#[cfg(test)]
+mod jobs_tests;
 #[cfg(test)]
 mod tests;
 mod xite;
@@ -57,6 +70,10 @@ pub use canonical::{
     MAX_LIMIT, MAX_SAFE_INTEGER,
 };
 pub use destination::{Destination, MockDestination};
+pub use jobs::{
+    JobRow, JobSpec, Slot, MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID, OCCURRENCE_SEPARATOR,
+    SECONDS_PER_DAY,
+};
 pub use xite::{
     RunRecord, XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS,
     MAX_RUNTIME_PROFILES, MAX_TEXT, XITE_BUDGET_LIMIT,
@@ -67,9 +84,10 @@ pub use xite::{
 /// Version 1 is the Milestone 1 layout (`grants`, `invocations`, `outbox`,
 /// `checkpoints`; databases written before the version was recorded read as
 /// 0 and are treated as 1). Version 2 adds `xite_grants`, `allow_once` and
-/// `runs`. [`DurableState::open`] applies every step up to this version with
-/// `IF NOT EXISTS` statements only, so an older file keeps all of its rows.
-pub const SCHEMA_VERSION: u32 = 2;
+/// `runs`. Version 3 adds `jobs` and `daily_runs`. [`DurableState::open`]
+/// applies every step up to this version with `IF NOT EXISTS` statements
+/// only, so an older file keeps all of its rows.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Most invocations or outbox rows retained per xite, and most receipts or
 /// published entries retained by the mock destination.
@@ -597,6 +615,215 @@ fn invocation_from_row(row: InvocationRow, fresh: bool) -> Invocation {
     }
 }
 
+/// The body of [`DurableState::begin`], run inside a caller-owned
+/// `BEGIN IMMEDIATE` transaction so a job claim can reserve the occurrence
+/// and update its job row atomically. Inputs are already validated and
+/// `request_digest` is the digest of the canonical request.
+pub(crate) fn begin_in(
+    conn: &Connection,
+    xite: &str,
+    occurrence: &str,
+    request_digest: &str,
+    cost: u64,
+) -> Result<Invocation> {
+    let grant = allowed(conn, xite, None, None)?;
+    if let Some(prior) = load_invocation(conn, xite, occurrence)? {
+        if prior.request_digest != request_digest || prior.cost != cost {
+            return Err(Error::conflict("occurrence payload or cost conflict"));
+        }
+        return Ok(invocation_from_row(prior, false));
+    }
+    if grant.used + cost > grant.budget_limit {
+        return Err(Error::budget("persistent budget exhausted"));
+    }
+    if count(
+        conn,
+        "SELECT COUNT(*) FROM invocations WHERE xite=?1",
+        params![xite],
+    )? >= MAX_ROWS
+    {
+        return Err(Error::budget("retained occurrence limit"));
+    }
+    conn.execute(
+        "UPDATE grants SET used=used+?1 WHERE xite=?2",
+        params![cost, xite],
+    )?;
+    conn.execute(
+        &format!(
+            "INSERT INTO invocations ({INVOCATION_COLUMNS}) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL)"
+        ),
+        params![
+            xite,
+            occurrence,
+            fresh_token(),
+            grant.generation,
+            grant.schema_generation,
+            request_digest,
+            cost,
+            InvocationStatus::Running.as_str(),
+        ],
+    )?;
+    let row = load_invocation(conn, xite, occurrence)?
+        .ok_or_else(|| Error::conflict("reservation vanished"))?;
+    Ok(invocation_from_row(row, true))
+}
+
+/// A commit whose inputs passed validation and canonical encoding, ready to
+/// be applied inside a transaction by [`commit_in`].
+pub(crate) struct PreparedCommit<'a> {
+    response: &'a Value,
+    response_raw: String,
+    effects: &'a [Effect],
+    state: Option<(StateUpdate, String)>,
+}
+
+/// Validate and canonically encode a commit's inputs outside any
+/// transaction, so a malformed result holds no database lock.
+pub(crate) fn prepare_commit<'a>(
+    response: &'a Value,
+    effects: &'a [Effect],
+    state: Option<StateUpdate>,
+) -> Result<PreparedCommit<'a>> {
+    let response_raw = canonical(response)?;
+    let mut keys: Vec<&str> = effects.iter().map(|effect| effect.key.as_str()).collect();
+    keys.sort_unstable();
+    keys.dedup();
+    if effects.len() > MAX_EFFECTS || keys.len() != effects.len() {
+        return Err(Error::invalid("effect count or duplicate key"));
+    }
+    let state = match state {
+        Some(update) => {
+            positive(update.expected_version, true)?;
+            let raw = canonical(&update.value)?;
+            Some((update, raw))
+        }
+        None => None,
+    };
+    Ok(PreparedCommit {
+        response,
+        response_raw,
+        effects,
+        state,
+    })
+}
+
+/// The body of [`DurableState::commit`], run inside a caller-owned
+/// `BEGIN IMMEDIATE` transaction so a job's finish can complete the
+/// occurrence and update its job row atomically. Returns the stored response
+/// when the occurrence was already completed with an identical result
+/// (nothing is written in that case) and `None` when this call completed it.
+pub(crate) fn commit_in(
+    conn: &Connection,
+    invocation: &Invocation,
+    prepared: &PreparedCommit<'_>,
+    failpoint: Option<Failpoint<'_>>,
+) -> Result<Option<Value>> {
+    let row = match load_invocation(conn, &invocation.xite, &invocation.occurrence)? {
+        Some(row) if row.token == invocation.token => row,
+        _ => return Err(Error::conflict("stale invocation token")),
+    };
+    let grant = allowed(
+        conn,
+        &invocation.xite,
+        Some(row.generation),
+        Some(row.schema_generation),
+    )?;
+    let mut encoded = prepared
+        .effects
+        .iter()
+        .map(|effect| {
+            envelope(effect, grant.publication_prefix.as_deref())
+                .map(|raw| (effect.key.as_str(), raw))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    encoded.sort();
+    let state_update = prepared.state.as_ref().map(
+        |(update, _)| json!({"expected_version": update.expected_version, "value": update.value}),
+    );
+    let commit_digest = digest(&canonical(&json!({
+        "response": prepared.response,
+        "effects": encoded.iter().map(|(key, raw)| json!([key, raw])).collect::<Vec<_>>(),
+        "state_update": state_update,
+    }))?);
+    if row.status == InvocationStatus::Completed {
+        if row.commit_digest.as_deref() != Some(commit_digest.as_str()) {
+            return Err(Error::conflict("completed occurrence result conflict"));
+        }
+        return Ok(Some(row.response.unwrap_or(Value::Null)));
+    }
+    if let Some((update, state_raw)) = &prepared.state {
+        let version: u64 = conn
+            .query_row(
+                "SELECT version FROM checkpoints WHERE xite=?1",
+                params![invocation.xite],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0);
+        if version != update.expected_version {
+            return Err(Error::conflict("checkpoint version conflict"));
+        }
+        conn.execute(
+            "INSERT INTO checkpoints (xite, version, value) VALUES (?1,?2,?3) \
+             ON CONFLICT(xite) DO UPDATE SET version=excluded.version, \
+             value=excluded.value",
+            params![invocation.xite, version + 1, state_raw],
+        )?;
+    }
+    for (key, raw) in &encoded {
+        let payload_digest = digest(raw);
+        if let Some(prior) = load_outbox(conn, &invocation.xite, key)? {
+            if prior.payload_digest != payload_digest {
+                return Err(Error::conflict("effect payload conflict"));
+            }
+            let expired = prior.status == OutboxStatus::Cancelled
+                || (prior.status == OutboxStatus::Queued
+                    && (prior.generation != row.generation
+                        || prior.schema_generation != row.schema_generation));
+            if expired {
+                return Err(Error::denied("effect belongs to expired authority"));
+            }
+            continue;
+        }
+        if count(
+            conn,
+            "SELECT COUNT(*) FROM outbox WHERE xite=?1",
+            params![invocation.xite],
+        )? >= MAX_ROWS
+        {
+            return Err(Error::budget("retained effect limit"));
+        }
+        conn.execute(
+            &format!("INSERT INTO outbox ({OUTBOX_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL)"),
+            params![
+                invocation.xite,
+                key,
+                row.generation,
+                row.schema_generation,
+                raw,
+                payload_digest,
+                OutboxStatus::Queued.as_str(),
+            ],
+        )?;
+    }
+    conn.execute(
+        "UPDATE invocations SET status=?1, response=?2, commit_digest=?3 \
+         WHERE xite=?4 AND occurrence=?5",
+        params![
+            InvocationStatus::Completed.as_str(),
+            prepared.response_raw,
+            commit_digest,
+            invocation.xite,
+            invocation.occurrence,
+        ],
+    )?;
+    if let Some(failpoint) = failpoint {
+        failpoint("before_commit");
+    }
+    Ok(None)
+}
+
 /// Validate an effect and encode its canonical envelope. `prefix` is the
 /// grant's publication prefix; publication without one is denied.
 pub(crate) fn envelope(effect: &Effect, prefix: Option<&str>) -> Result<String> {
@@ -684,8 +911,9 @@ impl DurableState {
             return Err(Error::conflict("database schema is newer than this build"));
         }
         conn.execute_batch(&format!(
-            "BEGIN IMMEDIATE;{SCHEMA}{}PRAGMA user_version={SCHEMA_VERSION};COMMIT;",
-            xite::SCHEMA_V2
+            "BEGIN IMMEDIATE;{SCHEMA}{}{}PRAGMA user_version={SCHEMA_VERSION};COMMIT;",
+            xite::SCHEMA_V2,
+            jobs::SCHEMA_V3
         ))?;
         Ok(state)
     }
@@ -810,47 +1038,7 @@ impl DurableState {
         positive(cost, false)?;
         let request_digest = digest(&canonical(request.unwrap_or(&Value::Null))?);
         transaction(&self.path, |conn| {
-            let grant = allowed(conn, xite, None, None)?;
-            if let Some(prior) = load_invocation(conn, xite, occurrence)? {
-                if prior.request_digest != request_digest || prior.cost != cost {
-                    return Err(Error::conflict("occurrence payload or cost conflict"));
-                }
-                return Ok(invocation_from_row(prior, false));
-            }
-            if grant.used + cost > grant.budget_limit {
-                return Err(Error::budget("persistent budget exhausted"));
-            }
-            if count(
-                conn,
-                "SELECT COUNT(*) FROM invocations WHERE xite=?1",
-                params![xite],
-            )? >= MAX_ROWS
-            {
-                return Err(Error::budget("retained occurrence limit"));
-            }
-            conn.execute(
-                "UPDATE grants SET used=used+?1 WHERE xite=?2",
-                params![cost, xite],
-            )?;
-            conn.execute(
-                &format!(
-                    "INSERT INTO invocations ({INVOCATION_COLUMNS}) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL)"
-                ),
-                params![
-                    xite,
-                    occurrence,
-                    fresh_token(),
-                    grant.generation,
-                    grant.schema_generation,
-                    request_digest,
-                    cost,
-                    InvocationStatus::Running.as_str(),
-                ],
-            )?;
-            let row = load_invocation(conn, xite, occurrence)?
-                .ok_or_else(|| Error::conflict("reservation vanished"))?;
-            Ok(invocation_from_row(row, true))
+            begin_in(conn, xite, occurrence, &request_digest, cost)
         })
     }
 
@@ -910,126 +1098,9 @@ impl DurableState {
         state: Option<StateUpdate>,
         failpoint: Option<Failpoint<'_>>,
     ) -> Result<Value> {
-        let response_raw = canonical(response)?;
-        let mut keys: Vec<&str> = effects.iter().map(|effect| effect.key.as_str()).collect();
-        keys.sort_unstable();
-        keys.dedup();
-        if effects.len() > MAX_EFFECTS || keys.len() != effects.len() {
-            return Err(Error::invalid("effect count or duplicate key"));
-        }
-        let state = match state {
-            Some(update) => {
-                positive(update.expected_version, true)?;
-                let raw = canonical(&update.value)?;
-                Some((update, raw))
-            }
-            None => None,
-        };
+        let prepared = prepare_commit(response, effects, state)?;
         let replayed = transaction(&self.path, |conn| {
-            let row = match load_invocation(conn, &invocation.xite, &invocation.occurrence)? {
-                Some(row) if row.token == invocation.token => row,
-                _ => return Err(Error::conflict("stale invocation token")),
-            };
-            let grant = allowed(
-                conn,
-                &invocation.xite,
-                Some(row.generation),
-                Some(row.schema_generation),
-            )?;
-            let mut encoded = effects
-                .iter()
-                .map(|effect| {
-                    envelope(effect, grant.publication_prefix.as_deref())
-                        .map(|raw| (effect.key.as_str(), raw))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            encoded.sort();
-            let state_update = state.as_ref().map(|(update, _)| {
-                json!({"expected_version": update.expected_version, "value": update.value})
-            });
-            let commit_digest = digest(&canonical(&json!({
-                "response": response,
-                "effects": encoded.iter().map(|(key, raw)| json!([key, raw])).collect::<Vec<_>>(),
-                "state_update": state_update,
-            }))?);
-            if row.status == InvocationStatus::Completed {
-                if row.commit_digest.as_deref() != Some(commit_digest.as_str()) {
-                    return Err(Error::conflict("completed occurrence result conflict"));
-                }
-                return Ok(Some(row.response.unwrap_or(Value::Null)));
-            }
-            if let Some((update, state_raw)) = &state {
-                let version: u64 = conn
-                    .query_row(
-                        "SELECT version FROM checkpoints WHERE xite=?1",
-                        params![invocation.xite],
-                        |row| row.get(0),
-                    )
-                    .optional()?
-                    .unwrap_or(0);
-                if version != update.expected_version {
-                    return Err(Error::conflict("checkpoint version conflict"));
-                }
-                conn.execute(
-                    "INSERT INTO checkpoints (xite, version, value) VALUES (?1,?2,?3) \
-                     ON CONFLICT(xite) DO UPDATE SET version=excluded.version, \
-                     value=excluded.value",
-                    params![invocation.xite, version + 1, state_raw],
-                )?;
-            }
-            for (key, raw) in &encoded {
-                let payload_digest = digest(raw);
-                if let Some(prior) = load_outbox(conn, &invocation.xite, key)? {
-                    if prior.payload_digest != payload_digest {
-                        return Err(Error::conflict("effect payload conflict"));
-                    }
-                    let expired = prior.status == OutboxStatus::Cancelled
-                        || (prior.status == OutboxStatus::Queued
-                            && (prior.generation != row.generation
-                                || prior.schema_generation != row.schema_generation));
-                    if expired {
-                        return Err(Error::denied("effect belongs to expired authority"));
-                    }
-                    continue;
-                }
-                if count(
-                    conn,
-                    "SELECT COUNT(*) FROM outbox WHERE xite=?1",
-                    params![invocation.xite],
-                )? >= MAX_ROWS
-                {
-                    return Err(Error::budget("retained effect limit"));
-                }
-                conn.execute(
-                    &format!(
-                        "INSERT INTO outbox ({OUTBOX_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7,NULL)"
-                    ),
-                    params![
-                        invocation.xite,
-                        key,
-                        row.generation,
-                        row.schema_generation,
-                        raw,
-                        payload_digest,
-                        OutboxStatus::Queued.as_str(),
-                    ],
-                )?;
-            }
-            conn.execute(
-                "UPDATE invocations SET status=?1, response=?2, commit_digest=?3 \
-                 WHERE xite=?4 AND occurrence=?5",
-                params![
-                    InvocationStatus::Completed.as_str(),
-                    response_raw,
-                    commit_digest,
-                    invocation.xite,
-                    invocation.occurrence,
-                ],
-            )?;
-            if let Some(failpoint) = failpoint {
-                failpoint("before_commit");
-            }
-            Ok(None)
+            commit_in(conn, invocation, &prepared, failpoint)
         })?;
         if let Some(failpoint) = failpoint {
             failpoint("after_commit");
@@ -1037,7 +1108,8 @@ impl DurableState {
         if let Some(stored) = replayed {
             return Ok(stored);
         }
-        serde_json::from_str(&response_raw).map_err(|_| Error::invalid("unsupported JSON value"))
+        serde_json::from_str(&prepared.response_raw)
+            .map_err(|_| Error::invalid("unsupported JSON value"))
     }
 
     /// Host-selected xite checkpoint with its compare-and-swap version.

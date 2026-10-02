@@ -173,14 +173,14 @@ pub(crate) fn now_unix() -> Result<u64> {
         .map_err(|_| Error::denied("clock before the Unix epoch"))
 }
 
-fn text(value: &str, what: &str) -> Result<()> {
+pub(crate) fn text(value: &str, what: &str) -> Result<()> {
     if value.len() > MAX_TEXT || value.chars().any(char::is_control) {
         return Err(Error::Invalid(format!("invalid {what}")));
     }
     Ok(())
 }
 
-fn timestamp(value: u64, what: &str) -> Result<()> {
+pub(crate) fn timestamp(value: u64, what: &str) -> Result<()> {
     if value > MAX_SAFE_INTEGER {
         return Err(Error::Invalid(format!("invalid {what}")));
     }
