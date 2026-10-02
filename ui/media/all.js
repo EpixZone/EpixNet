@@ -2086,9 +2086,17 @@ if (window.getComputedStyle(document.body).transform) {
     // Whether the inspect payload lets `program` run once: it must be a
     // declared, usable program that the publisher marked run-once. Own
     // properties only, so an id such as `constructor` names nothing.
+    // The inspect payload's declaration part: the node nests the parsed
+    // summary under `declaration` (programs, jobs, unsupported) and the
+    // host's effective limits under `effective.limits`.
+    Wrapper.prototype.evxDeclaration = function (payload) {
+      var decl = payload && typeof payload.declaration === "object" && payload.declaration ? payload.declaration : payload;
+      return decl && typeof decl === "object" ? decl : {};
+    };
+
     Wrapper.prototype.evxRunnableOnce = function (payload, program) {
       var entry, programs;
-      programs = payload.programs;
+      programs = this.evxDeclaration(payload).programs;
       if (!programs || typeof programs !== "object" || !Object.prototype.hasOwnProperty.call(programs, program)) {
         return false;
       }
@@ -2123,7 +2131,7 @@ if (window.getComputedStyle(document.body).transform) {
     // honour, and that enabling also covers the publisher's authenticated
     // updates within these scopes.
     Wrapper.prototype.evxPromptBody = function (payload, program, once) {
-      var body, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, list, max, schedule;
+      var body, decl, effective, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, list, max, schedule;
       max = 200;
       esc = function (value) {
         var text;
@@ -2178,14 +2186,15 @@ if (window.getComputedStyle(document.body).transform) {
       if (grant && typeof grant === "object") {
         body += "<br><small>Current grant: " + (grant.enabled === true ? "enabled" : "disabled") + " (generation " + esc(grant.generation) + ")</small>";
       }
+      decl = this.evxDeclaration(payload);
       body += "<br><br><b>Programs</b>";
-      lines = ids(payload.programs);
+      lines = ids(decl.programs);
       if (!lines.length) {
         body += "<br>&bull; none declared";
       }
       for (i = 0, len = lines.length; i < len; i++) {
         id = lines[i];
-        entry = payload.programs[id];
+        entry = decl.programs[id];
         if (!entry || typeof entry !== "object") {
           continue;
         }
@@ -2194,7 +2203,7 @@ if (window.getComputedStyle(document.body).transform) {
           body += " &mdash; unsupported: " + (Array.isArray(entry.reasons) && entry.reasons.length ? list(entry.reasons, "; ") : "no reason given");
           continue;
         }
-        body += " &mdash; entry " + file(entry.entry);
+        body += " &mdash; entry " + file(entry.files && entry.files.entry ? entry.files.entry : entry.entry);
         if (Array.isArray(entry.dependencies) && entry.dependencies.length) {
           body += "; depends on ";
           for (j = 0; j < entry.dependencies.length; j++) {
@@ -2206,13 +2215,13 @@ if (window.getComputedStyle(document.body).transform) {
         body += " &middot; run once: " + (entry.allow_run_once === true ? "allowed" : "not allowed") + "</small>";
       }
       body += "<br><br><b>Triggers</b>";
-      lines = ids(payload.jobs);
+      lines = ids(decl.jobs);
       if (!lines.length) {
         body += "<br>&bull; none declared";
       }
       for (i = 0, len = lines.length; i < len; i++) {
         id = lines[i];
-        job = payload.jobs[id];
+        job = decl.jobs[id];
         if (!job || typeof job !== "object") {
           continue;
         }
@@ -2230,18 +2239,19 @@ if (window.getComputedStyle(document.body).transform) {
         }
         body += ", concurrency " + esc(job.max_concurrency);
       }
-      if (Array.isArray(payload.unsupported) && payload.unsupported.length) {
+      if (Array.isArray(decl.unsupported) && decl.unsupported.length) {
         body += "<br><br><b>Not supported on this node</b>";
-        for (i = 0, len = payload.unsupported.length; i < len; i++) {
-          entry = payload.unsupported[i];
+        for (i = 0, len = decl.unsupported.length; i < len; i++) {
+          entry = decl.unsupported[i];
           if (!entry || typeof entry !== "object") {
             continue;
           }
           body += "<br>&bull; " + esc(entry.path) + ": " + esc(entry.reason);
         }
       }
-      if (payload.effective_limits && typeof payload.effective_limits === "object") {
-        body += "<br><br><small>Effective limits on this node: " + limits(payload.effective_limits) + "</small>";
+      effective = payload.effective && typeof payload.effective === "object" ? payload.effective.limits : payload.effective_limits;
+      if (effective && typeof effective === "object") {
+        body += "<br><br><small>Effective limits on this node: " + limits(effective) + "</small>";
       }
       body += "<br><br><small>Enabling also covers authenticated updates to this xite from the same publisher within these capabilities and limits, without another prompt. Nothing beyond them runs until you are asked again.</small>";
       if (program !== null) {

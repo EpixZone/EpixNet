@@ -31,3 +31,8 @@ epix-crypt = { path = "../epix-crypt" }
 # the manifest pins. The service itself never links the text format.
 evx-runtime = { path = "../evx-runtime", features = ["text"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# examples/wrapper_fixture.rs: the real UI server with this plugin, in path
+# mode or (--host) behind the browsers' TLS proxy, for real-browser checks.
+epix-browser-net = { path = "../epix-browser-net" }
+axum = "0.8"
+tower = { version = "0.5", features = ["util"] }

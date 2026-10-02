@@ -69,7 +69,7 @@ function inspectPayload(overrides) {
       },
     },
     unsupported: [{ path: "streams.presence", reason: "retained streams not supported" }],
-    effective_limits: { memory_bytes: 33554432, fuel: 1000000 },
+    effective: { limits: { memory_bytes: 33554432, fuel: 1000000 } },
   }, overrides || {});
 }
 
@@ -82,6 +82,7 @@ function wrapper(windowOverrides, results) {
     ${method("setXiteInfo")}
     ${method("handleMessage")}
     ${method("actionEvxRequest")}
+    ${method("evxDeclaration")}
     ${method("evxRunnableOnce")}
     ${method("evxGrantOutcome")}
     ${method("evxPromptBody")}
@@ -165,6 +166,39 @@ test("an evxRequest inspects the xite and shows the dialog built from the digest
   assert.match(body, /Effective limits on this node: fuel 1000000, memory_bytes 33554432/);
   assert.match(body, /Enabling also covers authenticated updates to this xite from the same publisher within these capabilities and limits/);
   assert.match(body, /Allow once runs <b>presence<\/b> one time/);
+});
+
+// The node nests the parsed declaration under `declaration` and pins each
+// program's files under `files` (crates/epix-evx inspect payload); the
+// dialog must read that shape, not only the flat one above.
+test("the dialog reads the node's nested declaration shape with pinned files", () => {
+  const flat = inspectPayload();
+  const nested = {
+    xite: flat.xite, publisher: flat.publisher, declaration_digest: flat.declaration_digest, integrity: flat.integrity, grant: null,
+    declaration: {
+      version: 1,
+      programs: {
+        calc: {
+          usable: true, runtime_profile: "wasm-core-v1", entry: "evx/calc.wasm", dependencies: [], capabilities: [],
+          limits: { fuel: 1000000 }, allow_run_once: true, reasons: [],
+          files: { entry: { path: "evx/calc.wasm", size: 40, sha512: ENTRY_HASH }, dependencies: [] },
+        },
+      },
+      jobs: {},
+      unsupported: [{ path: "streams.x", reason: "retained streams not supported" }],
+    },
+    requested: { capabilities: [], limits: {}, allow_run_once: true, programs: ["calc"] },
+    effective: { capabilities: [], limits: { fuel: 1000000, memory_bytes: 33554432 }, runtime_profiles: ["wasm-core-v1"], allow_run_once: true, allow_background: false },
+  };
+  const { instance, dialogs } = wrapper({}, { evxInspect: () => nested });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "calc" }, id: 9 });
+  assert.equal(dialogs.length, 1);
+  assert.deepEqual(captions(dialogs[0]), ["Enable EVX for this xite", "Allow once", "Deny"], "the run-once program is found under declaration");
+  const body = dialogs[0].body;
+  assert.match(body, /<b>calc<\/b>/);
+  assert.ok(body.includes(`evx/calc.wasm (sha512 ${ENTRY_HASH.slice(0, 16)}`), "pinned entry with its hash: " + body);
+  assert.ok(body.includes("streams.x: retained streams not supported"), body);
+  assert.match(body, /Effective limits on this node: fuel 1000000, memory_bytes 33554432/);
 });
 
 test("deny sends nothing to the node and answers the page granted:false", () => {
@@ -318,7 +352,7 @@ test("every payload string is HTML-escaped before it reaches the dialog", () => 
         bad: { usable: false, reasons: [hostile] },
       },
       unsupported: [{ path: hostile, reason: hostile }],
-      effective_limits: { [hostile]: hostile },
+      effective: { limits: { [hostile]: hostile } },
     }),
   });
   instance.handleMessage({ cmd: "evxRequest", params: { program: hostile }, id: 24 });
@@ -370,7 +404,7 @@ test("tags that toHtmlSafe would re-enable appear as literal text in every paylo
       bad: { usable: false, reasons: [text] },
     },
     unsupported: [{ path: text, reason: text }],
-    effective_limits: { [text]: text },
+    effective: { limits: { [text]: text } },
   });
   const benign = wrapper({}, { evxInspect: () => shape("plain") });
   benign.instance.handleMessage({ cmd: "evxRequest", params: { program: "plain" }, id: 26 });
@@ -469,6 +503,7 @@ function dialogWrapper(results) {
     ${method("setXiteInfo")}
     ${method("handleMessage")}
     ${method("actionEvxRequest")}
+    ${method("evxDeclaration")}
     ${method("evxRunnableOnce")}
     ${method("evxGrantOutcome")}
     ${method("evxPromptBody")}

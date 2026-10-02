@@ -97,9 +97,6 @@ bridges = []
 
 [dev-dependencies]
 epix-reticulum = { path = "../epix-reticulum" }
-# The desktop/mobile browsers' TLS proxy, so examples/wrapper_fixture.rs can
-# serve host mode (`https://<xite>.epix` + `<xite>.content.epix`) for browser checks.
-epix-browser-net = { path = "../epix-browser-net" }
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
 tokio = { version = "1", features = ["full", "test-util"] }

@@ -19,6 +19,16 @@ pub struct CompiledArtifact {
     pub engine_key: String,
 }
 
+/// The child closed its output without an artifact: say how it ended and
+/// what it wrote to stderr (sanitised, bounded), which is the only evidence.
+fn exited_without_result(peer: &mut Peer) -> Denied {
+    let code = peer.poll();
+    let diagnostics = evx_api::result::safe_text(&String::from_utf8_lossy(&peer.diagnostics), 512);
+    Denied::new(format!(
+        "compiler exited without a result (exit {code:?}; stderr: {diagnostics:?})"
+    ))
+}
+
 /// Validate and precompile `module` in a confined compiler process. The
 /// child has no workspace access; a hang or crash is reported, never retried
 /// unconfined.
@@ -36,6 +46,12 @@ pub fn compile_module(config: &Config, module: &[u8]) -> Result<CompiledArtifact
     let deadline = Instant::now() + config.compile_timeout;
     let mut reply: Option<FromCompiler> = None;
     let mut failure: Option<Denied> = None;
+    // The reader thread delivers the child's frames and then, at EOF, the
+    // stdout `Closed` event, in that order. A child that has already exited
+    // may still have its artifact in flight on that thread, so the exit alone
+    // is never the verdict: the stream's end is, with a bounded drain after
+    // the exit so a reader that never reaches EOF cannot hang us.
+    let mut exited_at: Option<Instant> = None;
     while reply.is_none() && failure.is_none() {
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
@@ -50,13 +66,16 @@ pub fn compile_module(config: &Config, module: &[u8]) -> Result<CompiledArtifact
             Ok(Event::Stderr(_, chunk)) => peer.record_stderr(&chunk),
             Ok(Event::Closed(_, Stream::Stdout, _)) => {
                 if reply.is_none() {
-                    failure = Some(Denied::new("compiler exited without a result"));
+                    failure = Some(exited_without_result(&mut peer));
                 }
             }
             Ok(Event::Closed(_, Stream::Stderr, _)) => {}
             Err(mpsc::RecvTimeoutError::Timeout) => {
-                if peer.poll().is_some() && reply.is_none() {
-                    failure = Some(Denied::new("compiler exited without a result"));
+                if peer.poll().is_some() {
+                    let since = *exited_at.get_or_insert_with(Instant::now);
+                    if since.elapsed() > Duration::from_secs(5) {
+                        failure = Some(Denied::new("compiler output not drained after exit"));
+                    }
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {

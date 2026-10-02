@@ -120,7 +120,7 @@ opaque, because it can have a real origin that is still not the wrapper's:
 
 Path mode (the loopback UI, Chrome and other browsers, the Android shell)
 keeps the opaque sandbox above: there every xite would share the node's
-origin. `examples/wrapper_fixture.rs --host` serves host mode through the
+origin. `crates/epix-evx/examples/wrapper_fixture.rs --host` serves host mode through the
 browsers' proxy for a real-browser check.
 
 ## Known limits

@@ -7,9 +7,12 @@ as implemented in the `evx-*` crates. The product plan, security review and
 prior-art research live outside this repository in the planning documents;
 this page is the engineering reference for what exists in the tree.
 
-Status: milestone 1. macOS only. Not integrated with EpixNet's grants, UI,
-scheduler or publication yet. Not reviewed independently. Do not enable for
-untrusted public content.
+Status: milestone 2 (`docs/evx-milestone-2.md`). Execution is macOS only.
+A xite's signed `evx` declaration is parsed from its root `content.json`,
+inspected inertly, granted through the wrapper's consent dialog or the
+operator socket, run once on demand, and revoked. No scheduler or background
+lifecycle yet (milestone 3), no publication or chain operations. Not reviewed
+independently. Do not enable for untrusted public content.
 
 ## Crates
 
@@ -23,12 +26,18 @@ untrusted public content.
 | `evx-activation` | Ed25519-signed activation envelopes, immutable closure capture, two-phase admission, shared-source record verification. | Trusted |
 | `evx-state` | SQLite durable model: grants with separate authority and limits generations, cumulative budgets, idempotent occurrences, atomic checkpoint plus outbox, mock destination. | Trusted |
 | `evx-host` | Binds activation to the supervisor; JSON-on-stdin CLI for harnesses. | Trusted |
+| `evx-declaration` | Strict parser and manifest binder for the signed `evx` section of a root `content.json`: programs, jobs, capability requests, limits; unsupported items disable only the affected work. | Dependency leaf, hostile input |
+| `epix-evx` | The node's EVX plugin: grant store and workspaces under `private/evx/`, the `evx*` WebSocket commands (inspect, status, request, grant, revoke, limits, run once) and the activation of a xite's declared program through `evx-host`. | Trusted |
 
 ## Execution boundary
 
 ```text
-EpixNet host (future)
-  -> evx-host: verify signed envelope, capture closure, check binding against grant
+EpixNet node (epix-evx plugin)
+  -> read the xite's root content.json bytes; require the owner's signature and a complete core
+  -> evx-declaration: parse the evx section strictly, bind entry + dependencies to the manifest hashes
+  -> consent: the wrapper's dialog (Enable / Allow once / Deny) or the operator socket; a page can only ask
+  -> evx-state: persistent xite grant (capabilities, profiles, limits, generations), allow-once tokens, run history
+  -> evx-host: verify the content activation, capture closure, check binding against grant
   -> evx-supervisor: compile in a confined child, admit (version floor advances here), lease workspace
        -> evx-worker run      (no filesystem, no network, no fork/exec; Wasmtime, fuel, epoch, store limits)
             evx.call -------> supervisor authorizes request under grant generation
@@ -118,11 +127,13 @@ deliberate: there is no unconfined fallback.
   packaged as an XPC service with its own entitlements; the frame protocol does
   not change.
 - RSS is sampled, not capped. A native allocation can overshoot between polls.
-- No scheduler, no background lifecycle, no EpixNet grant or publication
-  integration, no management UI. Those are the next milestones in the plan.
-- The `permissionAdd` self-grant defect in `epix-ui` is fixed: grants need the
-  wrapper's prompt, the wrapper's socket is authenticated by the xite's secret
-  key, and the xite page runs in an opaque origin (see `docs/wrapper-sandbox.md`).
-  An independent review of that boundary is still a prerequisite before any
-  xite is opted in.
+- No scheduler and no background lifecycle: a program runs only when the
+  user or operator says so (milestone 3). No publication, streams or chain
+  operations. The resource dashboard is limited to the inspect/status payloads.
+- Grants need the wrapper's consent dialog or the operator socket. The
+  wrapper's socket is authenticated by the xite's secret key, the xite page
+  runs in an opaque origin (path mode) or its own content host (host mode),
+  and neither `ADMIN` nor the `as` command confers EVX authority
+  (`docs/wrapper-sandbox.md`). An independent review of the whole boundary is
+  still a prerequisite before any xite is opted in.
 - Not independently reviewed. No fuzzing campaign has been run.

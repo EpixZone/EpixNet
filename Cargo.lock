@@ -2955,6 +2955,8 @@ name = "epix-evx"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "epix-browser-net",
  "epix-content",
  "epix-crypt",
  "epix-plugin",
@@ -2973,6 +2975,7 @@ dependencies = [
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "tower",
 ]
 
 [[package]]
@@ -3313,7 +3316,6 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "epix-blob",
- "epix-browser-net",
  "epix-bt",
  "epix-chain",
  "epix-content",

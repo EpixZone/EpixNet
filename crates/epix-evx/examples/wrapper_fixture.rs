@@ -14,9 +14,14 @@
 //! `https://<xite>.content.epix/` the page's own origin. It then prints the
 //! proxy address and the CA certificate path; point a browser at that proxy.
 
+use epix_evx::EvxPlugin;
+use epix_plugin::PluginRegistry;
 use epix_ui::{AppState, UiServer, XiteEntry};
 use epix_xite::XiteStorage;
 use serde_json::json;
+
+/// The fixture's declared program: adds two numbers, no capabilities.
+const CALC: &str = r#"(module (memory (export "memory") 1) (func (export "run") (result i32) i32.const 19 i32.const 23 i32.add))"#;
 
 const INDEX: &str = r#"<!doctype html>
 <html><head><meta charset="utf-8"><title>Sandbox fixture</title>
@@ -74,6 +79,10 @@ try {
   ws.onerror = function () { results.ownSocket = "refused"; };
   ws.onopen = function () { results.ownSocket = "open"; };
 } catch (e) { results.ownSocket = e.name; }
+// EVX: the driver calls these from outside; the page only ever asks.
+window.evxRequest = function (program) { return cmd("evxRequest", { program: program }).then(function (r) { results.evx = r; return r; }); };
+window.evxStatus = function () { return cmd("evxStatus", {}).then(function (r) { results.evxStatus = r; return r; }); };
+window.evxGrantDirect = function () { return cmd("evxGrant", { xite: "x", declaration_digest: "0", mode: "enable" }).then(function (r) { results.evxDirect = r; return r; }); };
 window.addEventListener("load", function () {
   results.classic = window.classic_loaded === true;
   results.styled = getComputedStyle(document.getElementById("p")).color;
@@ -89,7 +98,9 @@ async fn main() {
     let port: u16 = args.iter().find_map(|a| a.parse().ok()).unwrap_or(0);
     let dir = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(dir.path());
+    let module = evx_runtime::text_to_binary(CALC).expect("fixture program");
     let files: Vec<(&str, &[u8])> = vec![
+        ("evx/calc.wasm", &module),
         ("index.html", INDEX.as_bytes()),
         ("style.css", b"#p { color: rgb(0, 128, 0); }"),
         ("classic.js", b"window.classic_loaded = true;"),
@@ -112,17 +123,36 @@ async fn main() {
         "title": "Sandbox fixture",
         "modified": 1.0,
         "files": manifest_files,
+        "evx": {
+            "version": 1,
+            "programs": {
+                "calc": {
+                    "runtime_profile": "wasm-core-v1",
+                    "entry": "evx/calc.wasm",
+                    "allow_run_once": true,
+                    "capabilities": []
+                }
+            }
+        }
     });
     epix_content::sign(&mut root, &key).unwrap();
     storage
         .write("content.json", epix_content::dumps_content(&root).as_bytes())
         .unwrap();
 
-    let state = AppState::new("fixture");
+    // A data root, so the EVX grant store and workspaces have a home.
+    let data = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("fixture", data.path());
     state
         .add_xite(&address, XiteEntry { storage, content: Some(root) })
         .await;
     state.set_owned(&address, true).await;
+    // The node's plugin set as far as EVX is concerned: the worker comes from
+    // EVX_WORKER (or beside this executable).
+    let mut plugins = PluginRegistry::new();
+    plugins.register(std::sync::Arc::new(EvxPlugin::default()));
+    plugins.start_all(&state);
+    let registry = plugins.command_registry();
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -136,7 +166,7 @@ async fn main() {
         let ca_pem = ca_dir.path().join("ca.pem");
         std::fs::write(&ca_pem, ca.cert_pem()).unwrap();
         let app = tower::ServiceExt::<axum::extract::Request>::map_request(
-            UiServer::new(state).router(),
+            UiServer::with_registry(state, registry).router(),
             epix_ui::rewrite_proxy_host,
         );
         let secure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
@@ -145,8 +175,9 @@ async fn main() {
         drop(ca_dir);
     } else {
         println!("fixture http://{addr}/{address}/");
-        let router = UiServer::new(state).router();
+        let router = UiServer::with_registry(state, registry).router();
         axum::serve(listener, router).await.unwrap();
     }
+    drop(data);
     drop(dir);
 }
