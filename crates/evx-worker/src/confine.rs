@@ -16,6 +16,10 @@
 use std::path::Path;
 
 /// What a mode needs from the filesystem. Everything else is denied.
+///
+/// Only the macOS profile reads the fields; other platforms refuse to run
+/// before looking at them, which `-D warnings` must not mistake for dead code.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 pub struct Spec<'a> {
     /// Workspace the process may read, and write when `writable`.
     pub workspace: Option<&'a Path>,
