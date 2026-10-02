@@ -134,8 +134,11 @@ jobs:
       # EVX (sandboxed xite execution, docs/evx.md): the crates whose tests do
       # not need the macOS confinement. The supervisor and host integration
       # suites run on the macOS job below; here they are compiled but gated out.
-      - name: Test EVX validator, workspace, activation and durable state
-        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host --locked
+      # epix-evx is the node's service and management API (milestone 2): its
+      # grant, gate and gateway tests run everywhere, its execution tests only
+      # on the macOS job.
+      - name: Test EVX validator, workspace, activation, durable state and node service
+        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host -p epix-evx --locked
 
   mobile-profiles:
     name: Mobile feature profiles
@@ -181,6 +184,27 @@ jobs:
       # cannot prove that iOS excludes BT or that Android/desktop retain it.
       - name: Assert platform BitTorrent boundaries
         run: python3 scripts/check-platform-features.py
+      # The EVX service (epix-node's `evx` feature) links Wasmtime and the
+      # supervisor's process code; execution is macOS-only, so the mobile
+      # embedder and the native messaging host must not carry it. `cargo tree
+      # -i wasmtime` scoped to the package prints the reverse edges when it
+      # is in the graph (the leak) and fails with "did not match any
+      # packages" when it is not (the pass); any other failure is a broken
+      # resolution and fails the guard too.
+      - name: Assert the mobile embedder and the messaging host link no EVX runtime
+        run: |
+          set -uo pipefail
+          check() {
+            local out status
+            out="$(cargo tree --locked -i wasmtime "$@" 2>&1)" && status=0 || status=$?
+            if [ "$status" -ne 0 ] && printf '%s' "$out" | grep -q 'did not match any packages'; then
+              return 0
+            fi
+            echo "::error::wasmtime reaches $* (or cargo tree failed):"; echo "$out"; exit 1
+          }
+          check -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery
+          check -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery,bittorrent
+          check -p epix-nmh
       - name: Test tracker discovery with and without BitTorrent
         run: |
           cargo test -p epix-discovery -p epix-xite --locked
@@ -213,7 +237,9 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # The epix-evx service suite builds the worker itself (as the evx-host
+      # suite does), so it finds the binary this step already produced.
       - name: Build the confined worker and the hostile peer
         run: cargo build -p evx-worker -p evx-host -p evx-supervisor --bins --example hostile_peer --locked
-      - name: Test containment, hostile IPC, lifecycle and signed activation against the real worker
-        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host --locked
+      - name: Test containment, hostile IPC, lifecycle, signed activation and the node service against the real worker
+        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host -p epix-evx --locked

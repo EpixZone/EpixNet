@@ -49,6 +49,9 @@ struct Options {
     wat: &'static str,
     allow_run_once: bool,
     capabilities: Vec<&'static str>,
+    /// Declared `limits`, overlaid on the defaults by the parser; `None`
+    /// declares none.
+    limits: Option<Value>,
     signed: bool,
     worker: Option<PathBuf>,
 }
@@ -59,6 +62,7 @@ impl Default for Options {
             wat: CALC,
             allow_run_once: true,
             capabilities: Vec::new(),
+            limits: None,
             signed: true,
             #[cfg(target_os = "macos")]
             worker: Some(worker_binary()),
@@ -111,6 +115,9 @@ impl Fixture {
                 }
             }
         });
+        if let Some(limits) = options.limits {
+            content["evx"]["programs"][PROGRAM]["limits"] = limits;
+        }
         if options.signed {
             epix_content::sign(&mut content, &key).unwrap();
         }
@@ -346,6 +353,108 @@ async fn a_page_socket_cannot_grant_with_or_without_an_elevated_id() {
     }
     assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none());
     assert!(!f.state.xite_has_admin(&f.address).await, "no ADMIN was involved");
+}
+
+#[tokio::test]
+async fn an_admin_xite_page_cannot_grant_through_as() {
+    // On a normal node the dashboard xite holds ADMIN by default, and so
+    // does any xite the user ever granted it. ADMIN grants nothing here: the
+    // page is forwarded by the wrapper with its own small id, and `as` must
+    // not turn that ADMIN into wrapper authority.
+    let f = Fixture::new(Options::default()).await;
+    f.state.add_permission(&f.address, "ADMIN").await;
+    assert!(f.state.xite_has_admin(&f.address).await);
+    let page = f.page();
+    let once = json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM });
+    for params in [f.enable_params(), once] {
+        let denied = f.call(&page, "as", json!([f.address, "evxGrant", params.clone()]), 8).await.unwrap_err();
+        assert!(denied.contains("prompt"), "{denied}");
+        let denied = f
+            .call(&page, "as", json!({ "address": f.address, "cmd": "evxGrant", "params": params }), 9)
+            .await
+            .unwrap_err();
+        assert!(denied.contains("prompt"), "{denied}");
+    }
+    for cmd in ["evxRevoke", "evxSetLimits", "evxRunOnce"] {
+        let params = json!({ "xite": f.address, "limits": Limits::default(), "program": PROGRAM });
+        let denied = f.call(&page, "as", json!([f.address, cmd, params]), 10).await.unwrap_err();
+        assert!(denied.contains("prompt"), "{cmd}: {denied}");
+    }
+    assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none(), "ADMIN stored a grant");
+    assert!(f.service.durable().runs(&f.address).unwrap().is_empty());
+
+    // Another xite that holds ADMIN gets no further on this one.
+    let dashboard = "1AdminDashboard";
+    let dir = tempfile::tempdir().unwrap();
+    f.state
+        .add_xite(dashboard, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+        .await;
+    f.state.add_permission(dashboard, "ADMIN").await;
+    let admin_page = WsSession::new(f.state.clone(), Some(dashboard.into()));
+    let denied = f
+        .call(&admin_page, "as", json!([f.address, "evxGrant", f.enable_params()]), 11)
+        .await
+        .unwrap_err();
+    assert!(denied.contains("prompt"), "{denied}");
+    assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none());
+    // The inert commands still answer it for the xite it rebinds to, as
+    // ADMIN's `as` always allowed.
+    let inspect = f.call(&admin_page, "as", json!([f.address, "evxInspect", {}]), 12).await.unwrap();
+    assert_eq!(inspect["declaration_digest"], f.digest);
+
+    // The wrapper's own dialog answer and the operator socket are the only
+    // routes, through `as` as directly.
+    let granted = f
+        .call(&f.wrapper(), "as", json!([f.address, "evxGrant", f.enable_params()]), WRAPPER_ID_BASE + 1)
+        .await
+        .unwrap();
+    assert_eq!(granted["granted"], true);
+    let revoked = f.call(&f.operator(), "as", json!([f.address, "evxRevoke", {}]), 1).await.unwrap();
+    assert_eq!(revoked["revoked"], true);
+}
+
+#[tokio::test]
+async fn a_gateway_visitor_is_told_only_whether_execution_is_enabled() {
+    let f = Fixture::new(Options::default()).await;
+    let mut labelled = f.enable_params();
+    labelled["label"] = json!("operator laptop");
+    f.call(&f.operator(), "evxGrant", labelled, 1).await.unwrap();
+    f.state.config_set("ui_restrict", json!(true)).await;
+
+    // Any visitor can bind a socket to a xite the gateway serves. It learns
+    // that execution is enabled and nothing of the consent behind it.
+    let visitor = f.page();
+    for cmd in ["evxInspect", "evxStatus"] {
+        let payload = f.call(&visitor, cmd, json!({}), 1).await.unwrap();
+        assert_eq!(payload["grant"], json!({ "enabled": true }), "{cmd}: {payload}");
+        for gone in ["generations", "runs", "run_count", "asked_unix"] {
+            assert!(payload.get(gone).is_none(), "{cmd}: {gone} survived");
+        }
+        let text = payload.to_string();
+        assert!(!text.contains("operator laptop"), "{cmd} leaked the label: {text}");
+        assert!(!text.contains("created_unix"), "{cmd} leaked the consent time: {text}");
+        assert_eq!(payload["xite"], f.address, "{cmd}");
+    }
+    let status = f.call(&visitor, "evxStatus", json!({}), 2).await.unwrap();
+    assert!(status["reasons"].is_array());
+    assert_eq!(status["running"], false);
+    // No dialog is shown on a gateway, so the ask is refused, not recorded.
+    let denied = f.call(&visitor, "evxRequest", json!({}), 3).await.unwrap_err();
+    assert!(denied.contains("gateway"), "{denied}");
+    let status = f.call(&f.operator(), "evxStatus", json!({ "xite": f.address }), 4).await.unwrap();
+    assert!(status["asked_unix"].is_null(), "the refused ask was recorded");
+
+    // The operator socket sees everything, and a plain node tells its
+    // page everything too.
+    assert_eq!(status["grant"]["label"], "operator laptop");
+    assert!(status["generations"]["generation"].is_u64());
+    assert_eq!(status["runs"], json!([]));
+    let inspect = f.call(&f.operator(), "evxInspect", json!({ "xite": f.address }), 5).await.unwrap();
+    assert_eq!(inspect["grant"]["label"], "operator laptop");
+    f.state.config_set("ui_restrict", json!(false)).await;
+    let status = f.call(&visitor, "evxStatus", json!({}), 6).await.unwrap();
+    assert_eq!(status["grant"]["label"], "operator laptop");
+    assert!(f.call(&visitor, "evxRequest", json!({}), 7).await.is_ok());
 }
 
 #[tokio::test]
@@ -643,6 +752,102 @@ mod execution {
         assert!(spent.contains("token"), "{spent}");
         assert_eq!(f.service.durable().runs(&f.address).unwrap().len(), 1);
         assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none(), "a run never created a grant");
+    }
+
+    #[tokio::test]
+    async fn an_allow_once_token_survives_a_program_file_that_cannot_be_read() {
+        let f = Fixture::new(Options::default()).await;
+        let minted = f
+            .chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM }))
+            .await
+            .unwrap();
+        let token = minted["token"].as_str().unwrap().to_string();
+        // The entry file grows past its signed size on disk (a local edit
+        // after signing): the bounded read refuses it before any run, and
+        // a refusal that ran nothing must spend nothing.
+        {
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new().append(true).open(f.served_root().join(ENTRY_PATH)).unwrap();
+            file.write_all(b"\0").unwrap();
+        }
+        let denied = f.chrome("evxRunOnce", json!({ "program": PROGRAM, "token": token })).await.unwrap_err();
+        assert!(denied.contains(ENTRY_PATH), "{denied}");
+        assert!(f.service.durable().runs(&f.address).unwrap().is_empty(), "nothing ran");
+        assert!(!f.service.workspace_dir(&f.address).exists(), "no workspace was created");
+        assert!(
+            f.service.durable().consume_allow_once(&f.address, &token, &f.digest, PROGRAM).unwrap(),
+            "the token was spent although nothing ran"
+        );
+    }
+
+    /// Spins until the grant is revoked: a billion units of fuel spent
+    /// mostly on a dependent chain of divisions and square roots, which
+    /// cost one unit each but tens of cycles, so the run outlives the
+    /// test's revocation by seconds and the 30 s wall ceiling ends it
+    /// otherwise.
+    const SPIN: &str = r#"(module (memory (export "memory") 1)
+        (func (export "run") (result i32)
+            (local $x f64)
+            (local.set $x (f64.const 1234567.5))
+            (loop
+                (local.set $x (f64.div (f64.const 98765432.25) (f64.sqrt (f64.div (f64.const 8765432.5) (f64.sqrt (f64.add (local.get $x) (f64.const 2.5)))))))
+                (local.set $x (f64.div (f64.const 12345678.75) (f64.sqrt (f64.div (f64.const 7654321.5) (f64.sqrt (f64.add (local.get $x) (f64.const 3.5)))))))
+                (local.set $x (f64.div (f64.const 23456789.25) (f64.sqrt (f64.div (f64.const 6543210.5) (f64.sqrt (f64.add (local.get $x) (f64.const 4.5)))))))
+                (local.set $x (f64.div (f64.const 34567890.75) (f64.sqrt (f64.div (f64.const 5432109.5) (f64.sqrt (f64.add (local.get $x) (f64.const 5.5)))))))
+                (br 0))
+            i32.const 0))"#;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_queued_behind_a_revocation_is_refused_rather_than_run_under_the_revoked_grant() {
+        let f = Arc::new(
+            Fixture::new(Options {
+                wat: SPIN,
+                limits: Some(json!({ "fuel": HOST_CEILING.fuel, "wall_seconds": 30.0, "process_cpu_seconds": 30.0 })),
+                ..Options::default()
+            })
+            .await,
+        );
+        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+
+        // Run 1 spins; run 2 queues behind it on the xite's run lock.
+        let first = tokio::spawn({
+            let f = Arc::clone(&f);
+            async move { f.chrome("evxRunOnce", json!({ "program": PROGRAM })).await }
+        });
+        let started = std::time::Instant::now();
+        loop {
+            let status = f.call(&f.page(), "evxStatus", json!({}), 1).await.unwrap();
+            if status["running"] == true {
+                break;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(20), "run 1 never started: {status}");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let second = tokio::spawn({
+            let f = Arc::clone(&f);
+            async move { f.chrome("evxRunOnce", json!({ "program": PROGRAM })).await }
+        });
+        // Long enough for run 2 to reach the lock; run 1 is held for the
+        // wall ceiling if nothing stops it.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // The revocation stops run 1 through its broker; run 2, whose turn
+        // comes afterwards, must see the revoked grant, not the one it was
+        // queued under.
+        let revoked = f.chrome("evxRevoke", json!({})).await.unwrap();
+        let first = first.await.unwrap().unwrap();
+        assert_eq!(revoked["stopped_run"], true, "{revoked}; run 1: {first}");
+        assert_ne!(first["status"], serde_json::to_value(Status::Ok).unwrap(), "{first}");
+        // "revoked" once the run is in flight; "opt-in required" is the
+        // supervisor's word for a grant already disabled at admission.
+        let error = first["error"].as_str().unwrap_or_default();
+        assert!(error.contains("revoked") || error.contains("opt-in"), "{first}");
+        let second = second.await.unwrap().unwrap_err();
+        assert!(second.contains("no enabled EVX grant"), "{second}");
+        let runs = f.service.durable().runs(&f.address).unwrap();
+        assert_eq!(runs.len(), 1, "run 2 was recorded: {runs:?}");
+        let status = f.call(&f.page(), "evxStatus", json!({}), 2).await.unwrap();
+        assert_eq!(status["running"], false);
     }
 
     #[tokio::test]

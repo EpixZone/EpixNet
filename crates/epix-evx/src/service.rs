@@ -288,6 +288,37 @@ impl GrantMode {
     }
 }
 
+/// What a run-once invocation was admitted under, as the payload reports it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Authority {
+    /// The enabled, persistent grant.
+    Grant,
+    /// A spent allow-once token.
+    Once,
+}
+
+impl Authority {
+    fn name(self) -> &'static str {
+        match self {
+            Authority::Grant => "grant",
+            Authority::Once => "once",
+        }
+    }
+}
+
+/// The authority [`EvxService::run_once`] established for one run, handed
+/// to the blocking half so it can re-derive it once the broker is in
+/// `running`: the generation and the revocation count it was admitted at,
+/// and the capabilities, profiles and limits the broker enforces.
+struct Admitted {
+    authority: Authority,
+    generation: u64,
+    revocations: u64,
+    capabilities: BTreeSet<Capability>,
+    profiles: BTreeSet<String>,
+    limits: Limits,
+}
+
 /// The node's EVX service. One per node, created by the plugin at start and
 /// shared with its commands through `AppState::install_capability`.
 pub struct EvxService {
@@ -304,6 +335,12 @@ pub struct EvxService {
     /// and persisted around each run, and two runs interleaving on it could
     /// persist the lower floor last.
     run_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// How often each xite has been revoked since start. A run notes the
+    /// count when its authority is checked and refuses to proceed if it
+    /// moved by the time its broker is registered; the durable grant
+    /// carries the same fact for a xite that has a grant row, this covers
+    /// the token-only xite that has none.
+    revocations: Mutex<HashMap<String, u64>>,
     /// When each xite's page last asked (`evxRequest`), for status views.
     asked: Mutex<HashMap<String, u64>>,
 }
@@ -353,6 +390,7 @@ impl EvxService {
             worker,
             running: Mutex::new(HashMap::new()),
             run_locks: tokio::sync::Mutex::new(HashMap::new()),
+            revocations: Mutex::new(HashMap::new()),
             asked: Mutex::new(HashMap::new()),
         })
     }
@@ -632,6 +670,13 @@ impl EvxService {
     /// advances, outstanding allow-once tokens are discarded, and a run in
     /// flight is told to stop through its broker. Nothing published is
     /// recalled and the run history is kept.
+    ///
+    /// The order is the mirror of the run's: the durable grant and the
+    /// revocation count first, the broker lookup last, so a run that
+    /// registered its broker before the lookup is stopped through it and
+    /// one that registers after it sees the revocation when it re-derives
+    /// its authority. A run queued behind the one in flight takes the run
+    /// lock only afterwards and reads the disabled grant then.
     pub async fn revoke(&self, app: &AppState, xite: &str) -> Result<Value, String> {
         xite_id(xite)?;
         let had_grant = self
@@ -642,6 +687,9 @@ impl EvxService {
         self.state
             .revoke_xite(xite)
             .map_err(|error| format!("EVX state: {error}"))?;
+        if let Ok(mut revocations) = self.revocations.lock() {
+            *revocations.entry(xite.to_string()).or_default() += 1;
+        }
         let running = self
             .running
             .lock()
@@ -700,6 +748,16 @@ impl EvxService {
     /// report. On a host that cannot execute it returns
     /// [`UNSUPPORTED_HOST`] before reading anything, so neither the grant
     /// nor a token is touched.
+    ///
+    /// The order inside matters. The xite's run lock is taken first, so a
+    /// run queued behind another sees the grant as it is when its turn
+    /// comes, not as it was when it was queued: a revocation that lands
+    /// while it waits is seen. The program files are read before any
+    /// authority is spent, so a file that cannot be read (a local edit past
+    /// its signed size, a file gone missing) costs no token. The authority
+    /// is checked last, and checked once more inside the blocking run after
+    /// its broker is registered in `running`, where a revocation can reach
+    /// it (see [`EvxService::authority_stands`]).
     pub async fn run_once(
         self: &Arc<Self>,
         app: &AppState,
@@ -710,6 +768,13 @@ impl EvxService {
         let worker = self.execution()?.to_path_buf();
         xite_id(xite)?;
         evx_api::validate_identifier(program).map_err(|denied| format!("invalid program: {denied}"))?;
+
+        let lock = {
+            let mut locks = self.run_locks.lock().await;
+            locks.entry(xite.to_string()).or_default().clone()
+        };
+        let _running = lock.lock().await;
+
         let inspection = self.inspect(app, xite).await?;
         if inspection.integrity != Integrity::Verified {
             return Err(format!(
@@ -726,11 +791,24 @@ impl EvxService {
         if !declared.allow_run_once {
             return Err(format!("program {program} does not allow run-once"));
         }
+
+        // The closure's bytes, read now so the blocking run needs no node
+        // state. Each read is bounded by the size the manifest signed; the
+        // loader re-hashes every byte against the pin.
+        let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+        for pin in std::iter::once(&bound.entry).chain(bound.dependencies.iter()) {
+            let data = app.read_xite_file_bounded(xite, &pin.path, pin.size).await?;
+            files.insert(pin.path.clone(), data);
+        }
+        let entry_sha256 = hex::encode(Sha256::digest(files.get(&bound.entry.path).map(Vec::as_slice).unwrap_or_default()));
         let now = now_unix()?;
 
         // Authority: a spent token covers exactly this program at exactly
         // this digest with its own declared request; an enabled grant must
-        // already cover the program's request.
+        // already cover the program's request. The revocation count is read
+        // before either is spent, so a revocation from here on is seen by
+        // the re-check in the blocking run.
+        let revocations = self.revocations_of(xite);
         let (capabilities, limits, generation, authority) = match token {
             Some(token) => {
                 let spent = self
@@ -745,7 +823,7 @@ impl EvxService {
                     .as_ref()
                     .map(|(_, generations)| generations.generation)
                     .unwrap_or(1);
-                (declared.capabilities.clone(), clamp(&declared.limits)?, generation, "once")
+                (declared.capabilities.clone(), clamp(&declared.limits)?, generation, Authority::Once)
             }
             None => {
                 let (grant, generations) = inspection
@@ -760,25 +838,9 @@ impl EvxService {
                 if !grant.runtime_profiles.contains(&declared.runtime_profile) {
                     return Err(format!("program {program} asks for a runtime profile beyond the grant"));
                 }
-                (grant.capabilities.clone(), grant.limits.clone(), generations.generation, "grant")
+                (grant.capabilities.clone(), grant.limits.clone(), generations.generation, Authority::Grant)
             }
         };
-
-        // The closure's bytes, read now so the blocking run needs no node
-        // state. Each read is bounded by the size the manifest signed; the
-        // loader re-hashes every byte against the pin.
-        let mut files: BTreeMap<String, Vec<u8>> = BTreeMap::new();
-        for pin in std::iter::once(&bound.entry).chain(bound.dependencies.iter()) {
-            let data = app.read_xite_file_bounded(xite, &pin.path, pin.size).await?;
-            files.insert(pin.path.clone(), data);
-        }
-        let entry_sha256 = hex::encode(Sha256::digest(files.get(&bound.entry.path).map(Vec::as_slice).unwrap_or_default()));
-
-        let lock = {
-            let mut locks = self.run_locks.lock().await;
-            locks.entry(xite.to_string()).or_default().clone()
-        };
-        let _running = lock.lock().await;
 
         let service = Arc::clone(self);
         let xite_owned = xite.to_string();
@@ -787,7 +849,8 @@ impl EvxService {
         let profiles: BTreeSet<String> = [RUNTIME_PROFILE.to_string()].into_iter().collect();
         let started = now;
         let run = tokio::task::spawn_blocking(move || {
-            service.run_blocking(&xite_owned, &worker, content, bound, files, capabilities, profiles, limits, generation)
+            let admitted = Admitted { authority, generation, revocations, capabilities, profiles, limits };
+            service.run_blocking(&xite_owned, &worker, content, bound, files, admitted)
         })
         .await
         .map_err(|error| format!("EVX run task failed: {error}"))?;
@@ -833,7 +896,8 @@ impl EvxService {
         app.log(
             "INFO",
             format!(
-                "EVX: ran {xite} program {program} under {authority}: {status}{}",
+                "EVX: ran {xite} program {program} under {}: {status}{}",
+                authority.name(),
                 outcome.result.error.as_deref().map(|error| format!(" ({error})")).unwrap_or_default()
             ),
         )
@@ -846,17 +910,63 @@ impl EvxService {
         if let Some(object) = payload.as_object_mut() {
             object.insert("activation".into(), serde_json::to_value(&outcome.activation).unwrap_or(Value::Null));
             object.insert("run".into(), run_json(&record));
-            object.insert("authority".into(), json!(authority));
+            object.insert("authority".into(), json!(authority.name()));
             object.insert("checkpoint_error".into(), json!(checkpoint_error));
         }
         Ok(payload)
+    }
+
+    /// How many times `xite` has been revoked since the service started.
+    fn revocations_of(&self, xite: &str) -> u64 {
+        self.revocations
+            .lock()
+            .ok()
+            .and_then(|revocations| revocations.get(xite).copied())
+            .unwrap_or(0)
+    }
+
+    /// Whether the authority a run was admitted under still stands. Called
+    /// in the blocking run once its broker is in `running`, so that from
+    /// here on a revocation reaches the run through the broker; a
+    /// revocation that landed before this point is visible in two places,
+    /// and either one disqualifies the run: the durable grant (disabled, or
+    /// at a newer generation than the one admitted) and the service's
+    /// revocation count for the xite, which also covers a token run on a
+    /// xite that never had a grant row for `revoke_xite` to mark.
+    fn authority_stands(&self, xite: &str, admitted: &Admitted) -> Result<(), String> {
+        if self.revocations_of(xite) != admitted.revocations {
+            return Err("execution grant revoked".into());
+        }
+        let stored = self
+            .state
+            .xite_grant(xite)
+            .map_err(|error| format!("EVX state: {error}"))?;
+        match (admitted.authority, stored) {
+            (Authority::Grant, Some((grant, generations))) => {
+                let live = grant.enabled && !grant.expires_unix.is_some_and(|at| now_unix().is_ok_and(|now| now >= at));
+                if !live || generations.generation != admitted.generation {
+                    return Err("execution grant revoked".into());
+                }
+            }
+            (Authority::Grant, None) => return Err("execution grant revoked".into()),
+            (Authority::Once, Some((_, generations))) if generations.generation != admitted.generation => {
+                return Err("execution grant revoked".into());
+            }
+            (Authority::Once, _) => {}
+        }
+        Ok(())
     }
 
     /// The blocking half of [`EvxService::run_once`]: the loader with the
     /// persisted floor, a broker on the xite's private workspace, the run,
     /// and the floor persisted again if it moved. Runs on a blocking thread
     /// because the supervisor spawns and waits on processes.
-    #[allow(clippy::too_many_arguments)]
+    ///
+    /// The broker is registered in `running` before anything that depends
+    /// on the grant, and the authority is re-derived right after: a
+    /// revocation ordered before the registration is seen by the re-check,
+    /// one ordered after it finds the broker and revokes it, so no window
+    /// is left in which a run proceeds under a grant that is already gone.
     fn run_blocking(
         &self,
         xite: &str,
@@ -864,38 +974,43 @@ impl EvxService {
         content: Value,
         bound: BoundProgram,
         files: BTreeMap<String, Vec<u8>>,
-        capabilities: BTreeSet<Capability>,
-        profiles: BTreeSet<String>,
-        limits: Limits,
-        generation: u64,
+        admitted: Admitted,
     ) -> Result<(evx_host::ActivationOutcome, Result<(), String>), String> {
         let checkpoints = self.root.join("checkpoints");
         let floor = checkpoint::load(&checkpoints, xite)?;
         let loader_grant = evx_activation::XiteGrant::for_root_address(
             xite.to_string(),
             xite.to_string(),
-            capabilities.clone(),
-            profiles.clone(),
+            admitted.capabilities.clone(),
+            admitted.profiles.clone(),
         )
-        .and_then(|grant| grant.with_generation(generation))
+        .and_then(|grant| grant.with_generation(admitted.generation))
         .map_err(|error| format!("activation grant: {error}"))?;
         let mut loader = ActivationLoader::with_checkpoint(loader_grant, floor.clone());
         let broker_grant = Grant {
             xite: xite.to_string(),
             enabled: true,
-            generation,
-            capabilities,
+            generation: admitted.generation,
+            capabilities: admitted.capabilities.clone(),
             publisher: Some(xite.to_string()),
             publisher_public_key: None,
-            runtime_profiles: profiles,
+            runtime_profiles: admitted.profiles.clone(),
         };
         let workspace = self.workspace_dir(xite);
         std::fs::create_dir_all(&workspace).map_err(|error| format!("workspace: {error}"))?;
         let broker = Arc::new(
-            Broker::new(&workspace, broker_grant, limits).map_err(|denied| format!("workspace: {denied}"))?,
+            Broker::new(&workspace, broker_grant, admitted.limits.clone())
+                .map_err(|denied| format!("workspace: {denied}"))?,
         );
         if let Ok(mut running) = self.running.lock() {
             running.insert(xite.to_string(), Arc::clone(&broker));
+        }
+        // A revocation that landed between the check in `run_once` and the
+        // registration above disables the broker's grant here, and the
+        // activation's binding check below then denies the run before any
+        // worker is spawned; the denial is recorded like any other.
+        if self.authority_stands(xite, &admitted).is_err() {
+            broker.revoke();
         }
         let config = Config::new(worker.to_path_buf());
         let mut read = |path: &str| -> Result<Vec<u8>, AuthenticationError> {

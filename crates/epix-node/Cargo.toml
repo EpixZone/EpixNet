@@ -20,8 +20,11 @@ epix-plugins = { path = "../epix-plugins" }
 # The EVX service and management API (docs/evx-milestone-2.md section 4):
 # the `Evx` plugin that inspects, grants, runs once and revokes a xite's
 # declared programs. Execution is macOS-only in this milestone; elsewhere the
-# plugin still answers inspect, grant and revoke.
-epix-evx = { path = "../epix-evx" }
+# plugin still answers inspect, grant and revoke. Optional, behind the `evx`
+# feature below: it links Wasmtime, Cranelift and the supervisor's process
+# code, which a download-only embedder (the mobile FFI, the native messaging
+# host) must not carry for a feature that cannot execute there.
+epix-evx = { path = "../epix-evx", optional = true }
 # default-features = false so a download-only embedder (the mobile FFI) does
 # NOT pull the runtime's inbound-seeding / local-discovery loops just by
 # depending on the node. Each is re-exposed as a node feature below and put in
@@ -49,8 +52,14 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]
+default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery", "evx"]
 tor = ["epix-runtime/tor"]
+# The EVX service (the `Evx` plugin and its `evx*` commands). In the node
+# default, so desktop and server carry it; the mobile FFI and the native
+# messaging host take `default-features = false` and never enable it, so
+# neither links Wasmtime (CI asserts `cargo tree -i wasmtime` is empty for
+# both). Off, the node registers no Evx plugin and the commands are unknown.
+evx = ["dep:epix-evx"]
 # In-process Tor pluggable transports (Snowflake) for censored networks. Off by
 # default; forwards to the runtime and activates the Config-page toggle.
 bridges = ["tor", "epix-runtime/bridges", "epix-ui/bridges"]

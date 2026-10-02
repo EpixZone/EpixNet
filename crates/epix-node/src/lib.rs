@@ -4870,6 +4870,8 @@ async fn serve(
     // EVX: the `evx*` commands and the grant store under private/evx. The
     // worker binary is resolved at start (EVX_WORKER, else beside this
     // executable); without it, or off macOS, runs report `unsupported host`.
+    // Behind the `evx` feature: a download-only embedder leaves it out.
+    #[cfg(feature = "evx")]
     plugins.register(Arc::new(epix_evx::EvxPlugin::default()));
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
     plugin_names.extend(epix_ui::builtin_plugins().into_iter().map(String::from));
