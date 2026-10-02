@@ -15,21 +15,22 @@ use evx_supervisor::{Broker, Config, RunOptions};
 
 const CALC: &str = r#"(module (memory (export "memory") 1) (func (export "run") (result i32) i32.const 19 i32.const 23 i32.add))"#;
 
+/// Build and locate `evx-worker` relative to this test binary's target dir;
+/// the build is a no-op when fresh and never serves a stale worker.
 fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let target = manifest.join("../../target/debug/evx-worker");
-        if !target.exists() {
-            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-            let status = std::process::Command::new(cargo)
-                .args(["build", "-p", "evx-worker"])
-                .current_dir(manifest.join("../.."))
-                .status()
-                .expect("cargo build -p evx-worker");
-            assert!(status.success());
+        let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+        let mut command = std::process::Command::new(cargo);
+        command.args(["build", "-p", "evx-worker"]).current_dir(manifest.join("../.."));
+        if !cfg!(debug_assertions) {
+            command.arg("--release");
         }
-        std::fs::canonicalize(target).unwrap()
+        assert!(command.status().expect("cargo build -p evx-worker").success());
+        let exe = std::env::current_exe().unwrap();
+        let profile_dir = exe.parent().and_then(std::path::Path::parent).unwrap();
+        std::fs::canonicalize(profile_dir.join("evx-worker")).unwrap()
     })
     .clone()
 }

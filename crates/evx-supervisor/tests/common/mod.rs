@@ -11,24 +11,42 @@ use evx_supervisor::{compile_module, run_guest, Broker, CompiledArtifact, Config
 
 pub const PAGE: usize = 65_536;
 
-/// Locate the worker binary, building it once if the test runner has not.
+/// Build and locate `evx-worker`. The target directory is derived from this
+/// test binary's own location, so `CARGO_TARGET_DIR`, `--release` and
+/// `--target` all resolve correctly, and the build is always requested so an
+/// edit to the worker can never be tested against a stale binary (cargo makes
+/// it a no-op when fresh).
 pub fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let target = manifest.join("../../target/debug/evx-worker");
-        if !target.exists() {
-            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-            let status = std::process::Command::new(cargo)
-                .args(["build", "-p", "evx-worker"])
-                .current_dir(manifest.join("../.."))
-                .status()
-                .expect("cargo build -p evx-worker");
-            assert!(status.success(), "building evx-worker failed");
-        }
-        std::fs::canonicalize(target).expect("evx-worker binary")
-    })
-    .clone()
+    PATH.get_or_init(|| build_target("evx-worker", &["-p", "evx-worker"], "")).clone()
+}
+
+/// Build and locate the hostile peer example of `evx-supervisor`.
+pub fn hostile_peer_binary() -> PathBuf {
+    static PATH: OnceLock<PathBuf> = OnceLock::new();
+    PATH.get_or_init(|| build_target("hostile_peer", &["-p", "evx-supervisor", "--example", "hostile_peer"], "examples"))
+        .clone()
+}
+
+fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let mut command = std::process::Command::new(cargo);
+    command.arg("build").args(args).current_dir(manifest.join("../.."));
+    if !cfg!(debug_assertions) {
+        command.arg("--release");
+    }
+    let status = command.status().unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
+    assert!(status.success(), "building {name} failed");
+    // target/<profile>/deps/<test-binary> -> target/<profile>
+    let exe = std::env::current_exe().expect("test binary path");
+    let profile_dir = exe
+        .parent()
+        .and_then(std::path::Path::parent)
+        .expect("target profile directory")
+        .to_path_buf();
+    let path = if subdir.is_empty() { profile_dir.join(name) } else { profile_dir.join(subdir).join(name) };
+    std::fs::canonicalize(&path).unwrap_or_else(|e| panic!("{name} not found at {}: {e}", path.display()))
 }
 
 pub fn config() -> Config {

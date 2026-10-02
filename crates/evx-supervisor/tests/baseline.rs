@@ -90,6 +90,10 @@ fn traversal_absolute_cross_xite_links_and_special_files_denied() {
     f.denied_call(&read_wat("../outside-secret.txt"));
     f.denied_call(&read_wat(f.outside.to_str().unwrap()));
     f.denied_call(&read_wat("../game-b/private.txt"));
+    // macOS named-fork alias of an existing file is refused end to end.
+    let write = f.run(&write_wat("state/presence.txt", "game fixture"));
+    assert!(write.responses[0].is_ok(), "{write:?}");
+    f.denied_call(&read_wat("state/presence.txt/..namedfork/rsrc"));
     symlink(&f.outside, f.workspace.join("outside-link")).unwrap();
     symlink(&f.other, f.workspace.join("dir-link")).unwrap();
     f.denied_call(&read_wat("outside-link"));

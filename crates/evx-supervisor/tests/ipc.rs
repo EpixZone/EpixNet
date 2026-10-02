@@ -6,35 +6,12 @@
 
 mod common;
 
-use std::path::PathBuf;
-use std::sync::OnceLock;
 
 use evx_api::frames::HelperFault;
 use evx_api::{Limits, RunResult, Status};
 use evx_supervisor::{run_guest, Config, RunOptions};
 
 use common::*;
-
-/// Locate the hostile peer example, building it once if the test runner has
-/// not. `cargo test` builds examples by default, so this is normally a no-op.
-fn hostile_peer_binary() -> PathBuf {
-    static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| {
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let target = manifest.join("../../target/debug/examples/hostile_peer");
-        if !target.exists() {
-            let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-            let status = std::process::Command::new(cargo)
-                .args(["build", "-p", "evx-supervisor", "--example", "hostile_peer"])
-                .current_dir(manifest.join("../.."))
-                .status()
-                .expect("cargo build --example hostile_peer");
-            assert!(status.success(), "building hostile_peer failed");
-        }
-        std::fs::canonicalize(target).expect("hostile_peer binary")
-    })
-    .clone()
-}
 
 fn hostile_config(mode: &str) -> Config {
     let mut config = Config::new(hostile_peer_binary());

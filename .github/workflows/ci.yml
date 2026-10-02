@@ -130,6 +130,11 @@ jobs:
       # durable ratchet/outbox behavior, pairwise and group engines, and RLN.
       - name: Test metadata-private channel crates
         run: cargo test -p epix-chain -p epix-envelope -p epix-channel -p epix-pairwise-engine -p epix-group-engine -p epix-rln -p epix-plugins -p epix-node -p epix-nmh -p epix-ffi --locked
+      # EVX (sandboxed xite execution, docs/evx.md): the crates whose tests do
+      # not need the macOS confinement. The supervisor and host integration
+      # suites run on the macOS job below; here they are compiled but gated out.
+      - name: Test EVX validator, workspace, activation and durable state
+        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host --locked
 
   mobile-profiles:
     name: Mobile feature profiles
@@ -189,3 +194,25 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 shells/ios/tests/run-regressions.py
+
+  evx-sandbox:
+    name: EVX sandbox (macOS)
+    runs-on: macos-latest
+    # Wasmtime is the long pole on a cold cache (~6 min); the suites themselves
+    # take under a minute. They launch the real confined worker and the hostile
+    # peer, so they only prove anything on macOS.
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: "-D warnings"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: Build the confined worker and the hostile peer
+        run: cargo build -p evx-worker -p evx-host -p evx-supervisor --bins --example hostile_peer --locked
+      - name: Test containment, hostile IPC, lifecycle and signed activation against the real worker
+        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host --locked
