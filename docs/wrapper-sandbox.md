@@ -67,8 +67,12 @@ default for loopback binds). For the opaque frame:
 | A real foreign origin | blocked, as before |
 
 The frame library (`epixframe.js`) asks the wrapper for the `ajax_key` and
-appends it to the page's XHR and fetch URLs; that is what makes a xite's own
-`fetch("data.json")` work from the opaque origin. The one write a page makes
+appends it to the page's XHR and fetch URLs once the page calls
+`monkeyPatchAjax()`; that is what makes a xite's own `fetch("data.json")`
+work from the opaque origin. A page that fetches its own files without the
+key does not get them in path mode (the shipped dashboard's translation
+loader does this today and must enable the patch). The key never reads the
+wrapper document itself, which carries the xite's secrets. The one write a page makes
 over HTTP, the Bigfile upload POST, is accepted from a null origin because
 its one-time `upload_nonce` authorises it.
 
@@ -94,13 +98,38 @@ browser against the production wrapper.
 - Fonts and ES modules load from the xite's own files. Fetching another
   xite's files needs `Cors:<address>`, requested through the wrapper.
 
+## Host mode: a real origin per xite
+
+In the Epix browsers (desktop, iOS) every xite is served under its own
+`.epix` host through a local TLS proxy. There the page does not need to be
+opaque, because it can have a real origin that is still not the wrapper's:
+
+- `https://talk.epix/` is the **chrome host**: it serves the wrapper and
+  nothing else. Any xite file requested there is redirected to the content
+  host, so no xite HTML can ever run as the wrapper's origin.
+- `https://talk.content.epix/` is the **content host**: the iframe loads from
+  it, the xite's files are served from it, and it is the page's own origin.
+  The sandbox keeps `allow-same-origin` here, so the page has `localStorage`,
+  IndexedDB and service workers, scoped to that xite.
+- A document navigation that reaches a content host (a `_top` link from
+  inside the page, a typed URL) is redirected back to the chrome host.
+- The node accepts no WebSocket on a content host and none whose `Origin`
+  is a content host; the wrapper's socket comes only from the chrome host.
+- The wrapper page is unreadable from the content origin (no CORS grant),
+  so the keys stay with the chrome. `content.epix` is a reserved name.
+
+Path mode (the loopback UI, Chrome and other browsers, the Android shell)
+keeps the opaque sandbox above: there every xite would share the node's
+origin. `examples/wrapper_fixture.rs --host` serves host mode through the
+browsers' proxy for a real-browser check.
+
 ## Known limits
 
 - The existence of a xite file can still be probed by a `no-cors` load from
   a page that suppresses its `Referer`; the bytes are not readable. Modern
   browsers' local-network-access rules and the browser extension's clearnet
   block both stand in front of this.
-- A per-xite origin (serving xite files from a host distinct from the
-  wrapper's) would let xites keep storage and service workers without
-  `allow-same-origin`. That is the intended successor to this model; the
-  wrapper and gate rules above are unchanged by it.
+- Path mode cannot give a xite a real origin of its own; a xite that needs
+  storage or a service worker there needs `NOSANDBOX` or the Epix browser.
+- A wrapper can be framed by another page (no `frame-ancestors` yet); the
+  framing page cannot script it, but a dialog could be overlaid. Pre-existing.

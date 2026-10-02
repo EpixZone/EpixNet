@@ -4810,6 +4810,12 @@ pub(crate) fn xite_domain_name(value: &str) -> Option<String> {
     let name = value.trim().to_ascii_lowercase();
     let label = name.strip_suffix(".epix")?;
     let bytes = label.as_bytes();
+    // `content.epix` is reserved: xite pages live on `<xite>.content.epix`
+    // (crates/epix-ui/src/lib.rs CONTENT_HOST_LABEL), and a xite named
+    // `content` would sit above every one of them.
+    if label == "content" {
+        return None;
+    }
     if bytes.is_empty() || bytes.len() > 63
         || !bytes.first()?.is_ascii_alphanumeric()
         || !bytes.last()?.is_ascii_alphanumeric()
@@ -33186,6 +33192,10 @@ impl AppState {
         }
         // Lock order: xites, then pending (add_xite takes them the same way).
         let mut pending = self.pending_wrapper_keys.lock().unwrap();
+        // Addresses that never land must not grow this for the process lifetime.
+        if pending.len() >= 512 && !pending.contains_key(address) {
+            pending.clear();
+        }
         pending
             .entry(address.to_string())
             .or_insert_with(|| (epix_crypt::new_seed(), epix_crypt::new_seed()))
@@ -33302,6 +33312,11 @@ impl AppState {
         if !host.is_empty() {
             self.allowed_ws_origins.lock().unwrap().insert(host.to_string());
         }
+    }
+
+    /// Whether a wrapper page was served from this host (`allow_ws_origin`).
+    pub fn is_served_wrapper_host(&self, host: &str) -> bool {
+        self.allowed_ws_origins.lock().unwrap().contains(host)
     }
 
     /// Whether a WebSocket `Origin` host is allowed: same as the request host,
@@ -42594,6 +42609,17 @@ mod tests {
             .unwrap();
         let q = state.notification_query().await;
         assert_eq!(q["results"][0]["count"], 1, "3 total minus 2 seen: {q}");
+    }
+
+    #[test]
+    fn the_content_host_label_is_not_a_xite_name() {
+        // `<xite>.content.epix` is where xite pages live in host mode; a
+        // xite named `content` would sit above all of them.
+        assert_eq!(xite_domain_name("content.epix"), None);
+        assert_eq!(xite_domain_name("Content.epix"), None);
+        assert_eq!(xite_domain_name("talk.content.epix"), None, "three labels are never a name");
+        assert_eq!(xite_domain_name("contents.epix").as_deref(), Some("contents.epix"));
+        assert_eq!(xite_domain_name("talk.epix").as_deref(), Some("talk.epix"));
     }
 
     #[tokio::test]

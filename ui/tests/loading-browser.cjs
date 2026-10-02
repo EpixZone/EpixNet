@@ -102,7 +102,7 @@ const server = http.createServer((req, res) => {
         .end(
           // Mirrors the node's placeholder (lib.rs download_wait_response):
           // the frame is an opaque origin, so it announces its state itself.
-          '<!doctype html><html data-epix-load-state="waiting"><head><script>try{parent.postMessage({cmd:"innerLoadState",params:"waiting"},"*")}catch(e){}</script></head><body>Waiting for this xite</body></html>'
+          '<!doctype html><html data-epix-load-state="waiting"><head><script>try{var n=(location.search.match(/wrapper_nonce=([A-Za-z0-9]+)/)||[])[1];parent.postMessage({cmd:"innerLoadState",params:"waiting",wrapper_nonce:n},"*")}catch(e){}</script></head><body>Waiting for this xite</body></html>'
         );
     }
     return;
@@ -189,9 +189,12 @@ wss.on("connection", (ws) => {
       viewport: { width: 1280, height: 900 },
     });
     page.on("pageerror", (e) => errors.push(e.message));
+    // Wait on the document's own ready state: the driver's load tracking can
+    // miss the event while the waiting frame answers 503.
     await page.goto(`http://127.0.0.1:${server.address().port}/${address}/`, {
-      waitUntil: "load",
+      waitUntil: "domcontentloaded",
     });
+    await page.waitForFunction(() => document.readyState === "complete", null, { polling: 250 });
     await page.waitForTimeout(400);
     async function shot(stage) {
       await page.screenshot({

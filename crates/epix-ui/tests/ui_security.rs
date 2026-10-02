@@ -454,6 +454,14 @@ async fn the_sandboxed_xite_frame_reads_its_own_files_and_nothing_else() {
         assert_eq!(resp.status(), 403, "{uri} {dest}");
     }
 
+    // The key reads files, never the wrapper document (which carries the
+    // xite's secret keys): directory routes stay refused and ungranted.
+    for uri in [keyed("/1Target/", &target_key), keyed("/1Target", &target_key), keyed("/1Target/sub/", &target_key)] {
+        let resp = router.clone().oneshot(fetch(&uri, "empty")).await.unwrap();
+        assert_eq!(resp.status(), 403, "{uri}");
+        assert!(resp.headers().get("access-control-allow-origin").is_none(), "{uri}");
+    }
+
     // Another xite's key identifies ITS page: a cross-xite read needs the
     // Cors permission, exactly as a referer-identified one does.
     let resp = router.clone().oneshot(fetch(&keyed("/1Target/data.json", &source_key), "empty")).await.unwrap();

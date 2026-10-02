@@ -8,7 +8,11 @@
 //! each outcome on `window.results` for the driver to read.
 //!
 //! Run: `cargo run -p epix-ui --example wrapper_fixture [port]`; it prints the
-//! wrapper URL and serves until killed.
+//! wrapper URL and serves until killed. With `--host`, it instead serves host
+//! mode the way the Epix browser does: through the browsers' TLS proxy
+//! (`epix-browser-net`), so `https://<xite>.epix/` is the wrapper and
+//! `https://<xite>.content.epix/` the page's own origin. It then prints the
+//! proxy address and the CA certificate path; point a browser at that proxy.
 
 use epix_ui::{AppState, UiServer, XiteEntry};
 use epix_xite::XiteStorage;
@@ -26,6 +30,15 @@ var results = window.results;
 try { results.parentAccess = typeof parent.document; } catch (e) { results.parentAccess = e.name; }
 try { localStorage.setItem("a", "b"); results.localStorage = "ok"; } catch (e) { results.localStorage = e.name; }
 results.origin = window.origin;
+try {
+  var sw = navigator.serviceWorker;
+  results.serviceWorker = typeof sw;
+  if (sw) { sw.register("sw.js").then(function () { results.serviceWorkerRegistered = true; }, function (e) { results.serviceWorkerRegistered = e.name; }); }
+} catch (e) { results.serviceWorker = e.name; }
+// The wrapper's page must stay unreadable from here (cross-origin).
+fetch(location.protocol + "//" + location.host.replace(".content.epix", ".epix") + "/", { mode: "cors" })
+  .then(function (r) { return r.text(); })
+  .then(function (t) { results.wrapperPageReadable = t.length > 0; }, function () { results.wrapperPageReadable = false; });
 // The frame library's flow: ask the wrapper for the ajax key, then fetch.
 var pending = {};
 var next = 1;
@@ -57,7 +70,7 @@ cmd("wrapperGetAjaxKey").then(function (key) {
   results.siteInfoHasSecrets = !!(info && info.settings && (info.settings.wrapper_key || info.settings.ajax_key));
 });
 try {
-  var ws = new WebSocket("ws://" + location.host + "/EpixNet-Internal/Websocket?wrapper_key=" + location.pathname.split("/")[1]);
+  var ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/EpixNet-Internal/Websocket?xite=" + location.host.split(".")[0]);
   ws.onerror = function () { results.ownSocket = "refused"; };
   ws.onopen = function () { results.ownSocket = "open"; };
 } catch (e) { results.ownSocket = e.name; }
@@ -71,7 +84,9 @@ window.addEventListener("load", function () {
 
 #[tokio::main]
 async fn main() {
-    let port: u16 = std::env::args().nth(1).and_then(|p| p.parse().ok()).unwrap_or(0);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let host_mode = args.iter().any(|a| a == "--host");
+    let port: u16 = args.iter().find_map(|a| a.parse().ok()).unwrap_or(0);
     let dir = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(dir.path());
     let files: Vec<(&str, &[u8])> = vec![
@@ -80,6 +95,7 @@ async fn main() {
         ("classic.js", b"window.classic_loaded = true;"),
         ("module.js", b"window.module_loaded = true; export const ok = true;"),
         ("data.json", br#"{"fixture":true}"#),
+        ("sw.js", b"self.addEventListener('fetch', function () {});"),
     ];
     let mut manifest_files = serde_json::Map::new();
     for (name, bytes) in &files {
@@ -110,8 +126,27 @@ async fn main() {
 
     let listener = tokio::net::TcpListener::bind(("127.0.0.1", port)).await.unwrap();
     let addr = listener.local_addr().unwrap();
-    println!("fixture http://{addr}/{address}/");
-    let router = UiServer::new(state).router();
-    axum::serve(listener, router).await.unwrap();
+    if host_mode {
+        // What epix-browser does: the router behind the host rewrite, served
+        // by the TLS-terminating proxy with a per-install CA.
+        let ca_dir = tempfile::tempdir().unwrap();
+        let ca = std::sync::Arc::new(
+            epix_browser_net::ca::LocalCa::load_or_create(ca_dir.path()).expect("local CA"),
+        );
+        let ca_pem = ca_dir.path().join("ca.pem");
+        std::fs::write(&ca_pem, ca.cert_pem()).unwrap();
+        let app = tower::ServiceExt::<axum::extract::Request>::map_request(
+            UiServer::new(state).router(),
+            epix_ui::rewrite_proxy_host,
+        );
+        let secure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        println!("fixture https://{address}.epix/ proxy {addr} ca {}", ca_pem.display());
+        epix_browser_net::proxy::serve(listener, app, ca, secure).await.unwrap();
+        drop(ca_dir);
+    } else {
+        println!("fixture http://{addr}/{address}/");
+        let router = UiServer::new(state).router();
+        axum::serve(listener, router).await.unwrap();
+    }
     drop(dir);
 }

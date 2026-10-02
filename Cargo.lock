@@ -3287,6 +3287,7 @@ dependencies = [
  "base64 0.23.1",
  "blake3",
  "epix-blob",
+ "epix-browser-net",
  "epix-bt",
  "epix-chain",
  "epix-content",

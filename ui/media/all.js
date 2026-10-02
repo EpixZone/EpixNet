@@ -2997,6 +2997,9 @@ if (window.getComputedStyle(document.body).transform) {
       return this.ws.cmd("serverGetWrapperNonce", [], (function (_this) {
         return function (wrapper_nonce) {
           src = src.replace(/wrapper_nonce=[A-Za-z0-9]+/, "wrapper_nonce=" + wrapper_nonce);
+          // Nonce-secured xites sign their inner messages with the nonce in
+          // their URL; the new document carries the new one.
+          window.wrapper_nonce = wrapper_nonce;
           _this.log("Reloading iframe using url", src);
           return $("iframe").attr("src", src);
         };

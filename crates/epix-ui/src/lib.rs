@@ -671,6 +671,13 @@ async fn null_origin_read(
     let Some(target) = path.trim_start_matches('/').split('/').next().filter(|s| !s.is_empty()) else {
         return NullOriginRead::Refused;
     };
+    // Only files. The wrapper route (`/{address}/`, directories) carries the
+    // xite's secret keys and is for the chrome alone: a page reading its own
+    // wrapper document with its ajax key would learn its wrapper key.
+    let rest = path.trim_start_matches('/').split_once('/').map(|(_, r)| r).unwrap_or("");
+    if rest.is_empty() || rest.ends_with('/') {
+        return NullOriginRead::Refused;
+    }
     let ajax_key = query
         .unwrap_or("")
         .split('&')
@@ -816,6 +823,9 @@ fn referer_xite(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
         .unwrap_or(after_scheme);
     let (ref_host, ref_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
     let ref_host = strip_port(ref_host);
+    // A page on its content host (`talk.content.epix`) is the `talk.epix` xite.
+    let content_xite = content_host_xite(ref_host);
+    let ref_host = content_xite.as_deref().unwrap_or(ref_host);
     // A xite can be served nested under another xite's proxy host: clicking a
     // xite in the dashboard lands the iframe on `dashboard.epix/epix1talk…/`,
     // so that page's OWN resources carry a referer like
@@ -866,6 +876,35 @@ fn is_global_path(path: &str) -> bool {
 fn is_proxy_host(host: &str) -> bool {
     (host.ends_with(".epix") && !host.is_empty())
         || (host.starts_with("epix1") && host.len() > 20 && !host.contains('.'))
+}
+
+/// The reserved label under which a xite's CONTENT is served in host mode.
+/// `talk.epix` is the wrapper's origin (the chrome the user trusts and sees
+/// in the URL bar); `talk.content.epix` is the xite page's own origin, so the
+/// page can keep `allow-same-origin` - storage, service workers, a real
+/// origin of its own - without ever sharing the wrapper's. Names are single
+/// labels, so a three-label host can never be a xite name, and the label
+/// itself is refused as a name (`xite_domain_name`) so no xite can sit above
+/// another's content hosts. See docs/wrapper-sandbox.md.
+const CONTENT_HOST_LABEL: &str = "content";
+
+/// Marks a request the proxy rewrite took from a content host, so handlers
+/// know the xite page (not the wrapper) is the client. Stripped from incoming
+/// requests like [`PROXY_REWRITE_MARKER`].
+const CONTENT_HOST_MARKER: &str = "x-epix-content-host";
+
+/// `talk.content.epix` -> `talk.epix`: the xite host a content host serves
+/// for, or `None` when `host` is not a content host.
+fn content_host_xite(host: &str) -> Option<String> {
+    let suffix = format!(".{CONTENT_HOST_LABEL}.epix");
+    let label = host.strip_suffix(suffix.as_str())?;
+    (!label.is_empty() && !label.contains('.')).then(|| format!("{label}.epix"))
+}
+
+/// `talk.epix` (or a bare `epix1…` address) -> `talk.content.epix`.
+fn content_host_for(xite_host: &str) -> String {
+    let label = xite_host.strip_suffix(".epix").unwrap_or(xite_host);
+    format!("{label}.{CONTENT_HOST_LABEL}.epix")
 }
 
 /// True if a path segment plausibly references a xite we could fetch on
@@ -928,6 +967,7 @@ const PROXY_REWRITE_MARKER: &str = "x-epix-host-rewrite";
 /// can apply the identical rewrite.
 pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Request {
     req.headers_mut().remove(PROXY_REWRITE_MARKER);
+    req.headers_mut().remove(CONTENT_HOST_MARKER);
     let host = req
         .headers()
         .get(header::HOST)
@@ -952,8 +992,13 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
     if (first_seg.starts_with("epix1") && first_seg.len() > 20) || first_seg.ends_with(".epix") {
         return req;
     }
+    // A content host (`talk.content.epix`) serves its xite's files: route it
+    // under the xite's path, marked so the handlers never render the wrapper
+    // there and never take a chrome-host request for one.
+    let content_host = content_host_xite(&host);
+    let xite_host = content_host.clone().unwrap_or_else(|| host.clone());
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let new_paq = format!("/{host}{path}{query}");
+    let new_paq = format!("/{xite_host}{path}{query}");
     let mut parts = req.uri().clone().into_parts();
     parts.scheme = None;
     parts.authority = None;
@@ -965,6 +1010,12 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
                 PROXY_REWRITE_MARKER,
                 axum::http::HeaderValue::from_static("1"),
             );
+            if content_host.is_some() {
+                req.headers_mut().insert(
+                    CONTENT_HOST_MARKER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
         }
     }
     req
@@ -1387,7 +1438,23 @@ async fn render_wrapper(
         let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
         return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
     }
+    // The wrapper is chrome: it lives on the xite host only. A document
+    // navigation that reached a content host (a `_top` link from inside the
+    // page, a typed URL) lands back on the chrome host, same path and query.
+    if headers.contains_key(CONTENT_HOST_MARKER) {
+        let Some(origin) = cross_xite_origin(&requested) else {
+            return (StatusCode::BAD_REQUEST, "invalid xite navigation target").into_response();
+        };
+        let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
+        return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
+    }
     let proxy_mode = host == requested;
+    // In host mode the xite page gets an origin of its own, distinct from this
+    // wrapper's: the iframe loads from the content host, and because that is
+    // a real origin the page may keep `allow-same-origin`. In path mode (the
+    // loopback UI, the Android shell) every xite shares the node's origin, so
+    // the page stays an opaque origin there.
+    let site_file_server = if proxy_mode { format!("//{}", content_host_for(&host)) } else { String::new() };
 
     // The path segment may be a `.epix` name (xID) or the bech32 address; the
     // node's identity for a xite is ALWAYS the bech32 address, so translate
@@ -1614,11 +1681,12 @@ async fn render_wrapper(
     } else {
         ctx.state.wrapper_keys(&address).await
     };
-    // The inner frame runs in an opaque origin unless the user granted
-    // NOSANDBOX, which is exactly `allow-same-origin`: a same-origin page
-    // could open its own WebSocket as the wrapper's origin and script the
-    // wrapper through popups, so it is a full-trust grant (the prompt says so).
-    let sandbox_permissions = if permissions.iter().any(|p| p == "NOSANDBOX") {
+    // `allow-same-origin` is safe exactly when the page's origin is not the
+    // wrapper's: in host mode the frame is on the content host (its own real
+    // origin). In path mode it would make the page the wrapper - able to open
+    // the WebSocket as this origin and script a wrapper through a popup - so
+    // only the user's NOSANDBOX grant adds it there (the prompt says so).
+    let sandbox_permissions = if proxy_mode || permissions.iter().any(|p| p == "NOSANDBOX") {
         "allow-same-origin".to_string()
     } else {
         String::new()
@@ -1668,7 +1736,7 @@ async fn render_wrapper(
         ("themeclass", themeclass),
         ("script_nonce", script_nonce.clone()),
         ("homepage", homepage),
-        ("site_file_server", String::new()),
+        ("site_file_server", site_file_server),
         ("file_url", file_url),
         ("file_inner_path", inner_path.clone()),
         ("query_string", query_string),
@@ -2994,7 +3062,7 @@ fn download_wait_response(is_html: bool) -> Response {
 <html lang="en" data-epix-load-state="waiting">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="30"><title>Waiting for this xite - EpixNet</title>
-<script>try{parent.postMessage({cmd:"innerLoadState",params:"waiting"},"*")}catch(e){}</script>
+<script>try{var n=(location.search.match(/wrapper_nonce=([A-Za-z0-9]+)/)||[])[1];parent.postMessage({cmd:"innerLoadState",params:"waiting",wrapper_nonce:n},"*")}catch(e){}</script>
 <style>body{margin:0;background:#101116;color:#eeeef5;font:16px/1.6 system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}main{max-width:28rem;padding:2rem}h1{font-size:1.5rem}p{color:#b2b4c7}a{color:#a8a0ff}</style></head>
 <body><main><h1>Waiting for this xite</h1><p>The download isn't ready yet. This page will try again automatically.</p><a href="/Config">Connection settings</a></main></body></html>"#)
     } else {
@@ -3040,6 +3108,34 @@ async fn serve_file(
                 .filter(|s| !s.is_empty())
                 .map(String::from);
             return render_wrapper(ctx, address, inner, wrapper_request_path(&uri), outer_query, headers).await;
+        }
+    }
+    // In host mode the chrome host serves only the wrapper. Every xite FILE
+    // belongs on the content host: an HTML file served raw here - in a frame
+    // some page opened, with a nonce it guessed - would run as the wrapper's
+    // origin, which is the one thing the content host exists to prevent.
+    // A host-form request (the rewrite marker: the host IS this xite) moves
+    // to the xite's content host. A path-form request on a xite host
+    // (`dashboard.epix/epix1talk…/img/x.png`, a link or resource naming
+    // another xite by path) keeps serving nested when it is an opaque
+    // subresource or comes from a client without fetch metadata, exactly as
+    // the browser proxy's canonical redirect does; anything that could run or
+    // be read is sent to that xite's own origin (and on to its content host).
+    {
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(strip_port).unwrap_or("");
+        if is_proxy_host(host) && !headers.contains_key(CONTENT_HOST_MARKER) {
+            let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
+            if headers.contains_key(PROXY_REWRITE_MARKER) {
+                let target = format!("//{}/{path}{query}", content_host_for(host));
+                return Redirect::temporary(&target).into_response();
+            }
+            let dest = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok());
+            let opaque = dest.is_none_or(|d| matches!(d, "image" | "font" | "audio" | "video" | "track"));
+            if !opaque {
+                if let Some(origin) = cross_xite_origin(&address) {
+                    return Redirect::temporary(&format!("//{origin}/{path}{query}")).into_response();
+                }
+            }
         }
     }
     // Release a one-time wrapper nonce if the inner frame passed one (tracks
@@ -3670,13 +3766,18 @@ async fn ws_upgrade(
     // local command API (EpixNet's allowed_ws_origins check).
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
-    // The inner xite frame is an opaque origin (the wrapper's iframe sandbox
-    // has no `allow-same-origin`), so a WebSocket it opens itself says
-    // `Origin: null`. The wrapper never does; refuse it before anything else.
+    // The xite page is never the wrapper. In path mode it is an opaque origin
+    // (the iframe sandbox has no `allow-same-origin`), so a WebSocket it
+    // opens itself says `Origin: null`; in host mode it lives on a content
+    // host, which is neither a wrapper origin nor a host the wrapper
+    // connects to. Refuse both before anything else.
     if origin == "null" {
         return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
     }
     let origin_host = origin.rsplit("://").next().unwrap_or("");
+    if content_host_xite(strip_port(origin_host)).is_some() || content_host_xite(strip_port(host)).is_some() {
+        return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
+    }
     if !ctx.state.is_ws_origin_allowed(origin_host, host) {
         return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
     }
@@ -3688,9 +3789,16 @@ async fn ws_upgrade(
     // session binds to the address but is a page-level session with no
     // wrapper authority. A wrapper in resolving mode (the name has no address
     // yet) sends an empty key: that session binds to no xite at all.
+    // The loopback rule above lets any local app open a page-level socket;
+    // the wrapper's authority additionally needs the wrapper's own origin
+    // (the request host, or a host the wrapper was served from) - a key that
+    // leaked to some other local origin buys nothing.
+    let wrapper_origin = origin_host.is_empty()
+        || strip_port(origin_host) == strip_port(host)
+        || ctx.state.is_served_wrapper_host(origin_host);
     let (xite, wrapper) = match q.wrapper_key.filter(|key| !key.is_empty()) {
         Some(key) => match ctx.state.xite_by_wrapper_key(&key).await {
-            Some(address) => (Some(address), true),
+            Some(address) => (Some(address), wrapper_origin),
             None => (Some(ctx.state.canonical_key(&key).await), false),
         },
         None => match q.xite.filter(|key| !key.is_empty()) {

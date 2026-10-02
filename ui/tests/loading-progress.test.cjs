@@ -49,7 +49,7 @@ function fixture() {
     RateLimit(delay, fn) { fn(); },
   });
   const loading = source.slice(source.indexOf('/* ---- Loading.coffee ---- */'), source.indexOf('/* ---- Notifications.coffee ---- */'));
-  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'loadingDocumentReady', 'setInnerLoadState', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
+  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'loadingDocumentReady', 'setInnerLoadState', 'onMessageInner', 'handleMessage', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
   const wrapper = Object.assign(Object.create(context.Wrapper.prototype), {
     xite_info: null, inner, inner_loaded: false, inner_ready: true,
     event_xite_info: { resolve() {} }, noteContentSync() {}, log() {}, reloadXiteInfo() {},
@@ -323,4 +323,20 @@ test('a reconnect snapshot restores saved download progress without waiting for 
   }));
   assert.equal(f.context.$('.transfer-count').text(), '3 of 6 files');
   assert.equal(f.context.$('.transfer-peers').text(), 'Downloaded files are kept');
+});
+
+test('a nonce-secured xite still hears its placeholder announce itself', () => {
+  // postmessage_nonce_security makes onMessageInner drop unsigned inner
+  // messages; the placeholder signs its announce with the nonce from its URL.
+  const f = fixture(); let reloads = 0;
+  f.context.window.postmessage_nonce_security = true;
+  f.context.window.wrapper_nonce = 'abc123';
+  f.wrapper.opener_tested = true;
+  f.wrapper.reloadIframe = () => { reloads++; f.wrapper.inner_load_state = null; };
+  f.wrapper.xite_info = info(['clone_status', 'complete'], { clone_status: { state: 'complete', attempt: 1 } });
+  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting' }, source: f.wrapper.inner });
+  assert.equal(f.wrapper.inner_load_state, undefined, 'an unsigned announce is dropped');
+  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting', wrapper_nonce: 'abc123' }, source: f.wrapper.inner });
+  assert.equal(reloads, 1, 'the signed announce reaches the recovery');
+  assert.equal(f.wrapper.inner_loaded, false);
 });

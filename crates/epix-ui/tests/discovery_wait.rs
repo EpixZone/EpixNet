@@ -69,7 +69,7 @@ async fn interrupted_core_download_keeps_document_waiting_then_serves_complete_x
     assert!(html.contains("data-epix-load-state=\"waiting\""));
     // The frame is an opaque origin, so the placeholder tells the wrapper
     // itself that it is not the xite.
-    assert!(html.contains(r#"postMessage({cmd:"innerLoadState",params:"waiting"}"#), "{html}");
+    assert!(html.contains(r#"postMessage({cmd:"innerLoadState",params:"waiting",wrapper_nonce:n}"#), "{html}");
     assert!(!html.contains("Ready xite"));
 
     storage.write("style.css", b"body { color: purple; }").unwrap();
@@ -93,7 +93,7 @@ async fn unavailable_new_xite_returns_retryable_document_instead_of_stranding_re
     assert!(html.contains("data-epix-load-state=\"waiting\""));
     // The frame is an opaque origin, so the placeholder tells the wrapper
     // itself that it is not the xite.
-    assert!(html.contains(r#"postMessage({cmd:"innerLoadState",params:"waiting"}"#), "{html}");
+    assert!(html.contains(r#"postMessage({cmd:"innerLoadState",params:"waiting",wrapper_nonce:n}"#), "{html}");
 }
 
 #[tokio::test]

@@ -261,9 +261,15 @@ async fn transparent_proxy_serves_epix_host() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let sandbox_of = |html: &str| -> String {
+        html.split("id='inner-iframe' sandbox=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().to_string()
+    };
 
-    // Proxy request for the wrapper: Host is the xite name, path is "/".
+    // Proxy request for the wrapper: Host is the xite name, path is "/". The
+    // wrapper is the chrome origin; the xite page gets its own origin, the
+    // content host, and because that is a real origin of its own it keeps
+    // allow-same-origin (storage, service workers) without being the wrapper.
     let wrapper = client
         .get(format!("http://{addr}/"))
         .header("host", "talk.epix")
@@ -273,22 +279,71 @@ async fn transparent_proxy_serves_epix_host() {
         .unwrap();
     assert_eq!(wrapper.status(), 200);
     let html = wrapper.text().await.unwrap();
-    // Host mode emits host-relative URLs (NOT /talk.epix/index.html).
-    assert!(html.contains(r#"iframe_src = "/index.html?"#), "host-relative iframe: {html}");
+    assert!(
+        html.contains(r#"iframe_src = "//talk.content.epix/index.html?"#),
+        "the frame loads from the content host: {html}"
+    );
     assert!(!html.contains("/talk.epix/index.html"), "no path-prefix in host mode");
+    assert!(sandbox_of(&html).contains("allow-same-origin"), "host mode: own origin: {html}");
 
-    // Proxy request for an inner file: Host + host-relative path.
-    let inner = client
-        .get(format!("http://{addr}/index.html"))
+    // The chrome host serves no xite file: every file request moves to the
+    // content host (an HTML file served raw here would run as the wrapper).
+    let moved = client
+        .get(format!("http://{addr}/index.html?wrapper_nonce=abc"))
         .header("host", "talk.epix")
         .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 307);
+    assert_eq!(moved.headers()["location"], "//talk.content.epix/index.html?wrapper_nonce=abc");
+
+    // The content host serves the files...
+    let inner = client
+        .get(format!("http://{addr}/index.html"))
+        .header("host", "talk.content.epix")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
         .send()
         .await
         .unwrap();
     assert_eq!(inner.status(), 200);
     assert_eq!(inner.text().await.unwrap(), "<h1>inner</h1>");
+    // ...but never the wrapper: a document navigation there (a `_top` link
+    // from inside the page, a typed URL) lands back on the chrome host.
+    for path in ["/", "/index.html"] {
+        let back = client
+            .get(format!("http://{addr}{path}?Topic:1"))
+            .header("host", "talk.content.epix")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(back.status(), 307, "{path}");
+        assert_eq!(back.headers()["location"], format!("//talk.epix{}?Topic:1", if path == "/" { "/" } else { path }), "{path}");
+    }
 
-    // Normal localhost path mode is unchanged: path-prefixed URLs.
+    // The content host is never a wrapper: no WebSocket is accepted there,
+    // and a page on it cannot open one to the chrome host either.
+    use tokio_tungstenite::tungstenite::http;
+    for (host, origin) in [("talk.content.epix", "http://talk.content.epix"), ("talk.epix", "http://talk.content.epix")] {
+        let req = http::Request::builder()
+            .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?xite=talk.epix"))
+            .header("Host", host)
+            .header("Origin", origin)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(())
+            .unwrap();
+        assert!(tokio_tungstenite::connect_async(req).await.is_err(), "ws refused for {host} from {origin}");
+    }
+
+    // Normal localhost path mode is unchanged: path-prefixed URLs, and the
+    // page stays an opaque origin because it would share the node's.
     let path_mode = client
         .get(format!("http://{addr}/talk.epix/"))
         .header("sec-fetch-mode", "navigate")
@@ -297,6 +352,15 @@ async fn transparent_proxy_serves_epix_host() {
         .unwrap();
     let path_html = path_mode.text().await.unwrap();
     assert!(path_html.contains("/talk.epix/index.html"), "path mode keeps the prefix");
+    assert!(!sandbox_of(&path_html).contains("allow-same-origin"), "path mode stays opaque: {path_html}");
+    let raw = client
+        .get(format!("http://{addr}/talk.epix/index.html"))
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), 200, "path mode serves files on the node origin");
 }
 
 #[tokio::test]
@@ -435,7 +499,10 @@ async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
         .unwrap();
     assert_eq!(r.status(), 200, "address host serves at its own origin");
     let html = r.text().await.unwrap();
-    assert!(html.contains(r#"iframe_src = "/index.html?"#), "host-relative iframe: {html}");
+    assert!(
+        html.contains(&format!(r#"iframe_src = "//{talk}.content.epix/index.html?"#)),
+        "the frame loads from the address's content host: {html}"
+    );
 
     // Loopback path mode is untouched: no redirect for 127.0.0.1 hosts.
     let r = client
@@ -469,7 +536,7 @@ async fn rejects_cross_origin_websocket() {
 #[tokio::test]
 async fn a_socket_without_the_wrapper_key_never_gains_wrapper_authority() {
     use tokio_tungstenite::tungstenite::http;
-    let (addr, xite, _key, _dir) = start_server().await;
+    let (addr, xite, key, _dir) = start_server().await;
 
     // Binding by address (a manual client, an older wrapper, or a page that
     // opened its own socket) gives a page-level session: an elevated id is
@@ -491,6 +558,39 @@ async fn a_socket_without_the_wrapper_key_never_gains_wrapper_authority() {
     .unwrap();
     let pong = call(&mut ws, "ping", 9).await;
     assert_eq!(pong["to"], 9, "the ignored answer produced no frame of its own");
+
+    // The real key from some other local origin (a page on another local
+    // server that learned it) binds, but is not the wrapper: the wrapper's
+    // socket comes from the wrapper's own origin.
+    let req = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}"))
+        .header("Host", addr.to_string())
+        .header("Origin", "http://localhost:3000")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("loopback origins may open page sockets");
+    let denied = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(denied["result"]["error"].as_str().unwrap().contains("permission"), "{denied}");
+    let info = call(&mut ws, "siteInfo", 2).await;
+    assert_eq!(info["result"]["address"].as_str(), Some(xite.as_str()), "still bound to the xite");
+    // From the wrapper's origin the same key is the wrapper.
+    let req = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}"))
+        .header("Host", addr.to_string())
+        .header("Origin", format!("http://{addr}"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let allowed = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(allowed["result"].is_array(), "{allowed}");
 
     // A random key that matches no xite binds the same way (and to nothing).
     let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={}", "f".repeat(64));
