@@ -23,12 +23,18 @@ NOTARY_ARGS=()
 
 echo "· building release binaries"
 if [ "${EPIX_SKIP_BUILD:-0}" != "1" ]; then
-  ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh )
+  ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh -p evx-worker )
 fi
 LAUNCHER="$REPO_ROOT/target/release/epix-browser"
 NMH="$REPO_ROOT/target/release/epix-nmh"
+# The EVX confined worker (docs/evx.md): the node resolves it beside its own
+# executable, so it ships next to epix-browser. It confines itself with
+# Seatbelt before reading any input; the XPC packaging for the App Store
+# build is still to come.
+EVX_WORKER="$REPO_ROOT/target/release/evx-worker"
 [ -x "$LAUNCHER" ] || { echo "missing $LAUNCHER"; exit 1; }
 [ -x "$NMH" ] || { echo "missing $NMH"; exit 1; }
+[ -x "$EVX_WORKER" ] || { echo "missing $EVX_WORKER"; exit 1; }
 
 # The shipped binaries must only load system libraries. A Homebrew/MacPorts
 # dylib path baked in here (e.g. liblzma from pkg-config) makes the app crash
@@ -70,6 +76,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/firefox"
 cp "$LAUNCHER" "$APP/Contents/MacOS/epix-browser"
 cp "$NMH" "$APP/Contents/MacOS/epix-nmh"
+cp "$EVX_WORKER" "$APP/Contents/MacOS/evx-worker"
 # Copy the whole Firefox.app under Resources/firefox, keeping its name so the
 # launcher's edition detection (ESR/Developer) still works.
 cp -R "$FIREFOX_APP" "$APP/Contents/Resources/firefox/"
@@ -194,7 +201,7 @@ if [ -n "${EPIX_SIGN_ID:-}" ]; then
     --entitlements "$FF_ENTITLEMENTS" \
     --sign "$EPIX_SIGN_ID" "$APP/Contents/Resources/firefox/"*.app
   codesign --force --options runtime --timestamp \
-    --sign "$EPIX_SIGN_ID" "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/epix-browser"
+    --sign "$EPIX_SIGN_ID" "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/evx-worker" "$APP/Contents/MacOS/epix-browser"
   codesign --force --options runtime --timestamp --sign "$EPIX_SIGN_ID" "$APP"
   codesign --verify --deep --strict "$APP" && echo "  signature verified"
 
@@ -223,7 +230,7 @@ else
   codesign --force --deep --entitlements "$FF_ENTITLEMENTS" --sign - \
     "$APP/Contents/Resources/firefox/"*.app 2>/dev/null || \
     echo "  (firefox ad-hoc sign warned)"
-  codesign --force --sign - "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/epix-browser" 2>/dev/null || true
+  codesign --force --sign - "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/evx-worker" "$APP/Contents/MacOS/epix-browser" 2>/dev/null || true
   codesign --force --sign - "$APP" 2>/dev/null || \
     echo "  (codesign warned; the app still runs locally)"
 fi
