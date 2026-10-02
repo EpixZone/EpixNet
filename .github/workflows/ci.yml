@@ -7,8 +7,9 @@ name: CI
 on:
   push:
     # edx: long-lived EDX protocol branch — every push must build and test
-    # green so the branch stays bisectable.
-    branches: [main, edx]
+    # green so the branch stays bisectable. evx: the EVX sandboxed-runtime
+    # branch, same rule (its macOS sandbox job only runs here).
+    branches: [main, edx, evx]
   pull_request:
     branches: [main]
 
