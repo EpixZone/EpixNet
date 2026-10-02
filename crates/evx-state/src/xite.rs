@@ -13,6 +13,15 @@
 //! generation only when the limits change, so adjusting a quota never cancels
 //! queued work and re-saving an identical grant never fences anything.
 //!
+//! The derivation is one-way. The Milestone 1
+//! [`set_grant`](DurableState::set_grant) may still tighten a xite's budget
+//! or disable it (a disable is mirrored into the xite grant so status views
+//! stay truthful), but it can never re-enable a xite whose xite grant is
+//! disabled: that is consent, and only a new `set_xite_grant` records it.
+//! Independently, every fence (`begin`, `commit`, `dispatch`) consults the
+//! xite grant's own `enabled` flag and expiry, so the two rows can never
+//! disagree about whether the xite may run.
+//!
 //! Allow-once tokens are the "Allow once" button: a single-use secret bound
 //! to the xite, the declaration digest the operator saw and the one program
 //! they approved. They expire after [`ALLOW_ONCE_TTL`] seconds, and revoking
@@ -29,7 +38,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::canonical::{identifier, sha256_hex, MAX_SAFE_INTEGER};
 use crate::{
-    load_grant, random_hex, transaction, DurableState, Error, Generations, Result, MAX_LIMIT,
+    load_grant, random_hex, transaction, DurableState, Error, Failpoint, Generations, Result,
+    MAX_LIMIT,
 };
 
 /// Run records retained per xite; older ones are dropped as new ones arrive.
@@ -42,6 +52,11 @@ pub const MAX_ALLOW_ONCE: u64 = 64;
 pub const MAX_TEXT: usize = 256;
 /// Longest run `message` accepted, in bytes.
 pub const MAX_MESSAGE: usize = 4096;
+/// Most runtime profiles one xite grant may list.
+///
+/// `capabilities` needs no such bound: it is a set over the closed
+/// [`Capability`] enum, so it can never hold more members than the enum has.
+pub const MAX_RUNTIME_PROFILES: usize = 16;
 /// Reservation ceiling of the policy derived from a xite grant.
 ///
 /// The cumulative reservation budget is the Milestone 1 fixture control; a
@@ -85,7 +100,11 @@ const RUN_COLUMNS: &str = "started_unix, finished_unix, program, declaration_dig
 /// activation itself (background scheduling is Milestone 3 and is stored
 /// only so the consent survives). `expires_unix`, when set, makes the grant
 /// deny from that second on without a revocation.
+///
+/// Decoding is strict: an unknown or misspelled field is a deserialisation
+/// error, never silently dropped, like every other wire type in `evx_api`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct XiteGrant {
     /// Xite namespace (its address).
     pub xite: String,
@@ -117,7 +136,9 @@ pub struct XiteGrant {
 /// `status` is the host's closed vocabulary (`ok`, `denied`, `crashed`,
 /// ...) stored as text so the state crate does not have to change when the
 /// host adds one; it is validated as an identifier, never interpreted here.
+/// Decoding refuses unknown fields, as [`XiteGrant`] does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RunRecord {
     /// Unix seconds when the run started.
     pub started_unix: u64,
@@ -141,13 +162,15 @@ pub struct RunRecord {
     pub peak_rss: u64,
 }
 
-/// Current Unix time in whole seconds. A clock before the epoch reads as 0,
-/// which makes every token and expiry check fail closed rather than panic.
-pub(crate) fn now_unix() -> u64 {
+/// Current Unix time in whole seconds. A clock before the epoch is an
+/// [`Error::Denied`]: no token can be minted or spent and no grant can be
+/// admitted without a clock to check its expiry against, so the caller
+/// fails closed instead of comparing against a sentinel.
+pub(crate) fn now_unix() -> Result<u64> {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|elapsed| elapsed.as_secs())
-        .unwrap_or(0)
+        .map_err(|_| Error::denied("clock before the Unix epoch"))
 }
 
 fn text(value: &str, what: &str) -> Result<()> {
@@ -175,6 +198,9 @@ fn decode<T: for<'de> Deserialize<'de>>(raw: &str) -> Result<T> {
 fn validate_grant(grant: &XiteGrant) -> Result<()> {
     identifier(&grant.xite)?;
     identifier(&grant.publisher).map_err(|_| Error::invalid("invalid publisher"))?;
+    if grant.runtime_profiles.len() > MAX_RUNTIME_PROFILES {
+        return Err(Error::invalid("too many runtime profiles"));
+    }
     for profile in &grant.runtime_profiles {
         identifier(profile).map_err(|_| Error::invalid("invalid runtime profile"))?;
     }
@@ -260,18 +286,36 @@ pub(crate) fn load_xite_grant(conn: &Connection, xite: &str) -> Result<Option<Xi
     }
 }
 
-/// Whether the xite grant for `xite`, if any, has passed its `expires_unix`.
-/// A xite without a xite grant never expires this way (its Milestone 1 policy
-/// row alone decides).
-pub(crate) fn expired(conn: &Connection, xite: &str, now: u64) -> Result<bool> {
-    let expires: Option<Option<u64>> = conn
+/// Deny unless the xite grant for `xite`, if any, is enabled and has not
+/// passed its `expires_unix` at `now`. A xite without a xite grant passes
+/// (its Milestone 1 policy row alone decides). `now == 0` is the reading of
+/// a clock that could not be trusted, so a grant that expires at all is
+/// treated as expired rather than compared against it.
+pub(crate) fn check_xite_grant(conn: &Connection, xite: &str, now: u64) -> Result<()> {
+    let row: Option<(i64, Option<u64>)> = conn
         .query_row(
-            "SELECT expires_unix FROM xite_grants WHERE xite=?1",
+            "SELECT enabled, expires_unix FROM xite_grants WHERE xite=?1",
             params![xite],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?;
-    Ok(matches!(expires, Some(Some(at)) if now >= at))
+    match row {
+        None => Ok(()),
+        Some((0, _)) => Err(Error::denied("xite grant disabled")),
+        Some((_, Some(at))) if now == 0 || now >= at => Err(Error::denied("grant expired")),
+        Some(_) => Ok(()),
+    }
+}
+
+/// Mirror a policy-row disable into the xite grant row (if any) so
+/// [`DurableState::xite_grant`] reports what the fences enforce. Called by
+/// `set_grant`; `revoke` uses [`revoke_xite_rows`], which also drops tokens.
+pub(crate) fn disable_xite_grant_row(conn: &Connection, xite: &str) -> Result<()> {
+    conn.execute(
+        "UPDATE xite_grants SET enabled=0 WHERE xite=?1",
+        params![xite],
+    )?;
+    Ok(())
 }
 
 /// Disable the xite grant row (if any) and drop every outstanding allow-once
@@ -391,12 +435,33 @@ impl DurableState {
     /// [`DurableState::set_xite_grant`]. A revoked grant is returned with
     /// `enabled == false`; an expired one is returned as stored, with its
     /// `expires_unix` for the caller to show.
+    ///
+    /// Both rows are read in one snapshot, so the grant body and the
+    /// generations always belong to the same `set_xite_grant` or revocation
+    /// even while another thread is writing.
     pub fn xite_grant(&self, xite: &str) -> Result<Option<(XiteGrant, Generations)>> {
-        let conn = crate::connect(&self.path)?;
-        let Some(grant) = load_xite_grant(&conn, xite)? else {
+        self.xite_grant_with_failpoint(xite, None)
+    }
+
+    /// [`DurableState::xite_grant`] with a test-only failpoint called with
+    /// `"between_reads"` after the xite grant row is read and before the
+    /// policy row is.
+    pub(crate) fn xite_grant_with_failpoint(
+        &self,
+        xite: &str,
+        failpoint: Option<Failpoint<'_>>,
+    ) -> Result<Option<(XiteGrant, Generations)>> {
+        let mut conn = crate::connect(&self.path)?;
+        // A deferred (read) transaction: in WAL mode it pins one snapshot for
+        // both reads without blocking the writers it is racing.
+        let tx = conn.transaction()?;
+        let Some(grant) = load_xite_grant(&tx, xite)? else {
             return Ok(None);
         };
-        let policy = load_grant(&conn, xite)?
+        if let Some(failpoint) = failpoint {
+            failpoint("between_reads");
+        }
+        let policy = load_grant(&tx, xite)?
             .ok_or_else(|| Error::conflict("xite grant without a policy row"))?;
         Ok(Some((
             grant,
@@ -426,7 +491,7 @@ impl DurableState {
         declaration_digest: &str,
         program: &str,
     ) -> Result<String> {
-        self.allow_once_at(xite, declaration_digest, program, now_unix())
+        self.allow_once_at(xite, declaration_digest, program, now_unix()?)
     }
 
     /// [`DurableState::allow_once`] with an explicit issue time, for tests.
@@ -481,7 +546,7 @@ impl DurableState {
         declaration_digest: &str,
         program: &str,
     ) -> Result<bool> {
-        self.consume_allow_once_at(xite, token, declaration_digest, program, now_unix())
+        self.consume_allow_once_at(xite, token, declaration_digest, program, now_unix()?)
     }
 
     /// [`DurableState::consume_allow_once`] with an explicit clock, for tests.
