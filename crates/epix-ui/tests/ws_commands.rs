@@ -443,7 +443,9 @@ async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
 
     let mut events = state.subscribe_events();
     let res =
-        registry.dispatch(&session, "permissionAdd", &json!(["Merger:Test"]), 1).await.unwrap();
+        // The grant arrives from the wrapper's elevated id range after the
+        // user confirmed it; a page's own id is refused.
+        registry.dispatch(&session, "permissionAdd", &json!(["Merger:Test"]), 1_000_001).await.unwrap();
     assert_eq!(res, Value::from("ok"));
 
     // The rebuild ran inline: the hub's rows answer immediately.

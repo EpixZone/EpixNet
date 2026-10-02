@@ -13,7 +13,35 @@ use std::sync::Arc;
 /// The wrapper chrome (all.js) numbers its own WebSocket commands from this
 /// base; the inner xite page numbers from 1. Commands at or above this id are
 /// treated as coming from the trusted wrapper and may run ADMIN actions.
-const WRAPPER_ID_BASE: i64 = 1_000_000;
+pub const WRAPPER_ID_BASE: i64 = 1_000_000;
+
+/// Whether a connection may act as the trusted wrapper chrome: the operator's
+/// admin socket, or a request numbered from the wrapper's elevated range. An
+/// inner xite page can never reach this: the wrapper forwards a page's
+/// messages with the page's own small ids and drops any inner message that
+/// claims an elevated one.
+pub fn is_wrapper_authority(trusted: bool, req_id: i64) -> bool {
+    trusted || req_id >= WRAPPER_ID_BASE
+}
+
+/// Permissions a xite may ask the user to grant through the wrapper's prompt.
+/// The grant itself is a user decision made in trusted chrome; this only
+/// bounds what can be stored, so an unknown or unbounded string can never
+/// reach the persisted grant list or a plugin that matches on prefixes.
+pub fn validate_grantable_permission(permission: &str) -> Result<(), String> {
+    fn suffix_ok(suffix: &str) -> bool {
+        !suffix.is_empty()
+            && suffix.len() <= 128
+            && suffix.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            && suffix.as_bytes()[0].is_ascii_alphanumeric()
+    }
+    match permission {
+        "ADMIN" | "NOSANDBOX" | "CHANNELS" => Ok(()),
+        p if p.starts_with("Merger:") && suffix_ok(&p["Merger:".len()..]) => Ok(()),
+        p if p.starts_with("Channels:") && suffix_ok(&p["Channels:".len()..]) => Ok(()),
+        _ => Err(format!("Unknown or malformed permission: {}", permission.chars().take(64).filter(|c| !c.is_control()).collect::<String>())),
+    }
+}
 
 /// Commands that require the ADMIN permission, mirroring EpixNet's
 /// `@flag.admin` set. An inner xite page can only run these once the user has
@@ -355,6 +383,23 @@ impl CommandRegistry {
             };
             if restrict || (req_id < WRAPPER_ID_BASE && !admin) {
                 return Err("Global network retry requires wrapper or ADMIN authority".into());
+            }
+        }
+        // Granting a permission is the wrapper's job after the user confirms
+        // it in trusted chrome (`wrapperPermissionAdd`). The wrapper sends the
+        // resulting `permissionAdd` from its own elevated id range; a page's
+        // forwarded `permissionAdd` arrives with the page's small id and is
+        // refused here, so a xite can never grant itself ADMIN, a merger type
+        // or a channel namespace without the prompt. `corsPermission` prompts
+        // inside its handler. On a public gateway every visitor could send an
+        // elevated id, so neither is honoured there except from the operator
+        // socket.
+        if cmd == "permissionAdd" || cmd == "corsPermission" {
+            if restrict {
+                return Err(format!("{cmd} is disabled on this gateway"));
+            }
+            if cmd == "permissionAdd" && !is_wrapper_authority(session.trusted, req_id) {
+                return Err("permissionAdd requires the wrapper's permission prompt".into());
             }
         }
         if is_admin_command(cmd) {
@@ -1983,9 +2028,30 @@ impl WsCommand for CorsPermission {
         if addresses.is_empty() {
             return Err("corsPermission: address required".into());
         }
+        let granted = s.state.xite_permissions(&xite).await;
         for addr in addresses {
             let addr = require_address(&addr)?;
-            s.state.add_permission(&xite, &format!("Cors:{addr}")).await;
+            if addr.is_empty()
+                || addr.len() > 128
+                || !addr.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            {
+                return Err("corsPermission: malformed address".into());
+            }
+            let permission = format!("Cors:{addr}");
+            if granted.iter().any(|p| *p == permission) {
+                continue;
+            }
+            // Reading another xite's files is a grant the user makes in the
+            // wrapper's confirm dialog, exactly like permissionAdd. Only the
+            // operator socket skips the dialog; a timeout or dismissal grants
+            // nothing.
+            if !s.trusted {
+                let body = format!("This xite requests permission to read files from xite {addr}");
+                if !s.state.confirm(&xite, &body, "Grant").await {
+                    return Err(format!("corsPermission: access to {addr} was not granted"));
+                }
+            }
+            s.state.add_permission(&xite, &permission).await;
         }
         Ok(Value::from("ok"))
     }
@@ -3341,6 +3407,7 @@ impl WsCommand for PermissionAdd {
             .as_str()
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .ok_or("permissionAdd: permission required")?;
+        validate_grantable_permission(permission)?;
         s.state.add_permission(&address, permission).await;
         // A Merger grant rebuilds the merger dbs inline (not spawned) so the
         // page's grant callback already queries populated data - EpixNet's
@@ -3402,8 +3469,9 @@ impl WsCommand for PermissionDetails {
                     .replace('>', "&gt;")
                     .replace('"', "&quot;");
                 format!(
-                    "Allow this xite to read and send private messages for its own app \
-                    (<b>{app}</b>) as your identity. It cannot see your mail or other apps."
+                    "Allow this xite to read and send private messages in the app channel \
+                    <b>{app}</b> as your identity. Every xite granted this same app name shares \
+                    that channel; it cannot see your mail or other apps."
                 )
             }
             p if p.starts_with("Merger:") => {
@@ -4997,8 +5065,11 @@ mod tests {
             ("1A".to_string(), "index.html".to_string())
         );
 
-        // Grant Cors:1B (as corsPermission does), then the cors- path routes to 1B.
-        CorsPermission.handle(&session, &json!("1B")).await.unwrap();
+        // Grant Cors:1B from the operator socket (a page's corsPermission
+        // first waits for the user's answer; see cors_permission_waits_for_the_users_answer),
+        // then the cors- path routes to 1B.
+        let operator = WsSession::new_trusted(state.clone(), Some("1A".into()));
+        CorsPermission.handle(&operator, &json!("1B")).await.unwrap();
         assert_eq!(
             session.cors_target("cors-1B/data.json").await.unwrap(),
             ("1B".to_string(), "data.json".to_string())
@@ -5048,6 +5119,148 @@ mod tests {
         state.set_plugin_enabled("Multiuser", true).await;
         let on = registry.dispatch(&session, "userList", &json!([]), 1_000_002).await;
         assert!(on.unwrap().is_array());
+    }
+
+    #[tokio::test]
+    async fn a_page_cannot_grant_itself_permissions_without_the_wrapper_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1SelfGrant";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+
+        // The forwarded inner-page shape: small id, no prompt happened.
+        for permission in ["ADMIN", "Merger:EpixPost", "Channels:talk", "NOSANDBOX"] {
+            let denied = registry.dispatch(&session, "permissionAdd", &json!(permission), 7).await;
+            assert!(denied.is_err(), "{permission}: a page granted itself a permission");
+            assert!(denied.unwrap_err().contains("prompt"));
+        }
+        assert!(!state.xite_has_admin(addr).await);
+        assert!(state.xite_permissions(addr).await.is_empty(), "nothing was persisted");
+
+        // Rebinding to itself through `as` keeps the page's id, so it is refused too.
+        let via_as = registry
+            .dispatch(&session, "as", &json!([addr, "permissionAdd", ["ADMIN"]]), 8)
+            .await;
+        assert!(via_as.is_err());
+        assert!(!state.xite_has_admin(addr).await);
+
+        // The wrapper, after the user tapped Grant, sends from its own range.
+        assert_eq!(
+            registry.dispatch(&session, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 3).await.unwrap(),
+            "ok"
+        );
+        assert!(state.xite_has_admin(addr).await);
+
+        // So does the operator's admin socket.
+        let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+        assert_eq!(
+            registry.dispatch(&trusted, "permissionAdd", &json!("Merger:EpixPost"), 1).await.unwrap(),
+            "ok"
+        );
+        assert!(state.xite_permissions(addr).await.iter().any(|p| p == "Merger:EpixPost"));
+    }
+
+    #[tokio::test]
+    async fn permission_grants_are_refused_on_a_public_gateway_even_with_an_elevated_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1Gateway";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        state.config_set("ui_restrict", json!(true)).await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        // Any visitor can send an elevated id to a reverse-proxied node.
+        let denied = registry.dispatch(&session, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 1).await;
+        assert!(denied.unwrap_err().contains("gateway"));
+        let denied = registry.dispatch(&session, "corsPermission", &json!("1Other"), WRAPPER_ID_BASE + 2).await;
+        assert!(denied.unwrap_err().contains("gateway"));
+        assert!(state.xite_permissions(addr).await.is_empty());
+        // The operator socket is the sanctioned way to change a locked node.
+        let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+        assert_eq!(registry.dispatch(&trusted, "permissionAdd", &json!("ADMIN"), 1).await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn only_known_well_formed_permissions_can_be_granted() {
+        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "Merger:EpixPost", "Channels:talk", "Channels:a.b-c_1"] {
+            assert!(validate_grantable_permission(ok).is_ok(), "{ok}");
+        }
+        let long = format!("Merger:{}", "x".repeat(129));
+        for bad in [
+            "", "admin", "ADMIN ", "ADMIN\n", "Merger:", "Channels:", "Channels:<img src=x>",
+            "Merger:../x", "Cors:1Target", "EVX", "Merger:a b", long.as_str(), "Channels:-x",
+        ] {
+            assert!(validate_grantable_permission(bad).is_err(), "accepted {bad:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1Shapes";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        let denied = registry.dispatch(&session, "permissionAdd", &json!("Cors:1Target"), WRAPPER_ID_BASE + 1).await;
+        assert!(denied.is_err(), "Cors grants go through corsPermission's own prompt");
+        assert!(state.xite_permissions(addr).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cors_permission_waits_for_the_users_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1Reader";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        let mut events = state.subscribe_events();
+        state.register_bound_conn(addr, 1);
+
+        // The page asks; the handler pushes a confirm to the wrapper and waits.
+        let (s2, r2) = (state.clone(), registry);
+        let pending = tokio::spawn(async move {
+            let session = WsSession::new(s2, Some(addr.into()));
+            r2.dispatch(&session, "corsPermission", &json!("1Target"), 3).await
+        });
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "confirm");
+        assert!(payload["params"][0].as_str().unwrap().contains("1Target"));
+        assert!(state.xite_permissions(addr).await.is_empty(), "nothing granted before the answer");
+
+        // The user declines: no grant, the command errors.
+        let to = payload["id"].as_i64().unwrap();
+        assert!(state.resolve_callback(to, json!(false)));
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await.unwrap().unwrap();
+        assert!(outcome.is_err());
+        assert!(state.xite_permissions(addr).await.is_empty());
+
+        // Malformed targets never reach the prompt.
+        let bad = CorsPermission.handle(&session, &json!("../1Target")).await;
+        assert!(bad.is_err());
+        // The operator socket needs no dialog.
+        let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+        assert_eq!(CorsPermission.handle(&trusted, &json!("1Target")).await.unwrap(), "ok");
+        assert!(state.xite_permissions(addr).await.iter().any(|p| p == "Cors:1Target"));
+    }
+
+    #[test]
+    fn pushed_prompt_answers_need_wrapper_authority() {
+        // The wrapper answers a server confirm over its own socket from the
+        // elevated id range; a forwarded inner-page answer carries a small id.
+        assert!(is_wrapper_authority(false, WRAPPER_ID_BASE));
+        assert!(is_wrapper_authority(true, 1));
+        assert!(!is_wrapper_authority(false, 1));
+        assert!(!is_wrapper_authority(false, WRAPPER_ID_BASE - 1));
+        assert!(!is_wrapper_authority(false, 0));
     }
 
     #[tokio::test]

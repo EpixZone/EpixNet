@@ -3729,6 +3729,16 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
     // A reply to a server-pushed confirm/prompt: resolve the waiting callback
     // rather than dispatching it as a command. `to` is the pushed event's id.
     if cmd == "response" {
+        // Only the wrapper chrome (which numbers its answers from the elevated
+        // range) or the operator socket may answer a pushed confirm or prompt.
+        // Callback ids are sequential, so a page forwarding `response` frames
+        // with guessed `to` values could otherwise accept its own dialogs.
+        if !crate::command::is_wrapper_authority(session.trusted, id) {
+            ctx.state
+                .log("WARNING", format!("ws response with non-wrapper id {id} ignored"))
+                .await;
+            return String::new();
+        }
         if let Some(to) = req.get("to").and_then(|v| v.as_i64()) {
             let result = req.get("result").cloned().unwrap_or(Value::Null);
             ctx.state.resolve_callback(to, result);

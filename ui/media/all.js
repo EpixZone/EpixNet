@@ -1732,6 +1732,18 @@ if (window.getComputedStyle(document.body).transform) {
         return this.actionOpenWindow(message.params);
       } else if (cmd === "wrapperPermissionAdd") {
         return this.actionPermissionAdd(message);
+      } else if (cmd === "permissionAdd") {
+        // A page may only ask; the grant is the user's decision in this
+        // chrome. Route a raw permissionAdd through the same prompt instead of
+        // forwarding it (the node refuses it from a page id regardless).
+        if (Array.isArray(message.params)) {
+          message.params = message.params[0];
+        }
+        return this.actionPermissionAdd(message);
+      } else if (cmd === "response") {
+        // Answers to the node's confirm/prompt dialogs come from this chrome
+        // over its own socket, never from the page.
+        return this.log("Ignoring inner response message");
       } else if (cmd === "wrapperRequestFullscreen") {
         return this.actionRequestFullscreen();
       } else if (cmd === "wrapperWebNotification") {
