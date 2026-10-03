@@ -91,6 +91,14 @@ pub const STATUS_RUNS: usize = 10;
 /// The label a grant gets when the wrapper does not name one.
 pub const DEFAULT_LABEL: &str = "wrapper";
 
+/// The refusal of an `enable` grant whose dialog showed a different bound
+/// closure than the declaration has now (see [`GrantRequest::shown`]).
+pub const SHOWN_CHANGED: &str = "declaration changed since it was shown; inspect again";
+
+/// Why a job occurrence was closed without its result: its grant changed
+/// while it ran.
+pub const ABANDONED_REVOKED: &str = "grant revoked while the occurrence ran";
+
 /// What the node established about a xite's root `content.json`, in the
 /// closed vocabulary the inspect payload and the `/list` panel show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -143,8 +151,10 @@ impl Trigger {
 /// cleared nor rewritten, so a newer build's pause survives an older one.
 ///
 /// The first two are set by people or by a run and cleared only by
-/// `evxJobResume`; the last two are set and cleared by registration, which
-/// re-derives them from the declaration and the grant on every inspection.
+/// `evxJobResume`; the others are set and cleared by registration, which
+/// re-derives them from the declaration and the grant on every inspection:
+/// the last two are set when the scheduler could not inspect the xite at
+/// all, and the next verified inspection clears them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PauseReason {
     /// `evxJobPause`.
@@ -158,6 +168,15 @@ pub enum PauseReason {
     /// The job's program can no longer be bound to the signed manifest on
     /// this node (a pinned file past the size bound, a missing entry).
     ProgramUnsupported,
+    /// The scheduler could not read the declaration of a xite with due jobs:
+    /// `content.json` unreadable or no longer valid, no `evx` section, or a
+    /// signature that does not verify. The jobs wait for a content change
+    /// (or the scheduler's own slow re-check) instead of being retried
+    /// every tick.
+    DeclarationUnavailable,
+    /// The declaration verified but files it declares are still missing on
+    /// this node; the jobs wait for them to arrive.
+    ContentIncomplete,
 }
 
 impl PauseReason {
@@ -168,6 +187,8 @@ impl PauseReason {
             PauseReason::ReconcileRequired => "reconcile_required",
             PauseReason::DeclarationOutgrewGrant => "declaration_outgrew_grant",
             PauseReason::ProgramUnsupported => "program_unsupported",
+            PauseReason::DeclarationUnavailable => "declaration_unavailable",
+            PauseReason::ContentIncomplete => "content_incomplete",
         }
     }
 
@@ -179,6 +200,8 @@ impl PauseReason {
             "reconcile_required" => Some(PauseReason::ReconcileRequired),
             "declaration_outgrew_grant" => Some(PauseReason::DeclarationOutgrewGrant),
             "program_unsupported" => Some(PauseReason::ProgramUnsupported),
+            "declaration_unavailable" => Some(PauseReason::DeclarationUnavailable),
+            "content_incomplete" => Some(PauseReason::ContentIncomplete),
             _ => None,
         }
     }
@@ -186,7 +209,19 @@ impl PauseReason {
     /// Whether registration owns this reason: it is set and cleared from
     /// the declaration and the grant, never by a person.
     pub fn from_registration(self) -> bool {
-        matches!(self, PauseReason::DeclarationOutgrewGrant | PauseReason::ProgramUnsupported)
+        matches!(
+            self,
+            PauseReason::DeclarationOutgrewGrant
+                | PauseReason::ProgramUnsupported
+                | PauseReason::DeclarationUnavailable
+                | PauseReason::ContentIncomplete
+        )
+    }
+
+    /// Whether the scheduler set this reason because it could not inspect
+    /// the xite: the pauses it re-checks by itself.
+    pub fn from_inspection(self) -> bool {
+        matches!(self, PauseReason::DeclarationUnavailable | PauseReason::ContentIncomplete)
     }
 }
 
@@ -219,6 +254,10 @@ pub enum WaitReason {
     Paused,
     /// The clock is before the last claimed slot's end.
     ClockRollback,
+    /// The xite holds as many occurrence rows as the state retains, so no
+    /// new occurrence can be reserved; the job moves to its next slot each
+    /// time rather than retrying.
+    OccurrenceLimit,
     /// The xite started [`BACKGROUND_RUNS_PER_DAY`] runs this UTC day.
     DailyBudget,
     /// [`BACKGROUND_WORKERS`] background runs are already in flight.
@@ -241,6 +280,7 @@ impl WaitReason {
             WaitReason::JobDisabled => "job_disabled",
             WaitReason::Paused => "paused",
             WaitReason::ClockRollback => "clock_rollback",
+            WaitReason::OccurrenceLimit => "occurrence_limit",
             WaitReason::DailyBudget => "daily_budget",
             WaitReason::WorkersBusy => "workers_busy",
             WaitReason::XiteBusy => "xite_busy",
@@ -464,6 +504,56 @@ pub struct GrantRequest {
     /// Free-text label stored with an `enable` grant.
     #[serde(default)]
     pub label: Option<String>,
+    /// What the dialog showed of the bound closure, for an `enable` grant
+    /// (required there, refused for `once`): the inspect payload's
+    /// `requested.programs`, `requested.jobs`, `effective.allow_run_once`
+    /// and `effective.allow_background`. The digest covers the `evx` object
+    /// only, and which programs bind (and so which jobs are usable, whether
+    /// any run-once is requested, and whether background work is granted)
+    /// also depends on the signed `files` manifest, which a re-sign can
+    /// change without changing the digest. The grant compares these with
+    /// what it would record and refuses on any difference, so consent is
+    /// never wider than the text the user read.
+    #[serde(default)]
+    pub shown: Option<Shown>,
+}
+
+/// The bound closure the consent dialog rendered (see
+/// [`GrantRequest::shown`]). Decoded strictly like the request.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Shown {
+    /// The usable programs, by id (`requested.programs`).
+    pub programs: Vec<String>,
+    /// The usable jobs, by id (`requested.jobs`).
+    pub jobs: Vec<String>,
+    /// `effective.allow_run_once`.
+    pub allow_run_once: bool,
+    /// `effective.allow_background`.
+    pub allow_background: bool,
+}
+
+impl Shown {
+    /// What an `enable` grant of `inspection` records, in the same terms.
+    pub fn of(inspection: &Inspection) -> Shown {
+        let usable_jobs = inspection.usable_jobs();
+        Shown {
+            programs: inspection.bound.keys().cloned().collect(),
+            jobs: usable_jobs.keys().map(|id| (*id).to_string()).collect(),
+            allow_run_once: inspection.requests_run_once(),
+            allow_background: !usable_jobs.is_empty(),
+        }
+    }
+
+    /// The same shape with the lists in a canonical order, so the order a
+    /// client happened to send them in never matters.
+    fn sorted(mut self) -> Shown {
+        self.programs.sort();
+        self.programs.dedup();
+        self.jobs.sort();
+        self.jobs.dedup();
+        self
+    }
 }
 
 /// The two consent shapes the dialog offers.
@@ -787,13 +877,21 @@ impl EvxService {
                 max_concurrency: job.max_concurrency,
             })
             .collect();
-        self.state
-            .set_jobs(xite, &inspection.digest, &specs, now)
-            .map_err(|error| format!("EVX state: {error}"))?;
-        let rows = self
+        let mut rows = self
             .state
             .jobs(xite)
             .map_err(|error| format!("EVX state: {error}"))?;
+        // The scheduler inspects a xite on every content change and every
+        // due tick, so an unchanged registration is not written again.
+        if !registered_as(&rows, &inspection.digest, &specs) {
+            self.state
+                .set_jobs(xite, &inspection.digest, &specs, now)
+                .map_err(|error| format!("EVX state: {error}"))?;
+            rows = self
+                .state
+                .jobs(xite)
+                .map_err(|error| format!("EVX state: {error}"))?;
+        }
         for row in rows {
             let Some(job) = inspection.declaration.jobs.get(&row.job) else { continue };
             let wanted = if !inspection.bound.contains_key(&job.program) {
@@ -816,6 +914,34 @@ impl EvxService {
                 .map_err(|error| format!("EVX state: {error}"))?;
         }
         Ok(())
+    }
+
+    /// Pause every job of `xite` with `reason`, one the scheduler sets when
+    /// it cannot inspect the xite ([`PauseReason::from_inspection`]). A pause
+    /// a person or a run set is left alone, as registration leaves it.
+    /// Returns whether any job changed, so the caller logs a pause once
+    /// rather than on every re-check.
+    pub(crate) fn pause_for_inspection(&self, xite: &str, reason: PauseReason) -> Result<bool, String> {
+        let rows = self
+            .state
+            .jobs(xite)
+            .map_err(|error| format!("EVX state: {error}"))?;
+        let mut changed = false;
+        for row in rows {
+            let current = row.paused_reason.as_deref();
+            let owned = match current {
+                None => true,
+                Some(text) => PauseReason::parse(text).is_some_and(PauseReason::from_registration),
+            };
+            if !owned || current == Some(reason.name()) {
+                continue;
+            }
+            self.state
+                .set_job_paused(xite, &row.job, Some(reason.name()))
+                .map_err(|error| format!("EVX state: {error}"))?;
+            changed = true;
+        }
+        Ok(changed)
     }
 
     /// The inspect payload for `xite`.
@@ -864,6 +990,11 @@ impl EvxService {
             .state
             .daily_runs(xite, now)
             .map_err(|error| format!("EVX state: {error}"))?;
+        let occurrences_full = self
+            .state
+            .retained_occurrences(xite)
+            .map_err(|error| format!("EVX state: {error}"))?
+            >= evx_state::MAX_ROWS;
         let plugin_enabled = app.plugin_enabled(PLUGIN_NAME).await;
         let execution = self.execution().map(|_| ());
         let grant_wait = match &stored {
@@ -915,6 +1046,8 @@ impl EvxService {
                     Some(WaitReason::Paused)
                 } else if slot.is_some_and(|slot| row.last_slot.is_some_and(|last| slot.index < last)) {
                     Some(WaitReason::ClockRollback)
+                } else if occurrences_full {
+                    Some(WaitReason::OccurrenceLimit)
                 } else if runs_today >= BACKGROUND_RUNS_PER_DAY {
                     Some(WaitReason::DailyBudget)
                 } else if busy_workers >= BACKGROUND_WORKERS {
@@ -986,6 +1119,13 @@ impl EvxService {
                 if request.program.is_some() {
                     return Err("program applies to mode once only".into());
                 }
+                let shown = request
+                    .shown
+                    .clone()
+                    .ok_or_else(|| "shown is required for mode enable: what the consent dialog showed".to_string())?;
+                if shown.sorted() != Shown::of(&inspection) {
+                    return Err(SHOWN_CHANGED.into());
+                }
                 if inspection.bound.is_empty() {
                     return Err("no usable program to grant".into());
                 }
@@ -1043,8 +1183,8 @@ impl EvxService {
                 }))
             }
             GrantMode::Once => {
-                if request.limits.is_some() || request.label.is_some() {
-                    return Err("limits and label apply to mode enable only".into());
+                if request.limits.is_some() || request.label.is_some() || request.shown.is_some() {
+                    return Err("limits, label and shown apply to mode enable only".into());
                 }
                 let program = request
                     .program
@@ -1245,22 +1385,33 @@ impl EvxService {
             .find(|row| row.job == job)
             .ok_or_else(|| format!("job {job} is not registered for {xite}; it needs an enabled grant that allows background runs"))?;
         let slot = DurableState::slot_at(&row.schedule, now).map_err(|error| format!("EVX state: {error}"))?;
-        let invocation = self
+        // Held before the claim commits, so the scheduler's recovery can
+        // never see this fresh reservation unheld and run it a second time
+        // as a crash's leftover; released again unless the claim is ours.
+        let occurrence_id = DurableState::occurrence_id(&row.job, &slot);
+        self.scheduler.hold(xite, &occurrence_id);
+        let invocation = match self
             .state
             .claim_occurrence(xite, &row, &slot, &occurrence_request(&row, &slot), now)
-            .map_err(|error| format!("EVX state: {error}"))?;
-        if !invocation.fresh {
-            if invocation.completed {
-                return Ok(json!({
-                    "stored": true,
-                    "occurrence": invocation.occurrence,
-                    "job": job,
-                    "result": invocation.response,
-                }));
+        {
+            Ok(invocation) if invocation.fresh => invocation,
+            Ok(invocation) => {
+                self.scheduler.release(xite, &occurrence_id);
+                if invocation.completed {
+                    return Ok(json!({
+                        "stored": true,
+                        "occurrence": invocation.occurrence,
+                        "job": job,
+                        "result": invocation.response,
+                    }));
+                }
+                return Err(format!("occurrence {} is already running", invocation.occurrence));
             }
-            return Err(format!("occurrence {} is already running", invocation.occurrence));
-        }
-        self.scheduler.hold(xite, &invocation.occurrence);
+            Err(error) => {
+                self.scheduler.release(xite, &occurrence_id);
+                return Err(format!("EVX state: {error}"));
+            }
+        };
         let program = row.program.clone();
         let occurrence = Box::new(Occurrence { invocation, row, slot });
         let result = self
@@ -1363,6 +1514,24 @@ impl EvxService {
             }
             if occurrence.row.program != program {
                 return Err("occurrence does not belong to this program".into());
+            }
+            // The job as it is now, after the inspection re-registered it: a
+            // job paused or disabled since the slot was reserved (by a person,
+            // or by registration) does not run behind its pause, whether the
+            // reservation is the scheduler's, a manual run's or a recovered
+            // one.
+            let current = self
+                .state
+                .jobs(xite)
+                .map_err(|error| format!("EVX state: {error}"))?
+                .into_iter()
+                .find(|row| row.job == occurrence.row.job)
+                .ok_or_else(|| format!("job {} is no longer registered", occurrence.row.job))?;
+            if !current.enabled {
+                return Err(format!("job {} is disabled", current.job));
+            }
+            if let Some(reason) = &current.paused_reason {
+                return Err(format!("job {} is paused: {reason}", current.job));
             }
         }
         let declared = usable_program(&inspection, program)?.clone();
@@ -1578,11 +1747,31 @@ impl EvxService {
         } else {
             occurrence.slot.end_unix
         };
-        if let Err(error) = self
+        match self
             .state
             .finish_occurrence(&occurrence.invocation, &summary, Some(next_due), failed)
         {
-            app.log("ERROR", format!("EVX: occurrence {id} of {} not finished: {error}", occurrence.row.xite)).await;
+            Ok(()) => {}
+            // The grant was revoked (or revoked and given again) while the
+            // occurrence ran: its generation fences the commit, and would
+            // fence every later attempt too. The host closes its own
+            // reservation without the fence instead, so it is neither left
+            // open for every later start to trip over nor counted against
+            // the retained rows forever.
+            Err(evx_state::Error::Denied(denied)) => {
+                let message = format!("{ABANDONED_REVOKED} ({denied})");
+                match self.state.abandon(&occurrence.invocation, &bounded_message(&message)) {
+                    Ok(()) => {
+                        app.log("WARN", format!("EVX: occurrence {id} of {} abandoned: {message}", occurrence.row.xite)).await;
+                    }
+                    Err(error) => {
+                        app.log("ERROR", format!("EVX: occurrence {id} of {} not abandoned: {error}", occurrence.row.xite)).await;
+                    }
+                }
+            }
+            Err(error) => {
+                app.log("ERROR", format!("EVX: occurrence {id} of {} not finished: {error}", occurrence.row.xite)).await;
+            }
         }
         if reconcile {
             if let Err(error) = self.state.set_job_paused(
@@ -1769,6 +1958,21 @@ pub(crate) fn occurrence_request(row: &JobRow, slot: &Slot) -> Value {
     })
 }
 
+/// Whether `rows` already hold the registration `specs` under `digest`:
+/// the same jobs with the same programs, schedules and concurrency.
+fn registered_as(rows: &[JobRow], digest: &str, specs: &[JobSpec]) -> bool {
+    rows.len() == specs.len()
+        && specs.iter().all(|spec| {
+            rows.iter().any(|row| {
+                row.job == spec.job
+                    && row.program == spec.program
+                    && row.max_concurrency == spec.max_concurrency
+                    && row.declaration_digest == digest
+                    && serde_json::to_value(&spec.schedule).is_ok_and(|schedule| schedule == row.schedule)
+            })
+        })
+}
+
 /// Identifier check for an address used as a grant key and a path
 /// component. A bech32 address passes; anything with a separator does not.
 fn xite_id(xite: &str) -> Result<(), String> {
@@ -1907,6 +2111,8 @@ mod tests {
             PauseReason::ReconcileRequired,
             PauseReason::DeclarationOutgrewGrant,
             PauseReason::ProgramUnsupported,
+            PauseReason::DeclarationUnavailable,
+            PauseReason::ContentIncomplete,
         ] {
             assert_eq!(PauseReason::parse(reason.name()), Some(reason));
         }
@@ -1916,6 +2122,12 @@ mod tests {
         assert!(PauseReason::ProgramUnsupported.from_registration());
         assert!(!PauseReason::User.from_registration());
         assert!(!PauseReason::ReconcileRequired.from_registration());
+        assert!(PauseReason::DeclarationUnavailable.from_registration());
+        assert!(PauseReason::ContentIncomplete.from_registration());
+        assert!(PauseReason::DeclarationUnavailable.from_inspection());
+        assert!(PauseReason::ContentIncomplete.from_inspection());
+        assert!(!PauseReason::DeclarationOutgrewGrant.from_inspection());
+        assert!(!PauseReason::User.from_inspection());
     }
 
     #[test]

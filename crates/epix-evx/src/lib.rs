@@ -74,8 +74,8 @@ pub use limits::{clamp, BACKGROUND_RUNS_PER_DAY, BACKGROUND_WORKERS, HOST_CEILIN
 pub use scheduler::Scheduler;
 pub use service::{
     default_worker_binary, EvxService, GrantMode, GrantRequest, Inspection, Integrity,
-    PauseReason, Trigger, WaitReason, DEFAULT_LABEL, RUNTIME_PROFILE, UNSUPPORTED_HOST,
-    WORKER_BINARY,
+    PauseReason, Shown, Trigger, WaitReason, ABANDONED_REVOKED, DEFAULT_LABEL, RUNTIME_PROFILE,
+    SHOWN_CHANGED, UNSUPPORTED_HOST, WORKER_BINARY,
 };
 
 /// The plugin's stable name, as the plugin manager and the command registry
