@@ -87,6 +87,7 @@ function wrapper(windowOverrides, results) {
     ${method("evxDeclaration")}
     ${method("evxRunnableOnce")}
     ${method("evxGrantOutcome")}
+    ${method("evxShown")}
     ${method("evxPromptBody")}
     ${method("toHtmlSafe")}
   `, context);
@@ -224,11 +225,85 @@ test("enable sends evxGrant with the inspected digest and mode enable, then answ
   const { instance, dialogs, commands, replies } = wrapper();
   instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 10 });
   dialogs[0].cb("enable");
+  // The flat fixture payload names no requested programs or jobs and no
+  // run-once bit, so what the dialog showed of them is empty and false.
   assert.deepEqual(plain(commands), [
     { command: "evxInspect", params: { xite: "game.epix" } },
-    { command: "evxGrant", params: { xite: "game.epix", declaration_digest: DIGEST, mode: "enable" } },
+    {
+      command: "evxGrant",
+      params: {
+        xite: "game.epix", declaration_digest: DIGEST, mode: "enable",
+        shown: { programs: [], jobs: [], allow_run_once: false, allow_background: true },
+      },
+    },
   ]);
   assert.deepEqual(plain(replies), [{ cmd: "response", to: 10, result: { granted: true, mode: "enable" } }]);
+});
+
+// The node refuses an enable grant whose bound closure differs from what the
+// dialog showed (docs/evx-milestone-3.md section 3: consent never wider than
+// the text read), so the chrome sends exactly what it rendered from, taken
+// from the same inspect payload.
+test("enable sends what the dialog showed of the bound closure, from the payload it was rendered from", () => {
+  const payload = inspectPayload({
+    requested: { capabilities: [], limits: {}, allow_run_once: true, programs: ["presence"], jobs: ["refresh"] },
+    effective: { limits: { fuel: 1000000 }, allow_run_once: true, allow_background: true },
+  });
+  const { instance, dialogs, commands } = wrapper({}, { evxInspect: () => payload });
+  instance.handleMessage({ cmd: "evxRequest", params: {}, id: 20 });
+  assert.match(dialogs[0].body, /Enabling lets them run in the background/, "the background paragraph was shown");
+  dialogs[0].cb("enable");
+  assert.deepEqual(plain(commands[1].params.shown), {
+    programs: ["presence"], jobs: ["refresh"], allow_run_once: true, allow_background: true,
+  });
+});
+
+test("a dialog without the background paragraph sends allow_background false, so a widened closure is refused", () => {
+  const payload = inspectPayload({
+    jobs: {},
+    requested: { capabilities: [], limits: {}, allow_run_once: true, programs: ["presence"], jobs: [] },
+    // Anything but exactly true is no background authority shown.
+    effective: { limits: { fuel: 1000000 }, allow_run_once: "yes", allow_background: "true" },
+  });
+  const { instance, dialogs, commands, replies } = wrapper({}, {
+    evxInspect: () => payload,
+    // The node re-inspected and found a usable job the dialog never named.
+    evxGrant: params => (params.shown.allow_background === true
+      ? { granted: true, mode: params.mode }
+      : { error: "declaration changed since it was shown; inspect again" }),
+  });
+  instance.handleMessage({ cmd: "evxRequest", params: {}, id: 21 });
+  assert.doesNotMatch(dialogs[0].body, /in the background/, "no background paragraph");
+  dialogs[0].cb("enable");
+  assert.deepEqual(plain(commands[1].params.shown), {
+    programs: ["presence"], jobs: [], allow_run_once: false, allow_background: false,
+  });
+  assert.deepEqual(plain(replies), [{
+    cmd: "response", to: 21,
+    result: { granted: false, mode: "enable", error: "declaration changed since it was shown; inspect again" },
+  }]);
+});
+
+test("what the dialog showed keeps only string ids from the payload's lists", () => {
+  const payload = inspectPayload({
+    requested: { programs: ["presence", 7, null, { id: "x" }], jobs: "refresh" },
+    effective: { allow_background: true },
+  });
+  const { instance, dialogs, commands } = wrapper({}, { evxInspect: () => payload });
+  instance.handleMessage({ cmd: "evxRequest", params: {}, id: 22 });
+  dialogs[0].cb("enable");
+  assert.deepEqual(plain(commands[1].params.shown), {
+    programs: ["presence"], jobs: [], allow_run_once: false, allow_background: true,
+  });
+});
+
+test("allow once sends no shown closure: it grants nothing further", () => {
+  const { instance, dialogs, commands } = wrapper();
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 23 });
+  dialogs[0].cb("once");
+  assert.equal(commands[1].command, "evxGrant");
+  assert.equal(commands[1].params.mode, "once");
+  assert.equal(commands[1].params.shown, undefined);
 });
 
 test("a refused enable answers the page granted:false with the node's reason", () => {
@@ -621,6 +696,7 @@ function dialogWrapper(results) {
     ${method("evxDeclaration")}
     ${method("evxRunnableOnce")}
     ${method("evxGrantOutcome")}
+    ${method("evxShown")}
     ${method("evxPromptBody")}
     ${method("toHtmlSafe")}
     ${method("displayChoice")}

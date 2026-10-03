@@ -111,10 +111,12 @@ pub struct Scheduler {
     /// When the task means to wake next, for status; `None` while it waits
     /// for a wake only.
     next_wake: Mutex<Option<u64>>,
-    /// Occurrences reserved by this process and not yet finished, as
-    /// `<xite>/<occurrence>`: what recovery must not mistake for a crash's
-    /// leftovers.
-    held: Mutex<HashSet<String>>,
+    /// Occurrences reserved (or about to be) by this process and not yet
+    /// finished, as `<xite>/<occurrence>`, each with how many holders it
+    /// has: what recovery must not mistake for a crash's leftovers. Counted,
+    /// so a claim that turns out not to be its holder's own (the slot was
+    /// already taken) releases only its own hold, never the owner's.
+    held: Mutex<HashMap<String, usize>>,
     /// Whether recovery has run; it runs once, at the first enabled tick.
     recovered: AtomicBool,
     stopped: AtomicBool,
@@ -125,22 +127,33 @@ pub struct Scheduler {
 impl Scheduler {
     /// Note that this process reserved `occurrence` of `xite`; released by
     /// [`EvxService::execute`] once the reservation is finished.
+    /// [`EvxService::execute`] once the reservation is finished. Called
+    /// before the claim is made, so there is no moment at which this
+    /// process's fresh reservation is in the database but not held.
     pub(crate) fn hold(&self, xite: &str, occurrence: &str) {
         if let Ok(mut held) = self.held.lock() {
-            held.insert(format!("{xite}/{occurrence}"));
+            *held.entry(format!("{xite}/{occurrence}")).or_default() += 1;
         }
     }
 
+    /// Drop one hold of `occurrence` of `xite`; the occurrence stays held
+    /// while any other holder remains.
     pub(crate) fn release(&self, xite: &str, occurrence: &str) {
         if let Ok(mut held) = self.held.lock() {
-            held.remove(&format!("{xite}/{occurrence}"));
+            let key = format!("{xite}/{occurrence}");
+            if let Some(count) = held.get_mut(&key) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    held.remove(&key);
+                }
+            }
         }
     }
 
-    fn holds(&self, xite: &str, occurrence: &str) -> bool {
+    pub(crate) fn holds(&self, xite: &str, occurrence: &str) -> bool {
         self.held
             .lock()
-            .is_ok_and(|held| held.contains(&format!("{xite}/{occurrence}")))
+            .is_ok_and(|held| held.contains_key(&format!("{xite}/{occurrence}")))
     }
 
     /// Wake the task: something that decides what is due changed. A wake
@@ -462,41 +475,14 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &m
         if facts.contains_key(&row.xite) || skipped.contains(&row.xite) {
             continue;
         }
-        // The inspection re-registers the jobs from what is on disk now and
-        // pauses what the grant no longer covers, so the rows are re-read
-        // after it and a job it paused is not a candidate. A xite that
-        // cannot be inspected has its jobs paused with the reason, visible
-        // in status, and is looked at again on a content change or after
-        // INSPECTION_RECHECK rather than on every tick.
-        let unreadable = match service.inspect(app, &row.xite).await {
-            Ok(inspection) if inspection.integrity == Integrity::Verified => {
-                let (daily_runs, rows) = match (service.state.daily_runs(&row.xite, now), service.state.jobs(&row.xite)) {
-                    (Ok(daily_runs), Ok(rows)) => (daily_runs, rows),
-                    (Err(error), _) | (_, Err(error)) => {
-                        app.log("ERROR", format!("EVX scheduler: {}: {error}", row.xite)).await;
-                        hints.push(now + RETRY_INTERVAL);
-                        skipped.insert(row.xite.clone());
-                        continue;
-                    }
-                };
-                facts.insert(
-                    row.xite.clone(),
-                    XiteFacts {
-                        covers: inspection.covers_declaration(now),
-                        daily_runs,
-                        busy: held_xites.contains(&row.xite) || !service.run_lock_free(&row.xite).await,
-                        rows,
-                    },
-                );
-                continue;
+        match xite_facts(service, app, &row.xite, now, held_xites.contains(&row.xite), task, &mut hints).await {
+            Some(xite) => {
+                facts.insert(row.xite.clone(), xite);
             }
-            Ok(inspection) => (inspection_pause(inspection.integrity), format!("declaration is {}", inspection.integrity.name())),
-            Err(error) => (PauseReason::DeclarationUnavailable, error),
-        };
-        skipped.insert(row.xite.clone());
-        pause_unreadable(service, app, &row.xite, unreadable.0, &unreadable.1).await;
-        task.rechecked.insert(row.xite.clone(), now);
-        hints.push(now + INSPECTION_RECHECK);
+            None => {
+                skipped.insert(row.xite.clone());
+            }
+        }
     }
     // The inspections read files; decide at the time the decision is made.
     let now = now_unix().unwrap_or(now);
@@ -547,6 +533,47 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &m
         }
     }
     hints.into_iter().min()
+}
+
+/// Gather what admission decides on for one xite with due jobs, or `None`
+/// when its jobs cannot be considered this tick. The inspection re-registers
+/// the jobs from what is on disk now and pauses what the grant no longer
+/// covers, so the rows are read after it and a job it paused is not a
+/// candidate. A xite that cannot be inspected has its jobs paused with the
+/// reason, which status shows, and is looked at again on a content change
+/// or after [`INSPECTION_RECHECK`], never on every tick.
+async fn xite_facts(
+    service: &Arc<EvxService>,
+    app: &Arc<AppState>,
+    xite: &str,
+    now: u64,
+    held: bool,
+    task: &mut TaskState,
+    hints: &mut Vec<u64>,
+) -> Option<XiteFacts> {
+    let (reason, detail) = match service.inspect(app, xite).await {
+        Ok(inspection) if inspection.integrity == Integrity::Verified => {
+            return match (service.state.daily_runs(xite, now), service.state.jobs(xite)) {
+                (Ok(daily_runs), Ok(rows)) => Some(XiteFacts {
+                    covers: inspection.covers_declaration(now),
+                    daily_runs,
+                    busy: held || !service.run_lock_free(xite).await,
+                    rows,
+                }),
+                (Err(error), _) | (_, Err(error)) => {
+                    app.log("ERROR", format!("EVX scheduler: {xite}: {error}")).await;
+                    hints.push(now + RETRY_INTERVAL);
+                    None
+                }
+            };
+        }
+        Ok(inspection) => (inspection_pause(inspection.integrity), format!("declaration is {}", inspection.integrity.name())),
+        Err(error) => (PauseReason::DeclarationUnavailable, error),
+    };
+    pause_unreadable(service, app, xite, reason, &detail).await;
+    task.rechecked.insert(xite.to_string(), now);
+    hints.push(now.saturating_add(INSPECTION_RECHECK));
+    None
 }
 
 /// The pause a xite gets for an inspection that did not verify.
@@ -978,6 +1005,309 @@ async fn record_abandoned(service: &EvxService, app: &AppState, row: &JobRow, oc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use std::cell::Cell;
+    use std::collections::BTreeSet;
+
+    use evx_api::Limits;
+    use evx_declaration::{Anchor, Missed, Schedule};
+    use evx_state::{JobSpec, XiteGrant};
+
+    use crate::service::RUNTIME_PROFILE;
+
+    /// The period of every job in the recovery tests.
+    const PERIOD: u64 = 60;
+    /// A slot start (a multiple of [`PERIOD`]) after the grants' consent.
+    const T: u64 = 1_700_000_040;
+
+    /// A service over a throwaway root with no xite served: an inspection
+    /// fails, and nothing a test does here reaches a worker.
+    fn service() -> (Arc<EvxService>, Arc<AppState>) {
+        let app = AppState::new("test");
+        let service = Arc::new(EvxService::for_node(&app, None).unwrap());
+        (service, app)
+    }
+
+    fn grant(service: &EvxService, xite: &str) {
+        let grant = XiteGrant {
+            xite: xite.into(),
+            publisher: xite.into(),
+            enabled: true,
+            capabilities: BTreeSet::new(),
+            runtime_profiles: [RUNTIME_PROFILE.to_string()].into_iter().collect(),
+            limits: Limits::default(),
+            allow_run_once: true,
+            allow_background: true,
+            created_unix: 1_700_000_000,
+            expires_unix: None,
+            label: "test".into(),
+        };
+        service.state.set_xite_grant(&grant).unwrap();
+    }
+
+    /// Grant `xite` and register its one job `sync` every [`PERIOD`].
+    fn granted_job(service: &EvxService, xite: &str) -> JobRow {
+        grant(service, xite);
+        let spec = JobSpec {
+            job: "sync".into(),
+            program: "calc".into(),
+            schedule: Schedule::Interval { seconds: PERIOD, anchor: Anchor::UnixEpoch, missed: Missed::Skip },
+            max_concurrency: 1,
+        };
+        service.state.set_jobs(xite, &"a".repeat(64), &[spec], T).unwrap();
+        service.state.jobs(xite).unwrap().remove(0)
+    }
+
+    /// Reserve the slot `at` falls in, as a process that then crashed did.
+    fn reserve(service: &EvxService, row: &JobRow, at: u64) -> Invocation {
+        let slot = DurableState::slot_at(&row.schedule, at).unwrap();
+        let invocation = service
+            .state
+            .claim_occurrence(&row.xite, row, &slot, &occurrence_request(row, &slot), at)
+            .unwrap();
+        assert!(invocation.fresh);
+        invocation
+    }
+
+    /// The committed response of `occurrence`, if it was closed.
+    fn response(service: &EvxService, xite: &str, occurrence: &str) -> Option<Value> {
+        service
+            .state
+            .snapshot(xite)
+            .unwrap()
+            .invocations
+            .into_iter()
+            .find(|row| row.occurrence == occurrence)
+            .and_then(|row| row.response)
+    }
+
+    fn job_row(service: &EvxService, xite: &str) -> JobRow {
+        service.state.jobs(xite).unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn recovery_decides_each_reservation_when_it_reaches_it_so_a_slot_that_passed_meanwhile_is_abandoned_not_run() {
+        let (service, app) = service();
+        let a = granted_job(&service, "1RecoverA");
+        let b = granted_job(&service, "1RecoverB");
+        let open_a = reserve(&service, &a, T + 10);
+        let open_b = reserve(&service, &b, T + 10);
+        // The clock moves on while recovery works through the list: the
+        // first reservation is examined inside its slot, the second after
+        // the slot ended (as if the first had taken ninety seconds).
+        let reads = Cell::new(0u32);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            Ok(if reads.get() == 1 { T + 10 } else { T + PERIOD + 30 })
+        };
+        let recovered = recover(&service, &app, clock).await;
+        assert_eq!(reads.get(), 2, "one clock read per reservation");
+        // The current one is handed back to run on a worker, re-fenced and
+        // held; nothing ran inside recovery.
+        assert_eq!(recovered.len(), 1);
+        assert_eq!(recovered[0].row.xite, "1RecoverA");
+        assert_eq!(recovered[0].invocation.occurrence, open_a.occurrence);
+        assert_ne!(recovered[0].invocation.token, open_a.token, "recover rotates the token");
+        assert!(service.scheduler.holds("1RecoverA", &open_a.occurrence));
+        assert!(service.state.runs("1RecoverA").unwrap().is_empty(), "nothing ran inline");
+        assert!(response(&service, "1RecoverA", &open_a.occurrence).is_none());
+        // The passed one is finished as abandoned and its job moves to the
+        // end of that slot, never re-run as if it were current.
+        let closed = response(&service, "1RecoverB", &open_b.occurrence).unwrap();
+        assert_eq!(closed["status"], ABANDONED);
+        assert_eq!(job_row(&service, "1RecoverB").next_due_unix, Some(T + PERIOD));
+        assert!(!service.scheduler.holds("1RecoverB", &open_b.occurrence));
+        let runs = service.state.runs("1RecoverB").unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, ABANDONED);
+        assert_eq!(runs[0].occurrence.as_deref(), Some(open_b.occurrence.as_str()));
+    }
+
+    #[tokio::test]
+    async fn recovered_runs_wait_for_a_free_worker_and_are_abandoned_if_their_slot_passes_while_they_wait() {
+        let (service, app) = service();
+        let xites = ["1RecoverA", "1RecoverB", "1RecoverC"];
+        let mut open = Vec::new();
+        for xite in xites {
+            let row = granted_job(&service, xite);
+            open.push(reserve(&service, &row, T + 10));
+        }
+        let mut pending = recover(&service, &app, || Ok(T + 10)).await;
+        assert_eq!(pending.len(), 3);
+        // Every worker is busy with admitted runs: none of the recovered
+        // runs starts, and the task looks again shortly.
+        service.scheduler.busy.store(BACKGROUND_WORKERS, Ordering::SeqCst);
+        let mut hints = Vec::new();
+        let launched = launch_recovered(&service, &app, &mut pending, T + 10, &mut hints).await;
+        assert!(launched.is_empty());
+        assert_eq!(pending.len(), 3);
+        assert_eq!(hints, [T + 10 + RETRY_INTERVAL]);
+        // One worker frees up: exactly one recovered run takes it, counted
+        // in `busy` before it has even started.
+        service.scheduler.busy.store(BACKGROUND_WORKERS - 1, Ordering::SeqCst);
+        let mut hints = Vec::new();
+        let launched = launch_recovered(&service, &app, &mut pending, T + 11, &mut hints).await;
+        assert_eq!(launched.into_iter().collect::<Vec<_>>(), ["1RecoverA"]);
+        assert_eq!(service.scheduler.busy(), BACKGROUND_WORKERS);
+        assert_eq!(pending.len(), 2);
+        // The slot ends before another worker is free: the two still
+        // waiting are closed as abandoned rather than run late, and their
+        // jobs move to the end of the slot.
+        let mut hints = Vec::new();
+        let launched = launch_recovered(&service, &app, &mut pending, T + PERIOD, &mut hints).await;
+        assert!(launched.is_empty());
+        assert!(pending.is_empty());
+        assert!(hints.is_empty());
+        for (xite, invocation) in xites.iter().zip(&open).skip(1) {
+            assert_eq!(response(&service, xite, &invocation.occurrence).unwrap()["status"], ABANDONED, "{xite}");
+            assert!(!service.scheduler.holds(xite, &invocation.occurrence), "{xite}");
+            assert_eq!(job_row(&service, xite).next_due_unix, Some(T + PERIOD), "{xite}");
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_closes_a_paused_jobs_reservation_as_abandoned_without_running_it_or_moving_its_schedule() {
+        let (service, app) = service();
+        let row = granted_job(&service, "1RecoverA");
+        let open = reserve(&service, &row, T + 10);
+        service.state.set_job_paused("1RecoverA", "sync", Some("user")).unwrap();
+        let before = job_row(&service, "1RecoverA");
+        let recovered = recover(&service, &app, || Ok(T + 10)).await;
+        assert!(recovered.is_empty(), "a paused job is not run behind its pause");
+        assert_eq!(response(&service, "1RecoverA", &open.occurrence).unwrap()["status"], ABANDONED);
+        assert!(service.state.incomplete_occurrences(None).unwrap().is_empty());
+        let after = job_row(&service, "1RecoverA");
+        assert_eq!(after.paused_reason.as_deref(), Some("user"));
+        assert_eq!(after.next_due_unix, before.next_due_unix);
+        assert_eq!(after.failures, before.failures);
+        // The same for a pause a run set.
+        let row = granted_job(&service, "1RecoverB");
+        let open = reserve(&service, &row, T + 10);
+        service.state.set_job_paused("1RecoverB", "sync", Some("reconcile_required")).unwrap();
+        assert!(recover(&service, &app, || Ok(T + 10)).await.is_empty());
+        assert_eq!(response(&service, "1RecoverB", &open.occurrence).unwrap()["status"], ABANDONED);
+    }
+
+    #[tokio::test]
+    async fn a_reservation_whose_grant_was_revoked_and_given_again_is_closed_at_recovery_instead_of_leaking() {
+        let (service, app) = service();
+        let a = granted_job(&service, "1RecoverA");
+        let b = granted_job(&service, "1RecoverB");
+        let open_a = reserve(&service, &a, T + 10);
+        let open_b = reserve(&service, &b, T + 10);
+        // Revoked mid-run and granted again: the generation the
+        // reservations were made under is gone, which fences `recover` and
+        // `finish_occurrence` for good.
+        for xite in ["1RecoverA", "1RecoverB"] {
+            service.state.revoke_xite(xite).unwrap();
+            grant(&service, xite);
+        }
+        assert!(service.state.recover(&open_a).is_err(), "the fence holds");
+        // A's slot is current, B's has passed.
+        let reads = Cell::new(0u32);
+        let clock = || {
+            reads.set(reads.get() + 1);
+            Ok(if reads.get() == 1 { T + 10 } else { T + PERIOD + 5 })
+        };
+        let recovered = recover(&service, &app, clock).await;
+        assert!(recovered.is_empty(), "a fenced reservation is not run");
+        for (xite, open) in [("1RecoverA", &open_a), ("1RecoverB", &open_b)] {
+            let closed = response(&service, xite, &open.occurrence).unwrap();
+            assert_eq!(closed["status"], ABANDONED, "{xite}");
+            assert_eq!(service.state.runs(xite).unwrap()[0].status, ABANDONED, "{xite}");
+        }
+        assert!(service.state.incomplete_occurrences(None).unwrap().is_empty(), "nothing left for the next start");
+        // The next start finds nothing to trip over.
+        assert!(recover(&service, &app, || Ok(T + 10)).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_claim_refused_by_a_retention_bound_moves_the_job_to_its_next_slot_instead_of_retrying_every_tick() {
+        let (service, app) = service();
+        let row = granted_job(&service, "1RecoverA");
+        // Fill the xite's retained rows with reservations of its own.
+        for index in 0..evx_state::MAX_ROWS {
+            service.state.begin("1RecoverA", &format!("once-{index:016x}"), None, 1).unwrap();
+        }
+        let now = T + 10;
+        let mut hints = Vec::new();
+        admit(&service, &app, row.clone(), now, &mut hints).await;
+        let after = job_row(&service, "1RecoverA");
+        assert_eq!(after.next_due_unix, Some(T + PERIOD), "the job steps to the next slot");
+        assert!(!hints.contains(&(now + RETRY_INTERVAL)), "no retry every few seconds: {hints:?}");
+        assert_eq!(service.scheduler.busy(), 0, "nothing started");
+        let slot = DurableState::slot_at(&row.schedule, now).unwrap();
+        assert!(!service.scheduler.holds("1RecoverA", &DurableState::occurrence_id("sync", &slot)), "the hold is released");
+        // Status says why the job is not running.
+        let status = service.status(&app, "1RecoverA").await.unwrap();
+        assert_eq!(status["jobs"][0]["waiting_reason"], "occurrence_limit", "{status}");
+    }
+
+    #[tokio::test]
+    async fn a_hold_is_counted_so_a_claim_that_was_not_its_own_never_drops_the_owners_hold() {
+        let (service, app) = service();
+        let row = granted_job(&service, "1RecoverA");
+        // A manual run holds and claims the current slot first.
+        let slot = DurableState::slot_at(&row.schedule, T + 10).unwrap();
+        let id = DurableState::occurrence_id("sync", &slot);
+        service.scheduler.hold("1RecoverA", &id);
+        reserve(&service, &row, T + 10);
+        // The scheduler then admits the same slot: its claim is not fresh,
+        // it releases its own hold and steps past the slot.
+        let mut hints = Vec::new();
+        admit(&service, &app, row, T + 10, &mut hints).await;
+        assert!(service.scheduler.holds("1RecoverA", &id), "the manual run still holds its occurrence");
+        assert_eq!(job_row(&service, "1RecoverA").next_due_unix, Some(T + PERIOD));
+        assert_eq!(service.scheduler.busy(), 0);
+        // Recovery leaves a held reservation to its owner.
+        assert!(recover(&service, &app, || Ok(T + 10)).await.is_empty());
+        assert!(response(&service, "1RecoverA", &id).is_none(), "the owner's reservation is untouched");
+        service.scheduler.release("1RecoverA", &id);
+        assert!(!service.scheduler.holds("1RecoverA", &id));
+        service.scheduler.release("1RecoverA", &id);
+        assert!(!service.scheduler.holds("1RecoverA", &id), "a release past zero stays at zero");
+    }
+
+    #[tokio::test]
+    async fn a_xite_that_cannot_be_inspected_has_its_jobs_paused_with_the_reason_and_is_looked_at_again_only_on_a_change_or_the_slow_recheck() {
+        let (service, app) = service();
+        granted_job(&service, "1RecoverA");
+        let now = now_unix().unwrap();
+        assert_eq!(service.state.due_jobs(now).unwrap().len(), 1);
+        let mut task = TaskState::default();
+        let mut hints = Vec::new();
+        // No such xite on this node: the declaration cannot be read.
+        let facts = xite_facts(&service, &app, "1RecoverA", now, false, &mut task, &mut hints).await;
+        assert!(facts.is_none());
+        assert_eq!(hints, [now + INSPECTION_RECHECK], "no retry every tick");
+        let row = job_row(&service, "1RecoverA");
+        assert_eq!(row.paused_reason.as_deref(), Some(PauseReason::DeclarationUnavailable.name()));
+        assert!(service.state.due_jobs(now).unwrap().is_empty(), "a paused job is not due");
+        let status = service.status(&app, "1RecoverA").await.unwrap();
+        assert_eq!(status["jobs"][0]["paused_reason"], "declaration_unavailable", "{status}");
+        assert_eq!(status["jobs"][0]["waiting_reason"], "paused");
+        // The next ticks leave it alone until the slow re-check is due...
+        let mut hints = Vec::new();
+        reinspect(&service, &app, now + 1, &mut task, &mut hints).await;
+        assert_eq!(hints, [now + INSPECTION_RECHECK]);
+        assert_eq!(task.rechecked.get("1RecoverA"), Some(&now));
+        // ...unless its content changed, which looks at once.
+        task.changed.insert("1RecoverA".into());
+        let mut hints = Vec::new();
+        reinspect(&service, &app, now + 2, &mut task, &mut hints).await;
+        assert_eq!(task.rechecked.get("1RecoverA"), Some(&(now + 2)));
+        assert_eq!(hints, [now + 2 + INSPECTION_RECHECK]);
+        assert!(task.changed.is_empty());
+        // A pause a person set is not the scheduler's to touch.
+        service.state.set_job_paused("1RecoverA", "sync", Some("user")).unwrap();
+        assert!(!service.pause_for_inspection("1RecoverA", PauseReason::ContentIncomplete).unwrap());
+        assert_eq!(job_row(&service, "1RecoverA").paused_reason.as_deref(), Some("user"));
+        // And with no pause of its own left, the slow re-check forgets it.
+        let mut hints = Vec::new();
+        reinspect(&service, &app, now + 3, &mut task, &mut hints).await;
+        assert!(task.rechecked.is_empty());
+        assert!(hints.is_empty());
+    }
 
     fn candidate(xite: &str, job: &str) -> Candidate {
         Candidate { xite: xite.into(), job: job.into(), covers: true, daily_runs: 0, xite_busy: false }

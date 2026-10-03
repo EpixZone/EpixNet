@@ -2048,7 +2048,7 @@ if (window.getComputedStyle(document.body).transform) {
               }
               chosen = true;
               if (choice === "enable") {
-                return _this.ws.cmd("evxGrant", {"xite": xite, "declaration_digest": digest, "mode": "enable"}, function (res) {
+                return _this.ws.cmd("evxGrant", {"xite": xite, "declaration_digest": digest, "mode": "enable", "shown": _this.evxShown(payload)}, function (res) {
                   return answer(_this.evxGrantOutcome(res, "enable"));
                 });
               } else if (choice === "once") {
@@ -2081,6 +2081,39 @@ if (window.getComputedStyle(document.body).transform) {
           });
         };
       })(this));
+    };
+
+    // What this dialog showed of the bound closure, sent with an enable grant
+    // so the node can refuse one whose consent would be wider than the text
+    // the user read: the digest covers the `evx` object only, and which
+    // programs bind (so which jobs are usable, whether run-once is asked
+    // and whether background work is granted) also depends on the signed
+    // `files` manifest, which a re-sign can change while the dialog is
+    // open. Taken from the very payload the dialog was rendered from, in
+    // the node's own words: `requested.programs` and `requested.jobs` (the
+    // usable ones) and the two `effective` bits, exactly `true` or not.
+    Wrapper.prototype.evxShown = function (payload) {
+      var effective, ids, requested;
+      requested = payload && typeof payload.requested === "object" && payload.requested ? payload.requested : {};
+      effective = payload && typeof payload.effective === "object" && payload.effective ? payload.effective : {};
+      ids = function (value) {
+        var k, n, out;
+        out = [];
+        if (Array.isArray(value)) {
+          for (k = 0, n = value.length; k < n; k++) {
+            if (typeof value[k] === "string") {
+              out.push(value[k]);
+            }
+          }
+        }
+        return out;
+      };
+      return {
+        "programs": ids(requested.programs),
+        "jobs": ids(requested.jobs),
+        "allow_run_once": effective.allow_run_once === true,
+        "allow_background": effective.allow_background === true
+      };
     };
 
     // Whether the inspect payload lets `program` run once: it must be a

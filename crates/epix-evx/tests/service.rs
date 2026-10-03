@@ -299,12 +299,23 @@ impl Fixture {
         self.call(&self.wrapper(), cmd, params, WRAPPER_ID_BASE + 1).await
     }
 
-    fn enable_params(&self) -> Value {
-        json!({ "xite": self.address, "declaration_digest": self.digest, "mode": "enable" })
+    /// The `enable` request the wrapper sends for the fixture xite: the
+    /// digest it was shown and what the dialog rendered of the bound
+    /// closure, from an inspection made now.
+    async fn enable_params(&self) -> Value {
+        self.enable_params_at(&self.address, &self.digest).await
     }
 
-    fn enable_params_for(xite: &Xite) -> Value {
-        json!({ "xite": xite.address, "declaration_digest": xite.digest, "mode": "enable" })
+    /// The same for another xite of the node.
+    async fn enable_params_for(&self, xite: &Xite) -> Value {
+        self.enable_params_at(&xite.address, &xite.digest).await
+    }
+
+    /// The `enable` request for `xite` at `digest`, with `shown` taken from
+    /// the inspect payload as the wrapper takes it.
+    async fn enable_params_at(&self, xite: &str, digest: &str) -> Value {
+        let inspect = self.service.inspect_json(&self.state, xite).await.unwrap();
+        json!({ "xite": xite, "declaration_digest": digest, "mode": "enable", "shown": shown(&inspect) })
     }
 
     fn served_root(&self) -> PathBuf {
@@ -331,6 +342,18 @@ impl Fixture {
 
 /// One job of the fixture, when it declares one.
 const JOB: &str = "sync";
+
+/// What the consent dialog rendered of the bound closure, taken from an
+/// inspect payload exactly as the wrapper takes it (`ui/media/all.js`
+/// `evxShown`): the usable programs and jobs and the two effective bits.
+fn shown(inspect: &Value) -> Value {
+    json!({
+        "programs": inspect["requested"]["programs"],
+        "jobs": inspect["requested"]["jobs"],
+        "allow_run_once": inspect["effective"]["allow_run_once"],
+        "allow_background": inspect["effective"]["allow_background"],
+    })
+}
 
 fn now_unix() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
@@ -429,7 +452,7 @@ async fn a_page_socket_can_inspect_request_and_read_status_for_its_own_xite_only
 #[tokio::test]
 async fn the_wrapper_enables_a_grant_that_status_and_the_list_panel_report() {
     let f = Fixture::new(Options { capabilities: vec!["workspace.read", "game.score.get"], ..Options::default() }).await;
-    let granted = f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    let granted = f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     assert_eq!(granted["granted"], true);
     assert_eq!(granted["mode"], "enable");
     assert_eq!(granted["grant"]["enabled"], true);
@@ -462,7 +485,7 @@ async fn the_wrapper_enables_a_grant_that_status_and_the_list_panel_report() {
 
     // Re-granting the same declaration is idempotent for the generation;
     // a label is stored as given.
-    let mut again = f.enable_params();
+    let mut again = f.enable_params().await;
     again["label"] = json!("laptop");
     let granted = f.chrome("evxGrant", again).await.unwrap();
     assert_eq!(granted["grant"]["generation"], 1);
@@ -472,7 +495,7 @@ async fn the_wrapper_enables_a_grant_that_status_and_the_list_panel_report() {
 #[tokio::test]
 async fn a_grant_with_a_stale_declaration_digest_is_refused() {
     let f = Fixture::new(Options::default()).await;
-    let mut stale = f.enable_params();
+    let mut stale = f.enable_params().await;
     stale["declaration_digest"] = json!("0".repeat(64));
     let denied = f.chrome("evxGrant", stale).await.unwrap_err();
     assert!(denied.contains("declaration_digest"), "{denied}");
@@ -502,7 +525,7 @@ async fn a_page_socket_cannot_grant_with_or_without_an_elevated_id() {
     let f = Fixture::new(Options::default()).await;
     let page = f.page();
     let once = json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM });
-    for params in [f.enable_params(), once] {
+    for params in [f.enable_params().await, once] {
         let denied = f.call(&page, "evxGrant", params.clone(), 7).await.unwrap_err();
         assert!(denied.contains("prompt"), "{denied}");
         let forged = f.call(&page, "evxGrant", params.clone(), WRAPPER_ID_BASE + 3).await.unwrap_err();
@@ -524,7 +547,7 @@ async fn a_page_socket_cannot_grant_with_or_without_an_elevated_id() {
     let handlers = EvxPlugin::default().ws_commands();
     for cmd in epix_ui::command::EVX_WRAPPER_COMMANDS {
         let handler = handlers.iter().find(|handler| handler.name() == *cmd).unwrap();
-        let denied = handler.handle(&page, &f.enable_params()).await.unwrap_err();
+        let denied = handler.handle(&page, &f.enable_params().await).await.unwrap_err();
         assert!(denied.contains("prompt"), "{cmd}: {denied}");
     }
     assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none());
@@ -542,7 +565,7 @@ async fn an_admin_xite_page_cannot_grant_through_as() {
     assert!(f.state.xite_has_admin(&f.address).await);
     let page = f.page();
     let once = json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM });
-    for params in [f.enable_params(), once] {
+    for params in [f.enable_params().await, once] {
         let denied = f.call(&page, "as", json!([f.address, "evxGrant", params.clone()]), 8).await.unwrap_err();
         assert!(denied.contains("prompt"), "{denied}");
         let denied = f
@@ -568,7 +591,7 @@ async fn an_admin_xite_page_cannot_grant_through_as() {
     f.state.add_permission(dashboard, "ADMIN").await;
     let admin_page = WsSession::new(f.state.clone(), Some(dashboard.into()));
     let denied = f
-        .call(&admin_page, "as", json!([f.address, "evxGrant", f.enable_params()]), 11)
+        .call(&admin_page, "as", json!([f.address, "evxGrant", f.enable_params().await]), 11)
         .await
         .unwrap_err();
     assert!(denied.contains("prompt"), "{denied}");
@@ -581,7 +604,7 @@ async fn an_admin_xite_page_cannot_grant_through_as() {
     // The wrapper's own dialog answer and the operator socket are the only
     // routes, through `as` as directly.
     let granted = f
-        .call(&f.wrapper(), "as", json!([f.address, "evxGrant", f.enable_params()]), WRAPPER_ID_BASE + 1)
+        .call(&f.wrapper(), "as", json!([f.address, "evxGrant", f.enable_params().await]), WRAPPER_ID_BASE + 1)
         .await
         .unwrap();
     assert_eq!(granted["granted"], true);
@@ -591,8 +614,10 @@ async fn an_admin_xite_page_cannot_grant_through_as() {
 
 #[tokio::test]
 async fn a_gateway_visitor_is_told_only_whether_execution_is_enabled() {
-    let f = Fixture::new(Options::default()).await;
-    let mut labelled = f.enable_params();
+    // A declaration without run-once: the operator's status says the grant
+    // does not allow it, which is a fact of the consent record.
+    let f = Fixture::new(Options { allow_run_once: false, ..Options::default() }).await;
+    let mut labelled = f.enable_params().await;
     labelled["label"] = json!("operator laptop");
     f.call(&f.operator(), "evxGrant", labelled, 1).await.unwrap();
     f.state.config_set("ui_restrict", json!(true)).await;
@@ -613,6 +638,10 @@ async fn a_gateway_visitor_is_told_only_whether_execution_is_enabled() {
     }
     let status = f.call(&visitor, "evxStatus", json!({}), 2).await.unwrap();
     assert!(status["reasons"].is_array());
+    for reason in status["reasons"].as_array().unwrap() {
+        assert!(epix_evx::commands::GATEWAY_REASONS.contains(&reason.as_str().unwrap()), "{reason} survived: {status}");
+    }
+    assert!(!status.to_string().contains("run_once_not_allowed"), "{status}");
     assert_eq!(status["running"], false);
     // No dialog is shown on a gateway, so the ask is refused, not recorded.
     let denied = f.call(&visitor, "evxRequest", json!({}), 3).await.unwrap_err();
@@ -623,6 +652,7 @@ async fn a_gateway_visitor_is_told_only_whether_execution_is_enabled() {
     // The operator socket sees everything, and a plain node tells its
     // page everything too.
     assert_eq!(status["grant"]["label"], "operator laptop");
+    assert!(status["reasons"].as_array().unwrap().contains(&json!("run_once_not_allowed")), "{status}");
     assert!(status["generations"]["generation"].is_u64());
     assert_eq!(status["runs"], json!([]));
     let inspect = f.call(&f.operator(), "evxInspect", json!({ "xite": f.address }), 5).await.unwrap();
@@ -637,7 +667,7 @@ async fn a_gateway_visitor_is_told_only_whether_execution_is_enabled() {
 async fn a_restricted_gateway_refuses_the_grant_commands_except_from_the_operator_socket() {
     let f = Fixture::new(Options::default()).await;
     f.state.config_set("ui_restrict", json!(true)).await;
-    let denied = f.chrome("evxGrant", f.enable_params()).await.unwrap_err();
+    let denied = f.chrome("evxGrant", f.enable_params().await).await.unwrap_err();
     assert!(denied.contains("gateway"), "{denied}");
     for cmd in ["evxRevoke", "evxSetLimits", "evxRunOnce", "evxJobPause", "evxJobResume", "evxRunJob"] {
         let params = json!({ "xite": f.address, "limits": Limits::default(), "program": PROGRAM, "job": JOB });
@@ -646,7 +676,7 @@ async fn a_restricted_gateway_refuses_the_grant_commands_except_from_the_operato
     assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none());
     // The operator socket is the sanctioned way to change a locked node,
     // and it may name any xite.
-    let granted = f.call(&f.operator(), "evxGrant", f.enable_params(), 1).await.unwrap();
+    let granted = f.call(&f.operator(), "evxGrant", f.enable_params().await, 1).await.unwrap();
     assert_eq!(granted["granted"], true);
     assert!(f.service.durable().xite_grant(&f.address).unwrap().unwrap().0.enabled);
     let revoked = f.call(&f.operator(), "evxRevoke", json!({ "xite": f.address }), 2).await.unwrap();
@@ -657,7 +687,7 @@ async fn a_restricted_gateway_refuses_the_grant_commands_except_from_the_operato
 #[tokio::test]
 async fn revocation_disables_the_grant_and_a_later_run_once_is_refused() {
     let f = Fixture::new(Options::default()).await;
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     let revoked = f.chrome("evxRevoke", json!({})).await.unwrap();
     assert_eq!(revoked["revoked"], true);
     assert_eq!(revoked["had_grant"], true);
@@ -724,7 +754,7 @@ async fn a_host_without_execution_reports_unsupported_host_and_spends_nothing() 
     assert_eq!(status["host"]["execution"], false);
     assert!(status["reasons"].as_array().unwrap().contains(&json!("unsupported_host")));
     // Inspect, grant and revoke still work.
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     let minted = f
         .chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM }))
         .await
@@ -759,7 +789,7 @@ async fn workspace_and_state_paths_are_under_private_evx_and_outside_the_served_
     }
     // A grant leaves the served root untouched.
     let before = f.served_files();
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     assert_eq!(f.served_files(), before);
     // An in-memory node keeps its state in a throwaway directory, never
     // beside anything served.
@@ -789,7 +819,7 @@ async fn inspecting_a_start_function_module_reports_its_hash_without_spawning_an
     assert_eq!(entry["size"], module.len());
     assert_eq!(inspect["integrity"], "verified");
     f.call(&f.page(), "evxRequest", json!({}), 2).await.unwrap();
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     f.chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM }))
         .await
         .unwrap();
@@ -803,7 +833,7 @@ async fn inspecting_a_start_function_module_reports_its_hash_without_spawning_an
 async fn set_limits_clamps_to_the_host_ceiling_and_advances_the_limits_generation() {
     let f = Fixture::new(Options::default()).await;
     assert!(f.chrome("evxSetLimits", json!({ "limits": Limits::default() })).await.is_err(), "no grant yet");
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     let generous = Limits { memory_bytes: 256 * 1024 * 1024, wall_seconds: 600.0, ..Limits::default() };
     generous.validate().unwrap();
     let set = f.chrome("evxSetLimits", json!({ "limits": generous })).await.unwrap();
@@ -824,7 +854,7 @@ async fn set_limits_clamps_to_the_host_ceiling_and_advances_the_limits_generatio
     assert!(f.chrome("evxSetLimits", json!({ "limits": unknown })).await.is_err());
     assert_eq!(f.service.durable().xite_grant(&f.address).unwrap().unwrap().1.limits_generation, 2);
     // The wrapper may also propose limits with the grant itself.
-    let mut with_limits = f.enable_params();
+    let mut with_limits = f.enable_params().await;
     with_limits["limits"] = serde_json::to_value(Limits { fuel: 1_000_000_000_000, ..Limits::default() }).unwrap();
     let granted = f.chrome("evxGrant", with_limits).await.unwrap();
     assert_eq!(granted["grant"]["limits"]["fuel"], HOST_CEILING.fuel);
@@ -837,7 +867,7 @@ async fn an_unsigned_declaration_is_inspectable_but_cannot_be_granted() {
     let inspect = f.call(&f.page(), "evxInspect", json!({}), 1).await.unwrap();
     assert_eq!(inspect["integrity"], "unsigned");
     assert_eq!(inspect["declaration_digest"], f.digest);
-    let denied = f.chrome("evxGrant", f.enable_params()).await.unwrap_err();
+    let denied = f.chrome("evxGrant", f.enable_params().await).await.unwrap_err();
     assert!(denied.contains("unsigned"), "{denied}");
     let denied = f
         .chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM }))
@@ -850,7 +880,7 @@ async fn an_unsigned_declaration_is_inspectable_but_cannot_be_granted() {
     std::fs::remove_file(f.served_root().join(ENTRY_PATH)).unwrap();
     let inspect = f.call(&f.page(), "evxInspect", json!({}), 1).await.unwrap();
     assert_eq!(inspect["integrity"], "incomplete");
-    let denied = f.chrome("evxGrant", f.enable_params()).await.unwrap_err();
+    let denied = f.chrome("evxGrant", f.enable_params().await).await.unwrap_err();
     assert!(denied.contains("incomplete"), "{denied}");
 }
 
@@ -873,7 +903,7 @@ async fn enabling_a_declaration_with_a_usable_job_records_background_consent_and
     assert_eq!(status["scheduler"]["enabled"], true);
     assert_eq!(status["scheduler"]["host"], if f.service.execution().is_ok() { "macos" } else { "unsupported" });
 
-    let granted = f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    let granted = f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     assert_eq!(granted["grant"]["allow_background"], true, "consent and authority agree: {granted}");
     assert_eq!(granted["jobs"], json!([JOB]));
     let (stored, _) = f.service.durable().xite_grant(&f.address).unwrap().unwrap();
@@ -895,7 +925,7 @@ async fn enabling_a_declaration_with_a_usable_job_records_background_consent_and
     let plain = Fixture::new(Options::default()).await;
     let inspect = plain.call(&plain.page(), "evxInspect", json!({}), 1).await.unwrap();
     assert_eq!(inspect["effective"]["allow_background"], false);
-    let granted = plain.chrome("evxGrant", plain.enable_params()).await.unwrap();
+    let granted = plain.chrome("evxGrant", plain.enable_params().await).await.unwrap();
     assert_eq!(granted["grant"]["allow_background"], false);
     assert_eq!(granted["jobs"], json!([]));
     assert!(plain.service.durable().jobs(&plain.address).unwrap().is_empty());
@@ -904,7 +934,7 @@ async fn enabling_a_declaration_with_a_usable_job_records_background_consent_and
 #[tokio::test]
 async fn a_manual_job_run_claims_the_current_slot_and_a_second_request_returns_the_stored_result() {
     let f = Fixture::new(Options::with_job(3600)).await;
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     let now = now_unix();
     let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
     let slot = DurableState::slot_at(&row.schedule, now).unwrap();
@@ -980,7 +1010,7 @@ async fn recovery_retries_an_open_occurrence_of_the_current_slot_and_abandons_a_
     // Grant with the scheduler held off, so the test owns the reservations.
     f.state.set_plugin_enabled(PLUGIN_NAME, false).await;
     f.service
-        .grant(&f.state, serde_json::from_value(f.enable_params()).unwrap())
+        .grant(&f.state, serde_json::from_value(f.enable_params().await).unwrap())
         .await
         .unwrap();
     let now = now_unix();
@@ -1060,7 +1090,7 @@ async fn every_authority_refusal_is_visible_on_the_job_and_re_enabling_resumes_o
     assert!(before["reasons"].as_array().unwrap().contains(&json!("no_grant")));
     assert_eq!(before["jobs"], json!([]));
 
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     let can_run = f.service.execution().is_ok();
     let slot = DurableState::slot_at(&f.service.durable().jobs(&f.address).unwrap()[0].schedule, now_unix()).unwrap();
     if can_run {
@@ -1121,7 +1151,7 @@ async fn every_authority_refusal_is_visible_on_the_job_and_re_enabling_resumes_o
     f.refused("evxRunJob", json!({ "job": JOB }), "paused").await;
     // A new grant for the wider declaration lifts the pause.
     let granted = f
-        .chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": wider, "mode": "enable" }))
+        .chrome("evxGrant", f.enable_params_at(&f.address, &wider).await)
         .await
         .unwrap();
     assert_eq!(granted["grant"]["capabilities"], json!(["workspace.read"]));
@@ -1132,7 +1162,7 @@ async fn every_authority_refusal_is_visible_on_the_job_and_re_enabling_resumes_o
     let job = f.job(JOB).await;
     assert_eq!(job["waiting_reason"], "revoked", "{job}");
     assert_eq!(f.service.durable().jobs(&f.address).unwrap().len(), 1, "registration survives a revocation");
-    f.chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": wider, "mode": "enable" }))
+    f.chrome("evxGrant", f.enable_params_at(&f.address, &wider).await)
         .await
         .unwrap();
     let job = f.job(JOB).await;
@@ -1161,7 +1191,7 @@ async fn a_xite_past_its_daily_budget_waits_with_the_reason_and_nothing_starts()
     for _ in 0..BACKGROUND_RUNS_PER_DAY {
         f.service.durable().reserve_daily_run(&f.address, now, BACKGROUND_RUNS_PER_DAY).unwrap();
     }
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     tokio::time::sleep(Duration::from_millis(2500)).await;
     let job = f.job(JOB).await;
     assert_eq!(job["waiting_reason"], "daily_budget", "{job}");
@@ -1192,7 +1222,7 @@ async fn a_xite_past_its_daily_budget_waits_with_the_reason_and_nothing_starts()
 #[tokio::test]
 async fn disabling_the_plugin_stops_admission_and_re_enabling_resumes_it() {
     let f = Fixture::new(Options::with_job(1)).await;
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     let can_run = f.service.execution().is_ok();
     if can_run {
         wait_for(Duration::from_secs(20), "the first scheduled run", || async { (!f.runs().is_empty()).then_some(()) }).await;
@@ -1228,7 +1258,7 @@ async fn disabling_the_plugin_stops_admission_and_re_enabling_resumes_it() {
 #[tokio::test]
 async fn a_job_whose_program_cannot_be_bound_is_registered_paused_with_the_reason() {
     let f = Fixture::new(Options::with_job(3600)).await;
-    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     assert!(f.job(JOB).await["paused_reason"].is_null());
     // Re-signed with the entry no longer pinned by the manifest: the
     // program cannot be bound, so it is unusable and so is the job, visibly.
@@ -1245,6 +1275,127 @@ async fn a_job_whose_program_cannot_be_bound_is_registered_paused_with_the_reaso
     f.refused("evxRunJob", json!({ "job": JOB }), "paused").await;
 }
 
+#[tokio::test]
+async fn an_enable_grant_is_refused_when_the_bound_closure_changed_since_the_dialog_showed_it() {
+    // The dialog is rendered from a manifest that does not pin the program:
+    // nothing is usable, so it shows no background paragraph.
+    let f = Fixture::new(Options { pin_entry: false, ..Options::with_job(3600) }).await;
+    let shown_then = f.enable_params().await;
+    assert_eq!(shown_then["shown"]["allow_background"], false, "{shown_then}");
+    assert_eq!(shown_then["shown"]["jobs"], json!([]));
+    assert_eq!(shown_then["shown"]["programs"], json!([]));
+    // While the user reads it, a re-sign pins the program and leaves the
+    // `evx` object alone: the digest is the same, the closure is wider.
+    let digest = f.resign(Options::with_job(3600));
+    assert_eq!(digest, f.digest, "the digest covers the evx object only");
+    let denied = f.chrome("evxGrant", shown_then).await.unwrap_err();
+    assert_eq!(denied, epix_evx::SHOWN_CHANGED);
+    assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none(), "nothing was recorded");
+    assert!(f.service.durable().jobs(&f.address).unwrap().is_empty(), "nothing was registered");
+    // A request that does not say what was shown is refused too.
+    let mut bare = f.enable_params().await;
+    bare.as_object_mut().unwrap().remove("shown");
+    let denied = f.chrome("evxGrant", bare).await.unwrap_err();
+    assert!(denied.contains("shown"), "{denied}");
+    // Each part counts: a dialog that said run-once is not requested, or
+    // that listed no jobs, did not show what enabling would record now.
+    let shown_now = f.enable_params().await;
+    assert_eq!(shown_now["shown"]["allow_background"], true, "{shown_now}");
+    assert_eq!(shown_now["shown"]["jobs"], json!([JOB]));
+    for (field, value) in [("allow_run_once", json!(false)), ("jobs", json!([])), ("allow_background", json!(false)), ("programs", json!([]))] {
+        let mut narrower = shown_now.clone();
+        narrower["shown"][field] = value;
+        let denied = f.chrome("evxGrant", narrower).await.unwrap_err();
+        assert_eq!(denied, epix_evx::SHOWN_CHANGED, "{field}");
+    }
+    assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none());
+    // `shown` is part of an enable grant only.
+    let mut once = json!({ "xite": f.address, "declaration_digest": f.digest, "mode": "once", "program": PROGRAM });
+    once["shown"] = shown_now["shown"].clone();
+    assert!(f.chrome("evxGrant", once).await.is_err());
+    // Shown again: the dialog names the job, and the grant records exactly
+    // the background authority it named.
+    f.chrome("evxGrant", shown_now).await.unwrap();
+    let (grant, _) = f.service.durable().xite_grant(&f.address).unwrap().unwrap();
+    assert!(grant.allow_background);
+    assert!(grant.allow_run_once);
+    assert_eq!(f.service.durable().jobs(&f.address).unwrap()[0].job, JOB);
+}
+
+/// Wait until the scheduler has stopped ticking (no tick for 400 ms) and
+/// return how many ticks it completed.
+async fn settled_ticks(f: &Fixture) -> u64 {
+    let mut last = f.service.scheduler_ticks();
+    loop {
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        let now = f.service.scheduler_ticks();
+        if now == last && now > 0 {
+            return now;
+        }
+        last = now;
+    }
+}
+
+#[tokio::test]
+async fn a_content_change_for_a_xite_with_jobs_re_registers_it_with_no_evx_command_and_one_for_another_xite_wakes_nothing() {
+    // No worker, so nothing runs and the scheduler only ticks when woken.
+    let missing = std::env::temp_dir().join("epix-evx-no-such-worker");
+    let options = || Options { worker: Some(missing.clone()), ..Options::with_job(3600) };
+    let f = Fixture::new(options()).await;
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
+    let other = f.add_xite(Options { worker: Some(missing.clone()), ..Options::default() }).await;
+    let settled = settled_ticks(&f).await;
+    let wake_before = f.status().await["scheduler"]["next_wake_unix"].clone();
+    // A change to a xite without jobs: no tick.
+    f.state.push_xite_info(&other.address).await;
+    tokio::time::sleep(epix_evx::scheduler::CONTENT_WAKE_COALESCE + Duration::from_millis(800)).await;
+    assert_eq!(f.service.scheduler_ticks(), settled, "an unrelated xite's change woke the scheduler");
+    assert_eq!(f.status().await["scheduler"]["next_wake_unix"], wake_before);
+    // The publisher re-signs asking for more, the node announces the change
+    // the way it announces every content change, and nobody sends an EVX
+    // command: the scheduler inspects the xite by itself, re-registers the
+    // job under the new digest and pauses it, since the grant no longer
+    // covers the declaration.
+    let wider = f.resign(Options { capabilities: vec!["workspace.read"], ..options() });
+    assert_ne!(wider, f.digest);
+    f.state.push_xite_info(&f.address).await;
+    let row = wait_for(
+        epix_evx::scheduler::CONTENT_WAKE_COALESCE + Duration::from_secs(3),
+        "the re-signed declaration to be registered",
+        || async {
+            let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
+            (row.declaration_digest == wider).then_some(row)
+        },
+    )
+    .await;
+    assert_eq!(row.paused_reason.as_deref(), Some("declaration_outgrew_grant"));
+    assert!(f.service.scheduler_ticks() > settled);
+    // The declaration then disappears in another re-sign: the job is held
+    // with the reason, not retried every tick, and a later fix clears it,
+    // again with no EVX command.
+    let settled = settled_ticks(&f).await;
+    let root = f.served_root();
+    let mut gone = f.xite.content.clone();
+    gone.as_object_mut().unwrap().remove("evx");
+    epix_content::sign(&mut gone, &f.xite.key).unwrap();
+    XiteStorage::new(&root).write("content.json", epix_content::dumps_content(&gone).as_bytes()).unwrap();
+    f.state.push_xite_info(&f.address).await;
+    wait_for(epix_evx::scheduler::CONTENT_WAKE_COALESCE + Duration::from_secs(3), "the job to be held", || async {
+        let job = f.job(JOB).await;
+        (job["paused_reason"] == "declaration_unavailable").then_some(())
+    })
+    .await;
+    assert!(f.service.scheduler_ticks() > settled);
+    f.resign(options());
+    f.state.push_xite_info(&f.address).await;
+    let row = wait_for(epix_evx::scheduler::CONTENT_WAKE_COALESCE + Duration::from_secs(3), "the hold to clear", || async {
+        let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
+        row.paused_reason.is_none().then_some(row)
+    })
+    .await;
+    assert_eq!(row.declaration_digest, f.digest);
+}
+
 #[cfg(target_os = "macos")]
 mod execution {
     use super::*;
@@ -1258,7 +1409,7 @@ mod execution {
         let f = Fixture::new(Options::with_job(1)).await;
         // The wrapper's dialog answer is the only command sent; no page
         // socket is ever opened and no manual run requested.
-        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+        f.chrome("evxGrant", f.enable_params().await).await.unwrap();
         let runs = wait_for(Duration::from_secs(20), "two scheduled runs", || async {
             let runs = f.runs();
             (runs.len() >= 2).then_some(runs)
@@ -1297,7 +1448,7 @@ mod execution {
     #[tokio::test]
     async fn a_failing_job_backs_off_with_the_persisted_next_due_and_a_manual_run_doubles_it() {
         let f = Fixture::new(Options { wat: TRAP, ..Options::with_job(1) }).await;
-        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+        f.chrome("evxGrant", f.enable_params().await).await.unwrap();
         let row = wait_for(Duration::from_secs(20), "the first failed run", || async {
             let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
             (row.failures >= 1).then_some(row)
@@ -1344,7 +1495,7 @@ mod execution {
         f.state.set_plugin_enabled(PLUGIN_NAME, false).await;
         for xite in [&f.xite, &b, &c] {
             f.service
-                .grant(&f.state, serde_json::from_value(Fixture::enable_params_for(xite)).unwrap())
+                .grant(&f.state, serde_json::from_value(f.enable_params_for(xite).await).unwrap())
                 .await
                 .unwrap();
         }
@@ -1380,7 +1531,7 @@ mod execution {
     async fn run_once_executes_the_baseline_program_through_the_real_worker() {
         let f = Fixture::new(Options::default()).await;
         assert!(f.service.execution().is_ok());
-        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+        f.chrome("evxGrant", f.enable_params().await).await.unwrap();
         let served_before = f.served_files();
 
         let outcome = f.chrome("evxRunOnce", json!({ "program": PROGRAM })).await.unwrap();
@@ -1500,7 +1651,7 @@ mod execution {
             })
             .await,
         );
-        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+        f.chrome("evxGrant", f.enable_params().await).await.unwrap();
 
         // Run 1 spins; run 2 queues behind it on the xite's run lock.
         let first = tokio::spawn({
@@ -1548,7 +1699,7 @@ mod execution {
         // Granted with no capabilities, then re-signed asking for one: the
         // update is authenticated but broader, so it waits for a new grant.
         let f = Fixture::new(Options::default()).await;
-        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+        f.chrome("evxGrant", f.enable_params().await).await.unwrap();
         let narrow = f.chrome("evxRunOnce", json!({ "program": PROGRAM })).await.unwrap();
         assert_eq!(narrow["value"], 42, "{narrow}");
         let denied = f.chrome("evxRunOnce", json!({ "program": "other" })).await.unwrap_err();

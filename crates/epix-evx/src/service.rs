@@ -2261,6 +2261,31 @@ mod tests {
         assert_eq!(after.next_due_unix, Some(occurrence.slot.end_unix));
     }
 
+    #[tokio::test]
+    async fn a_finish_fenced_by_a_revocation_during_the_run_closes_the_reservation_as_abandoned() {
+        let (service, app, row) = service_with_job().await;
+        let now = 1_700_000_000;
+        let occurrence = claim(&service, &row, now);
+        // Revoked while the occurrence ran, then granted again: the
+        // generation it was reserved under is gone for good.
+        service.state.revoke_xite(&row.xite).unwrap();
+        let (mut grant, _) = service.state.xite_grant(&row.xite).unwrap().unwrap();
+        grant.enabled = true;
+        service.state.set_xite_grant(&grant).unwrap();
+        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Ok)), now + 5).await;
+        assert!(service.state.incomplete_occurrences(None).unwrap().is_empty(), "the reservation is not left open");
+        let stored = service.state.snapshot(&row.xite).unwrap().invocations.remove(0);
+        let response = stored.response.unwrap();
+        assert_eq!(response["status"], evx_state::ABANDONED);
+        assert!(response["error"].as_str().unwrap().starts_with(ABANDONED_REVOKED), "{response}");
+        // The job keeps its schedule: the slot current when it is next due
+        // is claimed under the new generation.
+        let after = service.state.jobs(&row.xite).unwrap().remove(0);
+        assert_eq!(after.failures, row.failures);
+        let next = claim(&service, &after, occurrence.slot.end_unix);
+        assert!(next.invocation.fresh);
+    }
+
     #[test]
     fn trigger_and_authority_names_are_identifiers() {
         for name in [

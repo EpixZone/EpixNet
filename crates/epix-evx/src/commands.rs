@@ -117,12 +117,30 @@ pub fn redact_for_gateway(mut payload: Value) -> Value {
             let enabled = scheduler.get("enabled").and_then(Value::as_bool);
             object.insert("scheduler".into(), json!({ "enabled": enabled }));
         }
+        // The reasons are rebuilt from the facts that survive: whether a
+        // grant exists is the `grant` key itself, and the host and the
+        // plugin switch are the node's, not the consent's. Every reason
+        // drawn from the grant record (revoked or expired, background or
+        // run-once not allowed) is dropped, since the bare enabled bit is
+        // all a visitor is told of it.
+        if let Some(reasons) = object.get("reasons").and_then(Value::as_array) {
+            let kept: Vec<Value> = reasons
+                .iter()
+                .filter(|reason| reason.as_str().is_some_and(|reason| GATEWAY_REASONS.contains(&reason)))
+                .cloned()
+                .collect();
+            object.insert("reasons".into(), Value::Array(kept));
+        }
         for key in ["generations", "runs", "run_count", "asked_unix"] {
             object.remove(key);
         }
     }
     payload
 }
+
+/// The status reasons a gateway visitor may see: none of them says
+/// anything about the grant beyond whether one exists.
+pub const GATEWAY_REASONS: [&str; 3] = ["no_grant", "unsupported_host", "plugin_disabled"];
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -334,6 +352,30 @@ pub fn all() -> Vec<Arc<dyn WsCommand>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_gateway_visitor_sees_no_status_reason_drawn_from_the_grant_record() {
+        let payload = json!({
+            "grant": { "enabled": true, "label": "operator laptop", "allow_background": false },
+            "reasons": [
+                "no_grant",
+                "revoked",
+                "expired",
+                "run_once_not_allowed",
+                "background_not_allowed",
+                "unsupported_host",
+                "plugin_disabled",
+                7,
+            ],
+            "runs": [],
+        });
+        let redacted = redact_for_gateway(payload);
+        assert_eq!(redacted["grant"], json!({ "enabled": true }));
+        assert_eq!(redacted["reasons"], json!(["no_grant", "unsupported_host", "plugin_disabled"]));
+        assert!(redacted.get("runs").is_none());
+        // A payload without reasons (the inspect payload) gets none added.
+        assert!(redact_for_gateway(json!({ "grant": null })).get("reasons").is_none());
+    }
 
     #[test]
     fn null_params_are_the_empty_object_and_other_shapes_are_refused() {
