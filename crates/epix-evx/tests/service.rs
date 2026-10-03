@@ -306,7 +306,9 @@ impl Fixture {
         self.enable_params_at(&self.address, &self.digest).await
     }
 
-    /// The same for another xite of the node.
+    /// The same for another xite of the node. Only the macOS execution tests
+    /// use it.
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     async fn enable_params_for(&self, xite: &Xite) -> Value {
         self.enable_params_at(&xite.address, &xite.digest).await
     }

@@ -7,12 +7,15 @@ as implemented in the `evx-*` crates. The product plan, security review and
 prior-art research live outside this repository in the planning documents;
 this page is the engineering reference for what exists in the tree.
 
-Status: milestone 2 (`docs/evx-milestone-2.md`). Execution is macOS only.
+Status: milestone 3 (`docs/evx-milestone-3.md`). Execution is macOS only.
 A xite's signed `evx` declaration is parsed from its root `content.json`,
 inspected inertly, granted through the wrapper's consent dialog or the
-operator socket, run once on demand, and revoked. No scheduler or background
-lifecycle yet (milestone 3), no publication or chain operations. Not reviewed
-independently. Do not enable for untrusted public content.
+operator socket, run once on demand, run on its declared interval schedule
+in the background with no page open, and revoked. Each occurrence is
+reserved before it runs and completed with its result, so restarts, manual
+runs and duplicate wakes never run it twice. No mobile OS wake, publication
+or chain operations. Not reviewed independently. Do not enable for
+untrusted public content.
 
 ## Crates
 
@@ -127,8 +130,8 @@ deliberate: there is no unconfined fallback.
   packaged as an XPC service with its own entitlements; the frame protocol does
   not change.
 - RSS is sampled, not capped. A native allocation can overshoot between polls.
-- No scheduler and no background lifecycle: a program runs only when the
-  user or operator says so (milestone 3). No publication, streams or chain
+- Background jobs run inside the desktop node. Mobile OS wake (WorkManager,
+  BGTaskScheduler) is not implemented. No publication, streams or chain
   operations. The resource dashboard is limited to the inspect/status payloads.
 - Grants need the wrapper's consent dialog or the operator socket. The
   wrapper's socket is authenticated by the xite's secret key, the xite page
