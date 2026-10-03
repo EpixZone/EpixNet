@@ -10,8 +10,9 @@
 //! the task holds is a wake handle, a count of runs in flight and the time
 //! it means to wake at, for status. The selection itself ([`plan`]) is a
 //! pure function of what the tick gathered, so it is tested on a fake time
-//! line without a database or a worker, and the tick is the only clock
-//! read per pass: every decision of a pass is made at one `now`.
+//! line without a database or a worker. The tick reads the clock again
+//! after every step that can take a while, so no decision is made at a
+//! time a slot has since left behind.
 //!
 //! The lifecycle, from the spec: wait, wake, admit, run, commit, release.
 //! Admission checks run in the spec's order (plugin, grant, declaration
@@ -28,18 +29,22 @@
 //! identity when its slot is still the current one (`DurableState::recover`
 //! rotates its fencing token so the dead worker could not commit even if it
 //! were alive), and finished as `abandoned` when the slot has passed, so
-//! the schedule moves on and the history says what happened. A reservation
-//! this process holds (a manual run that claimed its slot before the task
-//! got to run) is not an earlier process's and is left to its owner, which
-//! is why every claim is registered with [`Scheduler::hold`] in the same
-//! breath. A reservation is never dropped silently; one the state refuses
-//! to touch (a grant fenced since, which also fences the commit of a run
-//! revoked in flight) is logged and left for the next start.
+//! the schedule moves on and the history says what happened. A recovered
+//! run is never awaited inside the tick: it waits for a worker like any
+//! admitted occurrence, counted against the host-wide cap, and is closed as
+//! abandoned instead if its slot passes while it waits. A reservation this
+//! process holds (a claim made before the task got to run) is not an
+//! earlier process's and is left to its owner, which is why every claim is
+//! registered with [`Scheduler::hold`] before it is made. A reservation is
+//! never dropped silently; one whose grant was fenced since (a run revoked
+//! in flight), or whose job is paused, is closed as abandoned without the
+//! fence (`DurableState::abandon`) rather than left open for every later
+//! start to trip over.
 
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::RandomState;
 use std::hash::BuildHasher;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -52,8 +57,8 @@ use tokio::sync::Notify;
 
 use crate::limits::{BACKGROUND_RUNS_PER_DAY, BACKGROUND_WORKERS};
 use crate::service::{
-    now_unix, occurrence_request, status_name, EvxService, Integrity, Occurrence, Run, Trigger,
-    WaitReason,
+    bounded_message, now_unix, occurrence_request, status_name, EvxService, Integrity, Occurrence,
+    PauseReason, Run, Trigger, WaitReason,
 };
 use crate::PLUGIN_NAME;
 
@@ -70,10 +75,17 @@ pub const DISABLED_POLL: u64 = 2;
 pub const CONTENT_WAKE_COALESCE: Duration = Duration::from_secs(2);
 
 /// How long the task waits before looking again at a job it could not act
-/// on for a reason no wake will clear by itself: a xite whose run lock is
-/// held by a run-once, an inspection that failed, a claim the state
-/// refused. A bound on retries, never a cadence.
+/// on for a reason no wake will clear by itself but that passes quickly: a
+/// xite whose run lock is held by a run-once, a database error. A bound on
+/// retries, never a cadence.
 pub const RETRY_INTERVAL: u64 = 2;
+
+/// How long the jobs of a xite the scheduler could not inspect (a
+/// declaration gone, unsigned or unreadable, files still missing) wait
+/// before the scheduler inspects it again by itself. A content change for
+/// the xite inspects it at once, so this is only the safety net for a
+/// change no event announced.
+pub const INSPECTION_RECHECK: u64 = 300;
 
 /// Smallest and largest jitter added to a wake, in seconds. The jitter is
 /// up to a tenth of the job's period within these bounds, so a thousand
@@ -88,7 +100,7 @@ pub const BACKOFF_BASE: u64 = 30;
 pub const BACKOFF_CEILING: u64 = 6 * 3600;
 
 /// The status word an abandoned reservation is finished and recorded with.
-pub const ABANDONED: &str = "abandoned";
+pub const ABANDONED: &str = evx_state::ABANDONED;
 
 /// The wake handle and the counters the task shares with the service.
 #[derive(Default)]
@@ -106,6 +118,8 @@ pub struct Scheduler {
     /// Whether recovery has run; it runs once, at the first enabled tick.
     recovered: AtomicBool,
     stopped: AtomicBool,
+    /// Ticks completed since start, for tests and status views.
+    ticks: AtomicU64,
 }
 
 impl Scheduler {
@@ -150,6 +164,11 @@ impl Scheduler {
     /// Background occurrences in flight right now.
     pub fn busy(&self) -> usize {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Ticks the task completed since start: what a wake led to.
+    pub fn ticks(&self) -> u64 {
+        self.ticks.load(Ordering::SeqCst)
     }
 
     /// When the task means to wake next, for status.
@@ -285,6 +304,24 @@ fn period(row: &JobRow) -> Result<u64, String> {
     Ok(slot.end_unix - slot.start_unix)
 }
 
+/// What the task carries from one tick to the next. None of it is state
+/// that matters across a restart: the reservations in `recovered` are open
+/// rows a later start recovers again, and the rest only paces re-checks.
+#[derive(Default)]
+pub(crate) struct TaskState {
+    /// Reservations recovery re-fenced and holds, waiting for a worker:
+    /// they run on their own tasks like admitted occurrences, counted
+    /// against [`BACKGROUND_WORKERS`], never inline in a tick.
+    recovered: Vec<Occurrence>,
+    /// Xites with jobs whose content changed since the last tick: each is
+    /// inspected again at the next tick, so a re-signed declaration is
+    /// registered (or paused) without waiting for its next due time.
+    changed: HashSet<String>,
+    /// When the task last inspected each xite whose jobs it paused because
+    /// it could not inspect them, for the slow re-check.
+    rechecked: HashMap<String, u64>,
+}
+
 /// The scheduler task: the wait/wake loop until [`Scheduler::stop`], with
 /// recovery folded into the first tick that finds the plugin enabled.
 pub(crate) async fn run(service: Arc<EvxService>, app: Arc<AppState>) {
@@ -294,6 +331,7 @@ pub(crate) async fn run(service: Arc<EvxService>, app: Arc<AppState>) {
     let mut job_xites: Vec<String> = Vec::new();
     let mut coalesce: Option<Instant> = None;
     let mut tick_due = true;
+    let mut task = TaskState::default();
     loop {
         if scheduler.stopped() {
             scheduler.set_next_wake(None);
@@ -302,13 +340,14 @@ pub(crate) async fn run(service: Arc<EvxService>, app: Arc<AppState>) {
         if tick_due {
             tick_due = false;
             let wake = match now_unix() {
-                Ok(now) => tick(&service, &app, now).await,
+                Ok(now) => tick(&service, &app, now, &mut task).await,
                 Err(error) => {
                     app.log("ERROR", format!("EVX scheduler: {error}")).await;
                     None
                 }
             };
             scheduler.set_next_wake(wake);
+            scheduler.ticks.fetch_add(1, Ordering::SeqCst);
             job_xites = service.state.job_xites().unwrap_or_default();
         }
         let timer = scheduler
@@ -328,10 +367,19 @@ pub(crate) async fn run(service: Arc<EvxService>, app: Arc<AppState>) {
             }
             event = events.recv(), if events_open => {
                 let relevant = match event {
-                    Ok(event) => event.target.as_deref().is_some_and(|target| job_xites.iter().any(|xite| xite == target)),
-                    // Events were dropped: one of them may have been a
-                    // xite with jobs, so wake as if it was.
-                    Err(RecvError::Lagged(_)) => !job_xites.is_empty(),
+                    Ok(event) => match event.target {
+                        Some(target) if job_xites.contains(&target) => {
+                            task.changed.insert(target);
+                            true
+                        }
+                        _ => false,
+                    },
+                    // Events were dropped: any of them may have been for a
+                    // xite with jobs, so every such xite is looked at again.
+                    Err(RecvError::Lagged(_)) => {
+                        task.changed.extend(job_xites.iter().cloned());
+                        !job_xites.is_empty()
+                    }
                     Err(RecvError::Closed) => {
                         events_open = false;
                         false
@@ -360,12 +408,17 @@ struct XiteFacts {
     rows: Vec<JobRow>,
 }
 
-/// One pass: admit what is due at `now` and say when to wake next
-/// (`None`: only a wake will do). Every pass starts with the plugin switch,
-/// so disabling the plugin stops admission at the next pass and revokes the
-/// brokers of running work; a host that cannot execute admits nothing and
-/// says so in status.
-async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) -> Option<u64> {
+/// One pass: admit what is due and say when to wake next (`None`: only a
+/// wake will do). Every pass starts with the plugin switch, so disabling
+/// the plugin stops admission at the next pass and revokes the brokers of
+/// running work; a host that cannot execute admits nothing and says so in
+/// status. Nothing in a pass waits for a run: recovered and admitted
+/// occurrences run on their own tasks, so the switch is read again within
+/// [`DISABLED_POLL`] whatever is running. The clock is read again after
+/// every step that can take a while (recovery, the inspections), so each
+/// decision is made at the time it is made, never at a time a slot has
+/// since left behind.
+async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &mut TaskState) -> Option<u64> {
     let scheduler = &service.scheduler;
     if !app.plugin_enabled(PLUGIN_NAME).await {
         let brokers: Vec<_> = service
@@ -382,11 +435,20 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) -> Optio
         return Some(now + DISABLED_POLL);
     }
     if !scheduler.recovered.swap(true, Ordering::SeqCst) {
-        recover(service, app, now).await;
+        let found = recover(service, app, now_unix).await;
+        task.recovered.extend(found);
     }
+    let mut hints: Vec<u64> = Vec::new();
+    let now = now_unix().unwrap_or(now);
+    // Recovered occurrences go first: their slot is current and already
+    // reserved, so they take the free workers before new admissions do.
+    let mut held_xites = launch_recovered(service, app, &mut task.recovered, now, &mut hints).await;
+    held_xites.extend(task.recovered.iter().map(|occurrence| occurrence.row.xite.clone()));
+    reinspect(service, app, now, task, &mut hints).await;
     if service.execution().is_err() {
-        return None;
+        return hints.into_iter().min();
     }
+    let now = now_unix().unwrap_or(now);
     let due = match service.state.due_jobs(now) {
         Ok(due) => due,
         Err(error) => {
@@ -394,48 +456,50 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) -> Optio
             return Some(now + RETRY_INTERVAL);
         }
     };
-    let mut hints: Vec<u64> = Vec::new();
-    let mut order: Vec<String> = Vec::new();
     let mut facts: HashMap<String, XiteFacts> = HashMap::new();
+    let mut skipped: HashSet<String> = HashSet::new();
     for row in &due {
-        if facts.contains_key(&row.xite) {
+        if facts.contains_key(&row.xite) || skipped.contains(&row.xite) {
             continue;
         }
         // The inspection re-registers the jobs from what is on disk now and
         // pauses what the grant no longer covers, so the rows are re-read
-        // after it and a job it paused is not a candidate.
-        let inspection = match service.inspect(app, &row.xite).await {
-            Ok(inspection) => inspection,
-            Err(error) => {
-                app.log("WARN", format!("EVX scheduler: {} not inspected: {error}", row.xite)).await;
-                hints.push(now + RETRY_INTERVAL);
+        // after it and a job it paused is not a candidate. A xite that
+        // cannot be inspected has its jobs paused with the reason, visible
+        // in status, and is looked at again on a content change or after
+        // INSPECTION_RECHECK rather than on every tick.
+        let unreadable = match service.inspect(app, &row.xite).await {
+            Ok(inspection) if inspection.integrity == Integrity::Verified => {
+                let (daily_runs, rows) = match (service.state.daily_runs(&row.xite, now), service.state.jobs(&row.xite)) {
+                    (Ok(daily_runs), Ok(rows)) => (daily_runs, rows),
+                    (Err(error), _) | (_, Err(error)) => {
+                        app.log("ERROR", format!("EVX scheduler: {}: {error}", row.xite)).await;
+                        hints.push(now + RETRY_INTERVAL);
+                        skipped.insert(row.xite.clone());
+                        continue;
+                    }
+                };
+                facts.insert(
+                    row.xite.clone(),
+                    XiteFacts {
+                        covers: inspection.covers_declaration(now),
+                        daily_runs,
+                        busy: held_xites.contains(&row.xite) || !service.run_lock_free(&row.xite).await,
+                        rows,
+                    },
+                );
                 continue;
             }
+            Ok(inspection) => (inspection_pause(inspection.integrity), format!("declaration is {}", inspection.integrity.name())),
+            Err(error) => (PauseReason::DeclarationUnavailable, error),
         };
-        if inspection.integrity != Integrity::Verified {
-            app.log("WARN", format!("EVX scheduler: {} is {}, jobs wait", row.xite, inspection.integrity.name())).await;
-            hints.push(now + RETRY_INTERVAL);
-            continue;
-        }
-        let (daily_runs, rows) = match (service.state.daily_runs(&row.xite, now), service.state.jobs(&row.xite)) {
-            (Ok(daily_runs), Ok(rows)) => (daily_runs, rows),
-            (Err(error), _) | (_, Err(error)) => {
-                app.log("ERROR", format!("EVX scheduler: {}: {error}", row.xite)).await;
-                hints.push(now + RETRY_INTERVAL);
-                continue;
-            }
-        };
-        order.push(row.xite.clone());
-        facts.insert(
-            row.xite.clone(),
-            XiteFacts {
-                covers: inspection.covers_declaration(now),
-                daily_runs,
-                busy: !service.run_lock_free(&row.xite).await,
-                rows,
-            },
-        );
+        skipped.insert(row.xite.clone());
+        pause_unreadable(service, app, &row.xite, unreadable.0, &unreadable.1).await;
+        task.rechecked.insert(row.xite.clone(), now);
+        hints.push(now + INSPECTION_RECHECK);
     }
+    // The inspections read files; decide at the time the decision is made.
+    let now = now_unix().unwrap_or(now);
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut rows: HashMap<(String, String), JobRow> = HashMap::new();
     for due_row in &due {
@@ -485,10 +549,159 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) -> Optio
     hints.into_iter().min()
 }
 
+/// The pause a xite gets for an inspection that did not verify.
+fn inspection_pause(integrity: Integrity) -> PauseReason {
+    match integrity {
+        Integrity::Incomplete => PauseReason::ContentIncomplete,
+        _ => PauseReason::DeclarationUnavailable,
+    }
+}
+
+/// Pause the jobs of a xite the scheduler could not inspect, logging the
+/// pause once, when it is set, rather than on every look.
+async fn pause_unreadable(service: &EvxService, app: &AppState, xite: &str, reason: PauseReason, detail: &str) {
+    match service.pause_for_inspection(xite, reason) {
+        Ok(true) => {
+            app.log("WARN", format!("EVX scheduler: jobs of {xite} paused ({}): {detail}", reason.name())).await;
+        }
+        Ok(false) => {}
+        Err(error) => {
+            app.log("ERROR", format!("EVX scheduler: jobs of {xite} not paused: {error}")).await;
+        }
+    }
+}
+
+/// Inspect again every xite whose content changed since the last tick and
+/// every xite whose jobs the task paused for an inspection that failed,
+/// the latter at most every [`INSPECTION_RECHECK`] unless its content
+/// changed. A verified inspection registers the jobs, which re-derives
+/// every pause registration owns (clearing an inspection pause); one that
+/// fails pauses the jobs with the reason instead.
+async fn reinspect(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &mut TaskState, hints: &mut Vec<u64>) {
+    let changed = std::mem::take(&mut task.changed);
+    let paused: HashSet<String> = match service.state.paused_jobs(now) {
+        Ok(rows) => rows
+            .into_iter()
+            .filter(|row| {
+                row.paused_reason
+                    .as_deref()
+                    .and_then(PauseReason::parse)
+                    .is_some_and(PauseReason::from_inspection)
+            })
+            .map(|row| row.xite)
+            .collect(),
+        Err(error) => {
+            app.log("ERROR", format!("EVX scheduler: paused jobs: {error}")).await;
+            HashSet::new()
+        }
+    };
+    task.rechecked.retain(|xite, _| paused.contains(xite));
+    let mut look: Vec<String> = changed.iter().cloned().collect();
+    for xite in &paused {
+        if changed.contains(xite) {
+            continue;
+        }
+        match task.rechecked.get(xite).map(|at| at.saturating_add(INSPECTION_RECHECK)) {
+            Some(at) if at > now => hints.push(at),
+            _ => look.push(xite.clone()),
+        }
+    }
+    look.sort();
+    for xite in look {
+        let unreadable = match service.inspect(app, &xite).await {
+            Ok(inspection) if inspection.integrity == Integrity::Verified => None,
+            Ok(inspection) => Some((inspection_pause(inspection.integrity), format!("declaration is {}", inspection.integrity.name()))),
+            Err(error) => Some((PauseReason::DeclarationUnavailable, error)),
+        };
+        match unreadable {
+            None => {
+                if task.rechecked.remove(&xite).is_some() {
+                    app.log("INFO", format!("EVX scheduler: {xite} inspected again; its jobs are registered from the current declaration")).await;
+                }
+            }
+            Some((reason, detail)) => {
+                pause_unreadable(service, app, &xite, reason, &detail).await;
+                task.rechecked.insert(xite, now);
+                hints.push(now.saturating_add(INSPECTION_RECHECK));
+            }
+        }
+    }
+}
+
+/// Run recovered occurrences on their own tasks while workers are free,
+/// one per xite per tick and only where the xite's run lock is free, and
+/// close the ones whose slot passed while they waited (a passed slot is
+/// never run). Returns the xites launched for, which the rest of the tick
+/// treats as busy: their runs have not taken the lock yet.
+async fn launch_recovered(
+    service: &Arc<EvxService>,
+    app: &Arc<AppState>,
+    pending: &mut Vec<Occurrence>,
+    now: u64,
+    hints: &mut Vec<u64>,
+) -> HashSet<String> {
+    let mut launched: HashSet<String> = HashSet::new();
+    let mut waiting: Vec<Occurrence> = Vec::new();
+    for occurrence in std::mem::take(pending) {
+        let xite = occurrence.row.xite.clone();
+        if occurrence.slot.end_unix <= now {
+            let closed = close_abandoned(
+                service,
+                app,
+                &occurrence.invocation,
+                Some(&occurrence.row),
+                Close::Finish(Some(occurrence.slot.end_unix)),
+                RECOVERED_SLOT_PASSED,
+                now,
+            )
+            .await;
+            if closed {
+                service.scheduler.release(&xite, &occurrence.invocation.occurrence);
+            }
+            continue;
+        }
+        if service.scheduler.busy() >= BACKGROUND_WORKERS || launched.contains(&xite) || !service.run_lock_free(&xite).await {
+            waiting.push(occurrence);
+            continue;
+        }
+        app.log("INFO", format!("EVX recovery: running {} of {xite} again under the same identity", occurrence.invocation.occurrence)).await;
+        launched.insert(xite);
+        spawn_occurrence(service, app, occurrence);
+    }
+    if !waiting.is_empty() {
+        hints.push(now + RETRY_INTERVAL);
+    }
+    *pending = waiting;
+    launched
+}
+
+/// Run a reserved, held occurrence on its own task, counted in `busy` from
+/// now until it is finished, and wake the task when it is.
+fn spawn_occurrence(service: &Arc<EvxService>, app: &Arc<AppState>, occurrence: Occurrence) {
+    let xite = occurrence.row.xite.clone();
+    let job = occurrence.row.job.clone();
+    let program = occurrence.row.program.clone();
+    service.scheduler.busy.fetch_add(1, Ordering::SeqCst);
+    let service = Arc::clone(service);
+    let app = Arc::clone(app);
+    tokio::spawn(async move {
+        let result = service
+            .execute(&app, &xite, &program, Run::Job { occurrence: Box::new(occurrence), trigger: Trigger::Job })
+            .await;
+        if let Err(error) = result {
+            app.log("WARN", format!("EVX scheduler: job {job} of {xite} refused: {error}")).await;
+        }
+        service.scheduler.busy.fetch_sub(1, Ordering::SeqCst);
+        service.scheduler.wake();
+    });
+}
+
 /// Reserve the current slot of `row` and run it on its own task, so two
 /// xites admitted in one tick run at once. A slot already claimed (by a
 /// manual run) is stepped past; a clock before the last claimed slot
-/// claims nothing and the job sleeps until that slot has passed.
+/// claims nothing and the job sleeps until that slot has passed. The
+/// reservation is held before it is made, so recovery can never take a
+/// fresh claim of this process for a crash's leftover.
 async fn admit(service: &Arc<EvxService>, app: &Arc<AppState>, row: JobRow, now: u64, hints: &mut Vec<u64>) {
     let xite = row.xite.clone();
     let job = row.job.clone();
@@ -510,18 +723,40 @@ async fn admit(service: &Arc<EvxService>, app: &Arc<AppState>, row: JobRow, now:
         hints.push(passed);
         return;
     }
+    let occurrence_id = DurableState::occurrence_id(&row.job, &slot);
+    service.scheduler.hold(&xite, &occurrence_id);
     let invocation = match service
         .state
         .claim_occurrence(&xite, &row, &slot, &occurrence_request(&row, &slot), now)
     {
         Ok(invocation) => invocation,
         Err(error) => {
-            app.log("WARN", format!("EVX scheduler: job {job} of {xite} not claimed: {error}")).await;
-            hints.push(now + RETRY_INTERVAL);
+            service.scheduler.release(&xite, &occurrence_id);
+            match error {
+                // A bound the state keeps (the retained occurrences, the
+                // grant's persistent budget) will not move by itself within
+                // this slot: the job steps to the next slot, which status
+                // shows, instead of trying again every few seconds.
+                evx_state::Error::BudgetExceeded(_) => {
+                    app.log("WARN", format!("EVX scheduler: job {job} of {xite} not claimed: {error}; next slot")).await;
+                    if let Err(error) = service.state.set_job_next_due(&xite, &job, Some(slot.end_unix)) {
+                        app.log("ERROR", format!("EVX scheduler: job {job} of {xite}: {error}")).await;
+                    }
+                }
+                // The grant changed under the plan; the change wakes the task.
+                evx_state::Error::Denied(_) => {
+                    app.log("WARN", format!("EVX scheduler: job {job} of {xite} not claimed: {error}")).await;
+                }
+                _ => {
+                    app.log("WARN", format!("EVX scheduler: job {job} of {xite} not claimed: {error}")).await;
+                    hints.push(now + RETRY_INTERVAL);
+                }
+            }
             return;
         }
     };
     if !invocation.fresh {
+        service.scheduler.release(&xite, &occurrence_id);
         app.log(
             "INFO",
             format!(
@@ -550,34 +785,39 @@ async fn admit(service: &Arc<EvxService>, app: &Arc<AppState>, row: JobRow, now:
         if let Err(error) = service.state.finish_occurrence(&invocation, &summary, Some(slot.end_unix), false) {
             app.log("ERROR", format!("EVX scheduler: occurrence {} of {xite} not finished: {error}", invocation.occurrence)).await;
         }
+        service.scheduler.release(&xite, &occurrence_id);
         hints.push((now / SECONDS_PER_DAY + 1) * SECONDS_PER_DAY);
         return;
     }
-    service.scheduler.hold(&xite, &invocation.occurrence);
-    let program = row.program.clone();
-    let occurrence = Box::new(Occurrence { invocation, row, slot });
-    service.scheduler.busy.fetch_add(1, Ordering::SeqCst);
-    let service = Arc::clone(service);
-    let app = Arc::clone(app);
-    tokio::spawn(async move {
-        let result = service
-            .execute(&app, &xite, &program, Run::Job { occurrence, trigger: Trigger::Job })
-            .await;
-        if let Err(error) = result {
-            app.log("WARN", format!("EVX scheduler: job {job} of {xite} refused: {error}")).await;
-        }
-        service.scheduler.busy.fetch_sub(1, Ordering::SeqCst);
-        service.scheduler.wake();
-    });
+    spawn_occurrence(service, app, Occurrence { invocation, row, slot });
 }
 
-/// Examine every reservation left open by an earlier process, once.
-async fn recover(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) {
+/// Why a reservation from an earlier process is closed without running.
+const RECOVERED_SLOT_PASSED: &str = "reservation from before a restart; its slot has passed";
+const RECOVERED_JOB_PAUSED: &str = "reservation from before a restart; the job is paused or disabled";
+const RECOVERED_GRANT_CHANGED: &str = "reservation from before a restart; the grant changed since it was made";
+
+/// Examine every reservation left open by an earlier process, once, reading
+/// `clock` afresh for each so that whatever time the examination takes,
+/// "still current" means current when it is decided. Nothing runs here:
+/// an occurrence whose slot is current and whose job may run is re-fenced
+/// (`DurableState::recover` rotates its token), held, and returned for the
+/// tick to run on a worker like an admitted one. One whose slot has passed
+/// is finished as abandoned so the schedule moves on; one whose job is
+/// paused or disabled, or whose grant changed since it was made (a run
+/// revoked mid-flight), is closed as abandoned without the grant fence and
+/// without moving the schedule. Each closure is recorded in the history.
+async fn recover(
+    service: &Arc<EvxService>,
+    app: &Arc<AppState>,
+    clock: impl Fn() -> Result<u64, String>,
+) -> Vec<Occurrence> {
+    let mut recovered = Vec::new();
     let incomplete = match service.state.incomplete_occurrences(None) {
         Ok(incomplete) => incomplete,
         Err(error) => {
             app.log("ERROR", format!("EVX recovery: {error}")).await;
-            return;
+            return recovered;
         }
     };
     for open in incomplete {
@@ -612,25 +852,28 @@ async fn recover(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) {
                 continue;
             }
         };
+        let now = match clock() {
+            Ok(now) => now,
+            Err(error) => {
+                app.log("ERROR", format!("EVX recovery: {error}")).await;
+                break;
+            }
+        };
         let current = row
             .as_ref()
             .and_then(|row| DurableState::slot_at(&row.schedule, now).ok())
             .filter(|slot| slot.index == index);
         match (row, current) {
+            (Some(row), Some(_)) if !row.enabled || row.paused_reason.is_some() => {
+                close_abandoned(service, app, &invocation, Some(&row), Close::Abandon, RECOVERED_JOB_PAUSED, now).await;
+            }
             (Some(row), Some(slot)) => match service.state.recover(&invocation) {
                 Ok(fresh) => {
-                    app.log("INFO", format!("EVX recovery: running {} of {} again under the same identity", open.occurrence, open.xite)).await;
                     service.scheduler.hold(&open.xite, &open.occurrence);
-                    let program = row.program.clone();
-                    let occurrence = Box::new(Occurrence { invocation: fresh, row, slot });
-                    service.scheduler.busy.fetch_add(1, Ordering::SeqCst);
-                    let result = service
-                        .execute(app, &open.xite, &program, Run::Job { occurrence, trigger: Trigger::Job })
-                        .await;
-                    service.scheduler.busy.fetch_sub(1, Ordering::SeqCst);
-                    if let Err(error) = result {
-                        app.log("WARN", format!("EVX recovery: {} of {} refused: {error}", open.occurrence, open.xite)).await;
-                    }
+                    recovered.push(Occurrence { invocation: fresh, row, slot });
+                }
+                Err(evx_state::Error::Denied(_)) => {
+                    close_abandoned(service, app, &invocation, Some(&row), Close::Abandon, RECOVERED_GRANT_CHANGED, now).await;
                 }
                 Err(error) => {
                     app.log("ERROR", format!("EVX recovery: {} of {} cannot be recovered: {error}", open.occurrence, open.xite)).await;
@@ -644,25 +887,64 @@ async fn recover(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) {
                     .as_ref()
                     .and_then(|row| period(row).ok())
                     .map(|period| (index + 1).saturating_mul(period));
-                let summary = json!({
-                    "status": ABANDONED,
-                    "value": null,
-                    "error": "reservation from before a restart; its slot has passed",
-                    "elapsed_ms": 0,
-                    "occurrence": open.occurrence,
-                });
-                match service.state.finish_occurrence(&invocation, &summary, next_due, false) {
-                    Ok(()) => {
-                        app.log("WARN", format!("EVX recovery: {} of {} abandoned; its slot has passed", open.occurrence, open.xite)).await;
-                        if let Some(row) = &row {
-                            record_abandoned(service, app, row, &open.occurrence, now).await;
-                        }
-                    }
-                    Err(error) => {
-                        app.log("ERROR", format!("EVX recovery: {} of {} not finished: {error}", open.occurrence, open.xite)).await;
-                    }
-                }
+                close_abandoned(service, app, &invocation, row.as_ref(), Close::Finish(next_due), RECOVERED_SLOT_PASSED, now).await;
             }
+        }
+    }
+    recovered
+}
+
+/// How [`close_abandoned`] closes a reservation.
+#[derive(Debug, Clone, Copy)]
+enum Close {
+    /// Finish it through the grant fence and move the job to this
+    /// `next_due`; a fenced grant falls back to [`Close::Abandon`].
+    Finish(Option<u64>),
+    /// Close it without the fence, leaving the job row as it is.
+    Abandon,
+}
+
+/// Close a reservation without a run, as `abandoned` with `message`, and
+/// record it in the run history. Returns whether it is closed.
+async fn close_abandoned(
+    service: &EvxService,
+    app: &AppState,
+    invocation: &Invocation,
+    row: Option<&JobRow>,
+    close: Close,
+    message: &str,
+    now: u64,
+) -> bool {
+    let id = invocation.occurrence.as_str();
+    let xite = invocation.xite.as_str();
+    let summary = json!({
+        "status": ABANDONED,
+        "value": null,
+        "error": message,
+        "elapsed_ms": 0,
+        "occurrence": id,
+    });
+    let closed = match close {
+        Close::Finish(next_due) => match service.state.finish_occurrence(invocation, &summary, next_due, false) {
+            // Fenced: the grant was revoked or given again since the
+            // reservation was made, which would refuse every later finish
+            // too. The host closes its own reservation without the fence.
+            Err(evx_state::Error::Denied(_)) => service.state.abandon(invocation, &bounded_message(message)),
+            other => other,
+        },
+        Close::Abandon => service.state.abandon(invocation, &bounded_message(message)),
+    };
+    match closed {
+        Ok(()) => {
+            app.log("WARN", format!("EVX recovery: {id} of {xite} abandoned: {message}")).await;
+            if let Some(row) = row {
+                record_abandoned(service, app, row, id, message, now).await;
+            }
+            true
+        }
+        Err(error) => {
+            app.log("ERROR", format!("EVX recovery: {id} of {xite} not closed: {error}")).await;
+            false
         }
     }
 }
@@ -670,7 +952,7 @@ async fn recover(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64) {
 /// Put an abandoned occurrence in the run history, so status shows what
 /// became of it next to the runs that happened. Nothing ran, so the
 /// artifact is the digest of nothing and the input the canonical `null`.
-async fn record_abandoned(service: &Arc<EvxService>, app: &Arc<AppState>, row: &JobRow, occurrence: &str, now: u64) {
+async fn record_abandoned(service: &EvxService, app: &AppState, row: &JobRow, occurrence: &str, message: &str, now: u64) {
     let input = evx_state::canonical(&Value::Null)
         .map(|canonical| evx_state::digest(&canonical))
         .unwrap_or_default();
@@ -682,7 +964,7 @@ async fn record_abandoned(service: &Arc<EvxService>, app: &Arc<AppState>, row: &
         artifact_sha256: hex::encode(Sha256::digest(b"")),
         input_digest: input,
         status: ABANDONED.to_string(),
-        message: Some("reservation from before a restart; its slot has passed".to_string()),
+        message: Some(bounded_message(message)),
         cpu_seconds: 0.0,
         peak_rss: 0,
         occurrence: Some(occurrence.to_string()),

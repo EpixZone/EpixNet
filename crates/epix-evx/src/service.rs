@@ -752,6 +752,12 @@ impl EvxService {
         self.scheduler.wake();
     }
 
+    /// Ticks the scheduler completed since start, so a caller can tell
+    /// whether an event woke it.
+    pub fn scheduler_ticks(&self) -> u64 {
+        self.scheduler.ticks()
+    }
+
     /// Stop the scheduler task at its next wake. The node has no graceful
     /// shutdown hook (the design is crash-safe instead); this exists so a
     /// test can reopen the same state under a second service without two
@@ -2011,7 +2017,7 @@ fn input_digest() -> Result<String, String> {
 }
 
 /// A run message cut to what the state stores, on a character boundary.
-fn bounded_message(message: &str) -> String {
+pub(crate) fn bounded_message(message: &str) -> String {
     let mut out = String::new();
     for c in message.chars() {
         if out.len() + c.len_utf8() > MAX_MESSAGE {
