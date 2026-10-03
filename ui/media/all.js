@@ -1981,9 +1981,13 @@ if (window.getComputedStyle(document.body).transform) {
     // them as the user's), and always with the inspected payload's
     // `declaration_digest`, so a declaration that changes between the prompt
     // and the tap is refused by the node's expected-version check rather
-    // than silently covered. Deny, dismissal and every failure answer the
-    // page and send nothing. The answer closure settles once: the dialog's
-    // close cross and its buttons both route through it.
+    // than silently covered. An enable grant also carries what the dialog
+    // showed of the bound closure (`evxShown`), so a re-sign that changes
+    // only the `files` manifest while the dialog is open is refused too
+    // rather than granting more than the text said. Deny, dismissal and
+    // every failure answer the page and send nothing. The answer closure
+    // settles once: the dialog's close cross and its buttons both route
+    // through it.
     Wrapper.prototype.actionEvxRequest = function (message) {
       var answer, chosen, program, prompt_id, settled;
       settled = false;

@@ -108,6 +108,10 @@ pub struct Scheduler {
     notify: Notify,
     /// Background occurrences admitted and not yet finished.
     busy: AtomicUsize,
+    /// The same occurrences by xite: a xite here is busy from the moment
+    /// its occurrence is spawned, before the run has taken the xite's run
+    /// lock, so a tick in between cannot admit a second run of the xite.
+    active: Mutex<HashMap<String, usize>>,
     /// When the task means to wake next, for status; `None` while it waits
     /// for a wake only.
     next_wake: Mutex<Option<u64>>,
@@ -177,6 +181,33 @@ impl Scheduler {
     /// Background occurrences in flight right now.
     pub fn busy(&self) -> usize {
         self.busy.load(Ordering::SeqCst)
+    }
+
+    /// Count a background occurrence of `xite` as in flight.
+    fn enter(&self, xite: &str) {
+        self.busy.fetch_add(1, Ordering::SeqCst);
+        if let Ok(mut active) = self.active.lock() {
+            *active.entry(xite.to_string()).or_default() += 1;
+        }
+    }
+
+    /// The occurrence [`Scheduler::enter`] counted has finished.
+    fn leave(&self, xite: &str) {
+        self.busy.fetch_sub(1, Ordering::SeqCst);
+        if let Ok(mut active) = self.active.lock() {
+            if let Some(count) = active.get_mut(xite) {
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    active.remove(xite);
+                }
+            }
+        }
+    }
+
+    /// Whether a background occurrence of `xite` is in flight, whether or
+    /// not it has reached the xite's run lock yet.
+    pub(crate) fn active(&self, xite: &str) -> bool {
+        self.active.lock().is_ok_and(|active| active.contains_key(xite))
     }
 
     /// Ticks the task completed since start: what a wake led to.
@@ -557,7 +588,7 @@ async fn xite_facts(
                 (Ok(daily_runs), Ok(rows)) => Some(XiteFacts {
                     covers: inspection.covers_declaration(now),
                     daily_runs,
-                    busy: held || !service.run_lock_free(xite).await,
+                    busy: held || service.scheduler.active(xite) || !service.run_lock_free(xite).await,
                     rows,
                 }),
                 (Err(error), _) | (_, Err(error)) => {
@@ -656,7 +687,7 @@ async fn reinspect(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, tas
 }
 
 /// Run recovered occurrences on their own tasks while workers are free,
-/// one per xite per tick and only where the xite's run lock is free, and
+/// one per xite at a time and only where the xite's run lock is free, and
 /// close the ones whose slot passed while they waited (a passed slot is
 /// never run). Returns the xites launched for, which the rest of the tick
 /// treats as busy: their runs have not taken the lock yet.
@@ -687,7 +718,10 @@ async fn launch_recovered(
             }
             continue;
         }
-        if service.scheduler.busy() >= BACKGROUND_WORKERS || launched.contains(&xite) || !service.run_lock_free(&xite).await {
+        if service.scheduler.busy() >= BACKGROUND_WORKERS
+            || service.scheduler.active(&xite)
+            || !service.run_lock_free(&xite).await
+        {
             waiting.push(occurrence);
             continue;
         }
@@ -702,13 +736,14 @@ async fn launch_recovered(
     launched
 }
 
-/// Run a reserved, held occurrence on its own task, counted in `busy` from
-/// now until it is finished, and wake the task when it is.
+/// Run a reserved, held occurrence on its own task, counted in `busy` and
+/// as its xite's from now until it is finished, and wake the task when it
+/// is.
 fn spawn_occurrence(service: &Arc<EvxService>, app: &Arc<AppState>, occurrence: Occurrence) {
     let xite = occurrence.row.xite.clone();
     let job = occurrence.row.job.clone();
     let program = occurrence.row.program.clone();
-    service.scheduler.busy.fetch_add(1, Ordering::SeqCst);
+    service.scheduler.enter(&xite);
     let service = Arc::clone(service);
     let app = Arc::clone(app);
     tokio::spawn(async move {
@@ -718,7 +753,7 @@ fn spawn_occurrence(service: &Arc<EvxService>, app: &Arc<AppState>, occurrence: 
         if let Err(error) = result {
             app.log("WARN", format!("EVX scheduler: job {job} of {xite} refused: {error}")).await;
         }
-        service.scheduler.busy.fetch_sub(1, Ordering::SeqCst);
+        service.scheduler.leave(&xite);
         service.scheduler.wake();
     });
 }
@@ -1162,6 +1197,53 @@ mod tests {
             assert_eq!(response(&service, xite, &invocation.occurrence).unwrap()["status"], ABANDONED, "{xite}");
             assert!(!service.scheduler.holds(xite, &invocation.occurrence), "{xite}");
             assert_eq!(job_row(&service, xite).next_due_unix, Some(T + PERIOD), "{xite}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_xite_with_a_spawned_run_is_busy_before_the_run_takes_its_lock() {
+        let (service, app) = service();
+        grant(&service, "1RecoverA");
+        let spec = |job: &str| JobSpec {
+            job: job.into(),
+            program: "calc".into(),
+            schedule: Schedule::Interval { seconds: PERIOD, anchor: Anchor::UnixEpoch, missed: Missed::Skip },
+            max_concurrency: 1,
+        };
+        service.state.set_jobs("1RecoverA", &"a".repeat(64), &[spec("first"), spec("second")], T).unwrap();
+        for row in service.state.jobs("1RecoverA").unwrap() {
+            reserve(&service, &row, T + 10);
+        }
+        let mut pending = recover(&service, &app, || Ok(T + 10)).await;
+        assert_eq!(pending.len(), 2);
+        // The first is spawned and has not run at all yet (this runtime
+        // has one thread and the test has not yielded): its xite's run lock
+        // is still free, and the xite is busy all the same.
+        let mut hints = Vec::new();
+        let launched = launch_recovered(&service, &app, &mut pending, T + 10, &mut hints).await;
+        assert_eq!(launched.len(), 1);
+        assert!(service.run_lock_free("1RecoverA").await);
+        assert!(service.scheduler.active("1RecoverA"));
+        assert_eq!(pending.len(), 1, "one run per xite at a time");
+        // A later pass, before the first run has started, still waits.
+        let launched = launch_recovered(&service, &app, &mut pending, T + 11, &mut hints).await;
+        assert!(launched.is_empty());
+        assert_eq!(pending.len(), 1);
+        // Once the first run is over the xite is free again.
+        wait_until(|| !service.scheduler.active("1RecoverA")).await;
+        assert_eq!(service.scheduler.busy(), 0);
+        let launched = launch_recovered(&service, &app, &mut pending, T + 12, &mut hints).await;
+        assert_eq!(launched.len(), 1);
+        assert!(pending.is_empty());
+        wait_until(|| service.scheduler.busy() == 0).await;
+    }
+
+    /// Yield until `done` holds, for at most ten seconds.
+    async fn wait_until(done: impl Fn() -> bool) {
+        let started = Instant::now();
+        while !done() {
+            assert!(started.elapsed() < Duration::from_secs(10), "timed out");
+            tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
 
