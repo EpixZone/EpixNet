@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 
 use crate::{
     connect, DurableState, Error, Invocation, InvocationStatus, JobRow, JobSpec, Slot, XiteGrant,
-    DAILY_RUN_RETENTION_DAYS, MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID, SCHEMA, SCHEMA_VERSION,
-    SECONDS_PER_DAY,
+    DAILY_RUN_RETENTION_DAYS, MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID,
+    RETAINED_OCCURRENCES_PER_JOB, SCHEMA, SCHEMA_VERSION, SECONDS_PER_DAY,
 };
 
 const DIGEST_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -552,7 +552,11 @@ fn due_jobs_honours_next_due_and_orders_by_it() {
 #[test]
 fn next_due_job_is_the_soonest_job_that_will_come_due_by_itself() {
     let f = fixture();
-    assert_eq!(f.state.next_due_job(NOW).unwrap(), None, "nothing registered");
+    assert_eq!(
+        f.state.next_due_job(NOW).unwrap(),
+        None,
+        "nothing registered"
+    );
     f.state.set_xite_grant(&grant("game-a")).unwrap();
     f.state.set_xite_grant(&grant("game-b")).unwrap();
     f.state
@@ -579,9 +583,15 @@ fn next_due_job_is_the_soonest_job_that_will_come_due_by_itself() {
         .unwrap();
     // Strictly after `now`: a job due at `now` is `due_jobs`' business.
     let next = f.state.next_due_job(NOW).unwrap().unwrap();
-    assert_eq!((next.xite.as_str(), next.next_due_unix), ("game-b", Some(NOW + 50)));
+    assert_eq!(
+        (next.xite.as_str(), next.next_due_unix),
+        ("game-b", Some(NOW + 50))
+    );
     let next = f.state.next_due_job(NOW + 50).unwrap().unwrap();
-    assert_eq!((next.xite.as_str(), next.next_due_unix), ("game-a", Some(NOW + 100)));
+    assert_eq!(
+        (next.xite.as_str(), next.next_due_unix),
+        ("game-a", Some(NOW + 100))
+    );
     assert_eq!(f.state.next_due_job(NOW + 100).unwrap(), None);
     // Paused, disabled, ungranted and expiring-first jobs are not waited for.
     f.state
@@ -626,7 +636,10 @@ fn job_xites_lists_every_xite_with_a_registration_whatever_its_state() {
         .set_jobs(
             "game-a",
             DIGEST_A,
-            &[spec("sync", PERIOD, Missed::Skip), spec("other", PERIOD, Missed::Skip)],
+            &[
+                spec("sync", PERIOD, Missed::Skip),
+                spec("other", PERIOD, Missed::Skip),
+            ],
             NOW,
         )
         .unwrap();
@@ -640,9 +653,20 @@ fn job_xites_lists_every_xite_with_a_registration_whatever_its_state() {
 
 #[test]
 fn occurrence_parts_accepts_only_a_job_occurrence() {
-    assert_eq!(crate::occurrence_parts("sync.28333333").unwrap(), ("sync", 28_333_333));
+    assert_eq!(
+        crate::occurrence_parts("sync.28333333").unwrap(),
+        ("sync", 28_333_333)
+    );
     assert_eq!(crate::occurrence_parts("a.b.7").unwrap(), ("a.b", 7));
-    for bad in ["once-0123456789abcdef", "sync", "sync.", ".7", "sync.07", "sync.x", "a b.7"] {
+    for bad in [
+        "once-0123456789abcdef",
+        "sync",
+        "sync.",
+        ".7",
+        "sync.07",
+        "sync.x",
+        "a b.7",
+    ] {
         assert_err!(crate::occurrence_parts(bad), Error::Invalid(_));
     }
 }
@@ -1400,6 +1424,205 @@ fn daily_budget_is_counted_per_xite() {
     assert_eq!(f.state.daily_runs("game-b", NOW).unwrap(), 1);
 }
 
+// Retention, abandonment and paused listings
+
+/// Claim and finish `count` consecutive slots of `name`, starting at the
+/// slot `start` falls in.
+fn run_slots(state: &DurableState, xite: &str, name: &str, start: u64, period: u64, count: u64) {
+    for step in 0..count {
+        let invocation = claim(state, xite, name, start + step * period).unwrap();
+        assert!(invocation.fresh);
+        let next = start + (step + 1) * period;
+        state
+            .finish_occurrence(&invocation, &json!({"status": "ok"}), Some(next), false)
+            .unwrap();
+    }
+}
+
+fn occurrences_of(state: &DurableState, xite: &str, name: &str) -> Vec<String> {
+    state
+        .snapshot(xite)
+        .unwrap()
+        .invocations
+        .into_iter()
+        .filter(|row| crate::occurrence_parts(&row.occurrence).is_ok_and(|(job, _)| job == name))
+        .map(|row| row.occurrence)
+        .collect()
+}
+
+#[test]
+fn a_job_keeps_only_its_newest_completed_occurrences_so_it_never_reaches_the_row_limit() {
+    let f = fixture();
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    // `a.b` is a job of its own, not occurrences of `a`: trimming one never
+    // touches the other.
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[
+                spec("a", PERIOD, Missed::Skip),
+                spec("a.b", PERIOD, Missed::Skip),
+            ],
+            NOW,
+        )
+        .unwrap();
+    let runs = RETAINED_OCCURRENCES_PER_JOB as u64 + 36;
+    run_slots(&f.state, "game-a", "a", NOW, PERIOD, runs);
+    run_slots(&f.state, "game-a", "a.b", NOW, PERIOD, 3);
+    let kept = occurrences_of(&f.state, "game-a", "a");
+    assert_eq!(kept.len(), RETAINED_OCCURRENCES_PER_JOB);
+    assert_eq!(occurrences_of(&f.state, "game-a", "a.b").len(), 3);
+    assert_eq!(
+        f.state.retained_occurrences("game-a").unwrap(),
+        RETAINED_OCCURRENCES_PER_JOB as u64 + 3
+    );
+    // The newest are the ones kept: the last slot run is still there and
+    // still not claimable as fresh, the first one is gone.
+    let first = NOW / PERIOD;
+    let last = first + runs - 1;
+    assert!(kept.contains(&format!("a.{last}")));
+    assert!(!kept.contains(&format!("a.{first}")));
+    let again = claim(&f.state, "game-a", "a", NOW + (runs - 1) * PERIOD).unwrap();
+    assert!(!again.fresh && again.completed);
+    // A claim trims to one fewer first, so with the new reservation the job
+    // still holds the bound in all.
+    let next = claim(&f.state, "game-a", "a", NOW + runs * PERIOD).unwrap();
+    assert!(next.fresh);
+    assert_eq!(
+        occurrences_of(&f.state, "game-a", "a").len(),
+        RETAINED_OCCURRENCES_PER_JOB
+    );
+    // The bound times the most jobs a xite may register fits the row limit.
+    assert!((RETAINED_OCCURRENCES_PER_JOB * MAX_JOBS) as u64 <= crate::MAX_ROWS);
+}
+
+#[test]
+fn trimming_after_a_period_change_keeps_the_occurrence_just_completed_under_the_new_numbering() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    // A full history under a one-minute period: high slot indexes.
+    run_slots(
+        &f.state,
+        "game-a",
+        "sync",
+        NOW,
+        PERIOD,
+        RETAINED_OCCURRENCES_PER_JOB as u64,
+    );
+    // Re-registered hourly: the new indexes are sixty times smaller than
+    // every one in the history, yet the slot it just ran is the newest.
+    let later = NOW + RETAINED_OCCURRENCES_PER_JOB as u64 * PERIOD;
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", 3600, Missed::Skip)],
+            later,
+        )
+        .unwrap();
+    let hourly = claim(&f.state, "game-a", "sync", later).unwrap();
+    assert!(hourly.fresh);
+    f.state
+        .finish_occurrence(&hourly, &json!({"status": "ok"}), Some(later + 3600), false)
+        .unwrap();
+    assert!(occurrences_of(&f.state, "game-a", "sync").contains(&hourly.occurrence));
+    let again = claim(&f.state, "game-a", "sync", later).unwrap();
+    assert!(!again.fresh, "the slot just run must not run again");
+    assert!(again.completed);
+}
+
+#[test]
+fn abandon_closes_a_reservation_whose_grant_was_revoked_and_granted_again() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let running = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    // Revoked mid-run, then granted again: the generation moved twice, so
+    // every fenced call refuses the reservation for good.
+    f.state.revoke_xite("game-a").unwrap();
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    assert_err!(finish(&f.state, &running, false), Error::Denied(_));
+    assert_err!(f.state.recover(&running), Error::Denied(_));
+    // Another token cannot close it.
+    let mut stale = running.clone();
+    stale.token = "0".repeat(running.token.len());
+    assert_err!(f.state.abandon(&stale, "x"), Error::Conflict(_));
+    assert_err!(f.state.abandon(&running, "line\nbreak"), Error::Invalid(_));
+    // The host can.
+    f.state
+        .abandon(&running, "grant revoked while the occurrence ran")
+        .unwrap();
+    assert!(f
+        .state
+        .incomplete_occurrences(Some("game-a"))
+        .unwrap()
+        .is_empty());
+    let stored = f
+        .state
+        .snapshot("game-a")
+        .unwrap()
+        .invocations
+        .into_iter()
+        .find(|row| row.occurrence == running.occurrence)
+        .unwrap();
+    assert_eq!(stored.status, InvocationStatus::Completed);
+    assert_eq!(
+        stored.response,
+        Some(json!({
+            "status": crate::ABANDONED,
+            "value": null,
+            "error": "grant revoked while the occurrence ran",
+            "elapsed_ms": 0,
+            "occurrence": running.occurrence,
+        }))
+    );
+    // Closing twice is harmless, and the slot stays claimed: a later claim
+    // of it finds the closed reservation.
+    f.state.abandon(&running, "again").unwrap();
+    let again = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    assert!(!again.fresh && again.completed);
+    // Nothing else moved: the job keeps its schedule and its failures.
+    let row = job(&f.state, "game-a", "sync");
+    assert_eq!(row.failures, 0);
+    assert_eq!(
+        row.last_occurrence.as_deref(),
+        Some(running.occurrence.as_str())
+    );
+    // An unknown occurrence is a conflict, not a new row.
+    let mut unknown = running;
+    unknown.occurrence = "sync.1".into();
+    assert_err!(f.state.abandon(&unknown, "x"), Error::Conflict(_));
+}
+
+#[test]
+fn paused_jobs_lists_the_paused_jobs_of_live_background_grants_only() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    granted_job(&f, "game-b", Missed::Skip);
+    assert!(f.state.paused_jobs(NOW).unwrap().is_empty());
+    f.state
+        .set_job_paused("game-a", "sync", Some("declaration_unavailable"))
+        .unwrap();
+    f.state
+        .set_job_paused("game-b", "sync", Some("user"))
+        .unwrap();
+    let paused = f.state.paused_jobs(NOW).unwrap();
+    assert_eq!(
+        paused
+            .iter()
+            .map(|row| (row.xite.as_str(), row.paused_reason.as_deref()))
+            .collect::<Vec<_>>(),
+        [
+            ("game-a", Some("declaration_unavailable")),
+            ("game-b", Some("user"))
+        ]
+    );
+    // A revoked grant or a disabled job is not waiting on its pause alone.
+    f.state.revoke_xite("game-b").unwrap();
+    f.state.set_job_enabled("game-a", "sync", false).unwrap();
+    assert!(f.state.paused_jobs(NOW).unwrap().is_empty());
+}
+
 // Pause and enable
 
 #[test]
@@ -1518,7 +1741,10 @@ fn database_written_by_the_milestone_two_schema_migrates_in_place() {
     assert_eq!(incomplete[0].occurrence, "once-0123456789abcdef");
     // The version 2 run row reads back as the run-once it was.
     let old_run = &state.runs("game-a").unwrap()[0];
-    assert_eq!((old_run.trigger.as_str(), old_run.occurrence.as_deref()), ("once", None));
+    assert_eq!(
+        (old_run.trigger.as_str(), old_run.occurrence.as_deref()),
+        ("once", None)
+    );
     assert!(state.jobs("game-a").unwrap().is_empty());
     assert!(state.due_jobs(NOW).unwrap().is_empty());
     assert_eq!(state.daily_runs("game-a", NOW).unwrap(), 0);

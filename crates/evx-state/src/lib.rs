@@ -71,8 +71,9 @@ pub use canonical::{
 };
 pub use destination::{Destination, MockDestination};
 pub use jobs::{
-    occurrence_parts, JobRow, JobSpec, Slot, DAILY_RUN_RETENTION_DAYS, MAX_JOBS,
-    MAX_JOB_CONCURRENCY, MAX_JOB_ID, OCCURRENCE_SEPARATOR, SECONDS_PER_DAY,
+    occurrence_parts, JobRow, JobSpec, Slot, ABANDONED, DAILY_RUN_RETENTION_DAYS, MAX_JOBS,
+    MAX_JOB_CONCURRENCY, MAX_JOB_ID, OCCURRENCE_SEPARATOR, RETAINED_OCCURRENCES_PER_JOB,
+    SECONDS_PER_DAY,
 };
 pub use xite::{
     RunRecord, XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS,

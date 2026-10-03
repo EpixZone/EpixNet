@@ -45,11 +45,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 use crate::canonical::{identifier, sha256_hex};
+use crate::xite::MAX_MESSAGE;
 use crate::xite::{load_xite_grant, text, timestamp};
 use crate::{
-    begin_in_at, canonical, commit_in, digest, invocation_row, prepare_commit, transaction,
-    DurableState, Error, Invocation, InvocationRow, InvocationStatus, Result, INVOCATION_COLUMNS,
-    MAX_LIMIT,
+    begin_in_at, canonical, commit_in, count, digest, invocation_row, load_invocation,
+    prepare_commit, transaction, DurableState, Error, Invocation, InvocationRow, InvocationStatus,
+    Result, INVOCATION_COLUMNS, MAX_LIMIT,
 };
 
 /// Seconds in one UTC day; the daily budget's window.
@@ -80,6 +81,23 @@ const MAX_IDENTIFIER: usize = 128;
 /// Digits in the largest slot index: `now` is at most [`MAX_SAFE_INTEGER`]
 /// (16 digits) and `index = now / seconds` can be no larger.
 const MAX_INDEX_DIGITS: usize = 16;
+/// Completed occurrence rows each job keeps, newest first by insertion.
+///
+/// Every occurrence is an `invocations` row and the reservation refuses a
+/// new one once a xite holds [`crate::MAX_ROWS`] of them, so without a
+/// bound a job running every five minutes would stop being claimable
+/// after about two weeks. The newest rows are the ones idempotency needs:
+/// the slot a manual run and the scheduler might both claim is the
+/// current one, and older slots are already behind the job row's
+/// `last_slot`. A claim trims the job's completed rows to one fewer than
+/// this before it reserves, so a job never holds more than this many rows
+/// in all and [`MAX_JOBS`] jobs together stay under the row limit; a
+/// finish trims them to this.
+pub const RETAINED_OCCURRENCES_PER_JOB: usize = 64;
+/// The status word of an occurrence the host closed without a result
+/// ([`DurableState::abandon`]), and of the scheduler's own abandonment of
+/// a reservation whose slot passed.
+pub const ABANDONED: &str = "abandoned";
 /// Longest job id `set_jobs` accepts: a job id plus the separator and the
 /// widest slot index must still be an identifier, or the job could be
 /// registered but never claimed.
@@ -298,6 +316,41 @@ fn load_jobs(conn: &Connection, xite: &str) -> Result<Vec<JobRow>> {
 fn update_job(conn: &Connection, sql: &str, args: impl rusqlite::Params) -> Result<()> {
     if conn.execute(sql, args)? != 1 {
         return Err(Error::conflict("unknown job"));
+    }
+    Ok(())
+}
+
+/// Delete all but the newest `keep` completed occurrences of `job` in
+/// `xite`. "Newest" is insertion order (the table's rowid), not the slot
+/// index: a re-registration with a new period renumbers the slots, and the
+/// row just completed under the new numbering must never be the one
+/// dropped. Running rows are never touched, and an occurrence id whose job
+/// part is not exactly `job` (a job `a.b` next to a job `a`) is not this
+/// job's. Runs inside the caller's transaction.
+fn prune_job_occurrences(conn: &Connection, xite: &str, job: &str, keep: usize) -> Result<()> {
+    let prefix = format!("{job}{OCCURRENCE_SEPARATOR}");
+    let mut statement = conn.prepare(
+        "SELECT rowid, occurrence FROM invocations \
+         WHERE xite=?1 AND status=?2 AND substr(occurrence, 1, length(?3))=?3 \
+         ORDER BY rowid DESC",
+    )?;
+    let mut rows = statement.query(params![xite, InvocationStatus::Completed.as_str(), prefix])?;
+    let mut kept = 0usize;
+    let mut doomed: Vec<i64> = Vec::new();
+    while let Some(row) = rows.next()? {
+        let rowid: i64 = row.get(0)?;
+        let occurrence: String = row.get(1)?;
+        if !occurrence_parts(&occurrence).is_ok_and(|(owner, _)| owner == job) {
+            continue;
+        }
+        if kept < keep {
+            kept += 1;
+        } else {
+            doomed.push(rowid);
+        }
+    }
+    for rowid in doomed {
+        conn.execute("DELETE FROM invocations WHERE rowid=?1", params![rowid])?;
     }
     Ok(())
 }
@@ -649,6 +702,7 @@ impl DurableState {
                     "clock rollback: slot before the last claimed slot",
                 ));
             }
+            prune_job_occurrences(conn, xite, &job.job, RETAINED_OCCURRENCES_PER_JOB - 1)?;
             let invocation = begin_in_at(conn, xite, &occurrence, &request_digest, 1, now)?;
             if invocation.fresh {
                 update_job(
@@ -703,6 +757,7 @@ impl DurableState {
             if commit_in(conn, invocation, &prepared, None)?.is_some() {
                 return Ok(());
             }
+            prune_job_occurrences(conn, &invocation.xite, job, RETAINED_OCCURRENCES_PER_JOB)?;
             let Some(row) = load_job(conn, &invocation.xite, job)? else {
                 return Ok(());
             };
@@ -725,6 +780,111 @@ impl DurableState {
                 )
             }
         })
+    }
+
+    /// Close a reservation the host gave up on, without the grant fence.
+    ///
+    /// A reservation is fenced by the grant generation it was made under:
+    /// [`DurableState::commit`], [`DurableState::finish_occurrence`] and
+    /// [`DurableState::recover`] all refuse once the grant was revoked, which
+    /// is what stops a revoked worker from committing. But the host must
+    /// still be able to close its own reservation afterwards, or a run
+    /// revoked mid-flight leaves a `running` row that no later call can
+    /// touch (a re-grant advances the generation again) and that recovery
+    /// meets at every start. This is that close: the row whose token
+    /// matches `invocation` is marked completed with the response
+    /// `{"status": "abandoned", "value": null, "error": message,
+    /// "elapsed_ms": 0, "occurrence": ...}`, the shape the host commits for
+    /// every job occurrence, and nothing else changes: no effect is queued,
+    /// no checkpoint moves, and the job row (if any) keeps its schedule, so
+    /// the scheduler claims the slot current when it next looks.
+    ///
+    /// Only the host calls this, never on a worker's behalf: the token
+    /// check keeps a stale handle from closing a reservation that was
+    /// recovered since. An unknown occurrence or another token is an
+    /// [`Error::Conflict`]; a row already completed is left as it is and the
+    /// call succeeds, so closing twice is harmless. `message` is at most
+    /// [`MAX_MESSAGE`] bytes of printable text.
+    pub fn abandon(&self, invocation: &Invocation, message: &str) -> Result<()> {
+        identifier(&invocation.xite)?;
+        identifier(&invocation.occurrence)?;
+        if message.len() > MAX_MESSAGE || message.chars().any(char::is_control) {
+            return Err(Error::invalid("invalid message"));
+        }
+        let response = json!({
+            "status": ABANDONED,
+            "value": null,
+            "error": message,
+            "elapsed_ms": 0,
+            "occurrence": invocation.occurrence,
+        });
+        let response_raw = canonical(&response)?;
+        // The digest a commit of the same response with no effects and no
+        // checkpoint records, so a later identical finish replays.
+        let commit_digest = digest(&canonical(&json!({
+            "response": response,
+            "effects": [],
+            "state_update": null,
+        }))?);
+        transaction(&self.path, |conn| {
+            let row = match load_invocation(conn, &invocation.xite, &invocation.occurrence)? {
+                Some(row) if row.token == invocation.token => row,
+                _ => return Err(Error::conflict("stale invocation token")),
+            };
+            if row.status == InvocationStatus::Completed {
+                return Ok(());
+            }
+            conn.execute(
+                "UPDATE invocations SET status=?1, response=?2, commit_digest=?3 \
+                 WHERE xite=?4 AND occurrence=?5",
+                params![
+                    InvocationStatus::Completed.as_str(),
+                    response_raw,
+                    commit_digest,
+                    invocation.xite,
+                    invocation.occurrence,
+                ],
+            )?;
+            if let Ok((job, _)) = occurrence_parts(&invocation.occurrence) {
+                prune_job_occurrences(conn, &invocation.xite, job, RETAINED_OCCURRENCES_PER_JOB)?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Every enabled job that is paused, whose xite holds a grant that is
+    /// enabled, allows background work and has not expired at `now`: the
+    /// jobs that would be due but for their pause, ordered by xite and job.
+    /// The host re-checks the ones whose pause it owns (a declaration it
+    /// could not read, say) without waiting for a person.
+    pub fn paused_jobs(&self, now: u64) -> Result<Vec<JobRow>> {
+        timestamp(now, "now")?;
+        let conn = crate::connect(&self.path)?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {JOINED_JOB_COLUMNS} FROM jobs AS j JOIN xite_grants AS g ON g.xite=j.xite \
+             WHERE j.enabled=1 AND j.paused_reason IS NOT NULL \
+             AND g.enabled=1 AND g.allow_background=1 \
+             AND (g.expires_unix IS NULL OR g.expires_unix>?1) \
+             ORDER BY j.xite, j.job"
+        ))?;
+        let mut rows = statement.query(params![now])?;
+        let mut jobs = Vec::new();
+        while let Some(row) = rows.next()? {
+            jobs.push(job_row(row)?);
+        }
+        Ok(jobs)
+    }
+
+    /// How many invocation rows the xite holds, running and completed: the
+    /// number the reservation compares with [`crate::MAX_ROWS`].
+    pub fn retained_occurrences(&self, xite: &str) -> Result<u64> {
+        identifier(xite)?;
+        let conn = crate::connect(&self.path)?;
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM invocations WHERE xite=?1",
+            params![xite],
+        )
     }
 
     /// Invocations reserved and never committed, for one xite or all, ordered
