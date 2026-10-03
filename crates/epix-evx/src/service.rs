@@ -1611,6 +1611,9 @@ impl EvxService {
             let mut locks = self.run_locks.lock().await;
             locks.entry(xite.to_string()).or_default().clone()
         };
+        // Bound to a name rather than returned as the tail expression: the
+        // guard `try_lock` hands back borrows `lock`, and a tail-expression
+        // temporary is dropped after the locals it borrows from.
         let free = lock.try_lock().is_ok();
         free
     }

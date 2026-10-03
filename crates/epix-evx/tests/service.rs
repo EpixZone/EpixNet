@@ -1291,8 +1291,11 @@ mod execution {
         assert_eq!(f.job(JOB).await["waiting_reason"], "revoked");
     }
 
+    /// The reset of the count on a success is the service unit test's
+    /// business (`a_failed_or_refused_occurrence_counts_and_backs_off_and_an_unknown_effect_pauses`);
+    /// a program that always traps cannot show it here.
     #[tokio::test]
-    async fn a_failing_job_backs_off_with_the_persisted_next_due_and_a_success_resets_it() {
+    async fn a_failing_job_backs_off_with_the_persisted_next_due_and_a_manual_run_doubles_it() {
         let f = Fixture::new(Options { wat: TRAP, ..Options::with_job(1) }).await;
         f.chrome("evxGrant", f.enable_params()).await.unwrap();
         let row = wait_for(Duration::from_secs(20), "the first failed run", || async {
