@@ -118,6 +118,13 @@ claimed and the job reports `clock_rollback` until time passes the slot.
   that slot cannot both execute; a second request returns the stored result.
   `evxRunOnce {program}` keeps its own identity `once-<16 hex>` and does not
   touch the job's slot.
+- Pause reasons owned by registration: `declaration_outgrew_grant`,
+  `declaration_unavailable`, `content_incomplete`; cleared by the next
+  verified inspection. A xite that fails inspection is rechecked on a content
+  change or every 300 s, never every tick. Completed occurrences are trimmed
+  to the newest 64 per job; a claim refused by that bound waits for the next
+  slot with `waiting_reason: occurrence_limit`. A reservation fenced by a
+  revocation is closed with `DurableState::abandon`.
 - Status: `evxStatus` gains `jobs: [{job, program, schedule, enabled,
   paused_reason, next_due_unix, last_slot, last_occurrence, failures,
   runs_today, daily_limit}]` and `scheduler: {enabled, busy_workers,
@@ -133,7 +140,10 @@ claimed and the job reports `clock_rollback` until time passes the slot.
 ### 3. Wrapper (`ui/media/all.js`) and grant semantics
 
 - `evxGrant mode "enable"` sets `allow_background = true` when the
-  declaration has at least one usable job; the consent dialog then says,
+  declaration has at least one usable job. The wrapper sends `shown`
+  (programs, jobs, `allow_run_once`, `allow_background`) from the payload it
+  drew the dialog from, and the node refuses the grant when the current
+  inspection disagrees ("declaration changed since it was shown"). the consent dialog then says,
   in its own paragraph: "This xite also declares N scheduled job(s): <job>
   runs <program> every <period>. Enabling lets them run in the background on
   this node, even when no page of this xite is open." A declaration with no
