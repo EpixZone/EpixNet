@@ -1,19 +1,26 @@
 //! The EVX service against a real node state: a signed fixture xite under a
-//! temporary data root, the `Evx` plugin started the way the node starts it,
-//! and every command sent through `CommandRegistry::dispatch`, where the
-//! wrapper-only gate lives. Execution itself runs only on macOS, through the
-//! real worker built like the `evx-host` suite builds it; everywhere else
-//! the run path must report `unsupported host` and touch nothing.
+//! temporary data root, the `Evx` plugin started the way the node starts it
+//! (scheduler task included), and every command sent through
+//! `CommandRegistry::dispatch`, where the wrapper-only gate lives. Execution
+//! itself runs only on macOS, through the real worker built like the
+//! `evx-host` suite builds it; everywhere else the run path must report
+//! `unsupported host` and touch nothing, and the scheduler must admit
+//! nothing while saying so in status.
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
-use epix_evx::{EvxPlugin, EvxService, CAPABILITY_KEY, HOST_CEILING, UNSUPPORTED_HOST};
+use epix_evx::{
+    EvxPlugin, EvxService, BACKGROUND_RUNS_PER_DAY, CAPABILITY_KEY, HOST_CEILING, PLUGIN_NAME,
+    UNSUPPORTED_HOST,
+};
 use epix_plugin::{Plugin, PluginRegistry};
 use epix_ui::command::WRAPPER_ID_BASE;
 use epix_ui::{AppState, CommandRegistry, WsSession, XiteEntry};
 use epix_xite::XiteStorage;
 use evx_api::Limits;
+use evx_state::DurableState;
 use serde_json::{json, Value};
 
 const CALC: &str = r#"(module (memory (export "memory") 1) (func (export "run") (result i32) i32.const 19 i32.const 23 i32.add))"#;
@@ -52,6 +59,11 @@ struct Options {
     /// Declared `limits`, overlaid on the defaults by the parser; `None`
     /// declares none.
     limits: Option<Value>,
+    /// Declared jobs of the one program: `(job id, interval seconds)`.
+    jobs: Vec<(&'static str, u64)>,
+    /// Whether the manifest pins the entry file; without it the program
+    /// cannot be bound and is unusable, as are its jobs.
+    pin_entry: bool,
     signed: bool,
     worker: Option<PathBuf>,
 }
@@ -63,6 +75,8 @@ impl Default for Options {
             allow_run_once: true,
             capabilities: Vec::new(),
             limits: None,
+            jobs: Vec::new(),
+            pin_entry: true,
             signed: true,
             #[cfg(target_os = "macos")]
             worker: Some(worker_binary()),
@@ -72,6 +86,107 @@ impl Default for Options {
     }
 }
 
+impl Options {
+    /// One job `sync` every `seconds`.
+    fn with_job(seconds: u64) -> Options {
+        Options { jobs: vec![(JOB, seconds)], ..Options::default() }
+    }
+}
+
+/// One signed fixture xite on disk: its address, its signing key, the
+/// declaration digest and the content as signed, for re-signing and for
+/// re-adding to a reopened node.
+struct Xite {
+    address: String,
+    key: String,
+    digest: String,
+    content: Value,
+}
+
+/// Write a signed fixture xite under `data_root` and add it to `state`.
+async fn write_xite(data_root: &std::path::Path, state: &AppState, options: &Options) -> Xite {
+    let key = epix_crypt::new_seed();
+    let address = epix_crypt::privatekey_to_address(&key).unwrap();
+    let root = data_root.join("data").join(&address);
+    std::fs::create_dir_all(root.join("evx")).unwrap();
+    let storage = XiteStorage::new(&root);
+    let index = b"<html>evx fixture</html>";
+    storage.write("index.html", index).unwrap();
+    let module = evx_runtime::text_to_binary(options.wat).unwrap();
+    storage.write(ENTRY_PATH, &module).unwrap();
+    let content = sign_content(&address, &key, options, index, &module);
+    let raw = epix_content::dumps_content(&content).into_bytes();
+    storage.write("content.json", &raw).unwrap();
+    let digest = evx_declaration::declaration_digest_bytes(&raw).unwrap().unwrap();
+    state
+        .add_xite(&address, XiteEntry { storage, content: Some(content.clone()) })
+        .await;
+    Xite { address, key, digest, content }
+}
+
+/// The fixture's root `content.json`, signed with `key` unless `options`
+/// say otherwise.
+fn sign_content(address: &str, key: &str, options: &Options, index: &[u8], module: &[u8]) -> Value {
+    let capabilities: Vec<Value> = options.capabilities.iter().map(|api| json!({ "api": api })).collect();
+    let mut content = json!({
+        "address": address,
+        "title": "EVX fixture",
+        "modified": MODIFIED,
+        "files": {
+            "index.html": { "size": index.len(), "sha512": XiteStorage::hash_bytes(index) },
+            ENTRY_PATH: { "size": module.len(), "sha512": XiteStorage::hash_bytes(module) },
+        },
+        "evx": {
+            "version": 1,
+            "programs": {
+                PROGRAM: {
+                    "runtime_profile": "wasm-core-v1",
+                    "entry": ENTRY_PATH,
+                    "allow_run_once": options.allow_run_once,
+                    "capabilities": capabilities,
+                }
+            }
+        }
+    });
+    if let Some(limits) = &options.limits {
+        content["evx"]["programs"][PROGRAM]["limits"] = limits.clone();
+    }
+    if !options.pin_entry {
+        content["files"].as_object_mut().unwrap().remove(ENTRY_PATH);
+    }
+    if !options.jobs.is_empty() {
+        let mut jobs = serde_json::Map::new();
+        for (job, seconds) in &options.jobs {
+            jobs.insert(
+                job.to_string(),
+                json!({
+                    "program": PROGRAM,
+                    "schedule": { "type": "interval", "seconds": seconds, "anchor": "unix_epoch", "missed": "skip" },
+                    "max_concurrency": 1,
+                }),
+            );
+        }
+        content["evx"]["jobs"] = Value::Object(jobs);
+    }
+    if options.signed {
+        epix_content::sign(&mut content, key).unwrap();
+    }
+    content
+}
+
+fn start_plugin(state: &Arc<AppState>, worker: Option<PathBuf>) -> (CommandRegistry, Arc<EvxService>) {
+    let plugin = match worker {
+        Some(worker) => EvxPlugin::with_worker(worker),
+        None => EvxPlugin::default(),
+    };
+    let mut plugins = PluginRegistry::new();
+    plugins.register(Arc::new(plugin));
+    plugins.start_all(state);
+    let commands = plugins.command_registry();
+    let service = state.capability::<EvxService>(CAPABILITY_KEY).expect("service installed");
+    (commands, service)
+}
+
 struct Fixture {
     dir: tempfile::TempDir,
     state: Arc<AppState>,
@@ -79,65 +194,88 @@ struct Fixture {
     commands: CommandRegistry,
     service: Arc<EvxService>,
     digest: String,
+    xite: Xite,
+    worker: Option<PathBuf>,
 }
 
 impl Fixture {
     async fn new(options: Options) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir("test", dir.path());
-        let key = epix_crypt::new_seed();
-        let address = epix_crypt::privatekey_to_address(&key).unwrap();
-        let root = dir.path().join("data").join(&address);
-        std::fs::create_dir_all(root.join("evx")).unwrap();
-        let storage = XiteStorage::new(&root);
-        let index = b"<html>evx fixture</html>";
-        storage.write("index.html", index).unwrap();
-        let module = evx_runtime::text_to_binary(options.wat).unwrap();
-        storage.write(ENTRY_PATH, &module).unwrap();
-        let capabilities: Vec<Value> = options.capabilities.iter().map(|api| json!({ "api": api })).collect();
-        let mut content = json!({
-            "address": address,
-            "title": "EVX fixture",
-            "modified": MODIFIED,
-            "files": {
-                "index.html": { "size": index.len(), "sha512": XiteStorage::hash_bytes(index) },
-                ENTRY_PATH: { "size": module.len(), "sha512": XiteStorage::hash_bytes(&module) },
-            },
-            "evx": {
-                "version": 1,
-                "programs": {
-                    PROGRAM: {
-                        "runtime_profile": "wasm-core-v1",
-                        "entry": ENTRY_PATH,
-                        "allow_run_once": options.allow_run_once,
-                        "capabilities": capabilities,
-                    }
-                }
-            }
-        });
-        if let Some(limits) = options.limits {
-            content["evx"]["programs"][PROGRAM]["limits"] = limits;
+        let xite = write_xite(dir.path(), &state, &options).await;
+        let (commands, service) = start_plugin(&state, options.worker.clone());
+        Fixture {
+            dir,
+            state,
+            address: xite.address.clone(),
+            commands,
+            service,
+            digest: xite.digest.clone(),
+            xite,
+            worker: options.worker,
         }
-        if options.signed {
-            epix_content::sign(&mut content, &key).unwrap();
-        }
-        let raw = epix_content::dumps_content(&content).into_bytes();
-        storage.write("content.json", &raw).unwrap();
-        let digest = evx_declaration::declaration_digest_bytes(&raw).unwrap().unwrap();
-        state
-            .add_xite(&address, XiteEntry { storage, content: Some(content) })
-            .await;
+    }
 
-        let plugin = match options.worker {
-            Some(worker) => EvxPlugin::with_worker(worker),
-            None => EvxPlugin::default(),
-        };
-        let mut plugins = PluginRegistry::new();
-        plugins.register(Arc::new(plugin));
-        plugins.start_all(&state);
-        let commands = plugins.command_registry();
-        let service = state.capability::<EvxService>(CAPABILITY_KEY).expect("service installed");
-        Fixture { dir, state, address, commands, service, digest }
+    /// A second signed xite on the same node.
+    async fn add_xite(&self, options: Options) -> Xite {
+        write_xite(self.dir.path(), &self.state, &options).await
+    }
+
+    /// Re-sign the fixture's declaration from `options`, as a publisher's
+    /// authenticated update does, leaving the files as they are. The digest
+    /// changes; the old one stays in `self.digest`.
+    fn resign(&self, options: Options) -> String {
+        let root = self.served_root();
+        let index = std::fs::read(root.join("index.html")).unwrap();
+        let module = std::fs::read(root.join(ENTRY_PATH)).unwrap();
+        let content = sign_content(&self.address, &self.xite.key, &options, &index, &module);
+        let raw = epix_content::dumps_content(&content).into_bytes();
+        XiteStorage::new(&root).write("content.json", &raw).unwrap();
+        evx_declaration::declaration_digest_bytes(&raw).unwrap().unwrap()
+    }
+
+    /// The same data root under a fresh node and a fresh plugin, as a
+    /// restart is: the old scheduler is stopped first, so one database has
+    /// one scheduler.
+    async fn reopen(self) -> Fixture {
+        self.service.shutdown();
+        tokio::task::yield_now().await;
+        let state = AppState::with_data_dir("test", self.dir.path());
+        let root = self.served_root();
+        state
+            .add_xite(&self.address, XiteEntry { storage: XiteStorage::new(&root), content: Some(self.xite.content.clone()) })
+            .await;
+        let (commands, service) = start_plugin(&state, self.worker.clone());
+        Fixture { state, commands, service, ..self }
+    }
+
+    /// Sends `cmd` to the chrome with `params` and expects a refusal
+    /// mentioning `word`.
+    async fn refused(&self, cmd: &str, params: Value, word: &str) {
+        let denied = self.chrome(cmd, params).await.unwrap_err();
+        assert!(denied.contains(word), "{cmd}: {denied}");
+    }
+
+    /// The status payload straight from the service, whatever the plugin
+    /// switch says (the dispatcher drops a disabled plugin's commands).
+    async fn status(&self) -> Value {
+        self.service.status(&self.state, &self.address).await.unwrap()
+    }
+
+    /// The status payload's entry for `job`.
+    async fn job(&self, job: &str) -> Value {
+        let status = self.status().await;
+        status["jobs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["job"] == job)
+            .cloned()
+            .unwrap_or_else(|| panic!("job {job} not in status: {status}"))
+    }
+
+    fn runs(&self) -> Vec<evx_state::RunRecord> {
+        self.service.durable().runs(&self.address).unwrap()
     }
 
     fn page(&self) -> WsSession {
@@ -165,6 +303,10 @@ impl Fixture {
         json!({ "xite": self.address, "declaration_digest": self.digest, "mode": "enable" })
     }
 
+    fn enable_params_for(xite: &Xite) -> Value {
+        json!({ "xite": xite.address, "declaration_digest": xite.digest, "mode": "enable" })
+    }
+
     fn served_root(&self) -> PathBuf {
         self.dir.path().join("data").join(&self.address)
     }
@@ -187,6 +329,29 @@ impl Fixture {
     }
 }
 
+/// One job of the fixture, when it declares one.
+const JOB: &str = "sync";
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()
+}
+
+/// Poll `check` every 50 ms until it returns `Some`, or panic with
+/// `what` after `timeout`. The poll is a future so it can read status.
+async fn wait_for<T, F>(timeout: Duration, what: &str, mut check: impl FnMut() -> F) -> T
+where
+    F: std::future::Future<Output = Option<T>>,
+{
+    let started = Instant::now();
+    loop {
+        if let Some(value) = check().await {
+            return value;
+        }
+        assert!(started.elapsed() < timeout, "timed out waiting for {what}");
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
 #[tokio::test]
 async fn the_evx_plugin_registers_its_commands_under_its_name() {
     let plugin = EvxPlugin::default();
@@ -194,7 +359,18 @@ async fn the_evx_plugin_registers_its_commands_under_its_name() {
     let names: Vec<&str> = plugin.ws_commands().iter().map(|command| command.name()).collect();
     assert_eq!(
         names,
-        ["evxInspect", "evxStatus", "evxRequest", "evxGrant", "evxRevoke", "evxSetLimits", "evxRunOnce"]
+        [
+            "evxInspect",
+            "evxStatus",
+            "evxRequest",
+            "evxGrant",
+            "evxRevoke",
+            "evxSetLimits",
+            "evxRunOnce",
+            "evxJobPause",
+            "evxJobResume",
+            "evxRunJob",
+        ]
     );
     for wrapper_only in epix_ui::command::EVX_WRAPPER_COMMANDS {
         assert!(names.contains(wrapper_only), "{wrapper_only} is gated but not registered");
@@ -336,8 +512,8 @@ async fn a_page_socket_cannot_grant_with_or_without_an_elevated_id() {
         // A page command forwarded by the wrapper keeps its small id.
         assert!(f.call(&f.wrapper(), "evxGrant", params.clone(), 7).await.is_err());
     }
-    for cmd in ["evxRevoke", "evxSetLimits", "evxRunOnce"] {
-        let params = json!({ "xite": f.address, "limits": Limits::default(), "program": PROGRAM });
+    for cmd in ["evxRevoke", "evxSetLimits", "evxRunOnce", "evxJobPause", "evxJobResume", "evxRunJob"] {
+        let params = json!({ "xite": f.address, "limits": Limits::default(), "program": PROGRAM, "job": JOB });
         assert!(f.call(&page, cmd, params.clone(), 7).await.unwrap_err().contains("prompt"), "{cmd}");
         assert!(f.call(&page, cmd, params, WRAPPER_ID_BASE + 3).await.unwrap_err().contains("prompt"), "{cmd}");
     }
@@ -463,8 +639,8 @@ async fn a_restricted_gateway_refuses_the_grant_commands_except_from_the_operato
     f.state.config_set("ui_restrict", json!(true)).await;
     let denied = f.chrome("evxGrant", f.enable_params()).await.unwrap_err();
     assert!(denied.contains("gateway"), "{denied}");
-    for cmd in ["evxRevoke", "evxSetLimits", "evxRunOnce"] {
-        let params = json!({ "xite": f.address, "limits": Limits::default(), "program": PROGRAM });
+    for cmd in ["evxRevoke", "evxSetLimits", "evxRunOnce", "evxJobPause", "evxJobResume", "evxRunJob"] {
+        let params = json!({ "xite": f.address, "limits": Limits::default(), "program": PROGRAM, "job": JOB });
         assert!(f.chrome(cmd, params).await.unwrap_err().contains("gateway"), "{cmd}");
     }
     assert!(f.service.durable().xite_grant(&f.address).unwrap().is_none());
@@ -678,10 +854,524 @@ async fn an_unsigned_declaration_is_inspectable_but_cannot_be_granted() {
     assert!(denied.contains("incomplete"), "{denied}");
 }
 
+// The scheduler (docs/evx-milestone-3.md section 2), on every host: what is
+// registered, claimed, refused and shown is the same everywhere, and only
+// the run itself needs the macOS worker. Each test below says what it
+// expects of a host that cannot execute.
+
+#[tokio::test]
+async fn enabling_a_declaration_with_a_usable_job_records_background_consent_and_registers_it() {
+    let f = Fixture::new(Options::with_job(3600)).await;
+    let inspect = f.call(&f.page(), "evxInspect", json!({}), 1).await.unwrap();
+    assert_eq!(inspect["effective"]["allow_background"], true, "{inspect}");
+    assert_eq!(inspect["requested"]["jobs"], json!([JOB]));
+    assert_eq!(inspect["declaration"]["jobs"][JOB]["usable"], true);
+    // Nothing is registered before consent: an inspection writes no row.
+    assert!(f.service.durable().jobs(&f.address).unwrap().is_empty());
+    let status = f.call(&f.page(), "evxStatus", json!({}), 2).await.unwrap();
+    assert_eq!(status["jobs"], json!([]));
+    assert_eq!(status["scheduler"]["enabled"], true);
+    assert_eq!(status["scheduler"]["host"], if f.service.execution().is_ok() { "macos" } else { "unsupported" });
+
+    let granted = f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    assert_eq!(granted["grant"]["allow_background"], true, "consent and authority agree: {granted}");
+    assert_eq!(granted["jobs"], json!([JOB]));
+    let (stored, _) = f.service.durable().xite_grant(&f.address).unwrap().unwrap();
+    assert!(stored.allow_background);
+    let rows = f.service.durable().jobs(&f.address).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].job, JOB);
+    assert_eq!(rows[0].program, PROGRAM);
+    assert_eq!(rows[0].declaration_digest, f.digest);
+    assert_eq!(rows[0].paused_reason, None);
+    let slot = DurableState::slot_at(&rows[0].schedule, now_unix()).unwrap();
+    assert!(rows[0].next_due_unix.is_some_and(|due| due <= slot.end_unix), "{rows:?}");
+    let job = f.job(JOB).await;
+    assert_eq!(job["daily_limit"], BACKGROUND_RUNS_PER_DAY);
+    assert_eq!(job["schedule"]["seconds"], 3600);
+    assert_eq!(job["declaration_digest"], f.digest);
+
+    // A declaration without a job grants no background authority, as before.
+    let plain = Fixture::new(Options::default()).await;
+    let inspect = plain.call(&plain.page(), "evxInspect", json!({}), 1).await.unwrap();
+    assert_eq!(inspect["effective"]["allow_background"], false);
+    let granted = plain.chrome("evxGrant", plain.enable_params()).await.unwrap();
+    assert_eq!(granted["grant"]["allow_background"], false);
+    assert_eq!(granted["jobs"], json!([]));
+    assert!(plain.service.durable().jobs(&plain.address).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_manual_job_run_claims_the_current_slot_and_a_second_request_returns_the_stored_result() {
+    let f = Fixture::new(Options::with_job(3600)).await;
+    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    let now = now_unix();
+    let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
+    let slot = DurableState::slot_at(&row.schedule, now).unwrap();
+    let occurrence = DurableState::occurrence_id(JOB, &slot);
+
+    // The scheduler may claim the slot first (it was woken by the grant);
+    // either way exactly one execution of this occurrence happens, and the
+    // manual run returns either its own result or the stored one.
+    let first = f.chrome("evxRunJob", json!({ "job": JOB })).await;
+    let can_run = f.service.execution().is_ok();
+    match &first {
+        Ok(payload) if payload["stored"] == true => {
+            assert_eq!(payload["occurrence"], occurrence, "{payload}");
+        }
+        Ok(payload) => {
+            assert!(can_run, "ran on a host without execution: {payload}");
+            assert_eq!(payload["value"], 42, "{payload}");
+            assert_eq!(payload["trigger"], "manual_job");
+            assert_eq!(payload["authority"], "scheduled");
+            assert_eq!(payload["occurrence"], occurrence);
+            assert_eq!(payload["run"]["occurrence"], occurrence);
+            assert_eq!(payload["run"]["trigger"], "manual_job");
+        }
+        Err(error) => {
+            // A host without execution refuses the run, yet the reservation
+            // it made is finished as refused, never left open.
+            assert!((!can_run && error == UNSUPPORTED_HOST) || error.contains("already running"), "{error}");
+        }
+    }
+    let completed = wait_for(Duration::from_secs(20), "the occurrence to complete", || async {
+        let snapshot = f.service.durable().snapshot(&f.address).unwrap();
+        snapshot.invocations.into_iter().find(|row| row.occurrence == occurrence && row.response.is_some())
+    })
+    .await;
+    assert_eq!(completed.response.as_ref().unwrap()["occurrence"], occurrence);
+    let stored_status = completed.response.as_ref().unwrap()["status"].clone();
+    assert_eq!(stored_status, if can_run { "ok" } else { "denied" }, "{completed:?}");
+
+    // The second request returns the stored result and runs nothing.
+    let second = f.chrome("evxRunJob", json!({ "job": JOB })).await.unwrap();
+    assert_eq!(second["stored"], true, "{second}");
+    assert_eq!(second["occurrence"], occurrence);
+    assert_eq!(second["result"]["status"], stored_status);
+    assert!(second["result"]["elapsed_ms"].is_u64(), "a float-free summary: {second}");
+
+    // One reservation for the slot, one run at most, and the schedule moved
+    // past it even where the scheduler found the slot already claimed.
+    let snapshot = f.service.durable().snapshot(&f.address).unwrap();
+    assert_eq!(snapshot.invocations.len(), 1, "{:?}", snapshot.invocations);
+    let runs = f.runs();
+    assert_eq!(runs.len(), usize::from(can_run), "{runs:?}");
+    if can_run {
+        assert_eq!(runs[0].occurrence.as_deref(), Some(occurrence.as_str()));
+        assert!(runs[0].trigger == "manual_job" || runs[0].trigger == "job", "{runs:?}");
+    }
+    let job = wait_for(Duration::from_secs(5), "the schedule to move on", || async {
+        let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
+        (row.next_due_unix.is_some_and(|due| due >= slot.end_unix)).then_some(row)
+    })
+    .await;
+    assert_eq!(job.last_slot, Some(slot.index));
+    assert_eq!(job.last_occurrence.as_deref(), Some(occurrence.as_str()));
+    assert_eq!(job.failures, u32::from(!can_run));
+    // Unknown and unregistered jobs are refused, not invented.
+    f.refused("evxRunJob", json!({ "job": "nightly" }), "not registered").await;
+    assert!(f.chrome("evxRunJob", json!({ "job": "no such job!" })).await.is_err());
+    assert!(f.chrome("evxRunJob", json!({})).await.is_err(), "job is required");
+}
+
+#[tokio::test]
+async fn recovery_retries_an_open_occurrence_of_the_current_slot_and_abandons_a_stale_one() {
+    let f = Fixture::new(Options { jobs: vec![(JOB, 3600), ("old", 60)], ..Options::default() }).await;
+    // Grant with the scheduler held off, so the test owns the reservations.
+    f.state.set_plugin_enabled(PLUGIN_NAME, false).await;
+    f.service
+        .grant(&f.state, serde_json::from_value(f.enable_params()).unwrap())
+        .await
+        .unwrap();
+    let now = now_unix();
+    let state = f.service.durable();
+    let rows = state.jobs(&f.address).unwrap();
+    let current_row = rows.iter().find(|row| row.job == JOB).unwrap();
+    let current_slot = DurableState::slot_at(&current_row.schedule, now).unwrap();
+    let current = state
+        .claim_occurrence(&f.address, current_row, &current_slot, &request(current_row, &current_slot), now)
+        .unwrap();
+    assert!(current.fresh);
+    let old_row = rows.iter().find(|row| row.job == "old").unwrap();
+    let stale_slot = DurableState::slot_at(&old_row.schedule, now - 600).unwrap();
+    let stale = state
+        .claim_occurrence(&f.address, old_row, &stale_slot, &request(old_row, &stale_slot), now)
+        .unwrap();
+    assert!(stale.fresh);
+    assert_eq!(state.incomplete_occurrences(Some(&f.address)).unwrap().len(), 2);
+    // The daily budget survives too; spend one unit to see it.
+    state.reserve_daily_run(&f.address, now, BACKGROUND_RUNS_PER_DAY).unwrap();
+    // The old scheduler is stopped before the switch goes back on, so it
+    // cannot pick the reservations up itself.
+    f.service.shutdown();
+    tokio::task::yield_now().await;
+    f.state.set_plugin_enabled(PLUGIN_NAME, true).await;
+
+    // A restart: the new scheduler examines both reservations once.
+    let f = f.reopen().await;
+    let can_run = f.service.execution().is_ok();
+    let (retried, abandoned) = wait_for(Duration::from_secs(30), "both reservations to be settled", || async {
+        let snapshot = f.service.durable().snapshot(&f.address).unwrap();
+        let find = |id: &str| snapshot.invocations.iter().find(|row| row.occurrence == id).cloned();
+        match (find(&current.occurrence), find(&stale.occurrence)) {
+            (Some(a), Some(b)) if a.response.is_some() && b.response.is_some() => Some((a, b)),
+            _ => None,
+        }
+    })
+    .await;
+    // The current slot ran again under the same identity: a rotated token,
+    // the same occurrence, one result.
+    assert_ne!(retried.token, current.token, "recover rotates the fencing token");
+    let retried_status = retried.response.as_ref().unwrap()["status"].clone();
+    assert_eq!(retried_status, if can_run { "ok" } else { "denied" }, "{retried:?}");
+    let runs = f.runs();
+    let retried_runs: Vec<_> = runs.iter().filter(|run| run.occurrence.as_deref() == Some(current.occurrence.as_str())).collect();
+    assert_eq!(retried_runs.len(), usize::from(can_run), "retried once: {runs:?}");
+    if can_run {
+        assert_eq!(retried_runs[0].trigger, "job");
+        assert_eq!(retried_runs[0].status, "ok");
+    }
+    // The stale one is finished as abandoned and recorded as such.
+    assert_eq!(abandoned.response.as_ref().unwrap()["status"], "abandoned");
+    let abandoned_run = runs.iter().find(|run| run.occurrence.as_deref() == Some(stale.occurrence.as_str())).unwrap();
+    assert_eq!(abandoned_run.status, "abandoned");
+    assert_eq!(abandoned_run.trigger, "job");
+    assert_eq!(abandoned_run.program, PROGRAM);
+    let old = f.service.durable().jobs(&f.address).unwrap().into_iter().find(|row| row.job == "old").unwrap();
+    assert!(old.next_due_unix.is_some_and(|due| due >= stale_slot.end_unix), "the schedule moved on: {old:?}");
+    assert_eq!(old.failures, 0, "abandonment is not the program's failure");
+    // The budget was not reset by the reopen.
+    assert!(f.service.durable().daily_runs(&f.address, now_unix()).unwrap() >= 1);
+    let status = f.call(&f.page(), "evxStatus", json!({}), 1).await.unwrap();
+    assert!(status["runs"].as_array().unwrap().iter().any(|run| run["status"] == "abandoned"), "{status}");
+}
+
+/// The exact request `claim_occurrence` requires.
+fn request(row: &evx_state::JobRow, slot: &evx_state::Slot) -> Value {
+    json!({ "job": row.job, "slot": slot.index, "program": row.program, "declaration_digest": row.declaration_digest })
+}
+
+#[tokio::test]
+async fn every_authority_refusal_is_visible_on_the_job_and_re_enabling_resumes_on_the_current_slot() {
+    let f = Fixture::new(Options::with_job(3600)).await;
+    let page = f.page();
+    // No grant: nothing registered, the xite-level reason says why.
+    let before = f.status().await;
+    assert!(before["reasons"].as_array().unwrap().contains(&json!("no_grant")));
+    assert_eq!(before["jobs"], json!([]));
+
+    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    let can_run = f.service.execution().is_ok();
+    let slot = DurableState::slot_at(&f.service.durable().jobs(&f.address).unwrap()[0].schedule, now_unix()).unwrap();
+    if can_run {
+        // The grant woke the scheduler: the current slot is claimed and run.
+        wait_for(Duration::from_secs(20), "the first scheduled run", || async { (!f.runs().is_empty()).then_some(()) }).await;
+        assert_eq!(f.job(JOB).await["last_slot"], slot.index);
+    } else {
+        let job = f.job(JOB).await;
+        assert_eq!(job["waiting_reason"], "unsupported_host", "{job}");
+        assert!(job["last_slot"].is_null(), "nothing was claimed: {job}");
+    }
+
+    // A grant without background authority (given to a declaration that
+    // had no jobs, say): the registered job waits with the reason.
+    let (mut grant, _) = f.service.durable().xite_grant(&f.address).unwrap().unwrap();
+    grant.allow_background = false;
+    f.service.durable().set_xite_grant(&grant).unwrap();
+    let job = f.job(JOB).await;
+    assert_eq!(job["waiting_reason"], "background_not_allowed", "{job}");
+    assert!(f.status().await["reasons"].as_array().unwrap().contains(&json!("background_not_allowed")));
+    // Expired: an expiry must follow the consent, so the consent is dated
+    // back with it.
+    grant.allow_background = true;
+    grant.created_unix = now_unix() - 10;
+    grant.expires_unix = Some(now_unix() - 1);
+    f.service.durable().set_xite_grant(&grant).unwrap();
+    assert_eq!(f.job(JOB).await["waiting_reason"], "expired");
+    grant.expires_unix = None;
+    f.service.durable().set_xite_grant(&grant).unwrap();
+    // Paused by the operator, then resumed on the same slot.
+    let paused = f.chrome("evxJobPause", json!({ "job": JOB })).await.unwrap();
+    assert_eq!(paused["paused_reason"], "user", "{paused}");
+    assert_eq!(paused["waiting_reason"], "paused");
+    assert_eq!(f.call(&page, "evxStatus", json!({}), 1).await.unwrap()["jobs"][0]["paused_reason"], "user");
+    f.refused("evxJobPause", json!({ "job": "nightly" }), "unknown job").await;
+    let resumed = f.chrome("evxJobResume", json!({ "job": JOB })).await.unwrap();
+    assert!(resumed["paused_reason"].is_null(), "{resumed}");
+    assert_ne!(resumed["waiting_reason"], "paused");
+    // Disabled plugin: the scheduler says so and admits nothing.
+    f.state.set_plugin_enabled(PLUGIN_NAME, false).await;
+    let disabled = f.status().await;
+    assert_eq!(disabled["scheduler"]["enabled"], false);
+    assert_eq!(disabled["jobs"][0]["waiting_reason"], "plugin_disabled");
+    assert!(disabled["reasons"].as_array().unwrap().contains(&json!("plugin_disabled")));
+    f.state.set_plugin_enabled(PLUGIN_NAME, true).await;
+    // A declaration that outgrew its grant: re-signed asking for a
+    // capability the grant does not hold. The next inspection re-registers
+    // the job under the new digest and pauses it until a new grant.
+    let wider = f.resign(Options { capabilities: vec!["workspace.read"], ..Options::with_job(3600) });
+    assert_ne!(wider, f.digest);
+    let inspect = f.call(&page, "evxInspect", json!({}), 2).await.unwrap();
+    assert_eq!(inspect["declaration_digest"], wider);
+    assert_eq!(inspect["grant"]["covers_declaration"], false);
+    let job = f.job(JOB).await;
+    assert_eq!(job["paused_reason"], "declaration_outgrew_grant", "{job}");
+    assert_eq!(job["declaration_digest"], wider);
+    assert_eq!(job["waiting_reason"], "paused");
+    f.refused("evxRunJob", json!({ "job": JOB }), "paused").await;
+    // A new grant for the wider declaration lifts the pause.
+    let granted = f
+        .chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": wider, "mode": "enable" }))
+        .await
+        .unwrap();
+    assert_eq!(granted["grant"]["capabilities"], json!(["workspace.read"]));
+    assert!(f.job(JOB).await["paused_reason"].is_null());
+    // Revoked, then granted again: the job resumes on the slot current then,
+    // never on a missed one.
+    f.chrome("evxRevoke", json!({})).await.unwrap();
+    let job = f.job(JOB).await;
+    assert_eq!(job["waiting_reason"], "revoked", "{job}");
+    assert_eq!(f.service.durable().jobs(&f.address).unwrap().len(), 1, "registration survives a revocation");
+    f.chrome("evxGrant", json!({ "xite": f.address, "declaration_digest": wider, "mode": "enable" }))
+        .await
+        .unwrap();
+    let job = f.job(JOB).await;
+    assert_ne!(job["waiting_reason"], "revoked", "{job}");
+    let current = DurableState::slot_at(&f.service.durable().jobs(&f.address).unwrap()[0].schedule, now_unix()).unwrap();
+    assert!(job["next_due_unix"].as_u64().unwrap() <= current.end_unix, "{job}");
+    if can_run {
+        // The slot of the first run was this one too (an hour is long), so
+        // the scheduler finds it claimed and steps to the next slot rather
+        // than running it twice.
+        let row = wait_for(Duration::from_secs(10), "the schedule to step past the claimed slot", || async {
+            let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
+            (row.next_due_unix == Some(current.end_unix)).then_some(row)
+        })
+        .await;
+        assert_eq!(row.last_slot, Some(current.index));
+        assert_eq!(f.runs().iter().filter(|run| run.trigger == "job").count(), 1, "the slot ran once");
+    }
+}
+
+#[tokio::test]
+async fn a_xite_past_its_daily_budget_waits_with_the_reason_and_nothing_starts() {
+    let f = Fixture::new(Options::with_job(1)).await;
+    // Spend the whole day before the grant, so the first tick already waits.
+    let now = now_unix();
+    for _ in 0..BACKGROUND_RUNS_PER_DAY {
+        f.service.durable().reserve_daily_run(&f.address, now, BACKGROUND_RUNS_PER_DAY).unwrap();
+    }
+    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let job = f.job(JOB).await;
+    assert_eq!(job["waiting_reason"], "daily_budget", "{job}");
+    assert_eq!(job["runs_today"], BACKGROUND_RUNS_PER_DAY);
+    assert_eq!(job["daily_limit"], BACKGROUND_RUNS_PER_DAY);
+    assert!(job["last_slot"].is_null(), "a slot was claimed past the budget: {job}");
+    assert!(f.runs().is_empty());
+    assert!(f.service.durable().incomplete_occurrences(None).unwrap().is_empty());
+    // The scheduler sleeps until the next UTC day, not a busy loop (a host
+    // that cannot execute has nothing to wake for at all).
+    let status = f.status().await;
+    let next_day = (now / 86_400 + 1) * 86_400;
+    if f.service.execution().is_ok() {
+        assert!(status["scheduler"]["next_wake_unix"].as_u64().is_some_and(|wake| wake >= next_day), "{status}");
+    } else {
+        assert!(status["scheduler"]["next_wake_unix"].is_null(), "{status}");
+    }
+    // The budget does not stop a manual run: it bounds what the node
+    // starts by itself.
+    let manual = f.chrome("evxRunJob", json!({ "job": JOB })).await;
+    if f.service.execution().is_ok() {
+        assert_eq!(manual.unwrap()["value"], 42);
+    } else {
+        assert_eq!(manual.unwrap_err(), UNSUPPORTED_HOST);
+    }
+}
+
+#[tokio::test]
+async fn disabling_the_plugin_stops_admission_and_re_enabling_resumes_it() {
+    let f = Fixture::new(Options::with_job(1)).await;
+    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    let can_run = f.service.execution().is_ok();
+    if can_run {
+        wait_for(Duration::from_secs(20), "the first scheduled run", || async { (!f.runs().is_empty()).then_some(()) }).await;
+    }
+    f.state.set_plugin_enabled(PLUGIN_NAME, false).await;
+    // The tick in flight, if any, finishes; from the next one on nothing
+    // is admitted.
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    let count = f.runs().len();
+    let claimed = f.service.durable().jobs(&f.address).unwrap()[0].last_slot;
+    tokio::time::sleep(Duration::from_millis(2500)).await;
+    assert_eq!(f.runs().len(), count, "a run was admitted while the plugin was disabled");
+    assert_eq!(f.service.durable().jobs(&f.address).unwrap()[0].last_slot, claimed, "a slot was claimed while disabled");
+    let status = f.status().await;
+    assert_eq!(status["scheduler"]["enabled"], false);
+    assert_eq!(status["jobs"][0]["waiting_reason"], "plugin_disabled");
+    // The plugin's commands are not dispatched while it is off.
+    assert_eq!(f.chrome("evxStatus", json!({})).await.unwrap(), Value::Null);
+    // Re-enabled: the poll notices within its interval and admission resumes.
+    f.state.set_plugin_enabled(PLUGIN_NAME, true).await;
+    if can_run {
+        wait_for(Duration::from_secs(10), "admission to resume", || async { (f.runs().len() > count).then_some(()) }).await;
+    } else {
+        let status = wait_for(Duration::from_secs(10), "the scheduler to report itself enabled", || async {
+            let status = f.status().await;
+            (status["scheduler"]["enabled"] == true).then_some(status)
+        })
+        .await;
+        assert_eq!(status["jobs"][0]["waiting_reason"], "unsupported_host");
+    }
+}
+
+#[tokio::test]
+async fn a_job_whose_program_cannot_be_bound_is_registered_paused_with_the_reason() {
+    let f = Fixture::new(Options::with_job(3600)).await;
+    f.chrome("evxGrant", f.enable_params()).await.unwrap();
+    assert!(f.job(JOB).await["paused_reason"].is_null());
+    // Re-signed with the entry no longer pinned by the manifest: the
+    // program cannot be bound, so it is unusable and so is the job, visibly.
+    let unpinned = f.resign(Options { pin_entry: false, ..Options::with_job(3600) });
+    let inspect = f.call(&f.page(), "evxInspect", json!({}), 1).await.unwrap();
+    assert_eq!(inspect["declaration_digest"], unpinned);
+    assert_eq!(inspect["declaration"]["programs"][PROGRAM]["usable"], false, "{inspect}");
+    assert_eq!(inspect["declaration"]["jobs"][JOB]["usable"], false, "{inspect}");
+    assert_eq!(inspect["effective"]["allow_background"], false);
+    assert!(inspect["unsupported"].as_array().unwrap().iter().any(|item| item["path"] == format!("jobs.{JOB}")), "{inspect}");
+    let job = f.job(JOB).await;
+    assert_eq!(job["paused_reason"], "program_unsupported", "{job}");
+    assert_eq!(job["waiting_reason"], "paused");
+    f.refused("evxRunJob", json!({ "job": JOB }), "paused").await;
+}
+
 #[cfg(target_os = "macos")]
 mod execution {
     use super::*;
     use evx_api::Status;
+
+    /// A program that traps: every run is an `error`.
+    const TRAP: &str = r#"(module (memory (export "memory") 1) (func (export "run") (result i32) unreachable))"#;
+
+    #[tokio::test]
+    async fn a_one_second_job_runs_on_its_own_with_no_page_open_and_stops_after_a_revocation() {
+        let f = Fixture::new(Options::with_job(1)).await;
+        // The wrapper's dialog answer is the only command sent; no page
+        // socket is ever opened and no manual run requested.
+        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+        let runs = wait_for(Duration::from_secs(20), "two scheduled runs", || async {
+            let runs = f.runs();
+            (runs.len() >= 2).then_some(runs)
+        })
+        .await;
+        for run in &runs {
+            assert_eq!(run.trigger, "job", "{run:?}");
+            assert_eq!(run.status, "ok", "{run:?}");
+            let occurrence = run.occurrence.as_deref().expect("a scheduled run names its occurrence");
+            let (job, _) = evx_state::occurrence_parts(occurrence).unwrap();
+            assert_eq!(job, JOB);
+        }
+        let mut occurrences: Vec<_> = runs.iter().map(|run| run.occurrence.clone()).collect();
+        occurrences.dedup();
+        assert_eq!(occurrences.len(), runs.len(), "an occurrence ran twice: {runs:?}");
+        let status = f.call(&f.operator(), "evxStatus", json!({ "xite": f.address }), 1).await.unwrap();
+        assert_eq!(status["runs"][0]["trigger"], "job");
+        assert!(status["runs"][0]["occurrence"].is_string());
+        assert_eq!(status["jobs"][0]["failures"], 0);
+        assert!(status["jobs"][0]["runs_today"].as_u64().unwrap() >= 2);
+        assert!(status["jobs"][0]["waiting_reason"].is_null() || status["jobs"][0]["waiting_reason"] == "xite_busy", "{status}");
+
+        // Revoked: nothing further starts within a period, and a run in
+        // flight is stopped through its broker.
+        f.chrome("evxRevoke", json!({})).await.unwrap();
+        tokio::time::sleep(Duration::from_millis(1500)).await;
+        let after = f.runs().len();
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(f.runs().len(), after, "a run started after the revocation");
+        assert_eq!(f.job(JOB).await["waiting_reason"], "revoked");
+    }
+
+    #[tokio::test]
+    async fn a_failing_job_backs_off_with_the_persisted_next_due_and_a_success_resets_it() {
+        let f = Fixture::new(Options { wat: TRAP, ..Options::with_job(1) }).await;
+        f.chrome("evxGrant", f.enable_params()).await.unwrap();
+        let row = wait_for(Duration::from_secs(20), "the first failed run", || async {
+            let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
+            (row.failures >= 1).then_some(row)
+        })
+        .await;
+        let now = now_unix();
+        assert_eq!(row.failures, 1, "{row:?}");
+        // Backed off a minute, well past the one-second period, and stored.
+        let next_due = row.next_due_unix.unwrap();
+        assert!(next_due >= now + 55 && next_due <= now + 65, "{row:?}");
+        tokio::time::sleep(Duration::from_millis(2500)).await;
+        assert_eq!(f.runs().len(), 1, "a run started during the backoff");
+        assert_eq!(f.runs()[0].status, "error");
+        let job = f.job(JOB).await;
+        assert!(job["waiting_reason"].is_null(), "a backoff is a due time, not a block: {job}");
+        assert_eq!(job["next_due_unix"], next_due);
+        // The stored summary of the occurrence is float-free and says error.
+        let snapshot = f.service.durable().snapshot(&f.address).unwrap();
+        let stored = snapshot.invocations.iter().find(|row| row.response.is_some()).unwrap();
+        assert_eq!(stored.response.as_ref().unwrap()["status"], "error");
+        // A manual run of the next slot fails too and doubles the backoff.
+        tokio::time::sleep(Duration::from_millis(1100)).await;
+        let manual = f.chrome("evxRunJob", json!({ "job": JOB })).await.unwrap();
+        assert_eq!(manual["status"], serde_json::to_value(Status::Error).unwrap(), "{manual}");
+        let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
+        assert_eq!(row.failures, 2);
+        assert!(row.next_due_unix.unwrap() >= now_unix() + 115, "{row:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_xites_run_within_one_tick_and_a_third_waits_for_a_worker() {
+        // Each run holds a worker for its three-second wall ceiling.
+        let slow = || Options {
+            wat: SPIN,
+            limits: Some(json!({ "fuel": HOST_CEILING.fuel, "wall_seconds": 3.0, "process_cpu_seconds": 3.0 })),
+            ..Options::with_job(1)
+        };
+        let f = Fixture::new(slow()).await;
+        let b = f.add_xite(slow()).await;
+        let c = f.add_xite(slow()).await;
+        // Granted with the scheduler held off (the dispatcher drops a
+        // disabled plugin's commands, so the service is called directly),
+        // then released: one tick sees all three due at once.
+        f.state.set_plugin_enabled(PLUGIN_NAME, false).await;
+        for xite in [&f.xite, &b, &c] {
+            f.service
+                .grant(&f.state, serde_json::from_value(Fixture::enable_params_for(xite)).unwrap())
+                .await
+                .unwrap();
+        }
+        f.state.set_plugin_enabled(PLUGIN_NAME, true).await;
+        // Within one tick two xites are running; the third waits and says so.
+        wait_for(Duration::from_secs(10), "two workers busy", || async {
+            (f.status().await["scheduler"]["busy_workers"] == 2).then_some(())
+        })
+        .await;
+        let mut running = 0;
+        let mut waiting = Vec::new();
+        for xite in [&f.address, &b.address, &c.address] {
+            let status = f.service.status(&f.state, xite).await.unwrap();
+            if status["running"] == true {
+                running += 1;
+            } else {
+                waiting.push(status["jobs"][0]["waiting_reason"].clone());
+            }
+        }
+        assert_eq!(running, 2, "{waiting:?}");
+        assert_eq!(waiting, [json!("workers_busy")]);
+        // Once a worker is free the third runs.
+        wait_for(Duration::from_secs(20), "every xite to have run", || async {
+            [&f.address, &b.address, &c.address]
+                .iter()
+                .all(|xite| !f.service.durable().runs(xite).unwrap().is_empty())
+                .then_some(())
+        })
+        .await;
+    }
 
     #[tokio::test]
     async fn run_once_executes_the_baseline_program_through_the_real_worker() {

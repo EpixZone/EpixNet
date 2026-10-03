@@ -71,8 +71,8 @@ pub use canonical::{
 };
 pub use destination::{Destination, MockDestination};
 pub use jobs::{
-    JobRow, JobSpec, Slot, DAILY_RUN_RETENTION_DAYS, MAX_JOBS, MAX_JOB_CONCURRENCY, MAX_JOB_ID,
-    OCCURRENCE_SEPARATOR, SECONDS_PER_DAY,
+    occurrence_parts, JobRow, JobSpec, Slot, DAILY_RUN_RETENTION_DAYS, MAX_JOBS,
+    MAX_JOB_CONCURRENCY, MAX_JOB_ID, OCCURRENCE_SEPARATOR, SECONDS_PER_DAY,
 };
 pub use xite::{
     RunRecord, XiteGrant, ALLOW_ONCE_TTL, MAX_ALLOW_ONCE, MAX_MESSAGE, MAX_RUNS,
@@ -84,10 +84,11 @@ pub use xite::{
 /// Version 1 is the Milestone 1 layout (`grants`, `invocations`, `outbox`,
 /// `checkpoints`; databases written before the version was recorded read as
 /// 0 and are treated as 1). Version 2 adds `xite_grants`, `allow_once` and
-/// `runs`. Version 3 adds `jobs` and `daily_runs`. [`DurableState::open`]
+/// `runs`. Version 3 adds `jobs` and `daily_runs`. Version 4 adds the
+/// `occurrence` and `trigger` columns of `runs`. [`DurableState::open`]
 /// applies every step up to this version with `IF NOT EXISTS` statements
-/// only, so an older file keeps all of its rows.
-pub const SCHEMA_VERSION: u32 = 3;
+/// and guarded `ADD COLUMN`s only, so an older file keeps all of its rows.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Most invocations or outbox rows retained per xite, and most receipts or
 /// published entries retained by the mock destination.
@@ -919,11 +920,12 @@ impl DurableState {
     /// Open (creating if needed) the database at `path`, switch it to WAL and
     /// bring the schema up to [`SCHEMA_VERSION`].
     ///
-    /// Migration is additive only (`CREATE ... IF NOT EXISTS`), runs inside
-    /// one `BEGIN IMMEDIATE` transaction with the version bump, and never
-    /// touches existing rows. A file whose `user_version` is newer than this
-    /// build is an [`Error::Conflict`]: reading it with older assumptions
-    /// could silently drop authority this build does not know about.
+    /// Migration is additive only (`CREATE ... IF NOT EXISTS`, and an `ADD
+    /// COLUMN` run only when the column is missing), runs inside one `BEGIN
+    /// IMMEDIATE` transaction with the version bump, and never touches
+    /// existing rows. A file whose `user_version` is newer than this build
+    /// is an [`Error::Conflict`]: reading it with older assumptions could
+    /// silently drop authority this build does not know about.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let state = DurableState {
             path: path.as_ref().to_path_buf(),
@@ -935,10 +937,20 @@ impl DurableState {
             return Err(Error::conflict("database schema is newer than this build"));
         }
         conn.execute_batch(&format!(
-            "BEGIN IMMEDIATE;{SCHEMA}{}{}PRAGMA user_version={SCHEMA_VERSION};COMMIT;",
+            "BEGIN IMMEDIATE;{SCHEMA}{}{}",
             xite::SCHEMA_V2,
             jobs::SCHEMA_V3
         ))?;
+        let has_trigger = conn
+            .prepare("PRAGMA table_info(runs)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .iter()
+            .any(|column| column == "trigger");
+        if !has_trigger {
+            conn.execute_batch(xite::SCHEMA_V4_RUN_COLUMNS)?;
+        }
+        conn.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION};COMMIT;"))?;
         Ok(state)
     }
 

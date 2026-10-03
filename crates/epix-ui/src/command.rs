@@ -133,16 +133,26 @@ pub fn is_admin_command(cmd: &str) -> bool {
 }
 
 /// The EVX management commands only the wrapper's consent dialog or the
-/// operator socket may send (`docs/evx-milestone-2.md` section 4). They mint,
-/// widen, narrow or spend a xite's execution grant, so they are gated in
-/// [`CommandRegistry::dispatch`] exactly like `permissionAdd`: an elevated id
+/// operator socket may send (`docs/evx-milestone-2.md` section 4,
+/// `docs/evx-milestone-3.md` section 2). They mint, widen, narrow or spend a
+/// xite's execution grant, or start, pause and resume its scheduled jobs,
+/// so they are gated in [`CommandRegistry::dispatch`] exactly like
+/// `permissionAdd`: an elevated id
 /// on a socket that authenticated with the xite's `wrapper_key`, or the
 /// operator socket; refused on a restricted gateway except from the operator
 /// socket. A page's forwarded command keeps its small id and never passes,
 /// and a socket a page opened itself never has wrapper authority whatever
 /// id it picks. The list is checked here rather than inside each handler so
 /// a handler can never be reached by a page id, even through `as`.
-pub const EVX_WRAPPER_COMMANDS: &[&str] = &["evxGrant", "evxRevoke", "evxSetLimits", "evxRunOnce"];
+pub const EVX_WRAPPER_COMMANDS: &[&str] = &[
+    "evxGrant",
+    "evxRevoke",
+    "evxSetLimits",
+    "evxRunOnce",
+    "evxJobPause",
+    "evxJobResume",
+    "evxRunJob",
+];
 
 /// Commands that create or clone a new xite - blocked by NoNewSites.
 const NEW_XITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
@@ -5360,6 +5370,40 @@ mod tests {
         for cmd in EVX_WRAPPER_COMMANDS {
             assert!(registry.dispatch(&operator, "as", &json!([target, cmd, params.clone()]), 1).await.is_ok(), "{cmd}");
         }
+    }
+
+    /// The Milestone 3 job commands are gated by name, exactly like the
+    /// grant commands: the page may read a job's status, never start, pause
+    /// or resume one. Pinned on the names so a rename or an omission from
+    /// the list fails here rather than in the plugin's suite alone.
+    #[tokio::test]
+    async fn a_page_cannot_reach_the_evx_job_commands_without_the_wrapper_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1EvxJobs";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let page = WsSession::new(state.clone(), Some(addr.into()));
+        let params = json!({ "xite": addr, "job": "sync" });
+        for cmd in ["evxJobPause", "evxJobResume", "evxRunJob"] {
+            assert!(EVX_WRAPPER_COMMANDS.contains(&cmd), "{cmd} is not gated");
+            let denied = registry.dispatch(&page, cmd, &params, 7).await;
+            assert!(denied.as_ref().unwrap_err().contains("prompt"), "{cmd}: {denied:?}");
+            let forged = registry.dispatch(&page, cmd, &params, WRAPPER_ID_BASE + 3).await;
+            assert!(forged.as_ref().unwrap_err().contains("prompt"), "{cmd}: {forged:?}");
+            let via_as = registry.dispatch(&page, "as", &json!([addr, cmd, params.clone()]), 8).await;
+            assert!(via_as.is_err(), "{cmd} reached through as");
+            let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&wrapper, cmd, &params, 7).await.is_err(), "{cmd}: forwarded page command");
+            assert!(registry.dispatch(&wrapper, cmd, &params, WRAPPER_ID_BASE + 3).await.is_ok(), "{cmd}: the wrapper's own");
+            let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&trusted, cmd, &params, 1).await.is_ok(), "{cmd}: the operator");
+        }
+        // Status, which carries the jobs, stays readable by the page.
+        assert!(!EVX_WRAPPER_COMMANDS.contains(&"evxStatus"));
+        assert!(registry.dispatch(&page, "evxStatus", &json!({}), 7).await.is_ok());
     }
 
     #[tokio::test]

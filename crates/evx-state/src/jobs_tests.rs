@@ -549,6 +549,104 @@ fn due_jobs_honours_next_due_and_orders_by_it() {
     );
 }
 
+#[test]
+fn next_due_job_is_the_soonest_job_that_will_come_due_by_itself() {
+    let f = fixture();
+    assert_eq!(f.state.next_due_job(NOW).unwrap(), None, "nothing registered");
+    f.state.set_xite_grant(&grant("game-a")).unwrap();
+    f.state.set_xite_grant(&grant("game-b")).unwrap();
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    f.state
+        .set_jobs(
+            "game-b",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    f.state
+        .set_job_next_due("game-a", "sync", Some(NOW + 100))
+        .unwrap();
+    f.state
+        .set_job_next_due("game-b", "sync", Some(NOW + 50))
+        .unwrap();
+    // Strictly after `now`: a job due at `now` is `due_jobs`' business.
+    let next = f.state.next_due_job(NOW).unwrap().unwrap();
+    assert_eq!((next.xite.as_str(), next.next_due_unix), ("game-b", Some(NOW + 50)));
+    let next = f.state.next_due_job(NOW + 50).unwrap().unwrap();
+    assert_eq!((next.xite.as_str(), next.next_due_unix), ("game-a", Some(NOW + 100)));
+    assert_eq!(f.state.next_due_job(NOW + 100).unwrap(), None);
+    // Paused, disabled, ungranted and expiring-first jobs are not waited for.
+    f.state
+        .set_job_paused("game-b", "sync", Some("user"))
+        .unwrap();
+    assert_eq!(f.state.next_due_job(NOW).unwrap().unwrap().xite, "game-a");
+    f.state.set_job_paused("game-b", "sync", None).unwrap();
+    f.state.set_job_enabled("game-b", "sync", false).unwrap();
+    assert_eq!(f.state.next_due_job(NOW).unwrap().unwrap().xite, "game-a");
+    f.state.set_job_enabled("game-b", "sync", true).unwrap();
+    let mut expiring = grant("game-b");
+    expiring.expires_unix = Some(NOW + 50);
+    f.state.set_xite_grant(&expiring).unwrap();
+    assert_eq!(f.state.next_due_job(NOW).unwrap().unwrap().xite, "game-a");
+    expiring.expires_unix = Some(NOW + 51);
+    f.state.set_xite_grant(&expiring).unwrap();
+    assert_eq!(f.state.next_due_job(NOW).unwrap().unwrap().xite, "game-b");
+    f.state.revoke_xite("game-b").unwrap();
+    assert_eq!(f.state.next_due_job(NOW).unwrap().unwrap().xite, "game-a");
+    let mut no_background = grant("game-a");
+    no_background.allow_background = false;
+    f.state.set_xite_grant(&no_background).unwrap();
+    assert_eq!(f.state.next_due_job(NOW).unwrap(), None);
+    assert_err!(f.state.next_due_job((1 << 53) + 1), Error::Invalid(_));
+}
+
+#[test]
+fn job_xites_lists_every_xite_with_a_registration_whatever_its_state() {
+    let f = fixture();
+    assert!(f.state.job_xites().unwrap().is_empty());
+    f.state.set_xite_grant(&grant("game-b")).unwrap();
+    f.state
+        .set_jobs(
+            "game-b",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    // No grant at all for game-a: still listed, a wake for it is harmless.
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip), spec("other", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    f.state
+        .set_job_paused("game-b", "sync", Some("user"))
+        .unwrap();
+    assert_eq!(f.state.job_xites().unwrap(), ["game-a", "game-b"]);
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    assert_eq!(f.state.job_xites().unwrap(), ["game-b"]);
+}
+
+#[test]
+fn occurrence_parts_accepts_only_a_job_occurrence() {
+    assert_eq!(crate::occurrence_parts("sync.28333333").unwrap(), ("sync", 28_333_333));
+    assert_eq!(crate::occurrence_parts("a.b.7").unwrap(), ("a.b", 7));
+    for bad in ["once-0123456789abcdef", "sync", "sync.", ".7", "sync.07", "sync.x", "a b.7"] {
+        assert_err!(crate::occurrence_parts(bad), Error::Invalid(_));
+    }
+}
+
 // Claims
 
 #[test]
@@ -1418,6 +1516,9 @@ fn database_written_by_the_milestone_two_schema_migrates_in_place() {
     let incomplete = state.incomplete_occurrences(None).unwrap();
     assert_eq!(incomplete.len(), 1);
     assert_eq!(incomplete[0].occurrence, "once-0123456789abcdef");
+    // The version 2 run row reads back as the run-once it was.
+    let old_run = &state.runs("game-a").unwrap()[0];
+    assert_eq!((old_run.trigger.as_str(), old_run.occurrence.as_deref()), ("once", None));
     assert!(state.jobs("game-a").unwrap().is_empty());
     assert!(state.due_jobs(NOW).unwrap().is_empty());
     assert_eq!(state.daily_runs("game-a", NOW).unwrap(), 0);

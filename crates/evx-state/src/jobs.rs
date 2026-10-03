@@ -233,8 +233,10 @@ fn validate_digest(declaration_digest: &str) -> Result<()> {
 /// Split an occurrence id back into its job and slot index. Strict: the
 /// index is the text after the last separator, all digits, with no leading
 /// zero, and the job part is itself an identifier, so a run-once identity
-/// or a hand-made string is refused rather than attributed to a job.
-fn occurrence_parts(occurrence: &str) -> Result<(&str, u64)> {
+/// or a hand-made string is refused rather than attributed to a job. Public
+/// so the host's recovery can tell which job an incomplete reservation
+/// belongs to without a second spelling of the id format.
+pub fn occurrence_parts(occurrence: &str) -> Result<(&str, u64)> {
     let (job, index_text) = occurrence
         .rsplit_once(OCCURRENCE_SEPARATOR)
         .ok_or_else(|| Error::invalid("occurrence id is not a job occurrence"))?;
@@ -499,6 +501,45 @@ impl DurableState {
             jobs.push(job_row(row)?);
         }
         Ok(jobs)
+    }
+
+    /// The job that is due soonest after `now` under the same conditions
+    /// [`DurableState::due_jobs`] applies at that moment, or `None` when no
+    /// job will come due by itself: what the scheduler sleeps until. A job
+    /// whose grant expires before its due time is left out, since it will
+    /// not be due then either; a wake for a grant change comes from the
+    /// host, not the timer. Ties are broken like `due_jobs` orders.
+    pub fn next_due_job(&self, now: u64) -> Result<Option<JobRow>> {
+        timestamp(now, "now")?;
+        let conn = crate::connect(&self.path)?;
+        let mut statement = conn.prepare(&format!(
+            "SELECT {JOINED_JOB_COLUMNS} FROM jobs AS j JOIN xite_grants AS g ON g.xite=j.xite \
+             WHERE j.enabled=1 AND j.paused_reason IS NULL \
+             AND j.next_due_unix IS NOT NULL AND j.next_due_unix>?1 \
+             AND g.enabled=1 AND g.allow_background=1 \
+             AND (g.expires_unix IS NULL OR g.expires_unix>j.next_due_unix) \
+             ORDER BY j.next_due_unix, j.xite, j.job LIMIT 1"
+        ))?;
+        let mut rows = statement.query(params![now])?;
+        match rows.next()? {
+            Some(row) => job_row(row).map(Some),
+            None => Ok(None),
+        }
+    }
+
+    /// Every xite with at least one registered job, ordered by address, for
+    /// the host to tell a content change that matters to the scheduler from
+    /// one that does not. Paused, disabled and ungranted jobs count: a wake
+    /// for them is harmless, a missed one for a job just resumed is not.
+    pub fn job_xites(&self) -> Result<Vec<String>> {
+        let conn = crate::connect(&self.path)?;
+        let mut statement = conn.prepare("SELECT DISTINCT xite FROM jobs ORDER BY xite")?;
+        let rows = statement.query_map([], |row| row.get::<_, String>(0))?;
+        let mut xites = Vec::new();
+        for row in rows {
+            xites.push(row?);
+        }
+        Ok(xites)
     }
 
     /// The slot an interval schedule puts `now` in: `index = now / seconds`,

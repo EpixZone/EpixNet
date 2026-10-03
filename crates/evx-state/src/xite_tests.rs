@@ -65,6 +65,8 @@ fn run(program: &str, started: u64) -> RunRecord {
         message: None,
         cpu_seconds: 0.25,
         peak_rss: 4096,
+        occurrence: None,
+        trigger: "once".to_owned(),
     }
 }
 
@@ -544,6 +546,24 @@ fn run_history_round_trips_and_is_newest_first() {
     assert_eq!(runs, vec![run("main", 200), first]);
     assert_eq!(f.state.runs("game-b").unwrap(), vec![run("other", 300)]);
     assert!(f.state.runs("game-c").unwrap().is_empty());
+}
+
+#[test]
+fn run_history_keeps_the_occurrence_and_trigger_of_a_job_run() {
+    let f = fixture();
+    let mut job_run = run("main", 100);
+    job_run.occurrence = Some("sync.28333333".to_owned());
+    job_run.trigger = "job".to_owned();
+    f.state.record_run("game-a", &job_run).unwrap();
+    assert_eq!(f.state.runs("game-a").unwrap(), vec![job_run.clone()]);
+    // Both are identifiers, like `status`: no free text reaches the history.
+    let mut bad = job_run.clone();
+    bad.trigger = "manual job".to_owned();
+    assert_err!(f.state.record_run("game-a", &bad), Error::Invalid(_));
+    let mut bad = job_run;
+    bad.occurrence = Some("sync @ 1".to_owned());
+    assert_err!(f.state.record_run("game-a", &bad), Error::Invalid(_));
+    assert_eq!(f.state.runs("game-a").unwrap().len(), 1);
 }
 
 #[test]

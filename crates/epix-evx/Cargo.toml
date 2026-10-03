@@ -2,7 +2,7 @@
 name = "epix-evx"
 version = "0.1.0"
 edition = "2021"
-description = "The node's EVX service and management API: inspect, consent to, run once and revoke a xite's declared programs (docs/evx-milestone-2.md section 4)."
+description = "The node's EVX service, management API and durable scheduler: inspect, consent to, run once, schedule and revoke a xite's declared programs (docs/evx-milestone-2.md section 4, docs/evx-milestone-3.md section 2)."
 
 [dependencies]
 epix-plugin = { path = "../epix-plugin" }
@@ -18,7 +18,7 @@ evx-supervisor = { path = "../evx-supervisor" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"
-tokio = { version = "1", features = ["rt", "sync"] }
+tokio = { version = "1", features = ["rt", "sync", "time", "macros"] }
 sha2 = "0.10"
 hex = "0.4"
 # An in-memory node (no data root) keeps its EVX state in a throwaway

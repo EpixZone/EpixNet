@@ -1,27 +1,45 @@
-//! `epix-evx`: the node's EVX service and management API
-//! (`docs/evx-milestone-2.md` section 4).
+//! `epix-evx`: the node's EVX service, management API and durable
+//! scheduler (`docs/evx-milestone-2.md` section 4, `docs/evx-milestone-3.md`
+//! section 2).
 //!
 //! The [`EvxPlugin`] is an `epix_plugin::Plugin` named `Evx`. At start it
 //! opens the durable EVX state at `<data_root>/private/evx/state.sqlite`,
 //! creates `<data_root>/private/evx/workspaces/`, installs the grant reader
-//! the `/list` inspection panel uses, and shares its [`EvxService`] with its
-//! seven WebSocket commands through the node's capability map:
+//! the `/list` inspection panel uses, starts the scheduler task, and shares
+//! its [`EvxService`] with its ten WebSocket commands through the node's
+//! capability map:
 //!
 //! | Command | Who | Effect |
 //! | --- | --- | --- |
-//! | `evxInspect` | the bound xite's page, the wrapper | none |
+//! | `evxInspect` | the bound xite's page, the wrapper | registers the jobs of a granted xite |
 //! | `evxStatus` | the bound xite's page, the wrapper | none |
 //! | `evxRequest` | the bound xite's page | records the ask |
 //! | `evxGrant` | wrapper / operator only | stores consent or mints a token |
 //! | `evxRevoke` | wrapper / operator only | disables the grant |
 //! | `evxSetLimits` | wrapper / operator only | adjusts limits |
 //! | `evxRunOnce` | wrapper / operator only | runs one program now |
+//! | `evxJobPause` | wrapper / operator only | pauses a scheduled job |
+//! | `evxJobResume` | wrapper / operator only | resumes a paused job |
+//! | `evxRunJob` | wrapper / operator only | runs a job's current occurrence now |
 //!
-//! The last four are gated in `epix_ui::command::CommandRegistry::dispatch`
+//! The last seven are gated in `epix_ui::command::CommandRegistry::dispatch`
 //! through `EVX_WRAPPER_COMMANDS`, exactly as `permissionAdd` is, so no page
 //! id can reach them; the handlers re-check the session shape as well.
 //! `ADMIN` plays no part: an ADMIN xite cannot grant EVX, and an EVX grant
 //! confers no ADMIN.
+//!
+//! The scheduler (`scheduler`) is one tokio task over the same service: it
+//! sleeps until the earliest persisted `next_due`, wakes for grants,
+//! revocations, job commands and content changes, and runs each reserved
+//! occurrence through the same path `evxRunOnce` uses. Its rules, each in
+//! one place: a schedule is a row, not a thread (`evx_state::JobRow`); an
+//! occurrence is reserved before a worker starts and completed with its
+//! result (`claim_occurrence`, `finish_occurrence`); the same occurrence
+//! never runs twice (the claim is not fresh the second time); a missed
+//! slot is never backfilled (only the current slot is ever claimed);
+//! authority, budget and the plugin switch are rechecked at every admission
+//! (`scheduler::tick`); a budget wait, a pause and an unsupported host are
+//! visible in `evxStatus` (`waiting_reason`), never silent drops.
 //!
 //! The plan's rules this crate upholds, each in one place: publisher
 //! requests never self-grant (`EvxService::grant` is the only writer and is
@@ -49,12 +67,15 @@ use epix_ui::{AppState, WsCommand};
 mod checkpoint;
 pub mod commands;
 pub mod limits;
+pub mod scheduler;
 pub mod service;
 
-pub use limits::{clamp, HOST_CEILING};
+pub use limits::{clamp, BACKGROUND_RUNS_PER_DAY, BACKGROUND_WORKERS, HOST_CEILING};
+pub use scheduler::Scheduler;
 pub use service::{
     default_worker_binary, EvxService, GrantMode, GrantRequest, Inspection, Integrity,
-    DEFAULT_LABEL, RUNTIME_PROFILE, UNSUPPORTED_HOST, WORKER_BINARY,
+    PauseReason, Trigger, WaitReason, DEFAULT_LABEL, RUNTIME_PROFILE, UNSUPPORTED_HOST,
+    WORKER_BINARY,
 };
 
 /// The plugin's stable name, as the plugin manager and the command registry
@@ -88,9 +109,10 @@ impl Plugin for EvxPlugin {
         commands::all()
     }
 
-    /// Open the state and install the service. A failure is logged and
-    /// leaves no service installed, so every command answers that EVX is
-    /// unavailable instead of running without consent records.
+    /// Open the state, install the service and start the scheduler task. A
+    /// failure is logged and leaves no service installed, so every command
+    /// answers that EVX is unavailable instead of running without consent
+    /// records, and nothing is scheduled.
     fn start(&self, state: &Arc<AppState>) {
         let service = match EvxService::for_node(state, self.worker.clone()) {
             Ok(service) => Arc::new(service),
@@ -114,6 +136,7 @@ impl Plugin for EvxPlugin {
             state
                 .log("INFO", format!("EVX service ready at {} ({host})", service.root().display()))
                 .await;
+            scheduler::run(service, state).await;
         });
     }
 }

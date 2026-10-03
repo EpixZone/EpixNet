@@ -2271,10 +2271,19 @@ if (window.getComputedStyle(document.body).transform) {
       if (effective && typeof effective === "object") {
         body += "<br><br><small>Effective limits on this node: " + limits(effective) + "</small>";
       }
-      // Only usable jobs count: an unsupported one never registers with the
-      // scheduler, so it confers no background authority to warn about.
-      if (background.length) {
-        body += "<br><br>This xite also declares " + background.length + " scheduled job(s): " + background.join(", ") + ". Enabling lets them run in the background on this node, even when no page of this xite is open.";
+      // The paragraph follows the node's word, not this listing: the node
+      // computes `effective.allow_background` as "at least one usable, bound
+      // job", which is exactly what an enable grant records, so what the
+      // user is warned about and what the grant then allows cannot differ.
+      // Only that exact value counts; a payload without it grants no
+      // background authority and gets no paragraph. The jobs named are the
+      // ones the node called usable, which is the same set.
+      if (payload.effective && typeof payload.effective === "object" && payload.effective.allow_background === true) {
+        if (background.length) {
+          body += "<br><br>This xite also declares " + background.length + " scheduled job(s): " + background.join(", ") + ". Enabling lets them run in the background on this node, even when no page of this xite is open.";
+        } else {
+          body += "<br><br>This xite also declares scheduled jobs. Enabling lets them run in the background on this node, even when no page of this xite is open.";
+        }
       }
       body += "<br><br><small>Enabling also covers authenticated updates to this xite from the same publisher within these capabilities and limits, without another prompt. Nothing beyond them runs until you are asked again.</small>";
       if (program !== null) {

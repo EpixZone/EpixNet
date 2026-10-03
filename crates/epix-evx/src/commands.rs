@@ -5,7 +5,8 @@
 //! inert ones (`evxInspect`, `evxStatus`, `evxRequest`) are answerable to
 //! the bound xite's page and to the wrapper, and they act on the bound xite
 //! only. The effectful ones (`evxGrant`, `evxRevoke`, `evxSetLimits`,
-//! `evxRunOnce`) are listed in `epix_ui::command::EVX_WRAPPER_COMMANDS`, so
+//! `evxRunOnce`, `evxJobPause`, `evxJobResume`, `evxRunJob`) are listed in
+//! `epix_ui::command::EVX_WRAPPER_COMMANDS`, so
 //! the dispatcher refuses them for every request that is not the wrapper's
 //! own elevated-id command or the operator socket; each handler here
 //! re-checks that the session is a wrapper or operator session, so a direct
@@ -14,10 +15,11 @@
 //! dispatcher sees the request id, the handler sees the session.
 //!
 //! On a public gateway (`AppState::ui_restrict`) the inert commands answer
-//! a visitor with no consent detail (the grant is reduced to its `enabled`
-//! bit and the run history is left out, as the `/list` panel does there),
-//! and `evxRequest` is refused: no dialog is shown to a visitor and none
-//! may enable execution. The operator socket sees everything.
+//! a visitor with no consent detail (the grant, each job and the scheduler
+//! are reduced to their `enabled` bits and the run history is left out, as
+//! the `/list` panel does there), and `evxRequest` is refused: no dialog is
+//! shown to a visitor and none may enable execution. The operator socket
+//! sees everything.
 //!
 //! Parameters are JSON objects decoded with `deny_unknown_fields`; `null`
 //! stands for the empty object so a page that sends no parameters still
@@ -87,10 +89,12 @@ async fn gateway_visitor(session: &WsSession) -> bool {
 }
 
 /// The consent detail a gateway visitor does not get: the operator's grant
-/// (label, limits, when it was given, its generations) and the run history
-/// are the operator's own. Only whether execution is enabled survives, as
-/// a bare `{"enabled": bool}`, which is what the `/list` panel's rule
-/// leaves as well; the other keys are removed rather than zeroed so that
+/// (label, limits, when it was given, its generations), the run history,
+/// and the schedule's state (what is due when, why a job waits, how busy
+/// the node is) are the operator's own. Only the enabled bits survive: the
+/// grant as a bare `{"enabled": bool}`, which is what the `/list` panel's
+/// rule leaves as well, each job as `{"job", "enabled"}` and the scheduler
+/// as `{"enabled"}`; the other keys are removed rather than zeroed so that
 /// nothing reads as a fact.
 pub fn redact_for_gateway(mut payload: Value) -> Value {
     if let Some(object) = payload.as_object_mut() {
@@ -102,6 +106,17 @@ pub fn redact_for_gateway(mut payload: Value) -> Value {
             "grant".into(),
             enabled.map(|enabled| json!({ "enabled": enabled })).unwrap_or(Value::Null),
         );
+        if let Some(jobs) = object.get("jobs").and_then(Value::as_array) {
+            let jobs: Vec<Value> = jobs
+                .iter()
+                .map(|job| json!({ "job": job.get("job").cloned().unwrap_or(Value::Null), "enabled": job.get("enabled").and_then(Value::as_bool) }))
+                .collect();
+            object.insert("jobs".into(), Value::Array(jobs));
+        }
+        if let Some(scheduler) = object.get("scheduler") {
+            let enabled = scheduler.get("enabled").and_then(Value::as_bool);
+            object.insert("scheduler".into(), json!({ "enabled": enabled }));
+        }
         for key in ["generations", "runs", "run_count", "asked_unix"] {
             object.remove(key);
         }
@@ -141,7 +156,7 @@ impl WsCommand for EvxStatus {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let params: XiteParams = object_params(p)?;
         let xite = target_xite(s, params.xite.as_deref())?;
-        let payload = service(&s.state)?.status(&xite).await?;
+        let payload = service(&s.state)?.status(&s.state, &xite).await?;
         Ok(if gateway_visitor(s).await { redact_for_gateway(payload) } else { payload })
     }
 }
@@ -246,6 +261,60 @@ impl WsCommand for EvxRunOnce {
     }
 }
 
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobParams {
+    #[serde(default)]
+    xite: Option<String>,
+    job: String,
+}
+
+/// `evxJobPause {xite?, job}`: pause a registered job until resumed.
+pub struct EvxJobPause;
+#[async_trait]
+impl WsCommand for EvxJobPause {
+    fn name(&self) -> &'static str {
+        "evxJobPause"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        require_wrapper_or_operator(s, self.name())?;
+        let params: JobParams = object_params(p)?;
+        let xite = target_xite(s, params.xite.as_deref())?;
+        service(&s.state)?.job_pause(&s.state, &xite, &params.job).await
+    }
+}
+
+/// `evxJobResume {xite?, job}`: lift a job's pause, whoever set it.
+pub struct EvxJobResume;
+#[async_trait]
+impl WsCommand for EvxJobResume {
+    fn name(&self) -> &'static str {
+        "evxJobResume"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        require_wrapper_or_operator(s, self.name())?;
+        let params: JobParams = object_params(p)?;
+        let xite = target_xite(s, params.xite.as_deref())?;
+        service(&s.state)?.job_resume(&s.state, &xite, &params.job).await
+    }
+}
+
+/// `evxRunJob {xite?, job}`: run the job's current occurrence now, or
+/// return the stored result when that occurrence already ran.
+pub struct EvxRunJob;
+#[async_trait]
+impl WsCommand for EvxRunJob {
+    fn name(&self) -> &'static str {
+        "evxRunJob"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        require_wrapper_or_operator(s, self.name())?;
+        let params: JobParams = object_params(p)?;
+        let xite = target_xite(s, params.xite.as_deref())?;
+        service(&s.state)?.run_job(&s.state, &xite, &params.job).await
+    }
+}
+
 /// Every command the plugin registers.
 pub fn all() -> Vec<Arc<dyn WsCommand>> {
     vec![
@@ -256,6 +325,9 @@ pub fn all() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(EvxRevoke),
         Arc::new(EvxSetLimits),
         Arc::new(EvxRunOnce),
+        Arc::new(EvxJobPause),
+        Arc::new(EvxJobResume),
+        Arc::new(EvxRunJob),
     ]
 }
 
@@ -306,17 +378,21 @@ mod tests {
             "reasons": [],
             "asked_unix": 9,
             "host": { "execution": true },
+            "jobs": [{ "job": "sync", "enabled": true, "next_due_unix": 1800, "waiting_reason": "daily_budget", "failures": 2 }],
+            "scheduler": { "enabled": true, "busy_workers": 1, "next_wake_unix": 1800, "host": "macos" },
         });
         let redacted = redact_for_gateway(status);
         assert_eq!(redacted["grant"], json!({ "enabled": true }));
         assert_eq!(redacted["xite"], "1A");
         assert_eq!(redacted["running"], false);
         assert_eq!(redacted["host"]["execution"], true);
+        assert_eq!(redacted["jobs"], json!([{ "job": "sync", "enabled": true }]));
+        assert_eq!(redacted["scheduler"], json!({ "enabled": true }));
         for gone in ["generations", "runs", "run_count", "asked_unix"] {
             assert!(redacted.get(gone).is_none(), "{gone} survived");
         }
         let text = redacted.to_string();
-        for secret in ["laptop", "created_unix", "limits", "generation"] {
+        for secret in ["laptop", "created_unix", "limits", "generation", "next_due", "waiting_reason", "failures", "busy_workers", "next_wake", "macos"] {
             assert!(!text.contains(secret), "{secret} survived: {text}");
         }
         // No grant stays no grant; a non-object payload is left alone.
@@ -328,6 +404,9 @@ mod tests {
     fn the_effectful_commands_refuse_a_page_session_even_when_called_directly() {
         let state = AppState::new("test");
         let page = WsSession::new(state.clone(), Some("1A".into()));
+        for cmd in epix_ui::command::EVX_WRAPPER_COMMANDS {
+            assert!(require_wrapper_or_operator(&page, cmd).is_err(), "{cmd}");
+        }
         assert!(require_wrapper_or_operator(&page, "evxGrant").is_err());
         let wrapper = WsSession::new_wrapper(state.clone(), Some("1A".into()));
         assert!(require_wrapper_or_operator(&wrapper, "evxGrant").is_ok());

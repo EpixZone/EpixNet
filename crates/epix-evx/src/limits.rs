@@ -36,6 +36,22 @@ pub const HOST_CEILING: Limits = Limits {
     process_rss_bytes: 512 * 1024 * 1024,
 };
 
+/// Most background occurrences one xite may start per UTC day, host-wide
+/// policy like [`HOST_CEILING`] and just as fixed: a 5-minute job fills it
+/// exactly, a faster one waits with `daily_budget` in its status until the
+/// next UTC day. Counted in the durable state, so a restart cannot refill
+/// it. Kept beside `HOST_CEILING` rather than inside it because that is the
+/// per-invocation `evx_api::Limits` wire type, which a broker enforces and
+/// a declaration may request; a per-day count is neither.
+pub const BACKGROUND_RUNS_PER_DAY: u32 = 288;
+
+/// Most background occurrences the scheduler keeps running at once across
+/// every xite. Two is enough for a desktop node to make progress on one
+/// xite while another's job runs, and little enough that background work
+/// can never take the machine; the per-xite run lock keeps each xite at
+/// one, so this is also the most xites running in the background at once.
+pub const BACKGROUND_WORKERS: usize = 2;
+
 /// The limits a grant stores for `requested`: every field is the smaller of
 /// the request and [`HOST_CEILING`].
 ///

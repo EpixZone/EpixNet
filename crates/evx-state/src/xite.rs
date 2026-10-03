@@ -82,15 +82,28 @@ CREATE TABLE IF NOT EXISTS runs (
  started_unix INTEGER NOT NULL, finished_unix INTEGER NOT NULL,
  program TEXT NOT NULL, declaration_digest TEXT NOT NULL,
  artifact_sha256 TEXT NOT NULL, input_digest TEXT NOT NULL, status TEXT NOT NULL,
- message TEXT, cpu_seconds REAL NOT NULL, peak_rss INTEGER NOT NULL);
+ message TEXT, cpu_seconds REAL NOT NULL, peak_rss INTEGER NOT NULL,
+ occurrence TEXT, trigger TEXT NOT NULL DEFAULT 'once');
 CREATE INDEX IF NOT EXISTS runs_by_xite ON runs (xite, id);
+";
+
+/// The version 4 step: the two Milestone 3 columns of `runs`, added to a
+/// table a version 2 or 3 file created without them. SQLite has no `ADD
+/// COLUMN IF NOT EXISTS`, so [`DurableState::open`] runs this only when
+/// `PRAGMA table_info(runs)` lacks `trigger`; a fresh file gets the columns
+/// from [`SCHEMA_V2`] above. The default `'once'` is what every run before
+/// this version was: a run-once, with no occurrence.
+pub(crate) const SCHEMA_V4_RUN_COLUMNS: &str = "
+ALTER TABLE runs ADD COLUMN occurrence TEXT;
+ALTER TABLE runs ADD COLUMN trigger TEXT NOT NULL DEFAULT 'once';
 ";
 
 const XITE_GRANT_COLUMNS: &str = "xite, publisher, enabled, capabilities, runtime_profiles, \
                                   limits, allow_run_once, allow_background, created_unix, \
                                   expires_unix, label";
 const RUN_COLUMNS: &str = "started_unix, finished_unix, program, declaration_digest, \
-                           artifact_sha256, input_digest, status, message, cpu_seconds, peak_rss";
+                           artifact_sha256, input_digest, status, message, cpu_seconds, peak_rss, \
+                           occurrence, trigger";
 
 /// The persistent consent recorded for one xite by the wrapper or operator.
 ///
@@ -136,6 +149,10 @@ pub struct XiteGrant {
 /// `status` is the host's closed vocabulary (`ok`, `denied`, `crashed`,
 /// ...) stored as text so the state crate does not have to change when the
 /// host adds one; it is validated as an identifier, never interpreted here.
+/// `trigger` is the host's word for what started the run (`once`, `job`,
+/// `manual_job`) under the same rule, and `occurrence` the job occurrence
+/// the run was reserved under, so the history can be matched against the
+/// `invocations` table and a run of a job is never mistaken for a run-once.
 /// Decoding refuses unknown fields, as [`XiteGrant`] does.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -160,6 +177,10 @@ pub struct RunRecord {
     pub cpu_seconds: f64,
     /// Peak resident-set bytes observed.
     pub peak_rss: u64,
+    /// The job occurrence the run was reserved under; `None` for a run-once.
+    pub occurrence: Option<String>,
+    /// What started the run, in the host's closed vocabulary.
+    pub trigger: String,
 }
 
 /// Current Unix time in whole seconds. A clock before the epoch is an
@@ -241,6 +262,10 @@ fn validate_run(run: &RunRecord) -> Result<()> {
     if !run.cpu_seconds.is_finite() || run.cpu_seconds < 0.0 {
         return Err(Error::invalid("invalid cpu_seconds"));
     }
+    if let Some(occurrence) = &run.occurrence {
+        identifier(occurrence).map_err(|_| Error::invalid("invalid occurrence"))?;
+    }
+    identifier(&run.trigger).map_err(|_| Error::invalid("invalid run trigger"))?;
     timestamp(run.peak_rss, "peak_rss")
 }
 
@@ -272,6 +297,8 @@ fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRecord> {
         message: row.get(7)?,
         cpu_seconds: row.get(8)?,
         peak_rss: row.get(9)?,
+        occurrence: row.get(10)?,
+        trigger: row.get(11)?,
     })
 }
 
@@ -605,7 +632,7 @@ impl DurableState {
             conn.execute(
                 &format!(
                     "INSERT INTO runs (xite, {RUN_COLUMNS}) \
-                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)"
+                     VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)"
                 ),
                 params![
                     xite,
@@ -619,6 +646,8 @@ impl DurableState {
                     run.message,
                     run.cpu_seconds,
                     run.peak_rss,
+                    run.occurrence,
+                    run.trigger,
                 ],
             )?;
             conn.execute(

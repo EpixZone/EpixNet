@@ -69,7 +69,9 @@ function inspectPayload(overrides) {
       },
     },
     unsupported: [{ path: "streams.presence", reason: "retained streams not supported" }],
-    effective: { limits: { memory_bytes: 33554432, fuel: 1000000 } },
+    // The node's own word on background authority: true exactly when a
+    // usable job exists, as it does here.
+    effective: { limits: { memory_bytes: 33554432, fuel: 1000000 }, allow_background: true },
   }, overrides || {});
 }
 
@@ -352,7 +354,7 @@ test("every payload string is HTML-escaped before it reaches the dialog", () => 
         bad: { usable: false, reasons: [hostile] },
       },
       unsupported: [{ path: hostile, reason: hostile }],
-      effective: { limits: { [hostile]: hostile } },
+      effective: { limits: { [hostile]: hostile }, allow_background: true },
     }),
   });
   instance.handleMessage({ cmd: "evxRequest", params: { program: hostile }, id: 24 });
@@ -404,7 +406,7 @@ test("tags that toHtmlSafe would re-enable appear as literal text in every paylo
       bad: { usable: false, reasons: [text] },
     },
     unsupported: [{ path: text, reason: text }],
-    effective: { limits: { [text]: text } },
+    effective: { limits: { [text]: text }, allow_background: true },
   });
   const benign = wrapper({}, { evxInspect: () => shape("plain") });
   benign.instance.handleMessage({ cmd: "evxRequest", params: { program: "plain" }, id: 26 });
@@ -445,7 +447,10 @@ test("every rendered payload string is capped at 200 characters, each list item 
 // The background paragraph (docs/evx-milestone-3.md section 3): enabling a
 // declaration with a usable job also lets it run with no page open, so the
 // dialog says so in its own paragraph, listing each usable job, and says
-// nothing of the kind when no usable job exists.
+// nothing of the kind when no usable job exists. Whether the paragraph
+// appears is the node's `effective.allow_background`, the same bit an
+// enable grant records, so consent and authority cannot disagree; the job
+// listing inside it comes from the declaration summary.
 const BACKGROUND_TAIL = ". Enabling lets them run in the background on this node, even when no page of this xite is open.";
 function backgroundParagraph(body) {
   const match = body.match(/<br><br>This xite also declares (\d+) scheduled job\(s\): (.*?)\. Enabling lets them run in the background on this node, even when no page of this xite is open\./);
@@ -481,7 +486,7 @@ test("the background paragraph lists both usable jobs with their own programs an
 });
 
 test("a declaration with no jobs gets no background paragraph", () => {
-  const { instance, dialogs } = wrapper({}, { evxInspect: () => inspectPayload({ jobs: {} }) });
+  const { instance, dialogs } = wrapper({}, { evxInspect: () => inspectPayload({ jobs: {}, effective: { limits: { fuel: 1000000 }, allow_background: false } }) });
   instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 32 });
   const body = dialogs[0].body;
   assert.equal(backgroundParagraph(body), null, body);
@@ -494,6 +499,7 @@ test("a declaration whose only job is unsupported gets no background paragraph",
   const { instance, dialogs } = wrapper({}, {
     evxInspect: () => inspectPayload({
       jobs: { refresh: { usable: false, reasons: ["program: unknown program presence2"] } },
+      effective: { limits: { fuel: 1000000 }, allow_background: false },
     }),
   });
   instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 33 });
@@ -501,6 +507,34 @@ test("a declaration whose only job is unsupported gets no background paragraph",
   assert.equal(backgroundParagraph(body), null, body);
   assert.equal(body.includes("in the background"), false);
   assert.match(body, /<b>refresh<\/b> &mdash; unsupported: program: unknown program presence2/, "the unsupported job is still listed as such");
+});
+
+test("the paragraph follows the node's allow_background bit, not the job listing", () => {
+  // A listed job the node did not count (it will not record background
+  // authority): no paragraph, so the user is not warned about authority
+  // that enabling will not grant.
+  const withheld = wrapper({}, { evxInspect: () => inspectPayload({ effective: { limits: { fuel: 1 }, allow_background: false } }) });
+  withheld.instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 40 });
+  assert.equal(backgroundParagraph(withheld.dialogs[0].body), null, withheld.dialogs[0].body);
+  assert.equal(withheld.dialogs[0].body.includes("in the background"), false);
+  assert.match(withheld.dialogs[0].body, /<b>refresh<\/b> runs presence every 1800 s/, "the trigger line still lists the job");
+  // Only the exact boolean counts: a truthy string or a missing field is
+  // no consent to warn about.
+  for (const value of ["true", 1, undefined]) {
+    const loose = wrapper({}, { evxInspect: () => inspectPayload({ effective: { limits: { fuel: 1 }, allow_background: value } }) });
+    loose.instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 41 });
+    assert.equal(loose.dialogs[0].body.includes("in the background"), false, String(value));
+  }
+  const noEffective = wrapper({}, { evxInspect: () => inspectPayload({ effective: undefined }) });
+  noEffective.instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 42 });
+  assert.equal(noEffective.dialogs[0].body.includes("in the background"), false);
+  // The node says background authority is recorded although its summary
+  // lists no usable job: the warning is still given, without a listing,
+  // since the grant will carry the authority either way.
+  const unlisted = wrapper({}, { evxInspect: () => inspectPayload({ jobs: {}, effective: { limits: { fuel: 1 }, allow_background: true } }) });
+  unlisted.instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 43 });
+  assert.ok(unlisted.dialogs[0].body.includes("<br><br>This xite also declares scheduled jobs. Enabling lets them run in the background on this node, even when no page of this xite is open."), unlisted.dialogs[0].body);
+  assert.equal(backgroundParagraph(unlisted.dialogs[0].body), null, "no count, no listing");
 });
 
 test("job ids, programs and periods in the background paragraph are escaped like every other payload string", () => {
