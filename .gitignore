@@ -42,7 +42,6 @@ PLAN.md
 **/mutants.out*/
 dist/
 /packaging/firefox-esr/
-/packaging/linux/__pycache__/
 /.store-build/
 app-icon.png
 ios/Generated/
@@ -68,4 +67,5 @@ ios/**/project.xcworkspace/
 /ios/build/
 
 # Python validation scripts
-/scripts/__pycache__/
+__pycache__/
+*.py[cod]

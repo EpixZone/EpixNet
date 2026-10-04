@@ -1,0 +1,19 @@
+[package]
+name = "evx-declaration"
+version = "0.1.0"
+edition = "2021"
+description = "EVX: strict parser and manifest binder for the signed `evx` section of a xite's root content.json."
+
+[dependencies]
+evx-api = { path = "../evx-api" }
+evx-activation = { path = "../evx-activation" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+hex = "0.4"
+
+[dev-dependencies]
+# Round-trip tests sign a realistic root content.json the way the node does.
+# Neither crate is needed to parse or bind; a worker never links them.
+epix-content = { path = "../epix-content" }
+epix-crypt = { path = "../epix-crypt" }

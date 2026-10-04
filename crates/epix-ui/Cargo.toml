@@ -35,6 +35,11 @@ epix-chain = { path = "../epix-chain" }
 # by the `bittorrent` feature, so the iOS build (which never enables it) has no
 # BT code. See crates/epix-bt.
 epix-bt = { path = "../epix-bt", optional = true }
+# The strict parser, manifest binder and inspect summary for a xite's signed
+# `evx` declaration, for the inert `/list/<xite>/?evx=1` inspection view. Pure:
+# the view parses and displays, and this crate never links evx-runtime, so
+# nothing it serves can compile, instantiate or execute a program.
+evx-declaration = { path = "../evx-declaration" }
 base64 = "0.23"
 sha2 = "0.11"
 hmac = "0.13"

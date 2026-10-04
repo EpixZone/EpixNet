@@ -6,11 +6,27 @@
 # Usage: packaging/macos/build-app.sh [output-dir]
 #   EPIX_BUNDLE_FIREFOX=/path/to/Firefox.app  override which Firefox to bundle
 #   EPIX_SKIP_BUILD=1                          skip cargo build (reuse target/)
+#   EPIX_EVX_PROFILE=direct-child|apple-xpc-developer-id
+#   EPIX_EVX_TEAM_ID=ABCDEFGHIJ                compiled release identity for XPC
+#   EPIX_EVX_SLOTS=16                          permanent xite service slots (1..64)
 #
 # The shipping bundle should use Firefox ESR (stable, we patch on our cadence)
 # and be signed with a Developer ID + notarized (see NOTES at the bottom). This
 # script ad-hoc signs so the app runs locally for testing.
 set -euo pipefail
+
+# A signed child binary is not an App Sandbox XPC service. Refuse unsupported
+# profiles before building or replacing an output bundle.
+EVX_PROFILE="${EPIX_EVX_PROFILE:-direct-child}"
+case "$EVX_PROFILE" in
+  direct-child) ;;
+  apple-xpc-developer-id)
+    if [[ ! "${EPIX_EVX_TEAM_ID:-}" =~ ^[A-Z0-9]{10}$ ]] || [ -z "${EPIX_SIGN_ID:-}" ] || [ "${EPIX_SIGN_ID:-}" = "-" ]; then
+      echo "error: Developer ID EVX requires explicit EPIX_SIGN_ID and EPIX_EVX_TEAM_ID" >&2
+      exit 1
+    fi ;;
+  *) echo "error: unsupported EVX profile; App Store assembly remains separate" >&2; exit 1 ;;
+esac
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_DIR="${1:-$REPO_ROOT/dist}"
@@ -23,17 +39,28 @@ NOTARY_ARGS=()
 
 echo "· building release binaries"
 if [ "${EPIX_SKIP_BUILD:-0}" != "1" ]; then
-  ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh )
+  if [ "$EVX_PROFILE" = "apple-xpc-developer-id" ]; then
+    ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh -p evx-worker -p evx-supervisor \
+        --features epix-browser/apple-xpc,evx-worker/apple-xpc,evx-supervisor/apple-xpc --bins --locked )
+  else
+    ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh -p evx-worker )
+  fi
 fi
 LAUNCHER="$REPO_ROOT/target/release/epix-browser"
 NMH="$REPO_ROOT/target/release/epix-nmh"
+# The EVX confined worker (docs/evx.md): the node resolves it beside its own
+# executable, so it ships next to epix-browser. It confines itself with
+# Seatbelt before reading any input; the XPC packaging for the App Store
+# build is still to come.
+EVX_WORKER="$REPO_ROOT/target/release/evx-worker"
 [ -x "$LAUNCHER" ] || { echo "missing $LAUNCHER"; exit 1; }
 [ -x "$NMH" ] || { echo "missing $NMH"; exit 1; }
+[ -x "$EVX_WORKER" ] || { echo "missing $EVX_WORKER"; exit 1; }
 
 # The shipped binaries must only load system libraries. A Homebrew/MacPorts
 # dylib path baked in here (e.g. liblzma from pkg-config) makes the app crash
 # at launch on every Mac that doesn't have that exact library installed.
-for bin in "$LAUNCHER" "$NMH"; do
+for bin in "$LAUNCHER" "$NMH" "$EVX_WORKER"; do
   bad="$(otool -L "$bin" | tail -n +2 | awk '{print $1}' \
         | grep -v -e '^/usr/lib/' -e '^/System/' -e '^@' || true)"
   if [ -n "$bad" ]; then
@@ -70,6 +97,7 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources/firefox"
 cp "$LAUNCHER" "$APP/Contents/MacOS/epix-browser"
 cp "$NMH" "$APP/Contents/MacOS/epix-nmh"
+cp "$EVX_WORKER" "$APP/Contents/MacOS/evx-worker"
 # Copy the whole Firefox.app under Resources/firefox, keeping its name so the
 # launcher's edition detection (ESR/Developer) still works.
 cp -R "$FIREFOX_APP" "$APP/Contents/Resources/firefox/"
@@ -194,8 +222,14 @@ if [ -n "${EPIX_SIGN_ID:-}" ]; then
     --entitlements "$FF_ENTITLEMENTS" \
     --sign "$EPIX_SIGN_ID" "$APP/Contents/Resources/firefox/"*.app
   codesign --force --options runtime --timestamp \
-    --sign "$EPIX_SIGN_ID" "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/epix-browser"
-  codesign --force --options runtime --timestamp --sign "$EPIX_SIGN_ID" "$APP"
+    --sign "$EPIX_SIGN_ID" "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/evx-worker" "$APP/Contents/MacOS/epix-browser"
+  if [ "$EVX_PROFILE" = "apple-xpc-developer-id" ]; then
+    python3 "$REPO_ROOT/packaging/macos/xpc/release_pool.py" assemble "$APP" "$EVX_WORKER" \
+      "$REPO_ROOT/target/release/evx-xpc-service" --identity "$EPIX_SIGN_ID" \
+      --team-id "$EPIX_EVX_TEAM_ID" --slots "${EPIX_EVX_SLOTS:-16}"
+  else
+    codesign --force --options runtime --timestamp --sign "$EPIX_SIGN_ID" "$APP"
+  fi
   codesign --verify --deep --strict "$APP" && echo "  signature verified"
 
   # Notarize with either a stored notarytool profile (local) or direct
@@ -223,9 +257,18 @@ else
   codesign --force --deep --entitlements "$FF_ENTITLEMENTS" --sign - \
     "$APP/Contents/Resources/firefox/"*.app 2>/dev/null || \
     echo "  (firefox ad-hoc sign warned)"
-  codesign --force --sign - "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/epix-browser" 2>/dev/null || true
+  codesign --force --sign - "$APP/Contents/MacOS/epix-nmh" "$APP/Contents/MacOS/evx-worker" "$APP/Contents/MacOS/epix-browser" 2>/dev/null || true
   codesign --force --sign - "$APP" 2>/dev/null || \
     echo "  (codesign warned; the app still runs locally)"
+fi
+
+# Check the worker independently of the outer bundle, including the ad-hoc
+# build where earlier signing commands may have warned. This does not attest
+# runtime containment or App Store readiness.
+if [ "$EVX_PROFILE" = "apple-xpc-developer-id" ]; then
+  python3 "$REPO_ROOT/packaging/macos/xpc/release_pool.py" verify "$APP" --team-id "$EPIX_EVX_TEAM_ID"
+else
+  python3 "$REPO_ROOT/packaging/macos/verify-evx-package.py" "$APP" --profile "$EVX_PROFILE"
 fi
 
 # Guard: the bundled Firefox must keep its JIT entitlement, or it crashes at

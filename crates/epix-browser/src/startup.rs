@@ -15,6 +15,10 @@ use crate::splash_view::SplashView;
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 pub enum Stage {
     Preparing,
+    /// Only the Linux installer's browser-sandbox step reports this stage
+    /// (`linux_sandbox`); the splash still knows it everywhere, so a
+    /// warnings-as-errors build on other platforms must not flag it.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     Sandbox,
     Settings,
     Xites,

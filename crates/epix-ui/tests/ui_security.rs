@@ -384,3 +384,100 @@ async fn configuration_navigation_uses_node_origin_and_preserves_valid_posts() {
     ])).await.unwrap();
     assert_eq!(response.status(), 403, "Public gateways cannot expose node configuration");
 }
+
+/// The wrapper's iframe sandbox has no `allow-same-origin`, so the xite page
+/// is an opaque origin. Its requests therefore carry no Referer at all and
+/// `Origin: null` on CORS-mode ones; the gate must let the page load and read
+/// its own files while a foreign opaque page still gets nothing.
+#[tokio::test]
+async fn the_sandboxed_xite_frame_reads_its_own_files_and_nothing_else() {
+    let (state, router) = test_server().await;
+    state.config_set("ui_check_cors", json!(true)).await;
+    let host = ("host", "127.0.0.1:42222");
+    let (_, target_key) = state.wrapper_keys("1Target").await;
+    let (_, source_key) = state.wrapper_keys("1Source").await;
+    let cross_site = ("sec-fetch-site", "cross-site");
+
+    // Its scripts, styles and images: no Origin, no Referer, browser-set
+    // no-cors mode. They load, and get no CORS grant (nothing to read).
+    for dest in ["script", "style", "image", "empty"] {
+        let resp = router
+            .clone()
+            .oneshot(get(
+                "/1Target/data.json",
+                &[host, cross_site, ("sec-fetch-mode", "no-cors"), ("sec-fetch-dest", dest)],
+            ))
+            .await
+            .unwrap();
+        assert_ne!(resp.status(), 403, "no-cors {dest} load passes");
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+    // A client sending neither the headers nor a Sec-Fetch mode is still the
+    // untraceable request the gate always blocked.
+    let resp = router.clone().oneshot(get("/1Target/data.json", &[host])).await.unwrap();
+    assert_eq!(resp.status(), 403);
+    // Node pages that hold secrets never load this way.
+    for path in ["/Backup", "/Config"] {
+        let resp = router
+            .clone()
+            .oneshot(get(path, &[host, cross_site, ("sec-fetch-mode", "no-cors"), ("sec-fetch-dest", "image")]))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 403, "{path} stays blocked for an opaque frame");
+    }
+
+    // Its XHR/fetch calls carry the ajax_key the wrapper handed it: the read
+    // passes and is marked readable for a null origin.
+    let keyed = |path: &str, key: &str| format!("{path}?ajax_key={key}");
+    let fetch = |uri: &str, dest: &str| {
+        get(uri, &[host, cross_site, ("origin", "null"), ("sec-fetch-mode", "cors"), ("sec-fetch-dest", dest)])
+    };
+    let resp = router.clone().oneshot(fetch(&keyed("/1Target/data.json", &target_key), "empty")).await.unwrap();
+    assert_ne!(resp.status(), 403, "keyed read of its own file");
+    assert_eq!(resp.headers()["access-control-allow-origin"], "null");
+    assert_eq!(resp.headers()["vary"], "Origin");
+    // Without the key, or with a wrong one, a null-origin fetch is refused.
+    let resp = router.clone().oneshot(fetch("/1Target/data.json", "empty")).await.unwrap();
+    assert_eq!(resp.status(), 403, "keyless null-origin fetch");
+    let resp = router.clone().oneshot(fetch(&keyed("/1Target/data.json", "0000"), "empty")).await.unwrap();
+    assert_eq!(resp.status(), 403, "wrong key");
+    // Its fonts and ES modules carry no key but a browser-set destination
+    // that executes or renders the file without exposing its bytes.
+    for dest in ["font", "script"] {
+        let resp = router.clone().oneshot(fetch("/1Target/data.json", dest)).await.unwrap();
+        assert_ne!(resp.status(), 403, "{dest} passes");
+        assert_eq!(resp.headers()["access-control-allow-origin"], "null");
+    }
+    // A keyless CORS read of any other kind, and any node page, is refused.
+    for (uri, dest) in [("/1Target/data.json", "iframe"), ("/Backup", "empty"), ("/Config", "script")] {
+        let resp = router.clone().oneshot(fetch(uri, dest)).await.unwrap();
+        assert_eq!(resp.status(), 403, "{uri} {dest}");
+    }
+
+    // The key reads files, never the wrapper document (which carries the
+    // xite's secret keys): directory routes stay refused and ungranted.
+    for uri in [keyed("/1Target/", &target_key), keyed("/1Target", &target_key), keyed("/1Target/sub/", &target_key)] {
+        let resp = router.clone().oneshot(fetch(&uri, "empty")).await.unwrap();
+        assert_eq!(resp.status(), 403, "{uri}");
+        assert!(resp.headers().get("access-control-allow-origin").is_none(), "{uri}");
+    }
+
+    // Another xite's key identifies ITS page: a cross-xite read needs the
+    // Cors permission, exactly as a referer-identified one does.
+    let resp = router.clone().oneshot(fetch(&keyed("/1Target/data.json", &source_key), "empty")).await.unwrap();
+    assert_eq!(resp.status(), 403, "cross-xite keyed read blocked");
+    state.add_permission("1Source", "Cors:1Target").await;
+    let resp = router.clone().oneshot(fetch(&keyed("/1Target/data.json", &source_key), "empty")).await.unwrap();
+    assert_ne!(resp.status(), 403, "Cors permission unlocks the keyed read");
+    assert_eq!(resp.headers()["access-control-allow-origin"], "null");
+
+    // With the gate switched off (a LAN bind) the files are served to anyone,
+    // but only an authorised null-origin read is marked readable: the page
+    // still works, a foreign opaque page still cannot read the bytes.
+    state.config_set("ui_check_cors", json!(false)).await;
+    let resp = router.clone().oneshot(fetch(&keyed("/1Target/data.json", &target_key), "empty")).await.unwrap();
+    assert_eq!(resp.headers()["access-control-allow-origin"], "null");
+    let resp = router.clone().oneshot(fetch("/1Target/data.json", "empty")).await.unwrap();
+    assert_ne!(resp.status(), 403);
+    assert!(resp.headers().get("access-control-allow-origin").is_none());
+}

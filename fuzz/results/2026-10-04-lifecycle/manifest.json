@@ -1,0 +1,41 @@
+{
+  "date": "2026-10-04",
+  "target": "lifecycle_metadata",
+  "host": "macOS-15.5-arm64-arm-64bit",
+  "features": [
+    "lifecycle"
+  ],
+  "sanitizer": "address",
+  "toolchain": "nightly-2026-10-03",
+  "command": "cargo-fuzz run lifecycle_metadata --fuzz-dir fuzz --features lifecycle --codegen-units 16 --sanitizer address -- -max_total_time=120 -timeout=10 -rss_limit_mb=1024 -max_len=65537",
+  "build_environment": {
+    "CARGO_BUILD_JOBS": "1"
+  },
+  "source_manifest_sha256": "fb95838b050dc3e234f625478457223f9c6a13a2024d1327116b7e1dc1777997",
+  "source_archive_sha256": "1fba2d50fa2733aaf3ed82a3e3a14a3d03d4167f2291e5ec3ce5398393c98534",
+  "fuzz_lock_sha256": "1122cb5feb167bf5066b1ab385329af34406cb4c5dc830474a97e812f2168144",
+  "seed_manifest_sha256": "6f64e8e17316938cf480b94e9fc54e9f65346c3da14202de0c857c9f6ce7a5fc",
+  "corpus": {
+    "files": 257,
+    "archive_sha256": "cbde1b9e32c669f19bcac4409829ed0830970a7ccb688391b29800118be14d91"
+  },
+  "runs": [
+    {
+      "initial_corpus": "empty-initial",
+      "exit_code": 0,
+      "executions": 6950,
+      "reported_seconds": 121,
+      "log": "evx-lifecycle-metadata-fuzz.log",
+      "log_sha256": "8a14653c866460cb009122ea0844cd261772d5605205e224e91e49d6cda1cae2"
+    },
+    {
+      "initial_corpus": "curated-and-discovered-seeds",
+      "exit_code": 0,
+      "executions": 6878,
+      "reported_seconds": 121,
+      "log": "evx-lifecycle-metadata-seeded-fuzz.log",
+      "log_sha256": "335200f789401201c3c580344c0db57f522d93378e9c6ef74669b54bc9152c56"
+    }
+  ],
+  "limits": "Bounded host-control metadata fuzzing only. No worker starts, OS containment, actual reboot, mobile platform or independent audit coverage. Source was frozen before later Apple/Windows changes; see source manifest."
+}

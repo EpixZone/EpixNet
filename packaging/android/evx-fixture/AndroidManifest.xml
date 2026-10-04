@@ -1,0 +1,9 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="zone.epix.evxfixture">
+  <uses-sdk android:minSdkVersion="29" android:targetSdkVersion="36" />
+  <application android:label="EVX isolation fixture" android:allowBackup="false" android:usesCleartextTraffic="false">
+    <activity android:name=".FixtureActivity" android:exported="true">
+      <intent-filter><action android:name="android.intent.action.MAIN" /><category android:name="android.intent.category.LAUNCHER" /></intent-filter>
+    </activity>
+    <service android:name=".GameService" android:exported="false" android:isolatedProcess="true" android:useAppZygote="false" android:stopWithTask="true" />
+  </application>
+</manifest>

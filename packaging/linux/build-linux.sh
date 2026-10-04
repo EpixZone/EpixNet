@@ -32,7 +32,7 @@ FF="${EPIX_BUNDLE_FIREFOX:-$REPO_ROOT/packaging/firefox-esr/firefox}"
 python3 "$REPO_ROOT/packaging/linux/package-linux.py" --check-firefox "$FF"
 
 if [ "${EPIX_SKIP_BUILD:-0}" != 1 ]; then
-  ( cd "$REPO_ROOT" && cargo build --release --locked -p epix-browser -p epix-nmh -p epix-server )
+  ( cd "$REPO_ROOT" && cargo build --release --locked -p epix-browser -p epix-nmh -p epix-server -p evx-worker )
 fi
 
 rm -rf "$STAGE"; mkdir -p "$STAGE/firefox"
@@ -41,6 +41,8 @@ cp "$TARGET_DIR/release/epix-nmh" "$STAGE/epix-nmh"
 # The standalone node for headless servers: no Firefox, no GTK, honors
 # EPIX_HEADLESS / EPIX_UI_ADDR. See docs/install/linux.md.
 cp "$TARGET_DIR/release/epix-server" "$STAGE/epix-server"
+# EVX resolves its confined worker beside the node executable.
+cp "$TARGET_DIR/release/evx-worker" "$STAGE/evx-worker"
 
 # Bundle Firefox ESR (fetch-firefox-esr.sh linux) or a provided dir.
 cp -a "$FF/." "$STAGE/firefox/"

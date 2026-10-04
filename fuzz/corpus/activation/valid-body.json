@@ -1,0 +1,1 @@
+{"kind": "evx.activation.v1", "xite": "game-one", "publisher": "publisher-one", "version": 1, "runtime_profile": "fixture.wasm.v1", "entry": "main.wat", "artifact_format": "wat", "files": {"main.wat": "9ebad3406ae8e55a940db51f0768d65ee55747b7755cc955f8790aed662fab4a"}, "capabilities": ["game.score.get"]}

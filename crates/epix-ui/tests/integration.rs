@@ -31,9 +31,18 @@ async fn call_params(ws: &mut Ws, cmd: &str, params: Value, id: i64) -> Value {
 /// verified-authority root on disk). Ingest and db authority flow from an
 /// accepted manifest authority, so the root must declare every managed file -
 /// including `data/test.json`, the exact bytes `own_write_is_not_echoed_back`
-/// later writes. Returns the bound address, the xite's bech32 address, and
-/// the tempdir keeping the storage alive.
-async fn start_server() -> (std::net::SocketAddr, String, tempfile::TempDir) {
+/// later writes. Returns the bound address, the xite's bech32 address, the
+/// xite's secret wrapper_key (what the served wrapper page embeds), and the
+/// tempdir keeping the storage alive.
+async fn start_server() -> (std::net::SocketAddr, String, String, tempfile::TempDir) {
+    let (addr, address, key, _state, dir) = start_server_with_state().await;
+    (addr, address, key, dir)
+}
+
+/// [`start_server`] that also hands back the node state, for tests that
+/// change it (grant a permission, flip a config) between requests.
+async fn start_server_with_state(
+) -> (std::net::SocketAddr, String, String, std::sync::Arc<AppState>, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let storage = XiteStorage::new(dir.path());
     let index = b"<html>hi from xite</html>";
@@ -68,19 +77,60 @@ async fn start_server() -> (std::net::SocketAddr, String, tempfile::TempDir) {
     state.set_owned(&address, true).await;
     // Seed the chart db so the Stats page has data to query.
     state.collect_chart().await;
+    let (wrapper_key, _ajax_key) = state.wrapper_keys(&address).await;
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
-    let router = UiServer::new(state).router();
+    let router = UiServer::new(state.clone()).router();
     tokio::spawn(async move {
         axum::serve(listener, router).await.unwrap();
     });
-    (addr, address, dir)
+    (addr, address, wrapper_key, state, dir)
+}
+
+#[tokio::test]
+async fn the_wrapper_runs_the_xite_in_an_opaque_origin() {
+    let (addr, xite, key, state, _dir) = start_server_with_state().await;
+    let wrapper = || async {
+        reqwest::Client::new()
+            .get(format!("http://{addr}/{xite}/"))
+            .header("sec-fetch-mode", "navigate")
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap()
+    };
+    let html = wrapper().await;
+    let sandbox = html
+        .split("id='inner-iframe' sandbox=\"")
+        .nth(1)
+        .and_then(|rest| rest.split('"').next())
+        .expect("the inner iframe carries a sandbox attribute");
+    // The xite page is an opaque origin: it can run scripts and navigate, but
+    // it is not this origin, so it cannot script the wrapper or open the
+    // node's WebSocket as the wrapper's origin.
+    assert!(sandbox.contains("allow-scripts"), "{sandbox}");
+    assert!(!sandbox.contains("allow-same-origin"), "default sandbox is opaque: {sandbox}");
+    // The wrapper's own script receives the xite's secret keys and the
+    // gateway flag; the keys are what its WebSocket authenticates with.
+    assert!(html.contains(&format!("wrapper_key = \"{key}\"")), "wrapper embeds its key");
+    assert!(!html.contains(&format!("wrapper_key = \"{xite}\"")), "the key is not the address");
+    assert!(html.contains("ui_restrict = false"), "{html}");
+    let (_, ajax_key) = state.wrapper_keys(&xite).await;
+    assert!(html.contains(&format!("ajax_key = \"{ajax_key}\"")), "wrapper embeds the ajax key");
+
+    // NOSANDBOX is the user's explicit full-trust grant: only then does the
+    // frame share the wrapper's origin.
+    state.add_permission(&xite, "NOSANDBOX").await;
+    let html = wrapper().await;
+    assert!(html.contains("allow-popups-to-escape-sandbox allow-same-origin\""), "{html}");
 }
 
 #[tokio::test]
 async fn serves_xite_files_over_http() {
-    let (addr, xite, _dir) = start_server().await;
+    let (addr, xite, _key, _dir) = start_server().await;
     let body = reqwest::get(format!("http://{addr}/{xite}/index.html"))
         .await
         .unwrap();
@@ -211,9 +261,15 @@ async fn transparent_proxy_serves_epix_host() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+    let sandbox_of = |html: &str| -> String {
+        html.split("id='inner-iframe' sandbox=\"").nth(1).and_then(|r| r.split('"').next()).unwrap().to_string()
+    };
 
-    // Proxy request for the wrapper: Host is the xite name, path is "/".
+    // Proxy request for the wrapper: Host is the xite name, path is "/". The
+    // wrapper is the chrome origin; the xite page gets its own origin, the
+    // content host, and because that is a real origin of its own it keeps
+    // allow-same-origin (storage, service workers) without being the wrapper.
     let wrapper = client
         .get(format!("http://{addr}/"))
         .header("host", "talk.epix")
@@ -223,22 +279,71 @@ async fn transparent_proxy_serves_epix_host() {
         .unwrap();
     assert_eq!(wrapper.status(), 200);
     let html = wrapper.text().await.unwrap();
-    // Host mode emits host-relative URLs (NOT /talk.epix/index.html).
-    assert!(html.contains(r#"iframe_src = "/index.html?"#), "host-relative iframe: {html}");
+    assert!(
+        html.contains(r#"iframe_src = "//talk.content.epix/index.html?"#),
+        "the frame loads from the content host: {html}"
+    );
     assert!(!html.contains("/talk.epix/index.html"), "no path-prefix in host mode");
+    assert!(sandbox_of(&html).contains("allow-same-origin"), "host mode: own origin: {html}");
 
-    // Proxy request for an inner file: Host + host-relative path.
-    let inner = client
-        .get(format!("http://{addr}/index.html"))
+    // The chrome host serves no xite file: every file request moves to the
+    // content host (an HTML file served raw here would run as the wrapper).
+    let moved = client
+        .get(format!("http://{addr}/index.html?wrapper_nonce=abc"))
         .header("host", "talk.epix")
         .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(moved.status(), 307);
+    assert_eq!(moved.headers()["location"], "//talk.content.epix/index.html?wrapper_nonce=abc");
+
+    // The content host serves the files...
+    let inner = client
+        .get(format!("http://{addr}/index.html"))
+        .header("host", "talk.content.epix")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
         .send()
         .await
         .unwrap();
     assert_eq!(inner.status(), 200);
     assert_eq!(inner.text().await.unwrap(), "<h1>inner</h1>");
+    // ...but never the wrapper: a document navigation there (a `_top` link
+    // from inside the page, a typed URL) lands back on the chrome host.
+    for path in ["/", "/index.html"] {
+        let back = client
+            .get(format!("http://{addr}{path}?Topic:1"))
+            .header("host", "talk.content.epix")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "document")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(back.status(), 307, "{path}");
+        assert_eq!(back.headers()["location"], format!("//talk.epix{}?Topic:1", if path == "/" { "/" } else { path }), "{path}");
+    }
 
-    // Normal localhost path mode is unchanged: path-prefixed URLs.
+    // The content host is never a wrapper: no WebSocket is accepted there,
+    // and a page on it cannot open one to the chrome host either.
+    use tokio_tungstenite::tungstenite::http;
+    for (host, origin) in [("talk.content.epix", "http://talk.content.epix"), ("talk.epix", "http://talk.content.epix")] {
+        let req = http::Request::builder()
+            .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?xite=talk.epix"))
+            .header("Host", host)
+            .header("Origin", origin)
+            .header("Connection", "Upgrade")
+            .header("Upgrade", "websocket")
+            .header("Sec-WebSocket-Version", "13")
+            .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+            .body(())
+            .unwrap();
+        assert!(tokio_tungstenite::connect_async(req).await.is_err(), "ws refused for {host} from {origin}");
+    }
+
+    // Normal localhost path mode is unchanged: path-prefixed URLs, and the
+    // page stays an opaque origin because it would share the node's.
     let path_mode = client
         .get(format!("http://{addr}/talk.epix/"))
         .header("sec-fetch-mode", "navigate")
@@ -247,6 +352,15 @@ async fn transparent_proxy_serves_epix_host() {
         .unwrap();
     let path_html = path_mode.text().await.unwrap();
     assert!(path_html.contains("/talk.epix/index.html"), "path mode keeps the prefix");
+    assert!(!sandbox_of(&path_html).contains("allow-same-origin"), "path mode stays opaque: {path_html}");
+    let raw = client
+        .get(format!("http://{addr}/talk.epix/index.html"))
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(raw.status(), 200, "path mode serves files on the node origin");
 }
 
 #[tokio::test]
@@ -385,7 +499,10 @@ async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
         .unwrap();
     assert_eq!(r.status(), 200, "address host serves at its own origin");
     let html = r.text().await.unwrap();
-    assert!(html.contains(r#"iframe_src = "/index.html?"#), "host-relative iframe: {html}");
+    assert!(
+        html.contains(&format!(r#"iframe_src = "//{talk}.content.epix/index.html?"#)),
+        "the frame loads from the address's content host: {html}"
+    );
 
     // Loopback path mode is untouched: no redirect for 127.0.0.1 hosts.
     let r = client
@@ -399,7 +516,7 @@ async fn transparent_proxy_redirects_cross_xite_paths_to_own_origin() {
 
 #[tokio::test]
 async fn rejects_cross_origin_websocket() {
-    let (addr, xite, _dir) = start_server().await;
+    let (addr, xite, _key, _dir) = start_server().await;
     // A WebSocket from a foreign Origin is refused (can't drive the local API).
     use tokio_tungstenite::tungstenite::http;
     let req = http::Request::builder()
@@ -417,12 +534,92 @@ async fn rejects_cross_origin_websocket() {
 }
 
 #[tokio::test]
+async fn a_socket_without_the_wrapper_key_never_gains_wrapper_authority() {
+    use tokio_tungstenite::tungstenite::http;
+    let (addr, xite, key, _dir) = start_server().await;
+
+    // Binding by address (a manual client, an older wrapper, or a page that
+    // opened its own socket) gives a page-level session: an elevated id is
+    // just a number it chose, so admin commands and grants stay refused and
+    // nothing is persisted.
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let denied = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(denied["result"]["error"].as_str().unwrap().contains("permission"), "{denied}");
+    let denied = call_params(&mut ws, "permissionAdd", json!("ADMIN"), 1_000_002).await;
+    assert!(denied["result"]["error"].as_str().unwrap().contains("prompt"), "{denied}");
+    let info = call(&mut ws, "siteInfo", 1_000_003).await;
+    assert!(info["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
+    // Pushed-dialog answers from such a socket are ignored (no reply at all).
+    ws.send(Message::Text(
+        json!({ "cmd": "response", "id": 1_000_004, "to": 1, "result": true }).to_string().into(),
+    ))
+    .await
+    .unwrap();
+    let pong = call(&mut ws, "ping", 9).await;
+    assert_eq!(pong["to"], 9, "the ignored answer produced no frame of its own");
+
+    // The real key from some other local origin (a page on another local
+    // server that learned it) binds, but is not the wrapper: the wrapper's
+    // socket comes from the wrapper's own origin.
+    let req = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}"))
+        .header("Host", addr.to_string())
+        .header("Origin", "http://localhost:3000")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.expect("loopback origins may open page sockets");
+    let denied = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(denied["result"]["error"].as_str().unwrap().contains("permission"), "{denied}");
+    let info = call(&mut ws, "siteInfo", 2).await;
+    assert_eq!(info["result"]["address"].as_str(), Some(xite.as_str()), "still bound to the xite");
+    // From the wrapper's origin the same key is the wrapper.
+    let req = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}"))
+        .header("Host", addr.to_string())
+        .header("Origin", format!("http://{addr}"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(req).await.unwrap();
+    let allowed = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(allowed["result"].is_array(), "{allowed}");
+
+    // A random key that matches no xite binds the same way (and to nothing).
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={}", "f".repeat(64));
+    let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
+    let denied = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(denied["result"]["error"].is_string(), "{denied}");
+
+    // The sandboxed inner frame is an opaque origin: a socket it opens says
+    // `Origin: null` and is refused at the upgrade, whatever key it carries.
+    let req = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}"))
+        .header("Host", addr.to_string())
+        .header("Origin", "null")
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    assert!(tokio_tungstenite::connect_async(req).await.is_err(), "null-origin WS refused");
+}
+
+#[tokio::test]
 async fn own_write_is_not_echoed_back() {
     // EpixNet notifies `ws != self`: the connection whose fileWrite produced a
     // file_done must not receive the event (an echo re-renders the page
     // mid-interaction), while every other connection on the xite does.
     use base64::Engine;
-    let (addr, xite, _dir) = start_server().await;
+    let (addr, xite, _key, _dir) = start_server().await;
     let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
     let (mut writer, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
     let (mut watcher, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
@@ -455,9 +652,33 @@ async fn own_write_is_not_echoed_back() {
 }
 
 #[tokio::test]
+async fn same_host_different_port_is_not_the_wrappers_origin() {
+    use tokio_tungstenite::tungstenite::http;
+    let (addr, _xite, key, _dir) = start_server().await;
+    let foreign_port = if addr.port() == 65535 { 65534 } else { addr.port() + 1 };
+    let request = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}"))
+        .header("Host", addr.to_string())
+        .header("Origin", format!("http://127.0.0.1:{foreign_port}"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await
+        .expect("another loopback origin may open only a page-level socket");
+    let response = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(response["result"]["error"].is_string(),
+        "a key presented by a different port must not confer wrapper authority");
+}
+
+#[tokio::test]
 async fn handles_epixframe_websocket_commands() {
-    let (addr, xite, _dir) = start_server().await;
-    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={xite}");
+    let (addr, xite, key, _dir) = start_server().await;
+    // The wrapper page connects with the xite's secret wrapper_key: that is
+    // what makes this socket the trusted chrome for the xite.
+    let url = format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}");
     let (mut ws, _) = tokio_tungstenite::connect_async(url).await.unwrap();
 
     let pong = call(&mut ws, "ping", 1).await;
@@ -472,6 +693,9 @@ async fn handles_epixframe_websocket_commands() {
     assert_eq!(info["result"]["content"]["title"], "Test Xite");
     // A xite holds no permissions until the user grants one.
     assert!(info["result"]["settings"]["permissions"].as_array().unwrap().is_empty());
+    // The wrapper/AJAX secrets never travel to a page in siteInfo.
+    assert!(info["result"]["settings"].get("wrapper_key").is_none(), "{info}");
+    assert!(info["result"]["settings"].get("ajax_key").is_none(), "{info}");
 
     // An admin command from the inner page (small id) is refused...
     let denied = call(&mut ws, "siteList", 4).await;
@@ -493,4 +717,110 @@ async fn handles_epixframe_websocket_commands() {
     let unknown = call(&mut ws, "bogusCommand", 5).await;
     assert_eq!(unknown["to"], 5);
     assert!(unknown["result"].is_null());
+}
+
+/// With a UI password set, the chrome host's session cookie is host-only and
+/// never reaches the content host; the wrapper's iframe document request
+/// proves the session with its wrapper nonce and gets the content host a
+/// session of its own. Nothing else on the content host passes without one.
+#[cfg(feature = "ui-password")]
+#[tokio::test]
+async fn host_mode_hands_the_password_session_to_the_content_host() {
+    let dir = tempfile::tempdir().unwrap();
+    let storage = XiteStorage::new(dir.path());
+    storage.write("index.html", b"<h1>inner</h1>").unwrap();
+    storage.write("app.js", b"1").unwrap();
+    let state = AppState::new("0.1.0");
+    state
+        .add_xite(
+            "talk.epix",
+            XiteEntry {
+                storage,
+                content: Some(json!({ "title": "Talk", "files": { "index.html": {}, "app.js": {} } })),
+            },
+        )
+        .await;
+    state.config_set("ui_password", json!("pw")).await;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    drop(listener);
+    let server = UiServer::new(state);
+    tokio::spawn(async move {
+        let _ = server.serve(addr).await;
+    });
+    for _ in 0..50 {
+        if tokio::net::TcpStream::connect(addr).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let client = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()).build().unwrap();
+
+    // Log in on the chrome host.
+    let login = client
+        .post(format!("http://{addr}/Login"))
+        .header("host", "talk.epix")
+        .header("sec-fetch-site", "same-origin")
+        .form(&[("password", "pw")])
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 303, "login accepted");
+    let cookie = login.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    let wrapper = client
+        .get(format!("http://{addr}/"))
+        .header("host", "talk.epix")
+        .header("cookie", &cookie)
+        .header("sec-fetch-mode", "navigate")
+        .send()
+        .await
+        .unwrap();
+    let html = wrapper.text().await.unwrap();
+    let nonce = html
+        .split("//talk.content.epix/index.html?wrapper_nonce=")
+        .nth(1)
+        .and_then(|r| r.split('"').next())
+        .expect("the frame loads from the content host with a nonce")
+        .to_string();
+
+    // The iframe document request: content host, the nonce, no cookie.
+    let inner = client
+        .get(format!("http://{addr}/index.html?wrapper_nonce={nonce}"))
+        .header("host", "talk.content.epix")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(inner.status(), 200);
+    let content_cookie = inner.headers()["set-cookie"].to_str().unwrap().split(';').next().unwrap().to_string();
+    assert!(content_cookie.starts_with("session_id="), "content host gets a session");
+    assert_ne!(content_cookie, cookie, "a session of its own");
+    assert_eq!(inner.text().await.unwrap(), "<h1>inner</h1>");
+
+    // The page's later requests carry that cookie...
+    let js = client
+        .get(format!("http://{addr}/app.js"))
+        .header("host", "talk.content.epix")
+        .header("cookie", &content_cookie)
+        .header("sec-fetch-mode", "no-cors")
+        .header("sec-fetch-dest", "script")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(js.status(), 200);
+    assert_eq!(js.text().await.unwrap(), "1");
+    // ...and without one, or with a spent or made-up nonce, nothing passes.
+    for uri in ["/app.js", &format!("/index.html?wrapper_nonce={nonce}"), "/index.html?wrapper_nonce=bogus"] {
+        let locked = client
+            .get(format!("http://{addr}{uri}"))
+            .header("host", "talk.content.epix")
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "iframe")
+            .send()
+            .await
+            .unwrap();
+        let body = locked.text().await.unwrap();
+        assert!(body.contains("/Login"), "{uri} served the login page, not the file: {body}");
+    }
 }

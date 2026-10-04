@@ -1,0 +1,25 @@
+/coverage/
+/target/
+/artifacts/
+/corpus/*/*
+!/corpus/*/*.json
+!/corpus/*/*.wasm
+!/corpus/ipc_frames/*.frame
+!/corpus/state_sequences/*.seq
+!/corpus/lifecycle_metadata/*.case
+
+# Local campaign logs, archives and dependency dumps.
+# Keep only the compact review records in version control.
+/results/*
+!/results/campaign-summary.json
+!/results/corpus-manifest.json
+!/results/dependency-audit.json
+!/results/2026-10-03-prealignment/
+/results/2026-10-03-prealignment/*
+!/results/2026-10-03-prealignment/manifest.json
+!/results/2026-10-03-aligned/
+/results/2026-10-03-aligned/*
+!/results/2026-10-03-aligned/manifest.json
+!/results/2026-10-04-lifecycle/
+/results/2026-10-04-lifecycle/*
+!/results/2026-10-04-lifecycle/manifest.json

@@ -11,14 +11,49 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 /// The wrapper chrome (all.js) numbers its own WebSocket commands from this
-/// base; the inner xite page numbers from 1. Commands at or above this id are
-/// treated as coming from the trusted wrapper and may run ADMIN actions.
-const WRAPPER_ID_BASE: i64 = 1_000_000;
+/// base; the inner xite page numbers from 1. On a wrapper socket (one opened
+/// with the xite's secret `wrapper_key`), commands at or above this id come
+/// from the chrome itself and may run ADMIN actions; the wrapper forwards a
+/// page's messages with the page's own small ids and drops any inner message
+/// that claims an elevated one. The id alone proves nothing: a socket opened
+/// by anything other than the wrapper can pick any number, so
+/// [`WsSession::elevated`] also requires the socket to be a wrapper socket.
+pub const WRAPPER_ID_BASE: i64 = 1_000_000;
+
+/// Whether a request may act as the trusted wrapper chrome: the operator's
+/// admin socket, or an elevated-id request on a socket that authenticated as
+/// the wrapper with the xite's `wrapper_key`. An inner xite page can reach
+/// neither: it runs in an opaque origin (the iframe sandbox has no
+/// `allow-same-origin`), so it cannot read the key from the wrapper, and a
+/// WebSocket it opens itself carries `Origin: null` and is refused.
+pub fn is_wrapper_authority(session: &WsSession, req_id: i64) -> bool {
+    session.elevated(req_id)
+}
+
+/// Permissions a xite may ask the user to grant through the wrapper's prompt.
+/// The grant itself is a user decision made in trusted chrome; this only
+/// bounds what can be stored, so an unknown or unbounded string can never
+/// reach the persisted grant list or a plugin that matches on prefixes.
+pub fn validate_grantable_permission(permission: &str) -> Result<(), String> {
+    fn suffix_ok(suffix: &str) -> bool {
+        !suffix.is_empty()
+            && suffix.len() <= 128
+            && suffix.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+            && suffix.as_bytes()[0].is_ascii_alphanumeric()
+    }
+    match permission {
+        "ADMIN" | "NOSANDBOX" | "CHANNELS" => Ok(()),
+        p if p.starts_with("Merger:") && suffix_ok(&p["Merger:".len()..]) => Ok(()),
+        p if p.starts_with("Channels:") && suffix_ok(&p["Channels:".len()..]) => Ok(()),
+        _ => Err(format!("Unknown or malformed permission: {}", permission.chars().take(64).filter(|c| !c.is_control()).collect::<String>())),
+    }
+}
 
 /// Commands that require the ADMIN permission, mirroring EpixNet's
 /// `@flag.admin` set. An inner xite page can only run these once the user has
 /// granted that xite ADMIN through the wrapper's permission prompt.
 const ADMIN_COMMANDS: &[&str] = &[
+    "evxRecoverWorkspace",
     "announcerStats",
     "certList",
     "certSet",
@@ -98,6 +133,29 @@ pub fn is_admin_command(cmd: &str) -> bool {
     ADMIN_COMMANDS.contains(&cmd)
 }
 
+/// The EVX management commands only the wrapper's consent dialog or the
+/// operator socket may send (`docs/evx-milestone-2.md` section 4,
+/// `docs/evx-milestone-3.md` section 2). They mint, widen, narrow or spend a
+/// xite's execution grant, or start, pause and resume its scheduled jobs,
+/// so they are gated in [`CommandRegistry::dispatch`] exactly like
+/// `permissionAdd`: an elevated id
+/// on a socket that authenticated with the xite's `wrapper_key`, or the
+/// operator socket; refused on a restricted gateway except from the operator
+/// socket. A page's forwarded command keeps its small id and never passes,
+/// and a socket a page opened itself never has wrapper authority whatever
+/// id it picks. The list is checked here rather than inside each handler so
+/// a handler can never be reached by a page id, even through `as`.
+pub const EVX_WRAPPER_COMMANDS: &[&str] = &[
+    "evxGrant",
+    "evxRevoke",
+    "evxSetLimits",
+    "evxRunOnce",
+    "evxJobPause",
+    "evxJobResume",
+    "evxRunJob",
+    "evxRecoverWorkspace",
+];
+
 /// Commands that create or clone a new xite - blocked by NoNewSites.
 const NEW_XITE_COMMANDS: &[&str] = &["siteAdd", "siteClone", "mergerSiteAdd"];
 
@@ -164,20 +222,40 @@ pub struct WsSession {
     /// restricted-gateway gates and NoNewSites, since server-side admin is how
     /// a locked-down node is meant to be changed.
     pub trusted: bool,
+    /// The connection authenticated as the wrapper chrome of its bound xite:
+    /// the WebSocket upgrade presented that xite's secret `wrapper_key`, which
+    /// only the wrapper page receives. Only on such a socket do elevated ids
+    /// (>= [`WRAPPER_ID_BASE`]) carry the chrome's authority.
+    pub wrapper: bool,
+    /// The session was rebound through `as` by a caller whose own bound
+    /// xite holds ADMIN. It passes the admin gate the way the caller would
+    /// have, and nothing more: it is a page-level session with the page's
+    /// own id, so neither `permissionAdd` nor the EVX grant commands, which
+    /// need the wrapper's prompt, are reachable through it. ADMIN confers no
+    /// wrapper authority.
+    pub admin: bool,
 }
 
 impl WsSession {
+    /// A page-level session: no operator trust, no wrapper authority. This is
+    /// what a WebSocket without a valid `wrapper_key` gets.
     pub fn new(state: Arc<AppState>, xite: Option<String>) -> Self {
-        Self::build(state, xite, false)
+        Self::build(state, xite, false, false)
     }
 
     /// A trusted session for the local admin socket: full admin, no gateway
     /// restrictions. Only ever created for the filesystem-guarded Unix socket.
     pub fn new_trusted(state: Arc<AppState>, xite: Option<String>) -> Self {
-        Self::build(state, xite, true)
+        Self::build(state, xite, true, false)
     }
 
-    fn build(state: Arc<AppState>, xite: Option<String>, trusted: bool) -> Self {
+    /// The wrapper chrome's own socket for `xite`: created only when the
+    /// upgrade presented the xite's `wrapper_key`.
+    pub fn new_wrapper(state: Arc<AppState>, xite: Option<String>) -> Self {
+        Self::build(state, xite, false, true)
+    }
+
+    fn build(state: Arc<AppState>, xite: Option<String>, trusted: bool, wrapper: bool) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
         Self {
             state,
@@ -186,7 +264,16 @@ impl WsSession {
             channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             allsite_channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             trusted,
+            wrapper,
+            admin: false,
         }
+    }
+
+    /// Whether a request carries the chrome's authority: the operator socket
+    /// always does; a wrapper socket does for its own (elevated-id) commands
+    /// and never for the page commands it forwards with small ids.
+    pub fn elevated(&self, req_id: i64) -> bool {
+        self.trusted || (self.wrapper && req_id >= WRAPPER_ID_BASE)
     }
 
     /// The xite address bound to this connection, or an error if none.
@@ -349,12 +436,45 @@ impl CommandRegistry {
         // locked-down node).
         let restrict = session.state.ui_restrict().await && !session.trusted;
         if cmd == "networkRetry" && params.get("address").is_none() && !session.trusted {
-            let admin = match session.xite.as_deref() {
-                Some(address) => session.state.xite_has_admin(address).await,
-                None => false,
-            };
-            if restrict || (req_id < WRAPPER_ID_BASE && !admin) {
+            let admin = session.admin
+                || match session.xite.as_deref() {
+                    Some(address) => session.state.xite_has_admin(address).await,
+                    None => false,
+                };
+            if restrict || (!session.elevated(req_id) && !admin) {
                 return Err("Global network retry requires wrapper or ADMIN authority".into());
+            }
+        }
+        // Granting a permission is the wrapper's job after the user confirms
+        // it in trusted chrome (`wrapperPermissionAdd`). The wrapper sends the
+        // resulting `permissionAdd` from its own elevated id range; a page's
+        // forwarded `permissionAdd` arrives with the page's small id and is
+        // refused here, so a xite can never grant itself ADMIN, a merger type
+        // or a channel namespace without the prompt. `corsPermission` prompts
+        // inside its handler. On a public gateway every visitor could send an
+        // elevated id, so neither is honoured there except from the operator
+        // socket.
+        if cmd == "permissionAdd" || cmd == "corsPermission" {
+            if restrict {
+                return Err(format!("{cmd} is disabled on this gateway"));
+            }
+            if cmd == "permissionAdd" && !is_wrapper_authority(session, req_id) {
+                return Err("permissionAdd requires the wrapper's permission prompt".into());
+            }
+        }
+        // The EVX grant commands follow the same rule: the wrapper sends
+        // them from its own elevated id range after the user answered the
+        // EVX consent dialog, and a page's `evxRequest` only ever asks. On a
+        // public gateway no dialog is shown and no visitor may enable
+        // execution, so every one of them is refused there except from the
+        // operator socket. The handlers re-check the session shape too, but
+        // this gate is what makes the rule hold for every handler at once.
+        if EVX_WRAPPER_COMMANDS.contains(&cmd) {
+            if restrict {
+                return Err(format!("{cmd} is disabled on this gateway"));
+            }
+            if !is_wrapper_authority(session, req_id) {
+                return Err(format!("{cmd} requires the wrapper's EVX consent prompt"));
             }
         }
         if is_admin_command(cmd) {
@@ -367,12 +487,14 @@ impl CommandRegistry {
                 }
             } else {
                 // Allowed from the trusted admin socket, the wrapper (elevated
-                // id), or when the bound xite actually holds ADMIN.
-                let elevated = session.trusted || req_id >= WRAPPER_ID_BASE;
-                let has_admin = match &session.xite {
-                    Some(addr) => session.state.xite_has_admin(addr).await,
-                    None => false,
-                };
+                // id), when the bound xite actually holds ADMIN, or when the
+                // session was rebound through `as` by a xite that does.
+                let elevated = session.elevated(req_id);
+                let has_admin = session.admin
+                    || match &session.xite {
+                        Some(addr) => session.state.xite_has_admin(addr).await,
+                        None => false,
+                    };
                 if !elevated && !has_admin {
                     return Err(format!("You don't have permission to run {cmd}"));
                 }
@@ -432,9 +554,10 @@ impl CommandRegistry {
             return Err(msg.into());
         }
         // `as`: run another command in the context of a different xite
-        // (EpixNet's actionAs). Allowed for the bound xite itself, or when the
-        // CALLER's bound xite holds ADMIN; the inner command re-enters this
-        // dispatcher on a rebound session, so its own gates still apply.
+        // (EpixNet's actionAs). Allowed for the bound xite itself, for the
+        // wrapper's own elevated-id command or the operator socket, or when
+        // the CALLER's bound xite holds ADMIN; the inner command re-enters
+        // this dispatcher on a rebound session, so its own gates still apply.
         if cmd == "as" {
             let target = params
                 .get("address")
@@ -453,18 +576,32 @@ impl CommandRegistry {
                 .or_else(|| params.as_array().and_then(|a| a.get(2)))
                 .cloned()
                 .unwrap_or_else(|| Value::Array(Vec::new()));
-            let caller_elevated = session.trusted
-                || req_id >= WRAPPER_ID_BASE
-                || match &session.xite {
-                    Some(addr) => session.state.xite_has_admin(addr).await,
-                    None => false,
-                };
-            let allowed = caller_elevated || session.xite.as_deref() == Some(target.as_str());
+            // Wrapper authority comes from exactly two places: a real wrapper
+            // socket's own elevated-id command, or the operator socket. ADMIN
+            // on the caller's bound xite is not one of them: on a normal node
+            // the dashboard holds ADMIN by default, and were ADMIN to rebind
+            // as a wrapper, any ADMIN xite's page could reach `permissionAdd`
+            // and the EVX grant commands through `as` without a prompt.
+            let wrapper_authority = session.elevated(req_id);
+            let caller_admin = !wrapper_authority
+                && (session.admin
+                    || match &session.xite {
+                        Some(addr) => session.state.xite_has_admin(addr).await,
+                        None => false,
+                    });
+            let allowed =
+                wrapper_authority || caller_admin || session.xite.as_deref() == Some(target.as_str());
             if !allowed {
                 return Err(format!("No permission to run commands as {target}"));
             }
-            let rebound = WsSession::new(session.state.clone(), Some(target));
-            let inner_id = if caller_elevated { req_id.max(WRAPPER_ID_BASE) } else { req_id };
+            // The rebound session carries the caller's authority and nothing
+            // more: the wrapper or operator keeps wrapper authority and an
+            // elevated id; an ADMIN caller gets a page-level session that
+            // remembers only the ADMIN (for the admin gate) and keeps the
+            // page's id; a page-level caller stays one.
+            let mut rebound = WsSession::build(session.state.clone(), Some(target), false, wrapper_authority);
+            rebound.admin = caller_admin;
+            let inner_id = if wrapper_authority { req_id.max(WRAPPER_ID_BASE) } else { req_id };
             return Box::pin(self.dispatch(&rebound, &inner_cmd, &inner_params, inner_id)).await;
         }
         // A command from a disabled plugin behaves as if unregistered.
@@ -1983,9 +2120,30 @@ impl WsCommand for CorsPermission {
         if addresses.is_empty() {
             return Err("corsPermission: address required".into());
         }
+        let granted = s.state.xite_permissions(&xite).await;
         for addr in addresses {
             let addr = require_address(&addr)?;
-            s.state.add_permission(&xite, &format!("Cors:{addr}")).await;
+            if addr.is_empty()
+                || addr.len() > 128
+                || !addr.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+            {
+                return Err("corsPermission: malformed address".into());
+            }
+            let permission = format!("Cors:{addr}");
+            if granted.iter().any(|p| *p == permission) {
+                continue;
+            }
+            // Reading another xite's files is a grant the user makes in the
+            // wrapper's confirm dialog, exactly like permissionAdd. Only the
+            // operator socket skips the dialog; a timeout or dismissal grants
+            // nothing.
+            if !s.trusted {
+                let body = format!("This xite requests permission to read files from xite {addr}");
+                if !s.state.confirm(&xite, &body, "Grant").await {
+                    return Err(format!("corsPermission: access to {addr} was not granted"));
+                }
+            }
+            s.state.add_permission(&xite, &permission).await;
         }
         Ok(Value::from("ok"))
     }
@@ -3341,6 +3499,7 @@ impl WsCommand for PermissionAdd {
             .as_str()
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .ok_or("permissionAdd: permission required")?;
+        validate_grantable_permission(permission)?;
         s.state.add_permission(&address, permission).await;
         // A Merger grant rebuilds the merger dbs inline (not spawned) so the
         // page's grant callback already queries populated data - EpixNet's
@@ -3402,8 +3561,9 @@ impl WsCommand for PermissionDetails {
                     .replace('>', "&gt;")
                     .replace('"', "&quot;");
                 format!(
-                    "Allow this xite to read and send private messages for its own app \
-                    (<b>{app}</b>) as your identity. It cannot see your mail or other apps."
+                    "Allow this xite to read and send private messages in the app channel \
+                    <b>{app}</b> as your identity. Every xite granted this same app name shares \
+                    that channel; it cannot see your mail or other apps."
                 )
             }
             p if p.starts_with("Merger:") => {
@@ -4562,7 +4722,11 @@ mod tests {
         let commands = CommandRegistry::with_defaults();
         let result = commands.dispatch(&session, "networkRetry", &Value::Null, 1).await;
         assert!(result.is_err(), "an unprivileged page cannot wake every other download");
-        assert_eq!(commands.dispatch(&session, "networkRetry", &Value::Null, WRAPPER_ID_BASE)
+        // An elevated id on a page-level socket (one opened without the
+        // wrapper_key) is just a number the client chose.
+        assert!(commands.dispatch(&session, "networkRetry", &Value::Null, WRAPPER_ID_BASE).await.is_err());
+        let wrapper = WsSession::new_wrapper(session.state.clone(), session.xite.clone());
+        assert_eq!(commands.dispatch(&wrapper, "networkRetry", &Value::Null, WRAPPER_ID_BASE)
             .await.unwrap(), "ok");
     }
 
@@ -4997,8 +5161,11 @@ mod tests {
             ("1A".to_string(), "index.html".to_string())
         );
 
-        // Grant Cors:1B (as corsPermission does), then the cors- path routes to 1B.
-        CorsPermission.handle(&session, &json!("1B")).await.unwrap();
+        // Grant Cors:1B from the operator socket (a page's corsPermission
+        // first waits for the user's answer; see cors_permission_waits_for_the_users_answer),
+        // then the cors- path routes to 1B.
+        let operator = WsSession::new_trusted(state.clone(), Some("1A".into()));
+        CorsPermission.handle(&operator, &json!("1B")).await.unwrap();
         assert_eq!(
             session.cors_target("cors-1B/data.json").await.unwrap(),
             ("1B".to_string(), "data.json".to_string())
@@ -5051,6 +5218,341 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_page_cannot_grant_itself_permissions_without_the_wrapper_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1SelfGrant";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+
+        // The forwarded inner-page shape: small id, no prompt happened.
+        for permission in ["ADMIN", "Merger:EpixPost", "Channels:talk", "NOSANDBOX"] {
+            let denied = registry.dispatch(&session, "permissionAdd", &json!(permission), 7).await;
+            assert!(denied.is_err(), "{permission}: a page granted itself a permission");
+            assert!(denied.unwrap_err().contains("prompt"));
+        }
+        assert!(!state.xite_has_admin(addr).await);
+        assert!(state.xite_permissions(addr).await.is_empty(), "nothing was persisted");
+
+        // Rebinding to itself through `as` keeps the page's id, so it is refused too.
+        let via_as = registry
+            .dispatch(&session, "as", &json!([addr, "permissionAdd", ["ADMIN"]]), 8)
+            .await;
+        assert!(via_as.is_err());
+        assert!(!state.xite_has_admin(addr).await);
+
+        // A socket the page opened itself can claim the elevated range, but
+        // it never presented the wrapper_key, so the id proves nothing.
+        let forged = registry.dispatch(&session, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 3).await;
+        assert!(forged.unwrap_err().contains("prompt"));
+        assert!(!state.xite_has_admin(addr).await);
+
+        // The wrapper, after the user tapped Grant, sends from its own range
+        // over the socket it authenticated with the xite's wrapper_key.
+        let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+        assert!(registry.dispatch(&wrapper, "permissionAdd", &json!("ADMIN"), 7).await.is_err(),
+            "a page command forwarded by the wrapper keeps its small id and is still refused");
+        assert_eq!(
+            registry.dispatch(&wrapper, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 3).await.unwrap(),
+            "ok"
+        );
+        assert!(state.xite_has_admin(addr).await);
+
+        // So does the operator's admin socket.
+        let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+        assert_eq!(
+            registry.dispatch(&trusted, "permissionAdd", &json!("Merger:EpixPost"), 1).await.unwrap(),
+            "ok"
+        );
+        assert!(state.xite_permissions(addr).await.iter().any(|p| p == "Merger:EpixPost"));
+    }
+
+    #[tokio::test]
+    async fn a_page_cannot_reach_the_evx_grant_commands_without_the_wrapper_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1EvxSelfGrant";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        // The default registry has no EVX handlers (they are the Evx plugin's),
+        // so a request that passes the gate dispatches to `null` and one the
+        // gate refuses never gets that far. That is the distinction this test
+        // pins: a page hits the gate, never a handler.
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        let params = json!({ "xite": addr, "declaration_digest": "0".repeat(64), "mode": "enable" });
+
+        for cmd in EVX_WRAPPER_COMMANDS {
+            // The forwarded inner-page shape: small id, no dialog happened.
+            let denied = registry.dispatch(&session, cmd, &params, 7).await;
+            assert!(denied.as_ref().unwrap_err().contains("prompt"), "{cmd}: {denied:?}");
+            // A socket the page opened itself can claim the elevated range,
+            // but it never presented the wrapper_key, so the id proves nothing.
+            let forged = registry.dispatch(&session, cmd, &params, WRAPPER_ID_BASE + 3).await;
+            assert!(forged.as_ref().unwrap_err().contains("prompt"), "{cmd}: {forged:?}");
+            // Rebinding to itself through `as` keeps the page's id.
+            let via_as = registry.dispatch(&session, "as", &json!([addr, cmd, params.clone()]), 8).await;
+            assert!(via_as.is_err(), "{cmd} reached through as");
+            // The wrapper forwarding a page command keeps the small id too.
+            let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&wrapper, cmd, &params, 7).await.is_err(), "{cmd}");
+            // The wrapper's own dialog answer, and the operator socket, pass
+            // the gate (and reach the plugin's handler on a real node).
+            assert!(registry.dispatch(&wrapper, cmd, &params, WRAPPER_ID_BASE + 3).await.is_ok(), "{cmd}");
+            let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&trusted, cmd, &params, 1).await.is_ok(), "{cmd}");
+        }
+        // The inert commands are not gated: a page may inspect and ask.
+        for cmd in ["evxInspect", "evxStatus", "evxRequest"] {
+            assert!(!EVX_WRAPPER_COMMANDS.contains(&cmd));
+            assert!(registry.dispatch(&session, cmd, &json!({}), 7).await.is_ok(), "{cmd}");
+        }
+    }
+
+    #[tokio::test]
+    async fn an_admin_xite_page_gains_no_wrapper_authority_through_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let dashboard = "1AdminDashboard";
+        let target = "1EvxTarget";
+        for addr in [dashboard, target] {
+            state
+                .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path().join(addr)), content: None })
+                .await;
+        }
+        // The dashboard holds ADMIN, as it does by default on a normal node.
+        state.add_permission(dashboard, "ADMIN").await;
+        assert!(state.xite_has_admin(dashboard).await);
+        let registry = CommandRegistry::with_defaults();
+        let page = WsSession::new(state.clone(), Some(dashboard.into()));
+        let params = json!({ "xite": target, "declaration_digest": "0".repeat(64), "mode": "enable" });
+
+        // ADMIN grants nothing here: the rebound session is a page-level one
+        // with the page's own id, so the EVX gate refuses it for any target,
+        // the dashboard's own xite included.
+        for cmd in EVX_WRAPPER_COMMANDS {
+            for rebound_to in [target, dashboard] {
+                let via_as = registry.dispatch(&page, "as", &json!([rebound_to, cmd, params.clone()]), 8).await;
+                assert!(via_as.as_ref().unwrap_err().contains("prompt"), "{cmd} as {rebound_to}: {via_as:?}");
+                let keyed = registry
+                    .dispatch(&page, "as", &json!({ "address": rebound_to, "cmd": cmd, "params": params.clone() }), 9)
+                    .await;
+                assert!(keyed.as_ref().unwrap_err().contains("prompt"), "{cmd} as {rebound_to}: {keyed:?}");
+            }
+        }
+        // Nor does ADMIN stand in for the permission prompt on another xite.
+        let via_as = registry.dispatch(&page, "as", &json!([target, "permissionAdd", ["ADMIN"]]), 10).await;
+        assert!(via_as.unwrap_err().contains("prompt"));
+        assert!(!state.xite_has_admin(target).await);
+        assert!(state.xite_permissions(target).await.is_empty());
+
+        // What ADMIN did confer before still holds: admin commands run as
+        // another xite, and a xite that holds no ADMIN still cannot.
+        let detail = registry.dispatch(&page, "as", &json!([target, "permissionDetails", ["ADMIN"]]), 11).await;
+        assert!(detail.unwrap().as_str().unwrap().contains("administrate"));
+        let plain = WsSession::new(state.clone(), Some(target.into()));
+        assert!(registry.dispatch(&plain, "as", &json!([dashboard, "permissionDetails", ["ADMIN"]]), 12).await.is_err());
+        assert!(registry.dispatch(&plain, "permissionDetails", &json!(["ADMIN"]), 13).await.is_err());
+
+        // The wrapper's own command and the operator socket keep wrapper
+        // authority through `as`: they are the only two sources of it.
+        let wrapper = WsSession::new_wrapper(state.clone(), Some(dashboard.into()));
+        assert!(registry.dispatch(&wrapper, "as", &json!([target, "permissionAdd", ["Merger:EpixPost"]]), 7).await.is_err(),
+            "a page command forwarded by the wrapper keeps its small id");
+        let granted = registry
+            .dispatch(&wrapper, "as", &json!([target, "permissionAdd", ["Merger:EpixPost"]]), WRAPPER_ID_BASE + 2)
+            .await;
+        assert_eq!(granted.unwrap(), "ok");
+        assert!(state.xite_permissions(target).await.iter().any(|p| p == "Merger:EpixPost"));
+        let operator = WsSession::new_trusted(state.clone(), None);
+        for cmd in EVX_WRAPPER_COMMANDS {
+            assert!(registry.dispatch(&operator, "as", &json!([target, cmd, params.clone()]), 1).await.is_ok(), "{cmd}");
+        }
+    }
+
+    /// The Milestone 3 job commands are gated by name, exactly like the
+    /// grant commands: the page may read a job's status, never start, pause
+    /// or resume one. Pinned on the names so a rename or an omission from
+    /// the list fails here rather than in the plugin's suite alone.
+    #[tokio::test]
+    async fn a_page_cannot_reach_the_evx_job_commands_without_the_wrapper_prompt() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1EvxJobs";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let page = WsSession::new(state.clone(), Some(addr.into()));
+        let params = json!({ "xite": addr, "job": "sync" });
+        for cmd in ["evxJobPause", "evxJobResume", "evxRunJob"] {
+            assert!(EVX_WRAPPER_COMMANDS.contains(&cmd), "{cmd} is not gated");
+            let denied = registry.dispatch(&page, cmd, &params, 7).await;
+            assert!(denied.as_ref().unwrap_err().contains("prompt"), "{cmd}: {denied:?}");
+            let forged = registry.dispatch(&page, cmd, &params, WRAPPER_ID_BASE + 3).await;
+            assert!(forged.as_ref().unwrap_err().contains("prompt"), "{cmd}: {forged:?}");
+            let via_as = registry.dispatch(&page, "as", &json!([addr, cmd, params.clone()]), 8).await;
+            assert!(via_as.is_err(), "{cmd} reached through as");
+            let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&wrapper, cmd, &params, 7).await.is_err(), "{cmd}: forwarded page command");
+            assert!(registry.dispatch(&wrapper, cmd, &params, WRAPPER_ID_BASE + 3).await.is_ok(), "{cmd}: the wrapper's own");
+            let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&trusted, cmd, &params, 1).await.is_ok(), "{cmd}: the operator");
+        }
+        // Status, which carries the jobs, stays readable by the page.
+        assert!(!EVX_WRAPPER_COMMANDS.contains(&"evxStatus"));
+        assert!(registry.dispatch(&page, "evxStatus", &json!({}), 7).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn evx_grant_commands_are_refused_on_a_public_gateway_even_with_an_elevated_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1EvxGateway";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        state.config_set("ui_restrict", json!(true)).await;
+        let registry = CommandRegistry::with_defaults();
+        let params = json!({ "xite": addr });
+        for cmd in EVX_WRAPPER_COMMANDS {
+            // Any visitor can send an elevated id to a reverse-proxied node,
+            // and the wrapper page (with its key) is served to every visitor.
+            let page = WsSession::new(state.clone(), Some(addr.into()));
+            let denied = registry.dispatch(&page, cmd, &params, WRAPPER_ID_BASE + 1).await;
+            assert!(denied.unwrap_err().contains("gateway"), "{cmd}");
+            let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+            let denied = registry.dispatch(&wrapper, cmd, &params, WRAPPER_ID_BASE + 1).await;
+            assert!(denied.unwrap_err().contains("gateway"), "{cmd}");
+            // The operator socket is the sanctioned way to change a locked node.
+            let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+            assert!(registry.dispatch(&trusted, cmd, &params, 1).await.is_ok(), "{cmd}");
+        }
+    }
+
+    /// `EVX` is consent recorded by the Evx plugin's own grant store, never a
+    /// permission string: were `permissionAdd` to accept it, the generic
+    /// permission prompt would stand in for the EVX dialog and a stored
+    /// string would look like execution consent to anything matching on it.
+    #[test]
+    fn evx_is_never_a_grantable_permission() {
+        for spelling in ["EVX", "evx", "Evx", "EVX:run", "EVX:enable", "Evx:once"] {
+            assert!(validate_grantable_permission(spelling).is_err(), "accepted {spelling:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn permission_grants_are_refused_on_a_public_gateway_even_with_an_elevated_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1Gateway";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        state.config_set("ui_restrict", json!(true)).await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        // Any visitor can send an elevated id to a reverse-proxied node.
+        let denied = registry.dispatch(&session, "permissionAdd", &json!("ADMIN"), WRAPPER_ID_BASE + 1).await;
+        assert!(denied.unwrap_err().contains("gateway"));
+        let denied = registry.dispatch(&session, "corsPermission", &json!("1Other"), WRAPPER_ID_BASE + 2).await;
+        assert!(denied.unwrap_err().contains("gateway"));
+        assert!(state.xite_permissions(addr).await.is_empty());
+        // The operator socket is the sanctioned way to change a locked node.
+        let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+        assert_eq!(registry.dispatch(&trusted, "permissionAdd", &json!("ADMIN"), 1).await.unwrap(), "ok");
+    }
+
+    #[tokio::test]
+    async fn only_known_well_formed_permissions_can_be_granted() {
+        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "Merger:EpixPost", "Channels:talk", "Channels:a.b-c_1"] {
+            assert!(validate_grantable_permission(ok).is_ok(), "{ok}");
+        }
+        let long = format!("Merger:{}", "x".repeat(129));
+        for bad in [
+            "", "admin", "ADMIN ", "ADMIN\n", "Merger:", "Channels:", "Channels:<img src=x>",
+            "Merger:../x", "Cors:1Target", "EVX", "Merger:a b", long.as_str(), "Channels:-x",
+        ] {
+            assert!(validate_grantable_permission(bad).is_err(), "accepted {bad:?}");
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1Shapes";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        let denied = registry.dispatch(&session, "permissionAdd", &json!("Cors:1Target"), WRAPPER_ID_BASE + 1).await;
+        assert!(denied.is_err(), "Cors grants go through corsPermission's own prompt");
+        assert!(state.xite_permissions(addr).await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn cors_permission_waits_for_the_users_answer() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1Reader";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = CommandRegistry::with_defaults();
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        let mut events = state.subscribe_events();
+        state.register_bound_conn(addr, 1);
+
+        // The page asks; the handler pushes a confirm to the wrapper and waits.
+        let (s2, r2) = (state.clone(), registry);
+        let pending = tokio::spawn(async move {
+            let session = WsSession::new(s2, Some(addr.into()));
+            r2.dispatch(&session, "corsPermission", &json!("1Target"), 3).await
+        });
+        let ev = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv()).await.unwrap().unwrap();
+        let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+        assert_eq!(payload["cmd"], "confirm");
+        assert!(payload["params"][0].as_str().unwrap().contains("1Target"));
+        assert!(state.xite_permissions(addr).await.is_empty(), "nothing granted before the answer");
+
+        // The user declines: no grant, the command errors.
+        let to = payload["id"].as_i64().unwrap();
+        assert!(state.resolve_callback(to, json!(false)));
+        let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await.unwrap().unwrap();
+        assert!(outcome.is_err());
+        assert!(state.xite_permissions(addr).await.is_empty());
+
+        // Malformed targets never reach the prompt.
+        let bad = CorsPermission.handle(&session, &json!("../1Target")).await;
+        assert!(bad.is_err());
+        // The operator socket needs no dialog.
+        let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+        assert_eq!(CorsPermission.handle(&trusted, &json!("1Target")).await.unwrap(), "ok");
+        assert!(state.xite_permissions(addr).await.iter().any(|p| p == "Cors:1Target"));
+    }
+
+    #[test]
+    fn pushed_prompt_answers_need_wrapper_authority() {
+        // The wrapper answers a server confirm over its own socket (one that
+        // presented the xite's wrapper_key) from the elevated id range; a
+        // forwarded inner-page answer carries a small id, and a socket opened
+        // by anything else can pick any id without gaining authority.
+        let state = AppState::new("test");
+        let wrapper = WsSession::new_wrapper(state.clone(), Some("1site".into()));
+        let page = WsSession::new(state.clone(), Some("1site".into()));
+        let operator = WsSession::new_trusted(state, Some("1site".into()));
+        assert!(is_wrapper_authority(&wrapper, WRAPPER_ID_BASE));
+        assert!(!is_wrapper_authority(&wrapper, WRAPPER_ID_BASE - 1));
+        assert!(!is_wrapper_authority(&wrapper, 1));
+        assert!(is_wrapper_authority(&operator, 1));
+        assert!(!is_wrapper_authority(&page, WRAPPER_ID_BASE));
+        assert!(!is_wrapper_authority(&page, i64::MAX));
+        assert!(!is_wrapper_authority(&page, 0));
+    }
+
+    #[tokio::test]
     async fn admin_commands_are_gated_until_granted() {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");
@@ -5066,8 +5568,14 @@ mod tests {
         assert!(denied.is_err(), "siteList must be denied without ADMIN");
         assert!(denied.unwrap_err().contains("permission"));
 
-        // The trusted wrapper (elevated id) may run it even without a xite grant.
-        assert!(registry.dispatch(&session, "siteList", &json!([]), 1_000_001).await.is_ok());
+        // An elevated id on a page-level socket is not the wrapper.
+        assert!(registry.dispatch(&session, "siteList", &json!([]), 1_000_001).await.is_err());
+        // The wrapper (elevated id on its authenticated socket) may run it
+        // even without a xite grant.
+        let wrapper = WsSession::new_wrapper(state.clone(), Some(addr.into()));
+        assert!(registry.dispatch(&wrapper, "siteList", &json!([]), 1_000_001).await.is_ok());
+        assert!(registry.dispatch(&wrapper, "siteList", &json!([]), 5).await.is_err(),
+            "a forwarded page command keeps the page's authority");
 
         // Granting the xite ADMIN (as the wrapper does after the user confirms)
         // then lets the inner page run admin commands too.

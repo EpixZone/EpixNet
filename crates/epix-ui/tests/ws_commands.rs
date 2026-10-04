@@ -8,6 +8,8 @@ use epix_xite::XiteStorage;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+/// The wrapper chrome's own commands: an elevated id on a socket that
+/// authenticated with the xite's wrapper_key (`WsSession::new_wrapper`).
 const WRAPPER_ID: i64 = 1_000_000;
 
 fn assert_empty_authoring_fields(content: &Value) {
@@ -58,7 +60,7 @@ async fn state_with_xite() -> (Arc<AppState>, tempfile::TempDir, String, String)
 async fn xite_add_reports_existing_xite() {
     let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
-    let session = WsSession::new(state, Some(address.clone()));
+    let session = WsSession::new_wrapper(state, Some(address.clone()));
     let res = registry
         .dispatch(&session, "siteAdd", &json!({ "address": address }), WRAPPER_ID)
         .await
@@ -106,7 +108,7 @@ async fn file_query_wildcard_and_filter() {
 async fn modified_files_and_settings_value() {
     let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
-    let session = WsSession::new(state.clone(), Some(address.clone()));
+    let session = WsSession::new_wrapper(state.clone(), Some(address.clone()));
 
     // Freshly signed: nothing modified.
     let res = registry
@@ -200,7 +202,7 @@ async fn bad_cert_is_recorded() {
 async fn server_portcheck_reports_cached_status() {
     let (state, _root, address, _key) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
-    let session = WsSession::new(state.clone(), Some(address));
+    let session = WsSession::new_wrapper(state.clone(), Some(address));
     let res =
         registry.dispatch(&session, "serverPortcheck", &json!({}), WRAPPER_ID).await.unwrap();
     assert_eq!(res, Value::from(false));
@@ -434,7 +436,7 @@ async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
         .await;
 
     let registry = CommandRegistry::with_defaults();
-    let session = WsSession::new(state.clone(), Some(merger.clone()));
+    let session = WsSession::new_wrapper(state.clone(), Some(merger.clone()));
 
     // No grant yet: the merger db holds no merged rows.
     let rows =
@@ -443,7 +445,9 @@ async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
 
     let mut events = state.subscribe_events();
     let res =
-        registry.dispatch(&session, "permissionAdd", &json!(["Merger:Test"]), 1).await.unwrap();
+        // The grant arrives from the wrapper's elevated id range after the
+        // user confirmed it; a page's own id is refused.
+        registry.dispatch(&session, "permissionAdd", &json!(["Merger:Test"]), 1_000_001).await.unwrap();
     assert_eq!(res, Value::from("ok"));
 
     // The rebuild ran inline: the hub's rows answer immediately.
@@ -469,7 +473,7 @@ async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
 async fn set_xite_privatekey_rejects_a_key_that_cannot_sign_the_xite() {
     let (state, _root, address, privkey) = state_with_xite().await;
     let registry = CommandRegistry::with_defaults();
-    let session = WsSession::new(state.clone(), Some(address.clone()));
+    let session = WsSession::new_wrapper(state.clone(), Some(address.clone()));
 
     let malformed = registry
         .dispatch(&session, "userSetSitePrivatekey", &json!(["not-a-private-key"]), WRAPPER_ID)

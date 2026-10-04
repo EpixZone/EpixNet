@@ -1,0 +1,35 @@
+[package]
+name = "evx-activation"
+version = "0.1.0"
+edition = "2021"
+description = "EVX signed activation: envelope verification, immutable closure capture, admission."
+
+[features]
+# Exposes `sign_envelope` so a conformance suite can mint signed fixtures.
+# Never enable in a worker or any process that must not hold publisher keys.
+fixtures = []
+
+[dependencies]
+evx-api = { path = "../evx-api" }
+# The content path digests exactly the bytes the owner signed
+# (`epix_content::signed_data`) and names the owner by root address
+# (`epix_crypt::is_valid_address`). Neither crate verifies anything here;
+# the node does that before calling the loader.
+epix-content = { path = "../epix-content" }
+epix-crypt = { path = "../epix-crypt" }
+ed25519-dalek = { version = "3", default-features = false }
+sha2 = "0.10"
+hex = "0.4"
+base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+# float_roundtrip: parse floats correctly rounded, as Python does, so the
+# canonical form of a signed body is byte-identical to the reference.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs"] }
+
+[dev-dependencies]
+tempfile = "3"
+rand = "0.9"

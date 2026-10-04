@@ -1,0 +1,69 @@
+name: EVX platform acceptance
+
+on:
+  push:
+    branches: [main, evx]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  linux:
+    name: Linux native confinement (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      EPIX_WALLET_SKIP: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends protobuf-compiler pkg-config
+      - name: Run native and Pulley acceptance
+        run: python3 scripts/evx-platform-acceptance.py linux --output "${RUNNER_TEMP}/evx-evidence"
+      - name: Retain exact results, including failures
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: evx-${{ matrix.os }}
+          path: ${{ runner.temp }}/evx-evidence
+          if-no-files-found: error
+
+  windows-core:
+    name: Windows portable core (execution disabled)
+    runs-on: windows-2025
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Test portable runtime and preserve unsupported-product exclusion
+        shell: pwsh
+        run: python scripts/evx-platform-acceptance.py windows-core --output "$env:RUNNER_TEMP/evx-evidence"
+      - name: Retain results without claiming worker containment
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: evx-windows-core
+          path: ${{ runner.temp }}/evx-evidence
+          if-no-files-found: error

@@ -1,0 +1,62 @@
+{
+  "date": "2026-10-03",
+  "platform": "Darwin arm64",
+  "rustc": "rustc 1.101.0-nightly (0abfedbc7 2026-10-02)",
+  "cargo_fuzz": "0.13.2",
+  "sanitizer": "address",
+  "wasmtime": "48.0.5",
+  "wasmparser": "0.254.2",
+  "campaigns": [
+    {
+      "target": "declaration",
+      "executions": 2122598,
+      "seconds": 46,
+      "crashes": 0,
+      "result": "completed without a reported crash or invariant failure",
+      "final_status": "#2122598\tDONE   cov: 3053 ft: 9655 corp: 1574/269Kb lim: 4073 exec/s: 46143 rss: 575Mb",
+      "log": "declaration.log.gz"
+    },
+    {
+      "target": "activation",
+      "executions": 62401,
+      "seconds": 46,
+      "crashes": 0,
+      "result": "completed without a reported crash or invariant failure",
+      "final_status": "#62401\tDONE   cov: 4344 ft: 10820 corp: 560/37Kb lim: 305 exec/s: 1356 rss: 216Mb",
+      "log": "activation.log.gz"
+    },
+    {
+      "target": "wasm_profile",
+      "executions": 423328,
+      "seconds": 61,
+      "crashes": 0,
+      "result": "completed without a reported crash or invariant failure",
+      "final_status": "#423328\tDONE   cov: 9884 ft: 18421 corp: 2608/114Kb lim: 512 exec/s: 6939 rss: 444Mb",
+      "log": "wasm_profile.log.gz"
+    },
+    {
+      "target": "ipc_frames",
+      "executions": 1561164,
+      "seconds": 61,
+      "crashes": 0,
+      "peak_rss_mb": 685,
+      "result": "completed without a reported crash or invariant failure",
+      "final_status": "#1561164\tDONE   cov: 4875 ft: 14978 corp: 1749/339Kb lim: 4424 exec/s: 25592 rss: 685Mb",
+      "log": "ipc_frames.log.gz",
+      "boundary_replay": {
+        "inputs": 2,
+        "result": "both fixed maximum-size valid and truncated frames completed successfully under AddressSanitizer",
+        "log": "ipc_frames-boundary-replay.log.gz"
+      },
+      "command": "cargo +nightly fuzz run ipc_frames --fuzz-dir fuzz --target-dir /tmp/evx-ipc-fuzz-target --codegen-units 16 -- -max_total_time=60 -timeout=5 -rss_limit_mb=768 -max_len=131076",
+      "sanitizer": "address (cargo-fuzz default; explicit for fixed-input replay)",
+      "production_source_sha256": {
+        "crates/evx-worker/src/ipc.rs": "41694d6440d54e3a42f5c972dd99d90f9a79af8a8eed2d6c4e48316258a4c6f5",
+        "crates/evx-api/src/frames.rs": "47fc18dd000c4cbee542333db573867570eb73cb7a725fe9f6ac5b1136b1cb76",
+        "crates/evx-api/src/strict.rs": "99d3416157e3fc718b3917b8f4228da86515b4d4916bdb6a40601a126ac90a0a"
+      }
+    }
+  ],
+  "scope": "Historical initial campaigns; see aligned_manifest for the later frozen-source campaign.",
+  "aligned_manifest": "2026-10-03-aligned/manifest.json"
+}

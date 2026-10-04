@@ -67,10 +67,12 @@ fn document(state: &AppState, address: &str, by_name: bool) -> Request<Body> {
     } else {
         format!("/{address}/index.html?wrapper_nonce={nonce}")
     };
+    // In host mode the wrapper's frame loads from the xite's content host.
+    let content_host = format!("{}.content.epix", DOMAIN.trim_end_matches(".epix"));
     rewrite_proxy_host(
         Request::builder()
             .uri(uri)
-            .header("host", if by_name { DOMAIN } else { "127.0.0.1" })
+            .header("host", if by_name { content_host.as_str() } else { "127.0.0.1" })
             .header("sec-fetch-dest", "iframe")
             .header("sec-fetch-mode", "navigate")
             .body(Body::empty())

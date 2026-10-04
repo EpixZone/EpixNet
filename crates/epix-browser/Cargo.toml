@@ -88,8 +88,13 @@ zip = { version = "8", default-features = false, features = ["deflate"] }
 winresource = "0.1"
 
 [features]
-default = ["tor", "bridges", "bittorrent"]
+default = ["tor", "bridges", "bittorrent", "evx"]
 tor = ["epix-node/tor"]
+# The EVX service (docs/evx-milestone-2.md): the desktop node inspects,
+# grants and runs a xite's declared programs. Also in epix-node's default;
+# named here so a build that trims the node default keeps it explicitly.
+evx = ["epix-node/evx"]
+apple-xpc = ["evx", "epix-node/apple-xpc"]
 # In-process Tor pluggable transports (Snowflake) for censored networks. Off by
 # default; a bridges-enabled desktop build opts in explicitly.
 bridges = ["epix-node/bridges"]

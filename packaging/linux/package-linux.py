@@ -15,7 +15,8 @@ import tarfile
 import urllib.request
 
 HERE = Path(__file__).resolve().parent
-BINARIES = ("epix-browser", "epix-nmh", "epix-server")
+COMMANDS = ("epix-browser", "epix-nmh", "epix-server")
+BINARIES = COMMANDS + ("evx-worker",)
 
 
 def run(*args, **kwargs):
@@ -52,7 +53,10 @@ def check_firefox(directory, expected=None):
 def validate_stage(stage):
     arch = elf_arch(stage / BINARIES[0])
     for binary in BINARIES:
-        if elf_arch(stage / binary) != arch or not os.access(stage / binary, os.X_OK):
+        path = stage / binary
+        if path.is_symlink() or not path.is_file():
+            raise ValueError(f"{binary}: expected a regular executable, not a symlink")
+        if elf_arch(path) != arch or not os.access(path, os.X_OK):
             raise ValueError(f"{binary}: architecture mismatch or missing executable permission")
     check_firefox(stage / "firefox", arch)
     if elf_arch(stage / "firefox/libepix-sandbox-probe.so") != arch:
@@ -121,7 +125,7 @@ def native_config(stage, version, arch, work, files):
     ]
     contents += [
         {"src": "/opt/epixnet/" + binary, "dst": "/usr/bin/" + binary, "type": "symlink"}
-        for binary in BINARIES
+        for binary in COMMANDS
     ]
     # Derive Debian library versions from the actual ELF inputs, so even a
     # developer building on a newer distro cannot publish false requirements.
