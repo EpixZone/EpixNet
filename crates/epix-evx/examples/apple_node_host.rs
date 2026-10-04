@@ -3,7 +3,7 @@
 #[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() {
     use epix_evx::apple_development::AppleDevelopmentBackend;
-    use epix_evx::{EvxPlugin, EvxService, GrantMode, GrantRequest, Shown, CAPABILITY_KEY};
+    use epix_evx::{EvxPlugin, EvxService, GrantMode, GrantRequest, Shown, CAPABILITY_KEY, PLUGIN_NAME};
     use epix_plugin::Plugin;
     use epix_ui::{AppState, XiteEntry};
     use epix_xite::XiteStorage;
@@ -85,9 +85,20 @@ async fn main() {
 
     assert!(registry.lookup(&xite).unwrap().is_none(), "inspection allocated a slot");
     assert!(service.run_once(&app, &xite, "calc", None).await.is_err(), "execution needs consent");
+    // Let any in-flight tick finish before establishing consent and pausing
+    // the job. A claim racing that pause is refused and backs off, making the
+    // later resume check depend on a scheduling accident during setup.
+    app.set_plugin_enabled(PLUGIN_NAME, false).await;
+    let ticks = service.scheduler_ticks();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while service.scheduler_ticks() == ticks {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }).await.expect("scheduler observed disabled setup");
     service.grant(&app, GrantRequest { xite:xite.clone(), declaration_digest:inspection.digest.clone(), mode:GrantMode::Enable,
         program:None, limits:None, label:None, shown:Some(Shown::of(&inspection)) }).await.unwrap();
     service.job_pause(&app, &xite, "refresh").await.unwrap();
+    app.set_plugin_enabled(PLUGIN_NAME, true).await;
     let result = service.run_once(&app, &xite, "calc", None).await.unwrap();
     assert_eq!(result["status"], "ok", "{result}");
     assert_eq!(result["value"], 42);

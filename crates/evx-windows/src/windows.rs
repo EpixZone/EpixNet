@@ -126,7 +126,7 @@ impl Drop for Local {
 fn token(process: HANDLE) -> io::Result<Handle> {
     let mut raw = null_mut();
     unsafe {
-        ok(OpenProcessToken(process, TOKEN_QUERY, &mut raw))?;
+        ok(OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw))?;
     }
     Handle::checked(raw)
 }
@@ -528,27 +528,76 @@ fn job() -> io::Result<Handle> {
     }
     Ok(job)
 }
+fn grants_read(token: &Handle, package: &str) -> io::Result<bool> {
+    // Satisfy the ordinary user check with Everyone; the second grant tests
+    // the AppContainer package restriction independently of host file ACLs.
+    let sd = descriptor(&format!("O:SYG:SYD:(A;;0x1;;;WD)(A;;0x1;;;{package})"))?;
+    let mapping = GENERIC_MAPPING {
+        GenericRead: 1,
+        GenericWrite: 1,
+        GenericExecute: 1,
+        GenericAll: 1,
+    };
+    let mut privileges: PRIVILEGE_SET = unsafe { zeroed() };
+    let mut bytes = size_of::<PRIVILEGE_SET>() as u32;
+    let mut granted = 0;
+    let mut allowed = 0;
+    unsafe {
+        ok(AccessCheck(
+            sd.0,
+            token.0,
+            1,
+            &mapping,
+            &mut privileges,
+            &mut bytes,
+            &mut granted,
+            &mut allowed,
+        ))?;
+    }
+    Ok(allowed != 0 && granted & 1 != 0)
+}
+
+fn validate_lpac(token: &Handle, package: PSID) -> io::Result<()> {
+    let mut raw = null_mut();
+    unsafe {
+        ok(DuplicateToken(token.0, SecurityIdentification, &mut raw))?;
+    }
+    let impersonation = Handle::checked(raw)?;
+    // Class 46 (TokenIsLessPrivilegedAppContainer) is not queryable through
+    // GetTokenInformation on current Windows. Check LPAC's defining access
+    // restriction: its own package grant works, ALL_APPLICATION_PACKAGES does
+    // not. The positive control prevents an unrelated denial from passing.
+    if !grants_read(&impersonation, &sid_text(package)?)? {
+        return Err(fail("AppContainer token failed its own package access check"));
+    }
+    if grants_read(&impersonation, "S-1-15-2-1")? {
+        return Err(fail("child token accepts ALL_APPLICATION_PACKAGES; LPAC required"));
+    }
+    Ok(())
+}
+
 fn validate_token(process: HANDLE, expected: Option<PSID>) -> io::Result<()> {
     let token = token(process)?;
-    for class in [TokenIsAppContainer, TokenIsLessPrivilegedAppContainer] {
-        let buffer = token_info(&token, class)?;
-        if unsafe { *buffer.as_ptr().cast::<u32>() } != 1 {
-            return Err(fail("child token is not an LPAC"));
-        }
+    let buffer = token_info(&token, TokenIsAppContainer)?;
+    if unsafe { *buffer.as_ptr().cast::<u32>() } == 0 {
+        return Err(fail("child token is not an AppContainer"));
     }
     let caps = token_info(&token, TokenCapabilities)?;
     if unsafe { (*caps.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount } != 0 {
         return Err(fail("unexpected AppContainer capabilities"));
     }
+    let sid = token_info(&token, TokenAppContainerSid)?;
+    let actual =
+        unsafe { (*sid.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer };
+    if actual.is_null() {
+        return Err(fail("missing AppContainer identity"));
+    }
     if let Some(expected) = expected {
-        let sid = token_info(&token, TokenAppContainerSid)?;
-        let actual =
-            unsafe { (*sid.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer };
         if unsafe { EqualSid(actual, expected) } == 0 {
             return Err(fail("wrong AppContainer identity"));
         }
     }
-    Ok(())
+    validate_lpac(&token, actual)
 }
 
 struct Child {

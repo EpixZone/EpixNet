@@ -23,8 +23,12 @@ no network, broad filesystem or registry grants.
 
 `PROC_THREAD_ATTRIBUTE_JOB_LIST` attaches the process to its job during
 `CreateProcessW`. There is no create-then-assign gap. The process initially stays
-suspended while the host verifies its AppContainer SID, LPAC flag, empty
-capability list and job membership. An unsupported or failed operation refuses
+suspended while the host verifies its AppContainer SID, LPAC access restrictions,
+empty capability list and job membership. The LPAC check uses an impersonation
+duplicate with `AccessCheck`: a grant to the exact package must succeed, while
+a grant to `ALL_APPLICATION_PACKAGES` must be denied. This avoids relying on
+the class-46 token query, which current Windows rejects from user mode.
+An unsupported or failed operation refuses
 execution. There is no unrestricted fallback.
 
 The job permits one process, disallows breakaway, uses kill-on-last-job-handle
@@ -35,6 +39,8 @@ sleep and stalled execution. Child creation is also disabled by the process
 creation policy. The only inherited handle is a private reply-pipe writer;
 a deliberately inheritable event is excluded and checked by the fixture.
 The parent environment and ordinary standard handles are not passed through.
+The child environment contains only `SystemRoot` and `LOCALAPPDATA`, resolved
+through Windows APIs; AppContainer startup redirects its profile storage.
 
 Normal completion requires a signaled process handle followed by job accounting
 showing zero active processes. `TerminateJobObject` returning success, a reply,
