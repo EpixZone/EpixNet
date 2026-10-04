@@ -322,7 +322,7 @@ impl Peer {
                     "direct worker launch outcome unconfirmed".into(),
                 ));
             }
-            Err(_) => return Err(Denied::new("worker launch failed")),
+            Err(error) => return Err(Denied::new(format!("worker launch failed: {error}"))),
         };
         let pid = child.id() as i32;
         let stdin = child

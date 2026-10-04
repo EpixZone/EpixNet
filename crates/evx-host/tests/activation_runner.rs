@@ -13,6 +13,8 @@ use evx_api::{Capability, Grant, Limits, Status};
 use evx_host::run_activation;
 use evx_supervisor::{Broker, Config, RunOptions};
 
+const QUARANTINE_WORKER: &str = "EVX_COMPILER_QUARANTINE_FIXTURE";
+
 const CALC: &str = r#"(module (memory (export "memory") 1) (func (export "run") (result i32) i32.const 19 i32.const 23 i32.add))"#;
 
 /// Build and locate `evx-worker` relative to this test binary's target dir;
@@ -20,6 +22,12 @@ const CALC: &str = r#"(module (memory (export "memory") 1) (func (export "run") 
 fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
+        // The isolated quarantine child uses the worker its parent already
+        // built. A second Cargo build can replace the executable while the
+        // parent suite is launching it concurrently.
+        if let Some(worker) = std::env::var_os(QUARANTINE_WORKER) {
+            return std::fs::canonicalize(worker).unwrap();
+        }
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut command = std::process::Command::new(cargo);
@@ -471,15 +479,14 @@ fn host_binding_policy_changes_report_cancellation() {
 
 #[test]
 fn compiler_cleanup_uncertainty_stops_process_admission() {
-    const CHILD: &str = "EVX_COMPILER_QUARANTINE_FIXTURE";
-    if std::env::var_os(CHILD).is_none() {
+    if std::env::var_os(QUARANTINE_WORKER).is_none() {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "compiler_cleanup_uncertainty_stops_process_admission",
                 "--nocapture",
             ])
-            .env(CHILD, "1")
+            .env(QUARANTINE_WORKER, worker_binary())
             .output()
             .unwrap();
         assert!(

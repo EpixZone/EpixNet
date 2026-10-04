@@ -34,6 +34,9 @@ jobs:
       CARGO_TARGET_DIR: target/evx-windows-fixture
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: evx-windows-native
       - name: Check Windows transport and build native fixtures
         id: build-native
         shell: pwsh
@@ -44,6 +47,16 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo build -p evx-windows --bins --example acceptance --example execution_acceptance --release --locked
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $dumpbin = & "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe" -latest -products '*' -find 'VC\Tools\MSVC\**\bin\Hostx64\x64\dumpbin.exe' | Select-Object -First 1
+          if (!$dumpbin) { throw 'MSVC import inspection tool unavailable' }
+          foreach ($binary in @('examples/acceptance.exe', 'evx-windows-worker.exe')) {
+            $imports = & $dumpbin /dependents "target/evx-windows-fixture/release/$binary"
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            $imports
+            if ($imports -match '^\s*(userenv|shell32|ole32)\.dll\s*$') {
+              throw "Host-only DLL statically imported by confined image: $binary"
+            }
+          }
       - name: Require actual LPAC and Job Object acceptance
         shell: pwsh
         run: |

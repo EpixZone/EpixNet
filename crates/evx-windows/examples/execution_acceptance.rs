@@ -7,13 +7,25 @@ fn main() -> std::io::Result<()> {
         atomic::{AtomicBool, Ordering},
         Arc,
     };
-    let path = std::env::current_exe()?
+    let built_worker = std::env::current_exe()?
         .parent()
         .unwrap()
         .parent()
         .unwrap()
         .join("evx-windows-worker.exe");
+    // Cargo hard-links top-level binaries to its dependency artifacts. Model
+    // installation with an owned, single-link copy before pinning the worker.
+    let installation = tempfile::tempdir()?;
+    let path = installation.path().join("evx-windows-worker.exe");
+    std::fs::copy(built_worker, &path)?;
     let hash = hex::encode(Sha256::digest(std::fs::read(&path)?));
+    let linked = installation.path().join("linked-worker.exe");
+    std::fs::hard_link(&path, &linked)?;
+    assert!(
+        TrustedWorker::open(&path, &hash).is_err(),
+        "hard-linked workers must be rejected"
+    );
+    std::fs::remove_file(linked)?;
     assert!(TrustedWorker::open(&path, &"0".repeat(64)).is_err());
     let executor = WindowsExecutor::new(TrustedWorker::open(&path, &hash)?);
     let cancel = Arc::new(AtomicBool::new(false));

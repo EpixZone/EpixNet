@@ -11,7 +11,7 @@ use std::{
 };
 use windows_sys::Win32::{
     Foundation::*,
-    Security::{Authorization::*, Cryptography::*, Isolation::*, *},
+    Security::{Authorization::*, Cryptography::*, *},
     Storage::FileSystem::*,
     System::{JobObjects::*, Memory::*, Pipes::*, Threading::*, WindowsProgramming::*},
 };
@@ -266,12 +266,14 @@ struct Profile {
     name: Vec<u16>,
     sid: PSID,
     retained: bool,
+    delete: unsafe extern "system" fn(*const u16) -> i32,
+    _library: SystemLibrary,
 }
 impl Drop for Profile {
     fn drop(&mut self) {
         unsafe {
             if !self.retained {
-                DeleteAppContainerProfile(self.name.as_ptr());
+                (self.delete)(self.name.as_ptr());
             }
             FreeSid(self.sid);
         }
@@ -309,9 +311,27 @@ impl Stage {
         }
         let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
         let name = wide(format!("Epix.EvxFixture.{id}"))?;
+        type CreateProfile = unsafe extern "system" fn(
+            *const u16,
+            *const u16,
+            *const u16,
+            *const SID_AND_ATTRIBUTES,
+            u32,
+            *mut PSID,
+        ) -> i32;
+        type DeleteProfile = unsafe extern "system" fn(*const u16) -> i32;
+        // Profile management belongs to the host. Loading userenv.dll in the
+        // LPAC child can fail during DLL initialization before Rust runs.
+        let library = SystemLibrary::open("userenv.dll")?;
+        // SAFETY: fixed exports from the system DLL with their Win32 ABI;
+        // Profile retains the library until its deletion callback is finished.
+        let create: CreateProfile =
+            unsafe { std::mem::transmute(library.symbol(c"CreateAppContainerProfile")?) };
+        let delete: DeleteProfile =
+            unsafe { std::mem::transmute(library.symbol(c"DeleteAppContainerProfile")?) };
         let mut sid = null_mut();
         let status = unsafe {
-            CreateAppContainerProfile(
+            create(
                 name.as_ptr(),
                 name.as_ptr(),
                 name.as_ptr(),
@@ -330,6 +350,8 @@ impl Stage {
             name,
             sid,
             retained: false,
+            delete,
+            _library: library,
         };
         let parent = token(unsafe { GetCurrentProcess() })?;
         let user = token_info(&parent, TokenUser)?;
