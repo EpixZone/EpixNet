@@ -1,4 +1,4 @@
-use crate::denial::{denied, descendant_denied};
+use crate::denial::{denied, descendant_denied, winsock_startup_denied};
 use std::{
     ffi::OsStr,
     io,
@@ -855,6 +855,68 @@ fn verify_fixture_reply(reader: &Handle, code: u32) -> io::Result<()> {
     Ok(())
 }
 
+struct Winsock;
+impl Winsock {
+    fn start() -> io::Result<Self> {
+        use windows_sys::Win32::Networking::WinSock::{WSAStartup, WSADATA};
+        let mut data: WSADATA = unsafe { zeroed() };
+        let status = unsafe { WSAStartup(0x0202, &mut data) };
+        if status == 0 {
+            Ok(Self)
+        } else {
+            Err(io::Error::from_raw_os_error(status))
+        }
+    }
+}
+impl Drop for Winsock {
+    fn drop(&mut self) {
+        unsafe { windows_sys::Win32::Networking::WinSock::WSACleanup() };
+    }
+}
+
+fn winsock_catalog_access() -> io::Result<()> {
+    use windows_sys::Win32::System::Registry::{
+        RegCloseKey, RegOpenKeyExW, HKEY_LOCAL_MACHINE, KEY_QUERY_VALUE,
+    };
+    let path = wide(r"SYSTEM\CurrentControlSet\Services\WinSock2\Parameters\Protocol_Catalog9")?;
+    let mut key = null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.as_ptr(), 0, KEY_QUERY_VALUE, &mut key)
+    };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let status = unsafe { RegCloseKey(key) };
+    if status != ERROR_SUCCESS {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    Ok(())
+}
+
+fn network_denials(port: u16) -> io::Result<()> {
+    // Rust's networking initialization asserts that WSAStartup succeeds. A
+    // zero-capability LPAC can deny the catalog access needed even to start it.
+    // Check the native status first and require a separate permission denial;
+    // unavailable networking or another startup error cannot pass this test.
+    let _winsock = match Winsock::start() {
+        Ok(winsock) => winsock,
+        Err(error) => {
+            return winsock_startup_denied(
+                error.raw_os_error().unwrap_or(0),
+                winsock_catalog_access(),
+            );
+        }
+    };
+    denied(
+        TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            Duration::from_millis(500),
+        ),
+        "loopback connection",
+    )?;
+    denied(TcpListener::bind("127.0.0.1:0"), "network listen")
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         drop(self.job.take());
@@ -912,16 +974,7 @@ fn child(args: &[String]) -> io::Result<()> {
                     .arg("--unexpected-child")
                     .spawn(),
             )?;
-            denied(
-                TcpStream::connect_timeout(
-                    &format!("127.0.0.1:{port}")
-                        .parse()
-                        .map_err(|_| fail("invalid fixture address"))?,
-                    Duration::from_millis(500),
-                ),
-                "loopback connection",
-            )?;
-            denied(TcpListener::bind("127.0.0.1:0"), "network listen")?;
+            network_denials(port)?;
         }
         Mode::Memory => {
             let small =
@@ -971,6 +1024,8 @@ pub fn main() -> io::Result<()> {
     if args.len() != 1 {
         return Err(fail("the fixture accepts no caller-selected command"));
     }
+    let _winsock = Winsock::start()?;
+    winsock_catalog_access()?;
     let listener = TcpListener::bind("127.0.0.1:0")?;
     listener.set_nonblocking(true)?;
     let port = listener.local_addr()?.port();

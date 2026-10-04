@@ -69,7 +69,7 @@ cargo check -p evx-windows --all-targets --target x86_64-pc-windows-msvc --locke
 cargo clippy -p evx-windows --all-targets --target x86_64-pc-windows-msvc --locked --offline -- -D warnings
 ```
 
-Two portable regression tests also pass. They verify that descendant creation
+Portable regression tests also pass. They verify that descendant creation
 accepts the explicit `ERROR_CHILD_PROCESS_BLOCKED` status (367), while file and
 network checks still require `PermissionDenied`, and unrelated launch failures
 cannot count as isolation. The former permission-only descendant check failed
@@ -96,6 +96,12 @@ values and compares their underlying kernel objects: the explicit reply pipe
 must be inherited and the excluded event must not be. This handles recycled
 numbers without provoking LPAC's strict-handle termination inside the child.
 The host also verifies its event remains unsignaled after termination.
+When zero-capability LPAC blocks Winsock initialization itself, the network
+probe requires both `WSASYSCALLFAILURE` and an independent `PermissionDenied`
+reading the Winsock protocol catalog. The host first confirms that the same
+catalog and Winsock are usable outside the LPAC. A generic initialization error
+alone never counts as isolation; when initialization succeeds, connect/listen
+must each fail with `PermissionDenied` as usual.
 The workflow retains the output and fails on refused
 LPAC startup rather than treating an unavailable profile as a passing test.
 

@@ -21,6 +21,18 @@ pub(crate) fn descendant_denied<T>(result: io::Result<T>) -> io::Result<()> {
     denied(result, "descendant creation")
 }
 
+pub(crate) fn winsock_startup_denied(status: i32, catalog: io::Result<()>) -> io::Result<()> {
+    // WSASYSCALLFAILURE alone is generic, not isolation evidence. Require the
+    // independent access denial for the protocol catalog as well. The host
+    // positively checks this same catalog and Winsock before launching probes.
+    if status != 10107 {
+        return Err(io::Error::other(format!(
+            "unexpected Winsock initialization failure: {status}"
+        )));
+    }
+    denied(catalog, "Winsock protocol catalog read")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -48,6 +60,19 @@ mod tests {
         );
     }
 
+    #[test]
+    fn winsock_failure_requires_independent_catalog_access_denial() {
+        let denied_catalog = || Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        assert!(winsock_startup_denied(10107, denied_catalog()).is_ok());
+        assert!(winsock_startup_denied(10107, Ok(())).is_err());
+        for kind in [io::ErrorKind::NotFound, io::ErrorKind::OutOfMemory] {
+            assert!(winsock_startup_denied(10107, Err(io::Error::from(kind))).is_err());
+        }
+        for status in [0, 8, 10091, 10092, 10106] {
+            assert!(winsock_startup_denied(status, denied_catalog()).is_err());
+        }
+    }
+
     #[cfg(windows)]
     #[test]
     fn sdk_and_rust_mapping_match_regression() {
@@ -57,5 +82,6 @@ mod tests {
             ERROR_CHILD_PROCESS_BLOCKED as i32
         )))
         .is_ok());
+        assert_eq!(windows_sys::Win32::Networking::WinSock::WSASYSCALLFAILURE, 10107);
     }
 }
