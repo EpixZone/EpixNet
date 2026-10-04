@@ -436,11 +436,10 @@ impl Stage {
         // Only our fixed enum and decimal handles/loopback port enter argv. The
         // executable is also supplied separately, never searched through PATH.
         let mut command = wide(format!(
-            "\"{}\" --evx-fixed-child {} {} {} {}",
+            "\"{}\" --evx-fixed-child {} {} {}",
             self.executable.display(),
             mode as u32,
             writer.0 as usize,
-            excluded.0 as usize,
             port
         ))?;
         let cwd = wide(&self.root)?;
@@ -470,7 +469,6 @@ impl Stage {
         self.active = true;
         let process_handle = Handle::checked(process.hProcess)?;
         let thread = Handle::checked(process.hThread)?;
-        drop(writer);
         // An error from here leaves the stage quarantined; closing the job kills
         // the process but is not treated as confirmation that it has died.
         validate_token(process_handle.0, Some(profile.sid))?;
@@ -481,6 +479,16 @@ impl Stage {
         if in_job == 0 {
             return Err(fail("child not atomically placed in job"));
         }
+        // Inspect the suspended child's handle table from the host. Calling
+        // SetEvent on an excluded value inside LPAC triggers strict-handle
+        // termination, preventing the remaining denial probes from running.
+        if !inherited_object(process_handle.0, &writer)? {
+            return Err(fail("explicit reply handle was not inherited"));
+        }
+        if inherited_object(process_handle.0, &excluded)? {
+            return Err(fail("excluded event was inherited"));
+        }
+        drop(writer);
         if unsafe { ResumeThread(thread.0) } == u32::MAX {
             return Err(io::Error::last_os_error());
         }
@@ -493,6 +501,34 @@ impl Stage {
         })
     }
 }
+
+fn inherited_object(process: HANDLE, original: &Handle) -> io::Result<bool> {
+    let mut duplicate = null_mut();
+    let copied = unsafe {
+        DuplicateHandle(
+            process,
+            original.0,
+            GetCurrentProcess(),
+            &mut duplicate,
+            0,
+            0,
+            DUPLICATE_SAME_ACCESS,
+        )
+    };
+    if copied == 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(ERROR_INVALID_HANDLE as i32) {
+            Ok(false)
+        } else {
+            Err(error)
+        };
+    }
+    let duplicate = Handle::checked(duplicate)?;
+    // Inheritance preserves handle values. A recycled number referring to a
+    // different child-local object is not evidence that our object leaked.
+    Ok(unsafe { CompareObjectHandles(original.0, duplicate.0) } != 0)
+}
+
 impl Drop for Stage {
     fn drop(&mut self) {
         if self.active {
@@ -847,17 +883,14 @@ impl Mode {
     }
 }
 fn child(args: &[String]) -> io::Result<()> {
-    if args.len() != 6 {
+    if args.len() != 5 {
         return Err(fail("invalid child frame"));
     }
     let mode = Mode::parse(&args[2])?;
     let writer = args[3]
         .parse::<usize>()
         .map_err(|_| fail("bad reply handle"))? as HANDLE;
-    let excluded = args[4]
-        .parse::<usize>()
-        .map_err(|_| fail("bad excluded handle"))? as HANDLE;
-    let port = args[5]
+    let port = args[4]
         .parse::<u16>()
         .map_err(|_| fail("bad loopback port"))?;
     validate_token(unsafe { GetCurrentProcess() }, None)?;
@@ -874,11 +907,6 @@ fn child(args: &[String]) -> io::Result<()> {
                 std::fs::write(root.join("unexpected-save"), b"42"),
                 "package write",
             )?;
-            // The numeric value may name an unrelated child-local event. Only
-            // the host's observation of its original object proves inheritance.
-            unsafe {
-                SetEvent(excluded);
-            }
             descendant_denied(
                 std::process::Command::new(exe)
                     .arg("--unexpected-child")

@@ -91,9 +91,12 @@ connect/listen; rejection of an allocation above the memory cap after a small
 allocation succeeds; CPU termination before the wall fallback; confirmed wall
 termination; and confirmed death on job close. Non-permission errors do not count
 as access-denial evidence, except the specific child-policy status above for
-descendant creation. Handle inheritance is checked using the host's original
-event object; success operating on a recycled child-local handle number is not
-mistaken for a leak. The workflow retains the output and fails on refused
+descendant creation. Before resume, the host duplicates the child's handle
+values and compares their underlying kernel objects: the explicit reply pipe
+must be inherited and the excluded event must not be. This handles recycled
+numbers without provoking LPAC's strict-handle termination inside the child.
+The host also verifies its event remains unsignaled after termination.
+The workflow retains the output and fails on refused
 LPAC startup rather than treating an unavailable profile as a passing test.
 
 ## Remaining acceptance and integration
