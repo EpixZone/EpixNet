@@ -49,7 +49,7 @@ use windows_sys::Win32::{
         },
         Threading::{
             CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, ResumeThread,
-            WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+            WaitForSingleObject, DETACHED_PROCESS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
             EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
             PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
             PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
@@ -599,6 +599,7 @@ impl Invocation {
         let cwd = wide(&stage.root)?;
         let mut command = wide(format!("\"{}\" {role}", stage.executable.display()))?;
         let mut environment = worker_environment()?;
+        // Pipe-only transport must not initialize a console in the LPAC.
         let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
         unsafe {
             ok(CreateProcessW(
@@ -609,7 +610,7 @@ impl Invocation {
                 1,
                 EXTENDED_STARTUPINFO_PRESENT
                     | CREATE_SUSPENDED
-                    | CREATE_NO_WINDOW
+                    | DETACHED_PROCESS
                     | CREATE_UNICODE_ENVIRONMENT,
                 environment.as_mut_ptr().cast(),
                 cwd.as_ptr(),

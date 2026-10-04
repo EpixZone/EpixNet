@@ -37,6 +37,7 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           key: evx-windows-native
+          cache-on-failure: true
       - name: Check Windows transport and build native fixtures
         id: build-native
         shell: pwsh

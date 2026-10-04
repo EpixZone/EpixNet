@@ -39,6 +39,8 @@ sleep and stalled execution. Child creation is also disabled by the process
 creation policy. The only inherited handle is a private reply-pipe writer;
 a deliberately inheritable event is excluded and checked by the fixture.
 The parent environment and ordinary standard handles are not passed through.
+Workers start with `DETACHED_PROCESS` and communicate through their explicit
+pipes, without initializing console infrastructure inside the LPAC.
 The child environment contains only `SystemRoot` and `LOCALAPPDATA`, resolved
 through Windows APIs; AppContainer startup redirects its profile storage.
 

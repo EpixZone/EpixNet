@@ -447,6 +447,8 @@ impl Stage {
         // No parent environment is inherited.
         let mut environment = worker_environment()?;
         let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
+        // These pipe-only workers need no console infrastructure inside the
+        // zero-capability LPAC and its single-process job.
         unsafe {
             ok(CreateProcessW(
                 exe.as_ptr(),
@@ -456,7 +458,7 @@ impl Stage {
                 1,
                 EXTENDED_STARTUPINFO_PRESENT
                     | CREATE_SUSPENDED
-                    | CREATE_NO_WINDOW
+                    | DETACHED_PROCESS
                     | CREATE_UNICODE_ENVIRONMENT,
                 environment.as_mut_ptr().cast(),
                 cwd.as_ptr(),
