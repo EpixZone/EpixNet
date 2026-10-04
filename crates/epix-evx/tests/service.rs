@@ -813,7 +813,8 @@ async fn an_allow_once_token_is_bound_to_its_program_and_digest() {
 
 #[tokio::test]
 async fn a_host_without_execution_reports_unsupported_host_and_spends_nothing() {
-    let missing = std::env::temp_dir().join("epix-evx-no-such-worker");
+    let worker_dir = tempfile::tempdir().unwrap();
+    let missing = worker_dir.path().join("no-such-worker");
     let f = Fixture::new(Options { worker: Some(missing), ..Options::default() }).await;
     assert_eq!(f.service.execution().unwrap_err(), UNSUPPORTED_HOST);
     let status = f.call(&f.page(), "evxStatus", json!({}), 1).await.unwrap();
@@ -1405,7 +1406,8 @@ async fn settled_ticks(f: &Fixture) -> u64 {
 #[tokio::test]
 async fn a_content_change_for_a_xite_with_jobs_re_registers_it_with_no_evx_command_and_one_for_another_xite_wakes_nothing() {
     // No worker, so nothing runs and the scheduler only ticks when woken.
-    let missing = std::env::temp_dir().join("epix-evx-no-such-worker");
+    let worker_dir = tempfile::tempdir().unwrap();
+    let missing = worker_dir.path().join("no-such-worker");
     let options = || Options { worker: Some(missing.clone()), ..Options::with_job(3600) };
     let f = Fixture::new(options()).await;
     f.chrome("evxGrant", f.enable_params().await).await.unwrap();
@@ -1978,7 +1980,7 @@ int main(int argc, char **argv) {{
             if let Ok(pid) = text.parse() { break pid; }
         }
         if Instant::now() > deadline { let _ = old_host.kill(); let _ = old_host.wait(); panic!("helper never became ready"); }
-        std::thread::sleep(Duration::from_millis(5));
+        tokio::time::sleep(Duration::from_millis(5)).await;
     };
     struct KnownOrphan(i32);
     impl Drop for KnownOrphan { fn drop(&mut self) { let _ = std::process::Command::new("/bin/kill").args(["-KILL", &self.0.to_string()]).status(); } }

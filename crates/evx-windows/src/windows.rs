@@ -39,6 +39,28 @@ fn wide(value: impl AsRef<OsStr>) -> io::Result<Vec<u16>> {
     result.push(0);
     Ok(result)
 }
+// AppContainer process creation requires SystemRoot. Resolve it through the
+// OS, without inheriting any caller-controlled environment or credentials.
+fn worker_environment() -> io::Result<Vec<u16>> {
+    let mut windows = vec![0u16; 32768];
+    let size = unsafe {
+        windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW(
+            windows.as_mut_ptr(),
+            windows.len() as u32,
+        )
+    } as usize;
+    if size == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if size >= windows.len() {
+        return Err(fail("Windows directory exceeds environment limit"));
+    }
+    let mut environment: Vec<u16> = "SystemRoot=".encode_utf16().collect();
+    environment.extend_from_slice(&windows[..size]);
+    environment.extend([0, 0]);
+    Ok(environment)
+}
+
 struct Handle(HANDLE);
 impl Handle {
     fn checked(raw: HANDLE) -> io::Result<Self> {
@@ -163,17 +185,21 @@ fn protect(path: &Path, sddl: &str) -> io::Result<()> {
 struct Profile {
     name: Vec<u16>,
     sid: PSID,
+    retained: bool,
 }
 impl Drop for Profile {
     fn drop(&mut self) {
         unsafe {
-            DeleteAppContainerProfile(self.name.as_ptr());
+            if !self.retained {
+                DeleteAppContainerProfile(self.name.as_ptr());
+            }
             FreeSid(self.sid);
         }
     }
 }
 struct Stage {
     root: PathBuf,
+    directory: Option<tempfile::TempDir>,
     executable: PathBuf,
     profile: Option<Profile>,
     active: bool,
@@ -220,25 +246,23 @@ impl Stage {
                 status as u32
             )));
         }
-        let profile = Profile { name, sid };
+        let profile = Profile {
+            name,
+            sid,
+            retained: false,
+        };
         let parent = token(unsafe { GetCurrentProcess() })?;
         let user = token_info(&parent, TokenUser)?;
         let owner = sid_text(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })?;
         let package = sid_text(profile.sid)?;
         let private = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{owner})");
         let readable = format!("{private}(A;OICI;GRGX;;;{package})");
-        let root = std::env::temp_dir().join(format!("evx-windows-{id}"));
-        let root_wide = wide(&root)?;
-        let sd = descriptor(&readable)?;
-        let attrs = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: sd.0,
-            bInheritHandle: 0,
-        };
-        unsafe {
-            ok(CreateDirectoryW(root_wide.as_ptr(), &attrs))?;
-        }
+        let directory = tempfile::Builder::new().prefix("evx-windows-").tempdir()?;
+        let root = directory.path().to_path_buf();
+        // Apply the protected DACL before staging any executable or host data.
+        protect(&root, &readable)?;
         let stage = Self {
+            directory: Some(directory),
             executable: root.join("game.exe"),
             root,
             profile: Some(profile),
@@ -312,8 +336,8 @@ impl Stage {
             port
         ))?;
         let cwd = wide(&self.root)?;
-        // No parent environment, including credentials or configuration, is inherited.
-        let mut environment = [0u16, 0];
+        // Only the OS-derived SystemRoot is provided; no parent environment is inherited.
+        let mut environment = worker_environment()?;
         let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
         unsafe {
             ok(CreateProcessW(
@@ -363,15 +387,21 @@ impl Drop for Stage {
         if self.active {
             execution::quarantine();
             // Do not delete/reassign a profile after an unconfirmed child lifetime.
-            if let Some(profile) = self.profile.take() {
-                std::mem::forget(profile);
+            if let Some(profile) = self.profile.as_mut() {
+                // Retain the OS profile but release the local SID allocation.
+                profile.retained = true;
+            }
+            if let Some(directory) = self.directory.take() {
+                let _ = directory.keep();
             }
             eprintln!(
                 "retained unconfirmed fixture directory: {}",
                 self.root.display()
             );
-        } else if let Err(error) = std::fs::remove_dir_all(&self.root) {
-            eprintln!("fixture cleanup failed at {}: {error}", self.root.display());
+        } else if let Some(directory) = self.directory.take() {
+            if let Err(error) = directory.close() {
+                eprintln!("fixture cleanup failed at {}: {error}", self.root.display());
+            }
         }
     }
 }

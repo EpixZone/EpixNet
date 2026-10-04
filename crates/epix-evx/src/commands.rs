@@ -451,7 +451,7 @@ mod tests {
         }
         let text = redacted.to_string();
         for secret in ["laptop", "created_unix", "limits", "generation", "next_due", "waiting_reason", "failures", "busy_workers", "next_wake", "macos"] {
-            assert!(!text.contains(secret), "{secret} survived: {text}");
+            assert!(!text.contains(secret), "gateway response contains a private field");
         }
         // No grant stays no grant; a non-object payload is left alone.
         assert!(redact_for_gateway(json!({ "grant": null }))["grant"].is_null());

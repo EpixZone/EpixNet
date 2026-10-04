@@ -1,7 +1,12 @@
 //! Explicit operator recovery of private workspace effects. This never runs a
 //! guest, changes its grant, or infers authority from existing file contents.
 
-use super::*;
+use super::{clamp, xite_id, EvxService, RunningRegistration, PLUGIN_NAME};
+use std::collections::BTreeSet;
+use std::sync::Arc;
+use epix_ui::AppState;
+use evx_api::{Grant, Limits};
+use serde_json::{json, Value};
 
 impl EvxService {
     /// Recover interrupted manual writes without executing a program or

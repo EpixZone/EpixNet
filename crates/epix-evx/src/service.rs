@@ -845,9 +845,9 @@ impl EvxService {
     pub fn shutdown(&self) {
         // Order shutdown with broker registration. Detached completion tasks
         // retain bookkeeping ownership, never permission to outlive this stop.
-        let _policy = self.policy_lock.lock().unwrap_or_else(|error| error.into_inner());
+        let _policy = self.policy_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         self.scheduler.stop();
-        let running = self.running.lock().unwrap_or_else(|error| error.into_inner());
+        let running = self.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         for broker in running.values() {
             broker.revoke();
         }
@@ -1143,7 +1143,7 @@ impl EvxService {
             _ => {}
         }
         if let Some((grant, _)) = &stored {
-            if grant.enabled && !grant.expires_unix.is_some_and(|at| now >= at) && !grant.allow_run_once {
+            if grant.enabled && grant.expires_unix.is_none_or(|at| now < at) && !grant.allow_run_once {
                 reasons.push("run_once_not_allowed");
             }
         }
@@ -1651,6 +1651,39 @@ impl EvxService {
         }
     }
 
+    fn validate_occurrence(&self, xite: &str, program: &str, inspection: &Inspection, occurrence: &Occurrence) -> Result<(), String> {
+            // The occurrence was reserved for a job of one declaration; a
+            // root re-signed since then is a different request, and its jobs
+            // were re-registered under the new digest at the inspection
+            // just made. This reservation is finished as refused and the
+            // scheduler claims the slot it is due in under the new digest.
+            if occurrence.row.declaration_digest != inspection.digest {
+                return Err("declaration changed since the occurrence was reserved".into());
+            }
+            if occurrence.row.program != program {
+                return Err("occurrence does not belong to this program".into());
+            }
+            // The job as it is now, after the inspection re-registered it: a
+            // job paused or disabled since the slot was reserved (by a person,
+            // or by registration) does not run behind its pause, whether the
+            // reservation is the scheduler's, a manual run's or a recovered
+            // one.
+            let current = self
+                .state
+                .jobs(xite)
+                .map_err(|error| format!("EVX state: {error}"))?
+                .into_iter()
+                .find(|row| row.job == occurrence.row.job)
+                .ok_or_else(|| format!("job {} is no longer registered", occurrence.row.job))?;
+            if !current.enabled {
+                return Err(format!("job {} is disabled", current.job));
+            }
+            if let Some(reason) = &current.paused_reason {
+                return Err(format!("job {} is paused: {reason}", current.job));
+            }
+        Ok(())
+    }
+
     async fn execute_inner(
         self: &Arc<Self>,
         app: &AppState,
@@ -1682,35 +1715,7 @@ impl EvxService {
             ));
         }
         if let Some(occurrence) = occurrence {
-            // The occurrence was reserved for a job of one declaration; a
-            // root re-signed since then is a different request, and its jobs
-            // were re-registered under the new digest at the inspection
-            // just made. This reservation is finished as refused and the
-            // scheduler claims the slot it is due in under the new digest.
-            if occurrence.row.declaration_digest != inspection.digest {
-                return Err("declaration changed since the occurrence was reserved".into());
-            }
-            if occurrence.row.program != program {
-                return Err("occurrence does not belong to this program".into());
-            }
-            // The job as it is now, after the inspection re-registered it: a
-            // job paused or disabled since the slot was reserved (by a person,
-            // or by registration) does not run behind its pause, whether the
-            // reservation is the scheduler's, a manual run's or a recovered
-            // one.
-            let current = self
-                .state
-                .jobs(xite)
-                .map_err(|error| format!("EVX state: {error}"))?
-                .into_iter()
-                .find(|row| row.job == occurrence.row.job)
-                .ok_or_else(|| format!("job {} is no longer registered", occurrence.row.job))?;
-            if !current.enabled {
-                return Err(format!("job {} is disabled", current.job));
-            }
-            if let Some(reason) = &current.paused_reason {
-                return Err(format!("job {} is paused: {reason}", current.job));
-            }
+            self.validate_occurrence(xite, program, &inspection, occurrence)?;
         }
         let declared = usable_program(&inspection, program)?.clone();
         let bound = inspection
@@ -2004,11 +2009,7 @@ impl EvxService {
             let mut locks = self.run_locks.lock().await;
             locks.entry(xite.to_string()).or_default().clone()
         };
-        // Bound to a name rather than returned as the tail expression: the
-        // guard `try_lock` hands back borrows `lock`, and a tail-expression
-        // temporary is dropped after the locals it borrows from.
-        let free = lock.try_lock().is_ok();
-        free
+        lock.try_lock_owned().is_ok()
     }
 
     /// How many times `xite` has been revoked since the service started.
@@ -2197,7 +2198,7 @@ struct RunningRegistration<'a> {
 impl Drop for RunningRegistration<'_> {
     fn drop(&mut self) {
         if let Some(broker) = self.broker {
-            let mut running = self.service.running.lock().unwrap_or_else(|error| error.into_inner());
+            let mut running = self.service.running.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             if running.get(self.xite).is_some_and(|current| Arc::ptr_eq(current, broker)) {
                 running.remove(self.xite);
             }

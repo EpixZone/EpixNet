@@ -517,7 +517,7 @@ impl AppleSlotRegistry {
 fn parent(path: &Path) -> Result<(OwnedFd, String, PathBuf), Denied> {
     let name = path
         .file_name()
-        .and_then(|name| name.to_str())
+        .and_then(std::ffi::OsStr::to_str)
         .ok_or_else(|| denied("invalid directory path"))?;
     let parent = path
         .parent()

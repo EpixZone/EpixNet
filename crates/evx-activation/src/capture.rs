@@ -7,7 +7,7 @@
 //! path is never reopened later.
 
 use std::io::Read as _;
-use std::os::fd::{AsFd as _, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
 use rustix::fs::{FileType, Mode, OFlags};
@@ -48,7 +48,7 @@ pub(crate) fn capture_file(
     };
     let mut directory: Option<OwnedFd> = None;
     for part in directories {
-        let current = directory.as_ref().map_or(root, |fd| fd.as_fd());
+        let current = directory.as_ref().map_or(root, AsFd::as_fd);
         let next = rustix::fs::openat(
             current,
             *part,
@@ -58,7 +58,7 @@ pub(crate) fn capture_file(
         .map_err(|_| denied())?;
         directory = Some(next);
     }
-    let current = directory.as_ref().map_or(root, |fd| fd.as_fd());
+    let current = directory.as_ref().map_or(root, AsFd::as_fd);
     let file = rustix::fs::openat(
         current,
         *name,

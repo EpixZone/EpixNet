@@ -249,7 +249,7 @@ fn hand_built(entry: &str, dependencies: &[&str]) -> Declaration {
     let program = Program {
         runtime_profile: "wasm-core-v1".to_string(),
         entry: entry.to_string(),
-        dependencies: dependencies.iter().map(|d| d.to_string()).collect(),
+        dependencies: dependencies.iter().map(ToString::to_string).collect(),
         allow_run_once: false,
         capabilities: BTreeSet::new(),
         limits: Limits::default(),

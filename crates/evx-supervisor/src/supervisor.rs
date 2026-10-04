@@ -187,6 +187,30 @@ struct Loop<'a> {
     initial_fuel: u64,
 }
 
+fn apply_terminal_limits(
+    status: &mut Status,
+    value: &mut Option<i32>,
+    error: &mut Option<String>,
+    peak_rss: u64,
+    total_cpu: f64,
+    limits: &evx_api::Limits,
+) {
+    if *status == Status::Ok {
+        let limit_error = if peak_rss > limits.process_rss_bytes {
+            Some("observed process RSS limit")
+        } else if total_cpu > limits.process_cpu_seconds {
+            Some("observed process CPU limit")
+        } else {
+            None
+        };
+        if let Some(message) = limit_error {
+            *status = Status::ResourceLimit;
+            *value = None;
+            *error = Some(message.into());
+        }
+    }
+}
+
 fn execute(
     config: &Config,
     artifact: &CompiledArtifact,
@@ -324,20 +348,14 @@ fn execute(
     // violation cannot become a successful result, even if the guest already
     // released the allocation before sending its response. Other failures and
     // trusted cancellation retain their provenance; uncertainty wins below.
-    if status == Status::Ok {
-        let limit_error = if peak_rss > inner.limits.process_rss_bytes {
-            Some("observed process RSS limit")
-        } else if total_cpu > inner.limits.process_cpu_seconds {
-            Some("observed process CPU limit")
-        } else {
-            None
-        };
-        if let Some(message) = limit_error {
-            status = Status::ResourceLimit;
-            value = None;
-            error = Some(message.into());
-        }
-    }
+    apply_terminal_limits(
+        &mut status,
+        &mut value,
+        &mut error,
+        peak_rss,
+        total_cpu,
+        &inner.limits,
+    );
     if quarantined {
         status = Status::Quarantined;
         error = Some("child cleanup unconfirmed".into());
@@ -419,101 +437,20 @@ impl<'a> Loop<'a> {
     ) -> LoopOutcome {
         loop {
             let limits = self.broker.limits();
-            if limits.memory_bytes < self.initial_memory || limits.fuel < self.initial_fuel {
-                return Ok(Some((
-                    Status::ResourceLimit,
-                    None,
-                    Some("guest limits lowered; invocation cancelled".into()),
-                )));
-            }
             let now = Instant::now();
-            if let Some(flag) = &self.options.revoke_event {
-                if flag.load(Ordering::Relaxed) {
-                    self.broker.revoke();
-                    return Err(Denied::Cancelled("execution grant revoked".into()));
-                }
+            if let Some(outcome) = self.check_policy(&limits, now)? {
+                return Ok(Some(outcome));
             }
-            if self.revoked() {
-                return Err(Denied::Cancelled("execution grant revoked".into()));
+            if let Some(outcome) = self.observe_resources(&limits)? {
+                return Ok(Some(outcome));
             }
-            if now.duration_since(self.started).as_secs_f64() >= limits.wall_seconds {
-                return Ok(Some((
-                    Status::Timeout,
-                    None,
-                    Some("supervisor wall deadline".into()),
-                )));
-            }
-            self.worker.flush_input()?;
-            if let Some(helper) = self.helper.as_mut() {
-                helper.flush_input()?;
-            }
-            // Kernel observations for every live child.
-            self.worker.measure()?;
-            if let Some(helper) = self.helper.as_mut() {
-                helper.measure()?;
-            }
-            let worker_alive = self.worker.poll().is_none();
-            let helper_alive = self.helper.as_mut().is_some_and(|h| h.poll().is_none());
-            let mut rss = 0;
-            if worker_alive {
-                rss += self.worker.last_rss.unwrap_or(0);
-            }
-            if helper_alive {
-                rss += self.helper.as_ref().and_then(|h| h.last_rss).unwrap_or(0);
-            }
-            self.peak_rss = self.peak_rss.max(rss);
-            if rss > limits.process_rss_bytes {
-                return Ok(Some((
-                    Status::ResourceLimit,
-                    None,
-                    Some("observed process RSS limit".into()),
-                )));
-            }
-            let cpu: f64 = self.worker.max_cpu
-                + self.helper.as_ref().map_or(0.0, |h| h.max_cpu)
-                + self.finished.iter().map(|p| p.max_cpu).sum::<f64>();
-            if cpu > limits.process_cpu_seconds {
-                return Ok(Some((
-                    Status::ResourceLimit,
-                    None,
-                    Some("observed process CPU limit".into()),
-                )));
-            }
-            // Native call deadline for the helper.
-            if let Some(helper) = self.helper.as_mut() {
-                if now.duration_since(helper.started).as_secs_f64() > limits.host_call_seconds {
-                    self.commit_unknown |= helper.commit_sent;
-                    self.events.push("native_call_deadline".into());
-                    let mut helper = self.helper.take().expect("helper present");
-                    let closed = if self.options.fail_file_cleanup {
-                        Err(crate::process::CleanupTimeout { pid: helper.pid })
-                    } else {
-                        helper.close(GRACE, CLEANUP)
-                    };
-                    // Keep ownership even when the first cleanup cannot confirm
-                    // reaping. The workspace lease must remain quarantined.
-                    self.finished.push(helper);
-                    self.helper_request = None;
-                    self.pending_response = None;
-                    if closed.is_err() {
-                        crate::process::quarantine_child_admission();
-                        self.broker.lock().quarantined = true;
-                        return Err(Denied::new("child termination unconfirmed"));
-                    }
-                    if self.commit_unknown {
-                        return Ok(Some((
-                            Status::EffectUnknown,
-                            None,
-                            Some("file commit outcome needs reconciliation".into()),
-                        )));
-                    }
-                    self.reply(Response::error("native operation deadline"))?;
-                }
+            if let Some(outcome) = self.check_helper_deadline(&limits, now)? {
+                return Ok(Some(outcome));
             }
             let event = match rx.recv_timeout(POLL) {
                 Ok(event) => {
                     let (role, id) = event.origin();
-                    if !self.peer_mut(role).is_some_and(|peer| peer.id == id) {
+                    if self.peer_mut(role).is_none_or(|peer| peer.id != id) {
                         if self
                             .finished
                             .iter()
@@ -532,104 +469,238 @@ impl<'a> Loop<'a> {
                     return Err(Denied::new("worker channel closed"));
                 }
             };
-            match event {
-                Some(Event::Stderr(role, _, chunk)) => {
-                    let peer = self.peer_mut(role);
-                    if let Some(peer) = peer {
-                        peer.output_bytes += chunk.len();
-                        if peer.output_bytes > OUTPUT_QUOTA {
-                            return Err(Denied::new("worker output quota"));
-                        }
-                        peer.record_stderr(&chunk);
-                    }
+            self.handle_event(event, tx, worker_result)?;
+            self.complete_helper()?;
+            if let Some(outcome) = self.complete_worker(&limits, worker_result)? {
+                return Ok(Some(outcome));
+            }
+        }
+    }
+
+    fn check_policy(&mut self, limits: &evx_api::Limits, now: Instant) -> LoopOutcome {
+        if limits.memory_bytes < self.initial_memory || limits.fuel < self.initial_fuel {
+            return Ok(Some((
+                Status::ResourceLimit,
+                None,
+                Some("guest limits lowered; invocation cancelled".into()),
+            )));
+        }
+        if let Some(flag) = &self.options.revoke_event {
+            if flag.load(Ordering::Relaxed) {
+                self.broker.revoke();
+                return Err(Denied::Cancelled("execution grant revoked".into()));
+            }
+        }
+        if self.revoked() {
+            return Err(Denied::Cancelled("execution grant revoked".into()));
+        }
+        if now.duration_since(self.started).as_secs_f64() >= limits.wall_seconds {
+            return Ok(Some((
+                Status::Timeout,
+                None,
+                Some("supervisor wall deadline".into()),
+            )));
+        }
+
+        Ok(None)
+    }
+
+    fn observe_resources(&mut self, limits: &evx_api::Limits) -> LoopOutcome {
+        self.worker.flush_input()?;
+        if let Some(helper) = self.helper.as_mut() {
+            helper.flush_input()?;
+        }
+        // Kernel observations for every live child.
+        self.worker.measure()?;
+        if let Some(helper) = self.helper.as_mut() {
+            helper.measure()?;
+        }
+        let worker_alive = self.worker.poll().is_none();
+        let helper_alive = self.helper.as_mut().is_some_and(|h| h.poll().is_none());
+        let mut rss = 0;
+        if worker_alive {
+            rss += self.worker.last_rss.unwrap_or(0);
+        }
+        if helper_alive {
+            rss += self.helper.as_ref().and_then(|h| h.last_rss).unwrap_or(0);
+        }
+        self.peak_rss = self.peak_rss.max(rss);
+        if rss > limits.process_rss_bytes {
+            return Ok(Some((
+                Status::ResourceLimit,
+                None,
+                Some("observed process RSS limit".into()),
+            )));
+        }
+        let cpu: f64 = self.worker.max_cpu
+            + self.helper.as_ref().map_or(0.0, |h| h.max_cpu)
+            + self.finished.iter().map(|p| p.max_cpu).sum::<f64>();
+        if cpu > limits.process_cpu_seconds {
+            return Ok(Some((
+                Status::ResourceLimit,
+                None,
+                Some("observed process CPU limit".into()),
+            )));
+        }
+
+        Ok(None)
+    }
+
+    fn check_helper_deadline(&mut self, limits: &evx_api::Limits, now: Instant) -> LoopOutcome {
+        // Native call deadline for the helper.
+        if let Some(helper) = self.helper.as_mut() {
+            if now.duration_since(helper.started).as_secs_f64() > limits.host_call_seconds {
+                self.commit_unknown |= helper.commit_sent;
+                self.events.push("native_call_deadline".into());
+                let mut helper = self.helper.take().expect("helper present");
+                let closed = if self.options.fail_file_cleanup {
+                    Err(crate::process::CleanupTimeout { pid: helper.pid })
+                } else {
+                    helper.close(GRACE, CLEANUP)
+                };
+                // Keep ownership even when the first cleanup cannot confirm
+                // reaping. The workspace lease must remain quarantined.
+                self.finished.push(helper);
+                self.helper_request = None;
+                self.pending_response = None;
+                if closed.is_err() {
+                    crate::process::quarantine_child_admission();
+                    self.broker.lock().quarantined = true;
+                    return Err(Denied::new("child termination unconfirmed"));
                 }
-                Some(Event::Closed(role, _, stream, protocol_error)) => {
-                    if let Some(message) = protocol_error {
-                        return Err(Denied::new(message));
-                    }
-                    if let Some(peer) = self.peer_mut(role) {
-                        peer.readers = peer.readers.saturating_sub(1);
-                    }
-                    let _ = stream;
+                if self.commit_unknown {
+                    return Ok(Some((
+                        Status::EffectUnknown,
+                        None,
+                        Some("file commit outcome needs reconciliation".into()),
+                    )));
                 }
-                Some(Event::Frame(role, _, body)) => {
-                    let peer = self
-                        .peer_mut(role)
-                        .ok_or_else(|| Denied::new("stale helper message"))?;
-                    peer.output_bytes += body.len();
-                    peer.frames += 1;
+                self.reply(Response::error("native operation deadline"))?;
+            }
+        }
+
+        Ok(None)
+    }
+
+    fn handle_event(
+        &mut self,
+        event: Option<Event>,
+        tx: &mpsc::SyncSender<Event>,
+        worker_result: &mut Option<evx_api::frames::WorkerResult>,
+    ) -> Result<(), Denied> {
+        match event {
+            Some(Event::Stderr(role, _, chunk)) => {
+                let peer = self.peer_mut(role);
+                if let Some(peer) = peer {
+                    peer.output_bytes += chunk.len();
                     if peer.output_bytes > OUTPUT_QUOTA {
                         return Err(Denied::new("worker output quota"));
                     }
-                    if peer.frames > MAX_FRAMES {
-                        return Err(Denied::new("worker frame count"));
-                    }
-                    match role {
-                        Role::Guest => self.guest_frame(&body, tx, worker_result)?,
-                        Role::File => self.helper_frame(&body)?,
-                        Role::Compiler => return Err(Denied::new("worker protocol")),
-                    }
+                    peer.record_stderr(&chunk);
                 }
-                None => {}
             }
-            // Helper completion.
-            if let Some(helper) = self.helper.as_mut() {
-                if helper.poll().is_some() && helper.readers == 0 {
-                    let helper = self.helper.take().expect("helper present");
-                    let raw_request = self.helper_request.take();
-                    let ok = helper.terminal && helper.exit_code == Some(0);
-                    if !ok {
-                        self.commit_unknown |= helper.commit_sent;
-                        self.finished.push(helper);
-                        return Err(Denied::new("file helper failed"));
-                    }
-                    let response = self
-                        .pending_response
-                        .take()
-                        .expect("helper result recorded");
-                    let committed = helper.commit_sent;
+            Some(Event::Closed(role, _, stream, protocol_error)) => {
+                if let Some(message) = protocol_error {
+                    return Err(Denied::new(message));
+                }
+                if let Some(peer) = self.peer_mut(role) {
+                    peer.readers = peer.readers.saturating_sub(1);
+                }
+                let _ = stream;
+            }
+            Some(Event::Frame(role, _, body)) => {
+                let peer = self
+                    .peer_mut(role)
+                    .ok_or_else(|| Denied::new("stale helper message"))?;
+                peer.output_bytes += body.len();
+                peer.frames += 1;
+                if peer.output_bytes > OUTPUT_QUOTA {
+                    return Err(Denied::new("worker output quota"));
+                }
+                if peer.frames > MAX_FRAMES {
+                    return Err(Denied::new("worker frame count"));
+                }
+                match role {
+                    Role::Guest => self.guest_frame(&body, tx, worker_result)?,
+                    Role::File => self.helper_frame(&body)?,
+                    Role::Compiler => return Err(Denied::new("worker protocol")),
+                }
+            }
+            None => {}
+        }
+
+        Ok(())
+    }
+
+    fn complete_helper(&mut self) -> Result<(), Denied> {
+        // Helper completion.
+        if let Some(helper) = self.helper.as_mut() {
+            if helper.poll().is_some() && helper.readers == 0 {
+                let helper = self.helper.take().expect("helper present");
+                let raw_request = self.helper_request.take();
+                let ok = helper.terminal && helper.exit_code == Some(0);
+                if !ok {
+                    self.commit_unknown |= helper.commit_sent;
                     self.finished.push(helper);
-                    if committed && matches!(response, Response::Write { ok: true, .. }) {
-                        let request = Request::decode(
-                            raw_request
-                                .as_deref()
-                                .ok_or_else(|| Denied::new("missing file request"))?,
-                        )?;
-                        let Request::WorkspaceWrite { path, text } = request else {
-                            self.commit_unknown = true;
-                            return Err(Denied::new("invalid committed request"));
-                        };
-                        if let Err(error) = self.broker.provenance.complete(&path, &text) {
-                            self.commit_unknown = true;
-                            return Err(error);
-                        }
+                    return Err(Denied::new("file helper failed"));
+                }
+                let response = self
+                    .pending_response
+                    .take()
+                    .expect("helper result recorded");
+                let committed = helper.commit_sent;
+                self.finished.push(helper);
+                if committed && matches!(response, Response::Write { ok: true, .. }) {
+                    let request = Request::decode(
+                        raw_request
+                            .as_deref()
+                            .ok_or_else(|| Denied::new("missing file request"))?,
+                    )?;
+                    let Request::WorkspaceWrite { path, text } = request else {
+                        self.commit_unknown = true;
+                        return Err(Denied::new("invalid committed request"));
+                    };
+                    if let Err(error) = self.broker.provenance.complete(&path, &text) {
+                        self.commit_unknown = true;
+                        return Err(error);
                     }
-                    self.reply(response)?;
                 }
-            }
-            // Worker completion.
-            if self.worker.poll().is_some() && self.worker.readers == 0 {
-                let code = self.worker.exit_code;
-                let cpu: f64 = self.worker.max_cpu
-                    + self.helper.as_ref().map_or(0.0, |h| h.max_cpu)
-                    + self.finished.iter().map(|p| p.max_cpu).sum::<f64>();
-                if cpu > limits.process_cpu_seconds {
-                    return Ok(Some((
-                        Status::ResourceLimit,
-                        None,
-                        Some("observed process CPU limit".into()),
-                    )));
-                }
-                return match (worker_result.as_ref(), code) {
-                    (Some(_), Some(0)) => Ok(Some((Status::Ok, None, None))),
-                    _ => Ok(Some((
-                        Status::Error,
-                        None,
-                        Some("worker exited without clean completion".into()),
-                    ))),
-                };
+                self.reply(response)?;
             }
         }
+
+        Ok(())
+    }
+
+    fn complete_worker(
+        &mut self,
+        limits: &evx_api::Limits,
+        worker_result: &Option<evx_api::frames::WorkerResult>,
+    ) -> LoopOutcome {
+        // Worker completion.
+        if self.worker.poll().is_some() && self.worker.readers == 0 {
+            let code = self.worker.exit_code;
+            let cpu: f64 = self.worker.max_cpu
+                + self.helper.as_ref().map_or(0.0, |h| h.max_cpu)
+                + self.finished.iter().map(|p| p.max_cpu).sum::<f64>();
+            if cpu > limits.process_cpu_seconds {
+                return Ok(Some((
+                    Status::ResourceLimit,
+                    None,
+                    Some("observed process CPU limit".into()),
+                )));
+            }
+            return match (worker_result.as_ref(), code) {
+                (Some(_), Some(0)) => Ok(Some((Status::Ok, None, None))),
+                _ => Ok(Some((
+                    Status::Error,
+                    None,
+                    Some("worker exited without clean completion".into()),
+                ))),
+            };
+        }
+
+        Ok(None)
     }
 
     fn peer_mut(&mut self, role: Role) -> Option<&mut Peer> {

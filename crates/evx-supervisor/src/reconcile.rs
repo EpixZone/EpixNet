@@ -122,34 +122,8 @@ fn read_one(
         let mut response = None;
         loop {
             check_cancellation(cancelled)?;
-            let inner = broker.lock();
-            if inner.grant.generation != generation {
-                return Err(Denied::Cancelled("execution grant revoked".into()));
-            }
-            let live_limits = inner.limits.clone();
-            drop(inner);
-            if started.elapsed().as_secs_f64() >= limits.wall_seconds.min(live_limits.wall_seconds)
-                || helper.started.elapsed().as_secs_f64()
-                    >= limits.host_call_seconds.min(live_limits.host_call_seconds)
-            {
-                return Err(Denied::new("workspace reconciliation deadline"));
-            }
-            helper.flush_input()?;
-            helper.measure()?;
-            let stopped = helper.poll().is_some();
-            if spent_cpu + helper.max_cpu
-                > limits
-                    .process_cpu_seconds
-                    .min(live_limits.process_cpu_seconds)
-                // Reaping may supply an attributable terminal high-water
-                // mark. Check it before returning bytes to provenance. Linux
-                // has only post-exec live samples, so a stopped unsampled
-                // helper has no attributable RSS observation to compare.
-                || helper.last_rss.unwrap_or(if stopped { 0 } else { u64::MAX })
-                    > limits.process_rss_bytes.min(live_limits.process_rss_bytes)
-            {
-                return Err(Denied::new("workspace reconciliation resource limit"));
-            }
+            let stopped =
+                check_read_budget(&mut helper, broker, generation, limits, started, spent_cpu)?;
             if stopped && helper.readers == 0 {
                 if helper.exit_code != Some(0) {
                     return Err(Denied::new("workspace reconciliation helper failed"));
@@ -168,33 +142,7 @@ fn read_one(
                 }
                 Err(_) => return Err(Denied::new("workspace reconciliation channel closed")),
             };
-            if event.origin() != (Role::File, helper.id) {
-                return Err(Denied::new("workspace reconciliation peer mismatch"));
-            }
-            match event {
-                Event::Frame(_, _, body) => {
-                    helper.frames += 1;
-                    helper.output_bytes += body.len();
-                    if response.is_some() {
-                        return Err(Denied::new("workspace reconciliation extra frame"));
-                    }
-                    let frame: FromHelper = evx_api::strict::parse_typed(&body)?;
-                    let FromHelper::FileResult { response: value } = frame else {
-                        return Err(Denied::new("workspace reconciliation protocol"));
-                    };
-                    response = Some(value);
-                }
-                Event::Stderr(_, _, bytes) => helper.output_bytes += bytes.len(),
-                Event::Closed(_, _, _, error) => {
-                    if error.is_some() {
-                        return Err(Denied::new("workspace reconciliation framing"));
-                    }
-                    helper.readers = helper.readers.saturating_sub(1);
-                }
-            }
-            if helper.output_bytes > OUTPUT_QUOTA || helper.frames > MAX_FRAMES {
-                return Err(Denied::new("workspace reconciliation output limit"));
-            }
+            accept_read_event(&mut helper, event, &mut response)?;
         }
     })();
     if helper
@@ -208,4 +156,79 @@ fn read_one(
         ));
     }
     result.map(|response| (response, helper.max_cpu))
+}
+
+fn check_read_budget(
+    helper: &mut Peer,
+    broker: &Broker,
+    generation: u64,
+    limits: &Limits,
+    started: Instant,
+    spent_cpu: f64,
+) -> Result<bool, Denied> {
+    let inner = broker.lock();
+    if inner.grant.generation != generation {
+        return Err(Denied::Cancelled("execution grant revoked".into()));
+    }
+    let live_limits = inner.limits.clone();
+    drop(inner);
+    if started.elapsed().as_secs_f64() >= limits.wall_seconds.min(live_limits.wall_seconds)
+        || helper.started.elapsed().as_secs_f64()
+            >= limits.host_call_seconds.min(live_limits.host_call_seconds)
+    {
+        return Err(Denied::new("workspace reconciliation deadline"));
+    }
+    helper.flush_input()?;
+    helper.measure()?;
+    let stopped = helper.poll().is_some();
+    if spent_cpu + helper.max_cpu
+        > limits
+            .process_cpu_seconds
+            .min(live_limits.process_cpu_seconds)
+        // Reaping may supply an attributable terminal high-water
+        // mark. Check it before returning bytes to provenance. Linux
+        // has only post-exec live samples, so a stopped unsampled
+        // helper has no attributable RSS observation to compare.
+        || helper.last_rss.unwrap_or(if stopped { 0 } else { u64::MAX })
+            > limits.process_rss_bytes.min(live_limits.process_rss_bytes)
+    {
+        return Err(Denied::new("workspace reconciliation resource limit"));
+    }
+
+    Ok(stopped)
+}
+
+fn accept_read_event(
+    helper: &mut Peer,
+    event: Event,
+    response: &mut Option<Response>,
+) -> Result<(), Denied> {
+    if event.origin() != (Role::File, helper.id) {
+        return Err(Denied::new("workspace reconciliation peer mismatch"));
+    }
+    match event {
+        Event::Frame(_, _, body) => {
+            helper.frames += 1;
+            helper.output_bytes += body.len();
+            if response.is_some() {
+                return Err(Denied::new("workspace reconciliation extra frame"));
+            }
+            let frame: FromHelper = evx_api::strict::parse_typed(&body)?;
+            let FromHelper::FileResult { response: value } = frame else {
+                return Err(Denied::new("workspace reconciliation protocol"));
+            };
+            *response = Some(value);
+        }
+        Event::Stderr(_, _, bytes) => helper.output_bytes += bytes.len(),
+        Event::Closed(_, _, _, error) => {
+            if error.is_some() {
+                return Err(Denied::new("workspace reconciliation framing"));
+            }
+            helper.readers = helper.readers.saturating_sub(1);
+        }
+    }
+    if helper.output_bytes > OUTPUT_QUOTA || helper.frames > MAX_FRAMES {
+        return Err(Denied::new("workspace reconciliation output limit"));
+    }
+    Ok(())
 }

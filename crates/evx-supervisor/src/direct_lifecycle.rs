@@ -75,6 +75,9 @@ struct Journal {
 pub struct DirectLifecycle {
     path: PathBuf,
     binding: Binding,
+    // Pin namespace identities for the entire session, including between checks.
+    _root: OwnedFd,
+    _lock: OwnedFd,
     session: u64,
     boot: BootSession,
     gate: Mutex<()>,
@@ -170,7 +173,10 @@ impl DirectLifecycle {
         {
             return Err(denied());
         }
+        let lock = safe_open(&root, LOCK, true)?;
         let mut context = Self {
+            _root: root,
+            _lock: lock,
             path,
             binding,
             session: 0,

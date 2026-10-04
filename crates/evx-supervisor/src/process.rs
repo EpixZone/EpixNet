@@ -195,7 +195,7 @@ pub fn child_admission_status() -> Result<(), Denied> {
 pub(crate) fn quarantine_child_admission() {
     *CHILD_ADMISSION_STOPPED
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner()) = true;
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
 }
 
 impl Peer {

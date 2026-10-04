@@ -47,7 +47,8 @@ struct client {
     struct evx_xpc_observation sample;
     uint64_t observed_at;
     unsigned char challenge[32];
-    bool challenged, admitted;
+    bool challenged;
+    bool admitted;
 };
 
 enum { AUTHORITY_SIZE = 304 };
@@ -62,13 +63,16 @@ static int container_directory(const char *identifier, const char *leaf, char *o
     bool segment = false;
     for (size_t n = 0; n < length; ++n) {
         unsigned char ch = (unsigned char)identifier[n];
-        if (ch == '.') { if (!segment) return -1; segment = false; }
+        if (ch == '.') {
+            if (!segment) return -1;
+            segment = false;
+        }
         else if ((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
                  (ch >= '0' && ch <= '9') || ch == '-') segment = true;
         else return -1;
     }
     if (!segment) return -1;
-    char buffer[16384]; struct passwd entry, *result = NULL;
+    char buffer[16384]; struct passwd entry; struct passwd *result = NULL;
     if (getpwuid_r(geteuid(), &entry, buffer, sizeof(buffer), &result) || !result ||
         result->pw_uid != geteuid() || !result->pw_dir || result->pw_dir[0] != '/' ||
         !result->pw_dir[1]) return -1;
@@ -90,7 +94,7 @@ int evx_xpc_authority_directory(const char *identifier, char *output, size_t cap
  * macOS. Administrators are trusted installation authorities. This allowance
  * applies only to that root-level component, never arbitrary writable paths. */
 int evx_xpc_system_applications_directory(unsigned uid, unsigned gid, unsigned mode) {
-    char buffer[4096]; struct group group, *found = NULL;
+    char buffer[4096]; struct group group; struct group *found = NULL;
     return uid == 0 && (mode & 0022) == 0020 &&
         getgrnam_r("admin", &group, buffer, sizeof(buffer), &found) == 0 && found && gid == found->gr_gid;
 }
@@ -100,7 +104,8 @@ int evx_xpc_system_applications_directory(unsigned uid, unsigned gid, unsigned m
  * the final authority directory must still be privately owned and mode0700. */
 static int secure_directory(const char *path, bool private) {
     if (!path || path[0] != '/' || strlen(path) >= PATH_MAX || !path[1]) return -1;
-    char copy[PATH_MAX]; strcpy(copy, path + 1);
+    char copy[PATH_MAX];
+    if (strlcpy(copy, path + 1, sizeof(copy)) >= sizeof(copy)) return -1;
     int current = open("/", O_SEARCH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     char *component = copy;
     while (current >= 0 && component && *component) {
@@ -138,7 +143,7 @@ static void authority_record(unsigned char record[AUTHORITY_SIZE], const unsigne
 static int create_authority(int directory, const unsigned char challenge[32], const char *service,
                             char filename[65]) {
     if (strlen(service) > 255 || geteuid() == 0) return -1;
-    unsigned char random[32], record[AUTHORITY_SIZE]; arc4random_buf(random, sizeof(random));
+    unsigned char random[32]; unsigned char record[AUTHORITY_SIZE]; arc4random_buf(random, sizeof(random));
     for (unsigned n = 0; n < 32; ++n) snprintf(filename + 2 * n, 3, "%02x", random[n]);
     int output = openat(directory, filename, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
     if (output < 0) return -1;
@@ -214,8 +219,21 @@ static int wait_client(struct client *client, uint64_t deadline) {
     return pthread_cond_timedwait_relative_np(&client->condition, &client->mutex, &relative);
 }
 
+static void client_event(struct client *client, uint64_t *sequence, xpc_object_t object) {
+    const char *op = xpc_get_type(object) == XPC_TYPE_DICTIONARY ? xpc_dictionary_get_string(object, "op") : NULL;
+    if (op && !strcmp(op, "challenge") && !client->challenged && client->sample.state == 0 &&
+        xpc_dictionary_get_count(object) == 3 && unsigned_field(object, "v") &&
+        xpc_dictionary_get_uint64(object, "v") == 1) {
+        size_t size = 0; const void *bytes = xpc_dictionary_get_data(object, "challenge", &size);
+        if (bytes && size == sizeof(client->challenge)) {
+            memcpy(client->challenge, bytes, size); client->challenged = true;
+        } else client->sample.state = -1;
+    } else if (client->admitted) client_observe(client, sequence, object);
+    else client->sample.state = -1;
+}
+
 void *evx_xpc_open(const char *name, const char *requirement, const char *authority_root, uint32_t access, int input, int output, int error) {
-    if (__builtin_available(macOS 12.0, *)) {} else { return NULL; }
+    if (__builtin_available(macOS 12.0, *)) { /* Peer identity checks require macOS 12. */ } else { return NULL; }
     struct client *client = calloc(1, sizeof(*client));
     if (!client) return NULL;
     pthread_mutex_init(&client->mutex, NULL);
@@ -229,16 +247,7 @@ void *evx_xpc_open(const char *name, const char *requirement, const char *author
     __block uint64_t sequence = 0;
     xpc_connection_set_event_handler(client->connection, ^(xpc_object_t object) {
         pthread_mutex_lock(&client->mutex);
-        const char *op = xpc_get_type(object) == XPC_TYPE_DICTIONARY ? xpc_dictionary_get_string(object, "op") : NULL;
-        if (op && !strcmp(op, "challenge") && !client->challenged && client->sample.state == 0 &&
-            xpc_dictionary_get_count(object) == 3 && unsigned_field(object, "v") &&
-            xpc_dictionary_get_uint64(object, "v") == 1) {
-            size_t size = 0; const void *bytes = xpc_dictionary_get_data(object, "challenge", &size);
-            if (bytes && size == sizeof(client->challenge)) {
-                memcpy(client->challenge, bytes, size); client->challenged = true;
-            } else client->sample.state = -1;
-        } else if (client->admitted) client_observe(client, &sequence, object);
-        else client->sample.state = -1;
+        client_event(client, &sequence, object);
         pthread_cond_broadcast(&client->condition);
         pthread_mutex_unlock(&client->mutex);
     });
@@ -260,7 +269,10 @@ void *evx_xpc_open(const char *name, const char *requirement, const char *author
     char filename[65] = {0};
     int authority = directory >= 0 ? create_authority(directory, client->challenge, name, filename) : -1;
     if (authority < 0) {
-        if (directory >= 0) { if (*filename) unlinkat(directory, filename, 0); close(directory); }
+        if (directory >= 0) {
+            if (filename[0]) unlinkat(directory, filename, 0);
+            close(directory);
+        }
         evx_xpc_release(client); return NULL;
     }
     pthread_mutex_lock(&client->mutex); client->admitted = true; pthread_mutex_unlock(&client->mutex);
@@ -304,22 +316,36 @@ void evx_xpc_stop(void *opaque) {
     xpc_release(stop);
 }
 
-struct server {
+struct server_policy {
     char client_requirement[2048];
     char worker_digest[65];
     char worker_path[PATH_MAX];
-    char mode[32];
+    char *mode;
     char authority_root[PATH_MAX];
     char identifier[256];
     char workspace[PATH_MAX];
+};
+
+struct server {
+    struct server_policy policy;
     int workspace_lease;
     xpc_connection_t peer;
-    dispatch_source_t timer, idle_timer;
+    dispatch_source_t timer;
+    dispatch_source_t idle_timer;
     uint64_t idle_epoch;
     pid_t child;
-    bool stopping, killed, disconnected, reaped;
-    uint64_t stop_at, sequence, peak, child_peak, started_at;
-    double cpu, own_base, own_accounted;
+    bool stopping;
+    bool killed;
+    bool disconnected;
+    bool reaped;
+    uint64_t stop_at;
+    uint64_t sequence;
+    uint64_t peak;
+    uint64_t child_peak;
+    uint64_t started_at;
+    double cpu;
+    double own_base;
+    double own_accounted;
     int exit_code;
 };
 static struct server server = {.workspace_lease = -1};
@@ -418,8 +444,7 @@ static void poll_child(void) {
         double cpu = usage.ru_utime.tv_sec + usage.ru_utime.tv_usec / 1e6 +
                      usage.ru_stime.tv_sec + usage.ru_stime.tv_usec / 1e6;
         if ((uint64_t)usage.ru_maxrss > server.child_peak) server.child_peak = (uint64_t)usage.ru_maxrss;
-        server.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) :
-                           WIFSIGNALED(status) ? -WTERMSIG(status) : -1;
+        server.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -WTERMSIG(status);
         publish_sample(0, cpu);
         dispatch_source_cancel(server.timer);
         if (server.disconnected) clear_invocation();
@@ -447,6 +472,28 @@ static void poll_child(void) {
     publish_sample(observation.pti_resident_size, cpu);
 }
 
+static bool hash_worker(int fd, const struct stat *before, unsigned char hash[CC_SHA256_DIGEST_LENGTH]) {
+    CC_SHA256_CTX digest;
+    CC_SHA256_Init(&digest);
+    unsigned char bytes[65536];
+    uint64_t total = 0;
+    for (;;) {
+        ssize_t size = read(fd, bytes, sizeof(bytes));
+        if (size < 0 && errno == EINTR) continue;
+        if (size < 0) return false;
+        if (size == 0) break;
+        total += (uint64_t)size;
+        if (total > (uint64_t)before->st_size) return false;
+        CC_SHA256_Update(&digest, bytes, (CC_LONG)size);
+    }
+    struct stat after;
+    bool valid = total == (uint64_t)before->st_size && !fstat(fd, &after) &&
+        before->st_size == after.st_size && before->st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
+        before->st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec;
+    CC_SHA256_Final(hash, &digest);
+    return valid;
+}
+
 static bool worker_matches(const char *path, const char *expected) {
     /* The signed service manifest pins exact packaged bytes. App Sandbox
      * refuses Security's additional CodeSigningHelper validation. The host
@@ -457,7 +504,8 @@ static bool worker_matches(const char *path, const char *expected) {
               (expected[n] >= 'a' && expected[n] <= 'f'))) return false;
     char parent[PATH_MAX];
     if (strlen(path) >= sizeof(parent)) return false;
-    strcpy(parent, path); char *name = strrchr(parent, '/');
+    if (strlcpy(parent, path, sizeof(parent)) >= sizeof(parent)) return false;
+    char *name = strrchr(parent, '/');
     if (!name || name == parent || !name[1]) return false;
     *name++ = '\0';
     int directory = secure_directory(parent, false);
@@ -468,26 +516,15 @@ static bool worker_matches(const char *path, const char *expected) {
         os_log_error(OS_LOG_DEFAULT, "EVX XPC worker read refused: %{public}d", errno);
         return false;
     }
-    struct stat before, after;
+    struct stat before;
     bool valid = !fstat(fd, &before) && S_ISREG(before.st_mode) &&
         (before.st_uid == geteuid() || before.st_uid == 0) && !(before.st_mode & 0022) &&
         before.st_nlink == 1 && (before.st_mode & 0111) && before.st_size > 0 && before.st_size <= 512 * 1024 * 1024;
-    CC_SHA256_CTX digest;
-    CC_SHA256_Init(&digest);
-    unsigned char bytes[65536], hash[CC_SHA256_DIGEST_LENGTH];
-    uint64_t total = 0;
-    while (valid) {
-        ssize_t size = read(fd, bytes, sizeof(bytes));
-        if (size < 0 && errno == EINTR) continue;
-        if (size == 0) break;
-        if (size < 0 || (total += (uint64_t)size) > (uint64_t)before.st_size) { valid = false; break; }
-        CC_SHA256_Update(&digest, bytes, (CC_LONG)size);
-    }
-    valid = valid && total == (uint64_t)before.st_size && !fstat(fd, &after) &&
-        before.st_size == after.st_size && before.st_mtimespec.tv_sec == after.st_mtimespec.tv_sec &&
-        before.st_mtimespec.tv_nsec == after.st_mtimespec.tv_nsec;
+    unsigned char hash[CC_SHA256_DIGEST_LENGTH];
+    if (valid) valid = hash_worker(fd, &before, hash);
+
     close(fd);
-    CC_SHA256_Final(hash, &digest);
+    if (!valid) return false;
     char actual[65];
     for (size_t n = 0; n < sizeof(hash); ++n) snprintf(actual + n * 2, 3, "%02x", hash[n]);
     return valid && !strcmp(actual, expected);
@@ -511,7 +548,8 @@ static int pipe_descriptor(xpc_object_t request, const char *name, bool writable
  * Its lock serializes cooperative helpers. It is not proof that an orphan or
  * native-compromised worker has died; host quarantine must survive restart. */
 static int workspace_lease(void) {
-    char copy[PATH_MAX]; strcpy(copy, server.workspace + 1);
+    char copy[PATH_MAX];
+    if (strlcpy(copy, server.policy.workspace + 1, sizeof(copy)) >= sizeof(copy)) return -1;
     int current = open("/", O_SEARCH | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
     char *component = copy;
     while (current >= 0 && component && *component) {
@@ -544,9 +582,9 @@ static bool spawn_worker(xpc_object_t request) {
         pipe_descriptor(request, "error", true),
     };
     bool valid = descriptors[0] >= 0 && descriptors[1] >= 0 && descriptors[2] >= 0 &&
-                 worker_matches(server.worker_path, server.worker_digest);
+                 worker_matches(server.policy.worker_path, server.policy.worker_digest);
     uint64_t access = xpc_dictionary_get_uint64(request, "access");
-    bool file = !strcmp(server.mode, "apple-file");
+    bool file = !strcmp(server.policy.mode, "apple-file");
     valid = valid && unsigned_field(request, "access") && (file ? (access == 1 || access == 2) : access == 0);
     if (valid && file) {
         server.workspace_lease = workspace_lease(); valid = server.workspace_lease >= 0;
@@ -562,12 +600,12 @@ static bool spawn_worker(xpc_object_t request) {
         for (int n = 0; n < 3; ++n) posix_spawn_file_actions_adddup2(&actions, descriptors[n], n);
         if (file) {
             posix_spawn_file_actions_adddup2(&actions, server.workspace_lease, 3);
-            posix_spawn_file_actions_addchdir_np(&actions, server.workspace);
+            posix_spawn_file_actions_addchdir_np(&actions, server.policy.workspace);
         }
-        char *mode = file && access == 1 ? "apple-file-read" : server.mode;
-        char *arguments[] = {server.worker_path, mode, NULL};
+        char *mode = file && access == 1 ? "apple-file-read" : server.policy.mode;
+        char *arguments[] = {server.policy.worker_path, mode, NULL};
         char *environment[] = {"PATH=/usr/bin:/bin", "LANG=C", "LC_ALL=C", "EVX_APPLE_XPC_CHILD=1", NULL};
-        error = posix_spawn(&server.child, server.worker_path, &actions, &attributes, arguments, environment);
+        error = posix_spawn(&server.child, server.policy.worker_path, &actions, &attributes, arguments, environment);
         posix_spawnattr_destroy(&attributes);
         posix_spawn_file_actions_destroy(&actions);
     }
@@ -577,7 +615,7 @@ static bool spawn_worker(xpc_object_t request) {
     return error == 0;
 }
 
-struct admission { unsigned char challenge[32]; bool hello, consumed; dispatch_source_t timer; };
+struct admission { unsigned char challenge[32]; bool hello; bool consumed; dispatch_source_t timer; };
 static void admission_free(void *opaque) {
     free(opaque); atomic_fetch_sub(&connections, 1);
     dispatch_async(dispatch_get_main_queue(), ^{ arm_idle_exit(); });
@@ -595,27 +633,64 @@ static bool accept_authority(xpc_object_t request, xpc_connection_t peer, struct
     if (!value || xpc_get_type(value) != XPC_TYPE_FD || geteuid() == 0) return false;
     int descriptor = xpc_dictionary_dup_fd(request, "authority");
     if (descriptor < 0) return false;
-    struct stat info; char path[PATH_MAX]; unsigned char actual[AUTHORITY_SIZE], expected[AUTHORITY_SIZE];
+    struct stat info; char path[PATH_MAX]; unsigned char actual[AUTHORITY_SIZE]; unsigned char expected[AUTHORITY_SIZE];
     int flags = fcntl(descriptor, F_GETFL);
-    size_t root = strlen(server.authority_root);
+    size_t root = strlen(server.policy.authority_root);
     bool valid = flags >= 0 && (flags & O_ACCMODE) == O_RDONLY && !fstat(descriptor, &info) &&
         S_ISREG(info.st_mode) && info.st_uid == geteuid() && (info.st_mode & 0777) == 0600 &&
         info.st_nlink == 1 && info.st_size == AUTHORITY_SIZE && !fcntl(descriptor, F_GETPATH, path) &&
-        strlen(path) == root + 65 && !memcmp(path, server.authority_root, root) && path[root] == '/';
+        strlen(path) == root + 65 && !memcmp(path, server.policy.authority_root, root) && path[root] == '/';
     if (valid) for (size_t n = root + 1; n < root + 65; ++n)
         valid &= (path[n] >= '0' && path[n] <= '9') || (path[n] >= 'a' && path[n] <= 'f');
     if (valid) {
         ssize_t size; do { size = pread(descriptor, actual, sizeof(actual), 0); } while (size < 0 && errno == EINTR);
-        authority_record(expected, admission->challenge, xpc_connection_get_pid(peer), server.identifier);
+        authority_record(expected, admission->challenge, xpc_connection_get_pid(peer), server.policy.identifier);
         valid = size == sizeof(actual) && !memcmp(actual, expected, sizeof(actual));
     }
     close(descriptor);
     return valid;
 }
 
+static void service_request(xpc_connection_t peer, struct admission *admission, xpc_object_t request) {
+    if (xpc_get_type(request) == XPC_TYPE_ERROR) {
+        stop_admission_timer(admission);
+        if (server.peer == peer) {
+            server.disconnected = true;
+            if (server.reaped || server.child <= 0) clear_invocation();
+            else terminate_owned();
+        }
+        return;
+    }
+    bool dictionary = xpc_get_type(request) == XPC_TYPE_DICTIONARY;
+    const char *operation = dictionary ? xpc_dictionary_get_string(request, "op") : NULL;
+    if (!dictionary || !unsigned_field(request, "v") ||
+        xpc_dictionary_get_uint64(request, "v") != 1 || !operation) {
+        xpc_connection_cancel(peer);
+        return;
+    }
+    if (!strcmp(operation, "hello") && xpc_dictionary_get_count(request) == 2 && !admission->hello && (!server.peer || server.reaped)) {
+        admission->hello = true;
+    } else if (!strcmp(operation, "start") && xpc_dictionary_get_count(request) == 7 && admission->hello && !admission->consumed && (!server.peer || server.reaped) &&
+        accept_authority(request, peer, admission)) {
+        admission->consumed = true;
+        stop_admission_timer(admission);
+        clear_invocation();
+        server.peer = xpc_retain(peer);
+        if (!spawn_worker(request)) { xpc_connection_cancel(peer); _Exit(1); }
+        server.timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
+        dispatch_source_set_timer(server.timer, DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC, NSEC_PER_MSEC);
+        dispatch_source_set_event_handler(server.timer, ^{ poll_child(); });
+        dispatch_resume(server.timer);
+    } else if (!strcmp(operation, "stop") && xpc_dictionary_get_count(request) == 2 && server.peer == peer) {
+        terminate_owned();
+    } else {
+        xpc_connection_cancel(peer);
+    }
+}
+
 static void service_peer_serial(xpc_connection_t peer) {
     cancel_idle_exit();
-    if (xpc_connection_set_peer_code_signing_requirement(peer, server.client_requirement)) {
+    if (xpc_connection_set_peer_code_signing_requirement(peer, server.policy.client_requirement)) {
         xpc_connection_set_event_handler(peer, ^(xpc_object_t object) { (void)object; });
         xpc_connection_resume(peer);
         xpc_connection_cancel(peer);
@@ -628,40 +703,7 @@ static void service_peer_serial(xpc_connection_t peer) {
     xpc_connection_set_context(peer, admission); xpc_connection_set_finalizer_f(peer, admission_free);
     xpc_connection_set_target_queue(peer, dispatch_get_main_queue());
     xpc_connection_set_event_handler(peer, ^(xpc_object_t request) {
-        if (xpc_get_type(request) == XPC_TYPE_ERROR) {
-            stop_admission_timer(admission);
-            if (server.peer == peer) {
-                server.disconnected = true;
-                if (server.reaped || server.child <= 0) clear_invocation();
-                else terminate_owned();
-            }
-            return;
-        }
-        bool dictionary = xpc_get_type(request) == XPC_TYPE_DICTIONARY;
-        const char *operation = dictionary ? xpc_dictionary_get_string(request, "op") : NULL;
-        if (!dictionary || !unsigned_field(request, "v") ||
-            xpc_dictionary_get_uint64(request, "v") != 1 || !operation) {
-            xpc_connection_cancel(peer);
-            return;
-        }
-        if (!strcmp(operation, "hello") && xpc_dictionary_get_count(request) == 2 && !admission->hello && (!server.peer || server.reaped)) {
-            admission->hello = true;
-        } else if (!strcmp(operation, "start") && xpc_dictionary_get_count(request) == 7 && admission->hello && !admission->consumed && (!server.peer || server.reaped) &&
-            accept_authority(request, peer, admission)) {
-            admission->consumed = true;
-            stop_admission_timer(admission);
-            clear_invocation();
-            server.peer = xpc_retain(peer);
-            if (!spawn_worker(request)) { xpc_connection_cancel(peer); _Exit(1); }
-            server.timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
-            dispatch_source_set_timer(server.timer, DISPATCH_TIME_NOW, 20 * NSEC_PER_MSEC, NSEC_PER_MSEC);
-            dispatch_source_set_event_handler(server.timer, ^{ poll_child(); });
-            dispatch_resume(server.timer);
-        } else if (!strcmp(operation, "stop") && xpc_dictionary_get_count(request) == 2 && server.peer == peer) {
-            terminate_owned();
-        } else {
-            xpc_connection_cancel(peer);
-        }
+        service_request(peer, admission, request);
     });
     xpc_connection_resume(peer);
     xpc_object_t challenge = xpc_dictionary_create(NULL, NULL, 0);
@@ -704,21 +746,21 @@ static bool bundle_string(CFStringRef key, char *destination, size_t capacity) {
 }
 
 void evx_xpc_service_main(void) {
-    char role[32], host_identifier[256];
+    char role[32]; char host_identifier[256];
     if (CFBundleGetValueForInfoDictionaryKey(CFBundleGetMainBundle(), CFSTR("EVXAuthorityRoot")) ||
         !bundle_string(CFSTR("EVXAuthorityHostIdentifier"), host_identifier, sizeof(host_identifier)) ||
-        evx_xpc_authority_directory(host_identifier, server.authority_root, sizeof(server.authority_root)) ||
-        !bundle_string(CFSTR("CFBundleIdentifier"), server.identifier, sizeof(server.identifier)) ||
-        !bundle_string(CFSTR("EVXClientRequirement"), server.client_requirement, sizeof(server.client_requirement)) ||
-        !bundle_string(CFSTR("EVXWorkerSHA256"), server.worker_digest, sizeof(server.worker_digest)) ||
+        evx_xpc_authority_directory(host_identifier, server.policy.authority_root, sizeof(server.policy.authority_root)) ||
+        !bundle_string(CFSTR("CFBundleIdentifier"), server.policy.identifier, sizeof(server.policy.identifier)) ||
+        !bundle_string(CFSTR("EVXClientRequirement"), server.policy.client_requirement, sizeof(server.policy.client_requirement)) ||
+        !bundle_string(CFSTR("EVXWorkerSHA256"), server.policy.worker_digest, sizeof(server.policy.worker_digest)) ||
         !bundle_string(CFSTR("EVXRole"), role, sizeof(role))) _Exit(2);
-    if (server.authority_root[0] != '/' || !server.authority_root[1] ||
-        server.authority_root[strlen(server.authority_root) - 1] == '/' || geteuid() == 0) _Exit(2);
-    if (!strcmp(role, "guest")) strcpy(server.mode, "apple-run");
-    else if (!strcmp(role, "compiler")) strcpy(server.mode, "apple-compile");
+    if (server.policy.authority_root[0] != '/' || !server.policy.authority_root[1] ||
+        server.policy.authority_root[strlen(server.policy.authority_root) - 1] == '/' || geteuid() == 0) _Exit(2);
+    if (!strcmp(role, "guest")) server.policy.mode = "apple-run";
+    else if (!strcmp(role, "compiler")) server.policy.mode = "apple-compile";
     else if (!strcmp(role, "file")) {
-        strcpy(server.mode, "apple-file");
-        if (container_directory(server.identifier, "EVXWorkspace", server.workspace, sizeof(server.workspace))) _Exit(2);
+        server.policy.mode = "apple-file";
+        if (container_directory(server.policy.identifier, "EVXWorkspace", server.policy.workspace, sizeof(server.policy.workspace))) _Exit(2);
     }
     else _Exit(2);
     CFURLRef url = CFBundleCopyExecutableURL(CFBundleGetMainBundle());
@@ -728,8 +770,7 @@ void evx_xpc_service_main(void) {
     char *directory = strrchr(executable, '/');
     if (!directory) _Exit(2);
     *directory = '\0';
-    char candidate[PATH_MAX];
-    if (snprintf(candidate, sizeof(candidate), "%s/evx-worker-apple", executable) >= PATH_MAX) _Exit(2);
-    strcpy(server.worker_path, candidate);
+    int written = snprintf(server.policy.worker_path, sizeof(server.policy.worker_path), "%s/evx-worker-apple", executable);
+    if (written < 0 || (size_t)written >= sizeof(server.policy.worker_path)) _Exit(2);
     xpc_main(service_peer);
 }

@@ -497,7 +497,8 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &m
         return hints.into_iter().min();
     }
     let now = now_unix().unwrap_or(now);
-    let due = match service.state.due_jobs(now) {
+    let due_cutoff = now;
+    let due = match service.state.due_jobs(due_cutoff) {
         Ok(due) => due,
         Err(error) => {
             app.log("ERROR", format!("EVX scheduler: due jobs: {error}")).await;
@@ -526,7 +527,7 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &m
     for due_row in &due {
         let Some(xite) = facts.get(&due_row.xite) else { continue };
         let Some(row) = xite.rows.iter().find(|row| row.job == due_row.job) else { continue };
-        if !row.enabled || row.paused_reason.is_some() || !row.next_due_unix.is_some_and(|at| at <= now) {
+        if !row.enabled || row.paused_reason.is_some() || row.next_due_unix.is_none_or(|at| at > now) {
             continue;
         }
         candidates.push(Candidate {
@@ -555,12 +556,11 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &m
             Decision::Wait { .. } => {}
         }
     }
-    match service.state.next_due_job(now) {
-        Ok(Some(row)) => {
-            if let (Some(due), Ok(period)) = (row.next_due_unix, period(&row)) {
-                hints.push(jittered(due, period, jitter_seed(now)));
-            }
-        }
+    // A job that became due during this tick was absent from `due`. Search
+    // from that original cutoff so it produces an immediate wake instead of
+    // disappearing between the due and future queries at a second boundary.
+    match next_job_wake(&service.state, due_cutoff, now) {
+        Ok(Some(wake)) => hints.push(wake),
         Ok(None) => {}
         Err(error) => {
             app.log("ERROR", format!("EVX scheduler: next due: {error}")).await;
@@ -568,6 +568,14 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &m
         }
     }
     hints.into_iter().min()
+}
+
+fn next_job_wake(state: &DurableState, due_cutoff: u64, now: u64) -> evx_state::Result<Option<u64>> {
+    Ok(state.next_due_job(due_cutoff)?.and_then(|row| {
+        let due = row.next_due_unix?;
+        let period = period(&row).ok()?;
+        Some(jittered(due, period, jitter_seed(now)))
+    }))
 }
 
 /// Gather what admission decides on for one xite with due jobs, or `None`
@@ -1139,6 +1147,19 @@ mod tests {
         };
         service.state.set_jobs(xite, &"a".repeat(64), &[spec], T).unwrap();
         service.state.jobs(xite).unwrap().remove(0)
+    }
+
+    #[test]
+    fn a_job_becoming_due_during_a_tick_still_supplies_a_wake() {
+        let (service, _app) = service();
+        granted_job(&service, "1Boundary");
+        service.state.set_job_next_due("1Boundary", "sync", Some(T + PERIOD)).unwrap();
+        let cutoff = T + PERIOD - 1;
+        assert!(service.state.due_jobs(cutoff).unwrap().is_empty());
+        let finished = T + PERIOD + 30;
+        assert!(service.state.next_due_job(finished).unwrap().is_none());
+        let wake = next_job_wake(&service.state, cutoff, finished).unwrap().expect("newly due job must wake the scheduler");
+        assert!(wake <= finished, "a passed deadline must schedule an immediate tick");
     }
 
     /// Reserve the slot `at` falls in, as a process that then crashed did.

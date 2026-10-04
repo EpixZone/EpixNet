@@ -92,78 +92,35 @@ fn compile_input(
     }
     let frame = encode(&input)?;
     let (tx, rx) = mpsc::sync_channel(EVENT_CAPACITY);
-    let scratch = std::env::temp_dir();
-    let mut peer = Peer::spawn(config, "compile", &scratch, Role::Compiler, tx, None)?;
+    // Compilation needs no filesystem. Use a fixed system directory, never a
+    // shared temporary directory or a caller-controlled working directory.
+    let mut peer = Peer::spawn(
+        config,
+        "compile",
+        std::path::Path::new("/"),
+        Role::Compiler,
+        tx,
+        None,
+    )?;
     let send_failure = peer.send(&frame).err();
     let deadline = Instant::now() + config.compile_timeout;
     let mut reply: Option<FromCompiler> = None;
     let mut failure: Option<Denied> = send_failure;
     while failure.is_none() {
-        if cancelled() {
-            failure = Some(Denied::Cancelled("compilation cancelled".into()));
-            break;
-        }
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            failure = Some(Denied::new("compilation deadline"));
-            break;
-        }
-        if let Err(error) = peer.flush_input().and_then(|_| peer.measure()) {
-            failure = Some(error);
-            break;
-        }
-        peer.poll();
-        if peer.max_cpu > config.compile_cpu_seconds {
-            failure = Some(Denied::new("compiler CPU limit"));
-            break;
-        }
-        if peer.last_rss.unwrap_or(0) > config.compile_rss_bytes {
-            failure = Some(Denied::new("compiler RSS limit"));
-            break;
-        }
+        let remaining = match compiler_budget(&mut peer, config, deadline, cancelled) {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                failure = Some(error);
+                break;
+            }
+        };
         if peer.exit_code.is_some() && peer.readers == 0 {
             if reply.is_none() {
                 failure = Some(exited_without_result(&mut peer));
             }
             break;
         }
-        match rx.recv_timeout(remaining.min(Duration::from_millis(20))) {
-            Ok(Event::Frame(_, _, body)) => {
-                peer.output_bytes = peer.output_bytes.saturating_add(body.len());
-                if peer.output_bytes > OUTPUT_QUOTA {
-                    failure = Some(Denied::new("compiler output quota"));
-                } else if reply.is_some() {
-                    failure = Some(Denied::new("compiler message after terminal result"));
-                } else {
-                    match decode_compiler_reply(&body) {
-                        Ok(frame) => reply = Some(frame),
-                        Err(_) => failure = Some(Denied::new("compiler protocol")),
-                    }
-                }
-            }
-            Ok(Event::Stderr(_, _, chunk)) => {
-                peer.output_bytes = peer.output_bytes.saturating_add(chunk.len());
-                if peer.output_bytes > OUTPUT_QUOTA {
-                    failure = Some(Denied::new("compiler output quota"));
-                }
-                peer.record_stderr(&chunk);
-            }
-            Ok(Event::Closed(_, _, _, error)) => {
-                peer.readers = peer.readers.saturating_sub(1);
-                if let Some(error) = error {
-                    failure = Some(Denied::new(error));
-                }
-            }
-            Err(mpsc::RecvTimeoutError::Timeout) => {}
-            Err(mpsc::RecvTimeoutError::Disconnected) => {
-                // Both readers send their Closed event before disconnecting.
-                if peer.readers != 0 {
-                    failure = Some(Denied::new("compiler channel closed"));
-                } else {
-                    std::thread::sleep(Duration::from_millis(2));
-                }
-            }
-        }
+        failure = compiler_event(&mut peer, &rx, remaining, &mut reply).err();
     }
     let closed = if config.fail_compiler_cleanup {
         Err(crate::process::CleanupTimeout { pid: peer.pid })
@@ -206,4 +163,75 @@ fn compile_input(
         }
         None => Err(Denied::new("compiler produced no result")),
     }
+}
+
+fn compiler_budget(
+    peer: &mut Peer,
+    config: &Config,
+    deadline: Instant,
+    cancelled: &dyn Fn() -> bool,
+) -> Result<Duration, Denied> {
+    if cancelled() {
+        return Err(Denied::Cancelled("compilation cancelled".into()));
+    }
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return Err(Denied::new("compilation deadline"));
+    }
+    peer.flush_input()?;
+    peer.measure()?;
+    peer.poll();
+    if peer.max_cpu > config.compile_cpu_seconds {
+        return Err(Denied::new("compiler CPU limit"));
+    }
+    if peer.last_rss.unwrap_or(0) > config.compile_rss_bytes {
+        return Err(Denied::new("compiler RSS limit"));
+    }
+    Ok(remaining)
+}
+
+fn compiler_event(
+    peer: &mut Peer,
+    rx: &mpsc::Receiver<Event>,
+    remaining: Duration,
+    reply: &mut Option<FromCompiler>,
+) -> Result<(), Denied> {
+    match rx.recv_timeout(remaining.min(Duration::from_millis(20))) {
+        Ok(Event::Frame(_, _, body)) => {
+            peer.output_bytes = peer.output_bytes.saturating_add(body.len());
+            if peer.output_bytes > OUTPUT_QUOTA {
+                return Err(Denied::new("compiler output quota"));
+            } else if reply.is_some() {
+                return Err(Denied::new("compiler message after terminal result"));
+            } else {
+                match decode_compiler_reply(&body) {
+                    Ok(frame) => *reply = Some(frame),
+                    Err(_) => return Err(Denied::new("compiler protocol")),
+                }
+            }
+        }
+        Ok(Event::Stderr(_, _, chunk)) => {
+            peer.output_bytes = peer.output_bytes.saturating_add(chunk.len());
+            if peer.output_bytes > OUTPUT_QUOTA {
+                return Err(Denied::new("compiler output quota"));
+            }
+            peer.record_stderr(&chunk);
+        }
+        Ok(Event::Closed(_, _, _, error)) => {
+            peer.readers = peer.readers.saturating_sub(1);
+            if let Some(error) = error {
+                return Err(Denied::new(error));
+            }
+        }
+        Err(mpsc::RecvTimeoutError::Timeout) => {}
+        Err(mpsc::RecvTimeoutError::Disconnected) => {
+            // Both readers send their Closed event before disconnecting.
+            if peer.readers != 0 {
+                return Err(Denied::new("compiler channel closed"));
+            } else {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+    }
+    Ok(())
 }

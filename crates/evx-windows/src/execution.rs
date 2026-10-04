@@ -1,6 +1,9 @@
 //! Windows transport for real EVX compiler and Pulley worker roles.
 //! This trusted embedding API does not grant consent or enable node admission.
-use super::*;
+use super::{
+    descriptor, fail, job, ok, sid_text, token, token_info, validate_token, wide,
+    worker_environment, Attributes, Handle, Stage, TERMINATED,
+};
 use evx_api::frames::{self, FromCompiler, FromWorker, ToCompiler, ToWorker, WorkerResult};
 use evx_api::{Limits, MAX_ARTIFACT_FRAME, MAX_FRAME};
 use sha2::{Digest, Sha256};
@@ -10,7 +13,55 @@ use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
+use std::{
+    io,
+    mem::{size_of, zeroed},
+    path::{Path, PathBuf},
+    ptr::{null, null_mut},
+    time::{Duration, Instant},
+};
 use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
+use windows_sys::Win32::{
+    Foundation::{
+        GetLastError, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, FILETIME, GENERIC_READ,
+        GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
+    },
+    Security::{TokenUser, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_USER},
+    Storage::FileSystem::{
+        CreateFileW, GetFileAttributesW, GetFileInformationByHandle, ReadFile, WriteFile,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
+    },
+    System::{
+        JobObjects::{
+            IsProcessInJob, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
+            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
+            JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
+            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
+            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+            JOB_OBJECT_LIMIT_PROCESS_TIME,
+        },
+        Pipes::{
+            ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, PIPE_NOWAIT, PIPE_READMODE_BYTE,
+            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
+        },
+        Threading::{
+            CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, ResumeThread,
+            WaitForSingleObject, CREATE_NO_WINDOW, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
+            EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
+            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
+            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
+            STARTF_USESTDHANDLES, STARTUPINFOEXW,
+        },
+        WindowsProgramming::{
+            PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
+            PROCESS_CREATION_CHILD_PROCESS_RESTRICTED,
+        },
+    },
+};
 #[path = "../../evx-worker/src/ipc.rs"]
 mod ipc;
 
@@ -547,7 +598,7 @@ impl Invocation {
         let exe = wide(&stage.executable)?;
         let cwd = wide(&stage.root)?;
         let mut command = wide(format!("\"{}\" {role}", stage.executable.display()))?;
-        let mut environment = [0u16, 0];
+        let mut environment = worker_environment()?;
         let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
         unsafe {
             ok(CreateProcessW(

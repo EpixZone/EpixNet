@@ -110,22 +110,7 @@ pub fn validate_with(bytes: &[u8], caps: &Caps) -> Result<ModuleSummary, Validat
     }
     let mut validator = Validator::new_with_features(wasm_features());
     let mut allocs = FuncValidatorAllocations::default();
-    let mut types: Vec<FuncType> = Vec::new();
-    let mut func_type_indices: Vec<u32> = Vec::new();
-    let mut imported_functions: u32 = 0;
-    let mut imports: Vec<(String, String)> = Vec::new();
-    let mut exports: BTreeMap<String, (ExternalKind, u32)> = BTreeMap::new();
-    let mut memories: u32 = 0;
-    let mut memory_min_pages: u64 = 0;
-    let mut tables: u32 = 0;
-    let mut custom_sections = 0usize;
-    let mut custom_bytes = 0usize;
-    let mut total_locals: u64 = 0;
-    let mut weighted_complexity: u64 = 0;
-    let mut saw_start = false;
-    let mut data_segments: u32 = 0;
-    let mut globals: u32 = 0;
-    let mut defined_functions: u32 = 0;
+    let mut structure = StructuralValidator::default();
 
     for payload in Parser::new(0).parse_all(bytes) {
         let payload =
@@ -142,204 +127,63 @@ pub fn validate_with(bytes: &[u8], caps: &Caps) -> Result<ModuleSummary, Validat
             }
             ValidPayload::Ok | ValidPayload::Parser(_) | ValidPayload::End(_) => {}
         }
-        match &payload {
-            Payload::TypeSection(reader) => {
-                for group in reader.clone().into_iter() {
-                    let group =
-                        group.map_err(|e| ValidationError::new(format!("type section: {e}")))?;
-                    for sub in group.into_types() {
-                        match sub.composite_type.inner {
-                            wasmparser::CompositeInnerType::Func(func) => {
-                                if func.params().len() > caps.max_params {
-                                    return Err(ValidationError::new("function parameter limit"));
-                                }
-                                if func.results().len() > caps.max_results {
-                                    return Err(ValidationError::new("function result limit"));
-                                }
-                                types.push(func);
-                            }
-                            _ => return Err(ValidationError::new("unsupported type")),
-                        }
-                    }
-                }
-            }
-            Payload::ImportSection(reader) => {
-                for group in reader.clone().into_iter() {
-                    let group =
-                        group.map_err(|e| ValidationError::new(format!("import section: {e}")))?;
-                    let import = match group {
-                        wasmparser::Imports::Single(_, import) => import,
-                        _ => {
-                            return Err(ValidationError::new(
-                                "compact import sections are not supported",
-                            ))
-                        }
-                    };
-                    match import.ty {
-                        TypeRef::Func(type_index) => {
-                            let ty = types
-                                .get(type_index as usize)
-                                .ok_or_else(|| ValidationError::new("import type index"))?;
-                            if import.module != IMPORT_MODULE
-                                || import.name != IMPORT_NAME
-                                || !is_call_signature(ty)
-                            {
-                                return Err(ValidationError::new(format!(
-                                    "unsupported import: {}.{}",
-                                    import.module, import.name
-                                )));
-                            }
-                            imported_functions += 1;
-                            func_type_indices.push(type_index);
-                            imports.push((import.module.to_string(), import.name.to_string()));
-                        }
-                        _ => {
-                            return Err(ValidationError::new(format!(
-                                "unsupported import: {}.{}",
-                                import.module, import.name
-                            )))
-                        }
-                    }
-                }
-                if imported_functions > 1 {
-                    return Err(ValidationError::new("duplicate broker import"));
-                }
-            }
-            Payload::FunctionSection(reader) => {
-                for index in reader.clone().into_iter() {
-                    let index = index
-                        .map_err(|e| ValidationError::new(format!("function section: {e}")))?;
-                    func_type_indices.push(index);
-                    defined_functions += 1;
-                }
-                if defined_functions > caps.max_functions {
-                    return Err(ValidationError::new("function count limit"));
-                }
-            }
-            Payload::TableSection(reader) => {
-                for table in reader.clone().into_iter() {
-                    let table =
-                        table.map_err(|e| ValidationError::new(format!("table section: {e}")))?;
-                    tables += 1;
-                    if tables > 1 {
-                        return Err(ValidationError::new("table count limit"));
-                    }
-                    match table.ty.maximum {
-                        Some(max) if max <= caps.max_table_elements => {}
-                        _ => {
-                            return Err(ValidationError::new(
-                                "table must declare a bounded maximum",
-                            ))
-                        }
-                    }
-                    if table.ty.initial > caps.max_table_elements {
-                        return Err(ValidationError::new("table size limit"));
-                    }
-                }
-            }
-            Payload::MemorySection(reader) => {
-                for memory in reader.clone().into_iter() {
-                    let memory =
-                        memory.map_err(|e| ValidationError::new(format!("memory section: {e}")))?;
-                    memories += 1;
-                    if memories > 1 {
-                        return Err(ValidationError::new("memory count limit"));
-                    }
-                    if memory.maximum.is_some() {
-                        return Err(ValidationError::new("memory maximum is set by the host"));
-                    }
-                    if memory.shared || memory.memory64 {
-                        return Err(ValidationError::new("unsupported memory type"));
-                    }
-                    memory_min_pages = memory.initial;
-                }
-            }
+        structure.payload(&payload, caps)?;
+    }
+
+    structure.finish()
+}
+
+#[derive(Default)]
+struct StructuralValidator {
+    types: Vec<FuncType>,
+    func_type_indices: Vec<u32>,
+    imported_functions: u32,
+    imports: Vec<(String, String)>,
+    exports: BTreeMap<String, (ExternalKind, u32)>,
+    memories: u32,
+    memory_min_pages: u64,
+    tables: u32,
+    custom_sections: usize,
+    custom_bytes: usize,
+    total_locals: u64,
+    weighted_complexity: u64,
+    saw_start: bool,
+    data_segments: u32,
+    globals: u32,
+    defined_functions: u32,
+}
+
+impl StructuralValidator {
+    fn payload(&mut self, payload: &Payload<'_>, caps: &Caps) -> Result<(), ValidationError> {
+        match payload {
+            Payload::TypeSection(reader) => self.types(reader, caps)?,
+            Payload::ImportSection(reader) => self.imports(reader, caps)?,
+            Payload::FunctionSection(reader) => self.functions(reader, caps)?,
+            Payload::TableSection(reader) => self.tables(reader, caps)?,
+            Payload::MemorySection(reader) => self.memories(reader, caps)?,
             Payload::GlobalSection(reader) => {
-                globals += reader.count();
-                if globals > caps.max_globals {
+                self.globals += reader.count();
+                if self.globals > caps.max_globals {
                     return Err(ValidationError::new("global count limit"));
                 }
             }
-            Payload::ExportSection(reader) => {
-                for export in reader.clone().into_iter() {
-                    let export =
-                        export.map_err(|e| ValidationError::new(format!("export section: {e}")))?;
-                    if export.name.starts_with(RESERVED_EXPORT_PREFIX) {
-                        return Err(ValidationError::new("reserved export name"));
-                    }
-                    if exports
-                        .insert(export.name.to_string(), (export.kind, export.index))
-                        .is_some()
-                    {
-                        return Err(ValidationError::new("duplicate export"));
-                    }
-                    if exports.len() > caps.max_exports as usize {
-                        return Err(ValidationError::new("export count limit"));
-                    }
-                }
-            }
+            Payload::ExportSection(reader) => self.exports(reader, caps)?,
             Payload::StartSection { .. } => {
-                saw_start = true;
+                self.saw_start = true;
             }
             Payload::DataSection(reader) => {
-                data_segments += reader.count();
-                if data_segments > caps.max_data_segments {
+                self.data_segments += reader.count();
+                if self.data_segments > caps.max_data_segments {
                     return Err(ValidationError::new("data segment limit"));
                 }
             }
             Payload::TagSection(_) => return Err(ValidationError::new("unsupported section: tag")),
-            Payload::CodeSectionEntry(body) => {
-                let range = body.range();
-                if range.end - range.start > caps.max_body_bytes {
-                    return Err(ValidationError::new("function body size limit"));
-                }
-                let mut locals: u64 = 0;
-                let locals_reader = body
-                    .get_locals_reader()
-                    .map_err(|e| ValidationError::new(format!("locals: {e}")))?;
-                for local in locals_reader.into_iter() {
-                    let (count, _) =
-                        local.map_err(|e| ValidationError::new(format!("locals: {e}")))?;
-                    locals = locals.saturating_add(u64::from(count));
-                }
-                if locals > u64::from(caps.max_locals_per_function) {
-                    return Err(ValidationError::new("locals per function limit"));
-                }
-                total_locals = total_locals.saturating_add(locals);
-                if total_locals > caps.max_total_locals {
-                    return Err(ValidationError::new("total locals limit"));
-                }
-                let mut complexity: u64 = 0;
-                let ops = body
-                    .get_operators_reader()
-                    .map_err(|e| ValidationError::new(format!("operators: {e}")))?;
-                for op in ops.into_iter() {
-                    let op = op.map_err(|e| ValidationError::new(format!("operators: {e}")))?;
-                    let weight = match op {
-                        Operator::Br { .. }
-                        | Operator::BrIf { .. }
-                        | Operator::BrTable { .. }
-                        | Operator::Call { .. }
-                        | Operator::CallIndirect { .. }
-                        | Operator::Return
-                        | Operator::Loop { .. } => 50,
-                        Operator::TableGrow { .. } => {
-                            return Err(ValidationError::new("table.grow is not permitted"))
-                        }
-                        _ => 1,
-                    };
-                    complexity = complexity.saturating_add(weight);
-                    if complexity > caps.max_weighted_complexity {
-                        return Err(ValidationError::new("function complexity limit"));
-                    }
-                }
-                weighted_complexity = weighted_complexity.saturating_add(complexity);
-            }
+            Payload::CodeSectionEntry(body) => self.body(body, caps)?,
             Payload::CustomSection(section) => {
-                custom_sections += 1;
-                custom_bytes += section.data().len();
-                if custom_sections > caps.max_custom_sections
-                    || custom_bytes > caps.max_custom_bytes
+                self.custom_sections += 1;
+                self.custom_bytes += section.data().len();
+                if self.custom_sections > caps.max_custom_sections
+                    || self.custom_bytes > caps.max_custom_bytes
                 {
                     return Err(ValidationError::new("custom section limit"));
                 }
@@ -349,40 +193,257 @@ pub fn validate_with(bytes: &[u8], caps: &Caps) -> Result<ModuleSummary, Validat
             // Do not depend on optional wasmparser component payload variants.
             _ => {}
         }
+        Ok(())
     }
 
-    if saw_start {
-        return Err(ValidationError::new("start functions are not permitted"));
-    }
-    if memories != 1 {
-        return Err(ValidationError::new("missing memory export"));
-    }
-    match exports.get(EXPORT_MEMORY) {
-        Some((ExternalKind::Memory, _)) => {}
-        _ => return Err(ValidationError::new("missing memory export")),
-    }
-    match exports.get(EXPORT_RUN) {
-        Some((ExternalKind::Func, index)) => {
-            let type_index = func_type_indices
-                .get(*index as usize)
-                .ok_or_else(|| ValidationError::new("run export index"))?;
-            let ty = types
-                .get(*type_index as usize)
-                .ok_or_else(|| ValidationError::new("run export type"))?;
-            if !is_run_signature(ty) {
-                return Err(ValidationError::new("run must have signature () -> i32"));
+    fn types(
+        &mut self,
+        reader: &wasmparser::TypeSectionReader<'_>,
+        caps: &Caps,
+    ) -> Result<(), ValidationError> {
+        for group in reader.clone().into_iter() {
+            let group = group.map_err(|e| ValidationError::new(format!("type section: {e}")))?;
+            for sub in group.into_types() {
+                match sub.composite_type.inner {
+                    wasmparser::CompositeInnerType::Func(func) => {
+                        if func.params().len() > caps.max_params {
+                            return Err(ValidationError::new("function parameter limit"));
+                        }
+                        if func.results().len() > caps.max_results {
+                            return Err(ValidationError::new("function result limit"));
+                        }
+                        self.types.push(func);
+                    }
+                    _ => return Err(ValidationError::new("unsupported type")),
+                }
             }
         }
-        _ => return Err(ValidationError::new("missing run export")),
+        Ok(())
     }
 
-    Ok(ModuleSummary {
-        functions: imported_functions + defined_functions,
-        imports,
-        exports: exports.keys().cloned().collect(),
-        memory_min_pages,
-        weighted_complexity,
-    })
+    fn imports(
+        &mut self,
+        reader: &wasmparser::ImportSectionReader<'_>,
+        _caps: &Caps,
+    ) -> Result<(), ValidationError> {
+        for group in reader.clone().into_iter() {
+            let group = group.map_err(|e| ValidationError::new(format!("import section: {e}")))?;
+            let import = match group {
+                wasmparser::Imports::Single(_, import) => import,
+                _ => {
+                    return Err(ValidationError::new(
+                        "compact import sections are not supported",
+                    ))
+                }
+            };
+            match import.ty {
+                TypeRef::Func(type_index) => {
+                    let ty = self
+                        .types
+                        .get(type_index as usize)
+                        .ok_or_else(|| ValidationError::new("import type index"))?;
+                    if import.module != IMPORT_MODULE
+                        || import.name != IMPORT_NAME
+                        || !is_call_signature(ty)
+                    {
+                        return Err(ValidationError::new(format!(
+                            "unsupported import: {}.{}",
+                            import.module, import.name
+                        )));
+                    }
+                    self.imported_functions += 1;
+                    self.func_type_indices.push(type_index);
+                    self.imports
+                        .push((import.module.to_string(), import.name.to_string()));
+                }
+                _ => {
+                    return Err(ValidationError::new(format!(
+                        "unsupported import: {}.{}",
+                        import.module, import.name
+                    )))
+                }
+            }
+        }
+        if self.imported_functions > 1 {
+            return Err(ValidationError::new("duplicate broker import"));
+        }
+        Ok(())
+    }
+
+    fn functions(
+        &mut self,
+        reader: &wasmparser::FunctionSectionReader<'_>,
+        caps: &Caps,
+    ) -> Result<(), ValidationError> {
+        for index in reader.clone().into_iter() {
+            let index =
+                index.map_err(|e| ValidationError::new(format!("function section: {e}")))?;
+            self.func_type_indices.push(index);
+            self.defined_functions += 1;
+        }
+        if self.defined_functions > caps.max_functions {
+            return Err(ValidationError::new("function count limit"));
+        }
+        Ok(())
+    }
+
+    fn tables(
+        &mut self,
+        reader: &wasmparser::TableSectionReader<'_>,
+        caps: &Caps,
+    ) -> Result<(), ValidationError> {
+        for table in reader.clone().into_iter() {
+            let table = table.map_err(|e| ValidationError::new(format!("table section: {e}")))?;
+            self.tables += 1;
+            if self.tables > 1 {
+                return Err(ValidationError::new("table count limit"));
+            }
+            match table.ty.maximum {
+                Some(max) if max <= caps.max_table_elements => {}
+                _ => return Err(ValidationError::new("table must declare a bounded maximum")),
+            }
+            if table.ty.initial > caps.max_table_elements {
+                return Err(ValidationError::new("table size limit"));
+            }
+        }
+        Ok(())
+    }
+
+    fn memories(
+        &mut self,
+        reader: &wasmparser::MemorySectionReader<'_>,
+        _caps: &Caps,
+    ) -> Result<(), ValidationError> {
+        for memory in reader.clone().into_iter() {
+            let memory =
+                memory.map_err(|e| ValidationError::new(format!("memory section: {e}")))?;
+            self.memories += 1;
+            if self.memories > 1 {
+                return Err(ValidationError::new("memory count limit"));
+            }
+            if memory.maximum.is_some() {
+                return Err(ValidationError::new("memory maximum is set by the host"));
+            }
+            if memory.shared || memory.memory64 {
+                return Err(ValidationError::new("unsupported memory type"));
+            }
+            self.memory_min_pages = memory.initial;
+        }
+        Ok(())
+    }
+
+    fn exports(
+        &mut self,
+        reader: &wasmparser::ExportSectionReader<'_>,
+        caps: &Caps,
+    ) -> Result<(), ValidationError> {
+        for export in reader.clone().into_iter() {
+            let export =
+                export.map_err(|e| ValidationError::new(format!("export section: {e}")))?;
+            if export.name.starts_with(RESERVED_EXPORT_PREFIX) {
+                return Err(ValidationError::new("reserved export name"));
+            }
+            if self
+                .exports
+                .insert(export.name.to_string(), (export.kind, export.index))
+                .is_some()
+            {
+                return Err(ValidationError::new("duplicate export"));
+            }
+            if self.exports.len() > caps.max_exports as usize {
+                return Err(ValidationError::new("export count limit"));
+            }
+        }
+        Ok(())
+    }
+
+    fn body(
+        &mut self,
+        body: &wasmparser::FunctionBody<'_>,
+        caps: &Caps,
+    ) -> Result<(), ValidationError> {
+        let range = body.range();
+        if range.end - range.start > caps.max_body_bytes {
+            return Err(ValidationError::new("function body size limit"));
+        }
+        let mut locals: u64 = 0;
+        let locals_reader = body
+            .get_locals_reader()
+            .map_err(|e| ValidationError::new(format!("locals: {e}")))?;
+        for local in locals_reader.into_iter() {
+            let (count, _) = local.map_err(|e| ValidationError::new(format!("locals: {e}")))?;
+            locals = locals.saturating_add(u64::from(count));
+        }
+        if locals > u64::from(caps.max_locals_per_function) {
+            return Err(ValidationError::new("locals per function limit"));
+        }
+        self.total_locals = self.total_locals.saturating_add(locals);
+        if self.total_locals > caps.max_total_locals {
+            return Err(ValidationError::new("total locals limit"));
+        }
+        let mut complexity: u64 = 0;
+        let ops = body
+            .get_operators_reader()
+            .map_err(|e| ValidationError::new(format!("operators: {e}")))?;
+        for op in ops.into_iter() {
+            let op = op.map_err(|e| ValidationError::new(format!("operators: {e}")))?;
+            let weight = match op {
+                Operator::Br { .. }
+                | Operator::BrIf { .. }
+                | Operator::BrTable { .. }
+                | Operator::Call { .. }
+                | Operator::CallIndirect { .. }
+                | Operator::Return
+                | Operator::Loop { .. } => 50,
+                Operator::TableGrow { .. } => {
+                    return Err(ValidationError::new("table.grow is not permitted"))
+                }
+                _ => 1,
+            };
+            complexity = complexity.saturating_add(weight);
+            if complexity > caps.max_weighted_complexity {
+                return Err(ValidationError::new("function complexity limit"));
+            }
+        }
+        self.weighted_complexity = self.weighted_complexity.saturating_add(complexity);
+        Ok(())
+    }
+    fn finish(self) -> Result<ModuleSummary, ValidationError> {
+        if self.saw_start {
+            return Err(ValidationError::new("start functions are not permitted"));
+        }
+        if self.memories != 1 {
+            return Err(ValidationError::new("missing memory export"));
+        }
+        match self.exports.get(EXPORT_MEMORY) {
+            Some((ExternalKind::Memory, _)) => {}
+            _ => return Err(ValidationError::new("missing memory export")),
+        }
+        match self.exports.get(EXPORT_RUN) {
+            Some((ExternalKind::Func, index)) => {
+                let type_index = self
+                    .func_type_indices
+                    .get(*index as usize)
+                    .ok_or_else(|| ValidationError::new("run export index"))?;
+                let ty = self
+                    .types
+                    .get(*type_index as usize)
+                    .ok_or_else(|| ValidationError::new("run export type"))?;
+                if !is_run_signature(ty) {
+                    return Err(ValidationError::new("run must have signature () -> i32"));
+                }
+            }
+            _ => return Err(ValidationError::new("missing run export")),
+        }
+
+        Ok(ModuleSummary {
+            functions: self.imported_functions + self.defined_functions,
+            imports: self.imports,
+            exports: self.exports.keys().cloned().collect(),
+            memory_min_pages: self.memory_min_pages,
+            weighted_complexity: self.weighted_complexity,
+        })
+    }
 }
 
 #[cfg(test)]

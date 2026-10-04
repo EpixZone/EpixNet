@@ -42,8 +42,8 @@ fn supported_kernel_contains_native_probe() {
         );
         return;
     }
-    let root = std::env::temp_dir().join(format!("evx-native-probe-{}", std::process::id()));
-    std::fs::create_dir(&root).unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
     let workspace = root.join("workspace");
     std::fs::create_dir(&workspace).unwrap();
     let outside = root.join("outside.txt");
@@ -71,7 +71,6 @@ fn supported_kernel_contains_native_probe() {
     );
     assert!(!root.join("must-not-exist").exists());
     assert!(!workspace.join("native-probe.txt").exists());
-    std::fs::remove_dir_all(&root).unwrap();
     assert!(
         output.status.success(),
         "{}",

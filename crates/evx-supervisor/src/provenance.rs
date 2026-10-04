@@ -245,10 +245,10 @@ impl Provenance {
             // not enroll any bytes and permits a new first write after a
             // helper died between authorization and its initial rename.
             let mut record = self.load()?;
-            if !record
+            if record
                 .entries
                 .get(path)
-                .is_some_and(|entry| entry.pending.is_some())
+                .is_none_or(|entry| entry.pending.is_none())
             {
                 return Err(denied());
             }

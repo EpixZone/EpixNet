@@ -65,7 +65,7 @@ async fn fixture(with_job: bool, scheduler: bool) -> (tempfile::TempDir, Arc<App
     let key = epix_crypt::new_seed();
     let xite = epix_crypt::privatekey_to_address(&key).unwrap();
     let served = dir.path().join("data").join(&xite);
-    std::fs::create_dir_all(served.join("evx")).unwrap();
+    tokio::fs::create_dir_all(served.join("evx")).await.unwrap();
     let storage = XiteStorage::new(&served);
     let module = evx_runtime::text_to_binary(READY_THEN_SPIN).unwrap();
     storage.write("evx/main.wasm", &module).unwrap();

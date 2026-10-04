@@ -64,7 +64,7 @@ pub struct ActivationContext {
     pub xite: String,
     pub generation: u64,
     pub publisher: String,
-    #[serde(with = "key_bytes")]
+    #[serde(default, with = "key_bytes")]
     pub public_key: Option<[u8; 32]>,
     pub runtime_profile: String,
     pub capabilities: BTreeSet<Capability>,
@@ -112,5 +112,23 @@ mod key_bytes {
                 Ok(Some(out))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ActivationContext;
+    use serde_json::json;
+
+    #[test]
+    fn an_optional_activation_key_may_be_absent_but_never_malformed() {
+        let mut value = json!({"xite":"game", "generation":1, "publisher":"publisher", "runtime_profile":"wasm-core-v1", "capabilities":[]});
+        let context: ActivationContext = serde_json::from_value(value.clone()).unwrap();
+        assert!(context.public_key.is_none());
+        value["public_key"] = json!("ab".repeat(32));
+        let context: ActivationContext = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(context.public_key, Some([0xab; 32]));
+        value["public_key"] = json!("malformed");
+        assert!(serde_json::from_value::<ActivationContext>(value).is_err());
     }
 }

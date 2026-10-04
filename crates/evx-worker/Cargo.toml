@@ -19,3 +19,6 @@ rustix = { version = "1", features = ["fs", "process", "pipe"] }
 
 [features]
 apple-xpc = ["evx-runtime/pulley"]
+
+[dev-dependencies]
+tempfile = "3"
