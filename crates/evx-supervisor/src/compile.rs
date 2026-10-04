@@ -201,14 +201,12 @@ fn compiler_event(
             peer.output_bytes = peer.output_bytes.saturating_add(body.len());
             if peer.output_bytes > OUTPUT_QUOTA {
                 return Err(Denied::new("compiler output quota"));
-            } else if reply.is_some() {
-                return Err(Denied::new("compiler message after terminal result"));
-            } else {
-                match decode_compiler_reply(&body) {
-                    Ok(frame) => *reply = Some(frame),
-                    Err(_) => return Err(Denied::new("compiler protocol")),
-                }
             }
+            if reply.is_some() {
+                return Err(Denied::new("compiler message after terminal result"));
+            }
+            *reply =
+                Some(decode_compiler_reply(&body).map_err(|_| Denied::new("compiler protocol"))?);
         }
         Ok(Event::Stderr(_, _, chunk)) => {
             peer.output_bytes = peer.output_bytes.saturating_add(chunk.len());
@@ -228,9 +226,8 @@ fn compiler_event(
             // Both readers send their Closed event before disconnecting.
             if peer.readers != 0 {
                 return Err(Denied::new("compiler channel closed"));
-            } else {
-                std::thread::sleep(Duration::from_millis(2));
             }
+            std::thread::sleep(Duration::from_millis(2));
         }
     }
     Ok(())

@@ -39,8 +39,41 @@ fn wide(value: impl AsRef<OsStr>) -> io::Result<Vec<u16>> {
     result.push(0);
     Ok(result)
 }
-// AppContainer process creation requires SystemRoot. Resolve it through the
-// OS, without inheriting any caller-controlled environment or credentials.
+// Resolve profile storage from the current user's registered known folder,
+// without trusting or inheriting caller-controlled environment variables.
+fn local_app_data() -> io::Result<Vec<u16>> {
+    use windows_sys::Win32::{
+        System::Com::CoTaskMemFree,
+        UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
+    };
+    let mut path = null_mut();
+    let status = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, null_mut(), &mut path) };
+    let result = if status < 0 || path.is_null() {
+        Err(fail(&format!(
+            "local app data lookup failed: 0x{:08x}",
+            status as u32
+        )))
+    } else {
+        let mut len = 0;
+        unsafe {
+            while len < 32768 && *path.add(len) != 0 {
+                len += 1;
+            }
+            if len == 0 || len == 32768 {
+                Err(fail("invalid local app data path"))
+            } else {
+                Ok(std::slice::from_raw_parts(path, len).to_vec())
+            }
+        }
+    };
+    // The API requires freeing this allocation even on a failed lookup.
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
+}
+
+// AppContainer startup resolves and redirects LOCALAPPDATA for its profile.
+// SystemRoot is also required for Windows activation contexts. Supply only
+// these OS-derived values, in the case-insensitive environment sort order.
 fn worker_environment() -> io::Result<Vec<u16>> {
     let mut windows = vec![0u16; 32768];
     let size = unsafe {
@@ -55,7 +88,10 @@ fn worker_environment() -> io::Result<Vec<u16>> {
     if size >= windows.len() {
         return Err(fail("Windows directory exceeds environment limit"));
     }
-    let mut environment: Vec<u16> = "SystemRoot=".encode_utf16().collect();
+    let mut environment: Vec<u16> = "LOCALAPPDATA=".encode_utf16().collect();
+    environment.extend(local_app_data()?);
+    environment.push(0);
+    environment.extend("SystemRoot=".encode_utf16());
     environment.extend_from_slice(&windows[..size]);
     environment.extend([0, 0]);
     Ok(environment)
@@ -336,7 +372,7 @@ impl Stage {
             port
         ))?;
         let cwd = wide(&self.root)?;
-        // Only the OS-derived SystemRoot is provided; no parent environment is inherited.
+        // No parent environment is inherited.
         let mut environment = worker_environment()?;
         let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
         unsafe {
@@ -354,7 +390,8 @@ impl Stage {
                 cwd.as_ptr(),
                 &startup.StartupInfo,
                 &mut process,
-            ))?;
+            ))
+            .map_err(|error| fail(&format!("CreateProcessW LPAC fixture: {error}")))?;
         }
         self.active = true;
         let process_handle = Handle::checked(process.hProcess)?;

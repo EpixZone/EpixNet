@@ -277,6 +277,11 @@ fn file_confined(
 /// Real blocking native I/O with no writer, used only by test fault injection
 /// to prove the supervisor can terminate a stuck helper.
 fn block_forever() -> ! {
+    // Linux confinement permits pipe2 on both native architectures.
+    #[cfg(target_os = "linux")]
+    let (reader, _writer) =
+        rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC).expect("pipe");
+    #[cfg(not(target_os = "linux"))]
     let (reader, _writer) = rustix::pipe::pipe().expect("pipe");
     let mut file = std::fs::File::from(reader);
     let mut byte = [0u8; 1];
