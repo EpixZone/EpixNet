@@ -118,6 +118,201 @@ CREATE TABLE IF NOT EXISTS daily_runs (
  PRIMARY KEY (xite, day));
 ";
 
+/// Replay guards survive removal of a declared job and pruning of its results.
+/// Each cadence keeps its own floor so changing an interval does not erase
+/// the guard for the old cadence or prevent the new cadence from starting.
+pub(crate) const SCHEMA_V5: &str = "
+CREATE TABLE IF NOT EXISTS job_guards (
+ xite TEXT NOT NULL, job TEXT NOT NULL, period INTEGER NOT NULL,
+ latest_start_unix INTEGER NOT NULL, PRIMARY KEY (xite, job, period));
+";
+
+pub(crate) const SCHEMA_V7: &str = "
+CREATE TABLE IF NOT EXISTS job_reconciliation (
+ xite TEXT NOT NULL, job TEXT NOT NULL, PRIMARY KEY (xite, job));
+";
+
+pub(crate) const SCHEMA_V8: &str = "
+CREATE TABLE IF NOT EXISTS job_controls (
+ xite TEXT NOT NULL, job TEXT NOT NULL, enabled INTEGER NOT NULL,
+ paused_reason TEXT, PRIMARY KEY (xite, job));
+";
+
+pub(crate) const SCHEMA_V9: &str = "
+CREATE TABLE IF NOT EXISTS job_management_revisions (
+ xite TEXT PRIMARY KEY, revision INTEGER NOT NULL);
+";
+
+fn management_revision(conn: &Connection, xite: &str) -> Result<u64> {
+    let revision = conn.query_row(
+        "SELECT revision FROM job_management_revisions WHERE xite=?1",
+        params![xite], |row| row.get::<_, u64>(0),
+    ).optional()?.unwrap_or(0);
+    if revision > MAX_LIMIT {
+        return Err(Error::conflict("invalid job management revision"));
+    }
+    Ok(revision)
+}
+
+fn advance_management_revision(conn: &Connection, xite: &str) -> Result<()> {
+    let current = management_revision(conn, xite)?;
+    if current >= MAX_LIMIT {
+        return Err(Error::budget("job management revision limit"));
+    }
+    conn.execute(
+        "INSERT INTO job_management_revisions VALUES (?1,?2) ON CONFLICT(xite) \
+         DO UPDATE SET revision=excluded.revision",
+        params![xite, current + 1],
+    )?;
+    Ok(())
+}
+
+fn save_job_controls(conn: &Connection, xite: &str, job: &str) -> Result<()> {
+    let row = load_job(conn, xite, job)?.ok_or_else(|| Error::conflict("unknown job"))?;
+    if row.enabled && row.paused_reason.is_none() {
+        conn.execute(
+            "DELETE FROM job_controls WHERE xite=?1 AND job=?2",
+            params![xite, job],
+        )?;
+        return Ok(());
+    }
+    let exists: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM job_controls WHERE xite=?1 AND job=?2)",
+        params![xite, job],
+        |row| row.get(0),
+    )?;
+    if !exists
+        && count(
+            conn,
+            "SELECT COUNT(*) FROM job_controls WHERE xite=?1",
+            params![xite],
+        )? >= crate::MAX_ROWS
+    {
+        return Err(Error::budget("retained job control limit"));
+    }
+    conn.execute(
+        "INSERT INTO job_controls VALUES (?1,?2,?3,?4) ON CONFLICT(xite,job) \
+         DO UPDATE SET enabled=excluded.enabled, paused_reason=excluded.paused_reason",
+        params![xite, job, row.enabled, row.paused_reason],
+    )?;
+    Ok(())
+}
+
+pub(crate) fn seed_job_controls(conn: &Connection) -> Result<()> {
+    let mut statement =
+        conn.prepare("SELECT xite,job FROM jobs WHERE enabled=0 OR paused_reason IS NOT NULL")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (xite, job) in rows {
+        save_job_controls(conn, &xite, &job)?;
+    }
+    Ok(())
+}
+
+fn requires_reconciliation(conn: &Connection, xite: &str, job: &str) -> Result<bool> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM job_reconciliation WHERE xite=?1 AND job=?2)",
+        params![xite, job],
+        |row| row.get(0),
+    )?)
+}
+
+fn record_reconciliation(conn: &Connection, xite: &str, job: &str) -> Result<()> {
+    if !requires_reconciliation(conn, xite, job)? {
+        if count(
+            conn,
+            "SELECT COUNT(*) FROM job_reconciliation WHERE xite=?1",
+            params![xite],
+        )? >= crate::MAX_ROWS
+        {
+            return Err(Error::budget("retained reconciliation limit"));
+        }
+        conn.execute(
+            "INSERT INTO job_reconciliation VALUES (?1,?2)",
+            params![xite, job],
+        )?;
+    }
+    conn.execute(
+        "UPDATE jobs SET paused_reason='reconcile_required' WHERE xite=?1 AND job=?2",
+        params![xite, job],
+    )?;
+    Ok(())
+}
+
+/// Host summaries carry the effect flag independently of status because a
+/// quarantine can take precedence over the effect-unknown display status.
+fn result_requires_reconciliation(result: &Value) -> bool {
+    matches!(
+        result.get("status").and_then(Value::as_str),
+        Some("effect_unknown" | "quarantined")
+    ) || result
+        .get("effect_outcome_unknown")
+        .and_then(Value::as_bool)
+        == Some(true)
+}
+
+pub(crate) fn seed_reconciliation(conn: &Connection) -> Result<()> {
+    let mut statement =
+        conn.prepare("SELECT xite,job FROM jobs WHERE paused_reason='reconcile_required'")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (xite, job) in rows {
+        record_reconciliation(conn, &xite, &job)?;
+    }
+    let mut statement =
+        conn.prepare("SELECT xite,occurrence,response FROM invocations WHERE status='completed'")?;
+    let rows = statement
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for (xite, occurrence, response) in rows {
+        let Some(response) = crate::parse_json(response)? else {
+            continue;
+        };
+        if result_requires_reconciliation(&response) {
+            if let Ok((job, _)) = occurrence_parts(&occurrence) {
+                record_reconciliation(conn, &xite, job)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn seed_job_guards(conn: &Connection) -> Result<()> {
+    let mut statement = conn.prepare("SELECT DISTINCT xite FROM jobs")?;
+    let xites = statement
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for xite in xites {
+        for job in load_jobs(conn, &xite)? {
+            if let Some(index) = job.last_slot {
+                let seconds = period(&parse_schedule(&job.schedule)?)?;
+                let start = index
+                    .checked_mul(seconds)
+                    .ok_or_else(|| Error::conflict("stored job slot overflows"))?;
+                timestamp(start, "stored slot start")?;
+                conn.execute(
+                    "INSERT INTO job_guards VALUES (?1,?2,?3,?4) ON CONFLICT(xite,job,period) \
+                     DO UPDATE SET latest_start_unix=MAX(latest_start_unix,excluded.latest_start_unix)",
+                    params![xite, job.job, seconds, start],
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 const JOB_COLUMNS: &str = "xite, job, program, schedule, max_concurrency, declaration_digest, \
                            enabled, paused_reason, next_due_unix, last_slot, last_occurrence, \
                            failures, updated_unix";
@@ -395,6 +590,7 @@ impl DurableState {
         transaction(&self.path, |conn| {
             for old in load_jobs(conn, xite)? {
                 if names.binary_search(&old.job.as_str()).is_err() {
+                    save_job_controls(conn, xite, &old.job)?;
                     conn.execute(
                         "DELETE FROM jobs WHERE xite=?1 AND job=?2",
                         params![xite, old.job],
@@ -420,6 +616,12 @@ impl DurableState {
                                 slot_start,
                                 now,
                             ],
+                        )?;
+                        conn.execute(
+                            "UPDATE jobs SET (enabled,paused_reason)=(SELECT enabled,paused_reason \
+                             FROM job_controls WHERE xite=?1 AND job=?2) WHERE xite=?1 AND job=?2 \
+                             AND EXISTS(SELECT 1 FROM job_controls WHERE xite=?1 AND job=?2)",
+                            params![xite,spec.job],
                         )?;
                     }
                     Some(old) => {
@@ -461,6 +663,9 @@ impl DurableState {
                         }
                     }
                 }
+                if requires_reconciliation(conn, xite, &spec.job)? {
+                    record_reconciliation(conn, xite, &spec.job)?;
+                }
             }
             Ok(())
         })
@@ -472,9 +677,11 @@ impl DurableState {
         load_jobs(&conn, xite)
     }
 
-    /// Pause the job with `reason`, or resume it with `None`. The reason is
+    /// Pause the job with `reason`, or clear an ordinary pause with `None`. The reason is
     /// shown in status and must be non-empty printable text, so a pause can
-    /// never be a silent drop. An unknown job is an [`Error::Conflict`].
+    /// never be a silent drop. Reconciliation and `user` pauses survive
+    /// automatic updates; only [`DurableState::resume_job`] clears them.
+    /// An unknown job is an [`Error::Conflict`].
     pub fn set_job_paused(&self, xite: &str, job: &str, reason: Option<&str>) -> Result<()> {
         identifier(xite)?;
         identifier(job).map_err(|_| Error::invalid("invalid job"))?;
@@ -485,11 +692,72 @@ impl DurableState {
             }
         }
         transaction(&self.path, |conn| {
+            let row = load_job(conn, xite, job)?.ok_or_else(|| Error::conflict("unknown job"))?;
+            if reason == Some("reconcile_required") {
+                record_reconciliation(conn, xite, job)?;
+            }
+            let reason = if requires_reconciliation(conn, xite, job)? {
+                Some("reconcile_required")
+            } else if row.paused_reason.as_deref() == Some("user") {
+                Some("user")
+            } else {
+                reason
+            };
             update_job(
                 conn,
                 "UPDATE jobs SET paused_reason=?1 WHERE xite=?2 AND job=?3",
                 params![reason, xite, job],
-            )
+            )?;
+            advance_management_revision(conn, xite)?;
+            save_job_controls(conn, xite, job)
+        })
+    }
+
+    /// Explicit host management resume after reviewing an uncertain outcome.
+    /// Clears the durable reconciliation guard and pause atomically. Never
+    /// call this from automatic retry, content registration or recovery.
+    /// The job must currently exist; unknown jobs fail without any mutation.
+    pub fn resume_job(&self, xite: &str, job: &str) -> Result<()> {
+        self.resume_job_guarded(xite, job, None)
+    }
+
+    /// A durable fence for host management while workspace recovery is in
+    /// progress. It advances even when a repeated pause/disable has the same
+    /// value, and is retained when a declaration withdraws its jobs.
+    pub fn job_management_revision(&self, xite: &str) -> Result<u64> {
+        identifier(xite)?;
+        transaction(&self.path, |conn| management_revision(conn, xite))
+    }
+
+    /// Resume only if no later pause, enable/disable or resume changed this
+    /// xite's job controls. Comparison and clearing share one write transaction.
+    pub fn resume_job_at_revision(&self, xite: &str, job: &str, revision: u64) -> Result<()> {
+        if revision > MAX_LIMIT {
+            return Err(Error::invalid("invalid job management revision"));
+        }
+        self.resume_job_guarded(xite, job, Some(revision))
+    }
+
+    fn resume_job_guarded(&self, xite: &str, job: &str, revision: Option<u64>) -> Result<()> {
+        identifier(xite)?;
+        identifier(job).map_err(|_| Error::invalid("invalid job"))?;
+        transaction(&self.path, |conn| {
+            if let Some(expected) = revision {
+                if management_revision(conn, xite)? != expected {
+                    return Err(Error::conflict("job controls changed during workspace recovery"));
+                }
+            }
+            update_job(
+                conn,
+                "UPDATE jobs SET paused_reason=NULL WHERE xite=?1 AND job=?2",
+                params![xite, job],
+            )?;
+            conn.execute(
+                "DELETE FROM job_reconciliation WHERE xite=?1 AND job=?2",
+                params![xite, job],
+            )?;
+            advance_management_revision(conn, xite)?;
+            save_job_controls(conn, xite, job)
         })
     }
 
@@ -504,7 +772,9 @@ impl DurableState {
                 conn,
                 "UPDATE jobs SET enabled=?1 WHERE xite=?2 AND job=?3",
                 params![i64::from(enabled), xite, job],
-            )
+            )?;
+            advance_management_revision(conn, xite)?;
+            save_job_controls(conn, xite, job)
         })
     }
 
@@ -688,6 +958,9 @@ impl DurableState {
             if !row.enabled {
                 return Err(Error::denied("job disabled"));
             }
+            if requires_reconciliation(conn, xite, &job.job)? {
+                return Err(Error::denied("job requires reconciliation"));
+            }
             if let Some(reason) = &row.paused_reason {
                 return Err(Error::Denied(evx_api::Denied::new(format!(
                     "job paused: {reason}"
@@ -702,9 +975,35 @@ impl DurableState {
                     "clock rollback: slot before the last claimed slot",
                 ));
             }
-            prune_job_occurrences(conn, xite, &job.job, RETAINED_OCCURRENCES_PER_JOB - 1)?;
+            let latest: Option<u64> = conn.query_row(
+                "SELECT latest_start_unix FROM job_guards WHERE xite=?1 AND job=?2 AND period=?3",
+                params![xite, job.job, slot.end_unix - slot.start_unix], |row| row.get(0),
+            ).optional()?;
+            if load_invocation(conn, xite, &occurrence)?.is_none() {
+                if latest.is_some_and(|last| slot.start_unix <= last) {
+                    return Err(Error::conflict("clock rollback: slot already passed"));
+                }
+                if latest.is_none()
+                    && count(
+                        conn,
+                        "SELECT COUNT(*) FROM job_guards WHERE xite=?1",
+                        params![xite],
+                    )? >= crate::MAX_ROWS
+                {
+                    return Err(Error::budget("retained job identity limit"));
+                }
+                // Make room only for a new identity. Pruning a retained
+                // retry first could delete that very row and reserve it
+                // again when a removed job has lost its last_slot value.
+                prune_job_occurrences(conn, xite, &job.job, RETAINED_OCCURRENCES_PER_JOB - 1)?;
+            }
             let invocation = begin_in_at(conn, xite, &occurrence, &request_digest, 1, now)?;
             if invocation.fresh {
+                conn.execute(
+                    "INSERT INTO job_guards VALUES (?1,?2,?3,?4) ON CONFLICT(xite,job,period) \
+                     DO UPDATE SET latest_start_unix=MAX(latest_start_unix,excluded.latest_start_unix)",
+                    params![xite, job.job, slot.end_unix - slot.start_unix, slot.start_unix],
+                )?;
                 update_job(
                     conn,
                     "UPDATE jobs SET last_slot=?1, last_occurrence=?2 WHERE xite=?3 AND job=?4",
@@ -738,7 +1037,10 @@ impl DurableState {
     /// put its own `next_due_unix` there; writing the old cadence's value
     /// over it would make the job early or late by an arbitrary amount.
     /// The failure count is kept or reset either way, since it survives a
-    /// re-registration too.
+    /// re-registration too. A host result with status `effect_unknown` or
+    /// `quarantined`, or boolean `effect_outcome_unknown: true`, also records
+    /// the reconciliation guard in this same transaction, even if the job
+    /// was removed or its registration changed during the execution.
     pub fn finish_occurrence(
         &self,
         invocation: &Invocation,
@@ -756,6 +1058,9 @@ impl DurableState {
         transaction(&self.path, |conn| {
             if commit_in(conn, invocation, &prepared, None)?.is_some() {
                 return Ok(());
+            }
+            if result_requires_reconciliation(result) {
+                record_reconciliation(conn, &invocation.xite, job)?;
             }
             prune_job_occurrences(conn, &invocation.xite, job, RETAINED_OCCURRENCES_PER_JOB)?;
             let Some(row) = load_job(conn, &invocation.xite, job)? else {
@@ -806,13 +1111,33 @@ impl DurableState {
     /// call succeeds, so closing twice is harmless. `message` is at most
     /// [`MAX_MESSAGE`] bytes of printable text.
     pub fn abandon(&self, invocation: &Invocation, message: &str) -> Result<()> {
+        self.abandon_with_status(invocation, message, false)
+    }
+
+    /// Close a stopped execution whose non-transactional effects are unknown.
+    ///
+    /// Like [`DurableState::abandon`], this host-only operation checks the
+    /// token but not current grant authority, so revocation cannot strand a
+    /// reservation. The `effect_unknown` response and the extant job's
+    /// `reconcile_required` pause are committed atomically. No effect is
+    /// retried, undone or queued. Completed reservations remain unchanged.
+    pub fn abandon_uncertain(&self, invocation: &Invocation, message: &str) -> Result<()> {
+        self.abandon_with_status(invocation, message, true)
+    }
+
+    fn abandon_with_status(
+        &self,
+        invocation: &Invocation,
+        message: &str,
+        uncertain: bool,
+    ) -> Result<()> {
         identifier(&invocation.xite)?;
         identifier(&invocation.occurrence)?;
         if message.len() > MAX_MESSAGE || message.chars().any(char::is_control) {
             return Err(Error::invalid("invalid message"));
         }
         let response = json!({
-            "status": ABANDONED,
+            "status": if uncertain { "effect_unknown" } else { ABANDONED },
             "value": null,
             "error": message,
             "elapsed_ms": 0,
@@ -846,6 +1171,9 @@ impl DurableState {
                 ],
             )?;
             if let Ok((job, _)) = occurrence_parts(&invocation.occurrence) {
+                if uncertain {
+                    record_reconciliation(conn, &invocation.xite, job)?;
+                }
                 prune_job_occurrences(conn, &invocation.xite, job, RETAINED_OCCURRENCES_PER_JOB)?;
             }
             Ok(())
@@ -935,6 +1263,16 @@ impl DurableState {
         timestamp(now, "now")?;
         let day = now / SECONDS_PER_DAY;
         transaction(&self.path, |conn| {
+            let latest: Option<u64> = conn.query_row(
+                "SELECT MAX(day) FROM daily_runs WHERE xite=?1",
+                params![xite],
+                |row| row.get(0),
+            )?;
+            if latest.is_some_and(|latest| day < latest.saturating_sub(DAILY_RUN_RETENTION_DAYS)) {
+                return Err(Error::budget(
+                    "clock rollback outside retained daily budget",
+                ));
+            }
             conn.execute(
                 "DELETE FROM daily_runs WHERE xite=?1 AND day<?2",
                 params![xite, day.saturating_sub(DAILY_RUN_RETENTION_DAYS)],

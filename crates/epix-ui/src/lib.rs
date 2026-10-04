@@ -1640,7 +1640,7 @@ async fn render_wrapper(
     // query on boot to route. Without this the inner page always reloads at
     // its default view.
     let query_string = match raw_query.as_deref().filter(|q| !q.is_empty()) {
-        Some(q) => format!("?{}&wrapper_nonce={nonce}", escape_query(q)),
+        Some(q) => format!("?{q}&wrapper_nonce={nonce}"),
         None => format!("?wrapper_nonce={nonce}"),
     };
     // The xite's real permissions (empty until the user grants one). This is
@@ -1710,7 +1710,8 @@ async fn render_wrapper(
                 .filter(|value| !value.trim().is_empty());
             let theme = themeclass.trim_start_matches("theme-");
             let themed_key = format!("background-color-{theme}");
-            let background = hint(&themed_key).or_else(|| hint("background-color"));
+            let background = hint(&themed_key).and_then(wrapper_background_color)
+                .or_else(|| hint("background-color").and_then(wrapper_background_color));
             if let Some(color) = background {
                 style.push_str(&format!("background-color: {};", html_escape(color)));
             }
@@ -1731,30 +1732,30 @@ async fn render_wrapper(
         (meta, style)
     };
     let vars: Vec<(&str, String)> = vec![
-        ("title", title),
+        ("title", html_escape(&title)),
         ("rev", "1".into()),
         ("meta_tags", meta_tags),
         ("body_style", body_style),
-        ("themeclass", themeclass),
+        ("themeclass", html_escape(&themeclass)),
         ("script_nonce", script_nonce.clone()),
-        ("homepage", homepage),
-        ("site_file_server", site_file_server),
-        ("file_url", file_url),
-        ("file_inner_path", inner_path.clone()),
-        ("query_string", query_string),
-        ("address", wrapper_identity),
+        ("homepage", html_escape(&homepage)),
+        ("site_file_server", script_string(&site_file_server)),
+        ("file_url", script_string(&file_url)),
+        ("file_inner_path", script_string(&inner_path)),
+        ("query_string", script_string(&query_string)),
+        ("address", script_string(&wrapper_identity)),
         ("wrapper_nonce", nonce),
         ("wrapper_key", wrapper_key),
         ("ajax_key", ajax_key),
         ("postmessage_nonce_security", nonce_security.to_string()),
-        ("permissions", json!(permissions).to_string()),
+        ("permissions", script_json(&json!(permissions))),
         ("show_loadingscreen", if loading { "true" } else { "false" }.into()),
-        ("resolving_host", resolving_host.clone()),
+        ("resolving_host", script_string(&resolving_host)),
         ("is_homepage", if is_homepage { "true" } else { "false" }.into()),
         ("sandbox_permissions", sandbox_permissions),
         ("ui_restrict", if ui_restrict { "true" } else { "false" }.into()),
         ("server_url", String::new()),
-        ("lang", lang),
+        ("lang", html_escape(&lang)),
     ];
     let mut html = render(WRAPPER_HTML, &vars);
     // NoNewSites gateway: every page carries the read-only banner.
@@ -1765,6 +1766,7 @@ async fn render_wrapper(
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
             (header::CONTENT_SECURITY_POLICY, wrapper_csp(&script_nonce)),
+            (header::X_FRAME_OPTIONS, "DENY".to_string()),
             (header::REFERRER_POLICY, "same-origin".to_string()),
             (header::CACHE_CONTROL, "no-cache, no-store, private, must-revalidate, max-age=0".to_string()),
         ],
@@ -3065,17 +3067,32 @@ window.addEventListener('touchmove',move,{passive:true});window.addEventListener
 b.addEventListener('click',function(e){if(b._dragged){e.preventDefault();b._dragged=false;}});\
 })();</script>";
 
-/// Replace known `{name}` tokens; JS braces (not a known name) are left intact.
-/// Escape a raw query string for embedding in the wrapper template (it lands
-/// inside a script string that sets the iframe src). Mirrors EpixNet's
-/// xescape: html chars become entities so the value cannot break out of the
-/// string or the script tag; backslashes are doubled.
-fn escape_query(q: &str) -> String {
-    q.replace('\\', "\\\\")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
+/// JSON embedded in an HTML script must also prevent the HTML parser from
+/// recognizing a closing script tag, even inside a JavaScript string.
+fn script_json(value: &Value) -> String {
+    value.to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// String contents for the wrapper template's double-quoted JS literals.
+fn script_string(value: &str) -> String {
+    let encoded = script_json(&json!(value));
+    encoded[1..encoded.len() - 1].to_string()
+}
+
+/// A publisher can request a background color, never another CSS declaration
+/// that hides or repositions the trusted consent surface. The browser still
+/// validates the color; this alphabet excludes declaration delimiters, escapes,
+/// comments and markup while retaining ordinary CSS color functions.
+fn wrapper_background_color(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 128 && value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '#' | '(' | ')' | ',' | '.' | '%' | ' ' | '-' | '+' | '/' | '_')
+    })).then_some(value)
 }
 
 /// Drop a `wrapper_nonce=…` pair from a raw query string, keeping the rest.
@@ -3087,10 +3104,26 @@ fn strip_wrapper_nonce(q: &str) -> String {
 }
 
 fn render(template: &str, vars: &[(&str, String)]) -> String {
-    let mut out = template.to_string();
-    for (k, v) in vars {
-        out = out.replace(&format!("{{{k}}}"), v);
+    // Scan only the template, never substituted values. Publisher text can
+    // contain `{script_nonce}` or `{wrapper_key}` without receiving either.
+    // Unknown braces belong to the template's JavaScript and stay unchanged.
+    let mut out = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(open) = remaining.find('{') {
+        out.push_str(&remaining[..open]);
+        let after_open = &remaining[open + 1..];
+        if let Some(close) = after_open.find('}') {
+            let key = &after_open[..close];
+            if let Some((_, value)) = vars.iter().find(|(name, _)| *name == key) {
+                out.push_str(value);
+                remaining = &after_open[close + 1..];
+                continue;
+            }
+        }
+        out.push('{');
+        remaining = after_open;
     }
+    out.push_str(remaining);
     out
 }
 
@@ -3780,7 +3813,7 @@ fn wrapper_csp(script_nonce: &str) -> String {
     format!(
         "default-src 'none'; script-src 'nonce-{script_nonce}' 'wasm-unsafe-eval'; \
          img-src * blob: data:; media-src * blob: data:; font-src * data:; \
-         style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *"
+         style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *; frame-ancestors 'none'"
     )
 }
 
@@ -3877,7 +3910,9 @@ async fn ws_upgrade(
     // (the request host, or a host the wrapper was served from) - a key that
     // leaked to some other local origin buys nothing.
     let wrapper_origin = origin_host.is_empty()
-        || strip_port(origin_host) == strip_port(host)
+        // Ports are part of an origin. Another server on the same loopback
+        // host must not acquire wrapper authority if it learns a key.
+        || origin_host == host
         || ctx.state.is_served_wrapper_host(origin_host);
     let (xite, wrapper) = match q.wrapper_key.filter(|key| !key.is_empty()) {
         Some(key) => match ctx.state.xite_by_wrapper_key(&key).await {
@@ -4449,6 +4484,13 @@ mod range_tests {
 #[cfg(test)]
 mod csp_tests {
     use super::wrapper_csp;
+
+    #[test]
+    fn consent_wrapper_cannot_be_framed() {
+        let csp = wrapper_csp("NONCE123");
+        assert!(csp.split(';').any(|directive| directive.trim() == "frame-ancestors 'none'"),
+            "the wrapper's permission and EVX dialogs must not be exposed to clickjacking: {csp}");
+    }
 
     #[test]
     fn passive_media_is_cross_origin_but_scripts_stay_nonce_locked() {

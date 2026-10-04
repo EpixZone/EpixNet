@@ -131,6 +131,15 @@ browsers' proxy for a real-browser check.
   block both stand in front of this.
 - Path mode cannot give a xite a real origin of its own; a xite that needs
   storage or a service worker there needs `NOSANDBOX` or the Epix browser.
-- A wrapper can be framed by another page (no `frame-ancestors` yet); the
-  framing page cannot script it or send it commands (the wrapper accepts
-  messages only from its own inner frame), but a dialog could be overlaid.
+
+## Trusted rendering and consent
+
+Publisher titles are HTML-escaped. Paths, queries and other values placed in
+JavaScript literals use JSON escaping with HTML script delimiters escaped.
+Template substitution scans only the template, so publisher text containing
+`{script_nonce}` or `{wrapper_key}` cannot cause a second substitution.
+Background-color hints cannot add CSS declarations. The wrapper sends
+`frame-ancestors 'none'` and `X-Frame-Options: DENY`, preventing a foreign page
+from overlaying its consent controls. WebSocket origin matching includes the
+port, since another local server is a different origin. Expired grants are
+shown as expired rather than enabled in both the inspection page and dialog.

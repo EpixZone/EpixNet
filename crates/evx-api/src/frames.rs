@@ -2,7 +2,9 @@
 //!
 //! Wire format: a 4-byte big-endian length followed by that many bytes of
 //! UTF-8 JSON. Frames from an untrusted peer are decoded through
-//! [`crate::strict`]. Length is bounded by [`crate::MAX_FRAME`].
+//! [`crate::strict`]. Ordinary frames are bounded by [`crate::MAX_FRAME`].
+//! Only compiler artifacts and the initial guest artifact use the larger
+//! [`crate::MAX_ARTIFACT_FRAME`] envelope.
 //!
 //! Three peers speak these frames: the guest worker (untrusted), the compiler
 //! process (trusted code on hostile input) and the file helper (trusted code
@@ -10,7 +12,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Limits, Request, Response, MAX_FRAME};
+use crate::{Limits, Request, Response, MAX_ARTIFACT_FRAME, MAX_FRAME};
 
 /// Byte payloads are carried as base64 so frames stay valid UTF-8 JSON.
 pub mod b64 {
@@ -95,6 +97,12 @@ pub enum WorkerStatus {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", deny_unknown_fields)]
 pub enum ToCompiler {
+    /// Fixture text is parsed only after compiler-process confinement.
+    #[serde(rename = "compile_text")]
+    CompileText {
+        #[serde(with = "b64")]
+        source: Vec<u8>,
+    },
     #[serde(rename = "compile")]
     Compile {
         #[serde(with = "b64")]
@@ -154,6 +162,8 @@ pub enum FromHelper {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum HelperFault {
+    /// Native authority probe for a read-only helper, selected only by tests.
+    ReadOnlyWriteProbe,
     BlockBeforeOperation,
     BlockAfterAuthorization,
     FailAfterReplace,
@@ -161,8 +171,44 @@ pub enum HelperFault {
 
 /// Encode one frame with its length prefix.
 pub fn encode<T: Serialize>(frame: &T) -> Result<Vec<u8>, crate::Denied> {
+    encode_bounded(frame, MAX_FRAME)
+}
+
+/// Encode the one initial artifact sent by the trusted supervisor. Ordinary
+/// guest responses cannot use this larger envelope.
+pub fn encode_worker_init(frame: &ToWorker) -> Result<Vec<u8>, crate::Denied> {
+    if !matches!(frame, ToWorker::Init { .. }) {
+        return Err(crate::Denied::new("expected artifact initialization"));
+    }
+    encode_bounded(frame, MAX_ARTIFACT_FRAME)
+}
+
+/// The compiler may return one larger artifact, never a larger error.
+pub fn encode_compiler_reply(frame: &FromCompiler) -> Result<Vec<u8>, crate::Denied> {
+    let limit = if matches!(frame, FromCompiler::Artifact { .. }) {
+        MAX_ARTIFACT_FRAME
+    } else {
+        MAX_FRAME
+    };
+    encode_bounded(frame, limit)
+}
+
+/// Decode compiler output with the same variant-specific envelope as the
+/// encoder. The pipe reader bounds allocation before this parser runs.
+pub fn decode_compiler_reply(body: &[u8]) -> Result<FromCompiler, crate::Denied> {
+    if body.len() > MAX_ARTIFACT_FRAME {
+        return Err(crate::Denied::new("compiler frame limit"));
+    }
+    let frame = crate::strict::parse_typed(body)?;
+    if body.len() > MAX_FRAME && !matches!(frame, FromCompiler::Artifact { .. }) {
+        return Err(crate::Denied::new("compiler error frame limit"));
+    }
+    Ok(frame)
+}
+
+fn encode_bounded<T: Serialize>(frame: &T, limit: usize) -> Result<Vec<u8>, crate::Denied> {
     let body = serde_json::to_vec(frame).map_err(|_| crate::Denied::new("frame encoding"))?;
-    if body.len() > MAX_FRAME {
+    if body.len() > limit {
         return Err(crate::Denied::new("outgoing frame limit"));
     }
     let mut out = Vec::with_capacity(body.len() + 4);
@@ -190,5 +236,62 @@ mod tests {
         assert!(strict::parse_typed::<FromWorker>(bad_value).is_err());
         let nonfinite = br#"{"type":"result","status":"ok","value":1,"elapsed_ms":1e999}"#;
         assert!(strict::parse_typed::<FromWorker>(nonfinite).is_err());
+    }
+
+    #[test]
+    fn large_artifacts_have_narrow_directional_envelopes() {
+        let artifact = FromCompiler::Artifact {
+            artifact: vec![0; 132_880],
+            artifact_sha256: "0".repeat(64),
+            engine_key: "fixture".into(),
+        };
+        assert!(encode(&artifact).is_err());
+        let encoded = encode_compiler_reply(&artifact).unwrap();
+        assert!(encoded.len() > MAX_FRAME + 4);
+        assert_eq!(decode_compiler_reply(&encoded[4..]).unwrap(), artifact);
+
+        let init = ToWorker::Init {
+            artifact: vec![0; 132_880],
+            artifact_sha256: "0".repeat(64),
+            limits: Limits::default(),
+        };
+        assert!(encode(&init).is_err());
+        assert!(encode_worker_init(&init).is_ok());
+        let response = ToWorker::Response {
+            response: vec![0; MAX_FRAME],
+        };
+        assert!(encode(&response).is_err());
+        assert!(encode_worker_init(&response).is_err());
+        assert!(encode(&FromWorker::Call {
+            request: vec![0; MAX_FRAME]
+        })
+        .is_err());
+
+        let rejected = FromCompiler::Rejected {
+            error: "x".repeat(MAX_FRAME),
+        };
+        assert!(encode_compiler_reply(&rejected).is_err());
+        assert!(decode_compiler_reply(&serde_json::to_vec(&rejected).unwrap()).is_err());
+    }
+
+    #[test]
+    fn artifact_envelope_exact_limit_and_one_byte_over() {
+        let mut artifact = FromCompiler::Artifact {
+            artifact: vec![0; 132_880],
+            artifact_sha256: "0".repeat(64),
+            engine_key: String::new(),
+        };
+        let padding = MAX_ARTIFACT_FRAME - serde_json::to_vec(&artifact).unwrap().len();
+        if let FromCompiler::Artifact { engine_key, .. } = &mut artifact {
+            *engine_key = "x".repeat(padding);
+        }
+        let encoded = encode_compiler_reply(&artifact).unwrap();
+        assert_eq!(encoded.len(), MAX_ARTIFACT_FRAME + 4);
+        assert_eq!(decode_compiler_reply(&encoded[4..]).unwrap(), artifact);
+        if let FromCompiler::Artifact { engine_key, .. } = &mut artifact {
+            engine_key.push('x');
+        }
+        assert!(encode_compiler_reply(&artifact).is_err());
+        assert!(decode_compiler_reply(&serde_json::to_vec(&artifact).unwrap()).is_err());
     }
 }

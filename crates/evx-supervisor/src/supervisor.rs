@@ -9,7 +9,8 @@ use std::time::{Duration, Instant};
 use rustix::fs::{flock, FlockOperation};
 
 use evx_api::frames::{
-    encode, FromHelper, FromWorker, HelperFault, ToHelper, ToWorker, WorkerStatus,
+    encode, encode_worker_init, FromHelper, FromWorker, HelperFault, ToHelper, ToWorker,
+    WorkerStatus,
 };
 use evx_api::grant::ActivationContext;
 use evx_api::result::{safe_text, ChildReport};
@@ -19,30 +20,48 @@ use evx_api::{
 
 use crate::broker::Broker;
 use crate::compile::CompiledArtifact;
-use crate::process::{Event, Peer, Role};
+use crate::process::{Event, Peer, Role, EVENT_CAPACITY, MAX_FRAMES, OUTPUT_QUOTA};
 
 /// Host configuration for launching confined children.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// Required for production direct hosts. Raw None is a trusted embedding
+    /// primitive and provides no cross-restart process admission guarantee.
+    pub direct_lifecycle: Option<crate::direct_lifecycle::DirectScope>,
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    pub apple_xpc: Option<crate::apple::AppleXpcConfig>,
     pub worker_binary: PathBuf,
     /// Arguments inserted before the mode. Empty in production; a trusted
     /// test harness uses it to substitute a hostile peer script.
     pub worker_args: Vec<String>,
     pub compile_timeout: Duration,
+    pub compile_cpu_seconds: f64,
+    pub compile_rss_bytes: u64,
+    /// Trusted test-only injection; never derived from a guest declaration.
+    pub fail_compiler_cleanup: bool,
 }
 
 impl Config {
     pub fn new(worker_binary: PathBuf) -> Config {
         Config {
+            direct_lifecycle: None,
+            #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+            apple_xpc: None,
             worker_binary,
             worker_args: Vec::new(),
             compile_timeout: Duration::from_secs(30),
+            compile_cpu_seconds: 10.0,
+            compile_rss_bytes: 256 * 1024 * 1024,
+            fail_compiler_cleanup: false,
         }
     }
 }
 
 /// Per-invocation options. Everything after `activation_context` is a trusted
 /// test hook that never derives from guest input.
+type FileCommitHook = dyn Fn(&Broker) + Send;
+type HelperSpawnHook = dyn Fn(u32, u64, &mpsc::SyncSender<Event>) + Send;
+
 #[derive(Default)]
 pub struct RunOptions {
     pub activation_context: Option<ActivationContext>,
@@ -50,13 +69,15 @@ pub struct RunOptions {
     pub stall_broker: bool,
     pub revoke_at_file_commit: bool,
     pub file_fault: Option<HelperFault>,
+    pub file_fault_once: bool,
+    pub after_helper_spawn: Option<Box<HelperSpawnHook>>,
+    pub fail_file_cleanup: bool,
     pub revoke_event: Option<Arc<AtomicBool>>,
-    pub before_file_commit: Option<Box<dyn Fn(&Broker) + Send>>,
+    pub before_file_commit: Option<Box<FileCommitHook>>,
+    pub after_file_result: Option<Box<FileCommitHook>>,
 }
 
 const POLL: Duration = Duration::from_millis(20);
-const OUTPUT_QUOTA: usize = 256 * 1024;
-const MAX_FRAMES: u32 = 130;
 const GRACE: Duration = Duration::from_millis(50);
 const CLEANUP: Duration = Duration::from_secs(1);
 
@@ -74,11 +95,34 @@ pub fn run_guest(
     broker: &Broker,
     options: RunOptions,
 ) -> RunResult {
+    run_guest_with_admission(config, artifact, broker, options, |_| Ok(()))
+}
+
+/// Run a trusted admission action only after current authority and the
+/// workspace lease are accepted, before any guest can start. The callback
+/// runs under the broker lock and must not call back into the broker.
+pub fn run_guest_with_admission(
+    config: &Config,
+    artifact: &CompiledArtifact,
+    broker: &Broker,
+    options: RunOptions,
+    admit: impl FnOnce(&evx_api::Grant) -> Result<(), Denied>,
+) -> RunResult {
+    if let Err(error) = broker.check_backend(config) {
+        return RunResult::from_denial(error);
+    }
+    if let Err(error) = crate::process::child_admission_status() {
+        return RunResult::from_denial(error);
+    }
     if broker.quarantined() {
-        return RunResult::denied("workspace quarantined");
+        return RunResult::from_denial(Denied::Quarantined("workspace quarantined".into()));
     }
     if !broker.grant().enabled {
-        return RunResult::denied("EVX opt-in required");
+        return if options.activation_context.is_some() {
+            RunResult::from_denial(Denied::Cancelled("execution grant revoked".into()))
+        } else {
+            RunResult::denied("EVX opt-in required")
+        };
     }
     if artifact.engine_key != evx_runtime::engine_key() {
         return RunResult::denied("artifact engine mismatch");
@@ -87,17 +131,23 @@ pub fn run_guest(
     {
         let mut inner = broker.lock();
         if !inner.grant.enabled {
-            return RunResult::denied("execution grant revoked");
+            return RunResult::from_denial(Denied::Cancelled("execution grant revoked".into()));
         }
         generation = inner.grant.generation;
         if !matches_activation(options.activation_context.as_ref(), &inner.grant) {
-            return RunResult::denied("activation authority changed");
+            return RunResult::from_denial(Denied::Cancelled(
+                "activation authority changed".into(),
+            ));
         }
         if inner.running {
             return RunResult::denied("workspace busy");
         }
         if flock(broker.root_fd(), FlockOperation::NonBlockingLockExclusive).is_err() {
             return RunResult::denied("workspace busy");
+        }
+        if let Err(error) = admit(&inner.grant) {
+            let _ = flock(broker.root_fd(), FlockOperation::Unlock);
+            return RunResult::from_denial(error);
         }
         inner.running = true;
         inner.active_capabilities = options
@@ -133,6 +183,8 @@ struct Loop<'a> {
     peak_rss: u64,
     started: Instant,
     pending_response: Option<Response>,
+    initial_memory: u64,
+    initial_fuel: u64,
 }
 
 fn execute(
@@ -143,15 +195,15 @@ fn execute(
     generation: u64,
 ) -> RunResult {
     let started = Instant::now();
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(EVENT_CAPACITY);
     let limits = broker.limits();
-    let init = match encode(&ToWorker::Init {
+    let init = match encode_worker_init(&ToWorker::Init {
         artifact: artifact.bytes.clone(),
         artifact_sha256: artifact.sha256.clone(),
         limits: limits.clone(),
     }) {
         Ok(frame) => frame,
-        Err(e) => return RunResult::denied(e.to_string()),
+        Err(e) => return RunResult::from_denial(e),
     };
     let worker = {
         let inner = broker.lock();
@@ -159,7 +211,7 @@ fn execute(
             || inner.grant.generation != generation
             || !matches_activation(options.activation_context.as_ref(), &inner.grant)
         {
-            return RunResult::denied("execution grant revoked");
+            return RunResult::from_denial(Denied::Cancelled("execution grant revoked".into()));
         }
         match Peer::spawn(
             config,
@@ -170,7 +222,7 @@ fn execute(
             None,
         ) {
             Ok(peer) => peer,
-            Err(e) => return RunResult::denied(e.to_string()),
+            Err(e) => return RunResult::from_denial(e),
         }
     };
     let mut state = Loop {
@@ -187,10 +239,12 @@ fn execute(
         peak_rss: 0,
         started,
         pending_response: None,
+        initial_memory: limits.memory_bytes,
+        initial_fuel: limits.fuel,
     };
     let worker_pid = state.worker.pid;
     let mut outcome: LoopOutcome = Ok(None);
-    if let Err(e) = state.worker.send(&init) {
+    if let Err(e) = state.worker.send_artifact_init(&init) {
         outcome = Err(e);
     }
     let mut worker_result: Option<evx_api::frames::WorkerResult> = None;
@@ -205,14 +259,18 @@ fn execute(
         finished,
         events,
         mut commit_unknown,
-        peak_rss,
+        mut peak_rss,
         ..
     } = state;
-    let mut quarantined = false;
+    let mut quarantined = broker.quarantined() || crate::process::child_admission_status().is_err();
     let mut peers: Vec<Peer> = Vec::with_capacity(finished.len() + 2);
     peers.push(worker);
     peers.extend(finished);
     if let Some(helper) = helper {
+        // A remaining helper has not completed clean reaping and durable
+        // provenance finalization. Its acknowledgement alone cannot clear the
+        // pending write if cancellation interrupts that bookkeeping.
+        commit_unknown |= helper.commit_sent;
         peers.push(helper);
     }
     for peer in peers.iter_mut() {
@@ -222,11 +280,19 @@ fn execute(
         if peer.close(GRACE, CLEANUP).is_err() {
             quarantined = true;
         }
+        // Preserve attributable terminal usage (Darwin), or the last live
+        // sample (Linux). Per-role peaks may occur at different times, so
+        // never add them. Apple role usage includes trusted service overhead.
+        peak_rss = peak_rss.max(peer.last_rss.unwrap_or(0));
     }
     if quarantined {
         broker.lock().quarantined = true;
     }
 
+    // Only the trusted control-flow decision supplies this provenance.
+    // Worker-result text and broker state observed afterward cannot set it.
+    let host_cancellation = matches!(&outcome, Err(Denied::Cancelled(_)))
+        .then_some(evx_api::HostCancellation::AuthorityChanged);
     let (mut status, mut value, mut error) = match outcome {
         Ok(Some((status, value, error))) => (status, value, error),
         Ok(None) => (
@@ -252,22 +318,40 @@ fn execute(
         fuel_used = result.fuel_used;
         memory_bytes = result.memory_bytes;
     }
+    let inner = broker.lock();
+    let total_cpu: f64 = peers.iter().map(|p| p.max_cpu).sum();
+    // Reaping can reveal a peak that live polling missed. A known budget
+    // violation cannot become a successful result, even if the guest already
+    // released the allocation before sending its response. Other failures and
+    // trusted cancellation retain their provenance; uncertainty wins below.
+    if status == Status::Ok {
+        let limit_error = if peak_rss > inner.limits.process_rss_bytes {
+            Some("observed process RSS limit")
+        } else if total_cpu > inner.limits.process_cpu_seconds {
+            Some("observed process CPU limit")
+        } else {
+            None
+        };
+        if let Some(message) = limit_error {
+            status = Status::ResourceLimit;
+            value = None;
+            error = Some(message.into());
+        }
+    }
     if quarantined {
         status = Status::Quarantined;
-        error = Some("child termination unconfirmed".into());
+        error = Some("child cleanup unconfirmed".into());
     } else if commit_unknown {
         status = Status::EffectUnknown;
         error = Some("file commit outcome needs reconciliation; do not replay blindly".into());
     }
-    let inner = broker.lock();
-    let total_cpu: f64 = peers.iter().map(|p| p.max_cpu).sum();
     RunResult {
         status,
         value,
         error: error.map(|e| safe_text(&e, 2048)),
         worker_started: true,
         worker_pid: Some(worker_pid as u32),
-        worker_exit_code: peers.first().and_then(|p| p.exit_code),
+        worker_exit_code: peers.first().and_then(|p| p.observed_exit_code()),
         supervisor_elapsed_ms: started.elapsed().as_secs_f64() * 1000.0,
         broker_calls: inner.calls,
         responses: inner.responses.clone(),
@@ -275,23 +359,36 @@ fn execute(
         diagnostics: safe_text(&String::from_utf8_lossy(&peers[0].diagnostics), 4096),
         effective_limits: Some(limits),
         effect_outcome_unknown: commit_unknown,
+        host_cancellation,
         trusted_observations: Some(Observations {
             peak_aggregate_rss_bytes: peak_rss,
             cpu_seconds: total_cpu,
             poll_interval_seconds: POLL.as_secs_f64(),
-            source: "macOS libproc and terminal wait4 CPU; sampled detection, not a hard allocation ceiling".into(),
+            source: observation_source(config).into(),
         }),
         children: peers
             .iter()
             .map(|p| ChildReport {
                 role: p.role.name().into(),
                 pid: p.pid as u32,
-                exit_code: p.exit_code,
+                exit_code: p.observed_exit_code(),
                 diagnostics: safe_text(&String::from_utf8_lossy(&p.diagnostics), 2048),
             })
             .collect(),
         fuel_used,
         memory_bytes,
+    }
+}
+
+fn observation_source(_config: &Config) -> &'static str {
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    if _config.apple_xpc.is_some() {
+        return "App Sandbox proc_pidinfo, terminal child wait4 and trusted service getrusage; conservative summed process peaks, not a hard allocation ceiling";
+    }
+    if cfg!(target_os = "linux") {
+        "Linux post-exec procfs RSS samples and terminal wait4 CPU; short-lived memory peaks may be unobserved, not a hard allocation ceiling"
+    } else {
+        "macOS libproc and terminal wait4 CPU/RSS; sampled aggregate and individual terminal peaks, not a hard allocation ceiling"
     }
 }
 
@@ -317,20 +414,27 @@ impl<'a> Loop<'a> {
     fn run_loop(
         &mut self,
         rx: &mpsc::Receiver<Event>,
-        tx: &mpsc::Sender<Event>,
+        tx: &mpsc::SyncSender<Event>,
         worker_result: &mut Option<evx_api::frames::WorkerResult>,
     ) -> LoopOutcome {
-        let limits = self.broker.limits();
         loop {
+            let limits = self.broker.limits();
+            if limits.memory_bytes < self.initial_memory || limits.fuel < self.initial_fuel {
+                return Ok(Some((
+                    Status::ResourceLimit,
+                    None,
+                    Some("guest limits lowered; invocation cancelled".into()),
+                )));
+            }
             let now = Instant::now();
             if let Some(flag) = &self.options.revoke_event {
                 if flag.load(Ordering::Relaxed) {
                     self.broker.revoke();
-                    return Err(Denied::new("execution grant revoked"));
+                    return Err(Denied::Cancelled("execution grant revoked".into()));
                 }
             }
             if self.revoked() {
-                return Err(Denied::new("execution grant revoked"));
+                return Err(Denied::Cancelled("execution grant revoked".into()));
             }
             if now.duration_since(self.started).as_secs_f64() >= limits.wall_seconds {
                 return Ok(Some((
@@ -338,6 +442,10 @@ impl<'a> Loop<'a> {
                     None,
                     Some("supervisor wall deadline".into()),
                 )));
+            }
+            self.worker.flush_input()?;
+            if let Some(helper) = self.helper.as_mut() {
+                helper.flush_input()?;
             }
             // Kernel observations for every live child.
             self.worker.measure()?;
@@ -377,10 +485,21 @@ impl<'a> Loop<'a> {
                     self.commit_unknown |= helper.commit_sent;
                     self.events.push("native_call_deadline".into());
                     let mut helper = self.helper.take().expect("helper present");
-                    let _ = helper
-                        .close(GRACE, CLEANUP)
-                        .map_err(|_| Denied::new("child termination unconfirmed"))?;
+                    let closed = if self.options.fail_file_cleanup {
+                        Err(crate::process::CleanupTimeout { pid: helper.pid })
+                    } else {
+                        helper.close(GRACE, CLEANUP)
+                    };
+                    // Keep ownership even when the first cleanup cannot confirm
+                    // reaping. The workspace lease must remain quarantined.
                     self.finished.push(helper);
+                    self.helper_request = None;
+                    self.pending_response = None;
+                    if closed.is_err() {
+                        crate::process::quarantine_child_admission();
+                        self.broker.lock().quarantined = true;
+                        return Err(Denied::new("child termination unconfirmed"));
+                    }
                     if self.commit_unknown {
                         return Ok(Some((
                             Status::EffectUnknown,
@@ -391,8 +510,30 @@ impl<'a> Loop<'a> {
                     self.reply(Response::error("native operation deadline"))?;
                 }
             }
-            match rx.recv_timeout(POLL) {
-                Ok(Event::Stderr(role, chunk)) => {
+            let event = match rx.recv_timeout(POLL) {
+                Ok(event) => {
+                    let (role, id) = event.origin();
+                    if !self.peer_mut(role).is_some_and(|peer| peer.id == id) {
+                        if self
+                            .finished
+                            .iter()
+                            .any(|peer| peer.role == role && peer.id == id)
+                        {
+                            // A reader can deliver after its helper was reaped.
+                            // It cannot mutate a replacement's protocol state.
+                            continue;
+                        }
+                        return Err(Denied::new("unknown worker instance"));
+                    }
+                    Some(event)
+                }
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(Denied::new("worker channel closed"));
+                }
+            };
+            match event {
+                Some(Event::Stderr(role, _, chunk)) => {
                     let peer = self.peer_mut(role);
                     if let Some(peer) = peer {
                         peer.output_bytes += chunk.len();
@@ -402,7 +543,7 @@ impl<'a> Loop<'a> {
                         peer.record_stderr(&chunk);
                     }
                 }
-                Ok(Event::Closed(role, stream, protocol_error)) => {
+                Some(Event::Closed(role, _, stream, protocol_error)) => {
                     if let Some(message) = protocol_error {
                         return Err(Denied::new(message));
                     }
@@ -411,7 +552,7 @@ impl<'a> Loop<'a> {
                     }
                     let _ = stream;
                 }
-                Ok(Event::Frame(role, body)) => {
+                Some(Event::Frame(role, _, body)) => {
                     let peer = self
                         .peer_mut(role)
                         .ok_or_else(|| Denied::new("stale helper message"))?;
@@ -429,15 +570,13 @@ impl<'a> Loop<'a> {
                         Role::Compiler => return Err(Denied::new("worker protocol")),
                     }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {}
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    return Err(Denied::new("worker channel closed"))
-                }
+                None => {}
             }
             // Helper completion.
             if let Some(helper) = self.helper.as_mut() {
                 if helper.poll().is_some() && helper.readers == 0 {
                     let helper = self.helper.take().expect("helper present");
+                    let raw_request = self.helper_request.take();
                     let ok = helper.terminal && helper.exit_code == Some(0);
                     if !ok {
                         self.commit_unknown |= helper.commit_sent;
@@ -448,7 +587,23 @@ impl<'a> Loop<'a> {
                         .pending_response
                         .take()
                         .expect("helper result recorded");
+                    let committed = helper.commit_sent;
                     self.finished.push(helper);
+                    if committed && matches!(response, Response::Write { ok: true, .. }) {
+                        let request = Request::decode(
+                            raw_request
+                                .as_deref()
+                                .ok_or_else(|| Denied::new("missing file request"))?,
+                        )?;
+                        let Request::WorkspaceWrite { path, text } = request else {
+                            self.commit_unknown = true;
+                            return Err(Denied::new("invalid committed request"));
+                        };
+                        if let Err(error) = self.broker.provenance.complete(&path, &text) {
+                            self.commit_unknown = true;
+                            return Err(error);
+                        }
+                    }
                     self.reply(response)?;
                 }
             }
@@ -488,7 +643,7 @@ impl<'a> Loop<'a> {
     fn guest_frame(
         &mut self,
         body: &[u8],
-        tx: &mpsc::Sender<Event>,
+        tx: &mpsc::SyncSender<Event>,
         worker_result: &mut Option<evx_api::frames::WorkerResult>,
     ) -> Result<(), Denied> {
         if self.worker.terminal {
@@ -548,28 +703,40 @@ impl<'a> Loop<'a> {
                         caps,
                     )
                 };
+                let helper_mode = if matches!(decoded, Request::WorkspaceRead { .. }) {
+                    "file-read"
+                } else {
+                    "file"
+                };
                 let init = encode(&ToHelper::Init {
                     xite,
                     generation: self.generation,
                     capabilities,
                     limits: snapshot,
                     request: decoded,
-                    test_fault: self.options.file_fault,
+                    test_fault: if self.options.file_fault_once && !self.finished.is_empty() {
+                        None
+                    } else {
+                        self.options.file_fault
+                    },
                 })?;
-                let lease_fd = rustix::fd::AsRawFd::as_raw_fd(&self.broker.root_fd());
                 let mut helper = Peer::spawn(
                     self.config,
-                    "file",
+                    helper_mode,
                     self.broker.workspace(),
                     Role::File,
                     tx.clone(),
-                    Some(lease_fd),
+                    self.broker.helper_lease_fd(),
                 )?;
                 helper.limits_generation = limits_generation;
-                helper.send(&init)?;
+                if let Some(hook) = &self.options.after_helper_spawn {
+                    hook(calls, helper.id, tx);
+                }
                 self.helper_request = Some(request);
                 self.helper = Some(helper);
-                Ok(())
+                // Retain ownership before any fallible I/O so cleanup can
+                // quarantine an unconfirmed child instead of losing it.
+                self.helper.as_mut().expect("helper present").send(&init)
             }
             FromWorker::Result(result) => {
                 if self.helper.is_some() {
@@ -621,7 +788,11 @@ impl<'a> Loop<'a> {
                 let helper = self.helper.as_mut().expect("helper present");
                 {
                     let inner = self.broker.lock();
-                    Broker::authorize(&inner, &request, self.generation)?;
+                    let Request::WorkspaceWrite { path, text } =
+                        Broker::authorize(&inner, &request, self.generation)?
+                    else {
+                        return Err(Denied::new("invalid commit request"));
+                    };
                     if helper.limits_generation != inner.limits_generation {
                         return Err(Denied::new("limits changed before commit"));
                     }
@@ -631,16 +802,36 @@ impl<'a> Loop<'a> {
                     {
                         return Err(Denied::new("commit deadline"));
                     }
-                    helper.send(&encode(&ToHelper::Commit)?)?;
+                    // Authority metadata is durable before any native effect.
+                    self.broker.provenance.prepare(&path, &text)?;
+                    // Once the candidate is durable, failed or partial
+                    // delivery also needs reconciliation before new content.
                     helper.commit_sent = true;
+                    helper.send(&encode(&ToHelper::Commit)?)?;
                 }
                 self.events.push("file_commit_authorized".into());
                 Ok(())
             }
             FromHelper::FileResult { response } => {
-                helper.terminal = true;
                 if helper.commit_sent && !response.is_ok() {
                     self.commit_unknown = true;
+                }
+                let raw = self
+                    .helper_request
+                    .as_ref()
+                    .ok_or_else(|| Denied::new("missing file request"))?;
+                let request = Request::decode(raw)?;
+                let response = self.broker.provenance.validate_response(
+                    &request,
+                    response,
+                    helper.commit_sent,
+                )?;
+                // An invalid acknowledgement cannot establish completion.
+                // Leave the helper nonterminal on errors so cleanup preserves
+                // uncertainty for every already-authorized native commit.
+                helper.terminal = true;
+                if let Some(hook) = &self.options.after_file_result {
+                    hook(self.broker);
                 }
                 self.pending_response = Some(response);
                 Ok(())

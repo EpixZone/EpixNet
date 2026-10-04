@@ -26,6 +26,8 @@ serde = { version = "1", features = ["derive"] }
 # canonical form of a signed body is byte-identical to the reference.
 serde_json = { version = "1", features = ["float_roundtrip"] }
 thiserror = "2"
+
+[target.'cfg(unix)'.dependencies]
 rustix = { version = "1", features = ["fs"] }
 
 [dev-dependencies]

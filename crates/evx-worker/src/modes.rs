@@ -1,4 +1,4 @@
-//! The three worker modes.
+//! The confined worker modes.
 
 use std::io::{self, Read, Write};
 
@@ -9,7 +9,7 @@ use evx_api::{Request, Response};
 use evx_runtime::{HostCalls, HostError, RunOptions};
 
 use crate::confine::{self, Spec};
-use crate::ipc::{read_frame, write_frame};
+use crate::ipc::{read_frame, read_worker_init, write_compiler_reply, write_frame};
 
 /// Broker channel: each call is one frame out and one frame back.
 struct StdioBroker {
@@ -39,14 +39,29 @@ impl HostCalls for StdioBroker {
 
 /// Execute one precompiled artifact.
 pub fn run() -> Result<(), String> {
-    confine::apply_rlimits(3, 64)?;
+    // The supervisor enforces the current grant (at most 300 CPU seconds)
+    // and can apply live changes. This non-raisable backstop covers its loss.
+    confine::apply_rlimits(301, 64)?;
     confine::apply(&Spec {
         workspace: None,
         writable: false,
     })?;
+    run_confined()
+}
+
+/// The signed worker inherits the trusted service's App Sandbox. This profile
+/// permits that service's private container; it never installs another sandbox.
+#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+pub fn apple_run() -> Result<(), String> {
+    confine::apply_rlimits(301, 64)?;
+    confine::verify_apple_inheritance()?;
+    run_confined()
+}
+
+fn run_confined() -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let init = read_frame::<ToWorker>(&mut stdin.lock())?;
+    let init = read_worker_init(&mut stdin.lock())?;
     let (artifact, artifact_sha256, limits) = match init {
         ToWorker::Init {
             artifact,
@@ -61,14 +76,20 @@ pub fn run() -> Result<(), String> {
         artifact_sha256,
         engine_key: evx_runtime::engine_key(),
     };
-    let report = evx_runtime::run(
-        &artifact,
-        &options,
-        Box::new(StdioBroker {
-            stdin: io::stdin(),
-            stdout: io::stdout(),
-        }),
-    );
+    // SAFETY: this private inherited IPC channel is owned by the supervisor.
+    // It forwards unchanged output from its confined EVX compiler, never a
+    // publisher-provided serialized artifact. The worker has already applied
+    // the process sandbox, and the supervisor enforces native resource limits.
+    let report = unsafe {
+        evx_runtime::run(
+            &artifact,
+            &options,
+            Box::new(StdioBroker {
+                stdin: io::stdin(),
+                stdout: io::stdout(),
+            }),
+        )
+    };
     if report.unclassified_trap {
         eprintln!("evx-worker: unclassified trap variant observed");
     }
@@ -82,10 +103,26 @@ pub fn compile() -> Result<(), String> {
         workspace: None,
         writable: false,
     })?;
+    compile_confined()
+}
+
+#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+pub fn apple_compile() -> Result<(), String> {
+    confine::apply_rlimits(10, 64)?;
+    confine::verify_apple_inheritance()?;
+    compile_confined()
+}
+
+fn compile_confined() -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
-    let ToCompiler::Compile { module } = read_frame::<ToCompiler>(&mut stdin.lock())?;
-    let reply = match evx_runtime::precompile(&module) {
+    let module = match read_frame::<ToCompiler>(&mut stdin.lock())? {
+        ToCompiler::Compile { module } => Ok(module),
+        ToCompiler::CompileText { source } => std::str::from_utf8(&source)
+            .map_err(|_| evx_runtime::ValidationError::new("invalid WAT encoding"))
+            .and_then(evx_runtime::text_to_binary),
+    };
+    let reply = match module.and_then(|module| evx_runtime::precompile(&module)) {
         Ok(artifact) => FromCompiler::Artifact {
             artifact: artifact.bytes,
             artifact_sha256: artifact.sha256,
@@ -95,18 +132,61 @@ pub fn compile() -> Result<(), String> {
             error: error.to_string(),
         },
     };
-    write_frame(&mut stdout.lock(), &reply)
+    write_compiler_reply(&mut stdout.lock(), &reply)
 }
 
 /// Perform one workspace operation in the current directory, which the
 /// supervisor set to the workspace. Writes need a commit acknowledgement.
-pub fn file() -> Result<(), String> {
-    confine::apply_rlimits(3, 64)?;
+pub fn file(writable: bool) -> Result<(), String> {
+    // The supervisor enforces the current grant (at most 300 CPU seconds)
+    // and can apply live changes. This non-raisable backstop covers its loss.
+    confine::apply_rlimits(301, 64)?;
     let workspace = std::env::current_dir().map_err(|_| "no working directory")?;
     confine::apply(&Spec {
         workspace: Some(&workspace),
-        writable: true,
+        writable,
     })?;
+    file_confined(workspace, writable, None)
+}
+
+/// The trusted file service owns this private workspace and passes its lease.
+/// App Sandbox permits native access within this role container. Read/write
+/// request restrictions here are protocol checks, not separate OS profiles.
+#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+pub fn apple_file(writable: bool) -> Result<(), String> {
+    use std::os::fd::FromRawFd;
+    confine::apply_rlimits(301, 64)?;
+    confine::verify_apple_inheritance()?;
+    let workspace = std::env::current_dir().map_err(|_| "no working directory")?;
+    let mut lease: libc::stat = unsafe { std::mem::zeroed() };
+    let mut cwd: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fixed inherited descriptor and valid output pointers. FD3 is
+    // owned below only after checking it names the current workspace directory.
+    if unsafe { libc::fstat(3, &mut lease) } != 0
+        || unsafe {
+            libc::fstatat(
+                libc::AT_FDCWD,
+                c".".as_ptr(),
+                &mut cwd,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        || lease.st_mode & libc::S_IFMT != libc::S_IFDIR
+        || lease.st_dev != cwd.st_dev
+        || lease.st_ino != cwd.st_ino
+        || lease.st_uid != unsafe { libc::geteuid() }
+    {
+        return Err("Apple file workspace descriptor unavailable".into());
+    }
+    let root = unsafe { rustix::fd::OwnedFd::from_raw_fd(3) };
+    file_confined(workspace, writable, Some(root))
+}
+
+fn file_confined(
+    workspace: std::path::PathBuf,
+    writable: bool,
+    root: Option<rustix::fd::OwnedFd>,
+) -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let init = read_frame::<ToHelper>(&mut stdin.lock())?;
@@ -121,7 +201,24 @@ pub fn file() -> Result<(), String> {
         ToHelper::Commit => return Err("expected init frame".into()),
     };
     limits.validate().map_err(|e| e.to_string())?;
-    let root = evx_workspace::open_root(&workspace).map_err(|e| e.to_string())?;
+    if fault == Some(HelperFault::ReadOnlyWriteProbe) {
+        let allowed =
+            std::fs::write(workspace.join("read-only-native-probe.txt"), b"fixture").is_ok();
+        return write_frame(
+            &mut stdout.lock(),
+            &FromHelper::FileResult {
+                response: Response::error(if allowed {
+                    "native write allowed"
+                } else {
+                    "native write denied"
+                }),
+            },
+        );
+    }
+    let root = match root {
+        Some(root) => root,
+        None => evx_workspace::open_root(&workspace).map_err(|e| e.to_string())?,
+    };
     let root = rustix::fd::AsFd::as_fd(&root);
 
     if fault == Some(HelperFault::BlockBeforeOperation) {
@@ -133,7 +230,12 @@ pub fn file() -> Result<(), String> {
         if !capabilities.contains(&request.capability()) {
             return Err(evx_api::Denied::new("capability denied"));
         }
-        evx_workspace::cleanup_staging(root)?;
+        if writable {
+            evx_workspace::cleanup_staging(root)?;
+        }
+        if !writable && !matches!(request, Request::WorkspaceRead { .. }) {
+            return Err(evx_api::Denied::new("read-only helper operation"));
+        }
         match &request {
             Request::WorkspaceRead { path } => evx_workspace::read(root, path),
             Request::WorkspaceWrite { path, text } => {

@@ -21,7 +21,7 @@ use serde::{Deserialize, Serialize};
 
 use evx_api::frames::HelperFault;
 use evx_api::{Grant, Limits};
-use evx_supervisor::{compile_module, run_guest, Broker, CompiledArtifact, Config, RunOptions};
+use evx_supervisor::{compile_text, run_guest, Broker, CompiledArtifact, Config, RunOptions};
 
 #[derive(Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -84,17 +84,16 @@ fn main() {
     };
     let config = Config::new(worker_binary());
     let output = match command {
-        Command::Compile { source } => match evx_runtime::text_to_binary(&source)
-            .map_err(|e| e.to_string())
-            .and_then(|bytes| compile_module(&config, &bytes).map_err(|e| e.to_string()))
-        {
-            Ok(artifact) => serde_json::json!({"artifact": ArtifactJson {
-                bytes_b64: B64.encode(&artifact.bytes),
-                sha256: artifact.sha256,
-                engine_key: artifact.engine_key,
-            }}),
-            Err(error) => serde_json::json!({"error": error}),
-        },
+        Command::Compile { source } => {
+            match compile_text(&config, source.as_bytes()).map_err(|e| e.to_string()) {
+                Ok(artifact) => serde_json::json!({"artifact": ArtifactJson {
+                    bytes_b64: B64.encode(&artifact.bytes),
+                    sha256: artifact.sha256,
+                    engine_key: artifact.engine_key,
+                }}),
+                Err(error) => serde_json::json!({"error": error}),
+            }
+        }
         Command::Run {
             workspace,
             grant,

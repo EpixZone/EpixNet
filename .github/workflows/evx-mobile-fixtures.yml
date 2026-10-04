@@ -1,0 +1,64 @@
+name: EVX mobile fixture compilation
+
+on:
+  push:
+    branches: [main, evx]
+    paths:
+      - 'packaging/android/evx-fixture/**'
+      - 'packaging/android/evx-runtime/**'
+      - 'crates/evx-android/**'
+      - 'packaging/ios/evx-fixture/**'
+      - '.github/workflows/evx-mobile-fixtures.yml'
+  pull_request:
+    paths:
+      - 'packaging/android/evx-fixture/**'
+      - 'packaging/android/evx-runtime/**'
+      - 'crates/evx-android/**'
+      - 'packaging/ios/evx-fixture/**'
+      - '.github/workflows/evx-mobile-fixtures.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  android-api:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch pinned official API jar without installing an SDK
+        run: python3 packaging/android/evx-fixture/fetch-api.py --output "$RUNNER_TEMP/evx-android-api"
+      - name: Compile isolated-service fixture and run portable tests
+        run: python3 packaging/android/evx-fixture/check.py --android-jar "$RUNNER_TEMP/evx-android-api/android.jar"
+  android-runtime:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Fetch pinned official Android API jar
+        run: python3 packaging/android/evx-fixture/fetch-api.py --output "$RUNNER_TEMP/evx-android-api"
+      - name: Run real Wasm and JVM JNI tests, then typecheck Binder adapters
+        run: python3 packaging/android/evx-runtime/check.py --android-jar "$RUNNER_TEMP/evx-android-api/android.jar"
+      - name: Lint isolated runtime adapter
+        run: CARGO_TARGET_DIR=target/evx-android-runtime cargo clippy -p evx-android --all-targets --locked -- -D warnings
+  ios-api:
+    runs-on: macos-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      # Fails if the runner lacks SDK26. A library/core pass cannot replace this.
+      # No signing, device execution or production enablement occurs here.
+      - name: Test portable core and require both iOS26 SDK typechecks
+        run: python3 packaging/ios/evx-fixture/check.py --require-sdk

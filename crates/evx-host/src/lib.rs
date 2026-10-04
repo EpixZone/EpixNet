@@ -19,10 +19,14 @@ use std::collections::BTreeSet;
 use std::path::Path;
 
 use evx_activation::{
-    ActivationLoader, AuthenticationError, BoundProgram, ContentReadFn, PendingActivation,
+    ActivationCheckpoint, ActivationLoader, AuthenticationError, BoundProgram, ContentReadFn,
+    PendingActivation,
 };
-use evx_api::{Capability, RunResult};
-use evx_supervisor::{compile_module, run_guest, Broker, Config, RunOptions};
+use evx_api::{Capability, Denied, RunResult};
+use evx_supervisor::{
+    compile_module_cancellable, compile_text_cancellable, run_guest_with_admission, Broker, Config,
+    RunOptions,
+};
 
 /// Activation metadata attached to a result.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -56,6 +60,13 @@ fn denied(reason: impl Into<String>) -> ActivationOutcome {
     }
 }
 
+fn denied_cause(error: Denied) -> ActivationOutcome {
+    ActivationOutcome {
+        result: RunResult::from_denial(error),
+        activation: None,
+    }
+}
+
 /// Check that the loader's grant and the broker's current grant describe the
 /// same authority, optionally for a specific activation's declared needs.
 ///
@@ -68,34 +79,41 @@ fn check_binding(
     broker: &Broker,
     capabilities: Option<&BTreeSet<Capability>>,
     runtime_profile: Option<&str>,
-) -> Result<(), AuthenticationError> {
+) -> Result<(), Denied> {
+    check_binding_to_grant(loader, &broker.grant(), capabilities, runtime_profile)
+}
+
+fn check_binding_to_grant(
+    loader: &ActivationLoader,
+    current: &evx_api::Grant,
+    capabilities: Option<&BTreeSet<Capability>>,
+    runtime_profile: Option<&str>,
+) -> Result<(), Denied> {
     let grant = loader.grant();
-    let current = broker.grant();
     if !grant.enabled || !current.enabled {
-        return Err(AuthenticationError::new("execution grant is disabled"));
+        return Err(Denied::Cancelled("execution grant is disabled".into()));
     }
-    if current.xite != grant.xite || current.generation != grant.generation {
-        return Err(AuthenticationError::new(
-            "broker xite or grant generation mismatch",
-        ));
+    if current.xite != grant.xite {
+        return Err(Denied::new("broker xite mismatch"));
+    }
+    if current.generation != grant.generation {
+        return Err(Denied::Cancelled("broker grant generation changed".into()));
     }
     if current.publisher.as_deref() != Some(grant.publisher.as_str())
         || current.publisher_public_key != grant.ed25519_public_key()
     {
-        return Err(AuthenticationError::new(
-            "broker publisher binding mismatch",
-        ));
+        return Err(Denied::new("broker publisher binding mismatch"));
     }
     if let Some(caps) = capabilities {
         if !caps.is_subset(&current.capabilities) {
-            return Err(AuthenticationError::new(
+            return Err(Denied::new(
                 "activation capabilities exceed current broker grant",
             ));
         }
     }
     if let Some(profile) = runtime_profile {
         if !current.runtime_profiles.contains(profile) {
-            return Err(AuthenticationError::new(
+            return Err(Denied::new(
                 "activation runtime profile exceeds current broker grant",
             ));
         }
@@ -113,13 +131,13 @@ pub fn run_activation(
     options: RunOptions,
 ) -> ActivationOutcome {
     if let Err(e) = check_binding(loader, broker, None, None) {
-        return denied(e.to_string());
+        return denied_cause(e);
     }
     let pending: PendingActivation = match loader.verify(envelope, artifact_root) {
         Ok(pending) => pending,
         Err(e) => return denied(e.to_string()),
     };
-    bind_compile_admit_run(config, loader, pending, broker, options)
+    bind_compile_admit_run(config, loader, pending, broker, options, &mut |_| Ok(()))
 }
 
 /// Verify, capture, compile, admit and run one program of a xite's signed
@@ -141,14 +159,41 @@ pub fn run_content_activation(
     broker: &Broker,
     options: RunOptions,
 ) -> ActivationOutcome {
+    run_content_activation_with_admission(
+        config,
+        loader,
+        content,
+        bound,
+        read,
+        broker,
+        options,
+        &mut |_| Ok(()),
+    )
+}
+
+/// As `run_content_activation`, but persist the accepted checkpoint while
+/// holding execution admission, before starting the guest. A failed callback
+/// leaves the loader unchanged and starts no guest. The callback must not
+/// reenter this broker; it runs under the current grant and workspace lease.
+#[allow(clippy::too_many_arguments)]
+pub fn run_content_activation_with_admission(
+    config: &Config,
+    loader: &mut ActivationLoader,
+    content: &serde_json::Value,
+    bound: &BoundProgram,
+    read: &mut ContentReadFn<'_>,
+    broker: &Broker,
+    options: RunOptions,
+    persist: &mut dyn FnMut(&ActivationCheckpoint) -> Result<(), AuthenticationError>,
+) -> ActivationOutcome {
     if let Err(e) = check_binding(loader, broker, None, None) {
-        return denied(e.to_string());
+        return denied_cause(e);
     }
     let pending: PendingActivation = match loader.verify_content(content, bound, read) {
         Ok(pending) => pending,
         Err(e) => return denied(e.to_string()),
     };
-    bind_compile_admit_run(config, loader, pending, broker, options)
+    bind_compile_admit_run(config, loader, pending, broker, options, persist)
 }
 
 /// The shared tail of both paths: bind the pending activation's request to
@@ -159,59 +204,80 @@ fn bind_compile_admit_run(
     pending: PendingActivation,
     broker: &Broker,
     options: RunOptions,
+    persist: &mut dyn FnMut(&ActivationCheckpoint) -> Result<(), AuthenticationError>,
 ) -> ActivationOutcome {
+    if let Err(error) = broker.check_backend(config) {
+        return denied_cause(error);
+    }
     if let Err(e) = check_binding(
         loader,
         broker,
         Some(pending.capabilities()),
         Some(pending.runtime_profile()),
     ) {
-        return denied(e.to_string());
+        return denied_cause(e);
     }
     // Compile the captured bytes before admission so a module the compiler
     // refuses does not advance the version floor either.
-    let entry: Vec<u8> = match pending.artifact_format() {
+    let context = pending.grant_context(loader.grant());
+    let cancelled = || {
+        let grant = broker.grant();
+        !grant.enabled || !context.matches(&grant)
+    };
+    let compiled = match pending.artifact_format() {
         evx_activation::ArtifactFormat::Wat => {
-            let text = match std::str::from_utf8(pending.entry_bytes()) {
-                Ok(text) => text,
-                Err(_) => return denied("invalid WAT encoding"),
-            };
-            match evx_runtime::text_to_binary(text) {
-                Ok(bytes) => bytes,
-                Err(e) => return denied(e.to_string()),
+            compile_text_cancellable(config, pending.entry_bytes(), &cancelled)
+        }
+        evx_activation::ArtifactFormat::WasmCoreV1 => {
+            compile_module_cancellable(config, pending.entry_bytes(), &cancelled)
+        }
+    };
+    let artifact = match compiled {
+        Ok(artifact) => artifact,
+        Err(error) => {
+            return ActivationOutcome {
+                result: RunResult::from_denial(error),
+                activation: None,
             }
         }
-        evx_activation::ArtifactFormat::WasmCoreV1 => pending.entry_bytes().to_vec(),
     };
-    let artifact = match compile_module(config, &entry) {
-        Ok(artifact) => artifact,
-        Err(e) => return denied(e.to_string()),
-    };
-    let grant = loader.grant().clone();
-    let activation = match loader.admit(pending) {
-        Ok(activation) => activation,
-        Err(e) => return denied(e.to_string()),
-    };
-    let context = activation.grant_context(&grant);
-    let report = ActivationReport {
-        xite: activation.xite().to_string(),
-        publisher: activation.publisher().to_string(),
-        version: activation.version(),
-        grant_generation: activation.grant_generation(),
-        runtime_profile: activation.runtime_profile().to_string(),
-        artifact_format: activation.artifact_format().name().to_string(),
-        manifest_digest: activation.manifest_digest().to_string(),
-        artifact_sha256: artifact.sha256.clone(),
-        declaration_digest: activation.declaration_digest().map(str::to_string),
-        program: activation.program().map(str::to_string),
-    };
+    let mut report = None;
     let options = RunOptions {
         activation_context: Some(context),
         ..options
     };
-    let result = run_guest(config, &artifact, broker, options);
+    let result = run_guest_with_admission(config, &artifact, broker, options, |current| {
+        check_binding_to_grant(
+            loader,
+            current,
+            Some(pending.capabilities()),
+            Some(pending.runtime_profile()),
+        )?;
+        // Admit into a temporary loader so failure to persist never mutates
+        // the in-memory floor. `admit` rechecks the exact current checkpoint.
+        let mut candidate =
+            ActivationLoader::with_checkpoint(loader.grant().clone(), loader.checkpoint().clone());
+        let activation = candidate
+            .admit(pending)
+            .map_err(|e| evx_api::Denied::new(e.to_string()))?;
+        persist(candidate.checkpoint()).map_err(|e| evx_api::Denied::new(e.to_string()))?;
+        *loader = candidate;
+        report = Some(ActivationReport {
+            xite: activation.xite().to_string(),
+            publisher: activation.publisher().to_string(),
+            version: activation.version(),
+            grant_generation: activation.grant_generation(),
+            runtime_profile: activation.runtime_profile().to_string(),
+            artifact_format: activation.artifact_format().name().to_string(),
+            manifest_digest: activation.manifest_digest().to_string(),
+            artifact_sha256: artifact.sha256.clone(),
+            declaration_digest: activation.declaration_digest().map(str::to_string),
+            program: activation.program().map(str::to_string),
+        });
+        Ok(())
+    });
     ActivationOutcome {
         result,
-        activation: Some(report),
+        activation: report,
     }
 }

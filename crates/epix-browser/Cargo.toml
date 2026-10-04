@@ -94,6 +94,7 @@ tor = ["epix-node/tor"]
 # grants and runs a xite's declared programs. Also in epix-node's default;
 # named here so a build that trims the node default keeps it explicitly.
 evx = ["epix-node/evx"]
+apple-xpc = ["evx", "epix-node/apple-xpc"]
 # In-process Tor pluggable transports (Snowflake) for censored networks. Off by
 # default; a bridges-enabled desktop build opts in explicitly.
 bridges = ["epix-node/bridges"]

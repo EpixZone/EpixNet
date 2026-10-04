@@ -31,16 +31,32 @@ const ENTRY_PATH: &str = "evx/main.wasm";
 const PROGRAM: &str = "calc";
 const MODIFIED: f64 = 1_700_000_000.0;
 
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn failed_activation_checkpoint_persistence_prevents_guest_execution() {
+    let f = Fixture::new(Options::default()).await;
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
+    let blocked = f.service.root().join("checkpoints")
+        .join(format!("{}.json.tmp-{}", f.address, std::process::id()));
+    std::fs::create_dir(&blocked).unwrap();
+    let result = f.chrome("evxRunOnce", json!({ "program": PROGRAM })).await.unwrap();
+    assert_ne!(result["status"], "ok", "guest ran without a durable activation floor: {result}");
+    assert_eq!(result["worker_started"], false, "no guest may start after failed admission persistence: {result}");
+}
+
 /// Build and locate `evx-worker` relative to this test binary's target
 /// directory, exactly as the `evx-host` suite does.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 fn worker_binary() -> PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut command = std::process::Command::new(cargo);
-        command.args(["build", "-p", "evx-worker"]).current_dir(manifest.join("../.."));
+        command.args(["build", "-p", "evx-worker", "--locked"]).current_dir(manifest.join("../.."));
+        if evx_runtime::engine::backend_name().starts_with("pulley") {
+            command.args(["--features", "evx-runtime/pulley"]);
+        }
         if !cfg!(debug_assertions) {
             command.arg("--release");
         }
@@ -78,9 +94,9 @@ impl Default for Options {
             jobs: Vec::new(),
             pin_entry: true,
             signed: true,
-            #[cfg(target_os = "macos")]
+            #[cfg(any(target_os = "macos", target_os = "linux"))]
             worker: Some(worker_binary()),
-            #[cfg(not(target_os = "macos"))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
             worker: None,
         }
     }
@@ -187,8 +203,34 @@ fn start_plugin(state: &Arc<AppState>, worker: Option<PathBuf>) -> (CommandRegis
     (commands, service)
 }
 
-struct Fixture {
+// Keep the journal alive until any admitted supervisor has reaped its child.
+// Dropping only TempDir while a scheduler is finishing correctly quarantines
+// the process now, so fixture teardown must follow the host shutdown contract.
+struct FixtureDirectory {
     dir: tempfile::TempDir,
+    service: Arc<EvxService>,
+}
+impl std::ops::Deref for FixtureDirectory {
+    type Target = tempfile::TempDir;
+    fn deref(&self) -> &Self::Target { &self.dir }
+}
+impl Drop for FixtureDirectory {
+    fn drop(&mut self) {
+        self.service.shutdown();
+        let journal = self.service.root().join("lifecycle/lifecycle.json");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let active = std::fs::read(&journal).ok()
+                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+                .and_then(|value| value["active"].as_array().map(|rows| rows.len()));
+            if active == Some(0) || Instant::now() >= deadline { break; }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+struct Fixture {
+    dir: FixtureDirectory,
     state: Arc<AppState>,
     address: String,
     commands: CommandRegistry,
@@ -200,12 +242,32 @@ struct Fixture {
 
 impl Fixture {
     async fn new(options: Options) -> Fixture {
+        Self::build(options, true).await
+    }
+
+    /// Recovery fixtures need a live management service without automatic jobs.
+    /// Shutting down a service now stops all worker admission as well.
+    async fn without_scheduler(options: Options) -> Fixture {
+        Self::build(options, false).await
+    }
+
+    async fn build(options: Options, scheduler: bool) -> Fixture {
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir("test", dir.path());
         let xite = write_xite(dir.path(), &state, &options).await;
-        let (commands, service) = start_plugin(&state, options.worker.clone());
+        let (commands, service) = if scheduler {
+            start_plugin(&state, options.worker.clone())
+        } else {
+            let service = Arc::new(EvxService::for_node(&state, options.worker.clone()).unwrap());
+            state.install_capability(CAPABILITY_KEY, service.clone());
+            let reader = service.clone();
+            state.set_evx_grant_summary_source(Box::new(move |address| reader.grant_summary(address)));
+            let mut plugins = PluginRegistry::new();
+            plugins.register(Arc::new(EvxPlugin::default()));
+            (plugins.command_registry(), service)
+        };
         Fixture {
-            dir,
+            dir: FixtureDirectory { dir, service: service.clone() },
             state,
             address: xite.address.clone(),
             commands,
@@ -237,7 +299,7 @@ impl Fixture {
     /// The same data root under a fresh node and a fresh plugin, as a
     /// restart is: the old scheduler is stopped first, so one database has
     /// one scheduler.
-    async fn reopen(self) -> Fixture {
+    async fn reopen(mut self) -> Fixture {
         self.service.shutdown();
         tokio::task::yield_now().await;
         let state = AppState::with_data_dir("test", self.dir.path());
@@ -246,6 +308,7 @@ impl Fixture {
             .add_xite(&self.address, XiteEntry { storage: XiteStorage::new(&root), content: Some(self.xite.content.clone()) })
             .await;
         let (commands, service) = start_plugin(&state, self.worker.clone());
+        self.dir.service = service.clone();
         Fixture { state, commands, service, ..self }
     }
 
@@ -308,7 +371,7 @@ impl Fixture {
 
     /// The same for another xite of the node. Only the macOS execution tests
     /// use it.
-    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
     async fn enable_params_for(&self, xite: &Xite) -> Value {
         self.enable_params_at(&xite.address, &xite.digest).await
     }
@@ -395,6 +458,7 @@ async fn the_evx_plugin_registers_its_commands_under_its_name() {
             "evxJobPause",
             "evxJobResume",
             "evxRunJob",
+            "evxRecoverWorkspace",
         ]
     );
     for wrapper_only in epix_ui::command::EVX_WRAPPER_COMMANDS {
@@ -903,7 +967,7 @@ async fn enabling_a_declaration_with_a_usable_job_records_background_consent_and
     let status = f.call(&f.page(), "evxStatus", json!({}), 2).await.unwrap();
     assert_eq!(status["jobs"], json!([]));
     assert_eq!(status["scheduler"]["enabled"], true);
-    assert_eq!(status["scheduler"]["host"], if f.service.execution().is_ok() { "macos" } else { "unsupported" });
+    assert_eq!(status["scheduler"]["host"], if f.service.execution().is_ok() { std::env::consts::OS } else { "unsupported" });
 
     let granted = f.chrome("evxGrant", f.enable_params().await).await.unwrap();
     assert_eq!(granted["grant"]["allow_background"], true, "consent and authority agree: {granted}");
@@ -1398,7 +1462,7 @@ async fn a_content_change_for_a_xite_with_jobs_re_registers_it_with_no_evx_comma
     assert_eq!(row.declaration_digest, f.digest);
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", target_os = "linux"))]
 mod execution {
     use super::*;
     use evx_api::Status;
@@ -1502,23 +1566,23 @@ mod execution {
                 .unwrap();
         }
         f.state.set_plugin_enabled(PLUGIN_NAME, true).await;
-        // Within one tick two xites are running; the third waits and says so.
-        wait_for(Duration::from_secs(10), "two workers busy", || async {
-            (f.status().await["scheduler"]["busy_workers"] == 2).then_some(())
-        })
-        .await;
-        let mut running = 0;
-        let mut waiting = Vec::new();
-        for xite in [&f.address, &b.address, &c.address] {
-            let status = f.service.status(&f.state, xite).await.unwrap();
-            if status["running"] == true {
-                running += 1;
-            } else {
-                waiting.push(status["jobs"][0]["waiting_reason"].clone());
+        // Worker slots are reserved before broker registration. Observe both
+        // admissions, rather than treating the earlier capacity snapshot as
+        // an atomic snapshot of three separately queried xite statuses.
+        wait_for(Duration::from_secs(10), "two running xites and one waiting", || async {
+            let mut running = 0;
+            let mut waiting = Vec::new();
+            for xite in [&f.address, &b.address, &c.address] {
+                let status = f.service.status(&f.state, xite).await.unwrap();
+                if status["running"] == true {
+                    running += 1;
+                } else {
+                    waiting.push(status["jobs"][0]["waiting_reason"].clone());
+                }
             }
-        }
-        assert_eq!(running, 2, "{waiting:?}");
-        assert_eq!(waiting, [json!("workers_busy")]);
+            (running == 2 && waiting == [json!("workers_busy")]
+                && f.status().await["scheduler"]["busy_workers"] == 2).then_some(())
+        }).await;
         // Once a worker is free the third runs.
         wait_for(Duration::from_secs(20), "every xite to have run", || async {
             [&f.address, &b.address, &c.address]
@@ -1644,6 +1708,35 @@ mod execution {
             i32.const 0))"#;
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_run_queued_before_plugin_disable_cannot_start_afterward() {
+        let f = Arc::new(Fixture::new(Options {
+            wat: SPIN,
+            limits: Some(json!({ "fuel": HOST_CEILING.fuel, "wall_seconds": 3.0, "process_cpu_seconds": 3.0 })),
+            ..Options::default()
+        }).await);
+        f.chrome("evxGrant", f.enable_params().await).await.unwrap();
+        let first = tokio::spawn({
+            let f = f.clone();
+            async move { f.chrome("evxRunOnce", json!({ "program": PROGRAM })).await }
+        });
+        wait_for(Duration::from_secs(20), "first manual run", || async {
+            (f.status().await["running"] == true).then_some(())
+        }).await;
+        // Poll the second command while enabled so it passes the dispatcher
+        // and waits on the same xite lock. It must recheck at admission.
+        let queued = f.chrome("evxRunOnce", json!({ "program": PROGRAM }));
+        tokio::pin!(queued);
+        tokio::select! {
+            result = &mut queued => panic!("queued run finished early: {result:?}"),
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
+        }
+        f.state.set_plugin_enabled(PLUGIN_NAME, false).await;
+        let result = tokio::time::timeout(Duration::from_secs(10), &mut queued).await.unwrap();
+        first.await.unwrap().unwrap();
+        assert!(result.is_err(), "a queued run started while disabled: {result:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_run_queued_behind_a_revocation_is_refused_rather_than_run_under_the_revoked_grant() {
         let f = Arc::new(
             Fixture::new(Options {
@@ -1684,10 +1777,12 @@ mod execution {
         let first = first.await.unwrap().unwrap();
         assert_eq!(revoked["stopped_run"], true, "{revoked}; run 1: {first}");
         assert_ne!(first["status"], serde_json::to_value(Status::Ok).unwrap(), "{first}");
-        // "revoked" once the run is in flight; "opt-in required" is the
-        // supervisor's word for a grant already disabled at admission.
+        // Status becomes running while compilation is active too. Cancellation
+        // there carries the same typed cause as stopping an admitted guest.
+        // A grant already disabled at admission reports "opt-in required".
         let error = first["error"].as_str().unwrap_or_default();
-        assert!(error.contains("revoked") || error.contains("opt-in"), "{first}");
+        assert!(first["host_cancellation"] == "authority_changed"
+            || error.contains("revoked") || error.contains("opt-in"), "{first}");
         let second = second.await.unwrap().unwrap_err();
         assert!(second.contains("no enabled EVX grant"), "{second}");
         let runs = f.service.durable().runs(&f.address).unwrap();
@@ -1708,4 +1803,194 @@ mod execution {
         assert!(denied.contains("not usable"), "{denied}");
         assert_eq!(f.service.durable().runs(&f.address).unwrap().len(), 1);
     }
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+fn uncertain_workspace_write(f: &Fixture) {
+    let workspace = f.service.workspace_dir(&f.address);
+    std::fs::create_dir_all(&workspace).unwrap();
+    let (grant, generations) = f.service.durable().xite_grant(&f.address).unwrap().unwrap();
+    let broker = evx_supervisor::Broker::new(&workspace, evx_api::Grant {
+        xite: f.address.clone(), enabled: true, generation: generations.generation,
+        capabilities: [evx_api::Capability::WorkspaceWrite].into_iter().collect(),
+        publisher: Some(f.address.clone()), publisher_public_key: None,
+        runtime_profiles: grant.runtime_profiles,
+    }, grant.limits).unwrap();
+    let request = serde_json::to_vec(&json!({ "op": "workspace.write", "path": "score.txt", "text": "candidate" })).unwrap();
+    let escaped: String = request.iter().map(|b| format!("\\{b:02x}")).collect();
+    let wat = format!(r#"(module
+        (import "evx" "call" (func $call (param i32 i32 i32 i32) (result i32)))
+        (memory (export "memory") 1) (data (i32.const 0) "{escaped}")
+        (func (export "run") (result i32)
+          (call $call (i32.const 0) (i32.const {}) (i32.const 4096) (i32.const 4096))))"#, request.len());
+    let config = evx_supervisor::Config::new(worker_binary());
+    let artifact = evx_supervisor::compile_text(&config, wat.as_bytes()).unwrap();
+    let result = evx_supervisor::run_guest(&config, &artifact, &broker, evx_supervisor::RunOptions {
+        file_fault: Some(evx_api::frames::HelperFault::FailAfterReplace), ..Default::default()
+    });
+    assert_eq!(result.status, evx_api::Status::EffectUnknown, "{result:?}");
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn job_resume_refuses_unregistered_workspace_bytes_before_clearing_pause() {
+    let f = Fixture::without_scheduler(Options { capabilities: vec!["workspace.write"], ..Options::with_job(3600) }).await;
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
+    uncertain_workspace_write(&f);
+    f.service.durable().set_job_paused(&f.address, JOB, Some("reconcile_required")).unwrap();
+    std::fs::write(f.service.workspace_dir(&f.address).join("score.txt"), "unregistered").unwrap();
+    let result = f.chrome("evxJobResume", json!({ "job": JOB })).await;
+    assert!(result.is_err(), "resume cleared an unreconciled pause: {result:?}");
+    assert_eq!(f.service.durable().jobs(&f.address).unwrap()[0].paused_reason.as_deref(), Some("reconcile_required"));
+    std::fs::write(f.service.workspace_dir(&f.address).join("score.txt"), "candidate").unwrap();
+    f.chrome("evxJobResume", json!({ "job": JOB })).await.unwrap();
+    assert!(f.service.durable().jobs(&f.address).unwrap()[0].paused_reason.is_none());
+}
+
+#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[tokio::test]
+async fn explicit_operator_workspace_recovery_supports_interrupted_manual_runs() {
+    let f = Fixture::without_scheduler(Options { capabilities: vec!["workspace.write"], ..Options::default() }).await;
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
+    uncertain_workspace_write(&f);
+    f.chrome("evxRevoke", json!({})).await.unwrap();
+    let before = f.service.durable().xite_grant(&f.address).unwrap().unwrap();
+    let recovered = f.call(&f.operator(), "evxRecoverWorkspace", json!({ "xite": f.address }), 1).await.unwrap();
+    assert_eq!(recovered["reconciled_paths"], 1, "{recovered}");
+    assert_eq!(f.service.durable().xite_grant(&f.address).unwrap().unwrap(), before);
+    assert!(f.runs().is_empty(), "recovery executed a program");
+    assert!(f.service.durable().jobs(&f.address).unwrap().is_empty());
+    let again = f.call(&f.operator(), "evxRecoverWorkspace", json!({ "xite": f.address }), 2).await.unwrap();
+    assert_eq!(again["reconciled_paths"], 0);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_recovery_rejects_a_symlink_root() {
+    let f = Fixture::without_scheduler(Options::default()).await;
+    let outside = tempfile::tempdir().unwrap();
+    std::os::unix::fs::symlink(outside.path(), f.service.workspace_dir(&f.address)).unwrap();
+    let result = f.call(&f.operator(), "evxRecoverWorkspace", json!({ "xite": f.address }), 1).await;
+    assert!(result.is_err(), "recovery accepted a symlink root: {result:?}");
+}
+
+#[tokio::test]
+async fn workspace_recovery_requires_chrome_or_operator_authority_without_granting_admin() {
+    let f = Fixture::without_scheduler(Options::default()).await;
+    assert_eq!(f.chrome("evxRecoverWorkspace", json!({})).await.unwrap()["reconciled_paths"], 0);
+    assert!(!f.state.xite_has_admin(&f.address).await);
+    f.state.add_permission(&f.address, "ADMIN").await;
+    for id in [1, WRAPPER_ID_BASE + 1] {
+        assert!(f.call(&f.page(), "evxRecoverWorkspace", json!({}), id).await.is_err());
+    }
+    assert!(f.call(&f.wrapper(), "evxRecoverWorkspace", json!({}), 1).await.is_err());
+    let recovered = f.chrome("evxRecoverWorkspace", json!({})).await.unwrap();
+    assert_eq!(recovered["reconciled_paths"], 0);
+    assert!(f.chrome("evxRecoverWorkspace", json!({ "xite": "1Other" })).await.is_err());
+    assert!(f.chrome("evxRecoverWorkspace", json!({ "extra": true })).await.is_err());
+    f.state.config_set("ui_restrict", json!(true)).await;
+    assert!(f.chrome("evxRecoverWorkspace", json!({})).await.is_err());
+    assert!(f.call(&f.operator(), "evxRecoverWorkspace", json!({ "xite": f.address }), 1).await.is_ok());
+}
+
+#[tokio::test]
+async fn workspace_recovery_with_no_pending_paths_needs_no_worker() {
+    let f = Fixture::without_scheduler(Options { worker: Some(PathBuf::from("missing-evx-worker")), ..Options::default() }).await;
+    std::fs::create_dir_all(f.service.workspace_dir(&f.address)).unwrap();
+    assert!(f.service.execution().is_err());
+    let result = f.call(&f.operator(), "evxRecoverWorkspace", json!({ "xite": f.address }), 1).await.unwrap();
+    assert_eq!(result["reconciled_paths"], 0);
+    assert!(f.runs().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_recovery_refuses_a_stopped_service() {
+    let f = Fixture::without_scheduler(Options::default()).await;
+    f.service.shutdown();
+    let error = f.call(&f.operator(), "evxRecoverWorkspace", json!({ "xite": f.address }), 1).await.unwrap_err();
+    assert!(error.contains("cancelled by host policy"), "{error}");
+    assert!(f.runs().is_empty());
+}
+
+#[tokio::test]
+async fn workspace_recovery_rejects_a_regular_file_root() {
+    let f = Fixture::without_scheduler(Options::default()).await;
+    std::fs::write(f.service.workspace_dir(&f.address), "fixture").unwrap();
+    assert!(f.call(&f.operator(), "evxRecoverWorkspace", json!({ "xite": f.address }), 1).await.is_err());
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn direct_restart_refuses_a_live_native_helper_that_released_its_lease() {
+    if let Ok(root) = std::env::var("EVX_DIRECT_CRASH_ROOT") {
+        let root = PathBuf::from(root);
+        let address = std::env::var("EVX_DIRECT_CRASH_XITE").unwrap();
+        let worker = PathBuf::from(std::env::var("EVX_DIRECT_CRASH_WORKER").unwrap());
+        let app = AppState::with_data_dir("direct-crash", &root);
+        let stored = root.join("data").join(&address);
+        let content: Value = serde_json::from_slice(&std::fs::read(stored.join("content.json")).unwrap()).unwrap();
+        app.add_xite(&address, XiteEntry { storage: XiteStorage::new(&stored), content: Some(content) }).await;
+        let service = Arc::new(EvxService::for_node(&app, Some(worker)).unwrap());
+        let result = service.run_once(&app, &address, PROGRAM, None).await;
+        panic!("old host completed before intentional crash: {result:?}");
+    }
+    let request = serde_json::to_vec(&json!({"op":"workspace.write","path":"orphan-score.txt","text":"second run"})).unwrap();
+    let payload: String = request.iter().map(|byte| format!("\\{byte:02x}")).collect();
+    let wat: &'static str = Box::leak(format!(r#"(module
+      (import "evx" "call" (func $call (param i32 i32 i32 i32) (result i32)))
+      (memory (export "memory") 1) (data (i32.const 0) "{payload}")
+      (func (export "run") (result i32)
+      i32.const 0 i32.const {} i32.const 4096 i32.const 4096 call $call))"#, request.len()).into_boxed_str());
+    let f = Fixture::without_scheduler(Options { wat, capabilities: vec!["workspace.write"], ..Options::default() }).await;
+    f.chrome("evxGrant", f.enable_params().await).await.unwrap();
+    let worker = worker_binary();
+    let code = f.dir.path().join("orphan.c");
+    let wrapper = f.dir.path().join("orphan-worker");
+    // This native substitute deliberately drops the lease, as compromised native
+    // code can. It performs no EVX file operation and self-terminates after 30s.
+    std::fs::write(&code, format!(r#"
+#include <unistd.h>
+#include <stdio.h>
+#include <string.h>
+#include <signal.h>
+int main(int argc, char **argv) {{
+    if (argc == 2 && !strcmp(argv[1], "file")) {{
+        close(3); alarm(30);
+        FILE *f = fopen("peer-ready", "w"); if (!f) return 4;
+        fprintf(f, "%d", getpid()); fclose(f);
+        for (;;) pause();
+    }}
+    char *args[] = {{"{worker}", argc > 1 ? argv[1] : "", NULL}};
+    execv(args[0], args); return 3;
+}}
+"#, worker=worker.display())).unwrap();
+    assert!(std::process::Command::new("xcrun").args(["clang", "-Wall", "-Wextra", "-Werror"]).arg(&code).arg("-o").arg(&wrapper).status().unwrap().success());
+    let mut old_host = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "direct_restart_refuses_a_live_native_helper_that_released_its_lease", "--nocapture"])
+        .env("EVX_DIRECT_CRASH_ROOT", f.dir.path())
+        .env("EVX_DIRECT_CRASH_XITE", &f.address)
+        .env("EVX_DIRECT_CRASH_WORKER", &wrapper)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
+    let marker = f.service.workspace_dir(&f.address).join("peer-ready");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let pid: i32 = loop {
+        if let Ok(text) = std::fs::read_to_string(&marker) {
+            if let Ok(pid) = text.parse() { break pid; }
+        }
+        if Instant::now() > deadline { let _ = old_host.kill(); let _ = old_host.wait(); panic!("helper never became ready"); }
+        std::thread::sleep(Duration::from_millis(5));
+    };
+    struct KnownOrphan(i32);
+    impl Drop for KnownOrphan { fn drop(&mut self) { let _ = std::process::Command::new("/bin/kill").args(["-KILL", &self.0.to_string()]).status(); } }
+    let orphan = KnownOrphan(pid);
+    old_host.kill().unwrap(); old_host.wait().unwrap();
+    assert!(std::process::Command::new("/bin/kill").args(["-0", &pid.to_string()]).status().unwrap().success());
+    let f = f.reopen().await;
+    let result = f.chrome("evxRunOnce", json!({"program": PROGRAM})).await;
+    let still_alive = std::process::Command::new("/bin/kill").args(["-0", &pid.to_string()]).status().unwrap().success();
+    println!("orphan_pid={pid} still_alive={still_alive} restarted_result={result:?}");
+    drop(orphan);
+    assert!(still_alive, "reproduction requires live old helper");
+    assert!(match &result { Err(_) => true, Ok(value) => value["status"] != "ok" },
+        "restart admitted new manual execution while old native helper remained alive: {result:?}");
 }

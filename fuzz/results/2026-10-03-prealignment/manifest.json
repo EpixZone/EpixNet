@@ -1,0 +1,23 @@
+{
+  "Cargo.lock": {
+    "bytes": 48274,
+    "sha256": "28c2527d486689960100117b998017de584ee88fb6ca27534f5ea70c1820a4a7"
+  },
+  "ipc-extended.log": {
+    "bytes": 1614931,
+    "sha256": "3288058c41f220644753f176b92f7d2f8a2fa612d27debb3a73552f0bd788b2d"
+  },
+  "ipc_frames-corpus.tar.gz": {
+    "files": 2217,
+    "sha256": "fe319dee167c6de895c2f28992484d0f4fd16166b6350cdbe384079d843763fe"
+  },
+  "scope": "Historical extended campaigns used the pre-alignment dependency graph. The state target gained additional cross-xite assertions afterward, so that log does not validate the final target. Exact original source snapshots were not retained. Final-source campaigns with the aligned graph remain outstanding.",
+  "state-initial.log": {
+    "bytes": 94705,
+    "sha256": "ec82e23f8577f91050f3ce44bc907fe042280db906ddb3fca4932216486a175f"
+  },
+  "state_sequences-corpus.tar.gz": {
+    "files": 618,
+    "sha256": "3625e077c82c87474c43aea3ea05a872c48f398b09c720d81e090560e5abdd55"
+  }
+}

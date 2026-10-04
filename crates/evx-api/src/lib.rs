@@ -20,15 +20,23 @@ pub mod strict;
 pub use broker::{Capability, Request, Response};
 pub use grant::Grant;
 pub use limits::Limits;
-pub use result::{Observations, RunResult, Status};
+pub use result::{HostCancellation, Observations, RunResult, Status};
 
-/// Largest single IPC frame, in bytes, in either direction.
+/// Largest ordinary IPC frame, in bytes, in either direction.
 pub const MAX_FRAME: usize = 131_072;
+/// Compiler artifacts and the first guest initialization may use this larger
+/// envelope. Native Aarch64 artifacts contain 64 KiB aligned sections, even
+/// on hosts whose actual pages are smaller. Guest calls, helper frames and
+/// compiler input retain MAX_FRAME; this does not raise their authority.
+pub const MAX_ARTIFACT_FRAME: usize = 262_144;
 /// Largest broker request a guest may submit, in bytes.
 pub const MAX_REQUEST: usize = 8_192;
 /// Largest broker response returned to a guest, in bytes.
 pub const MAX_RESPONSE: usize = 4_096;
-/// Largest module accepted for compilation, in bytes.
+/// Structural module-size ceiling, in bytes. The single-frame process
+/// transport limits JSON/base64 encoded compiler input to MAX_FRAME and
+/// compiled artifacts to MAX_ARTIFACT_FRAME. A module below this ceiling can still be refused before
+/// launch by the encoded frame limit; this is not a 1 MiB transport promise.
 pub const MAX_MODULE: usize = 1_048_576;
 /// Largest workspace file a guest may read or write through the broker.
 pub const MAX_FILE: usize = 2_048;
@@ -40,6 +48,13 @@ pub const MAX_ENTRIES: usize = 128;
 pub enum Denied {
     #[error("{0}")]
     Reason(String),
+    /// Host cleanup uncertainty stops admission within this host process.
+    /// Confirm prior children stopped before restarting the host.
+    #[error("{0}")]
+    Quarantined(String),
+    /// A trusted policy check, not guest input, cancelled the invocation.
+    #[error("{0}")]
+    Cancelled(String),
 }
 
 impl Denied {

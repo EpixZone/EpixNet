@@ -570,6 +570,24 @@ async fn evx_panel_reports_a_disabled_grant_without_printing_it() {
 }
 
 #[tokio::test]
+async fn evx_panel_reports_an_expired_enabled_grant_as_unavailable() {
+    let (_directory, state, router, address, _) = evx_fixture(true, baseline_evx()).await;
+    let expected = address.clone();
+    state.set_evx_grant_summary_source(Box::new(move |xite| {
+        (xite == expected).then(|| {
+            let mut grant = grant_record(true);
+            grant["expired"] = json!(true);
+            grant
+        })
+    }));
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(html.contains("<dt>EVX enabled for this xite</dt><dd class='bad'>no: the stored grant is expired</dd>"),
+        "expired consent must not be shown as active");
+    assert!(!html.contains("<dt>EVX enabled for this xite</dt><dd class='ok'>yes</dd>"));
+    assert_no_grant_record(&html);
+}
+
+#[tokio::test]
 async fn evx_panel_on_a_restricted_gateway_says_nothing_about_the_grant() {
     let (_directory, state, router, address, _) = evx_fixture(true, baseline_evx()).await;
     let expected = address.clone();
@@ -763,4 +781,19 @@ fn panel(html: &str) -> &str {
     let (_, rest) = html.split_once("id='evx-panel'").expect("panel present");
     let (panel, _) = rest.split_once("</section>").expect("panel closed");
     panel
+}
+
+#[tokio::test]
+async fn evx_recovery_guidance_stays_inert_and_is_hidden_on_gateways() {
+    let (_directory, state, router, address, _) = evx_fixture(true, baseline_evx()).await;
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(html.contains("evxRecoverWorkspace"));
+    assert!(html.contains("evxJobResume"));
+    let panel = html.split("id='evx-panel'").nth(1).unwrap().split("</section>").next().unwrap();
+    assert!(!panel.contains("<script"));
+    assert!(!panel.contains("<form"));
+    assert!(!panel.contains("wrapper_key"));
+    state.config_set("ui_restrict", json!(true)).await;
+    let (_, html) = request(&router, "127.0.0.1:42222", &format!("/list/{address}?evx=1")).await;
+    assert!(!html.contains("evxRecoverWorkspace"));
 }

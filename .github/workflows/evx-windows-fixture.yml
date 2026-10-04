@@ -1,0 +1,65 @@
+name: EVX Windows native fixture
+
+on:
+  pull_request:
+    paths:
+      - 'crates/evx-windows/**'
+      - 'crates/evx-api/**'
+      - 'crates/evx-runtime/**'
+      - 'crates/evx-worker/src/ipc.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/evx-windows-fixture.yml'
+  push:
+    branches: [main, evx]
+    paths:
+      - 'crates/evx-windows/**'
+      - 'crates/evx-api/**'
+      - 'crates/evx-runtime/**'
+      - 'crates/evx-worker/src/ipc.rs'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - '.github/workflows/evx-windows-fixture.yml'
+  workflow_dispatch:
+
+permissions: {}
+
+jobs:
+  native-isolation:
+    runs-on: windows-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_TARGET_DIR: target/evx-windows-fixture
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check Windows transport and build native fixtures
+        shell: pwsh
+        run: |
+          cargo clippy -p evx-windows --all-targets --locked -- -D warnings
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p evx-windows --lib --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo build -p evx-windows --bins --example acceptance --example execution_acceptance --release --locked
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Require actual LPAC and Job Object acceptance
+        shell: pwsh
+        run: |
+          & target/evx-windows-fixture/release/examples/acceptance.exe 2>&1 | Tee-Object -FilePath windows-native-acceptance.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Require real confined Wasm compile, call, cancellation and fresh execution
+        shell: pwsh
+        run: |
+          & target/evx-windows-fixture/release/examples/execution_acceptance.exe 2>&1 | Tee-Object -FilePath windows-runtime-acceptance.log
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Preserve native acceptance output
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: evx-windows-native-acceptance
+          path: |
+            windows-native-acceptance.log
+            windows-runtime-acceptance.log
+          if-no-files-found: warn
+          retention-days: 14

@@ -10,6 +10,8 @@ use evx_api::{strict, Capability};
 use serde_json::{json, Value};
 use sha2::{Digest as _, Sha256};
 
+#[cfg(not(unix))]
+use super::FixtureFileVerify;
 use super::{generate_key, public, with};
 use crate::{
     digest, sha512_prefix, ActivationCheckpoint, ActivationLoader, ArtifactFormat,

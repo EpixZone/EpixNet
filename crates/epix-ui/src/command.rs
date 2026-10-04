@@ -53,6 +53,7 @@ pub fn validate_grantable_permission(permission: &str) -> Result<(), String> {
 /// `@flag.admin` set. An inner xite page can only run these once the user has
 /// granted that xite ADMIN through the wrapper's permission prompt.
 const ADMIN_COMMANDS: &[&str] = &[
+    "evxRecoverWorkspace",
     "announcerStats",
     "certList",
     "certSet",
@@ -152,6 +153,7 @@ pub const EVX_WRAPPER_COMMANDS: &[&str] = &[
     "evxJobPause",
     "evxJobResume",
     "evxRunJob",
+    "evxRecoverWorkspace",
 ];
 
 /// Commands that create or clone a new xite - blocked by NoNewSites.

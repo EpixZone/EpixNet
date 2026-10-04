@@ -7,6 +7,9 @@ description = "EVX host: binds signed activation to the supervisor, and a JSON-o
 [lib]
 path = "src/lib.rs"
 
+[features]
+apple-xpc = ["evx-supervisor/apple-xpc"]
+
 [[bin]]
 name = "evx-host"
 path = "src/main.rs"

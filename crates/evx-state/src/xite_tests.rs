@@ -121,6 +121,42 @@ fn identical_regrant_moves_no_generation() {
 }
 
 #[test]
+fn limits_only_update_preserves_revocation_and_replacement_authority() {
+    let f = fixture();
+    let original = grant("game-a");
+    f.state.set_xite_grant(&original).unwrap();
+    f.state.begin("game-a", "reserved", None, 3).unwrap();
+    let mut requested = original.limits.clone();
+    requested.storage_bytes /= 2;
+    f.state.revoke_xite("game-a").unwrap();
+    let changed = f.state.set_xite_limits("game-a", &requested).unwrap();
+    let (revoked, current) = f.state.xite_grant("game-a").unwrap().unwrap();
+    assert!(!revoked.enabled);
+    assert_eq!(revoked.limits, requested);
+    assert_eq!(changed, current);
+    assert_eq!(current.generation, 2);
+    assert_eq!(current.limits_generation, 2);
+    assert_eq!(f.state.snapshot("game-a").unwrap().grant.unwrap().used, 3);
+
+    let mut replacement = original;
+    replacement.capabilities.clear();
+    replacement.allow_background = false;
+    replacement.publisher = "new-publisher".to_owned();
+    f.state.set_xite_grant(&replacement).unwrap();
+    let generation = f.state.xite_grant("game-a").unwrap().unwrap().1.generation;
+    f.state.set_xite_limits("game-a", &requested).unwrap();
+    let (current, generations) = f.state.xite_grant("game-a").unwrap().unwrap();
+    replacement.limits = requested.clone();
+    assert_eq!(current, replacement);
+    assert_eq!(generations.generation, generation);
+    assert_eq!(
+        f.state.set_xite_limits("game-a", &requested).unwrap(),
+        generations
+    );
+    assert!(f.state.set_xite_limits("unknown", &requested).is_err());
+}
+
+#[test]
 fn enabled_change_bumps_authority_only() {
     let f = fixture();
     f.state.set_xite_grant(&grant("game-a")).unwrap();

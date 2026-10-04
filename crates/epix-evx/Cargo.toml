@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "The node's EVX service, management API and durable scheduler: inspect, consent to, run once, schedule and revoke a xite's declared programs (docs/evx-milestone-2.md section 4, docs/evx-milestone-3.md section 2)."
 
+[features]
+apple-xpc = ["evx-supervisor/apple-xpc", "evx-host/apple-xpc"]
+apple-xpc-development = ["apple-xpc"]
+
 [dependencies]
 epix-plugin = { path = "../epix-plugin" }
 epix-ui = { path = "../epix-ui" }

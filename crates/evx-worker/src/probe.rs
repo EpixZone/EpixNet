@@ -69,6 +69,26 @@ pub fn probe() -> Result<(), String> {
                 .map(|_| "written".into())
                 .map_err(|e| e.to_string())
         });
+        attempt("workspace_truncate_readonly", &mut results, || {
+            use std::os::unix::ffi::OsStrExt;
+            let path = std::ffi::CString::new(ws.join("native-fixture.txt").as_os_str().as_bytes())
+                .map_err(|e| e.to_string())?;
+            // Exercise O_RDONLY|O_TRUNC directly: a high-level file API may
+            // reject this before the OS, hiding a filesystem-policy gap.
+            let fd = unsafe {
+                libc::open(
+                    path.as_ptr(),
+                    libc::O_RDONLY | libc::O_TRUNC | libc::O_CLOEXEC,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            unsafe {
+                libc::close(fd);
+            }
+            Ok("truncated".into())
+        });
         attempt("symlink_read", &mut results, || {
             std::fs::read_to_string(ws.join("outside-link"))
                 .map(|s| format!("{} bytes", s.len()))
@@ -81,7 +101,14 @@ pub fn probe() -> Result<(), String> {
             .map_err(|e| e.to_string())
     });
     attempt("home_listing", &mut results, || {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/Users".into());
+        let home = std::env::var("HOME").unwrap_or_else(|_| {
+            if cfg!(target_os = "linux") {
+                "/home"
+            } else {
+                "/Users"
+            }
+            .into()
+        });
         std::fs::read_dir(home)
             .map(|d| format!("{} entries", d.count()))
             .map_err(|e| e.to_string())
@@ -115,6 +142,19 @@ pub fn probe() -> Result<(), String> {
         let mut status = 0;
         unsafe { libc::waitpid(pid, &mut status, 0) };
         Ok("forked".into())
+    });
+    #[cfg(target_os = "linux")]
+    attempt("raise_cpu_limit", &mut results, || {
+        let mut limit: libc::rlimit = unsafe { std::mem::zeroed() };
+        if unsafe { libc::getrlimit(libc::RLIMIT_CPU, &mut limit) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        limit.rlim_max += 1;
+        limit.rlim_cur = limit.rlim_max;
+        if unsafe { libc::setrlimit(libc::RLIMIT_CPU, &limit) } != 0 {
+            return Err(std::io::Error::last_os_error().to_string());
+        }
+        Ok("raised hard CPU limit".into())
     });
     attempt("wasmtime_engine", &mut results, || {
         evx_runtime::new_engine()

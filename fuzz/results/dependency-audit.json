@@ -1,0 +1,312 @@
+{
+  "database": {
+    "advisory-count": 1290,
+    "last-commit": "ef6173cbc5c50ec8166f9a5b28f07834144373ee",
+    "last-updated": "2026-10-03T10:14:03+02:00"
+  },
+  "tool": "cargo-audit 0.22.2",
+  "scope": "epix-evx, evx-worker, evx-host, evx-supervisor, evx-runtime, evx-activation, evx-declaration, evx-state dependency closure on macOS arm64",
+  "yanked_check": "unavailable: registry timeout; advisory scan rerun with --no-yanked",
+  "initial_findings": [
+    {
+      "category": "vulnerability",
+      "package": "wasmtime",
+      "version": "48.0.3",
+      "advisory": {
+        "id": "RUSTSEC-2026-0327",
+        "package": "wasmtime",
+        "title": "Wasmtime component async-lifted callback result count is unvalidated, causing a native stack buffer overflow",
+        "description": "This is an entry in the RustSec database for the Wasmtime security advisory\nlocated at\nhttps://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-32h6-97mm-8q3c\nFor more information see the GitHub-hosted security advisory.",
+        "date": "2026-10-02",
+        "aliases": [
+          "GHSA-32h6-97mm-8q3c"
+        ],
+        "related": [],
+        "collection": "crates",
+        "categories": [],
+        "keywords": [],
+        "cvss": "CVSS:4.0/AV:N/AC:L/AT:N/PR:N/UI:N/VC:L/VI:H/VA:H/SC:L/SI:H/SA:H",
+        "informational": null,
+        "references": [],
+        "source": null,
+        "url": "https://github.com/bytecodealliance/wasmtime/pull/14471",
+        "withdrawn": null,
+        "license": "CC0-1.0",
+        "expect-deleted": false
+      },
+      "versions": {
+        "patched": [
+          ">=48.0.4, <49.0.0",
+          ">=49.0.2"
+        ],
+        "unaffected": [
+          "<39.0.0"
+        ]
+      }
+    },
+    {
+      "category": "vulnerability",
+      "package": "wasmtime",
+      "version": "48.0.3",
+      "advisory": {
+        "id": "RUSTSEC-2026-0326",
+        "package": "wasmtime",
+        "title": "Rooting for GC values live across `try_call` may be missing, causing GC heap corruption",
+        "description": "This is an entry in the RustSec database for the Wasmtime security advisory\nlocated at\nhttps://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-hw8m-q44c-ggrf\nFor more information see the GitHub-hosted security advisory.",
+        "date": "2026-10-02",
+        "aliases": [
+          "GHSA-hw8m-q44c-ggrf"
+        ],
+        "related": [],
+        "collection": "crates",
+        "categories": [],
+        "keywords": [],
+        "cvss": "CVSS:3.1/AV:N/AC:L/PR:L/UI:R/S:U/C:N/I:N/A:H",
+        "informational": null,
+        "references": [],
+        "source": null,
+        "url": "https://github.com/bytecodealliance/wasmtime/pull/14478",
+        "withdrawn": null,
+        "license": "CC0-1.0",
+        "expect-deleted": false
+      },
+      "versions": {
+        "patched": [
+          ">=48.0.4, <49.0.0",
+          ">=49.0.2"
+        ],
+        "unaffected": [
+          "<47.0.0"
+        ]
+      }
+    },
+    {
+      "category": "vulnerability",
+      "package": "wasmtime",
+      "version": "48.0.3",
+      "advisory": {
+        "id": "RUSTSEC-2026-0325",
+        "package": "wasmtime",
+        "title": "Mis-typed WebAssembly tag imports can lead to GC heap corruption",
+        "description": "This is an entry in the RustSec database for the Wasmtime security advisory\nlocated at\nhttps://github.com/bytecodealliance/wasmtime/security/advisories/GHSA-cfhf-m2cr-62wj\nFor more information see the GitHub-hosted security advisory.",
+        "date": "2026-10-02",
+        "aliases": [
+          "GHSA-cfhf-m2cr-62wj"
+        ],
+        "related": [],
+        "collection": "crates",
+        "categories": [],
+        "keywords": [],
+        "cvss": "CVSS:4.0/AV:N/AC:L/AT:P/PR:L/UI:P/VC:N/VI:N/VA:H/SC:N/SI:N/SA:N",
+        "informational": null,
+        "references": [],
+        "source": null,
+        "url": "https://github.com/bytecodealliance/wasmtime/pull/14471",
+        "withdrawn": null,
+        "license": "CC0-1.0",
+        "expect-deleted": false
+      },
+      "versions": {
+        "patched": [
+          ">=48.0.4, <49.0.0",
+          ">=49.0.2"
+        ],
+        "unaffected": [
+          "<47.0.0"
+        ]
+      }
+    },
+    {
+      "category": "unmaintained",
+      "package": "paste",
+      "version": "1.0.15",
+      "advisory": {
+        "id": "RUSTSEC-2024-0436",
+        "package": "paste",
+        "title": "paste - no longer maintained",
+        "description": "The creator of the crate `paste` has stated in the [`README.md`](https://github.com/dtolnay/paste/blob/master/README.md) \nthat this project is not longer maintained as well as archived the repository\n\n## Possible Alternative(s)\n\n- [`pastey`]: a fork of paste and is aimed to be a drop-in replacement with additional features for paste crate\n- [`with_builtin_macros`]: crate providing a [superset of `paste`'s functionality including general `macro_rules!` eager expansions](https://docs.rs/with_builtin_macros/0.1.0/with_builtin_macros/macro.with_eager_expansions.html)  and `concat!`/`concat_idents!` macros\n\n[`pastey`]: https://crates.io/crates/pastey\n[`with_builtin_macros`]: https://crates.io/crates/with_builtin_macros",
+        "date": "2024-10-07",
+        "aliases": [],
+        "related": [],
+        "collection": "crates",
+        "categories": [],
+        "keywords": [],
+        "cvss": null,
+        "informational": "unmaintained",
+        "references": [],
+        "source": null,
+        "url": "https://github.com/dtolnay/paste",
+        "withdrawn": null,
+        "license": "CC0-1.0",
+        "expect-deleted": false
+      },
+      "versions": {
+        "patched": [],
+        "unaffected": []
+      }
+    },
+    {
+      "category": "unmaintained",
+      "package": "proc-macro-error",
+      "version": "0.4.12",
+      "advisory": {
+        "id": "RUSTSEC-2024-0370",
+        "package": "proc-macro-error",
+        "title": "proc-macro-error is unmaintained",
+        "description": "proc-macro-error's maintainer seems to be unreachable, with no commits for 2 years, no releases pushed for 4 years, and no activity on the GitLab repo or response to email.\n\nproc-macro-error also depends on `syn 1.x`, which may be bringing duplicate dependencies into dependant build trees.\n\n## Possible Alternative(s)\n\n- [manyhow](https://crates.io/crates/manyhow)\n- [proc-macro2-diagnostics](https://github.com/SergioBenitez/proc-macro2-diagnostics)",
+        "date": "2024-09-01",
+        "aliases": [],
+        "related": [],
+        "collection": "crates",
+        "categories": [],
+        "keywords": [],
+        "cvss": null,
+        "informational": "unmaintained",
+        "references": [],
+        "source": null,
+        "url": "https://gitlab.com/CreepySkeleton/proc-macro-error/-/issues/20",
+        "withdrawn": null,
+        "license": "CC0-1.0",
+        "expect-deleted": false
+      },
+      "versions": {
+        "patched": [],
+        "unaffected": []
+      }
+    }
+  ],
+  "final_findings": [
+    {
+      "category": "unmaintained",
+      "package": "paste",
+      "version": "1.0.15",
+      "advisory": {
+        "id": "RUSTSEC-2024-0436",
+        "package": "paste",
+        "title": "paste - no longer maintained",
+        "description": "The creator of the crate `paste` has stated in the [`README.md`](https://github.com/dtolnay/paste/blob/master/README.md) \nthat this project is not longer maintained as well as archived the repository\n\n## Possible Alternative(s)\n\n- [`pastey`]: a fork of paste and is aimed to be a drop-in replacement with additional features for paste crate\n- [`with_builtin_macros`]: crate providing a [superset of `paste`'s functionality including general `macro_rules!` eager expansions](https://docs.rs/with_builtin_macros/0.1.0/with_builtin_macros/macro.with_eager_expansions.html)  and `concat!`/`concat_idents!` macros\n\n[`pastey`]: https://crates.io/crates/pastey\n[`with_builtin_macros`]: https://crates.io/crates/with_builtin_macros",
+        "date": "2024-10-07",
+        "aliases": [],
+        "related": [],
+        "collection": "crates",
+        "categories": [],
+        "keywords": [],
+        "cvss": null,
+        "informational": "unmaintained",
+        "references": [],
+        "source": null,
+        "url": "https://github.com/dtolnay/paste",
+        "withdrawn": null,
+        "license": "CC0-1.0",
+        "expect-deleted": false
+      },
+      "versions": {
+        "patched": [],
+        "unaffected": []
+      }
+    },
+    {
+      "category": "unmaintained",
+      "package": "proc-macro-error",
+      "version": "0.4.12",
+      "advisory": {
+        "id": "RUSTSEC-2024-0370",
+        "package": "proc-macro-error",
+        "title": "proc-macro-error is unmaintained",
+        "description": "proc-macro-error's maintainer seems to be unreachable, with no commits for 2 years, no releases pushed for 4 years, and no activity on the GitLab repo or response to email.\n\nproc-macro-error also depends on `syn 1.x`, which may be bringing duplicate dependencies into dependant build trees.\n\n## Possible Alternative(s)\n\n- [manyhow](https://crates.io/crates/manyhow)\n- [proc-macro2-diagnostics](https://github.com/SergioBenitez/proc-macro2-diagnostics)",
+        "date": "2024-09-01",
+        "aliases": [],
+        "related": [],
+        "collection": "crates",
+        "categories": [],
+        "keywords": [],
+        "cvss": null,
+        "informational": "unmaintained",
+        "references": [],
+        "source": null,
+        "url": "https://gitlab.com/CreepySkeleton/proc-macro-error/-/issues/20",
+        "withdrawn": null,
+        "license": "CC0-1.0",
+        "expect-deleted": false
+      },
+      "versions": {
+        "patched": [],
+        "unaffected": []
+      }
+    }
+  ],
+  "final_wasmtime_version": "48.0.5",
+  "remaining_workspace_vulnerabilities_outside_scope": 1,
+  "latest_check": {
+    "date": "2026-10-04",
+    "platform": "aarch64-apple-darwin",
+    "lock_sha256": "60272ae2134cca75dd0fb3326b14e6973086cdc9f2f54804a2a4f58736d85b89",
+    "database": {
+      "advisory-count": 1290,
+      "last-commit": "ef6173cbc5c50ec8166f9a5b28f07834144373ee",
+      "last-updated": "2026-10-03T10:14:03+02:00"
+    },
+    "dependency_packages": 463,
+    "findings": [
+      {
+        "category": "vulnerability",
+        "package": "rsa",
+        "version": "0.9.10",
+        "advisory": "RUSTSEC-2023-0071",
+        "title": "Marvin Attack: potential key recovery through timing sidechannels",
+        "in_evx_closure": false
+      },
+      {
+        "category": "unmaintained",
+        "package": "bincode",
+        "version": "2.0.1",
+        "advisory": "RUSTSEC-2025-0141",
+        "title": "Bincode is unmaintained",
+        "in_evx_closure": false
+      },
+      {
+        "category": "unmaintained",
+        "package": "derivative",
+        "version": "2.2.0",
+        "advisory": "RUSTSEC-2024-0388",
+        "title": "`derivative` is unmaintained; consider using an alternative",
+        "in_evx_closure": false
+      },
+      {
+        "category": "unmaintained",
+        "package": "paste",
+        "version": "1.0.15",
+        "advisory": "RUSTSEC-2024-0436",
+        "title": "paste - no longer maintained",
+        "in_evx_closure": true
+      },
+      {
+        "category": "unmaintained",
+        "package": "proc-macro-error",
+        "version": "0.4.12",
+        "advisory": "RUSTSEC-2024-0370",
+        "title": "proc-macro-error is unmaintained",
+        "in_evx_closure": true
+      },
+      {
+        "category": "unmaintained",
+        "package": "proc-macro-error",
+        "version": "1.0.4",
+        "advisory": "RUSTSEC-2024-0370",
+        "title": "proc-macro-error is unmaintained",
+        "in_evx_closure": false
+      },
+      {
+        "category": "unsound",
+        "package": "glib",
+        "version": "0.18.5",
+        "advisory": "RUSTSEC-2024-0429",
+        "title": "Unsoundness in `Iterator` and `DoubleEndedIterator` impls for `glib::VariantStrIter`",
+        "in_evx_closure": false
+      }
+    ],
+    "yanked_check": "not performed (--no-yanked)",
+    "scope": "Same eight EVX package roots, resolved for macOS arm64; includes their resolved dependency closure.",
+    "vulnerabilities_in_evx_closure": 0
+  }
+}

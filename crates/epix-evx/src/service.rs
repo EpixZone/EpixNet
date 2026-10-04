@@ -50,6 +50,7 @@
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -57,7 +58,7 @@ use epix_ui::AppState;
 use evx_activation::{ActivationLoader, AuthenticationError, BoundProgram};
 use evx_api::{Capability, Grant, Limits, Status};
 use evx_declaration::{Declaration, DeclarationError};
-use evx_host::run_content_activation;
+use evx_host::run_content_activation_with_admission;
 use evx_state::{
     DurableState, Generations, Invocation, JobRow, JobSpec, RunRecord, Slot, XiteGrant,
     ALLOW_ONCE_TTL, MAX_MESSAGE,
@@ -72,13 +73,16 @@ use crate::limits::{clamp, combine, BACKGROUND_RUNS_PER_DAY, BACKGROUND_WORKERS,
 use crate::scheduler::{backoff, Scheduler};
 use crate::PLUGIN_NAME;
 
+#[path = "service_recovery.rs"]
+mod recovery;
+
 /// The one runtime profile this milestone executes; the grant's profile
 /// set is exactly this, so an activation declaring another profile is
 /// refused by the loader as outside the grant.
 pub const RUNTIME_PROFILE: &str = evx_declaration::RUNTIME_PROFILE;
 
 /// The error every effectful path reports on a host that cannot execute:
-/// a non-macOS build (no confinement yet) or a node without the worker
+/// a host without the required confinement or a node without the worker
 /// binary. Inspect, grant and revoke still work there.
 pub const UNSUPPORTED_HOST: &str = "unsupported host";
 
@@ -632,6 +636,20 @@ struct Admitted {
     limits: Limits,
 }
 
+struct ExecutionContext<'a> {
+    occurrence: Option<&'a Occurrence>,
+    plugin_interrupted: Arc<AtomicBool>,
+    plugin_changes: tokio::sync::watch::Receiver<()>,
+    lease: Arc<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+struct BlockingPolicy<'a> {
+    admitted: Admitted,
+    invocation: Option<&'a Invocation>,
+    plugin_changes: &'a tokio::sync::watch::Receiver<()>,
+    plugin_interrupted: &'a AtomicBool,
+}
+
 /// What the run half of [`EvxService::execute`] produced: the payload the
 /// command returns and the parts the occurrence commit needs.
 struct Executed {
@@ -640,6 +658,8 @@ struct Executed {
     value: Option<i32>,
     error: Option<String>,
     elapsed_ms: u64,
+    effect_outcome_unknown: bool,
+    host_cancellation: Option<evx_api::HostCancellation>,
 }
 
 /// The node's EVX service. One per node, created by the plugin at start and
@@ -651,12 +671,18 @@ pub struct EvxService {
     _scratch: Option<tempfile::TempDir>,
     /// The worker binary, when one was found at start.
     worker: Option<PathBuf>,
+    direct_lifecycle: Option<Arc<evx_supervisor::direct_lifecycle::DirectLifecycle>>,
+    direct_unavailable: Option<String>,
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    apple: Option<Arc<crate::apple_backend::AppleBackend>>,
     /// Brokers of runs in flight, by xite, so a revocation reaches the
     /// supervisor's grant check and stops the run.
     pub(crate) running: Mutex<HashMap<String, Arc<Broker>>>,
-    /// One run at a time per xite: the loader's checkpoint is read, moved
-    /// and persisted around each run, and two runs interleaving on it could
-    /// persist the lower floor last.
+    /// Orders durable policy changes with broker registration and propagation.
+    /// Never held across an await or guest execution.
+    policy_lock: Mutex<()>,
+    /// One run at a time per xite. The cross-process workspace lease also
+    /// protects the final checkpoint comparison and admission write.
     run_locks: tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// How often each xite has been revoked since start. A run notes the
     /// count when its authority is checked and refuses to proceed if it
@@ -669,7 +695,22 @@ pub struct EvxService {
     /// The scheduler's wake handle and counters; the task itself is spawned
     /// by the plugin.
     pub(crate) scheduler: Scheduler,
+    #[cfg(test)]
+    before_limits_write: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    before_run_classification: Mutex<Option<BeforeRunClassification>>,
+    #[cfg(test)]
+    before_recovery: Mutex<Option<BeforeRecovery>>,
+    #[cfg(test)]
+    pub(crate) before_occurrence_finish: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    #[cfg(test)]
+    pub(crate) before_execution_wait: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
+
+#[cfg(test)]
+type BeforeRunClassification = Box<dyn FnOnce(&Broker, &evx_api::RunResult) + Send>;
+#[cfg(test)]
+type BeforeRecovery = Box<dyn FnOnce(&Broker) + Send>;
 
 impl EvxService {
     /// Open the service rooted at `root` (`<data_root>/private/evx`),
@@ -677,26 +718,50 @@ impl EvxService {
     /// worker binary to use, or `None` to resolve it with
     /// [`default_worker_binary`].
     pub fn open(root: PathBuf, worker: Option<PathBuf>) -> Result<Self, String> {
-        Self::build(root, worker, None)
+        Self::build(root, worker, None, None)
     }
 
     /// Open the service for `app`: under its data root when it has one, in
     /// a temporary directory that disappears with the service otherwise.
     pub fn for_node(app: &AppState, worker: Option<PathBuf>) -> Result<Self, String> {
         match app.data_root_path() {
-            Some(data_root) => Self::build(data_root.join("private").join("evx"), worker, None),
+            Some(data_root) => Self::build(data_root.join("private").join("evx"), worker, None, None),
             None => {
                 let scratch = tempfile::Builder::new()
                     .prefix("epix-evx-")
                     .tempdir()
                     .map_err(|error| format!("EVX scratch directory: {error}"))?;
                 let root = scratch.path().to_path_buf();
-                Self::build(root, worker, Some(scratch))
+                Self::build(root, worker, Some(scratch), None)
             }
         }
     }
 
-    fn build(root: PathBuf, worker: Option<PathBuf>, scratch: Option<tempfile::TempDir>) -> Result<Self, String> {
+    /// Explicit trusted development selection. Production plugin assembly
+    /// never selects this constructor. Existing direct state is not migrated.
+    #[cfg(all(target_os = "macos", feature = "apple-xpc", any(test, feature = "apple-xpc-development")))]
+    pub fn for_node_apple_development(app: &AppState, backend: Arc<crate::apple_backend::AppleBackend>) -> Result<Self, String> {
+        Self::for_node_apple(app, backend)
+    }
+
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    pub(crate) fn for_node_apple(app: &AppState, backend: Arc<crate::apple_backend::AppleBackend>) -> Result<Self, String> {
+        let root = if let Some(root) = backend.state_root() { root.to_path_buf() } else {
+        let data_root = app.data_root_path().ok_or("Apple development execution requires a persistent data root")?;
+        data_root.join("private").join("evx-apple-development") };
+        let mut service = Self::build(root, None, None, Some(backend.binding()))?;
+        service.apple = Some(backend);
+        Ok(service)
+    }
+
+    fn build(root: PathBuf, worker: Option<PathBuf>, scratch: Option<tempfile::TempDir>, apple_binding: Option<&str>) -> Result<Self, String> {
+        if apple_binding.is_none() && root.file_name().is_some_and(|name| name == "evx-apple-development") {
+            return Err("reserved Apple development state root cannot use direct execution".into());
+        }
+        let (direct_lifecycle, direct_unavailable) = if apple_binding.is_none() {
+            crate::backend_binding::direct_lifecycle(&root)
+        } else { (None, None) };
+        crate::backend_binding::bind(&root, apple_binding.unwrap_or(crate::backend_binding::DIRECT), apple_binding.is_none())?;
         for dir in [root.clone(), root.join("workspaces"), root.join("checkpoints")] {
             std::fs::create_dir_all(&dir).map_err(|error| format!("EVX directory {}: {error}", dir.display()))?;
         }
@@ -705,20 +770,35 @@ impl EvxService {
         // A pinned path that is not a regular file is no worker either, and
         // it never falls back to the default: the caller pinned it so that
         // nothing else would run.
-        let worker = match worker {
+        let worker = if apple_binding.is_some() { None } else { match worker {
             Some(path) => path.is_file().then_some(path),
             None => default_worker_binary(),
-        };
+        }};
         Ok(EvxService {
             state,
             root,
             _scratch: scratch,
             worker,
+            direct_lifecycle,
+            direct_unavailable,
+            #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+            apple: None,
             running: Mutex::new(HashMap::new()),
+            policy_lock: Mutex::new(()),
             run_locks: tokio::sync::Mutex::new(HashMap::new()),
             revocations: Mutex::new(HashMap::new()),
             asked: Mutex::new(HashMap::new()),
             scheduler: Scheduler::default(),
+            #[cfg(test)]
+            before_limits_write: Mutex::new(None),
+            #[cfg(test)]
+            before_run_classification: Mutex::new(None),
+            #[cfg(test)]
+            before_recovery: Mutex::new(None),
+            #[cfg(test)]
+            before_occurrence_finish: Mutex::new(None),
+            #[cfg(test)]
+            before_execution_wait: Mutex::new(None),
         })
     }
 
@@ -758,23 +838,68 @@ impl EvxService {
         self.scheduler.ticks()
     }
 
-    /// Stop the scheduler task at its next wake. The node has no graceful
-    /// shutdown hook (the design is crash-safe instead); this exists so a
-    /// test can reopen the same state under a second service without two
-    /// schedulers ticking on one database.
+    /// Stop admission and the scheduler, and revoke every registered worker.
+    /// Completion remains asynchronous so supervisors can reap children and
+    /// finish their durable records. The node has no graceful shutdown hook;
+    /// callers reopening this root must first wait for its active work to end.
     pub fn shutdown(&self) {
+        // Order shutdown with broker registration. Detached completion tasks
+        // retain bookkeeping ownership, never permission to outlive this stop.
+        let _policy = self.policy_lock.lock().unwrap_or_else(|error| error.into_inner());
         self.scheduler.stop();
+        let running = self.running.lock().unwrap_or_else(|error| error.into_inner());
+        for broker in running.values() {
+            broker.revoke();
+        }
     }
 
     /// The worker binary when this host can execute, or why it cannot.
-    /// Execution is macOS-only in this milestone because the worker's
-    /// confinement is; the check is a runtime `cfg!` so the rest of the
-    /// service compiles identically everywhere.
+    /// The capability probe is read-only. Every child must still install its
+    /// sandbox before it reads input; this is never an unconfined fallback.
     pub fn execution(&self) -> Result<&Path, String> {
-        if !cfg!(target_os = "macos") {
-            return Err(UNSUPPORTED_HOST.into());
-        }
+        self.direct_context()?.validate().map_err(|error| error.to_string())?;
+        evx_supervisor::confinement_available().map_err(|_| UNSUPPORTED_HOST.to_string())?;
         self.worker.as_deref().ok_or_else(|| UNSUPPORTED_HOST.to_string())
+    }
+
+    fn direct_context(&self) -> Result<&Arc<evx_supervisor::direct_lifecycle::DirectLifecycle>, String> {
+        self.direct_lifecycle.as_ref().ok_or_else(|| self.direct_unavailable.clone()
+            .unwrap_or_else(|| "direct execution is not configured".into()))
+    }
+
+    /// Whether the explicitly selected backend can accept execution. This
+    /// read-only check never allocates a slot or opens a workspace session.
+    pub fn execution_ready(&self) -> Result<(), String> {
+        #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+        if self.apple.is_some() {
+            return evx_supervisor::process::child_admission_status().map_err(|error| error.to_string());
+        }
+        self.execution().map(|_| ())
+    }
+
+    fn prepare_backend(&self, xite: &str, grant: Grant, limits: Limits, allocate: bool) -> Result<Option<(Arc<Broker>, Config)>, String> {
+        #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+        if let Some(apple) = &self.apple { return apple.prepare(xite, grant, limits, allocate); }
+        let direct_scope = self.direct_context()?.scope(xite).map_err(|error| error.to_string())?;
+        let workspace = self.workspace_dir(xite);
+        if !allocate {
+            match std::fs::symlink_metadata(&workspace) {
+                Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {},
+                Ok(_) => return Err("workspace recovery requires a real directory".into()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => return Err(format!("workspace recovery: {error}")),
+            }
+        } else {
+            std::fs::create_dir_all(&workspace).map_err(|error| format!("workspace: {error}"))?;
+        }
+        // Readiness is checked before dispatch. An empty pinned executable
+        // still permits metadata-only recovery and can never select a file.
+        let worker = self.worker.clone().unwrap_or_default();
+        let broker = Arc::new(Broker::new(&workspace, grant, limits).map_err(|error| format!("workspace: {error}"))?);
+        let mut config = Config::new(worker);
+        config.direct_lifecycle = Some(direct_scope);
+        broker.check_backend(&config).map_err(|error| error.to_string())?;
+        Ok(Some((broker, config)))
     }
 
     /// The stored grant as the `/list` panel reads it (`enabled`,
@@ -953,7 +1078,7 @@ impl EvxService {
     /// The inspect payload for `xite`.
     pub async fn inspect_json(&self, app: &AppState, xite: &str) -> Result<Value, String> {
         let inspection = self.inspect(app, xite).await?;
-        Ok(inspection.to_json(now_unix()?, self.execution().map(|_| ())))
+        Ok(inspection.to_json(now_unix()?, self.execution_ready()))
     }
 
     /// Record that `xite`'s page asked for consent and return what the
@@ -1002,7 +1127,7 @@ impl EvxService {
             .map_err(|error| format!("EVX state: {error}"))?
             >= evx_state::MAX_ROWS;
         let plugin_enabled = app.plugin_enabled(PLUGIN_NAME).await;
-        let execution = self.execution().map(|_| ());
+        let execution = self.execution_ready();
         let grant_wait = match &stored {
             None => Some(WaitReason::NoGrant),
             Some((grant, _)) if !grant.enabled => Some(WaitReason::Revoked),
@@ -1098,7 +1223,7 @@ impl EvxService {
                 "enabled": plugin_enabled,
                 "busy_workers": busy_workers,
                 "next_wake_unix": self.scheduler.next_wake(),
-                "host": if execution.is_ok() { "macos" } else { "unsupported" },
+                "host": if execution.is_ok() { std::env::consts::OS } else { "unsupported" },
             },
         }))
     }
@@ -1159,10 +1284,13 @@ impl EvxService {
                     expires_unix: None,
                     label,
                 };
-                let generations = self
-                    .state
-                    .set_xite_grant(&grant)
-                    .map_err(|error| format!("EVX state: {error}"))?;
+                let generations = {
+                    let _policy = self.policy_lock.lock().map_err(|_| "EVX policy unavailable")?;
+                    let generations = self.state.set_xite_grant(&grant)
+                        .map_err(|error| format!("EVX state: {error}"))?;
+                    self.refresh_running_policy(xite)?;
+                    generations
+                };
                 // Register the jobs under the grant just stored, then wake
                 // the scheduler so the first occurrence is not left to the
                 // next timer.
@@ -1242,6 +1370,8 @@ impl EvxService {
     /// the same re-check.
     pub async fn revoke(&self, app: &AppState, xite: &str) -> Result<Value, String> {
         xite_id(xite)?;
+        let (had_grant, stopped) = {
+        let _policy = self.policy_lock.lock().map_err(|_| "EVX policy unavailable")?;
         let had_grant = self
             .state
             .xite_grant(xite)
@@ -1262,6 +1392,8 @@ impl EvxService {
         if let Some(broker) = running {
             broker.revoke();
         }
+        (had_grant, stopped)
+        };
         self.wake();
         app.log("INFO", format!("EVX: revoked {xite} (run in flight stopped: {stopped})")).await;
         Ok(json!({ "revoked": true, "xite": xite, "had_grant": had_grant, "stopped_run": stopped }))
@@ -1273,26 +1405,18 @@ impl EvxService {
     /// new values at its next broker check.
     pub async fn set_limits(&self, app: &AppState, xite: &str, limits: &Limits) -> Result<Value, String> {
         xite_id(xite)?;
-        let (mut grant, _) = self
-            .state
-            .xite_grant(xite)
-            .map_err(|error| format!("EVX state: {error}"))?
-            .ok_or_else(|| format!("no EVX grant for {xite}"))?;
-        grant.limits = clamp(limits)?;
-        let generations = self
-            .state
-            .set_xite_grant(&grant)
-            .map_err(|error| format!("EVX state: {error}"))?;
-        let running = self
-            .running
-            .lock()
-            .ok()
-            .and_then(|running| running.get(xite).cloned());
-        if let Some(broker) = running {
-            // A broker refuses limits it cannot enforce; the stored grant
-            // already holds them, so the next run gets them regardless.
-            let _ = broker.set_limits(grant.limits.clone());
+        let limits = clamp(limits)?;
+        #[cfg(test)]
+        if let Some(hook) = self.before_limits_write.lock().unwrap().take() {
+            hook();
         }
+        let generations = {
+            let _policy = self.policy_lock.lock().map_err(|_| "EVX policy unavailable")?;
+            let generations = self.state.set_xite_limits(xite, &limits)
+                .map_err(|error| format!("EVX state: {error}"))?;
+            self.refresh_running_policy(xite)?;
+            generations
+        };
         self.wake();
         app.log(
             "INFO",
@@ -1301,7 +1425,7 @@ impl EvxService {
         .await;
         Ok(json!({
             "xite": xite,
-            "limits": limits_json(Some(&grant.limits)),
+            "limits": limits_json(Some(&limits)),
             "generations": generations_json(&generations),
         }))
     }
@@ -1320,18 +1444,14 @@ impl EvxService {
         self.job_status(app, xite, job).await
     }
 
-    /// Resume a paused job (`evxJobResume`), whatever paused it: a person
-    /// lifting `reconcile_required` is saying the reconciliation happened,
-    /// and lifting a registration pause is harmless, since the next
-    /// inspection puts it back while its cause stands. The job's
+    /// Reconcile uncertain workspace writes before resuming a paused job.
+    /// A failed recovery leaves the pause unchanged. The job's
     /// `next_due_unix` is untouched, so it resumes on the slot it is due in
     /// now, never on one it missed.
-    pub async fn job_resume(&self, app: &AppState, xite: &str, job: &str) -> Result<Value, String> {
+    pub async fn job_resume(self: &Arc<Self>, app: &AppState, xite: &str, job: &str) -> Result<Value, String> {
         xite_id(xite)?;
         job_id(job)?;
-        self.state
-            .set_job_paused(xite, job, None)
-            .map_err(|error| format!("EVX state: {error}"))?;
+        self.recover_workspace_inner(app, xite, Some(job)).await?;
         self.wake();
         app.log("INFO", format!("EVX: resumed job {job} of {xite}")).await;
         self.job_status(app, xite, job).await
@@ -1353,7 +1473,7 @@ impl EvxService {
     /// slot.
     pub async fn run_once(
         self: &Arc<Self>,
-        app: &AppState,
+        app: &Arc<AppState>,
         xite: &str,
         program: &str,
         token: Option<&str>,
@@ -1370,7 +1490,7 @@ impl EvxService {
     /// was inspected since; a paused or disabled job is refused by the
     /// claim rather than run behind the pause. The daily budget is not
     /// spent: it bounds what the node starts by itself.
-    pub async fn run_job(self: &Arc<Self>, app: &AppState, xite: &str, job: &str) -> Result<Value, String> {
+    pub async fn run_job(self: &Arc<Self>, app: &Arc<AppState>, xite: &str, job: &str) -> Result<Value, String> {
         xite_id(xite)?;
         job_id(job)?;
         // Registration first, so a job of a freshly re-signed declaration
@@ -1433,14 +1553,15 @@ impl EvxService {
     }
 
     /// The one run path. Verifies, captures, compiles, admits and runs
-    /// through `evx_host::run_content_activation`, persists the checkpoint
-    /// and a run record, and returns the `RunResult` with the activation
+    /// through `evx_host::run_content_activation_with_admission`, persists
+    /// the checkpoint before execution and a run record afterward, and
+    /// returns the `RunResult` with the activation
     /// report. On a host that cannot execute it returns
     /// [`UNSUPPORTED_HOST`] before reading anything, so neither the grant
     /// nor a token is touched. A job occurrence is finished in the durable
     /// state on every exit, with the result when the run happened and with
-    /// the refusal when it did not, so the reservation the caller made is
-    /// never left open and the schedule always moves on.
+    /// the refusal when it did not. Persistence failures leave a recoverable
+    /// reservation; admitted work is never assumed effect-free on recovery.
     ///
     /// The order inside matters. The xite's run lock is taken first, so a
     /// run queued behind another sees the grant as it is when its turn
@@ -1453,25 +1574,72 @@ impl EvxService {
     /// it (see [`EvxService::authority_stands`]).
     pub(crate) async fn execute(
         self: &Arc<Self>,
-        app: &AppState,
+        app: &Arc<AppState>,
         xite: &str,
         program: &str,
         run: Run,
     ) -> Result<Value, String> {
+        // Request cancellation cannot cancel a blocking supervisor. Keep its
+        // completion, history and occurrence ownership in the same owned task.
+        // Explicit revocation, plugin disable and shutdown still reach it.
+        let service = Arc::clone(self);
+        let app = Arc::clone(app);
+        let xite = xite.to_string();
+        let program = program.to_string();
+        // Capture before task dispatch and before the xite lease queue. A
+        // disable/re-enable invalidates already queued requests as well.
+        let plugin_changes = app.subscribe_plugin_changes();
+        tokio::spawn(async move { service.execute_owned(&app, &xite, &program, run, plugin_changes).await })
+            .await
+            .map_err(|error| format!("EVX completion task failed: {error}"))?
+    }
+
+    async fn execute_owned(
+        self: &Arc<Self>,
+        app: &AppState,
+        xite: &str,
+        program: &str,
+        run: Run,
+        plugin_changes: tokio::sync::watch::Receiver<()>,
+    ) -> Result<Value, String> {
+        xite_id(xite)?;
+        let lock = {
+            let mut locks = self.run_locks.lock().await;
+            locks.entry(xite.to_string()).or_default().clone()
+        };
+        // The completion task retains this lease through history and durable
+        // occurrence completion, including errors after guest admission. Its
+        // blocking worker holds another reference until native cleanup ends.
+        #[cfg(test)]
+        if let Some(hook) = self.before_execution_wait.lock().unwrap().take() {
+            hook();
+        }
+        let lease = Arc::new(lock.lock_owned().await);
+        // Set only by host policy checks that actually interrupt this run,
+        // not by a worker result or an unrelated plugin notification.
+        let plugin_interrupted = Arc::new(AtomicBool::new(false));
         match run {
             Run::Once { token } => {
                 let executed = self
-                    .execute_inner(app, xite, program, Trigger::Once, token.as_deref(), None)
+                    .execute_inner(app, xite, program, Trigger::Once, token.as_deref(), ExecutionContext {
+                        occurrence: None, plugin_interrupted: Arc::clone(&plugin_interrupted), plugin_changes, lease: Arc::clone(&lease),
+                    })
                     .await?;
                 Ok(executed.payload)
             }
             Run::Job { occurrence, trigger } => {
                 let executed = self
-                    .execute_inner(app, xite, program, trigger, None, Some(&occurrence))
+                    .execute_inner(app, xite, program, trigger, None, ExecutionContext {
+                        occurrence: Some(&occurrence), plugin_interrupted: Arc::clone(&plugin_interrupted), plugin_changes, lease: Arc::clone(&lease),
+                    })
                     .await;
+                #[cfg(test)]
+                if let Some(hook) = self.before_occurrence_finish.lock().unwrap().take() {
+                    hook();
+                }
                 let finished = now_unix();
                 match finished {
-                    Ok(now) => self.finish_job_run(app, &occurrence, &executed, now).await,
+                    Ok(now) => self.finish_job_run(app, &occurrence, &executed, now, plugin_interrupted.load(Ordering::Acquire)).await,
                     Err(ref error) => {
                         app.log("ERROR", format!("EVX: occurrence {} of {xite} not finished: {error}", occurrence.invocation.occurrence)).await;
                     }
@@ -1490,17 +1658,21 @@ impl EvxService {
         program: &str,
         trigger: Trigger,
         token: Option<&str>,
-        occurrence: Option<&Occurrence>,
+        context: ExecutionContext<'_>,
     ) -> Result<Executed, String> {
-        let worker = self.execution()?.to_path_buf();
+        let ExecutionContext { occurrence, plugin_interrupted, plugin_changes, lease } = context;
+        self.execution_ready()?;
         xite_id(xite)?;
         evx_api::validate_identifier(program).map_err(|denied| format!("invalid program: {denied}"))?;
 
-        let lock = {
-            let mut locks = self.run_locks.lock().await;
-            locks.entry(xite.to_string()).or_default().clone()
-        };
-        let _running = lock.lock().await;
+        if self.scheduler.stopped() {
+            plugin_interrupted.store(true, Ordering::Release);
+            return Err("EVX service is stopped".into());
+        }
+        if !app.plugin_enabled(PLUGIN_NAME).await {
+            plugin_interrupted.store(true, Ordering::Release);
+            return Err("EVX plugin is disabled".into());
+        }
 
         let inspection = self.inspect(app, xite).await?;
         if inspection.integrity != Integrity::Verified {
@@ -1617,11 +1789,15 @@ impl EvxService {
         let content = inspection.content.clone();
         let digest = inspection.digest.clone();
         let profiles: BTreeSet<String> = [RUNTIME_PROFILE.to_string()].into_iter().collect();
+        let invocation = occurrence.map(|occurrence| occurrence.invocation.clone());
         let started = now;
         let started_instant = std::time::Instant::now();
         let run = tokio::task::spawn_blocking(move || {
+            let _lease = lease;
             let admitted = Admitted { authority, generation, revocations, capabilities, profiles, limits };
-            service.run_blocking(&xite_owned, &worker, content, bound, files, admitted)
+            service.run_blocking(&xite_owned, content, bound, files, BlockingPolicy {
+                admitted, invocation: invocation.as_ref(), plugin_changes: &plugin_changes, plugin_interrupted: &plugin_interrupted,
+            })
         })
         .await
         .map_err(|error| format!("EVX run task failed: {error}"))?;
@@ -1679,9 +1855,7 @@ impl EvxService {
             ),
         )
         .await;
-        // A checkpoint that could not be persisted is reported after the
-        // run record so the operator sees both; the next run re-admits the
-        // same version from the file that is there.
+        // Persistence failures deny admission before the guest starts.
         let checkpoint_error = checkpoint_result.err();
         let mut payload = result_json;
         if let Some(object) = payload.as_object_mut() {
@@ -1698,6 +1872,8 @@ impl EvxService {
             value: outcome.result.value,
             error: outcome.result.error,
             elapsed_ms,
+            effect_outcome_unknown: outcome.result.effect_outcome_unknown,
+            host_cancellation: outcome.result.host_cancellation,
         })
     }
 
@@ -1706,10 +1882,12 @@ impl EvxService {
     /// response is a float-free summary (status, value, error, elapsed
     /// milliseconds, occurrence) rather than the raw `RunResult`, whose
     /// float fields canonical JSON refuses; the full result is in the run
-    /// record. A success moves `next_due` to the slot's end; a failure
+    /// record. A success moves `next_due` to the slot's end; a task failure
     /// counts and backs off (`max(next slot, now + min(2^failures * 30 s,
-    /// 6 h))`), and `effect_unknown` also pauses the job
-    /// `reconcile_required`, since running again could repeat an effect
+    /// 6 h))`). A proven plugin-policy cancellation closes the occurrence
+    /// without changing prior failure backoff or refunding its reservation.
+    /// Unknown effects and quarantine always pause the job for
+    /// reconciliation, since running again could repeat an effect
     /// whose outcome nobody knows. A finish the state refuses (a grant
     /// revoked mid-run fences the commit) is logged, never swallowed: the
     /// reservation stays visible to recovery and the slot stays claimed.
@@ -1719,32 +1897,56 @@ impl EvxService {
         occurrence: &Occurrence,
         executed: &Result<Executed, String>,
         now: u64,
+        plugin_interrupted: bool,
     ) {
         let id = occurrence.invocation.occurrence.as_str();
         let (summary, failed, reconcile) = match executed {
-            Ok(executed) => (
-                json!({
+            Ok(executed) => {
+                let mut summary = json!({
                     "status": status_name(executed.status),
                     "value": executed.value,
                     "error": executed.error,
                     "elapsed_ms": executed.elapsed_ms,
                     "occurrence": id,
-                }),
-                executed.status != Status::Ok,
-                executed.status == Status::EffectUnknown,
-            ),
-            Err(refusal) => (
-                json!({
-                    "status": status_name(Status::Denied),
-                    "value": null,
-                    "error": bounded_message(refusal),
-                    "elapsed_ms": 0,
-                    "occurrence": id,
-                }),
-                true,
-                false,
-            ),
+                });
+                if executed.effect_outcome_unknown {
+                    summary["effect_outcome_unknown"] = json!(true);
+                }
+                let reconcile = executed.effect_outcome_unknown
+                    || matches!(executed.status, Status::EffectUnknown | Status::Quarantined);
+                (summary, executed.status != Status::Ok || reconcile, reconcile)
+            },
+            Err(refusal) => {
+                // An error in post-run bookkeeping cannot prove that the
+                // guest had no effects. A failed phase read is uncertain too.
+                let started = self.state.incomplete_occurrences(Some(&occurrence.row.xite))
+                    .map(|rows| rows.iter().any(|row| row.occurrence == id && row.execution_started))
+                    .unwrap_or(true);
+                (
+                    json!({
+                        "status": status_name(if started { Status::EffectUnknown } else { Status::Denied }),
+                        "value": null,
+                        "error": bounded_message(refusal),
+                        "elapsed_ms": 0,
+                        "occurrence": id,
+                    }),
+                    true,
+                    started,
+                )
+            },
         };
+        let cancelled_by_host = matches!(executed, Ok(result)
+            if matches!(result.status, Status::Denied | Status::Error)
+                && result.host_cancellation == Some(evx_api::HostCancellation::AuthorityChanged));
+        if plugin_interrupted && !reconcile && (summary["status"] == "denied" || cancelled_by_host) {
+            // A host stop is not a task failure. Abandon keeps this slot and
+            // spent budgets reserved and preserves any earlier real failure
+            // backoff. Re-enabling may admit the next eligible occurrence.
+            if let Err(error) = self.state.abandon(&occurrence.invocation, "plugin policy interrupted execution") {
+                app.log("ERROR", format!("EVX: interrupted occurrence {id} of {} not abandoned: {error}", occurrence.row.xite)).await;
+            }
+            return;
+        }
         let next_due = if failed {
             occurrence
                 .slot
@@ -1766,7 +1968,12 @@ impl EvxService {
             // the retained rows forever.
             Err(evx_state::Error::Denied(denied)) => {
                 let message = format!("{ABANDONED_REVOKED} ({denied})");
-                match self.state.abandon(&occurrence.invocation, &bounded_message(&message)) {
+                let closed = if reconcile {
+                    self.state.abandon_uncertain(&occurrence.invocation, &bounded_message(&message))
+                } else {
+                    self.state.abandon(&occurrence.invocation, &bounded_message(&message))
+                };
+                match closed {
                     Ok(()) => {
                         app.log("WARN", format!("EVX: occurrence {id} of {} abandoned: {message}", occurrence.row.xite)).await;
                     }
@@ -1780,22 +1987,13 @@ impl EvxService {
             }
         }
         if reconcile {
-            if let Err(error) = self.state.set_job_paused(
-                &occurrence.row.xite,
-                &occurrence.row.job,
-                Some(PauseReason::ReconcileRequired.name()),
-            ) {
-                app.log("ERROR", format!("EVX: job {} of {} not paused: {error}", occurrence.row.job, occurrence.row.xite)).await;
-            } else {
-                app.log(
-                    "WARN",
-                    format!(
-                        "EVX: job {} of {} paused: occurrence {id} ended with an unknown effect; resume it once reconciled",
-                        occurrence.row.job, occurrence.row.xite
-                    ),
-                )
-                .await;
-            }
+            // Both completion paths persist the pause in the same transaction
+            // as the response. A crash cannot leave a completed unknown effect
+            // eligible for the next slot before the pause reaches disk.
+            app.log("WARN", format!(
+                "EVX: job {} of {} requires reconciliation: occurrence {id} ended with an unknown effect",
+                occurrence.row.job, occurrence.row.xite
+            )).await;
         }
     }
 
@@ -1820,6 +2018,26 @@ impl EvxService {
             .ok()
             .and_then(|revocations| revocations.get(xite).copied())
             .unwrap_or(0)
+    }
+
+    /// Caller holds `policy_lock`, so a registering broker cannot miss the
+    /// durable change or overwrite it with an earlier limits snapshot.
+    fn refresh_running_policy(&self, xite: &str) -> Result<(), String> {
+        let stored = self.state.xite_grant(xite).map_err(|error| format!("EVX state: {error}"))?;
+        let running = self.running.lock().map_err(|_| "EVX running state unavailable")?
+            .get(xite).cloned();
+        if let Some(broker) = running {
+            match stored {
+                Some((grant, generations)) if grant.enabled
+                    && broker.grant().generation == generations.generation
+                    && broker.grant().capabilities.is_subset(&grant.capabilities)
+                    && broker.grant().runtime_profiles.is_subset(&grant.runtime_profiles) => {
+                        broker.set_limits(grant.limits).map_err(|error| format!("EVX broker: {error}"))?;
+                    }
+                _ => broker.revoke(),
+            }
+        }
+        Ok(())
     }
 
     /// Whether the authority a run was admitted under still stands. Called
@@ -1869,12 +2087,12 @@ impl EvxService {
     fn run_blocking(
         &self,
         xite: &str,
-        worker: &Path,
         content: Value,
         bound: BoundProgram,
         files: BTreeMap<String, Vec<u8>>,
-        admitted: Admitted,
+        policy: BlockingPolicy<'_>,
     ) -> Result<(evx_host::ActivationOutcome, Result<(), String>), String> {
+        let BlockingPolicy { admitted, invocation, plugin_changes, plugin_interrupted } = policy;
         let checkpoints = self.root.join("checkpoints");
         let floor = checkpoint::load(&checkpoints, xite)?;
         let loader_grant = evx_activation::XiteGrant::for_root_address(
@@ -1895,30 +2113,54 @@ impl EvxService {
             publisher_public_key: None,
             runtime_profiles: admitted.profiles.clone(),
         };
-        let workspace = self.workspace_dir(xite);
-        std::fs::create_dir_all(&workspace).map_err(|error| format!("workspace: {error}"))?;
-        let broker = Arc::new(
-            Broker::new(&workspace, broker_grant, admitted.limits.clone())
-                .map_err(|denied| format!("workspace: {denied}"))?,
-        );
-        if let Ok(mut running) = self.running.lock() {
+        let (broker, config) = self.prepare_backend(xite, broker_grant, admitted.limits.clone(), true)?
+            .ok_or("execution workspace unavailable")?;
+        let _policy = self.policy_lock.lock().map_err(|_| "EVX policy unavailable")?;
+        {
+            let mut running = self.running.lock().map_err(|_| "EVX running state unavailable")?;
+            if running.contains_key(xite) {
+                return Err("EVX execution is busy".into());
+            }
             running.insert(xite.to_string(), Arc::clone(&broker));
         }
+        let _registered = RunningRegistration { service: self, xite, broker: Some(&broker) };
         // A revocation that landed between the check in `execute` and the
         // registration above disables the broker's grant here, and the
         // activation's binding check below then denies the run before any
         // worker is spawned; the denial is recorded like any other.
-        if self.authority_stands(xite, &admitted).is_err() {
+        if self.scheduler.stopped() || plugin_changes.has_changed().unwrap_or(true) {
+            plugin_interrupted.store(true, Ordering::Release);
             broker.revoke();
+        } else if self.authority_stands(xite, &admitted).is_err() {
+            broker.revoke();
+        } else if !matches!(admitted.authority, Authority::Once) {
+            self.refresh_running_policy(xite)?;
         }
-        let config = Config::new(worker.to_path_buf());
+        drop(_policy);
         let mut read = |path: &str| -> Result<Vec<u8>, AuthenticationError> {
             files
                 .get(path)
                 .cloned()
                 .ok_or_else(|| AuthenticationError::new("file unavailable"))
         };
-        let outcome = run_content_activation(
+        let mut persisted = Ok(());
+        let mut persist = |candidate: &evx_activation::ActivationCheckpoint| {
+            // A toggle while queued, capturing or compiling invalidates this
+            // admission, even if the scheduler already examined its running
+            // brokers before this one registered. A fresh request can retry.
+            if self.scheduler.stopped() || plugin_changes.has_changed().unwrap_or(true) {
+                plugin_interrupted.store(true, Ordering::Release);
+                return Err(AuthenticationError::new("plugin configuration changed before admission"));
+            }
+            persisted = checkpoint::admit(&checkpoints, xite, &floor, candidate);
+            persisted.clone().map_err(AuthenticationError::new)?;
+            if let Some(invocation) = invocation {
+                self.state.mark_execution_started(invocation)
+                    .map_err(|error| AuthenticationError::new(format!("execution admission not persisted: {error}")))?;
+            }
+            Ok(())
+        };
+        let outcome = run_content_activation_with_admission(
             &config,
             &mut loader,
             &content,
@@ -1926,17 +2168,40 @@ impl EvxService {
             &mut read,
             &broker,
             RunOptions::default(),
+            &mut persist,
         );
-        if let Ok(mut running) = self.running.lock() {
-            running.remove(xite);
+        #[cfg(test)]
+        if let Some(hook) = self.before_run_classification.lock().unwrap().take() {
+            hook(&broker, &outcome.result);
         }
-        let moved = loader.checkpoint() != &floor;
-        let persisted = if moved {
-            checkpoint::store(&checkpoints, xite, loader.checkpoint())
-        } else {
-            Ok(())
-        };
+        // Only the supervisor's exact cancellation branch supplies this
+        // cause. Reading a revoked broker after an unrelated refusal would
+        // confuse a later policy change with the cause of that refusal.
+        if outcome.result.host_cancellation == Some(evx_api::HostCancellation::AuthorityChanged)
+            && (self.scheduler.stopped() || plugin_changes.has_changed().unwrap_or(true))
+            && self.authority_stands(xite, &admitted).is_ok()
+        {
+            plugin_interrupted.store(true, Ordering::Release);
+        }
         Ok((outcome, persisted))
+    }
+}
+
+/// Remove only this operation's broker, including on an early error or panic.
+struct RunningRegistration<'a> {
+    service: &'a EvxService,
+    xite: &'a str,
+    broker: Option<&'a Arc<Broker>>,
+}
+
+impl Drop for RunningRegistration<'_> {
+    fn drop(&mut self) {
+        if let Some(broker) = self.broker {
+            let mut running = self.service.running.lock().unwrap_or_else(|error| error.into_inner());
+            if running.get(self.xite).is_some_and(|current| Arc::ptr_eq(current, broker)) {
+                running.remove(self.xite);
+            }
+        }
     }
 }
 
@@ -2110,6 +2375,70 @@ fn host_json(execution: Result<(), String>) -> Value {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn limits_change_does_not_restore_a_concurrently_revoked_grant() {
+        let (service, app, row) = service_with_job().await;
+        let xite = row.xite.clone();
+        let durable = DurableState::open(service.state_path()).unwrap();
+        *service.before_limits_write.lock().unwrap() = Some(Box::new(move || {
+            durable.revoke_xite(&xite).unwrap();
+        }));
+        let mut limits = Limits::default();
+        limits.storage_bytes /= 2;
+        service.set_limits(&app, &row.xite, &limits).await.unwrap();
+        let (stored, _) = service.state.xite_grant(&row.xite).unwrap().unwrap();
+        assert!(!stored.enabled, "a limits-only update restored revoked execution authority");
+        assert_eq!(stored.limits, limits);
+    }
+
+    #[tokio::test]
+    async fn replacing_consent_stops_a_registered_broker_with_old_authority() {
+        let app = AppState::new("test");
+        let service = Arc::new(EvxService::for_node(&app, None).unwrap());
+        let key = epix_crypt::new_seed();
+        let xite = epix_crypt::privatekey_to_address(&key).unwrap();
+        let served = service.root().join("fixture");
+        std::fs::create_dir_all(&served).unwrap();
+        let storage = epix_xite::XiteStorage::new(&served);
+        let wasm = evx_runtime::text_to_binary(
+            "(module (memory (export \"memory\") 1) (func (export \"run\") (result i32) i32.const 42))"
+        ).unwrap();
+        storage.write("main.wasm", &wasm).unwrap();
+        let mut content = json!({
+            "address": xite, "modified": 1_700_000_000,
+            "files": { "main.wasm": { "size": wasm.len(), "sha512": epix_xite::XiteStorage::hash_bytes(&wasm) } },
+            "evx": { "version": 1, "programs": { "calc": {
+                "runtime_profile": RUNTIME_PROFILE, "entry": "main.wasm", "allow_run_once": true,
+                "capabilities": [{ "api": "workspace.write" }]
+            } } }
+        });
+        epix_content::sign(&mut content, &key).unwrap();
+        storage.write("content.json", epix_content::dumps_content(&content).as_bytes()).unwrap();
+        app.add_xite(&xite, epix_ui::XiteEntry { storage: storage.clone(), content: Some(content.clone()) }).await;
+        let first = service.inspect(&app, &xite).await.unwrap();
+        let request = |inspection: &Inspection| GrantRequest {
+            xite: xite.clone(), declaration_digest: inspection.digest.clone(), mode: GrantMode::Enable,
+            program: None, limits: None, label: None, shown: Some(Shown::of(inspection)),
+        };
+        service.grant(&app, request(&first)).await.unwrap();
+        let (stored, generations) = service.state.xite_grant(&xite).unwrap().unwrap();
+        let workspace = service.workspace_dir(&xite);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let broker = Arc::new(Broker::new(&workspace, Grant {
+            xite: xite.clone(), enabled: true, generation: generations.generation,
+            capabilities: stored.capabilities, publisher: Some(xite.clone()),
+            publisher_public_key: None, runtime_profiles: stored.runtime_profiles,
+        }, stored.limits).unwrap());
+        service.running.lock().unwrap().insert(xite.clone(), broker.clone());
+        content["modified"] = json!(1_700_000_001);
+        content["evx"]["programs"]["calc"]["capabilities"] = json!([]);
+        epix_content::sign(&mut content, &key).unwrap();
+        storage.write("content.json", epix_content::dumps_content(&content).as_bytes()).unwrap();
+        let updated = service.inspect(&app, &xite).await.unwrap();
+        service.grant(&app, request(&updated)).await.unwrap();
+        assert!(!broker.grant().enabled, "old broker retained workspace.write after replacement consent removed it");
+    }
+
     #[test]
     fn stored_pause_reasons_round_trip_and_unknown_text_is_not_a_reason() {
         for reason in [
@@ -2187,6 +2516,99 @@ mod tests {
         (service, app, row)
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_recovery_request_keeps_the_xite_lock_and_revocation_prevents_resume() {
+        let (service, app, row) = service_with_job().await;
+        std::fs::create_dir_all(service.workspace_dir(&row.xite)).unwrap();
+        service.state.set_job_paused(&row.xite, &row.job, Some("reconcile_required")).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *service.before_recovery.lock().unwrap() = Some(Box::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }));
+        let s = service.clone();
+        let a = app.clone();
+        let xite = row.xite.clone();
+        let job = row.job.clone();
+        let task = tokio::spawn(async move { s.job_resume(&a, &xite, &job).await });
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(!service.run_lock_free(&row.xite).await, "aborting the request released a live recovery lease");
+        service.revoke(&app, &row.xite).await.unwrap();
+        release_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !service.run_lock_free(&row.xite).await {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }).await.unwrap();
+        assert!(service.running.lock().unwrap().is_empty());
+        assert_eq!(service.state.jobs(&row.xite).unwrap()[0].paused_reason.as_deref(), Some("reconcile_required"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recovery_observes_policy_limits_and_replacement_consent() {
+        let (service, app, row) = service_with_job().await;
+        std::fs::create_dir_all(service.workspace_dir(&row.xite)).unwrap();
+        service.state.set_job_paused(&row.xite, &row.job, Some("user")).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        *service.before_recovery.lock().unwrap() = Some(Box::new(move |_| {
+            entered_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        }));
+        let s = service.clone();
+        let a = app.clone();
+        let xite = row.xite.clone();
+        let job = row.job.clone();
+        let task = tokio::spawn(async move { s.job_resume(&a, &xite, &job).await });
+        entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        let mut limits = Limits::default();
+        limits.storage_bytes /= 2;
+        service.set_limits(&app, &row.xite, &limits).await.unwrap();
+        assert_eq!(service.running.lock().unwrap()[&row.xite].limits(), limits);
+        // Replace consent under the same ordering lock used by the production
+        // grant path. This advances authority without calling revoke().
+        {
+            let _policy = service.policy_lock.lock().unwrap();
+            let (mut grant, _) = service.state.xite_grant(&row.xite).unwrap().unwrap();
+            grant.capabilities.insert(Capability::WorkspaceRead);
+            service.state.set_xite_grant(&grant).unwrap();
+            service.refresh_running_policy(&row.xite).unwrap();
+        }
+        release_tx.send(()).unwrap();
+        assert!(task.await.unwrap().is_err());
+        assert!(service.running.lock().unwrap().is_empty());
+        assert_eq!(service.state.jobs(&row.xite).unwrap()[0].paused_reason.as_deref(), Some("user"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_later_pause_wins_over_recovery_even_when_the_reason_is_unchanged() {
+        for reason in ["user", "reconcile_required"] {
+            let (service, app, row) = service_with_job().await;
+            std::fs::create_dir_all(service.workspace_dir(&row.xite)).unwrap();
+            service.state.set_job_paused(&row.xite, &row.job, Some(reason)).unwrap();
+            let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            *service.before_recovery.lock().unwrap() = Some(Box::new(move |_| {
+                entered_tx.send(()).unwrap();
+                release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            }));
+            let s = service.clone();
+            let a = app.clone();
+            let xite = row.xite.clone();
+            let job = row.job.clone();
+            let task = tokio::spawn(async move { s.job_resume(&a, &xite, &job).await });
+            entered_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            service.job_pause(&app, &row.xite, &row.job).await.unwrap();
+            release_tx.send(()).unwrap();
+            let result = task.await.unwrap();
+            assert!(result.is_err(), "an earlier resume overrode a later pause: {result:?}");
+            assert_eq!(service.state.jobs(&row.xite).unwrap()[0].paused_reason.as_deref(), Some(reason));
+        }
+    }
+
     fn claim(service: &EvxService, row: &JobRow, now: u64) -> Occurrence {
         let slot = DurableState::slot_at(&row.schedule, now).unwrap();
         let invocation = service
@@ -2204,7 +2626,174 @@ mod tests {
             value: (status == Status::Ok).then_some(42),
             error: (status != Status::Ok).then(|| "boom".to_string()),
             elapsed_ms: 12,
+            effect_outcome_unknown: status == Status::EffectUnknown,
+            host_cancellation: None,
         }
+    }
+
+    #[tokio::test]
+    async fn a_plugin_change_after_an_independent_denial_is_not_its_cause() {
+        let (service, _app, row) = service_with_job().await;
+        let xite = epix_crypt::privatekey_to_address(&epix_crypt::private_to_wif(&[7; 32])).unwrap();
+        let (mut grant, _) = service.state.xite_grant(&row.xite).unwrap().unwrap();
+        grant.xite = xite.clone();
+        grant.publisher = xite.clone();
+        let generations = service.state.set_xite_grant(&grant).unwrap();
+        let (changes, receiver) = tokio::sync::watch::channel(());
+        *service.before_run_classification.lock().unwrap() = Some(Box::new(move |broker, result| {
+            assert_eq!(result.status, Status::Denied);
+            assert_eq!(result.error.as_deref(), Some("content.json is not an object"));
+            // The unrelated refusal already exists. Only now does the host
+            // stop the broker and publish the policy-change notification.
+            broker.revoke();
+            changes.send_replace(());
+        }));
+        let interrupted = AtomicBool::new(false);
+        let admitted = Admitted {
+            authority: Authority::Scheduled,
+            generation: generations.generation,
+            revocations: 0,
+            capabilities: grant.capabilities,
+            profiles: grant.runtime_profiles,
+            limits: grant.limits,
+        };
+        let bound = BoundProgram {
+            program: "calc".into(),
+            entry: evx_activation::PinnedFile { path: "main.wasm".into(), size: 8, sha512: "a".repeat(64) },
+            dependencies: vec![],
+            total_bytes: 8,
+        };
+        let (outcome, _) = service.run_blocking(
+            &xite, Value::Null, bound,
+            BTreeMap::new(), BlockingPolicy { admitted, invocation: None, plugin_changes: &receiver, plugin_interrupted: &interrupted },
+        ).unwrap();
+        assert_eq!(outcome.result.status, Status::Denied);
+        assert!(!interrupted.load(Ordering::Acquire), "a later policy stop must not replace the earlier refusal's cause");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_interruption_does_not_add_failure_backoff_or_reset_prior_failures() {
+        let (service, app, row) = service_with_job().await;
+        let now = 1_700_000_000;
+        let first = claim(&service, &row, now);
+        service.finish_job_run(&app, &first, &Ok(executed(Status::Error)), now, false).await;
+        let row = service.state.jobs(&row.xite).unwrap().remove(0);
+        assert_eq!(row.failures, 1);
+        let occurrence = claim(&service, &row, first.slot.end_unix);
+        app.set_plugin_enabled(PLUGIN_NAME, false).await;
+        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Denied)), occurrence.slot.start_unix, true).await;
+        let after = service.state.jobs(&row.xite).unwrap().remove(0);
+        assert_eq!(after.failures, 1, "host interruption is not another task failure");
+        assert_eq!(after.next_due_unix, row.next_due_unix, "host interruption must not add a backoff");
+        assert_eq!(after.paused_reason, None);
+        app.set_plugin_enabled(PLUGIN_NAME, true).await;
+        assert_eq!(service.state.due_jobs(occurrence.slot.end_unix).unwrap().len(), 1);
+        assert!(service.state.incomplete_occurrences(Some(&row.xite)).unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_plugin_interruption_does_not_hide_task_errors_or_uncertain_effects() {
+        for (status, unknown, reconcile) in [
+            (Status::Error, false, false),
+            (Status::Denied, true, true),
+            (Status::Quarantined, false, true),
+        ] {
+            let (service, app, row) = service_with_job().await;
+            let now = 1_700_000_000;
+            let occurrence = claim(&service, &row, now);
+            let mut outcome = executed(status);
+            outcome.effect_outcome_unknown = unknown;
+            if reconcile {
+                outcome.host_cancellation = Some(evx_api::HostCancellation::AuthorityChanged);
+            }
+            service.finish_job_run(&app, &occurrence, &Ok(outcome), now, true).await;
+            let after = service.state.jobs(&row.xite).unwrap().remove(0);
+            assert_eq!(after.failures, 1);
+            assert_eq!(after.paused_reason.as_deref(), reconcile.then_some("reconcile_required"));
+            assert_eq!(service.state.snapshot(&row.xite).unwrap().invocations[0].response.as_ref().unwrap()["status"], status_name(status));
+        }
+        let (service, app, row) = service_with_job().await;
+        let now = 1_700_000_000;
+        let occurrence = claim(&service, &row, now);
+        service.state.mark_execution_started(&occurrence.invocation).unwrap();
+        service.finish_job_run(&app, &occurrence, &Err("post-run persistence failed".into()), now, true).await;
+        assert_eq!(service.state.jobs(&row.xite).unwrap()[0].paused_reason.as_deref(), Some("reconcile_required"));
+    }
+
+    #[tokio::test]
+    async fn an_active_guest_policy_cancellation_is_not_a_task_failure() {
+        let (service, app, row) = service_with_job().await;
+        let now = 1_700_000_000;
+        let occurrence = claim(&service, &row, now);
+        service.state.mark_execution_started(&occurrence.invocation).unwrap();
+        let mut result = executed(Status::Error);
+        result.host_cancellation = Some(evx_api::HostCancellation::AuthorityChanged);
+        service.finish_job_run(&app, &occurrence, &Ok(result), now, true).await;
+        let after = service.state.jobs(&row.xite).unwrap().remove(0);
+        assert_eq!(after.failures, 0);
+        assert_eq!(after.paused_reason, None);
+        let snapshot = service.state.snapshot(&row.xite).unwrap();
+        assert!(snapshot.invocations[0].execution_started);
+        assert_eq!(snapshot.invocations[0].response.as_ref().unwrap()["status"], "abandoned");
+    }
+
+    #[tokio::test]
+    async fn a_plugin_interruption_before_admission_closes_without_spending_a_second_reservation() {
+        let (service, app, row) = service_with_job().await;
+        let now = 1_700_000_000;
+        let occurrence = claim(&service, &row, now);
+        let before = service.state.snapshot(&row.xite).unwrap().grant.unwrap().used;
+        service.finish_job_run(&app, &occurrence, &Err("EVX plugin is disabled".into()), now, true).await;
+        let snapshot = service.state.snapshot(&row.xite).unwrap();
+        assert_eq!(snapshot.grant.unwrap().used, before);
+        assert_eq!(snapshot.invocations[0].response.as_ref().unwrap()["status"], "abandoned");
+        assert!(!snapshot.invocations[0].execution_started);
+        assert_eq!(service.state.jobs(&row.xite).unwrap()[0].failures, 0);
+        let retry = service.state.claim_occurrence(&row.xite, &row, &occurrence.slot, &occurrence_request(&row, &occurrence.slot), now).unwrap();
+        assert!(!retry.fresh);
+        assert!(retry.completed);
+    }
+
+    #[tokio::test]
+    async fn quarantined_completion_pauses_the_job_even_when_status_masks_uncertain_effects() {
+        for revoked in [false, true] {
+            let (service, app, row) = service_with_job().await;
+            let now = 1_700_000_000;
+            let occurrence = claim(&service, &row, now);
+            if revoked {
+                service.state.revoke_xite(&row.xite).unwrap();
+            }
+            service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Quarantined)), now, false).await;
+            let after = service.state.jobs(&row.xite).unwrap().remove(0);
+            assert_eq!(after.paused_reason.as_deref(), Some("reconcile_required"), "revoked={revoked}");
+            assert_eq!(service.state.snapshot(&row.xite).unwrap().invocations[0].response.as_ref().unwrap()["status"],
+                if revoked { "effect_unknown" } else { "quarantined" });
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unknown_effect_flag_is_preserved_even_with_a_different_status() {
+        let (service, app, row) = service_with_job().await;
+        let now = 1_700_000_000;
+        let occurrence = claim(&service, &row, now);
+        let mut result = executed(Status::Error);
+        result.effect_outcome_unknown = true;
+        service.finish_job_run(&app, &occurrence, &Ok(result), now, false).await;
+        let stored = service.state.snapshot(&row.xite).unwrap().invocations.remove(0);
+        assert_eq!(stored.response.unwrap()["effect_outcome_unknown"], true);
+        assert_eq!(service.state.jobs(&row.xite).unwrap()[0].paused_reason.as_deref(), Some("reconcile_required"));
+    }
+
+    #[tokio::test]
+    async fn an_internal_error_after_guest_admission_requires_reconciliation() {
+        let (service, app, row) = service_with_job().await;
+        let now = 1_700_000_000;
+        let occurrence = claim(&service, &row, now);
+        service.state.mark_execution_started(&occurrence.invocation).unwrap();
+        service.finish_job_run(&app, &occurrence, &Err("history could not be persisted".into()), now, false).await;
+        let stored = service.state.snapshot(&row.xite).unwrap().invocations.remove(0);
+        assert_eq!(stored.response.unwrap()["status"], "effect_unknown");
+        assert_eq!(service.state.jobs(&row.xite).unwrap()[0].paused_reason.as_deref(), Some("reconcile_required"));
     }
 
     #[tokio::test]
@@ -2212,7 +2801,7 @@ mod tests {
         let (service, app, row) = service_with_job().await;
         let now = 1_700_000_000;
         let occurrence = claim(&service, &row, now);
-        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Ok)), now + 5).await;
+        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Ok)), now + 5, false).await;
         let after = service.state.jobs(&row.xite).unwrap().remove(0);
         assert_eq!(after.failures, 0);
         assert_eq!(after.next_due_unix, Some(occurrence.slot.end_unix));
@@ -2230,7 +2819,7 @@ mod tests {
         let now = 1_700_000_000;
         // Refused before any run: finished as denied with the refusal.
         let occurrence = claim(&service, &row, now);
-        service.finish_job_run(&app, &occurrence, &Err("unsupported host".into()), now).await;
+        service.finish_job_run(&app, &occurrence, &Err("unsupported host".into()), now, false).await;
         let after = service.state.jobs(&row.xite).unwrap().remove(0);
         assert_eq!(after.failures, 1);
         assert_eq!(after.next_due_unix, Some(occurrence.slot.end_unix.max(now + backoff(1))));
@@ -2241,21 +2830,21 @@ mod tests {
         // once it is longer than the period.
         let later = occurrence.slot.end_unix;
         let occurrence = claim(&service, &after, later);
-        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Error)), later).await;
+        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Error)), later, false).await;
         let after = service.state.jobs(&row.xite).unwrap().remove(0);
         assert_eq!(after.failures, 2);
         assert_eq!(after.next_due_unix, Some(occurrence.slot.end_unix.max(later + backoff(2))));
         assert_eq!(after.paused_reason, None, "an error does not pause");
         // An unknown effect pauses the job until a person resumes it.
         let occurrence = claim(&service, &after, occurrence.slot.end_unix);
-        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::EffectUnknown)), occurrence.slot.start_unix).await;
+        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::EffectUnknown)), occurrence.slot.start_unix, false).await;
         let after = service.state.jobs(&row.xite).unwrap().remove(0);
         assert_eq!(after.failures, 3);
         assert_eq!(after.paused_reason.as_deref(), Some(PauseReason::ReconcileRequired.name()));
         // Resuming clears it and a success resets the count.
         service.job_resume(&app, &row.xite, &row.job).await.unwrap();
         let occurrence = claim(&service, &after, occurrence.slot.end_unix);
-        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Ok)), occurrence.slot.start_unix).await;
+        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Ok)), occurrence.slot.start_unix, false).await;
         let after = service.state.jobs(&row.xite).unwrap().remove(0);
         assert_eq!((after.failures, after.paused_reason), (0, None));
         assert_eq!(after.next_due_unix, Some(occurrence.slot.end_unix));
@@ -2272,7 +2861,7 @@ mod tests {
         let (mut grant, _) = service.state.xite_grant(&row.xite).unwrap().unwrap();
         grant.enabled = true;
         service.state.set_xite_grant(&grant).unwrap();
-        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Ok)), now + 5).await;
+        service.finish_job_run(&app, &occurrence, &Ok(executed(Status::Ok)), now + 5, false).await;
         assert!(service.state.incomplete_occurrences(None).unwrap().is_empty(), "the reservation is not left open");
         let stored = service.state.snapshot(&row.xite).unwrap().invocations.remove(0);
         let response = stored.response.unwrap();

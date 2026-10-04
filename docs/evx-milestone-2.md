@@ -95,15 +95,18 @@ The existing `GrantPolicy`/`set_grant` stays for the checkpoint/outbox model;
 ### 4. `crates/epix-evx` (new): the node's EVX service and management API
 
 An `epix_plugin::Plugin` named `Evx`, registered in `epix-node` next to the
-others. Owns an `EvxService`:
+others when the `evx` feature is enabled on macOS or Linux. Unsupported
+targets omit the plugin, including its management commands. Owns an
+`EvxService`:
 
 - `DurableState` at `<data_root>/private/evx/state.sqlite`; workspaces at
   `<data_root>/private/evx/workspaces/<address>/`; both outside every served
   root (`data/<address>`). Never under a xite directory.
 - Worker binary: `evx-worker` beside the node executable, overridable with
-  the `EVX_WORKER` environment variable. Execution is macOS-only in this
-  milestone; elsewhere inspect/grant/revoke work and run reports
-  `unsupported host`.
+  the `EVX_WORKER` environment variable. Execution requires a supported macOS
+  or Linux confinement profile. On those targets, an unavailable worker or
+  confinement profile makes runs report `unsupported host`; management
+  remains available. Windows and mobile products do not register the plugin.
 - Reads the xite's root `content.json` BYTES with `XiteStorage::read_bounded`
   (never the decoded `AppState::content` value, which has already collapsed
   duplicate keys) and accepts it only when `epix_content::verify_signer`
@@ -125,6 +128,7 @@ WebSocket commands (all params are JSON objects; errors use the usual
 | `evxRevoke` | wrapper / operator socket only | Disables the grant; running work is told to stop; nothing published is recalled. |
 | `evxSetLimits` | wrapper / operator socket only | Adjusts limits within host policy; limits generation advances; usage is never reset. |
 | `evxRunOnce` | wrapper / operator socket only | Runs one program now through `evx_host::run_activation` under the grant or a consumed allow-once token; persists input digest and result; returns the `RunResult`. Effectful; no ADMIN involved. |
+| `evxRecoverWorkspace` | wrapper / operator socket only | Explicitly reconciles interrupted manual writes against host-owned provenance. Runs no guest and resumes no job. The wrapper requires a separate user confirmation, without granting the xite global ADMIN. |
 
 Authority: the wrapper-only commands are gated in `epix-ui`'s dispatcher
 exactly like `permissionAdd` (`WsSession::elevated(req_id)`, refused on a
@@ -180,3 +184,14 @@ and never compiles anything.
 Background scheduler and OS wake (M3), retained streams, publication,
 chain reads/actions, XPC packaging, Linux/Windows confinement, the resource
 dashboard beyond the inspect/status payloads.
+
+## Review corrections
+
+Activation checkpoints are persisted under the workspace admission lease,
+before guest execution. Persistence failure denies the run. Replacing consent
+revokes brokers using the old authority generation. Updating limits uses an
+atomic limits-only transaction, so a concurrent revocation cannot be undone.
+The wrapper's publisher-controlled fields are escaped for their specific HTML
+or JavaScript context and substituted only once. Consent pages cannot be
+framed, and wrapper WebSocket origin checks include the port. See
+[`evx-review.md`](evx-review.md) for regression evidence and remaining gates.

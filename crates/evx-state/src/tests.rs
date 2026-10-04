@@ -71,6 +71,77 @@ fn effect(key: &str, value: i64) -> Effect {
     Effect::record(key, json!({"score": value}))
 }
 
+#[test]
+fn reservations_record_whether_guest_execution_has_started() {
+    let f = fixture();
+    f.state.begin("game-a", "tick.1", None, 1).unwrap();
+    let row = serde_json::to_value(&f.state.snapshot("game-a").unwrap().invocations[0]).unwrap();
+    assert_eq!(row.get("execution_started"), Some(&json!(false)));
+}
+
+#[test]
+fn execution_marker_survives_reopen_and_token_recovery() {
+    let f = fixture();
+    let call = f.state.begin("game-a", "tick.1", None, 1).unwrap();
+    f.state.mark_execution_started(&call).unwrap();
+    f.state.mark_execution_started(&call).unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    assert!(reopened.snapshot("game-a").unwrap().invocations[0].execution_started);
+    let recovered = reopened.recover(&call).unwrap();
+    assert!(reopened.snapshot("game-a").unwrap().invocations[0].execution_started);
+    assert!(matches!(
+        reopened.mark_execution_started(&call),
+        Err(Error::Conflict(_))
+    ));
+    reopened.mark_execution_started(&recovered).unwrap();
+    assert_eq!(used(&reopened, "game-a"), 1);
+    reopened.commit(&recovered, &json!({}), &[], None).unwrap();
+    assert!(matches!(
+        reopened.mark_execution_started(&recovered),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn execution_marker_refuses_revoked_and_stale_generation_handles() {
+    let f = fixture();
+    let call = f.state.begin("game-a", "tick.1", None, 1).unwrap();
+    let mut forged = call.clone();
+    forged.generation += 1;
+    assert!(matches!(
+        f.state.mark_execution_started(&forged),
+        Err(Error::Conflict(_))
+    ));
+    forged = call.clone();
+    forged.schema_generation += 1;
+    assert!(matches!(
+        f.state.mark_execution_started(&forged),
+        Err(Error::Conflict(_))
+    ));
+    f.state.revoke("game-a").unwrap();
+    assert!(matches!(
+        f.state.mark_execution_started(&call),
+        Err(Error::Denied(_))
+    ));
+    assert!(!f.state.snapshot("game-a").unwrap().invocations[0].execution_started);
+}
+
+#[test]
+fn migration_treats_old_incomplete_execution_as_unknown() {
+    let f = fixture();
+    f.state.begin("game-a", "tick.1", None, 1).unwrap();
+    let conn = rusqlite::Connection::open(&f.db_path).unwrap();
+    conn.execute_batch(
+        "ALTER TABLE invocations DROP COLUMN execution_started; PRAGMA user_version=5;",
+    )
+    .unwrap();
+    drop(conn);
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    assert!(reopened.snapshot("game-a").unwrap().invocations[0].execution_started);
+    reopened.begin("game-a", "tick.2", None, 1).unwrap();
+    assert!(!reopened.snapshot("game-a").unwrap().invocations[1].execution_started);
+}
+
 fn state_update(expected_version: u64, value: Value) -> Option<StateUpdate> {
     Some(StateUpdate {
         expected_version,

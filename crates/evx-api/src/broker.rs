@@ -139,7 +139,8 @@ pub enum Response {
 impl Response {
     pub fn error(message: impl Into<String>) -> Response {
         let mut text: String = message.into();
-        text.truncate(160);
+        let end = text.floor_char_boundary(160);
+        text.truncate(end);
         Response::Error {
             ok: false,
             error: text,
@@ -159,6 +160,26 @@ impl Response {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_limit_preserves_utf8() {
+        for suffix in ["é", "界", "🎮"] {
+            let message = format!("{}{suffix}", "x".repeat(159));
+            let Response::Error { ok, error } = Response::error(message) else {
+                panic!("expected error response");
+            };
+            assert!(!ok);
+            assert_eq!(error, "x".repeat(159));
+            assert!(error.len() <= 160);
+        }
+        assert_eq!(
+            Response::error("é".repeat(80)),
+            Response::Error {
+                ok: false,
+                error: "é".repeat(80)
+            }
+        );
+    }
 
     #[test]
     fn decodes_exact_shapes_only() {

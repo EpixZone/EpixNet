@@ -158,7 +158,32 @@ fn call_host(
 }
 
 /// Deserialize and run one artifact.
-pub fn run(artifact: &[u8], options: &RunOptions, host: Box<dyn HostCalls>) -> ExecReport {
+///
+/// A digest supplied alongside bytes is not evidence of trusted compilation.
+/// Calling this API requires an explicit artifact-provenance safety decision:
+///
+/// ```compile_fail,E0133
+/// use evx_runtime::{run, HostCalls, RunOptions};
+/// fn execute(bytes: &[u8], options: &RunOptions, host: Box<dyn HostCalls>) {
+///     run(bytes, options, host);
+/// }
+/// ```
+///
+/// # Safety
+///
+/// `artifact` must be the unchanged output of this runtime's trusted compiler
+/// using the EVX engine configuration. Its origin must be established outside
+/// the supplied digest and engine key. Those fields only detect mismatches;
+/// a publisher can compute both for malicious serialized code. A signed xite,
+/// an artifact received from a peer, or a hash match does not establish this
+/// contract. Raw Wasm must enter the confined compiler, never this function.
+///
+/// # Containment
+///
+/// Production callers must also provide the platform's process containment and
+/// resource accounting. Fuel, epochs and guest memory limits do not isolate a native
+/// engine failure or interrupt a blocked host callback.
+pub unsafe fn run(artifact: &[u8], options: &RunOptions, host: Box<dyn HostCalls>) -> ExecReport {
     let started = Instant::now();
     let mut report = ExecReport {
         result: WorkerResult {
@@ -208,10 +233,9 @@ pub fn run(artifact: &[u8], options: &RunOptions, host: Box<dyn HostCalls>) -> E
             return report;
         }
     };
-    // SAFETY: `artifact` was produced by `Engine::precompile_module` on this
-    // host under the same engine key, and its SHA-256 was verified above
-    // against the digest the supervisor recorded when it compiled it. No
-    // other bytes ever reach this call.
+    // SAFETY: the caller guarantees trusted compiler provenance and unchanged
+    // bytes. The checks above detect transport/configuration mismatches, but
+    // do not independently prove the serialized artifact is safe.
     let module = match unsafe { Module::deserialize(&engine, artifact) } {
         Ok(m) => m,
         Err(e) => {
@@ -324,7 +348,8 @@ pub fn run(artifact: &[u8], options: &RunOptions, host: Box<dyn HostCalls>) -> E
                     // Alternate formatting prints the cause chain, so a host
                     // callback failure is visible beneath Wasmtime's context.
                     let mut text = format!("{error:#}");
-                    text.truncate(2048);
+                    let end = text.floor_char_boundary(2048);
+                    text.truncate(end);
                     text
                 }
             };
@@ -335,10 +360,16 @@ pub fn run(artifact: &[u8], options: &RunOptions, host: Box<dyn HostCalls>) -> E
     report
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "compiler"))]
 mod tests {
     use super::*;
     use crate::compile::precompile;
+
+    fn run(artifact: &[u8], options: &RunOptions, host: Box<dyn HostCalls>) -> ExecReport {
+        // SAFETY: every test below executes unchanged bytes returned by the
+        // local EVX compiler. Negative cases change only digest/key metadata.
+        unsafe { super::run(artifact, options, host) }
+    }
 
     struct Echo(Vec<Vec<u8>>);
     impl HostCalls for Echo {
@@ -373,6 +404,60 @@ mod tests {
                 i32.const {req_ptr} i32.const {req_len} i32.const {out_ptr} i32.const {out_cap} call $call))"#
         );
         wat::parse_str(text).unwrap()
+    }
+
+    #[test]
+    fn multibyte_function_name_does_not_panic_when_error_is_bounded() {
+        let mut module = wat::parse_str(
+            r#"(module
+              (import "evx" "call" (func (param i32 i32 i32 i32) (result i32)))
+              (memory (export "memory") 1)
+              (func (export "run") (result i32)
+                (loop
+                  (drop (call 0 (i32.const 0) (i32.const 0)
+                    (i32.const 4096) (i32.const 4096)))
+                  (br 0))
+                (i32.const 0)))"#,
+        )
+        .unwrap();
+        fn leb(mut value: usize) -> Vec<u8> {
+            let mut bytes = Vec::new();
+            loop {
+                let byte = (value & 127) as u8;
+                value >>= 7;
+                bytes.push(byte | if value == 0 { 0 } else { 128 });
+                if value == 0 {
+                    return bytes;
+                }
+            }
+        }
+        // The optional Wasm name section is guest-controlled UTF-8 and appears
+        // in Wasmtime's error context for a host-call budget failure.
+        let name = "é".repeat(1200);
+        let mut names = vec![1, 1]; // One function name, for function index 1.
+        names.extend(leb(name.len()));
+        names.extend(name.as_bytes());
+        let mut section = vec![4];
+        section.extend(b"name");
+        section.push(1); // Function names subsection.
+        section.extend(leb(names.len()));
+        section.extend(names);
+        module.push(0); // Custom section.
+        module.extend(leb(section.len()));
+        module.extend(section);
+        let artifact = precompile(&module).unwrap();
+        let mut limits = Limits::default();
+        limits.host_calls = 1;
+        let report = run(
+            &artifact.bytes,
+            &options(&artifact, limits),
+            Box::new(Echo(vec![])),
+        );
+        assert_eq!(report.result.status, WorkerStatus::Error);
+        let error = report.result.error.unwrap();
+        assert!(!error.is_empty());
+        assert!(error.len() <= 2048);
+        assert_eq!(report.result.host_calls, 2);
     }
 
     #[test]

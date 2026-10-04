@@ -652,6 +652,28 @@ async fn own_write_is_not_echoed_back() {
 }
 
 #[tokio::test]
+async fn same_host_different_port_is_not_the_wrappers_origin() {
+    use tokio_tungstenite::tungstenite::http;
+    let (addr, _xite, key, _dir) = start_server().await;
+    let foreign_port = if addr.port() == 65535 { 65534 } else { addr.port() + 1 };
+    let request = http::Request::builder()
+        .uri(format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={key}"))
+        .header("Host", addr.to_string())
+        .header("Origin", format!("http://127.0.0.1:{foreign_port}"))
+        .header("Connection", "Upgrade")
+        .header("Upgrade", "websocket")
+        .header("Sec-WebSocket-Version", "13")
+        .header("Sec-WebSocket-Key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(())
+        .unwrap();
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await
+        .expect("another loopback origin may open only a page-level socket");
+    let response = call(&mut ws, "siteList", 1_000_001).await;
+    assert!(response["result"]["error"].is_string(),
+        "a key presented by a different port must not confer wrapper authority");
+}
+
+#[tokio::test]
 async fn handles_epixframe_websocket_commands() {
     let (addr, xite, key, _dir) = start_server().await;
     // The wrapper page connects with the xite's secret wrapper_key: that is

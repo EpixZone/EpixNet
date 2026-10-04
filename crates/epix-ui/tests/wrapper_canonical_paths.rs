@@ -7,13 +7,17 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tower::ServiceExt;
 
 async fn fixture() -> (tempfile::TempDir, axum::Router, String) {
+    fixture_with_title("Verified xite").await
+}
+
+async fn fixture_with_title(title: &str) -> (tempfile::TempDir, axum::Router, String) {
     let directory = tempfile::tempdir().unwrap();
     let key = epix_crypt::new_seed();
     let address = epix_crypt::privatekey_to_address(&key).unwrap();
     let storage = XiteStorage::new(directory.path().join("data").join(&address));
     let index = b"<!doctype html><title>Verified xite</title>";
     let mut content = json!({
-        "address": address, "domain": "talk.epix", "modified": 1,
+        "address": address, "domain": "talk.epix", "modified": 1, "title": title,
         "files": { "index.html": {
             "size": index.len(), "sha512": XiteStorage::hash_bytes(index)
         } }
@@ -52,6 +56,53 @@ async fn fixture() -> (tempfile::TempDir, axum::Router, String) {
     (directory, UiServer::new(state).router(), address)
 }
 
+async fn wrapper_document(router: &axum::Router, uri: &str) -> (String, String) {
+    let request = Request::builder()
+        .uri(uri)
+        .header("host", "127.0.0.1:42222")
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "document")
+        .body(Body::empty())
+        .unwrap();
+    let response = router.clone().oneshot(request).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let csp = response.headers()["content-security-policy"].to_str().unwrap().to_string();
+    let body = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+    (csp, String::from_utf8(body.to_vec()).unwrap())
+}
+
+#[tokio::test]
+async fn publisher_title_cannot_inject_a_nonce_authorized_wrapper_script() {
+    let title = "</title><script nonce=\"{script_nonce}\">window.evxWrapperFixture=true</script><title>";
+    let (_directory, router, _address) = fixture_with_title(title).await;
+    let (csp, body) = wrapper_document(&router, "/talk.epix/").await;
+    let nonce = csp.split("script-src 'nonce-").nth(1).unwrap().split('\'').next().unwrap();
+    assert!(!body.contains(&format!("<script nonce=\"{nonce}\">window.evxWrapperFixture=true</script>")),
+        "publisher HTML received the wrapper's valid CSP nonce");
+    assert!(body.contains("&lt;/title&gt;&lt;script nonce=&quot;{script_nonce}&quot;&gt;"),
+        "publisher titles must remain literal text");
+}
+
+#[tokio::test]
+async fn publisher_text_cannot_expand_wrapper_secrets() {
+    let title = "Fixture {wrapper_key} {ajax_key} {script_nonce}";
+    let (_directory, router, _address) = fixture_with_title(title).await;
+    let (_, body) = wrapper_document(&router, "/talk.epix/").await;
+    assert!(body.contains(&format!("<title>{title} - EpixNet</title>")),
+        "template placeholders inside publisher text must never expand");
+}
+
+#[tokio::test]
+async fn document_path_cannot_break_out_of_the_wrapper_script_string() {
+    let (_directory, router, _address) = fixture().await;
+    let (_, body) = wrapper_document(&router,
+        "/talk.epix/docs/%22%3Bwindow.evxPathFixture%3Dtrue%3B%2F%2F.html").await;
+    let literal = body.lines().find_map(|line| line.strip_prefix("file_inner_path = ")).unwrap();
+    let decoded: String = serde_json::from_str(literal)
+        .expect("the decoded path must remain one complete JavaScript string, not executable statements");
+    assert_eq!(decoded, "docs/\";window.evxPathFixture=true;//.html");
+}
+
 async fn redirect(router: &axum::Router, host: &str, uri: &str) -> String {
     let request = Request::builder()
         .uri(uri)
@@ -67,6 +118,27 @@ async fn redirect(router: &axum::Router, host: &str, uri: &str) -> String {
         .unwrap();
     assert_eq!(response.status(), 307, "{host}{uri}");
     response.headers()["location"].to_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn consent_wrapper_refuses_framing_in_path_and_host_modes() {
+    let (_directory, router, _address) = fixture().await;
+    for (host, uri) in [("127.0.0.1:42222", "/talk.epix/"), ("talk.epix", "/")] {
+        let request = Request::builder()
+            .uri(uri)
+            .header("host", host)
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "iframe")
+            .body(Body::empty())
+            .unwrap();
+        let response = router.clone().oneshot(rewrite_proxy_host(request)).await.unwrap();
+        assert_eq!(response.status(), 200, "{host}{uri}");
+        let csp = response.headers()["content-security-policy"].to_str().unwrap();
+        assert!(csp.split(';').any(|directive| directive.trim() == "frame-ancestors 'none'"),
+            "the real wrapper response allows framing on {host}: {csp}");
+        assert_eq!(response.headers().get("x-frame-options").and_then(|value| value.to_str().ok()),
+            Some("DENY"), "legacy framing protection on {host}");
+    }
 }
 
 #[tokio::test]

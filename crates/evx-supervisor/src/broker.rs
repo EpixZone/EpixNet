@@ -30,17 +30,34 @@ pub struct Broker {
     workspace: PathBuf,
     root_fd: OwnedFd,
     inner: Mutex<Inner>,
+    pub(crate) provenance: crate::provenance::Provenance,
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    apple_workspace: Option<std::sync::Arc<crate::apple_workspace::AppleWorkspace>>,
 }
 
 impl Broker {
     /// Open a workspace and bind a grant to it. The workspace must be a
-    /// host-created directory, never a symlink.
+    /// host-created directory, never a symlink. Its parent is host-owned and
+    /// trusted; only that parent is resolved before the final NOFOLLOW open.
     pub fn new(workspace: &Path, grant: Grant, limits: Limits) -> Result<Broker, Denied> {
         limits.validate()?;
-        let workspace =
-            std::fs::canonicalize(workspace).map_err(|_| Denied::new("workspace unavailable"))?;
+        let name = workspace
+            .file_name()
+            .ok_or_else(|| Denied::new("workspace unavailable"))?;
+        let parent = workspace
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let workspace = std::fs::canonicalize(parent)
+            .map_err(|_| Denied::new("workspace unavailable"))?
+            .join(name);
         let root_fd = evx_workspace::open_root(&workspace)?;
+        let provenance =
+            crate::provenance::Provenance::new(&workspace, root_fd.as_fd(), &grant.xite)?;
         Ok(Broker {
+            #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+            apple_workspace: None,
+            provenance,
             workspace,
             root_fd,
             inner: Mutex::new(Inner {
@@ -54,6 +71,56 @@ impl Broker {
                 responses: Vec::new(),
             }),
         })
+    }
+
+    /// Bind only host control/provenance state. Guest data remains in the
+    /// assigned file service's private container and is never opened here.
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    pub fn new_apple(
+        workspace: std::sync::Arc<crate::apple_workspace::AppleWorkspace>,
+        grant: Grant,
+        limits: Limits,
+    ) -> Result<Self, Denied> {
+        if grant.xite != workspace.xite() {
+            return Err(Denied::new("Apple workspace xite mismatch"));
+        }
+        workspace.validate()?;
+        let mut broker = Self::new(workspace.control_path(), grant, limits)?;
+        broker.apple_workspace = Some(workspace);
+        Ok(broker)
+    }
+
+    /// Check the trusted backend/workspace binding before compilation or
+    /// execution. This does not launch a process or allocate a service slot.
+    pub fn check_backend(&self, config: &crate::Config) -> Result<(), Denied> {
+        if let Some(scope) = &config.direct_lifecycle {
+            #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+            if config.apple_xpc.is_some() {
+                return Err(Denied::new("conflicting execution backends"));
+            }
+            if scope.xite() != self.grant().xite {
+                return Err(Denied::new("direct lifecycle xite mismatch"));
+            }
+            scope.validate()?;
+        }
+        #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+        match &self.apple_workspace {
+            Some(workspace) => return workspace.check_config(config),
+            None if config.apple_xpc.is_some() => {
+                return Err(Denied::new("Apple workspace binding required"));
+            }
+            None => {}
+        }
+        let _ = config;
+        Ok(())
+    }
+
+    pub(crate) fn helper_lease_fd(&self) -> Option<std::os::fd::RawFd> {
+        #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+        if self.apple_workspace.is_some() {
+            return None;
+        }
+        Some(std::os::fd::AsRawFd::as_raw_fd(&self.root_fd))
     }
 
     pub fn workspace(&self) -> &Path {
@@ -109,6 +176,12 @@ impl Broker {
 
     /// Bytes and entries currently used in the workspace.
     pub fn usage(&self) -> Result<(u64, usize), Denied> {
+        #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+        if self.apple_workspace.is_some() {
+            return Err(Denied::new(
+                "Apple workspace usage requires the scoped file service",
+            ));
+        }
         evx_workspace::usage(self.root_fd())
     }
 
@@ -120,7 +193,7 @@ impl Broker {
         expected_generation: u64,
     ) -> Result<Request, Denied> {
         if !inner.grant.enabled || inner.grant.generation != expected_generation {
-            return Err(Denied::new("execution grant revoked"));
+            return Err(Denied::Cancelled("execution grant revoked".into()));
         }
         let request = Request::decode(raw)?;
         let capability = request.capability();

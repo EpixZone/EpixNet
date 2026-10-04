@@ -5,8 +5,11 @@
 //! `O_NOFOLLOW | O_DIRECTORY`. Files must be regular with a link count of one.
 //! Writes stage into a `.pending-<random>` sibling, `fsync`, then `rename`
 //! over the target after the caller authorizes the commit. Nothing here resolves
-//! a path string against the host filesystem, so a symlink, hard link, FIFO or
-//! device placed inside the workspace cannot redirect an operation outside it.
+//! a path string against the host filesystem. Symlinks and special files are
+//! refused. A link-count snapshot cannot prove origin under concurrent hard-link
+//! replacement: an opened alias can disappear before fstat. The trusted broker
+//! must verify read bytes against host-owned write provenance before releasing
+//! them to a guest. This crate alone is not that provenance boundary.
 //!
 //! The same code runs in the trusted supervisor (for quota accounting) and in
 //! the OS-confined file helper (for the actual read or write), which is why
@@ -87,10 +90,12 @@ fn is_staging_name(name: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit())
 }
 
+type Visitor<'a> = dyn FnMut(BorrowedFd<'_>, &str, FileType, u64) -> Result<(), Denied> + 'a;
+
 fn walk(
     dir: BorrowedFd<'_>,
     depth: usize,
-    visit: &mut dyn FnMut(BorrowedFd<'_>, &str, FileType, u64) -> Result<(), Denied>,
+    visit: &mut Visitor<'_>,
 ) -> Result<(), Denied> {
     if depth > MAX_DEPTH {
         return Err(Denied::new("directory depth limit"));
@@ -160,7 +165,13 @@ pub fn read(root: BorrowedFd<'_>, path: &str) -> Result<Response, Denied> {
         OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
     )
-    .map_err(|_| Denied::new("workspace operation denied"))?;
+    .map_err(|error| {
+        if error == rustix::io::Errno::NOENT {
+            Denied::new("workspace file absent")
+        } else {
+            Denied::new("workspace operation denied")
+        }
+    })?;
     let st = fstat(&fd).map_err(|_| Denied::new("workspace stat"))?;
     let kind = FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode);
     if kind != FileType::RegularFile || st.st_nlink != 1 {
@@ -376,4 +387,38 @@ mod tests {
         assert!(!dir.path().join(&temp_name).exists());
         assert!(dir.path().join(".pending-not-hex").exists());
     }
+
+    #[test]
+    fn staged_parent_replacement_cannot_redirect_commit() {
+        let (dir, fd) = root();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("score.txt"), "outside secret").unwrap();
+        let staged = stage_write(fd.as_fd(), "round/score.txt", "updated", 4096).unwrap();
+        std::fs::rename(dir.path().join("round"), dir.path().join("retired")).unwrap();
+        symlink(outside.path(), dir.path().join("round")).unwrap();
+        staged.commit(None).unwrap();
+        assert_eq!(std::fs::read(outside.path().join("score.txt")).unwrap(), b"outside secret");
+        assert_eq!(std::fs::read(dir.path().join("retired/score.txt")).unwrap(), b"updated");
+        assert!(read(fd.as_fd(), "round/score.txt").is_err());
+    }
+
+    #[test]
+    fn target_link_inserted_after_staging_cannot_redirect_commit() {
+        for hard in [false, true] {
+            let (dir, fd) = root();
+            let outside = tempfile::tempdir().unwrap();
+            let secret = outside.path().join("secret");
+            std::fs::write(&secret, "outside secret").unwrap();
+            let staged = stage_write(fd.as_fd(), "score.txt", "updated", 4096).unwrap();
+            let target = dir.path().join("score.txt");
+            if hard { std::fs::hard_link(&secret, &target).unwrap(); }
+            else { symlink(&secret, &target).unwrap(); }
+            staged.commit(None).unwrap();
+            assert_eq!(std::fs::read(&secret).unwrap(), b"outside secret");
+            assert_eq!(std::fs::read(&target).unwrap(), b"updated");
+            assert!(!target.is_symlink());
+        }
+    }
+
+
 }

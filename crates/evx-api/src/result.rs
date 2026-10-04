@@ -20,9 +20,18 @@ pub enum Status {
     /// A file commit was authorized but its outcome is unknown. Reconcile
     /// before retrying; never replay blindly.
     EffectUnknown,
-    /// A child could not be reaped within budget. The workspace lease stays
-    /// held until an operator resolves it.
+    /// A child could not be reaped within budget. All new child admission
+    /// stays stopped in this host process; affected workspace leases stay held.
+    /// Confirm prior children stopped before restarting the host.
     Quarantined,
+}
+
+/// Why a trusted host check stopped this invocation. Guest result frames do
+/// not contain this field; neither guest text nor later policy changes set it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostCancellation {
+    AuthorityChanged,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -62,6 +71,8 @@ pub struct RunResult {
     pub effective_limits: Option<Limits>,
     pub effect_outcome_unknown: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_cancellation: Option<HostCancellation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub trusted_observations: Option<Observations>,
     pub children: Vec<ChildReport>,
     #[serde(default)]
@@ -71,6 +82,20 @@ pub struct RunResult {
 }
 
 impl RunResult {
+    /// Preserve trusted cleanup and cancellation causes across refusals.
+    pub fn from_denial(error: crate::Denied) -> RunResult {
+        let quarantined = matches!(error, crate::Denied::Quarantined(_));
+        let cancelled = matches!(error, crate::Denied::Cancelled(_));
+        let mut result = Self::denied(error.to_string());
+        if quarantined {
+            result.status = Status::Quarantined;
+        }
+        if cancelled {
+            result.host_cancellation = Some(HostCancellation::AuthorityChanged);
+        }
+        result
+    }
+
     pub fn denied(error: impl Into<String>) -> RunResult {
         RunResult {
             status: Status::Denied,
@@ -86,6 +111,7 @@ impl RunResult {
             diagnostics: String::new(),
             effective_limits: None,
             effect_outcome_unknown: false,
+            host_cancellation: None,
             trusted_observations: None,
             children: Vec::new(),
             fuel_used: 0,

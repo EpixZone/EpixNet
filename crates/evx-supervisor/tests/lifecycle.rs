@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 //! Cancellation, commit authorization and workspace leases. Port of
 //! `test_supervisor_lifecycle.py`, including the supervisor-death fixture,
 //! which re-invokes this test binary as a controlled crashing supervisor.
@@ -127,6 +127,62 @@ fn direct_revocation_stops_pure_computation() {
         "{result:?}"
     );
     assert_eq!(result.broker_calls, 0);
+    assert_eq!(
+        result.host_cancellation,
+        Some(evx_api::HostCancellation::AuthorityChanged),
+        "{result:?}"
+    );
+    assert_clean_children(&f, &result);
+}
+
+#[test]
+fn terminal_worker_memory_follows_platform_attribution() {
+    use evx_api::frames::{decode_compiler_reply, FromCompiler, ToCompiler};
+
+    let f = fixture();
+    let (tx, rx) = mpsc::sync_channel(8);
+    let mut peer = Peer::spawn(&f.config, "compile", &f.workspace, Role::Compiler, tx, None).unwrap();
+    peer.send(&encode(&ToCompiler::CompileText {
+        source: calc().as_bytes().to_vec(),
+    }).unwrap()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        assert!(Instant::now() < deadline, "compiler did not return its artifact");
+        peer.flush_input().unwrap();
+        if let Ok(Event::Frame(_, _, frame)) = rx.recv_timeout(Duration::from_millis(10)) {
+            assert!(matches!(decode_compiler_reply(&frame).unwrap(), FromCompiler::Artifact { .. }));
+            break;
+        }
+    }
+    // No live measurement was taken. Only the kernel's terminal usage can
+    // supply this result, as when cancellation wins the first sample race.
+    assert_eq!(peer.last_rss, None);
+    peer.close(Duration::from_millis(50), Duration::from_secs(1)).unwrap();
+    assert!(peer.max_cpu > 0.0);
+    #[cfg(target_os = "macos")]
+    assert!(peer.last_rss.is_some_and(|rss| rss > 0), "terminal RSS was lost");
+    // Linux wait4 can include inherited parent memory. Without a live
+    // post-exec sample, memory must remain unobserved instead of misattributed.
+    #[cfg(target_os = "linux")]
+    assert_eq!(peer.last_rss, None, "inherited RSS was attributed to the worker");
+}
+
+#[test]
+fn lowering_active_cpu_budget_stops_pure_computation() {
+    let f = fixture();
+    let changed_at = std::sync::Mutex::new(None);
+    let result = run_cancellable(&f, RunOptions::default(), || {
+        std::thread::sleep(Duration::from_millis(300));
+        let mut limits = f.broker.limits();
+        limits.process_cpu_seconds = 0.05;
+        *changed_at.lock().unwrap() = Some(Instant::now());
+        f.broker.set_limits(limits).unwrap();
+    });
+    assert!(
+        changed_at.lock().unwrap().unwrap().elapsed() < Duration::from_millis(600),
+        "stale active limits: {result:?}"
+    );
+    assert_eq!(result.status, Status::ResourceLimit, "{result:?}");
     assert_clean_children(&f, &result);
 }
 
@@ -218,6 +274,11 @@ fn revocation_at_commit_preserves_existing_file() {
         .events
         .contains(&"file_commit_authorized".to_string()));
     assert!(!result.effect_outcome_unknown);
+    assert_eq!(
+        result.host_cancellation,
+        Some(evx_api::HostCancellation::AuthorityChanged),
+        "{result:?}"
+    );
     assert_eq!(std::fs::read_to_string(&target).unwrap(), "old");
     assert_clean_children(&f, &result);
     f.broker.with_grant(|g| {
@@ -264,7 +325,7 @@ fn lease_supervisor(workspace: &Path) {
         rustix::fs::FlockOperation::NonBlockingLockExclusive,
     )
     .expect("lease");
-    let (tx, rx) = mpsc::channel();
+    let (tx, rx) = mpsc::sync_channel(8);
     let lease_fd = rustix::fd::AsRawFd::as_raw_fd(&broker.root_fd());
     let config = config();
     let mut helper =
@@ -284,7 +345,7 @@ fn lease_supervisor(workspace: &Path) {
     helper.send(&init).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        if let Ok(Event::Frame(_, body)) = rx.recv_timeout(Duration::from_millis(20)) {
+        if let Ok(Event::Frame(_, _, body)) = rx.recv_timeout(Duration::from_millis(20)) {
             if String::from_utf8_lossy(&body).contains("fault_entered") {
                 println!("{}", helper.pid);
                 let mut line = String::new();
@@ -361,4 +422,281 @@ fn inherited_lease_survives_supervisor_death() {
     let recovered = run_guest(&f.config, &artifact, &f.broker, RunOptions::default());
     assert_eq!(recovered.value, Some(42), "{recovered:?}");
     assert!(!f.workspace.join("never-committed.txt").exists());
+}
+
+#[test]
+fn cpu_budget_above_three_seconds_is_honored() {
+    let f = fixture();
+    let mut limits = lifecycle_limits();
+    limits.fuel = 1_000_000_000_000;
+    limits.process_cpu_seconds = 3.2;
+    limits.wall_seconds = 8.0;
+    f.broker.set_limits(limits).unwrap();
+    let artifact = compile_ok(&f.config, infinite_loop());
+    let result = run_guest(&f.config, &artifact, &f.broker, Default::default());
+    assert_eq!(
+        result.status,
+        Status::ResourceLimit,
+        "premature fixed CPU cap: {result:?}"
+    );
+    assert!(
+        result.trusted_observations.as_ref().unwrap().cpu_seconds >= 3.2,
+        "{result:?}"
+    );
+    assert_clean_children(&f, &result);
+}
+
+#[test]
+fn lowering_active_guest_memory_or_fuel_cancels_computation() {
+    for memory in [false, true] {
+        let f = fixture();
+        let changed_at = std::sync::Mutex::new(None);
+        let result = run_cancellable(&f, Default::default(), || {
+            std::thread::sleep(Duration::from_millis(300));
+            let mut limits = f.broker.limits();
+            if memory {
+                limits.memory_bytes = 65_536;
+            } else {
+                limits.fuel = 1;
+            }
+            *changed_at.lock().unwrap() = Some(Instant::now());
+            f.broker.set_limits(limits).unwrap();
+        });
+        assert!(
+            changed_at.lock().unwrap().unwrap().elapsed() < Duration::from_millis(600),
+            "stale guest limits (memory={memory}): {result:?}"
+        );
+        assert_eq!(result.status, Status::ResourceLimit, "{result:?}");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .unwrap_or("")
+                .contains("guest limits lowered"),
+            "{result:?}"
+        );
+        assert_clean_children(&f, &result);
+    }
+}
+
+#[test]
+fn read_helper_has_no_native_write_authority() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("read.txt"), "fixture").unwrap();
+    let result = f.run_with(
+        &read_wat("read.txt"),
+        RunOptions {
+            file_fault: Some(HelperFault::ReadOnlyWriteProbe),
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.status, Status::Ok, "{result:?}");
+    assert!(
+        !f.workspace.join("read-only-native-probe.txt").exists(),
+        "read helper could write directly: {result:?}"
+    );
+    assert_eq!(
+        result.responses,
+        vec![evx_api::Response::error("native write denied")]
+    );
+    assert_clean_children(&f, &result);
+}
+
+fn two_reads_wat(path: &str) -> String {
+    let request = serde_json::json!({"op":"workspace.read", "path":path});
+    let len = serde_json::to_vec(&request).unwrap().len();
+    call_wat(&request).replace("call $call))", &format!("call $call drop i32.const 0 i32.const {len} i32.const 4096 i32.const 4096 call $call))"))
+}
+
+fn late_helper_event(kind: u8) {
+    use evx_api::frames::FromHelper;
+    use evx_supervisor::process::Stream;
+    use std::sync::atomic::AtomicU64;
+    let f = fixture();
+    let mut limits = lifecycle_limits();
+    limits.host_call_seconds = 0.2;
+    f.broker.set_limits(limits).unwrap();
+    let write = f.run(&write_wat("state.txt", "current"));
+    assert_eq!(write.status, Status::Ok, "{write:?}");
+    let previous = Arc::new(AtomicU64::new(0));
+    let saved = previous.clone();
+    let result = f.run_with(
+        &two_reads_wat("state.txt"),
+        RunOptions {
+            file_fault: Some(HelperFault::BlockBeforeOperation),
+            file_fault_once: true,
+            after_helper_spawn: Some(Box::new(move |call, id, tx| {
+                if call == 1 {
+                    saved.store(id, Ordering::SeqCst);
+                }
+                if call == 2 {
+                    let old = saved.load(Ordering::SeqCst);
+                    assert_ne!(old, id);
+                    let event = match kind {
+                        0 => Event::Frame(
+                            Role::File,
+                            old,
+                            serde_json::to_vec(&FromHelper::FileResult {
+                                response: evx_api::Response::error("retired response"),
+                            })
+                            .unwrap(),
+                        ),
+                        1 => Event::Frame(
+                            Role::File,
+                            old,
+                            serde_json::to_vec(&FromHelper::Prepared).unwrap(),
+                        ),
+                        _ => Event::Closed(
+                            Role::File,
+                            old,
+                            Stream::Stdout,
+                            Some("retired protocol error"),
+                        ),
+                    };
+                    tx.send(event).unwrap();
+                }
+            })),
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        result.status,
+        Status::Ok,
+        "retired event changed current invocation: {result:?}"
+    );
+    assert_eq!(result.responses.len(), 2, "{result:?}");
+    assert!(!result.responses[0].is_ok());
+    assert_eq!(
+        result.responses[1],
+        evx_api::Response::Read {
+            ok: true,
+            bytes: 7,
+            data_b64: "Y3VycmVudA==".into()
+        },
+        "{result:?}"
+    );
+    assert!(
+        !result
+            .events
+            .contains(&"file_commit_authorized".to_string()),
+        "retired Prepared authorized a commit: {result:?}"
+    );
+    assert_clean_children(&f, &result);
+}
+
+#[test]
+fn late_helper_result_cannot_replace_current_response() {
+    late_helper_event(0);
+}
+#[test]
+fn late_helper_prepared_cannot_authorize_current_commit() {
+    late_helper_event(1);
+}
+#[test]
+fn late_helper_protocol_error_cannot_abort_replacement() {
+    late_helper_event(2);
+}
+
+fn unconfirmed_cleanup(commit: bool) {
+    const CHILD: &str = "EVX_HELPER_QUARANTINE_FIXTURE";
+    if std::env::var_os(CHILD).is_none() {
+        let test = if commit {
+            "unconfirmed_commit_cleanup_preserves_effect_uncertainty"
+        } else {
+            "unconfirmed_helper_cleanup_quarantines_the_workspace"
+        };
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--nocapture"])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let f = fixture();
+    let artifact = compile_ok(&f.config, calc());
+    let mut limits = lifecycle_limits();
+    limits.host_call_seconds = 0.2;
+    f.broker.set_limits(limits).unwrap();
+    let result = f.run_with(
+        &write_wat("pending.txt", "fixture"),
+        RunOptions {
+            file_fault: Some(if commit {
+                HelperFault::BlockAfterAuthorization
+            } else {
+                HelperFault::BlockBeforeOperation
+            }),
+            // Inject an unconfirmed first reap. Final cleanup still kills the
+            // sacrificial child; no real unkillable OS task is created.
+            fail_file_cleanup: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        result.status,
+        Status::Quarantined,
+        "cleanup uncertainty escaped bookkeeping: {result:?}"
+    );
+    assert!(f.broker.quarantined());
+    assert_eq!(result.effect_outcome_unknown, commit, "{result:?}");
+    assert!(
+        result.children.iter().any(|child| child.role == "file"),
+        "untracked helper: {result:?}"
+    );
+    let mut config = f.config.clone();
+    config.worker_binary = std::path::PathBuf::from("/missing-evx-quarantine-fixture");
+    let other = fixture();
+    let denied = run_guest(&config, &artifact, &other.broker, RunOptions::default());
+    assert_eq!(
+        denied.status,
+        Status::Quarantined,
+        "other workspace admitted: {denied:?}"
+    );
+    assert!(!denied.worker_started);
+    let compiler = evx_supervisor::compile_module(&config, &[0]);
+    assert!(compiler.unwrap_err().to_string().contains("quarantin"));
+}
+#[test]
+fn unconfirmed_helper_cleanup_quarantines_the_workspace() {
+    unconfirmed_cleanup(false);
+}
+#[test]
+fn unconfirmed_commit_cleanup_preserves_effect_uncertainty() {
+    unconfirmed_cleanup(true);
+}
+
+#[test]
+fn read_helper_cannot_request_commit_authority() {
+    let f = fixture();
+    std::fs::write(f.workspace.join("state.txt"), "current").unwrap();
+    let result = f.run_with(
+        &read_wat("state.txt"),
+        RunOptions {
+            after_helper_spawn: Some(Box::new(|_, id, tx| {
+                tx.send(Event::Frame(
+                    Role::File,
+                    id,
+                    serde_json::to_vec(&evx_api::frames::FromHelper::Prepared).unwrap(),
+                ))
+                .unwrap();
+            })),
+            ..Default::default()
+        },
+    );
+    assert_eq!(result.status, Status::Error, "{result:?}");
+    assert!(
+        !result
+            .events
+            .contains(&"file_commit_authorized".to_string()),
+        "{result:?}"
+    );
+    assert!(
+        !result.effect_outcome_unknown,
+        "read has no effect: {result:?}"
+    );
 }

@@ -358,6 +358,37 @@ pub(crate) fn revoke_xite_rows(conn: &Connection, xite: &str) -> Result<()> {
 }
 
 impl DurableState {
+    /// Change only limits while preserving the current consent and authority.
+    /// A stale management caller must not reconstruct and restore a grant
+    /// that was revoked or replaced while its request was in flight.
+    pub fn set_xite_limits(&self, xite: &str, limits: &Limits) -> Result<Generations> {
+        identifier(xite)?;
+        limits
+            .validate()
+            .map_err(|denied| Error::Invalid(denied.to_string()))?;
+        let encoded = encode(limits)?;
+        transaction(&self.path, |conn| {
+            let grant =
+                load_xite_grant(conn, xite)?.ok_or_else(|| Error::denied("xite grant missing"))?;
+            let policy = load_grant(conn, xite)?
+                .ok_or_else(|| Error::conflict("xite grant without a policy row"))?;
+            let limits_generation = policy.limits_generation + u64::from(grant.limits != *limits);
+            conn.execute(
+                "UPDATE xite_grants SET limits=?1 WHERE xite=?2",
+                params![encoded, xite],
+            )?;
+            conn.execute(
+                "UPDATE grants SET limits_generation=?1 WHERE xite=?2",
+                params![limits_generation, xite],
+            )?;
+            Ok(Generations {
+                generation: policy.generation,
+                limits_generation,
+                schema_generation: policy.schema_generation,
+            })
+        })
+    }
+
     /// Store or replace the persistent grant for `grant.xite` and derive the
     /// Milestone 1 policy row from it in the same transaction.
     ///

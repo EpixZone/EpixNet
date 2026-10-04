@@ -41,7 +41,9 @@
 //! ([`DurableState::occurrence_id`]), reserved with
 //! [`DurableState::claim_occurrence`] and completed with
 //! [`DurableState::finish_occurrence`], so every fence above applies to it
-//! unchanged and the same occurrence can never execute twice.
+//! unchanged. A recovery rotates the worker token, but cannot undo effects
+//! made before a crash. The host must reconcile a started execution before
+//! replaying work with non-transactional effects.
 
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
@@ -86,10 +88,15 @@ pub use xite::{
 /// `checkpoints`; databases written before the version was recorded read as
 /// 0 and are treated as 1). Version 2 adds `xite_grants`, `allow_once` and
 /// `runs`. Version 3 adds `jobs` and `daily_runs`. Version 4 adds the
-/// `occurrence` and `trigger` columns of `runs`. [`DurableState::open`]
+/// `occurrence` and `trigger` columns of `runs`. Version 5 adds retained job
+/// replay guards. Version 6 records whether guest execution started.
+/// Version 7 retains reconciliation guards across job removal.
+/// Version 8 retains host pause and enable controls across job removal.
+/// Version 9 fences workspace recovery against later job management actions.
+/// [`DurableState::open`]
 /// applies every step up to this version with `IF NOT EXISTS` statements
 /// and guarded `ADD COLUMN`s only, so an older file keeps all of its rows.
-pub const SCHEMA_VERSION: u32 = 4;
+pub const SCHEMA_VERSION: u32 = 9;
 
 /// Most invocations or outbox rows retained per xite, and most receipts or
 /// published entries retained by the mock destination.
@@ -371,6 +378,9 @@ pub struct InvocationRow {
     pub response: Option<Value>,
     /// Digest of the whole committed result, if any.
     pub commit_digest: Option<String>,
+    /// Whether the host durably admitted guest execution. A true value
+    /// survives recovery and means non-transactional effects may have run.
+    pub execution_started: bool,
 }
 
 /// An outbox row as stored.
@@ -453,7 +463,7 @@ CREATE TABLE IF NOT EXISTS checkpoints (
 const GRANT_COLUMNS: &str = "xite, enabled, generation, limits_generation, schema_generation, \
                              budget_limit, used, publication_prefix";
 const INVOCATION_COLUMNS: &str = "xite, occurrence, token, generation, schema_generation, \
-                                  request_digest, cost, status, response, commit_digest";
+                                  request_digest, cost, status, response, commit_digest, execution_started";
 const OUTBOX_COLUMNS: &str = "xite, effect_key, generation, schema_generation, envelope, \
                               payload_digest, status, response";
 
@@ -524,6 +534,7 @@ fn invocation_row(row: &rusqlite::Row<'_>) -> Result<InvocationRow> {
         status: InvocationStatus::parse(&row.get::<_, String>(7)?)?,
         response: parse_json(row.get(8)?)?,
         commit_digest: row.get(9)?,
+        execution_started: row.get(10)?,
     })
 }
 
@@ -676,7 +687,7 @@ pub(crate) fn begin_in_at(
     conn.execute(
         &format!(
             "INSERT INTO invocations ({INVOCATION_COLUMNS}) \
-             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL)"
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,NULL,NULL,0)"
         ),
         params![
             xite,
@@ -924,7 +935,10 @@ impl DurableState {
     /// Migration is additive only (`CREATE ... IF NOT EXISTS`, and an `ADD
     /// COLUMN` run only when the column is missing), runs inside one `BEGIN
     /// IMMEDIATE` transaction with the version bump, and never touches
-    /// existing rows. A file whose `user_version` is newer than this build
+    /// existing authority or budget values. Older incomplete reservations
+    /// have an unknown execution phase and migrate as already started, so
+    /// recovery cannot assume they are safe to replay. A file whose
+    /// `user_version` is newer than this build
     /// is an [`Error::Conflict`]: reading it with older assumptions could
     /// silently drop authority this build does not know about.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
@@ -951,6 +965,31 @@ impl DurableState {
         if !has_trigger {
             conn.execute_batch(xite::SCHEMA_V4_RUN_COLUMNS)?;
         }
+        conn.execute_batch(jobs::SCHEMA_V5)?;
+        if version < 5 {
+            jobs::seed_job_guards(&conn)?;
+        }
+        let has_execution_started = conn
+            .prepare("PRAGMA table_info(invocations)")?
+            .query_map([], |row| row.get::<_, String>(1))?
+            .collect::<std::result::Result<Vec<String>, _>>()?
+            .iter()
+            .any(|column| column == "execution_started");
+        if !has_execution_started {
+            conn.execute_batch(
+                "ALTER TABLE invocations ADD COLUMN execution_started INTEGER NOT NULL DEFAULT 0; \
+                 UPDATE invocations SET execution_started=1 WHERE status='running';",
+            )?;
+        }
+        conn.execute_batch(jobs::SCHEMA_V7)?;
+        if version < 7 {
+            jobs::seed_reconciliation(&conn)?;
+        }
+        conn.execute_batch(jobs::SCHEMA_V8)?;
+        if version < 8 {
+            jobs::seed_job_controls(&conn)?;
+        }
+        conn.execute_batch(jobs::SCHEMA_V9)?;
         conn.execute_batch(&format!("PRAGMA user_version={SCHEMA_VERSION};COMMIT;"))?;
         Ok(state)
     }
@@ -1079,9 +1118,41 @@ impl DurableState {
         })
     }
 
+    /// Durably record admission immediately before guest execution can start.
+    ///
+    /// The token and both generations must still match a running reservation.
+    /// Repeating this for the same live handle is harmless. This is a phase
+    /// marker, not a commit of guest effects or permission to replay them.
+    pub fn mark_execution_started(&self, invocation: &Invocation) -> Result<()> {
+        transaction(&self.path, |conn| {
+            let row = load_invocation(conn, &invocation.xite, &invocation.occurrence)?
+                .ok_or_else(|| Error::conflict("invocation missing"))?;
+            if row.token != invocation.token
+                || row.generation != invocation.generation
+                || row.schema_generation != invocation.schema_generation
+                || row.status != InvocationStatus::Running
+            {
+                return Err(Error::conflict("stale invocation admission"));
+            }
+            allowed(
+                conn,
+                &row.xite,
+                Some(row.generation),
+                Some(row.schema_generation),
+                xite::now_unix()?,
+            )?;
+            conn.execute(
+                "UPDATE invocations SET execution_started=1 WHERE xite=?1 AND occurrence=?2",
+                params![row.xite, row.occurrence],
+            )?;
+            Ok(())
+        })
+    }
+
     /// Host-only fencing after establishing that the old worker has stopped:
     /// rotates the token so the old handle can no longer commit, without
-    /// making a new reservation.
+    /// making a new reservation. Preserves `execution_started`: the host must
+    /// reconcile possibly applied effects before replaying started work.
     pub fn recover(&self, invocation: &Invocation) -> Result<Invocation> {
         transaction(&self.path, |conn| {
             allowed(

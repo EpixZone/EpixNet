@@ -3,6 +3,15 @@
 # Test install/reinstall/remove and preserve a user-data sentinel. This tests
 # the loaders and packaging; GUI startup has a separate Xvfb smoke test.
 set -euo pipefail
+
+check_evx_worker() {
+    local worker="$1/evx-worker"
+    if [[ ! -f "$worker" || ! -x "$worker" || -L "$worker" ]]; then
+        echo "EVX worker missing or invalid: $worker" >&2
+        return 1
+    fi
+}
+
 case "${1:?expected deb, rpm-fedora, appimage-suse or appimage}" in
   deb)
     export DEBIAN_FRONTEND=noninteractive
@@ -36,11 +45,13 @@ case "${1:?expected deb, rpm-fedora, appimage-suse or appimage}" in
     EPIX_DATA_DIR=/tmp/epix-loader-test ./EpixNet.AppImage --appimage-extract-and-run --quit
     ./EpixNet.AppImage --appimage-extract >/dev/null
     ./squashfs-root/usr/bin/firefox/appimage-firefox --headless --version
+    check_evx_worker ./squashfs-root/usr/bin
     echo 'PASS: AppImage extraction, launcher, and Firefox loader checks'
     exit 0
     ;;
   *) echo "Unknown test format: $1" >&2; exit 2 ;;
 esac
+check_evx_worker /opt/epixnet
 desktop-file-validate /usr/share/applications/epix.desktop
 EPIX_DATA_DIR=/tmp/epix-loader-test epix-browser --quit
 /opt/epixnet/firefox/firefox --headless --version
@@ -54,5 +65,6 @@ printf 'keep user data\n' > /root/.local/share/EpixNet/package-test-sentinel
 "${remove[@]}"
 test -f /root/.local/share/EpixNet/package-test-sentinel
 test ! -e /opt/epixnet/epix-browser
+test ! -e /opt/epixnet/evx-worker
 test ! -e /usr/share/applications/epix.desktop
 echo 'PASS: install, reinstall, loader checks, removal, and user-data preservation'

@@ -25,7 +25,7 @@
 //! claim rule already enforces, so the policies need no code here.
 //!
 //! Recovery runs once, at the first tick with the plugin enabled: a
-//! reservation left open by an earlier process is run again under the same
+//! reservation left open before guest admission is run under the same
 //! identity when its slot is still the current one (`DurableState::recover`
 //! rotates its fencing token so the dead worker could not commit even if it
 //! were alive), and finished as `abandoned` when the slot has passed, so
@@ -40,6 +40,9 @@
 //! in flight), or whose job is paused, is closed as abandoned without the
 //! fence (`DurableState::abandon`) rather than left open for every later
 //! start to trip over.
+//! A reservation whose guest was admitted may already have changed its
+//! workspace. Recovery closes it as `effect_unknown` and atomically pauses
+//! the job for reconciliation, even if its slot has passed.
 
 use std::collections::{HashMap, HashSet};
 use std::collections::hash_map::RandomState;
@@ -62,11 +65,8 @@ use crate::service::{
 };
 use crate::PLUGIN_NAME;
 
-/// How often the task re-reads the plugin switch while the plugin is
-/// disabled. `AppState::set_plugin_enabled` has no hook a plugin can
-/// subscribe to, so the "plugin enabled" wake of the spec is a poll at this
-/// interval: two seconds is prompt for a person flipping a switch and costs
-/// one config read.
+/// Backup policy polling while disabled. Configuration changes also wake
+/// the dedicated watch, including when there are no registered jobs.
 pub const DISABLED_POLL: u64 = 2;
 
 /// A content change for a xite with jobs wakes the scheduler this long
@@ -371,6 +371,7 @@ pub(crate) struct TaskState {
 pub(crate) async fn run(service: Arc<EvxService>, app: Arc<AppState>) {
     let scheduler = &service.scheduler;
     let mut events = app.subscribe_events();
+    let mut plugin_changes = app.subscribe_plugin_changes();
     let mut events_open = true;
     let mut job_xites: Vec<String> = Vec::new();
     let mut coalesce: Option<Instant> = None;
@@ -402,6 +403,9 @@ pub(crate) async fn run(service: Arc<EvxService>, app: Arc<AppState>) {
             (timer, coalesce) => timer.or(coalesce),
         };
         tokio::select! {
+            _ = plugin_changes.changed() => {
+                tick_due = true;
+            }
             _ = scheduler.notify.notified() => {
                 tick_due = true;
             }
@@ -489,7 +493,7 @@ async fn tick(service: &Arc<EvxService>, app: &Arc<AppState>, now: u64, task: &m
     let mut held_xites = launch_recovered(service, app, &mut task.recovered, now, &mut hints).await;
     held_xites.extend(task.recovered.iter().map(|occurrence| occurrence.row.xite.clone()));
     reinspect(service, app, now, task, &mut hints).await;
-    if service.execution().is_err() {
+    if service.execution_ready().is_err() {
         return hints.into_iter().min();
     }
     let now = now_unix().unwrap_or(now);
@@ -921,6 +925,21 @@ async fn recover(
                 break;
             }
         };
+        if open.execution_started {
+            let message = "execution was interrupted after admission; reconcile workspace effects before resuming";
+            match service.state.abandon_uncertain(&invocation, message) {
+                Ok(()) => {
+                    app.log("WARN", format!("EVX recovery: {} of {} requires reconciliation", open.occurrence, open.xite)).await;
+                    if let Some(row) = &row {
+                        record_closed(service, app, row, &open.occurrence, "effect_unknown", message, now).await;
+                    }
+                }
+                Err(error) => {
+                    app.log("ERROR", format!("EVX recovery: {} of {} could not be paused: {error}", open.occurrence, open.xite)).await;
+                }
+            }
+            continue;
+        }
         let current = row
             .as_ref()
             .and_then(|row| DurableState::slot_at(&row.schedule, now).ok())
@@ -1015,6 +1034,12 @@ async fn close_abandoned(
 /// became of it next to the runs that happened. Nothing ran, so the
 /// artifact is the digest of nothing and the input the canonical `null`.
 async fn record_abandoned(service: &EvxService, app: &AppState, row: &JobRow, occurrence: &str, message: &str, now: u64) {
+    record_closed(service, app, row, occurrence, ABANDONED, message, now).await;
+}
+
+// No artifact or telemetry survives an interrupted process. The empty digest
+// denotes unavailable provenance, not evidence that the guest did no work.
+async fn record_closed(service: &EvxService, app: &AppState, row: &JobRow, occurrence: &str, status: &str, message: &str, now: u64) {
     let input = evx_state::canonical(&Value::Null)
         .map(|canonical| evx_state::digest(&canonical))
         .unwrap_or_default();
@@ -1025,7 +1050,7 @@ async fn record_abandoned(service: &EvxService, app: &AppState, row: &JobRow, oc
         declaration_digest: row.declaration_digest.clone(),
         artifact_sha256: hex::encode(Sha256::digest(b"")),
         input_digest: input,
-        status: ABANDONED.to_string(),
+        status: status.to_string(),
         message: Some(bounded_message(message)),
         cpu_seconds: 0.0,
         peak_rss: 0,
@@ -1061,6 +1086,29 @@ mod tests {
         let app = AppState::new("test");
         let service = Arc::new(EvxService::for_node(&app, None).unwrap());
         (service, app)
+    }
+
+    #[tokio::test]
+    async fn disabling_the_plugin_wakes_an_idle_scheduler_and_revokes_a_manual_run() {
+        let (service, app) = service();
+        let workspace = service.workspace_dir("1ManualRun");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let grant = evx_api::Grant::new("1ManualRun", true).unwrap();
+        let broker = Arc::new(evx_supervisor::Broker::new(&workspace, grant, Limits::default()).unwrap());
+        service.running.lock().unwrap().insert("1ManualRun".into(), broker.clone());
+        let task = tokio::spawn(run(service.clone(), app.clone()));
+        while service.scheduler_ticks() == 0 {
+            tokio::task::yield_now().await;
+        }
+        app.set_plugin_enabled(PLUGIN_NAME, false).await;
+        let stopped = tokio::time::timeout(Duration::from_secs(3), async {
+            while broker.grant().enabled {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }).await;
+        service.shutdown();
+        task.await.unwrap();
+        assert!(stopped.is_ok(), "plugin disable never woke a scheduler with no jobs");
     }
 
     fn grant(service: &EvxService, xite: &str) {
@@ -1118,6 +1166,27 @@ mod tests {
 
     fn job_row(service: &EvxService, xite: &str) -> JobRow {
         service.state.jobs(xite).unwrap().remove(0)
+    }
+
+    #[tokio::test]
+    async fn recovery_never_replays_an_occurrence_that_may_have_written_before_crashing() {
+        for offset in [10, PERIOD + 10] {
+            let (service, app) = service();
+            let row = granted_job(&service, "1InterruptedWrite");
+            let open = reserve(&service, &row, T + 5);
+            service.state.mark_execution_started(&open).unwrap();
+            let workspace = service.workspace_dir(&row.xite);
+            std::fs::create_dir_all(&workspace).unwrap();
+            std::fs::write(workspace.join("score.txt"), "1").unwrap();
+            // The previous process died after a write, before its result was
+            // committed. Neither a current nor an expired slot proves that
+            // repeating that invocation would be safe.
+            let recovered = recover(&service, &app, || Ok(T + offset)).await;
+            assert!(recovered.is_empty(), "an admitted guest was scheduled again");
+            assert_eq!(job_row(&service, &row.xite).paused_reason.as_deref(), Some("reconcile_required"));
+            assert_eq!(response(&service, &row.xite, &open.occurrence).unwrap()["status"], "effect_unknown");
+            assert_eq!(std::fs::read_to_string(workspace.join("score.txt")).unwrap(), "1");
+        }
     }
 
     #[tokio::test]

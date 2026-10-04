@@ -1,0 +1,26 @@
+{
+  "declaration": {
+    "entries": 1569,
+    "bytes": 276269,
+    "archive": "declaration-corpus.tar.gz",
+    "sha256": "aae267583662c9da980ee986a37feaaf5c02cf66c8c44563e1ec8b0c0e413a3c"
+  },
+  "activation": {
+    "entries": 561,
+    "bytes": 38525,
+    "archive": "activation-corpus.tar.gz",
+    "sha256": "a857ddf457125b4efad74fba94abb4518a1469eaabf3c954fd8f9244af24b83c"
+  },
+  "wasm_profile": {
+    "entries": 5061,
+    "bytes": 243841,
+    "archive": "wasm_profile-corpus.tar.gz",
+    "sha256": "289fb96aa4018cb59dcfaf54aaba8edd11b18ed1d67e595dcb861f8ac0714c0c"
+  },
+  "ipc_frames": {
+    "entries": 1755,
+    "bytes": 486327,
+    "archive": "ipc_frames-corpus.tar.gz",
+    "sha256": "e8d7bada5ac60c060cc512ddcd8e95ce3787859058e2376adec74dc871d079a1"
+  }
+}

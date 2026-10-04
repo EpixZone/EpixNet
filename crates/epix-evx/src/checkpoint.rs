@@ -44,6 +44,20 @@ pub(crate) fn load(dir: &Path, xite: &str) -> Result<ActivationCheckpoint, Strin
 }
 
 /// Replace `xite`'s stored floor with `checkpoint`, atomically.
+/// The caller holds the workspace admission lease across this call.
+pub(crate) fn admit(dir: &Path, xite: &str, expected: &ActivationCheckpoint, candidate: &ActivationCheckpoint) -> Result<(), String> {
+    // Compilation happens before the lease is acquired. A second host using
+    // this data root may have admitted newer content during that interval.
+    if &load(dir, xite)? != expected {
+        return Err("activation checkpoint changed before admission; inspect and retry".into());
+    }
+    if candidate != expected {
+        store(dir, xite, candidate)?;
+    }
+    Ok(())
+}
+
+/// Write one checkpoint while the caller owns its admission lease.
 pub(crate) fn store(dir: &Path, xite: &str, checkpoint: &ActivationCheckpoint) -> Result<(), String> {
     let path = path(dir, xite);
     let tmp = dir.join(format!("{xite}.json.tmp-{}", std::process::id()));
@@ -70,6 +84,17 @@ pub(crate) fn store(dir: &Path, xite: &str, checkpoint: &ActivationCheckpoint) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn another_hosts_newer_admission_cannot_be_overwritten_by_a_stale_loader() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale_floor = load(dir.path(), "xite-a").unwrap();
+        let newer = ActivationCheckpoint::new(2, Some("bb".repeat(32)));
+        store(dir.path(), "xite-a", &newer).unwrap();
+        let older = ActivationCheckpoint::new(1, Some("aa".repeat(32)));
+        assert!(admit(dir.path(), "xite-a", &stale_floor, &older).is_err());
+        assert_eq!(load(dir.path(), "xite-a").unwrap(), newer);
+    }
 
     #[test]
     fn a_missing_file_is_the_empty_floor_and_a_stored_one_round_trips() {

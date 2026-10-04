@@ -3,7 +3,7 @@
 Milestone 2 (`docs/evx-milestone-2.md`) runs a declared program when the
 user or the operator says so. Milestone 3 makes a declared job run on its
 schedule inside the node, with no xite page open and across node restarts,
-without ever running the same logical occurrence twice. It implements the
+with durable occurrence identities and conservative crash recovery. It implements the
 plan's sections "Local execution and durable schedules", "Background task
 lifecycle", "Scheduling, budgets and native work" and "Required idempotency
 and recovery" for the desktop node. OS wake on mobile (WorkManager,
@@ -11,8 +11,8 @@ BGTaskScheduler), publication, streams and chain operations stay out.
 
 Rules, one line each: a schedule is persisted, not a thread; an occurrence
 identity is reserved before a worker starts and completed atomically with
-its result; a restart, a reconnecting page and a manual run never create a
-second execution of the same occurrence; a missed interval is skipped or
+its result; a reconnecting page and a manual run share the same reserved slot; an
+interrupted admitted guest requires reconciliation before its job resumes; a missed interval is skipped or
 coalesced into one catch-up, never backfilled; grants, budgets and the
 plugin switch are rechecked at admission and a revocation stops queued
 work; a budget wait, a paused job and an unsupported host are visible
@@ -32,7 +32,7 @@ release-> worker gone, broker dropped, nothing resident; back to wait
 
 ## Components
 
-### 1. `crates/evx-state`: schedule model (additive schema, version 3)
+### 1. `crates/evx-state`: schedule model (additive, versioned schema)
 
 ```rust
 pub struct JobSpec { pub job: String, pub program: String, pub schedule: evx_declaration::Schedule /* serialised as JSON text */, pub max_concurrency: u32 }
@@ -45,7 +45,9 @@ impl DurableState {
     /// Replace a xite's registered jobs from its current verified declaration (keyed by digest). Jobs that vanished are removed; existing rows keep last_slot/failures.
     pub fn set_jobs(&self, xite: &str, declaration_digest: &str, jobs: &[JobSpec], now: u64) -> Result<()>;
     pub fn jobs(&self, xite: &str) -> Result<Vec<JobRow>>;
-    pub fn set_job_paused(&self, xite: &str, job: &str, reason: Option<&str>) -> Result<()>;       // None resumes
+    pub fn set_job_paused(&self, xite: &str, job: &str, reason: Option<&str>) -> Result<()>; // None cannot clear user/reconciliation pauses
+    pub fn job_management_revision(&self, xite: &str) -> Result<u64>;
+    pub fn resume_job_at_revision(&self, xite: &str, job: &str, revision: u64) -> Result<()>;
     /// Every job due at `now`: enabled, not paused, next_due <= now, grant enabled + allow_background + not expired, plugin not required here.
     pub fn due_jobs(&self, now: u64) -> Result<Vec<JobRow>>;
     /// The slot an interval schedule puts `now` in, honouring anchor and period; pure.
@@ -103,21 +105,37 @@ claimed and the job reports `clock_rollback` until time passes the slot.
   plugin disable and the queued-run recheck behave exactly as for run once.
 - Commit: `finish_occurrence` with the `RunResult` as the response; the
   `RunRecord` gains `occurrence: Option<String>` and `trigger: "once" |
-  "job" | "manual_job"`. On failure (`error`, `denied`, `timeout`,
-  `resource_limit`, `effect_unknown`) `failures += 1` and `next_due = max(next
-  slot, now + min(2^failures * 30 s, 6 h))`; `effect_unknown` also pauses the
-  job with `reconcile_required` (a user resumes it from status). Success
-  resets failures.
+  "job" | "manual_job"`. Task failures (`error`, `denied`, `timeout`,
+  `resource_limit`, `effect_unknown`, `quarantined`) increment `failures` and
+  set `next_due = max(next slot, now + min(2^failures * 30 s, 6 h))`.
+  Unknown effects or quarantine also pause the job with `reconcile_required`
+  until an explicit operator resume. Success resets failures. A proven
+  plugin-policy cancellation closes the occurrence without adding failure
+  backoff, resetting earlier failures, refunding spent budgets, or releasing
+  the claimed slot for reuse. Cancellation comes from an explicit host
+  policy check or a typed host cancellation cause, never a guest message or
+  a later configuration change alone. Unrelated failures retain normal
+  backoff; uncertain effects and quarantine always require reconciliation.
 - Recovery at start: `incomplete_occurrences` are examined once: an
-  occurrence whose slot is still current is run again under the same
-  identity (`DurableState::recover` rotates the fencing token); an older one
-  is finished as `{"status":"abandoned"}` so the schedule moves on and the
-  record says so. Reservations are never silently dropped.
+  reservation that never reached guest admission can run in its still-current
+  slot (`DurableState::recover` rotates its fencing token). An unstarted older
+  reservation is abandoned. Before guest startup, the host persists the
+  activation checkpoint and `execution_started` marker. Every interrupted
+  admitted reservation closes as `effect_unknown` and pauses the job atomically
+  for reconciliation, regardless of slot age. Publication and file effects are
+  not rolled back. A durable reconciliation guard survives publisher removal
+  and re-registration and only an explicit operator resume clears it.
 - Manual job run: `evxRunJob {xite, job}` (wrapper/operator only) claims the
   job's *current* slot occurrence, so a manual run and the scheduled run of
   that slot cannot both execute; a second request returns the stored result.
   `evxRunOnce {program}` keeps its own identity `once-<16 hex>` and does not
   touch the job's slot.
+- Request disconnect: cancelling the API request does not cancel its owned
+  execution or completion task. Keep the per-xite lock through worker cleanup
+  and durable occurrence completion, including an uncertain-effect pause.
+  Revocation, plugin disable and service shutdown still stop execution.
+  A queued request cannot replace a live broker or begin recovery before that
+  completion is persisted. A process crash retains the existing recovery rules.
 - Pause reasons owned by registration: `declaration_outgrew_grant`,
   `declaration_unavailable`, `content_incomplete`; cleared by the next
   verified inspection. A xite that fails inspection is rechecked on a content
@@ -128,14 +146,23 @@ claimed and the job reports `clock_rollback` until time passes the slot.
 - Status: `evxStatus` gains `jobs: [{job, program, schedule, enabled,
   paused_reason, next_due_unix, last_slot, last_occurrence, failures,
   runs_today, daily_limit}]` and `scheduler: {enabled, busy_workers,
-  next_wake_unix, host: "macos"|"unsupported"}`; `evxInspect` lists the
+  next_wake_unix, host: "macos"|"linux"|"unsupported"}`; `evxInspect` lists the
   declared jobs as before. Run records expose `occurrence` and `trigger`.
 - Commands (wrapper/operator only, gated like the other EVX mutators in
   `EVX_WRAPPER_COMMANDS`): `evxJobPause {xite, job}`, `evxJobResume {xite,
   job}`, `evxRunJob {xite, job}`. The page may read status only.
+- Resume first reconciles pending workspace writes through confined read
+  helpers under the xite execution lock. Failed recovery leaves the pause.
+  A durable management revision prevents a later pause or disable, including
+  a repeated same-value action, from being cleared by an earlier recovery.
+  Interrupted manual writes use `evxRecoverWorkspace {xite}` through the
+  wrapper's explicit confirmation or operator API; it resumes no jobs.
 - Plugin disable (`set_plugin_enabled("Evx", false)`): the scheduler stops
   admitting at its next check (every tick starts with it), revokes the
-  brokers of running work, and the next enable wakes it.
+  brokers of running work. A dedicated configuration watch wakes it even
+  when there are no jobs or pending timers; enable also wakes it. Re-enable
+  permits a current or later eligible slot, respecting prior task-failure
+  backoff, spent budgets and reconciliation controls.
 
 ### 3. Wrapper (`ui/media/all.js`) and grant semantics
 
@@ -160,9 +187,11 @@ claimed and the job reports `clock_rollback` until time passes the slot.
   job run and a scheduled run of the same slot execute once; a page
   reconnect or restart does not create a second execution; a completed
   occurrence survives a reopen as completed.
-- Recovery: an incomplete occurrence of the current slot is retried once
-  under the same identity; an older incomplete one is finished as
-  abandoned; the daily budget is not reset by a reopen.
+- Recovery: an unstarted reservation of the current slot can run under the
+  same identity; an older unstarted one is abandoned. A previously admitted
+  guest is never automatically replayed. Its result and reconciliation pause
+  commit atomically, including across revocation and job removal. Replay
+  guards and budget history resist clock rollback after pruning.
 - Authority: no grant, grant without `allow_background`, expired grant,
   revoked grant, paused job, disabled plugin, and a declaration that
   outgrew its grant each admit nothing and show the reason in status; the

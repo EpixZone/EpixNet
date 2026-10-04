@@ -333,6 +333,21 @@ impl WsCommand for EvxRunJob {
     }
 }
 
+/// `evxRecoverWorkspace {xite?}`: explicitly reconcile interrupted manual
+/// writes. Requires the wrapper's explicit host management choice or operator
+/// authority, never the publisher xite's global permissions.
+pub struct EvxRecoverWorkspace;
+#[async_trait]
+impl WsCommand for EvxRecoverWorkspace {
+    fn name(&self) -> &'static str { "evxRecoverWorkspace" }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        require_wrapper_or_operator(s, self.name())?;
+        let params: XiteParams = object_params(p)?;
+        let xite = target_xite(s, params.xite.as_deref())?;
+        service(&s.state)?.recover_workspace(&s.state, &xite).await
+    }
+}
+
 /// Every command the plugin registers.
 pub fn all() -> Vec<Arc<dyn WsCommand>> {
     vec![
@@ -346,6 +361,7 @@ pub fn all() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(EvxJobPause),
         Arc::new(EvxJobResume),
         Arc::new(EvxRunJob),
+        Arc::new(EvxRecoverWorkspace),
     ]
 }
 

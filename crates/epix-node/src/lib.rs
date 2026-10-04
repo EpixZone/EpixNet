@@ -4869,10 +4869,15 @@ async fn serve(
     plugins.register(Arc::new(epix_plugins::ChannelPlugin));
     // EVX: the `evx*` commands and the grant store under private/evx. The
     // worker binary is resolved at start (EVX_WORKER, else beside this
-    // executable); without it, or off macOS, runs report `unsupported host`.
-    // Behind the `evx` feature: a download-only embedder leaves it out.
-    #[cfg(feature = "evx")]
+    // executable); without a usable worker, runs report `unsupported host`.
+    // Unsupported targets and download-only embedders omit the plugin.
+    #[cfg(all(feature = "evx", any(target_os = "macos", target_os = "linux"), not(all(target_os = "macos", feature = "apple-xpc"))))]
     plugins.register(Arc::new(epix_evx::EvxPlugin::default()));
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    match epix_evx::EvxPlugin::from_signed_apple_package() {
+        Ok(plugin) => plugins.register(Arc::new(plugin)),
+        Err(error) => state.log("ERROR", format!("EVX signed package unavailable: {error}")).await,
+    }
     let mut plugin_names: Vec<String> = plugins.names().iter().map(|s| s.to_string()).collect();
     plugin_names.extend(epix_ui::builtin_plugins().into_iter().map(String::from));
     plugin_names.sort();

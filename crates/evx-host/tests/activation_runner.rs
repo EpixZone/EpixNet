@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 //! Signed fixture programs execute through the real contained supervisor.
 //! Port of `test_activation_runner.py`, plus the two-phase admission fix.
 
@@ -23,11 +23,19 @@ fn worker_binary() -> PathBuf {
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut command = std::process::Command::new(cargo);
-        command.args(["build", "-p", "evx-worker"]).current_dir(manifest.join("../.."));
+        command
+            .args(["build", "-p", "evx-worker", "--locked"])
+            .current_dir(manifest.join("../.."));
+        if evx_runtime::engine::backend_name().starts_with("pulley") {
+            command.args(["--features", "evx-runtime/pulley"]);
+        }
         if !cfg!(debug_assertions) {
             command.arg("--release");
         }
-        assert!(command.status().expect("cargo build -p evx-worker").success());
+        assert!(command
+            .status()
+            .expect("cargo build -p evx-worker")
+            .success());
         let exe = std::env::current_exe().unwrap();
         let profile_dir = exe.parent().and_then(std::path::Path::parent).unwrap();
         std::fs::canonicalize(profile_dir.join("evx-worker")).unwrap()
@@ -243,7 +251,8 @@ fn xite_publisher_key_generation_and_profile_mismatches_deny() {
     let other_key = SigningKey::from_bytes(&rand::random::<[u8; 32]>())
         .verifying_key()
         .to_bytes();
-    let mutations: Vec<Box<dyn Fn(&mut Grant)>> = vec![
+    type GrantMutation = Box<dyn Fn(&mut Grant)>;
+    let mutations: Vec<GrantMutation> = vec![
         Box::new(|g| g.xite = "other-game".into()),
         Box::new(|g| g.publisher = Some("other-publisher".into())),
         Box::new(|g| g.generation = 2),
@@ -342,4 +351,169 @@ fn rollback_to_an_older_version_is_refused() {
     h.publish(CALC, 1, &[], true);
     assert_no_worker(&h.run());
     assert_eq!(h.loader.checkpoint().version, 2);
+}
+
+#[test]
+fn busy_workspace_does_not_advance_activation_floor() {
+    let mut h = Harness::new();
+    h.broker.lock().running = true;
+    let outcome = h.run();
+    h.broker.lock().running = false;
+    assert_eq!(outcome.result.status, Status::Denied, "{outcome:?}");
+    assert_eq!(
+        h.loader.checkpoint().version,
+        0,
+        "busy denial advanced the floor"
+    );
+    assert!(outcome.activation.is_none(), "{outcome:?}");
+}
+
+#[test]
+fn text_parsing_is_deferred_to_the_confined_compiler() {
+    let mut h = Harness::new();
+    h.publish("(module invalid syntax", 1, &[], false);
+    h.config.worker_binary = h.workspace.join("missing-compiler");
+    let outcome = h.run();
+    assert_no_worker(&outcome);
+    assert!(
+        outcome
+            .result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("worker launch failed"),
+        "text was parsed in the host: {outcome:?}"
+    );
+    assert_eq!(h.loader.checkpoint().version, 0);
+}
+
+#[test]
+fn revocation_cancels_an_active_compiler() {
+    let mut h = Harness::new();
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    assert!(std::process::Command::new(cargo)
+        .args(["build", "-p", "evx-supervisor", "--example", "hostile_peer"])
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
+        .status()
+        .unwrap()
+        .success());
+    let exe = std::env::current_exe().unwrap();
+    h.config.worker_binary = exe
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("examples/hostile_peer");
+    h.config.worker_args = vec!["unread_init".into()];
+    let changed = std::sync::Mutex::new(None);
+    let outcome = std::thread::scope(|scope| {
+        let broker = &h.broker;
+        let config = &h.config;
+        let loader = &mut h.loader;
+        let envelope = &h.envelope;
+        let artifacts = &h.artifacts;
+        let handle = scope.spawn(move || {
+            run_activation(
+                config,
+                loader,
+                envelope,
+                artifacts,
+                broker,
+                Default::default(),
+            )
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        *changed.lock().unwrap() = Some(std::time::Instant::now());
+        h.broker.revoke();
+        handle.join().unwrap()
+    });
+    assert!(
+        changed.lock().unwrap().unwrap().elapsed() < std::time::Duration::from_millis(600),
+        "compiler ignored revocation: {outcome:?}"
+    );
+    assert_no_worker(&outcome);
+    assert_eq!(
+        outcome.result.host_cancellation,
+        Some(evx_api::HostCancellation::AuthorityChanged)
+    );
+    assert_eq!(h.loader.checkpoint().version, 0);
+}
+
+#[test]
+fn host_binding_policy_changes_report_cancellation() {
+    let mut outcomes = Vec::new();
+    for change_generation in [false, true] {
+        let mut h = Harness::new();
+        if change_generation {
+            h.broker.with_grant(|grant| grant.generation += 1);
+        } else {
+            h.broker.revoke();
+        }
+        let outcome = h.run();
+        outcomes.push((
+            outcome.result.status,
+            outcome.result.host_cancellation,
+            outcome.result.worker_started,
+        ));
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                Status::Denied,
+                Some(evx_api::HostCancellation::AuthorityChanged),
+                false
+            );
+            2
+        ]
+    );
+}
+
+#[test]
+fn compiler_cleanup_uncertainty_stops_process_admission() {
+    const CHILD: &str = "EVX_COMPILER_QUARANTINE_FIXTURE";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "compiler_cleanup_uncertainty_stops_process_admission",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+    let mut h = Harness::new();
+    // Capture one valid artifact before the irreversible test-process latch.
+    let artifact =
+        evx_supervisor::compile_module(&h.config, &evx_runtime::text_to_binary(CALC).unwrap())
+            .unwrap();
+    h.config.fail_compiler_cleanup = true;
+    let first = h.run();
+    // A missing executable proves a later refusal happens before launch.
+    h.config.fail_compiler_cleanup = false;
+    h.config.worker_binary = PathBuf::from("/missing-evx-quarantine-fixture");
+    let second = h.run();
+    let other = Harness::new();
+    let guest =
+        evx_supervisor::run_guest(&h.config, &artifact, &other.broker, RunOptions::default());
+    assert_eq!(
+        (first.result.status, second.result.status, guest.status),
+        (
+            Status::Quarantined,
+            Status::Quarantined,
+            Status::Quarantined
+        ),
+        "first={first:?}, second={second:?}, guest={guest:?}"
+    );
+    assert!(!first.result.worker_started && !second.result.worker_started && !guest.worker_started);
+    assert!(second.result.error.unwrap().contains("quarantin"));
+    assert_eq!(h.loader.checkpoint().version, 0);
 }

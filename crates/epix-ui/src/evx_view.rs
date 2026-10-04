@@ -182,6 +182,12 @@ pub(crate) fn render(raw: &[u8], facts: &XiteFacts<'_>) -> Option<String> {
         if let Some(grant) = facts.grant {
             render_grant(&mut body, grant);
         }
+        body.push_str("<h3>Interrupted workspace writes</h3><p>Resume a paused job with \
+            <code>evxJobResume</code>. The node verifies pending writes before clearing its pause. \
+            For an interrupted manual run, use <code>evxRecoverWorkspace</code> through the \
+            local operator API, or request it from the xite and confirm in the wrapper. \
+            Recovery checks previously authorized contents without running a program or resuming jobs. \
+            Unrecognized file contents remain blocked.</p>");
     }
 
     Some(format!(
@@ -230,6 +236,9 @@ fn grant_is_enabled(grant: &Value) -> bool {
 fn grant_enabled(grant: Option<&Value>) -> Status {
     match grant {
         None => Status::bad("no: no grant is stored for this xite"),
+        Some(grant) if grant.get("expired") == Some(&Value::Bool(true)) => {
+            Status::bad("no: the stored grant is expired")
+        }
         Some(grant) if grant_is_enabled(grant) => Status::ok("yes"),
         Some(_) => Status::bad("no: the stored grant is disabled"),
     }

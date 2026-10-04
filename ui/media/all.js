@@ -1750,6 +1750,8 @@ if (window.getComputedStyle(document.body).transform) {
         return this.actionPermissionAdd(message);
       } else if (cmd === "evxRequest") {
         return this.actionEvxRequest(message);
+      } else if (cmd === "evxRecoverWorkspace") {
+        return this.actionEvxRecoverWorkspace(message);
       } else if (cmd === "evxGrant" || cmd === "evxRunOnce") {
         // A page may only ask for EVX; granting it, or running one of its
         // programs once, is the user's decision in this chrome. Route the raw
@@ -2087,6 +2089,44 @@ if (window.getComputedStyle(document.body).transform) {
       })(this));
     };
 
+    // Recovery is a host management choice, not a guest capability. A page
+    // can request this fixed confirmation for its bound xite only.
+    Wrapper.prototype.actionEvxRecoverWorkspace = function (message) {
+      var settled, chosen, prompt_id, answer;
+      settled = false;
+      chosen = false;
+      this.evx_prompt_count = (this.evx_prompt_count || 0) + 1;
+      prompt_id = "evx-prompt-" + this.evx_prompt_count;
+      answer = (function (_this) {
+        return function (result) {
+          if (settled) { return false; }
+          settled = true;
+          return _this.sendInner({"cmd": "response", "to": message.id, "result": result});
+        };
+      })(this);
+      if (window.ui_restrict) {
+        return answer({"error": "Workspace recovery is unavailable on a public gateway"});
+      }
+      return $.when(this.event_xite_info).done((function (_this) {
+        return function () {
+          var xite, label;
+          xite = _this.xite_info.address;
+          // Escape as plain text without the wrapper's small tag allowlist.
+          label = String(xite).slice(0, 200).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+          return _this.displayChoice(prompt_id,
+            "Recover interrupted EVX workspace writes for <b>" + label + "</b>?<br>" +
+            "This checks pending files against their previously authorized contents. It does not run a program, grant permissions or resume jobs. Unknown contents remain blocked.",
+            [{"caption": "Recover workspace", "value": "recover"}, {"caption": "Cancel", "value": "cancel", "safe": true}],
+            function (choice) {
+              if (settled || chosen) { return false; }
+              chosen = true;
+              if (choice !== "recover") { return answer({"recovered": false}); }
+              return _this.ws.cmd("evxRecoverWorkspace", {"xite": xite}, function (result) { return answer(result); });
+            });
+        };
+      })(this));
+    };
+
     // What this dialog showed of the bound closure, sent with an enable grant
     // so the node can refuse one whose consent would be wider than the text
     // the user read: the digest covers the `evx` object only, and which
@@ -2239,7 +2279,7 @@ if (window.getComputedStyle(document.body).transform) {
       body += "<br><small>Integrity: " + esc(payload.integrity) + " &middot; Declaration: " + esc(String(payload.declaration_digest).slice(0, 16)) + "\u2026</small>";
       grant = payload.grant;
       if (grant && typeof grant === "object") {
-        body += "<br><small>Current grant: " + (grant.enabled === true ? "enabled" : "disabled") + " (generation " + esc(grant.generation) + ")</small>";
+        body += "<br><small>Current grant: " + (grant.expired === true ? "expired" : grant.enabled === true ? "enabled" : "disabled") + " (generation " + esc(grant.generation) + ")</small>";
       }
       decl = this.evxDeclaration(payload);
       body += "<br><br><b>Programs</b>";

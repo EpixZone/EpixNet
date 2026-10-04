@@ -1,0 +1,1 @@
+{"type":"init","artifact":"AA==","artifact_sha256":"00","limits":{"memory_bytes":1048576,"fuel":100000,"host_calls":16,"storage_bytes":4096,"wall_seconds":2.0,"host_call_seconds":1.0,"process_cpu_seconds":1.0,"process_rss_bytes":134217728}}

@@ -9,11 +9,24 @@ evx-api = { path = "../evx-api" }
 evx-workspace = { path = "../evx-workspace" }
 evx-runtime = { path = "../evx-runtime" }
 serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+base64 = "0.22"
 libc = "0.2"
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
 sha2 = "0.10"
 hex = "0.4"
 thiserror = "2"
+
+[features]
+apple-xpc = ["evx-runtime/pulley"]
+
+[build-dependencies]
+cc = "1"
+
+[[bin]]
+name = "evx-xpc-service"
+path = "src/xpc_service_main.rs"
+required-features = ["apple-xpc"]
 
 [dev-dependencies]
 evx-runtime = { path = "../evx-runtime", features = ["text"] }

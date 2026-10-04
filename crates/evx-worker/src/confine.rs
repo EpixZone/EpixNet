@@ -17,9 +17,9 @@ use std::path::Path;
 
 /// What a mode needs from the filesystem. Everything else is denied.
 ///
-/// Only the macOS profile reads the fields; other platforms refuse to run
-/// before looking at them, which `-D warnings` must not mistake for dead code.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+/// The macOS and Linux profiles read the fields. Other platforms refuse to
+/// run before looking at them, which `-D warnings` must not mistake for dead code.
+#[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
 pub struct Spec<'a> {
     /// Workspace the process may read, and write when `writable`.
     pub workspace: Option<&'a Path>,
@@ -69,6 +69,76 @@ fn set_limit(kind: RlimitResource, value: u64) -> Result<(), String> {
 /// Apply the OS sandbox. Fails closed on platforms without an implementation.
 pub fn apply(spec: &Spec<'_>) -> Result<(), String> {
     platform::apply(spec)
+}
+
+/// Require the inherited-worker signing profile before parsing any input.
+/// The launch marker is a consistency check, not authentication. Signed bundle
+/// validation and the service-owned pipe establish the transport authority.
+#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+pub fn verify_apple_inheritance() -> Result<(), String> {
+    use std::ffi::{c_char, c_void};
+    type Object = *const c_void;
+    #[link(name = "Security", kind = "framework")]
+    unsafe extern "C" {
+        fn SecTaskCreateFromSelf(allocator: Object) -> Object;
+        fn SecTaskCopyValueForEntitlement(task: Object, name: Object, error: *mut Object)
+            -> Object;
+    }
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFStringCreateWithCString(
+            allocator: Object,
+            value: *const c_char,
+            encoding: u32,
+        ) -> Object;
+        fn CFEqual(left: Object, right: Object) -> u8;
+        fn CFRelease(value: Object);
+        static kCFBooleanTrue: Object;
+    }
+    if std::env::var("EVX_APPLE_XPC_CHILD").as_deref() != Ok("1")
+        || !evx_runtime::engine::backend_name().starts_with("pulley")
+    {
+        return Err("Apple worker requires its signed service launcher".into());
+    }
+    // SAFETY: the Security and CoreFoundation objects remain valid until their
+    // matching releases. Entitlements are read from this process's signature.
+    let valid = unsafe {
+        let task = SecTaskCreateFromSelf(std::ptr::null());
+        if task.is_null() {
+            false
+        } else {
+            let mut valid = true;
+            for name in [
+                c"com.apple.security.app-sandbox",
+                c"com.apple.security.inherit",
+            ] {
+                let key = CFStringCreateWithCString(std::ptr::null(), name.as_ptr(), 0x08000100);
+                if key.is_null() {
+                    valid = false;
+                    break;
+                }
+                let value = SecTaskCopyValueForEntitlement(task, key, std::ptr::null_mut());
+                CFRelease(key);
+                valid &= !value.is_null() && CFEqual(value, kCFBooleanTrue) != 0;
+                if !value.is_null() {
+                    CFRelease(value);
+                }
+            }
+            CFRelease(task);
+            valid
+        }
+    };
+    if !valid {
+        return Err("Apple worker signing profile unavailable".into());
+    }
+    // RLIMIT_NPROC is not enforced for root. The inherited App Sandbox may
+    // permit exec, but a compromised native worker must not create descendants
+    // that outlive the directly owned PID and its wait4 accounting.
+    if unsafe { libc::geteuid() } == 0 {
+        return Err("Apple inherited workers cannot run as root".into());
+    }
+    set_limit(libc::RLIMIT_NPROC, 0)?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -180,7 +250,11 @@ mod platform {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
+#[cfg(target_os = "linux")]
+#[path = "confine_linux.rs"]
+mod platform;
+
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
 mod platform {
     use super::Spec;
 

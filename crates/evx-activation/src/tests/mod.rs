@@ -6,7 +6,37 @@ mod activation;
 mod canonical;
 mod content;
 mod cross_language;
+mod reader;
 mod shared;
+
+// Only disposable test artifacts use this adapter. Production non-Unix hosts
+// provide their own confined reader; this is not a filesystem implementation.
+#[cfg(not(unix))]
+trait FixtureFileVerify {
+    fn verify(
+        &self,
+        envelope: &[u8],
+        root: &std::path::Path,
+    ) -> Result<crate::PendingActivation, crate::AuthenticationError>;
+}
+
+#[cfg(not(unix))]
+impl FixtureFileVerify for crate::ActivationLoader {
+    fn verify(
+        &self,
+        envelope: &[u8],
+        root: &std::path::Path,
+    ) -> Result<crate::PendingActivation, crate::AuthenticationError> {
+        use std::io::Read;
+        self.verify_reader(envelope, &mut |path, limit| {
+            let mut bytes = Vec::new();
+            std::fs::File::open(root.join(path))
+                .and_then(|file| file.take(limit as u64 + 1).read_to_end(&mut bytes))
+                .map_err(|_| crate::AuthenticationError::new("fixture read failed"))?;
+            Ok(bytes)
+        })
+    }
+}
 
 use ed25519_dalek::SigningKey;
 use serde_json::Value;

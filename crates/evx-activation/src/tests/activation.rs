@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::os::fd::BorrowedFd;
 use std::path::Path;
 
@@ -7,7 +8,10 @@ use evx_api::{Capability, Grant};
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
+#[cfg(not(unix))]
+use super::FixtureFileVerify;
 use super::{generate_key, invalid_public_key, public, updated, with, PROGRAM};
+#[cfg(unix)]
 use crate::capture;
 use crate::{
     canonical_bytes, digest, sign_envelope, ActivationCheckpoint, ActivationLoader, ArtifactFormat,
@@ -127,6 +131,27 @@ fn verified_entry_and_grant_context() {
         context.capabilities,
         BTreeSet::from([Capability::GameScoreGet])
     );
+}
+
+#[test]
+fn admission_rejects_pending_from_a_different_authority_with_the_same_generation() {
+    let fx = Fixture::new();
+    let mut other_key = fx.grant.clone();
+    other_key.public_key = public(&fx.impostor);
+    other_key.authority = crate::PublisherAuthority::Ed25519(other_key.public_key);
+    let mut fewer_capabilities = fx.grant.clone();
+    fewer_capabilities.capabilities.clear();
+    let mut other_profile = fx.grant.clone();
+    other_profile.runtime_profiles = BTreeSet::from(["other.wasm.v1".to_owned()]);
+    for grant in [other_key, fewer_capabilities, other_profile] {
+        let pending = fx.loader.verify(&fx.signed(&fx.body), fx.root()).unwrap();
+        let mut target = ActivationLoader::new(grant);
+        assert!(
+            target.admit(pending).is_err(),
+            "matching names and generation must not substitute a different verification grant"
+        );
+        assert_eq!(target.checkpoint().version, 0);
+    }
 }
 
 #[test]
@@ -313,6 +338,7 @@ fn capture_never_reopens_replaced_path() {
 }
 
 #[test]
+#[cfg(unix)]
 fn swap_after_capture_keeps_authenticated_bytes() {
     let mut fx = Fixture::new();
     let root = fx.root().to_path_buf();
@@ -331,6 +357,7 @@ fn swap_after_capture_keeps_authenticated_bytes() {
 }
 
 #[test]
+#[cfg(unix)]
 fn swap_before_capture_is_detected() {
     let fx = Fixture::new();
     let root = fx.root().to_path_buf();
@@ -347,6 +374,7 @@ fn swap_before_capture_is_detected() {
 }
 
 #[test]
+#[cfg(unix)]
 fn symlink_and_hardlink_artifacts_fail() {
     let mut fx = Fixture::new();
     let original = fx.root().join("main.wat");
@@ -361,6 +389,7 @@ fn symlink_and_hardlink_artifacts_fail() {
 }
 
 #[test]
+#[cfg(unix)]
 fn symlink_parent_and_root_fail() {
     let mut fx = Fixture::new();
     std::fs::create_dir(fx.root().join("real")).unwrap();

@@ -1,4 +1,4 @@
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 //! A xite's signed content.json runs one declared program through the real
 //! contained supervisor: the owner key signs the manifest the way the node
 //! does, `evx-declaration` parses and binds it from the stored bytes, and
@@ -29,8 +29,11 @@ fn worker_binary() -> PathBuf {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut command = std::process::Command::new(cargo);
         command
-            .args(["build", "-p", "evx-worker"])
+            .args(["build", "-p", "evx-worker", "--locked"])
             .current_dir(manifest.join("../.."));
+        if evx_runtime::engine::backend_name().starts_with("pulley") {
+            command.args(["--features", "evx-runtime/pulley"]);
+        }
         if !cfg!(debug_assertions) {
             command.arg("--release");
         }

@@ -1,17 +1,27 @@
 //! Grants, checkpoints and the two-phase activation loader.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::os::fd::AsFd as _;
-use std::path::Path;
+#[cfg(unix)]
+use std::{os::fd::AsFd as _, path::Path};
 
 use ed25519_dalek::VerifyingKey;
 use evx_api::grant::ActivationContext;
 use evx_api::Capability;
 use serde::{Deserialize, Serialize};
 
+#[cfg(unix)]
 use crate::capture::{self, CaptureFn};
 use crate::envelope::{self, field, Object};
-use crate::{digest, AuthenticationError, MAX_FILES, MAX_TOTAL};
+use crate::{digest, AuthenticationError, MAX_ARTIFACT, MAX_FILES, MAX_TOTAL};
+
+/// Trusted artifact reader selected by the host, never by a xite.
+///
+/// The arguments are a validated signed relative name and the maximum number
+/// of bytes permitted for that file. Implementations must restrict reads to
+/// the host-selected xite source and bound I/O and allocation independently.
+/// The loader rejects oversized returns and authenticates the exact bytes;
+/// this callback does not itself provide filesystem containment.
+pub type ArtifactReadFn<'a> = dyn FnMut(&str, usize) -> Result<Vec<u8>, AuthenticationError> + 'a;
 
 const KIND: &str = "evx.activation.v1";
 const BODY_KEYS: &[&str] = &[
@@ -384,6 +394,7 @@ impl FrozenActivation {
 #[derive(Debug)]
 pub struct PendingActivation {
     activation: FrozenActivation,
+    verified_grant: XiteGrant,
 }
 
 impl PendingActivation {
@@ -492,6 +503,7 @@ impl ActivationLoader {
     /// Phase one: authenticate `envelope`, validate every declaration against
     /// the grant, check the version against the checkpoint and capture the
     /// signed closure beneath `artifact_root`. Nothing is mutated.
+    #[cfg(unix)]
     pub fn verify(
         &self,
         envelope: &[u8],
@@ -507,6 +519,11 @@ impl ActivationLoader {
         &mut self,
         pending: PendingActivation,
     ) -> Result<FrozenActivation, AuthenticationError> {
+        if pending.verified_grant != self.grant {
+            return Err(AuthenticationError::new(
+                "pending activation was not verified under this grant",
+            ));
+        }
         let activation = pending.activation;
         if !self.grant.enabled {
             return Err(AuthenticationError::new("xite execution is not enabled"));
@@ -530,11 +547,35 @@ impl ActivationLoader {
         Ok(activation)
     }
 
+    #[cfg(unix)]
     pub(crate) fn verify_with(
         &self,
         envelope: &[u8],
         artifact_root: &Path,
         capture: &mut CaptureFn<'_>,
+    ) -> Result<PendingActivation, AuthenticationError> {
+        // Do not touch the filesystem until the signed declaration has passed
+        // identity, version, capability and closure validation.
+        let mut root = None;
+        self.verify_reader(envelope, &mut |path, _limit| {
+            if root.is_none() {
+                root = Some(capture::open_root(artifact_root)?);
+            }
+            capture(root.as_ref().expect("root opened above").as_fd(), path)
+        })
+    }
+
+    /// Verify an envelope and capture exact signed bytes from a trusted source.
+    ///
+    /// Works without Unix filesystem APIs. Identity, signature, capability and
+    /// version checks happen before the reader is called. The returned pending
+    /// activation does not advance the checkpoint until [`Self::admit`].
+    /// The host must choose and confine the reader; a validated relative name
+    /// is not permission to access an arbitrary operating-system path.
+    pub fn verify_reader(
+        &self,
+        envelope: &[u8],
+        read: &mut ArtifactReadFn<'_>,
     ) -> Result<PendingActivation, AuthenticationError> {
         let grant = &self.grant;
         if !grant.enabled {
@@ -581,11 +622,14 @@ impl ActivationLoader {
             .filter(|entry| expected.contains_key(*entry))
             .ok_or_else(|| AuthenticationError::new("entry absent from signed closure"))?;
 
-        let root = capture::open_root(artifact_root)?;
         let mut files = BTreeMap::new();
         let mut total = 0usize;
         for (path, expected_digest) in &expected {
-            let data = capture(root.as_fd(), path)?;
+            let remaining = MAX_ARTIFACT.min(MAX_TOTAL.saturating_sub(total));
+            let data = read(path, remaining)?;
+            if data.len() > remaining {
+                return Err(AuthenticationError::new("artifact size limit"));
+            }
             total = total.saturating_add(data.len());
             if total > MAX_TOTAL || digest(&data) != *expected_digest {
                 return Err(AuthenticationError::new(
@@ -595,9 +639,8 @@ impl ActivationLoader {
             artifact_format.check(&data)?;
             files.insert(path.clone(), data);
         }
-        drop(root);
-
         Ok(PendingActivation {
+            verified_grant: grant.clone(),
             activation: FrozenActivation {
                 xite: grant.xite.clone(),
                 publisher: grant.publisher.clone(),
@@ -621,6 +664,7 @@ impl ActivationLoader {
     /// and only the two verification paths can produce one.
     pub(crate) fn pending_content(&self, verified: VerifiedContent) -> PendingActivation {
         PendingActivation {
+            verified_grant: self.grant.clone(),
             activation: FrozenActivation {
                 xite: self.grant.xite.clone(),
                 publisher: self.grant.publisher.clone(),

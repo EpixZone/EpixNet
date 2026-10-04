@@ -344,9 +344,9 @@ pub fn validate_with(bytes: &[u8], caps: &Caps) -> Result<ModuleSummary, Validat
                     return Err(ValidationError::new("custom section limit"));
                 }
             }
-            Payload::ModuleSection { .. } | Payload::ComponentSection { .. } => {
-                return Err(ValidationError::new("components are not supported"));
-            }
+            // Component encodings are rejected by the core-module header
+            // check and disabled validator feature before section processing.
+            // Do not depend on optional wasmparser component payload variants.
             _ => {}
         }
     }
@@ -435,6 +435,9 @@ mod tests {
             assert!(validate_module(&bytes).is_err(), "accepted {case}");
         }
         assert!(validate_module(b"\0asm\x01\0\0\0\x01\x01\xff").is_err());
+        // The component header is refused even when wasmparser's optional
+        // component-model parsing code is absent from the runtime-only build.
+        assert!(validate_module(b"\0asm\x0d\0\x01\0").is_err());
         assert!(validate_module(b"not wasm").is_err());
         assert!(validate_module(&vec![0u8; MAX_MODULE + 1]).is_err());
     }

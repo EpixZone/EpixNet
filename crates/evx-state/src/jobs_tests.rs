@@ -142,6 +142,588 @@ fn invocation_status(state: &DurableState, xite: &str, occurrence: &str) -> Invo
         .status
 }
 
+#[test]
+fn effect_unknown_completion_atomically_pauses_the_job_after_re_registration() {
+    for re_register in [false, true] {
+        let f = fixture();
+        granted_job(&f, "game-a", Missed::Skip);
+        let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+        if re_register {
+            f.state
+                .set_jobs("game-a", DIGEST_B, &[spec("sync", 3600, Missed::Skip)], NOW)
+                .unwrap();
+        }
+        f.state
+            .finish_occurrence(&invocation, &json!({"status":"effect_unknown"}), None, true)
+            .unwrap();
+        let reopened = DurableState::open(&f.db_path).unwrap();
+        assert_eq!(
+            invocation_status(&reopened, "game-a", &invocation.occurrence),
+            InvocationStatus::Completed
+        );
+        assert_eq!(
+            job(&reopened, "game-a", "sync").paused_reason.as_deref(),
+            Some("reconcile_required")
+        );
+    }
+}
+
+#[test]
+fn quarantined_completion_requires_reconciliation_without_an_unknown_effect_flag() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    f.state
+        .finish_occurrence(
+            &invocation,
+            &json!({"status":"quarantined", "effect_outcome_unknown":false}),
+            None,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        job(&f.state, "game-a", "sync").paused_reason.as_deref(),
+        Some("reconcile_required")
+    );
+}
+
+#[test]
+fn unknown_effect_flag_requires_reconciliation_even_with_another_status() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    f.state
+        .finish_occurrence(
+            &invocation,
+            &json!({"status":"error", "effect_outcome_unknown":true}),
+            None,
+            true,
+        )
+        .unwrap();
+    assert_eq!(
+        job(&f.state, "game-a", "sync").paused_reason.as_deref(),
+        Some("reconcile_required")
+    );
+}
+
+#[test]
+fn untyped_false_or_nested_effect_flags_do_not_pause_normal_completion() {
+    for result in [
+        json!({"status":"ok", "effect_outcome_unknown":false}),
+        json!({"status":"ok", "effect_outcome_unknown":"true"}),
+        json!({"status":"ok", "value":{"effect_outcome_unknown":true}}),
+    ] {
+        let f = fixture();
+        granted_job(&f, "game-a", Missed::Skip);
+        let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+        f.state
+            .finish_occurrence(&invocation, &result, None, false)
+            .unwrap();
+        assert_eq!(job(&f.state, "game-a", "sync").paused_reason, None);
+    }
+}
+
+#[test]
+fn migration_recognizes_quarantine_and_unknown_effect_flags_for_absent_jobs() {
+    for result in [
+        json!({"status":"quarantined"}),
+        json!({"status":"error", "effect_outcome_unknown":true}),
+    ] {
+        let f = fixture();
+        granted_job(&f, "game-a", Missed::Skip);
+        let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+        // Model the persisted completion before reconciliation understood
+        // the independent outcome flag and quarantine status.
+        f.state.commit(&invocation, &result, &[], None).unwrap();
+        f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+        connect(&f.db_path)
+            .unwrap()
+            .execute_batch("DROP TABLE job_reconciliation; PRAGMA user_version=6;")
+            .unwrap();
+        let reopened = DurableState::open(&f.db_path).unwrap();
+        reopened
+            .set_jobs(
+                "game-a",
+                DIGEST_A,
+                &[spec("sync", PERIOD, Missed::Skip)],
+                NOW + PERIOD,
+            )
+            .unwrap();
+        assert_eq!(
+            job(&reopened, "game-a", "sync").paused_reason.as_deref(),
+            Some("reconcile_required")
+        );
+    }
+}
+
+#[test]
+fn abandon_uncertain_closes_revoked_work_and_pauses_atomically() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    granted_job(&f, "game-b", Missed::Skip);
+    let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    f.state.mark_execution_started(&invocation).unwrap();
+    f.state.revoke("game-a").unwrap();
+    f.state
+        .abandon_uncertain(&invocation, "host stopped after admission")
+        .unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    let snapshot = reopened.snapshot("game-a").unwrap();
+    let row = &snapshot.invocations[0];
+    assert!(row.execution_started);
+    assert_eq!(row.status, InvocationStatus::Completed);
+    assert_eq!(row.response.as_ref().unwrap()["status"], "effect_unknown");
+    assert!(snapshot.outbox.is_empty());
+    assert_eq!(
+        job(&reopened, "game-a", "sync").paused_reason.as_deref(),
+        Some("reconcile_required")
+    );
+    assert_eq!(job(&reopened, "game-b", "sync").paused_reason, None);
+    reopened
+        .abandon_uncertain(&invocation, "second close is harmless")
+        .unwrap();
+    assert_eq!(
+        reopened.snapshot("game-a").unwrap().invocations,
+        snapshot.invocations
+    );
+}
+
+#[test]
+fn abandon_uncertain_refuses_a_stale_token_without_pausing() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let old = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    let recovered = f.state.recover(&old).unwrap();
+    assert!(matches!(
+        f.state.abandon_uncertain(&old, "stale"),
+        Err(Error::Conflict(_))
+    ));
+    assert_eq!(job(&f.state, "game-a", "sync").paused_reason, None);
+    assert!(matches!(
+        f.state.abandon_uncertain(&recovered, "bad\nmessage"),
+        Err(Error::Invalid(_))
+    ));
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    f.state
+        .abandon_uncertain(&recovered, "job removed")
+        .unwrap();
+    assert_eq!(
+        invocation_status(&f.state, "game-a", &recovered.occurrence),
+        InvocationStatus::Completed
+    );
+}
+
+#[test]
+fn reconciliation_survives_removal_re_registration_and_completion_while_absent() {
+    for mode in ["remove-after-finish", "finish-absent", "abandon-absent"] {
+        let f = fixture();
+        granted_job(&f, "game-a", Missed::Skip);
+        let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+        if mode != "remove-after-finish" {
+            f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+        }
+        if mode == "abandon-absent" {
+            f.state
+                .abandon_uncertain(&invocation, "execution phase unknown")
+                .unwrap();
+        } else {
+            f.state
+                .finish_occurrence(&invocation, &json!({"status":"effect_unknown"}), None, true)
+                .unwrap();
+        }
+        f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+        let reopened = DurableState::open(&f.db_path).unwrap();
+        reopened
+            .set_jobs(
+                "game-a",
+                DIGEST_B,
+                &[spec("sync", 3600, Missed::Skip)],
+                NOW + PERIOD,
+            )
+            .unwrap();
+        assert_eq!(
+            job(&reopened, "game-a", "sync").paused_reason.as_deref(),
+            Some("reconcile_required"),
+            "{mode}"
+        );
+        assert!(matches!(
+            claim(&reopened, "game-a", "sync", NOW + PERIOD),
+            Err(Error::Denied(_))
+        ));
+    }
+}
+
+#[test]
+fn automatic_pause_updates_cannot_clear_reconciliation() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    f.state
+        .finish_occurrence(&invocation, &json!({"status":"effect_unknown"}), None, true)
+        .unwrap();
+    f.state.set_job_paused("game-a", "sync", None).unwrap();
+    f.state
+        .set_job_paused("game-a", "sync", Some("declaration_unavailable"))
+        .unwrap();
+    assert_eq!(
+        job(&f.state, "game-a", "sync").paused_reason.as_deref(),
+        Some("reconcile_required")
+    );
+}
+
+#[test]
+fn only_explicit_resume_clears_a_readded_jobs_reconciliation_guard() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    f.state.abandon_uncertain(&invocation, "uncertain").unwrap();
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    assert!(matches!(
+        f.state.resume_job("game-a", "sync"),
+        Err(Error::Conflict(_))
+    ));
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW + PERIOD,
+        )
+        .unwrap();
+    // The durable guard is also checked at claim, independently of the
+    // display pause on the current registration.
+    connect(&f.db_path)
+        .unwrap()
+        .execute("UPDATE jobs SET paused_reason=NULL WHERE xite='game-a'", [])
+        .unwrap();
+    assert!(matches!(
+        claim(&f.state, "game-a", "sync", NOW + PERIOD),
+        Err(Error::Denied(_))
+    ));
+    f.state.resume_job("game-a", "sync").unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    assert_eq!(job(&reopened, "game-a", "sync").paused_reason, None);
+    assert!(
+        claim(&reopened, "game-a", "sync", NOW + PERIOD)
+            .unwrap()
+            .fresh
+    );
+}
+
+#[test]
+fn version_six_migration_recovers_reconciliation_for_an_absent_job() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    f.state.abandon_uncertain(&invocation, "uncertain").unwrap();
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    connect(&f.db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE job_reconciliation; PRAGMA user_version=6;")
+        .unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    reopened
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW + PERIOD,
+        )
+        .unwrap();
+    assert_eq!(
+        job(&reopened, "game-a", "sync").paused_reason.as_deref(),
+        Some("reconcile_required")
+    );
+}
+
+#[test]
+fn full_reconciliation_storage_cannot_commit_without_its_guard() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let invocation = claim(&f.state, "game-a", "sync", NOW).unwrap();
+    let conn = connect(&f.db_path).unwrap();
+    conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+    for index in 0..crate::MAX_ROWS {
+        conn.execute(
+            "INSERT INTO job_reconciliation VALUES ('game-a',?1)",
+            [format!("old-{index}")],
+        )
+        .unwrap();
+    }
+    conn.execute_batch("COMMIT").unwrap();
+    assert!(matches!(
+        f.state.abandon_uncertain(&invocation, "uncertain"),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert_eq!(
+        invocation_status(&f.state, "game-a", &invocation.occurrence),
+        InvocationStatus::Running
+    );
+}
+
+#[test]
+fn publisher_registration_cannot_reset_operator_pause_or_enable_controls() {
+    for disabled in [false, true] {
+        let f = fixture();
+        granted_job(&f, "game-a", Missed::Skip);
+        if disabled {
+            f.state.set_job_enabled("game-a", "sync", false).unwrap();
+        } else {
+            f.state
+                .set_job_paused("game-a", "sync", Some("user_paused"))
+                .unwrap();
+        }
+        f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+        let reopened = DurableState::open(&f.db_path).unwrap();
+        reopened
+            .set_jobs(
+                "game-a",
+                DIGEST_B,
+                &[spec("sync", 3600, Missed::Skip)],
+                NOW + PERIOD,
+            )
+            .unwrap();
+        let row = job(&reopened, "game-a", "sync");
+        assert_eq!(row.enabled, !disabled);
+        assert_eq!(
+            row.paused_reason.as_deref(),
+            if disabled { None } else { Some("user_paused") }
+        );
+        assert!(matches!(
+            claim(&reopened, "game-a", "sync", NOW + PERIOD),
+            Err(Error::Denied(_))
+        ));
+    }
+}
+
+#[test]
+fn automatic_pause_updates_cannot_overwrite_operator_pause() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    f.state
+        .set_job_paused("game-a", "sync", Some("user"))
+        .unwrap();
+    f.state.set_job_paused("game-a", "sync", None).unwrap();
+    f.state
+        .set_job_paused("game-a", "sync", Some("declaration_unavailable"))
+        .unwrap();
+    assert_eq!(
+        job(&f.state, "game-a", "sync").paused_reason.as_deref(),
+        Some("user")
+    );
+}
+
+#[test]
+fn explicit_resume_preserves_disabled_control_until_explicit_enable() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    f.state.set_job_enabled("game-a", "sync", false).unwrap();
+    f.state
+        .set_job_paused("game-a", "sync", Some("user"))
+        .unwrap();
+    f.state.resume_job("game-a", "sync").unwrap();
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    assert!(!job(&f.state, "game-a", "sync").enabled);
+    assert_eq!(job(&f.state, "game-a", "sync").paused_reason, None);
+    f.state.set_job_enabled("game-a", "sync", true).unwrap();
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    assert!(claim(&f.state, "game-a", "sync", NOW).unwrap().fresh);
+}
+
+#[test]
+fn version_seven_migration_preserves_existing_operator_controls() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    f.state.set_job_enabled("game-a", "sync", false).unwrap();
+    f.state
+        .set_job_paused("game-a", "sync", Some("user"))
+        .unwrap();
+    connect(&f.db_path)
+        .unwrap()
+        .execute_batch("DROP TABLE job_controls; PRAGMA user_version=7;")
+        .unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    reopened.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    reopened
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    let row = job(&reopened, "game-a", "sync");
+    assert!(!row.enabled);
+    assert_eq!(row.paused_reason.as_deref(), Some("user"));
+}
+
+#[test]
+fn removed_job_cannot_replay_a_pruned_occurrence_after_clock_rollback() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    run_slots(&f.state, "game-a", "sync", NOW, PERIOD, 70);
+    let oldest = DurableState::occurrence_id(
+        "sync",
+        &DurableState::slot_at(&schedule_value(PERIOD), NOW).unwrap(),
+    );
+    assert!(f
+        .state
+        .snapshot("game-a")
+        .unwrap()
+        .invocations
+        .iter()
+        .all(|row| row.occurrence != oldest));
+    f.state
+        .set_jobs("game-a", DIGEST_A, &[], NOW + 70 * PERIOD)
+        .unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    reopened
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    let replay = claim(&reopened, "game-a", "sync", NOW);
+    assert!(
+        matches!(replay, Err(Error::Conflict(_))),
+        "removing a job must not erase its durable replay guard: {replay:?}"
+    );
+}
+
+#[test]
+fn removed_job_cannot_replay_a_retained_occurrence_during_pruning() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    run_slots(&f.state, "game-a", "sync", NOW, PERIOD, 70);
+    let oldest_retained = NOW + (70 - RETAINED_OCCURRENCES_PER_JOB as u64) * PERIOD;
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            oldest_retained,
+        )
+        .unwrap();
+    let retried = claim(&f.state, "game-a", "sync", oldest_retained).unwrap();
+    assert!(
+        !retried.fresh,
+        "pruning must not delete the occurrence being retried"
+    );
+    assert!(retried.completed);
+}
+
+#[test]
+fn daily_budget_cannot_be_reset_by_rolling_back_beyond_retention() {
+    let f = fixture();
+    f.state.reserve_daily_run("game-a", NOW, 1).unwrap();
+    let future = NOW + (DAILY_RUN_RETENTION_DAYS + 1) * SECONDS_PER_DAY;
+    f.state.reserve_daily_run("game-a", future, 1).unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    let replay = reopened.reserve_daily_run("game-a", NOW, 1);
+    assert!(
+        matches!(replay, Err(Error::BudgetExceeded(_))),
+        "pruning an old day must not grant it a fresh budget: {replay:?}"
+    );
+}
+
+#[test]
+fn version_four_migration_seeds_guards_before_jobs_can_be_removed() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    run_slots(&f.state, "game-a", "sync", NOW, PERIOD, 70);
+    let conn = connect(&f.db_path).unwrap();
+    conn.execute_batch("DROP TABLE job_guards; PRAGMA user_version=4;")
+        .unwrap();
+    drop(conn);
+    let migrated = DurableState::open(&f.db_path).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), SCHEMA_VERSION);
+    migrated.set_jobs("game-a", DIGEST_A, &[], NOW).unwrap();
+    migrated
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    assert!(matches!(
+        claim(&migrated, "game-a", "sync", NOW),
+        Err(Error::Conflict(_))
+    ));
+    assert!(
+        claim(&migrated, "game-a", "sync", NOW + 70 * PERIOD)
+            .unwrap()
+            .fresh
+    );
+}
+
+#[test]
+fn returning_to_an_old_cadence_keeps_its_pruned_slot_guard() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    run_slots(&f.state, "game-a", "sync", NOW, PERIOD, 70);
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_B,
+            &[spec("sync", 3600, Missed::Skip)],
+            NOW + 70 * PERIOD,
+        )
+        .unwrap();
+    f.state
+        .set_jobs(
+            "game-a",
+            DIGEST_A,
+            &[spec("sync", PERIOD, Missed::Skip)],
+            NOW,
+        )
+        .unwrap();
+    assert!(matches!(
+        claim(&f.state, "game-a", "sync", NOW),
+        Err(Error::Conflict(_))
+    ));
+}
+
+#[test]
+fn retained_job_guards_are_bounded_without_deleting_replay_protection() {
+    let f = fixture();
+    granted_job(&f, "game-a", Missed::Skip);
+    let mut conn = connect(&f.db_path).unwrap();
+    let tx = conn.transaction().unwrap();
+    for index in 0..crate::MAX_ROWS {
+        tx.execute(
+            "INSERT INTO job_guards VALUES (?1,?2,?3,?4)",
+            rusqlite::params!["game-a", format!("old-{index}"), PERIOD, NOW],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    assert!(matches!(
+        claim(&f.state, "game-a", "sync", NOW),
+        Err(Error::BudgetExceeded(_))
+    ));
+    assert_eq!(f.state.snapshot("game-a").unwrap().grant.unwrap().used, 0);
+}
+
 macro_rules! assert_err {
     ($result:expr, $pattern:pat) => {{
         let result = $result;
@@ -474,7 +1056,7 @@ fn due_jobs_skips_a_paused_or_disabled_job() {
         job(&f.state, "game-a", "sync").paused_reason.as_deref(),
         Some("reconcile_required")
     );
-    f.state.set_job_paused("game-a", "sync", None).unwrap();
+    f.state.resume_job("game-a", "sync").unwrap();
     assert_eq!(f.state.due_jobs(NOW).unwrap().len(), 1);
     f.state.set_job_enabled("game-a", "sync", false).unwrap();
     assert!(f.state.due_jobs(NOW).unwrap().is_empty());
@@ -598,7 +1180,7 @@ fn next_due_job_is_the_soonest_job_that_will_come_due_by_itself() {
         .set_job_paused("game-b", "sync", Some("user"))
         .unwrap();
     assert_eq!(f.state.next_due_job(NOW).unwrap().unwrap().xite, "game-a");
-    f.state.set_job_paused("game-b", "sync", None).unwrap();
+    f.state.resume_job("game-b", "sync").unwrap();
     f.state.set_job_enabled("game-b", "sync", false).unwrap();
     assert_eq!(f.state.next_due_job(NOW).unwrap().unwrap().xite, "game-a");
     f.state.set_job_enabled("game-b", "sync", true).unwrap();
@@ -843,7 +1425,7 @@ fn claim_occurrence_denies_a_paused_disabled_or_background_less_job() {
         .set_job_paused("game-a", "sync", Some("reconcile_required"))
         .unwrap();
     assert_err!(claim(&f.state, "game-a", "sync", NOW), Error::Denied(_));
-    f.state.set_job_paused("game-a", "sync", None).unwrap();
+    f.state.resume_job("game-a", "sync").unwrap();
     f.state.set_job_enabled("game-a", "sync", false).unwrap();
     assert_err!(claim(&f.state, "game-a", "sync", NOW), Error::Denied(_));
     f.state.set_job_enabled("game-a", "sync", true).unwrap();
@@ -1811,4 +2393,66 @@ fn database_written_before_versions_were_recorded_migrates_to_version_three() {
     state.set_xite_grant(&grant("game-a")).unwrap();
     assert_eq!(state.due_jobs(NOW).unwrap().len(), 1);
     assert!(claim(&state, "game-a", "sync", NOW).unwrap().fresh);
+}
+
+#[test]
+fn guarded_resume_rejects_later_same_value_controls_from_another_connection() {
+    let f = fixture();
+    for xite in ["game-a", "game-b"] {
+        f.state.set_jobs(xite, DIGEST_A, &[spec("sync", PERIOD, Missed::Skip)], NOW).unwrap();
+    }
+    for reason in ["user", "reconcile_required"] {
+        f.state.set_job_paused("game-a", "sync", Some(reason)).unwrap();
+        let revision = f.state.job_management_revision("game-a").unwrap();
+        let other = DurableState::open(&f.db_path).unwrap();
+        other.set_job_paused("game-a", "sync", Some(reason)).unwrap();
+        assert!(f.state.resume_job_at_revision("game-a", "sync", revision).is_err());
+        assert!(f.state.jobs("game-a").unwrap()[0].paused_reason.is_some());
+        assert_eq!(f.state.job_management_revision("game-b").unwrap(), 0);
+        let current = other.job_management_revision("game-a").unwrap();
+        other.resume_job_at_revision("game-a", "sync", current).unwrap();
+    }
+    let revision = f.state.job_management_revision("game-a").unwrap();
+    f.state.set_job_enabled("game-a", "sync", false).unwrap();
+    assert!(f.state.resume_job_at_revision("game-a", "sync", revision).is_err());
+    let current = f.state.job_management_revision("game-a").unwrap();
+    f.state.set_jobs("game-a", DIGEST_A, &[], NOW + 1).unwrap();
+    f.state.set_jobs("game-a", DIGEST_B, &[spec("sync", PERIOD, Missed::Skip)], NOW + 2).unwrap();
+    assert_eq!(f.state.job_management_revision("game-a").unwrap(), current);
+    assert!(!f.state.jobs("game-a").unwrap()[0].enabled);
+}
+
+#[test]
+fn management_revision_migrates_and_survives_reopen_without_changing_controls() {
+    let f = fixture();
+    f.state.set_jobs("game-a", DIGEST_A, &[spec("sync", PERIOD, Missed::Skip)], NOW).unwrap();
+    f.state.set_job_paused("game-a", "sync", Some("user")).unwrap();
+    let before = f.state.jobs("game-a").unwrap();
+    let conn = connect(&f.db_path).unwrap();
+    conn.execute_batch("DROP TABLE job_management_revisions; PRAGMA user_version=8;").unwrap();
+    drop(conn);
+    let migrated = DurableState::open(&f.db_path).unwrap();
+    assert_eq!(migrated.schema_version().unwrap(), SCHEMA_VERSION);
+    assert_eq!(migrated.job_management_revision("game-a").unwrap(), 0);
+    assert_eq!(migrated.jobs("game-a").unwrap(), before);
+    migrated.set_job_paused("game-a", "sync", Some("user")).unwrap();
+    let reopened = DurableState::open(&f.db_path).unwrap();
+    assert_eq!(reopened.job_management_revision("game-a").unwrap(), 1);
+    assert!(reopened.resume_job_at_revision("game-a", "sync", 0).is_err());
+    assert_eq!(reopened.jobs("game-a").unwrap(), before);
+}
+
+#[test]
+fn management_revision_exhaustion_rolls_back_control_changes() {
+    let f = fixture();
+    f.state.set_jobs("game-a", DIGEST_A, &[spec("sync", PERIOD, Missed::Skip)], NOW).unwrap();
+    f.state.set_job_paused("game-a", "sync", Some("user")).unwrap();
+    let conn = connect(&f.db_path).unwrap();
+    conn.execute("UPDATE job_management_revisions SET revision=?1 WHERE xite='game-a'", [crate::MAX_LIMIT]).unwrap();
+    drop(conn);
+    let before = f.state.jobs("game-a").unwrap();
+    assert!(f.state.set_job_enabled("game-a", "sync", false).is_err());
+    assert!(f.state.resume_job_at_revision("game-a", "sync", crate::MAX_LIMIT).is_err());
+    assert_eq!(f.state.jobs("game-a").unwrap(), before);
+    assert_eq!(f.state.job_management_revision("game-a").unwrap(), crate::MAX_LIMIT);
 }

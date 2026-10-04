@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-#![cfg(target_os = "macos")]
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 //! Port of the proof-of-concept baseline suite (`run_tests.py`): containment,
 //! capability boundary, guest-memory boundary, malformed input, resource
 //! limits, revocation, quotas and native escape simulation.

@@ -6,7 +6,7 @@
 //! opens the durable EVX state at `<data_root>/private/evx/state.sqlite`,
 //! creates `<data_root>/private/evx/workspaces/`, installs the grant reader
 //! the `/list` inspection panel uses, starts the scheduler task, and shares
-//! its [`EvxService`] with its ten WebSocket commands through the node's
+//! its [`EvxService`] with its eleven WebSocket commands through the node's
 //! capability map:
 //!
 //! | Command | Who | Effect |
@@ -21,8 +21,9 @@
 //! | `evxJobPause` | wrapper / operator only | pauses a scheduled job |
 //! | `evxJobResume` | wrapper / operator only | resumes a paused job |
 //! | `evxRunJob` | wrapper / operator only | runs a job's current occurrence now |
+//! | `evxRecoverWorkspace` | wrapper / operator only | reconciles interrupted manual writes without executing a program |
 //!
-//! The last seven are gated in `epix_ui::command::CommandRegistry::dispatch`
+//! The last eight are gated in `epix_ui::command::CommandRegistry::dispatch`
 //! through `EVX_WRAPPER_COMMANDS`, exactly as `permissionAdd` is, so no page
 //! id can reach them; the handlers re-check the session shape as well.
 //! `ADMIN` plays no part: an ADMIN xite cannot grant EVX, and an EVX grant
@@ -65,10 +66,17 @@ use epix_plugin::Plugin;
 use epix_ui::{AppState, WsCommand};
 
 mod checkpoint;
+mod backend_binding;
+#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+pub mod apple_backend;
+#[cfg(all(target_os = "macos", feature = "apple-xpc-development"))]
+pub mod apple_development;
 pub mod commands;
 pub mod limits;
 pub mod scheduler;
 pub mod service;
+#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+mod service_execution_tests;
 
 pub use limits::{clamp, BACKGROUND_RUNS_PER_DAY, BACKGROUND_WORKERS, HOST_CEILING};
 pub use scheduler::Scheduler;
@@ -91,12 +99,39 @@ pub const CAPABILITY_KEY: &str = "evx.service";
 #[derive(Default)]
 pub struct EvxPlugin {
     worker: Option<PathBuf>,
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    apple: Option<Arc<apple_backend::AppleBackend>>,
 }
 
 impl EvxPlugin {
     /// A plugin that executes with the worker binary at `worker`.
     pub fn with_worker(worker: PathBuf) -> Self {
-        EvxPlugin { worker: Some(worker) }
+        EvxPlugin {
+            worker: Some(worker),
+            #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+            apple: None,
+        }
+    }
+
+    /// Select only the authenticated current Developer ID package. A missing
+    /// or invalid policy is an error; the caller must never fall back to direct.
+    #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+    pub fn from_signed_apple_package() -> Result<Self, String> {
+        let package = evx_supervisor::apple_package::ApplePackage::current().map_err(|e|e.to_string())?;
+        Ok(Self { worker: None, apple: Some(Arc::new(apple_backend::AppleBackend::from_package(package)?)) })
+    }
+    /// Exercise signed-package bootstrap with a distinct ad-hoc fixture profile.
+    #[cfg(all(target_os = "macos", feature = "apple-xpc-development"))]
+    pub fn from_signed_apple_fixture() -> Result<Self, String> {
+        let package = evx_supervisor::apple_package::ApplePackage::current_for_fixture().map_err(|e|e.to_string())?;
+        Ok(Self { worker: None, apple: Some(Arc::new(apple_backend::AppleBackend::from_package(package)?)) })
+    }
+
+    /// Select a provisioned backend for a signed development host. No page,
+    /// environment variable or production App Store assembly selects it.
+    #[cfg(all(target_os = "macos", feature = "apple-xpc", any(test, feature = "apple-xpc-development")))]
+    pub fn with_apple_development(backend: Arc<apple_backend::AppleBackend>) -> Self {
+        Self { worker: None, apple: Some(backend) }
     }
 }
 
@@ -114,7 +149,14 @@ impl Plugin for EvxPlugin {
     /// answers that EVX is unavailable instead of running without consent
     /// records, and nothing is scheduled.
     fn start(&self, state: &Arc<AppState>) {
-        let service = match EvxService::for_node(state, self.worker.clone()) {
+        #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+        let opened = match &self.apple {
+            Some(backend) => EvxService::for_node_apple(state, backend.clone()),
+            None => EvxService::for_node(state, self.worker.clone()),
+        };
+        #[cfg(not(all(target_os = "macos", feature = "apple-xpc")))]
+        let opened = EvxService::for_node(state, self.worker.clone());
+        let service = match opened {
             Ok(service) => Arc::new(service),
             Err(error) => {
                 let state = Arc::clone(state);
@@ -127,8 +169,8 @@ impl Plugin for EvxPlugin {
         let reader = Arc::clone(&service);
         state.set_evx_grant_summary_source(Box::new(move |address| reader.grant_summary(address)));
         state.install_capability(CAPABILITY_KEY, service.clone());
-        let host = match service.execution() {
-            Ok(worker) => format!("execution enabled, worker {}", worker.display()),
+        let host = match service.execution_ready() {
+            Ok(()) => "execution enabled with configured backend".to_string(),
             Err(reason) => format!("execution disabled: {reason}"),
         };
         let state = Arc::clone(state);

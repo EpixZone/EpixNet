@@ -11,6 +11,8 @@ use evx_api::Capability;
 use serde_json::Value;
 use tempfile::TempDir;
 
+#[cfg(not(unix))]
+use super::FixtureFileVerify;
 use super::{generate_key, public, PROGRAM};
 use crate::envelope::{to_serde, verify_envelope};
 use crate::{canonical_bytes, digest, ActivationLoader, XiteGrant};

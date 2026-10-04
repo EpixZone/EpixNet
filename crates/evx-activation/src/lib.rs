@@ -8,8 +8,9 @@
 //!
 //! # Two paths, one admission
 //!
-//! [`ActivationLoader::verify`] authenticates an Ed25519 fixture envelope
-//! and captures its signed closure through confined descriptors.
+//! [`ActivationLoader::verify_reader`] authenticates an Ed25519 envelope and
+//! captures its signed closure through a trusted bounded reader. On Unix,
+//! `ActivationLoader::verify` supplies descriptor-relative file capture.
 //! [`ActivationLoader::verify_content`] takes the real authority chain
 //! instead: a root `content.json` the node has already verified against the
 //! xite owner's address, a [`BoundProgram`] pinned to that manifest, and a
@@ -38,6 +39,7 @@
 
 mod activation;
 pub mod canonical;
+#[cfg(unix)]
 mod capture;
 mod content;
 mod envelope;
@@ -48,8 +50,8 @@ mod tests;
 use sha2::{Digest as _, Sha256};
 
 pub use activation::{
-    ActivationCheckpoint, ActivationLoader, ArtifactFormat, FrozenActivation, PendingActivation,
-    PublisherAuthority, XiteGrant,
+    ActivationCheckpoint, ActivationLoader, ArtifactFormat, ArtifactReadFn, FrozenActivation,
+    PendingActivation, PublisherAuthority, XiteGrant,
 };
 pub use canonical::canonical_bytes;
 pub use content::{sha512_prefix, BoundProgram, ContentReadFn, PinnedFile};

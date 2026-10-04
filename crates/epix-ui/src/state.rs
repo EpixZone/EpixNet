@@ -4596,6 +4596,7 @@ pub struct AppState {
     /// Tor loop can re-bootstrap through (or away from) Snowflake without a
     /// node restart.
     tor_config_changed: Arc<tokio::sync::Notify>,
+    plugin_changes: tokio::sync::watch::Sender<()>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -5731,6 +5732,7 @@ impl AppState {
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
             tor_config_changed: Arc::new(tokio::sync::Notify::new()),
+            plugin_changes: tokio::sync::watch::channel(()).0,
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(persist.multi_users),
             #[cfg(feature = "multiuser")]
@@ -5896,6 +5898,12 @@ impl AppState {
     pub async fn plugin_enabled(&self, name: &str) -> bool {
         let (disabled, enabled) = self.plugin_overrides().await;
         effective_enabled(name, &disabled, &enabled)
+    }
+
+    /// Internal wake for plugin owners, including idle background services.
+    /// A watch retains a change while a receiver is checking current policy.
+    pub fn subscribe_plugin_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.plugin_changes.subscribe()
     }
 
     /// Enable/disable a plugin at runtime (persisted). Only stores an override
@@ -6724,6 +6732,9 @@ impl AppState {
         // (or away from) the bridge instead of waiting for a node restart.
         if key == "tor_use_bridges" {
             self.tor_config_changed.notify_waiters();
+        }
+        if matches!(key, "plugins_disabled" | "plugins_enabled") {
+            self.plugin_changes.send_replace(());
         }
         // Chain endpoints apply live: the shared resolver re-reads the
         // installed list per request, and open dashboards get the new

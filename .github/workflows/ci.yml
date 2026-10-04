@@ -50,6 +50,7 @@ jobs:
         run: |
           python3 packaging/test-firefox-download.py -v
           python3 packaging/linux/test-packaging.py -v
+          python3 packaging/linux/test-evx-package.py -v
 
   build-test:
     name: Build & test
@@ -131,14 +132,15 @@ jobs:
       # durable ratchet/outbox behavior, pairwise and group engines, and RLN.
       - name: Test metadata-private channel crates
         run: cargo test -p epix-chain -p epix-envelope -p epix-channel -p epix-pairwise-engine -p epix-group-engine -p epix-rln -p epix-plugins -p epix-node -p epix-nmh -p epix-ffi --locked
-      # EVX (sandboxed xite execution, docs/evx.md): the crates whose tests do
-      # not need the macOS confinement. The supervisor and host integration
-      # suites run on the macOS job below; here they are compiled but gated out.
-      # epix-evx is the node's service and management API (milestone 2): its
-      # grant, gate and gateway tests run everywhere, its execution tests only
-      # on the macOS job.
+      # EVX (sandboxed xite execution, docs/evx.md): these suites
+      # exercise Linux Landlock plus seccomp here and Seatbelt in the macOS
+      # job below. A runner without confinement must fail the integration gate.
       - name: Test EVX validator, workspace, activation, durable state and node service
-        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host -p epix-evx --locked
+        run: EVX_REQUIRE_LINUX_CONFINEMENT=1 cargo test -p evx-api -p evx-declaration -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-worker -p evx-supervisor -p evx-host -p epix-evx --locked
+      - name: Verify the built Linux worker confinement and artifact transport
+        run: python3 packaging/linux/verify-evx-worker.py target/debug/evx-worker
+      - name: Verify a privileged parent cannot lend capabilities to an EVX worker
+        run: sudo python3 packaging/linux/verify-evx-worker.py target/debug/evx-worker --require-privileged-parent
 
   mobile-profiles:
     name: Mobile feature profiles
@@ -184,27 +186,10 @@ jobs:
       # cannot prove that iOS excludes BT or that Android/desktop retain it.
       - name: Assert platform BitTorrent boundaries
         run: python3 scripts/check-platform-features.py
-      # The EVX service (epix-node's `evx` feature) links Wasmtime and the
-      # supervisor's process code; execution is macOS-only, so the mobile
-      # embedder and the native messaging host must not carry it. `cargo tree
-      # -i wasmtime` scoped to the package prints the reverse edges when it
-      # is in the graph (the leak) and fails with "did not match any
-      # packages" when it is not (the pass); any other failure is a broken
-      # resolution and fails the guard too.
-      - name: Assert the mobile embedder and the messaging host link no EVX runtime
-        run: |
-          set -uo pipefail
-          check() {
-            local out status
-            out="$(cargo tree --locked -i wasmtime "$@" 2>&1)" && status=0 || status=$?
-            if [ "$status" -ne 0 ] && printf '%s' "$out" | grep -q 'did not match any packages'; then
-              return 0
-            fi
-            echo "::error::wasmtime reaches $* (or cargo tree failed):"; echo "$out"; exit 1
-          }
-          check -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery
-          check -p epix-ffi --no-default-features --features tor,i2p-embedded,mesh,local-discovery,bittorrent
-          check -p epix-nmh
+      # Resolve each product against its actual target. Unsupported node
+      # targets and download-only embedders must not link the EVX runtime.
+      - name: Assert EVX platform boundaries
+        run: python3 scripts/check-evx-platforms.py
       - name: Test tracker discovery with and without BitTorrent
         run: |
           cargo test -p epix-discovery -p epix-xite --locked
@@ -223,14 +208,14 @@ jobs:
   evx-sandbox:
     name: EVX sandbox (macOS)
     runs-on: macos-latest
-    # Wasmtime is the long pole on a cold cache (~6 min); the suites themselves
-    # take under a minute. They launch the real confined worker and the hostile
-    # peer, so they only prove anything on macOS.
-    timeout-minutes: 40
+    # Build both the direct worker and signed Apple development host. Native
+    # containment and service-retirement checks require this macOS runner.
+    timeout-minutes: 60
     permissions:
       contents: read
     env:
       RUSTFLAGS: "-D warnings"
+      CARGO_BUILD_JOBS: "2"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -242,4 +227,54 @@ jobs:
       - name: Build the confined worker and the hostile peer
         run: cargo build -p evx-worker -p evx-host -p evx-supervisor --bins --example hostile_peer --locked
       - name: Test containment, hostile IPC, lifecycle, signed activation and the node service against the real worker
-        run: cargo test -p evx-api -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-supervisor -p evx-host -p epix-evx --locked
+        run: EVX_REQUIRE_LINUX_CONFINEMENT=1 cargo test -p evx-api -p evx-declaration -p evx-runtime -p evx-workspace -p evx-activation -p evx-state -p evx-worker -p evx-supervisor -p evx-host -p epix-evx --locked
+
+      - name: Test Pulley through the real worker, IPC and signed activation
+        run: cargo test -p evx-api -p evx-runtime -p evx-worker -p evx-supervisor -p evx-host --features evx-runtime/pulley --locked
+      - name: Test compiler-free Pulley artifact compatibility
+        run: python3 scripts/test-evx-pulley-runtime.py
+      - name: Test macOS packaging policy
+        run: python3 packaging/macos/test-evx-package.py
+      - name: Test signed XPC transport fixtures and lifecycle limits
+        run: python3 packaging/macos/xpc/test-xpc.py
+      - name: Test disabled Apple backend lifecycle handling
+        run: python3 packaging/macos/xpc/test-backend-lifecycle.py
+      - name: Test Apple slot, workspace and lifecycle journals
+        run: cargo test -p evx-supervisor --features apple-xpc --locked
+      - name: Test signed Apple development service-pool packaging
+        run: python3 packaging/macos/xpc/test-package-backend.py
+      - name: Test inherited native Apple container and process boundaries
+        run: python3 packaging/macos/xpc/test-native-isolation.py
+      - name: Test signed Apple adapter compilation, execution, cancellation and admission
+        run: python3 packaging/macos/xpc/test-backend.py
+      - name: Test the node development backend and admission policy
+        run: cargo test -p epix-evx --features apple-xpc-development --locked
+      - name: Test signed Apple node consent, manual work, recovery and scheduling
+        run: python3 packaging/macos/xpc/test-node-backend.py
+      - name: Test sealed Developer ID package mechanics with ad-hoc fixtures
+        run: python3 packaging/macos/xpc/test-release-pool.py
+
+  evx-ios-library:
+    name: EVX Pulley library (iOS, no host admission)
+    runs-on: macos-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    env:
+      RUSTFLAGS: "-D warnings"
+      IPHONEOS_DEPLOYMENT_TARGET: "17.0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+          targets: aarch64-apple-ios,aarch64-apple-ios-sim
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      # These build the interpreter library with the actual Apple SDKs.
+      # They do not enable epix-ffi EVX or prove device isolation/lifecycle.
+      - name: Check compiler-free Pulley device and simulator targets
+        run: |
+          cargo check -p evx-runtime --lib --locked --no-default-features --features pulley --target aarch64-apple-ios
+          cargo check -p evx-runtime --lib --locked --no-default-features --features pulley --target aarch64-apple-ios-sim
+      - name: Keep unsupported mobile product admission closed
+        run: python3 scripts/check-evx-platforms.py ios-ffi android-ffi

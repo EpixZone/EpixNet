@@ -84,6 +84,7 @@ function wrapper(windowOverrides, results) {
     ${method("setXiteInfo")}
     ${method("handleMessage")}
     ${method("actionEvxRequest")}
+    ${method("actionEvxRecoverWorkspace")}
     ${method("evxDeclaration")}
     ${method("evxRunnableOnce")}
     ${method("evxGrantOutcome")}
@@ -210,6 +211,15 @@ test("deny sends nothing to the node and answers the page granted:false", () => 
   dialogs[0].cb("deny");
   assert.deepEqual(commands.map(c => c.command), ["evxInspect"], "no grant command after Deny");
   assert.deepEqual(plain(replies), [{ cmd: "response", to: 8, result: { granted: false } }]);
+});
+
+test("the consent dialog does not describe an expired stored grant as enabled", () => {
+  const { instance, dialogs } = wrapper({}, {
+    evxInspect: () => inspectPayload({ grant: { enabled: true, expired: true, generation: 7 } }),
+  });
+  instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 40 });
+  assert.match(dialogs[0].body, /Current grant: expired \(generation 7\)/);
+  assert.doesNotMatch(dialogs[0].body, /Current grant: enabled/);
 });
 
 test("dismissing the dialog sends nothing and answers the page granted:false once", () => {
@@ -812,4 +822,51 @@ test("no page notification, confirm or progress can close or replace the open EV
   assert.equal(replies.length, 0, "and it is still unsettled");
   instance.handleMessage({ cmd: "evxRequest", params: { program: "presence" }, id: 7 });
   assert.equal(shown[shown.length - 1].id, "notification-evx-prompt-2", "the counter is the chrome's, whatever the page's ids");
+});
+
+test("workspace recovery waits for a wrapper-owned choice and ignores a page's target", () => {
+  const { instance, dialogs, commands, replies, forwarded } = wrapper({}, {
+    evxRecoverWorkspace: () => ({ xite: "game.epix", reconciled_paths: 1 }),
+  });
+  instance.handleMessage({ cmd: "evxRecoverWorkspace", params: { xite: "other.epix" }, id: 7 });
+  assert.equal(commands.length, 0);
+  assert.equal(forwarded.length, 0);
+  assert.equal(dialogs.length, 1, "the page cannot run recovery without a visible user choice");
+  assert.match(dialogs[0].body, /game\.epix/);
+  assert.doesNotMatch(dialogs[0].body, /other\.epix/);
+  assert.deepEqual(plain(dialogs[0].choices).map(choice => choice.safe === true), [false, true]);
+  dialogs[0].cb("recover");
+  dialogs[0].cb("recover");
+  assert.deepEqual(plain(commands), [{ command: "evxRecoverWorkspace", params: { xite: "game.epix" } }]);
+  assert.equal(replies.length, 1);
+});
+
+test("workspace recovery refusal or cancellation sends no management command", () => {
+  for (const restricted of [true]) {
+    const { instance, dialogs, commands, replies, forwarded } = wrapper({ ui_restrict: restricted });
+    instance.handleMessage({ cmd: "evxRecoverWorkspace", params: {}, id: 3 });
+    assert.equal(dialogs.length, 0);
+    assert.equal(commands.length, 0);
+    assert.equal(forwarded.length, 0);
+    assert.match(replies[0].result.error, /gateway/);
+  }
+  for (const choice of ["cancel", null]) {
+    const { instance, dialogs, commands, replies } = wrapper();
+      instance.handleMessage({ cmd: "evxRecoverWorkspace", params: {}, id: 3 });
+    dialogs[0].cb(choice);
+    assert.equal(commands.length, 0);
+    assert.deepEqual(plain(replies[0].result), { recovered: false });
+  }
+});
+
+test("workspace recovery escapes the bound address and returns a node refusal", () => {
+  const { instance, dialogs, replies } = wrapper({}, {
+    evxRecoverWorkspace: () => ({ error: "workspace recovery: unrecognized contents" }),
+  });
+  instance.xite_info.address = "<b>game</b><img src=x>";
+  instance.handleMessage({ cmd: "evxRecoverWorkspace", params: {}, id: 8 });
+  assert.match(dialogs[0].body, /&lt;b&gt;game&lt;\/b&gt;/);
+  assert.doesNotMatch(dialogs[0].body, /<img/);
+  dialogs[0].cb("recover");
+  assert.match(replies[0].result.error, /unrecognized contents/);
 });

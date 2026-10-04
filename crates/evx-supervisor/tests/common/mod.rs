@@ -18,25 +18,43 @@ pub const PAGE: usize = 65_536;
 /// it a no-op when fresh).
 pub fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| build_target("evx-worker", &["-p", "evx-worker"], "")).clone()
+    PATH.get_or_init(|| build_target("evx-worker", &["-p", "evx-worker"], ""))
+        .clone()
 }
 
 /// Build and locate the hostile peer example of `evx-supervisor`.
 pub fn hostile_peer_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| build_target("hostile_peer", &["-p", "evx-supervisor", "--example", "hostile_peer"], "examples"))
-        .clone()
+    PATH.get_or_init(|| {
+        build_target(
+            "hostile_peer",
+            &["-p", "evx-supervisor", "--example", "hostile_peer"],
+            "examples",
+        )
+    })
+    .clone()
 }
 
 fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut command = std::process::Command::new(cargo);
-    command.arg("build").args(args).current_dir(manifest.join("../.."));
+    command
+        .arg("build")
+        .args(args)
+        .current_dir(manifest.join("../.."));
+    command.arg("--locked");
+    // Nested Cargo invocations do not inherit this test's feature selection.
+    // Keep the compiler, guest and supervisor on the same engine backend.
+    if evx_runtime::engine::backend_name().starts_with("pulley") {
+        command.args(["--features", "evx-runtime/pulley"]);
+    }
     if !cfg!(debug_assertions) {
         command.arg("--release");
     }
-    let status = command.status().unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
+    let status = command
+        .status()
+        .unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
     assert!(status.success(), "building {name} failed");
     // target/<profile>/deps/<test-binary> -> target/<profile>
     let exe = std::env::current_exe().expect("test binary path");
@@ -45,8 +63,13 @@ fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {
         .and_then(std::path::Path::parent)
         .expect("target profile directory")
         .to_path_buf();
-    let path = if subdir.is_empty() { profile_dir.join(name) } else { profile_dir.join(subdir).join(name) };
-    std::fs::canonicalize(&path).unwrap_or_else(|e| panic!("{name} not found at {}: {e}", path.display()))
+    let path = if subdir.is_empty() {
+        profile_dir.join(name)
+    } else {
+        profile_dir.join(subdir).join(name)
+    };
+    std::fs::canonicalize(&path)
+        .unwrap_or_else(|e| panic!("{name} not found at {}: {e}", path.display()))
 }
 
 pub fn config() -> Config {
