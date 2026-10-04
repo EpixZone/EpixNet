@@ -35,6 +35,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Check Windows transport and build native fixtures
+        id: build-native
         shell: pwsh
         run: |
           cargo clippy -p evx-windows --all-targets --locked -- -D warnings
@@ -49,6 +50,7 @@ jobs:
           & target/evx-windows-fixture/release/examples/acceptance.exe 2>&1 | Tee-Object -FilePath windows-native-acceptance.log
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Require real confined Wasm compile, call, cancellation and fresh execution
+        if: ${{ !cancelled() && steps.build-native.outcome == 'success' }}
         shell: pwsh
         run: |
           & target/evx-windows-fixture/release/examples/execution_acceptance.exe 2>&1 | Tee-Object -FilePath windows-runtime-acceptance.log

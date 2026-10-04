@@ -42,12 +42,25 @@ fn wide(value: impl AsRef<OsStr>) -> io::Result<Vec<u16>> {
 // Resolve profile storage from the current user's registered known folder,
 // without trusting or inheriting caller-controlled environment variables.
 fn local_app_data() -> io::Result<Vec<u16>> {
-    use windows_sys::Win32::{
-        System::Com::CoTaskMemFree,
-        UI::Shell::{FOLDERID_LocalAppData, SHGetKnownFolderPath},
-    };
+    use windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData;
+    type KnownFolderPath = unsafe extern "system" fn(
+        *const windows_sys::core::GUID,
+        u32,
+        HANDLE,
+        *mut *mut u16,
+    ) -> i32;
+    type FreePath = unsafe extern "system" fn(*const std::ffi::c_void);
+    // Resolve host-only shell/COM entry points on demand. Static imports would
+    // also initialize these DLLs in the confined child before its entrypoint.
+    let shell = SystemLibrary::open("shell32.dll")?;
+    let com = SystemLibrary::open("ole32.dll")?;
+    // SAFETY: fixed system DLL exports and their documented Win32 signatures;
+    // both libraries remain loaded through the call and allocation release.
+    let known_folder: KnownFolderPath =
+        unsafe { std::mem::transmute(shell.symbol(c"SHGetKnownFolderPath")?) };
+    let free_path: FreePath = unsafe { std::mem::transmute(com.symbol(c"CoTaskMemFree")?) };
     let mut path = null_mut();
-    let status = unsafe { SHGetKnownFolderPath(&FOLDERID_LocalAppData, 0, null_mut(), &mut path) };
+    let status = unsafe { known_folder(&FOLDERID_LocalAppData, 0, null_mut(), &mut path) };
     let result = if status < 0 || path.is_null() {
         Err(fail(&format!(
             "local app data lookup failed: 0x{:08x}",
@@ -67,8 +80,35 @@ fn local_app_data() -> io::Result<Vec<u16>> {
         }
     };
     // The API requires freeing this allocation even on a failed lookup.
-    unsafe { CoTaskMemFree(path.cast()) };
+    unsafe { free_path(path.cast()) };
     result
+}
+
+struct SystemLibrary(HMODULE);
+impl SystemLibrary {
+    fn open(name: &str) -> io::Result<Self> {
+        use windows_sys::Win32::System::LibraryLoader::{
+            LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
+        };
+        let name = wide(name)?;
+        let module =
+            unsafe { LoadLibraryExW(name.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
+        if module.is_null() {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(Self(module))
+    }
+    fn symbol(&self, name: &std::ffi::CStr) -> io::Result<unsafe extern "system" fn() -> isize> {
+        unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetProcAddress(self.0, name.as_ptr().cast())
+        }
+        .ok_or_else(io::Error::last_os_error)
+    }
+}
+impl Drop for SystemLibrary {
+    fn drop(&mut self) {
+        unsafe { FreeLibrary(self.0) };
+    }
 }
 
 // AppContainer startup resolves and redirects LOCALAPPDATA for its profile.
@@ -126,7 +166,11 @@ impl Drop for Local {
 fn token(process: HANDLE) -> io::Result<Handle> {
     let mut raw = null_mut();
     unsafe {
-        ok(OpenProcessToken(process, TOKEN_QUERY | TOKEN_DUPLICATE, &mut raw))?;
+        ok(OpenProcessToken(
+            process,
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut raw,
+        ))?;
     }
     Handle::checked(raw)
 }
@@ -359,6 +403,12 @@ impl Stage {
         attrs.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &mut handles)?;
         let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
         startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
+        // The same explicitly inherited private pipe also captures bounded
+        // startup diagnostics; no host console handles are inherited.
+        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
+        startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
+        startup.StartupInfo.hStdOutput = writer.0;
+        startup.StartupInfo.hStdError = writer.0;
         startup.lpAttributeList = attrs.raw();
         let exe = wide(&self.executable)?;
         // Only our fixed enum and decimal handles/loopback port enter argv. The
@@ -568,10 +618,14 @@ fn validate_lpac(token: &Handle, package: PSID) -> io::Result<()> {
     // restriction: its own package grant works, ALL_APPLICATION_PACKAGES does
     // not. The positive control prevents an unrelated denial from passing.
     if !grants_read(&impersonation, &sid_text(package)?)? {
-        return Err(fail("AppContainer token failed its own package access check"));
+        return Err(fail(
+            "AppContainer token failed its own package access check",
+        ));
     }
     if grants_read(&impersonation, "S-1-15-2-1")? {
-        return Err(fail("child token accepts ALL_APPLICATION_PACKAGES; LPAC required"));
+        return Err(fail(
+            "child token accepts ALL_APPLICATION_PACKAGES; LPAC required",
+        ));
     }
     Ok(())
 }
@@ -693,34 +747,7 @@ impl Child {
             return Err(fail("excluded event was inherited or signaled"));
         }
         if expect_reply {
-            let mut bytes = 0;
-            unsafe {
-                ok(PeekNamedPipe(
-                    self.reader.0,
-                    null_mut(),
-                    0,
-                    null_mut(),
-                    &mut bytes,
-                    null_mut(),
-                ))?;
-            }
-            if bytes != FRAME.len() as u32 {
-                return Err(fail("wrong bounded reply size"));
-            }
-            let mut reply = [0u8; 8];
-            let mut read = 0;
-            unsafe {
-                ok(ReadFile(
-                    self.reader.0,
-                    reply.as_mut_ptr(),
-                    reply.len() as u32,
-                    &mut read,
-                    null_mut(),
-                ))?;
-            }
-            if read != 8 || reply != FRAME {
-                return Err(fail("invalid game reply"));
-            }
+            verify_fixture_reply(&self.reader, code)?;
         }
         Ok(Outcome {
             code,
@@ -730,6 +757,44 @@ impl Child {
         })
     }
 }
+fn verify_fixture_reply(reader: &Handle, code: u32) -> io::Result<()> {
+    let mut bytes = 0;
+    unsafe {
+        ok(PeekNamedPipe(
+            reader.0,
+            null_mut(),
+            0,
+            null_mut(),
+            &mut bytes,
+            null_mut(),
+        ))
+        .map_err(|error| fail(&format!("child exit 0x{code:08x} without a reply: {error}")))?;
+    }
+    if bytes == 0 || bytes > 4096 {
+        return Err(fail(&format!(
+            "child exit 0x{code:08x}: invalid reply size {bytes}"
+        )));
+    }
+    let mut reply = vec![0u8; bytes as usize];
+    let mut read = 0;
+    unsafe {
+        ok(ReadFile(
+            reader.0,
+            reply.as_mut_ptr(),
+            bytes,
+            &mut read,
+            null_mut(),
+        ))?;
+    }
+    if read != bytes || code != 0 || reply != FRAME {
+        return Err(fail(&format!(
+            "child exit 0x{code:08x}: invalid reply: {}",
+            String::from_utf8_lossy(&reply)
+        )));
+    }
+    Ok(())
+}
+
 impl Drop for Child {
     fn drop(&mut self) {
         drop(self.job.take());
