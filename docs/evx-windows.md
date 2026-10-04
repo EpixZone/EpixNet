@@ -49,7 +49,10 @@ showing zero active processes. `TerminateJobObject` returning success, a reply,
 pipe closure or an exit-code query alone cannot establish death. A termination
 wait or accounting failure retains the disposable stage/profile and returns an
 error. The separate kill-on-close case retains an independent process handle to
-observe death; its one-process restriction precludes descendants. This is not a
+observe death; a readiness frame and an unsignaled process first prove the
+sleeping child is alive, then job closure must terminate it before the wall
+deadline. The job-close exit code can be zero and does not prove success.
+Its one-process restriction precludes descendants. This is not a
 persistent production lifecycle journal or an actual host-crash test.
 
 This primitive does not promise that native code has no filesystem namespace.

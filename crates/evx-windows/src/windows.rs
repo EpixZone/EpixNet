@@ -728,6 +728,36 @@ struct Outcome {
     peak_bytes: usize,
 }
 impl Child {
+    fn confirm_ready(&self, wall: Duration) -> io::Result<()> {
+        loop {
+            if unsafe { WaitForSingleObject(self.process.0, 0) } != WAIT_TIMEOUT {
+                return Err(fail("sleep fixture exited before job-close probe"));
+            }
+            let mut bytes = 0;
+            unsafe {
+                ok(PeekNamedPipe(
+                    self.reader.0,
+                    null_mut(),
+                    0,
+                    null_mut(),
+                    &mut bytes,
+                    null_mut(),
+                ))?;
+            }
+            if bytes != 0 {
+                verify_fixture_reply(&self.reader, 0)?;
+                if unsafe { WaitForSingleObject(self.process.0, 0) } != WAIT_TIMEOUT {
+                    return Err(fail("sleep fixture died before closing the job"));
+                }
+                return Ok(());
+            }
+            if self.started.elapsed() >= wall {
+                return Err(fail("sleep fixture did not confirm readiness"));
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     fn finish(
         mut self,
         stage: &mut Stage,
@@ -738,6 +768,7 @@ impl Child {
         // KILL_ON_JOB_CLOSE test retains the process handle as independent death
         // evidence. ActiveProcessLimit=1 plus child restriction prevents descendants.
         if close_job {
+            self.confirm_ready(wall)?;
             drop(self.job.take());
         }
         let deadline;
@@ -998,8 +1029,16 @@ fn child(args: &[String]) -> io::Result<()> {
         Mode::Cpu => loop {
             std::hint::black_box(42u64.wrapping_mul(12345));
         },
-        Mode::Sleep => std::thread::sleep(Duration::from_secs(60)),
+        Mode::Sleep => {
+            write_fixture_reply(writer)?;
+            std::thread::sleep(Duration::from_secs(60));
+            return Err(fail("sleep fixture survived without termination"));
+        }
     }
+    write_fixture_reply(writer)
+}
+
+fn write_fixture_reply(writer: HANDLE) -> io::Result<()> {
     let mut written = 0;
     unsafe {
         ok(WriteFile(
@@ -1070,7 +1109,10 @@ pub fn main() -> io::Result<()> {
     let mut stage = Stage::new()?;
     let child = stage.launch(Mode::Sleep, port)?;
     let result = child.finish(&mut stage, Duration::from_secs(3), true, false)?;
-    if result.deadline || result.code == 0 {
+    // Closing the last job handle may produce exit code zero. Readiness and
+    // an independently signaled process before the deadline prove the kill;
+    // a loader failure or a naturally completed child cannot satisfy the probe.
+    if result.deadline {
         return Err(fail("kill-on-job-close did not terminate fixture"));
     }
     println!("PASS job close: process death confirmed independently");
