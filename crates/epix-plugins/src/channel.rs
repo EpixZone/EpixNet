@@ -2375,7 +2375,11 @@ async fn solve_recovered_record(
     signing_key: String,
 ) -> Result<Value, String> {
     tokio::task::spawn_blocking(move || -> Result<Value, String> {
-        epix_content::pool::solve_pow(&mut record, target_work);
+        // A queued record already carries the work it was sealed with, and
+        // re-solving from nonce 0 would only rediscover that same nonce.
+        if epix_content::pool::record_work_bits(&record) < target_work {
+            epix_content::pool::solve_pow(&mut record, target_work);
+        }
         record["sign"] = json!(epix_crypt::sign(
             &epix_content::record_signed_data(&record),
             &signing_key,
