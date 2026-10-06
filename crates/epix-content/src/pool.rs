@@ -439,13 +439,40 @@ pub fn rln_reservation_id(epoch: i64, ct: &[u8]) -> [u8; 32] {
     Sha256::digest(material).into()
 }
 
-/// Solve the proof of work for a record in place: try `pow` nonces until
+/// Solve the proof of work for a record in place: try `pow` nonces from 0 until
 /// `sha256d(record_signed_data(record))` clears `pow_bits`, set `record["pow"]`
 /// to the winning nonce, and return it. The caller signs AFTER this (the
-/// signature is excluded from the payload, so solving is stable). Reference
-/// implementation; a hot-path solver may splice the nonce over a cached
-/// canonical prefix instead of re-serializing each attempt.
+/// signature is excluded from the payload, so solving is stable).
+///
+/// The canonical payload is serialized once and split around the `pow` value;
+/// everything before it is absorbed into a SHA-256 midstate, so each attempt
+/// hashes only the nonce digits and the short suffix instead of re-serializing
+/// the padded ciphertext. The winning nonce is identical to
+/// [`solve_pow_reference`]'s.
 pub fn solve_pow(record: &mut Value, pow_bits: u32) -> u64 {
+    let Some((prefix, suffix)) = pow_payload_split(record) else {
+        return solve_pow_reference(record, pow_bits);
+    };
+    let mut base = Sha256::new();
+    base.update(prefix.as_bytes());
+    let mut digits = [0u8; 20];
+    let mut nonce: u64 = 0;
+    loop {
+        let mut first = base.clone();
+        first.update(decimal(nonce, &mut digits));
+        first.update(suffix.as_bytes());
+        let second = Sha256::digest(first.finalize().as_slice());
+        if leading_zero_bits(second.as_slice()) >= pow_bits {
+            record["pow"] = json!(nonce);
+            return nonce;
+        }
+        nonce += 1;
+    }
+}
+
+/// Re-serialize the whole record for every nonce. Kept as the fallback when the
+/// payload cannot be split around a unique `pow` value.
+fn solve_pow_reference(record: &mut Value, pow_bits: u32) -> u64 {
     let mut nonce: u64 = 0;
     loop {
         record["pow"] = json!(nonce);
@@ -453,6 +480,42 @@ pub fn solve_pow(record: &mut Value, pow_bits: u32) -> u64 {
             return nonce;
         }
         nonce += 1;
+    }
+}
+
+/// The canonical PoW payload with `pow = 0`, split into the bytes before and
+/// after that `0`. String values are escaped, so an unescaped `"pow": ` only
+/// occurs at the key itself; anything else returns `None`.
+fn pow_payload_split(record: &Value) -> Option<(String, String)> {
+    const NEEDLE: &str = "\"pow\": 0";
+    if !record.is_object() {
+        return None;
+    }
+    let mut probe = record.clone();
+    probe["pow"] = json!(0u64);
+    let payload = record_signed_data(&probe);
+    let mut hits = payload.match_indices(NEEDLE);
+    let (at, _) = hits.next()?;
+    if hits.next().is_some() {
+        return None;
+    }
+    let digit = at + NEEDLE.len() - 1;
+    Some((
+        payload[..digit].to_string(),
+        payload[digit + 1..].to_string(),
+    ))
+}
+
+/// `n` in decimal, matching `serde_json`'s rendering of an unsigned integer.
+fn decimal(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut start = buf.len();
+    loop {
+        start -= 1;
+        buf[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            return &buf[start..];
+        }
     }
 }
 
@@ -1467,5 +1530,63 @@ mod tests {
             merge_pool(&make_pool_container(vec![]), &make_pool_container(vec![rec]), &r, week, 6, now);
         assert!(pool_records_of(&into6).is_empty(), "record for sub 5 must not land in sub 6");
         assert!(delta6.is_empty());
+    }
+
+    #[test]
+    fn midstate_solver_finds_the_reference_nonce() {
+        // A padded-bucket-sized record carrying an `rln` field (sorts after
+        // `pow`) and a stale `sign` (excluded from the payload).
+        let base = json!({
+            "v": 1,
+            "epoch": 100,
+            "tag": tag_b64(3),
+            "ct": ct_b64(8192, 7),
+            "pow": 123,
+            "rln": "cHJvb2Y=",
+            "author": "epix1author",
+            "sign": "stale",
+        });
+        for bits in [0, 1, 8, 12] {
+            let mut fast = base.clone();
+            let mut reference = base.clone();
+            let nonce = solve_pow(&mut fast, bits);
+            assert_eq!(
+                nonce,
+                solve_pow_reference(&mut reference, bits),
+                "bits {bits}"
+            );
+            assert_eq!(fast, reference);
+            assert!(record_work_bits(&fast) >= bits);
+        }
+    }
+
+    #[test]
+    fn midstate_solver_ignores_pow_text_inside_strings() {
+        let base = json!({
+            "v": 1,
+            "epoch": 100,
+            "tag": "x\", \"pow\": 0, \"y",
+            "ct": "\"pow\": 0",
+            "pow": 0,
+            "author": "epix1author",
+        });
+        assert!(
+            pow_payload_split(&base).is_some(),
+            "escaped quotes never match the key"
+        );
+        let mut fast = base.clone();
+        let mut reference = base.clone();
+        assert_eq!(
+            solve_pow(&mut fast, 10),
+            solve_pow_reference(&mut reference, 10)
+        );
+    }
+
+    #[test]
+    fn decimal_matches_json_integer_rendering() {
+        let mut buf = [0u8; 20];
+        for n in [0u64, 7, 10, 1_186_474, u64::MAX] {
+            assert_eq!(decimal(n, &mut buf), json!(n).to_string().as_bytes());
+        }
     }
 }
