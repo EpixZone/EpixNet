@@ -2617,7 +2617,7 @@ dependencies = [
  "base64 0.23.1",
  "bech32",
  "ed25519-dalek 3.0.0",
- "fslock-guard",
+ "fslock-guard 0.9.0",
  "futures-util",
  "hex",
  "reqwest",
@@ -2884,7 +2884,7 @@ dependencies = [
  "epix-ui",
  "epix-worker",
  "epix-xite",
- "fslock-guard",
+ "fslock-guard 0.9.0",
  "hex",
  "serde_json",
  "sha2 0.11.0",
@@ -3507,6 +3507,17 @@ name = "fslock-guard"
 version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d10ce5036d49f8add4a11d08bc1b1afb0e3cefdd88778ab87fb4202d47b765e1"
+dependencies = [
+ "libc",
+ "thiserror 2.0.21",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "fslock-guard"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8082ded4af6b2e8e75d0ff71848ad7649d1ddff369a718e8e1db918795967bce"
 dependencies = [
  "libc",
  "thiserror 2.0.21",
@@ -8737,7 +8748,7 @@ dependencies = [
  "educe 0.4.23",
  "event-listener",
  "fs-mistrust",
- "fslock-guard",
+ "fslock-guard 0.8.2",
  "futures",
  "hex",
  "humantime",
@@ -9283,7 +9294,7 @@ dependencies = [
  "extend",
  "filetime",
  "fs-mistrust",
- "fslock-guard",
+ "fslock-guard 0.8.2",
  "futures",
  "itertools 0.15.0",
  "oneshot-fused-workaround",
