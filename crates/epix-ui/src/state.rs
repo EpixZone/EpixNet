@@ -4084,6 +4084,10 @@ const XID_RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_se
 /// chain stays unreachable re-checks every half hour, not every minute.
 const XID_RETRY_BACKOFF_MAX_SECS: u64 = 30 * 60;
 
+/// The reader [`AppState::set_evx_grant_summary_source`] installs: from a
+/// xite's bech32 address to its stored EVX grant as JSON, or `None`.
+pub type EvxGrantSummarySource = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
+
 pub struct AppState {
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
@@ -4217,6 +4221,15 @@ pub struct AppState {
     /// commands can retrieve it from the bound `AppState`, keeping the core free
     /// of any per-feature fields. See [`Self::install_capability`].
     capabilities: std::sync::RwLock<HashMap<String, Arc<dyn std::any::Any + Send + Sync>>>,
+    /// Where the `/list/<xite>/?evx=1` inspection view reads a xite's stored
+    /// EVX grant from, installed by the node's EVX service (Milestone 2 stage
+    /// 3). The grant lives in the service's own SQLite file outside every
+    /// served root, and this crate must not link the state crate that opens
+    /// it, so the service hands in a reader instead. `None` until installed:
+    /// the view then reports that no grant is stored, which is also the
+    /// truth on a node built without the service. See
+    /// [`Self::set_evx_grant_summary_source`].
+    evx_grant_summary_source: std::sync::RwLock<Option<EvxGrantSummarySource>>,
     /// Generic local (never-shared) feed/notification sources contributed by
     /// plugins. `feedQuery`/`notification_query` fold these in after the shared
     /// queries so private data (like decrypted mail) reaches the dashboard and
@@ -4523,6 +4536,10 @@ pub struct AppState {
     /// Outstanding one-time wrapper nonces (EpixNet's `server.wrapper_nonces`):
     /// issued when a wrapper is served, consumed on the inner file request.
     wrapper_nonces: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Wrapper/AJAX keys reserved for xites that are still being added (the
+    /// loading screen renders before the clone lands), keyed by address and
+    /// adopted by `add_xite` so the page already open keeps its authority.
+    pending_wrapper_keys: std::sync::Mutex<HashMap<String, (String, String)>>,
     /// The per-run token that authorizes state-changing UI requests (config
     /// saves, plugin toggles, restart). It is rendered into the mutating forms
     /// and must come back on the POST. A hostile page can navigate the browser
@@ -4579,6 +4596,7 @@ pub struct AppState {
     /// Tor loop can re-bootstrap through (or away from) Snowflake without a
     /// node restart.
     tor_config_changed: Arc<tokio::sync::Notify>,
+    plugin_changes: tokio::sync::watch::Sender<()>,
     /// Multiuser: extra identities keyed by master_address, persisted alongside
     /// the active `user`. Lets the operator log in with another master seed and
     /// switch between identities. Feature-gated (desktop only).
@@ -4806,6 +4824,12 @@ pub(crate) fn xite_domain_name(value: &str) -> Option<String> {
     let name = value.trim().to_ascii_lowercase();
     let label = name.strip_suffix(".epix")?;
     let bytes = label.as_bytes();
+    // `content.epix` is reserved: xite pages live on `<xite>.content.epix`
+    // (crates/epix-ui/src/lib.rs CONTENT_HOST_LABEL), and a xite named
+    // `content` would sit above every one of them.
+    if label == "content" {
+        return None;
+    }
     if bytes.is_empty() || bytes.len() > 63
         || !bytes.first()?.is_ascii_alphanumeric()
         || !bytes.last()?.is_ascii_alphanumeric()
@@ -5408,6 +5432,26 @@ fn random_hex_with(
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
 }
 
+/// Compare two secrets without an early exit on the first differing byte.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// A xite's settings as pages may see them. The wrapper and AJAX keys are
+/// authority secrets: a page that learned them could open a WebSocket as the
+/// trusted wrapper, so they are stripped from every `siteInfo` and event.
+pub fn public_settings(settings: &XiteSettings) -> Value {
+    let mut value = serde_json::to_value(settings).unwrap_or(Value::Null);
+    if let Value::Object(map) = &mut value {
+        map.remove("wrapper_key");
+        map.remove("ajax_key");
+    }
+    value
+}
+
 fn random_hex(bytes: usize) -> String {
     random_hex_with(bytes, &mut |buf| {
         getrandom::fill(buf).map_err(|error| format!("operating-system randomness failed: {error}"))
@@ -5590,6 +5634,7 @@ impl AppState {
             pool_events: tokio::sync::broadcast::channel(1024).0,
             pool_admission: RwLock::new(None),
             capabilities: std::sync::RwLock::new(HashMap::new()),
+            evx_grant_summary_source: std::sync::RwLock::new(None),
             local_sources: RwLock::new(Vec::new()),
             link_opener: RwLock::new(None),
             prop_store: std::sync::OnceLock::new(),
@@ -5672,6 +5717,7 @@ impl AppState {
             log_file: std::sync::Mutex::new(None),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
+            pending_wrapper_keys: std::sync::Mutex::new(HashMap::new()),
             ui_csrf: std::sync::OnceLock::new(),
             nmh_token: std::sync::OnceLock::new(),
             allowed_ws_origins: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -5686,6 +5732,7 @@ impl AppState {
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
             tor_config_changed: Arc::new(tokio::sync::Notify::new()),
+            plugin_changes: tokio::sync::watch::channel(()).0,
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(persist.multi_users),
             #[cfg(feature = "multiuser")]
@@ -5851,6 +5898,12 @@ impl AppState {
     pub async fn plugin_enabled(&self, name: &str) -> bool {
         let (disabled, enabled) = self.plugin_overrides().await;
         effective_enabled(name, &disabled, &enabled)
+    }
+
+    /// Internal wake for plugin owners, including idle background services.
+    /// A watch retains a change while a receiver is checking current policy.
+    pub fn subscribe_plugin_changes(&self) -> tokio::sync::watch::Receiver<()> {
+        self.plugin_changes.subscribe()
     }
 
     /// Enable/disable a plugin at runtime (persisted). Only stores an override
@@ -6680,6 +6733,9 @@ impl AppState {
         if key == "tor_use_bridges" {
             self.tor_config_changed.notify_waiters();
         }
+        if matches!(key, "plugins_disabled" | "plugins_enabled") {
+            self.plugin_changes.send_replace(());
+        }
         // Chain endpoints apply live: the shared resolver re-reads the
         // installed list per request, and open dashboards get the new
         // endpoints pushed over serverChanged.
@@ -7066,7 +7122,20 @@ impl AppState {
         // xites. Keep the root stat when the walk found less (mid-clone, the
         // children may not be on disk yet).
         settings.size_optional = settings.size_optional.max(optional_declared);
-        self.xites.write().await.insert(
+        {
+            let mut xites = self.xites.write().await;
+            // A wrapper rendered while this xite was still being added embedded
+            // reserved keys (`wrapper_keys`): the page holding them is the one
+            // open now, so they become the xite's keys.
+            {
+                let mut pending = self.pending_wrapper_keys.lock().unwrap();
+                let reserved = pending.remove(&address).or_else(|| pending.remove(&canonical));
+                if let Some((wrapper_key, ajax_key)) = reserved {
+                    settings.wrapper_key = wrapper_key;
+                    settings.ajax_key = ajax_key;
+                }
+            }
+            xites.insert(
             address.clone(),
             ManagedXite {
                 storage: entry.storage,
@@ -7096,6 +7165,7 @@ impl AppState {
                 check_peers: (0, 0),
             },
         );
+        }
         match verified_index {
             Some(index) => self.install_verified_xite_index(&canonical, index),
             None => {
@@ -17502,6 +17572,29 @@ impl AppState {
         self.xites.read().await.get(address).map(|x| x.storage.clone())
     }
 
+    /// Read one stored file of a served xite through
+    /// [`XiteStorage::read_bounded`]: no link is followed and a file whose
+    /// recorded size exceeds `max_bytes` is refused before allocation. This is
+    /// the raw-bytes read the EVX service needs for the root `content.json`
+    /// (the decoded [`AppState::content`] value has already collapsed a
+    /// duplicated key, which the strict declaration parser must still see)
+    /// and for the program files it hands the activation loader. The error
+    /// names the rule, never the host path.
+    pub async fn read_xite_file_bounded(
+        &self,
+        address: &str,
+        inner_path: &str,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>, String> {
+        let storage = self
+            .xite_storage(address)
+            .await
+            .ok_or_else(|| format!("xite {address} is not served by this node"))?;
+        storage
+            .read_bounded(inner_path, max_bytes)
+            .map_err(|_| format!("{inner_path}: unavailable or beyond {max_bytes} bytes"))
+    }
+
     /// The node master seed (hex), for deriving per-consumer identity seeds.
     pub(crate) async fn master_seed(&self) -> String {
         self.user.read().await.master_seed.clone()
@@ -17516,6 +17609,29 @@ impl AppState {
         if let Ok(mut caps) = self.capabilities.write() {
             caps.insert(key.to_string(), cap);
         }
+    }
+
+    /// Install the reader the EVX inspection view asks for a xite's stored
+    /// grant. The node's EVX service calls this once at startup with a closure
+    /// over its durable state; the closure takes the xite's bech32 address and
+    /// returns the grant rendered as JSON, or `None` when no grant is stored.
+    /// The view only displays the value (every string in it is HTML-escaped),
+    /// so the shape is the service's to choose; `enabled` is the one field the
+    /// view reads, for the `EVX enabled for this xite` status. Replaces any
+    /// reader installed earlier.
+    pub fn set_evx_grant_summary_source(&self, source: EvxGrantSummarySource) {
+        if let Ok(mut slot) = self.evx_grant_summary_source.write() {
+            *slot = Some(source);
+        }
+    }
+
+    /// The stored EVX grant for `address` as the installed reader renders
+    /// it, or `None` when no reader is installed or it has no grant for this
+    /// xite. Synchronous: the reader is a bounded local lookup and the lock
+    /// is never held across an await.
+    pub fn evx_grant_summary(&self, address: &str) -> Option<Value> {
+        let source = self.evx_grant_summary_source.read().ok()?;
+        source.as_ref()?(address)
     }
 
     /// Retrieve typed plugin state installed under `key`, if present and of type
@@ -18006,7 +18122,7 @@ impl AppState {
                 let entry = xites.get(address)?;
                 Some((
                     entry.content.as_ref().map(summarize_content),
-                    serde_json::to_value(&entry.settings).ok(),
+                    Some(public_settings(&entry.settings)),
                 ))
             })
             .unwrap_or((None, None));
@@ -33046,7 +33162,7 @@ impl AppState {
                 .map(|(done, total)| json!({ "done": done, "total": total }))
                 .unwrap_or(Value::Null),
             "bad_files": settings.cache.bad_files.len(),
-            "settings": serde_json::to_value(settings).unwrap_or(Value::Null),
+            "settings": public_settings(&settings),
             "size_limit": size_limit,
             "next_size_limit": next_size_limit,
             "peers": peers.max(1),
@@ -33126,10 +33242,73 @@ impl AppState {
         nonce
     }
 
+    /// Whether a wrapper nonce is outstanding, without consuming it (the file
+    /// request it rides on consumes it).
+    pub fn wrapper_nonce_outstanding(&self, nonce: &str) -> bool {
+        self.wrapper_nonces.lock().unwrap().contains(nonce)
+    }
+
     /// Consume a wrapper nonce; true if it was outstanding (valid). Matches
     /// EpixNet's remove-on-use.
     pub fn consume_wrapper_nonce(&self, nonce: &str) -> bool {
         self.wrapper_nonces.lock().unwrap().remove(nonce)
+    }
+
+    /// The per-xite secrets the wrapper page embeds (EpixNet's
+    /// `site.settings` `wrapper_key` / `ajax_key`): `wrapper_key` authorizes
+    /// the wrapper's WebSocket as the trusted chrome for that xite, `ajax_key`
+    /// lets the sandboxed (opaque-origin) inner page read its own files. Both
+    /// are random, persisted with the xite, and never sent to a page through
+    /// `siteInfo` (see [`public_settings`]). A xite that is still being added
+    /// gets keys reserved here; `add_xite` adopts them, so the loading screen
+    /// already open keeps working once the xite is managed.
+    pub async fn wrapper_keys(&self, address: &str) -> (String, String) {
+        let xites = self.xites.read().await;
+        if let Some(xite) = xites.get(address) {
+            return (xite.settings.wrapper_key.clone(), xite.settings.ajax_key.clone());
+        }
+        // Lock order: xites, then pending (add_xite takes them the same way).
+        let mut pending = self.pending_wrapper_keys.lock().unwrap();
+        // Addresses that never land must not grow this for the process lifetime.
+        if pending.len() >= 512 && !pending.contains_key(address) {
+            pending.clear();
+        }
+        pending
+            .entry(address.to_string())
+            .or_insert_with(|| (epix_crypt::new_seed(), epix_crypt::new_seed()))
+            .clone()
+    }
+
+    /// The xite whose `wrapper_key` this is, if any.
+    pub async fn xite_by_wrapper_key(&self, key: &str) -> Option<String> {
+        self.xite_by_key(key, true).await
+    }
+
+    /// The xite whose `ajax_key` this is, if any.
+    pub async fn xite_by_ajax_key(&self, key: &str) -> Option<String> {
+        self.xite_by_key(key, false).await
+    }
+
+    async fn xite_by_key(&self, key: &str, wrapper: bool) -> Option<String> {
+        if key.is_empty() {
+            return None;
+        }
+        let xites = self.xites.read().await;
+        let found = xites.iter().find(|(_, x)| {
+            let candidate = if wrapper { &x.settings.wrapper_key } else { &x.settings.ajax_key };
+            constant_time_eq(candidate.as_bytes(), key.as_bytes())
+        });
+        if let Some((address, _)) = found {
+            return Some(address.clone());
+        }
+        let pending = self.pending_wrapper_keys.lock().unwrap();
+        pending
+            .iter()
+            .find(|(_, keys)| {
+                let candidate = if wrapper { &keys.0 } else { &keys.1 };
+                constant_time_eq(candidate.as_bytes(), key.as_bytes())
+            })
+            .map(|(address, _)| address.clone())
     }
 
     /// This run's CSRF token, generated on first use. Rendered into every
@@ -33210,6 +33389,11 @@ impl AppState {
         if !host.is_empty() {
             self.allowed_ws_origins.lock().unwrap().insert(host.to_string());
         }
+    }
+
+    /// Whether a wrapper page was served from this host (`allow_ws_origin`).
+    pub fn is_served_wrapper_host(&self, host: &str) -> bool {
+        self.allowed_ws_origins.lock().unwrap().contains(host)
     }
 
     /// Whether a WebSocket `Origin` host is allowed: same as the request host,
@@ -42502,6 +42686,69 @@ mod tests {
             .unwrap();
         let q = state.notification_query().await;
         assert_eq!(q["results"][0]["count"], 1, "3 total minus 2 seen: {q}");
+    }
+
+    #[test]
+    fn the_content_host_label_is_not_a_xite_name() {
+        // `<xite>.content.epix` is where xite pages live in host mode; a
+        // xite named `content` would sit above all of them.
+        assert_eq!(xite_domain_name("content.epix"), None);
+        assert_eq!(xite_domain_name("Content.epix"), None);
+        assert_eq!(xite_domain_name("talk.content.epix"), None, "three labels are never a name");
+        assert_eq!(xite_domain_name("contents.epix").as_deref(), Some("contents.epix"));
+        assert_eq!(xite_domain_name("talk.epix").as_deref(), Some("talk.epix"));
+    }
+
+    #[tokio::test]
+    async fn wrapper_keys_are_reserved_before_a_xite_lands_and_never_reach_pages() {
+        let state = AppState::new("test");
+        let dir = tempdir().unwrap();
+
+        // A wrapper rendered while the xite is still being added gets keys
+        // reserved for that address, stable across renders, and already
+        // resolvable by the WebSocket upgrade.
+        let (wrapper_key, ajax_key) = state.wrapper_keys("1Pending").await;
+        assert_eq!(wrapper_key.len(), 64);
+        assert_eq!(ajax_key.len(), 64);
+        assert_ne!(wrapper_key, ajax_key);
+        assert_eq!(state.wrapper_keys("1Pending").await, (wrapper_key.clone(), ajax_key.clone()));
+        assert_eq!(state.xite_by_wrapper_key(&wrapper_key).await.as_deref(), Some("1Pending"));
+        assert_eq!(state.xite_by_ajax_key(&ajax_key).await.as_deref(), Some("1Pending"));
+        assert!(state.xite_by_wrapper_key(&ajax_key).await.is_none(), "keys are not interchangeable");
+        assert!(state.xite_by_wrapper_key("").await.is_none());
+        assert!(state.xite_by_wrapper_key("1Pending").await.is_none(), "an address is not a key");
+
+        // Adding the xite adopts the reserved keys, so the page already open
+        // keeps its authority once the xite is managed.
+        let manifest = |address: &str| Some(json!({ "address": address, "files": {} }));
+        state
+            .add_xite("1Pending", XiteEntry { storage: XiteStorage::new(dir.path()), content: manifest("1Pending") })
+            .await;
+        assert_eq!(state.wrapper_keys("1Pending").await, (wrapper_key.clone(), ajax_key.clone()));
+        assert_eq!(state.xite_by_wrapper_key(&wrapper_key).await.as_deref(), Some("1Pending"));
+        assert_eq!(state.xite_by_ajax_key(&ajax_key).await.as_deref(), Some("1Pending"));
+
+        // A xite added with no reservation gets its own fresh keys.
+        let other_dir = tempdir().unwrap();
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(other_dir.path()), content: manifest("1Other") })
+            .await;
+        assert!(state.is_serving("1Other").await);
+        let (other_key, _) = state.wrapper_keys("1Other").await;
+        assert_ne!(other_key, wrapper_key);
+        assert_eq!(state.xite_by_wrapper_key(&other_key).await.as_deref(), Some("1Other"));
+
+        // What a page sees of a xite's settings carries neither secret.
+        for addr in ["1Pending", "1Other"] {
+            let info = state.xite_info(addr).await;
+            assert!(info["settings"].get("permissions").is_some(), "{info}");
+            assert!(info["settings"].get("wrapper_key").is_none(), "{info}");
+            assert!(info["settings"].get("ajax_key").is_none(), "{info}");
+        }
+        let settings = state.xites.read().await.get("1Other").unwrap().settings.clone();
+        let public = public_settings(&settings);
+        assert!(public.get("wrapper_key").is_none() && public.get("ajax_key").is_none());
+        assert_eq!(public["serving"], true);
     }
 
     #[tokio::test]

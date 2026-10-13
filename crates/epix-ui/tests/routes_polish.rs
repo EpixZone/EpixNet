@@ -126,3 +126,14 @@ async fn theme_background_overrides_the_shared_background() {
     assert!(html.contains("background-color: #abcdef;"));
     assert!(!html.contains("background-color: #123456;"));
 }
+
+#[tokio::test]
+async fn publisher_background_cannot_add_styles_to_the_consent_wrapper() {
+    for color in ["red; display:none", "red; opacity:0", "red; pointer-events:none"] {
+        let router = router_with_hints(json!({ "background-color": color })).await;
+        let response = router.oneshot(get("/1Polish/")).await.unwrap();
+        assert_eq!(response.status(), 200);
+        let html = String::from_utf8(axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap().to_vec()).unwrap();
+        assert!(!html.contains(color), "a color hint changed the trusted consent surface's styles");
+    }
+}

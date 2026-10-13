@@ -1,0 +1,14 @@
+[package]
+name = "evx-workspace"
+version = "0.1.0"
+edition = "2021"
+description = "EVX private workspace operations: descriptor-relative, link-refusing, quota-bounded reads and staged writes."
+
+[dependencies]
+evx-api = { path = "../evx-api" }
+rustix = { version = "1", features = ["fs"] }
+base64 = "0.22"
+rand = "0.9"
+
+[dev-dependencies]
+tempfile = "3"

@@ -65,6 +65,7 @@ jobs:
         run: |
           python3 packaging/test-firefox-download.py
           python3 packaging/linux/test-packaging.py
+          python3 packaging/linux/test-evx-package.py
           shellcheck packaging/linux/*.sh packaging/linux/AppRun packaging/fetch-firefox-esr.sh
           desktop-file-validate packaging/linux/epix.desktop
           sudo apt-get install -y ./dist/*.deb

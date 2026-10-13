@@ -4,7 +4,7 @@ on:
   push:
     # edx: new EDX dependencies (blake3, bao-tree, snow, yamux, ...) must pass
     # the advisory/license gates on every branch push, not first at merge time.
-    branches: [main, edx]
+    branches: [main, edx, evx]
   pull_request:
     branches: [main]
   schedule:
@@ -16,6 +16,74 @@ on:
 permissions: {}
 
 jobs:
+  evx-fuzz:
+    name: EVX boundary fuzz smoke
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: nightly-2026-10-03
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          workspaces: fuzz -> target
+      - name: Install and fetch pinned fuzz dependencies
+        id: fuzz-setup
+        run: |
+          python3 scripts/test-evx-fuzz-lock.py
+          python3 scripts/test-evx-review-bundle.py
+          cargo install cargo-fuzz --version 0.13.2 --locked
+          cargo fetch --locked --manifest-path fuzz/Cargo.toml
+          python3 scripts/check-evx-fuzz-lock.py
+          mkdir -p fuzz/results/ci
+          sha256sum Cargo.lock fuzz/Cargo.lock > fuzz/results/ci/locks.sha256
+          git rev-parse HEAD > fuzz/results/ci/revision.txt
+          rustc --version --verbose > fuzz/results/ci/toolchain.txt
+          cargo fuzz --version >> fuzz/results/ci/toolchain.txt
+      - name: Exercise strict decoding and signed activation
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: |
+          cargo fuzz run declaration --fuzz-dir fuzz --codegen-units 16 -- -runs=10000 -max_total_time=45 -timeout=5 -rss_limit_mb=768 -max_len=65536 2>&1 | tee fuzz/results/ci/declaration.log
+          cargo fuzz run activation --fuzz-dir fuzz --codegen-units 16 -- -runs=10000 -max_total_time=45 -timeout=5 -rss_limit_mb=768 -max_len=65536 2>&1 | tee fuzz/results/ci/activation.log
+      - name: Exercise the production Wasm profile validator
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo fuzz run wasm_profile --fuzz-dir fuzz --features runtime --codegen-units 16 -- -runs=10000 -max_total_time=60 -timeout=5 -rss_limit_mb=1024 -max_len=1048576 2>&1 | tee fuzz/results/ci/wasm_profile.log
+      - name: Exercise IPC framing and strict message decoding
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo fuzz run ipc_frames --fuzz-dir fuzz --codegen-units 16 -- -runs=10000 -max_total_time=60 -timeout=5 -rss_limit_mb=1024 -max_len=262148 2>&1 | tee fuzz/results/ci/ipc_frames.log
+      - name: Exercise durable state transitions
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo fuzz run state_sequences --fuzz-dir fuzz --features state --codegen-units 16 -- -runs=10000 -max_total_time=60 -timeout=15 -rss_limit_mb=1024 -max_len=2048 2>&1 | tee fuzz/results/ci/state_sequences.log
+      - name: Exercise host lifecycle metadata refusal and migration parsing
+        env:
+          CARGO_NET_OFFLINE: "true"
+        run: cargo fuzz run lifecycle_metadata --fuzz-dir fuzz --features lifecycle --codegen-units 16 --sanitizer address -- -runs=10000 -max_total_time=60 -timeout=10 -rss_limit_mb=1024 -max_len=65537 2>&1 | tee fuzz/results/ci/lifecycle_metadata.log
+      - name: Verify fuzzing preserved both lockfiles
+        if: always() && steps.fuzz-setup.outcome == 'success'
+        run: sha256sum --check fuzz/results/ci/locks.sha256
+      - name: Retain fuzz evidence and failure inputs
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: evx-fuzz-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            fuzz/results/ci/
+            fuzz/artifacts/
+          if-no-files-found: ignore
+          retention-days: 14
+
   cargo-audit:
     name: cargo audit (RustSec advisories)
     runs-on: ubuntu-latest

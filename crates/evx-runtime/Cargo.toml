@@ -1,0 +1,35 @@
+[package]
+name = "evx-runtime"
+version = "0.1.0"
+edition = "2021"
+description = "EVX validator, engine configuration, compilation and execution on Wasmtime."
+
+[dependencies]
+evx-api = { path = "../evx-api" }
+# Wasmtime 48 is the current long-term-support line. Default features are
+# off: no WASI, no component model, no GC, no threads, no cache, no profiling.
+wasmtime = { version = "=48.0.5", default-features = false, features = ["runtime", "std"] }
+# Same wasmparser line Wasmtime 48 uses, so the validator and the engine never
+# disagree about the feature set.
+wasmparser = { version = "0.254", default-features = false, features = ["std", "validate", "features"] }
+wat = { version = "1.254", optional = true }
+sha2 = "0.10"
+hex = "0.4"
+thiserror = "2"
+
+[features]
+default = ["compiler"]
+# Only the confined compiler profile needs Cranelift. A compiler-free Pulley
+# consumer is built with --no-default-features --features pulley.
+compiler = ["wasmtime/cranelift"]
+# Text-format support for fixtures, parsed only in the confined compiler.
+text = ["dep:wat", "compiler"]
+# Exercise the interpreter on desktop using the same configuration as iOS.
+pulley = ["wasmtime/pulley"]
+
+# iOS has no executable-memory entitlement in the EVX profile.
+[target.'cfg(target_os = "ios")'.dependencies]
+wasmtime = { version = "=48.0.5", default-features = false, features = ["pulley"] }
+
+[dev-dependencies]
+wat = "1.254"

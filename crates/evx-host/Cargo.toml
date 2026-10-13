@@ -1,0 +1,36 @@
+[package]
+name = "evx-host"
+version = "0.1.0"
+edition = "2021"
+description = "EVX host: binds signed activation to the supervisor, and a JSON-on-stdin CLI for external harnesses."
+
+[lib]
+path = "src/lib.rs"
+
+[features]
+apple-xpc = ["evx-supervisor/apple-xpc"]
+
+[[bin]]
+name = "evx-host"
+path = "src/main.rs"
+
+[dependencies]
+evx-api = { path = "../evx-api" }
+evx-activation = { path = "../evx-activation" }
+evx-supervisor = { path = "../evx-supervisor" }
+evx-runtime = { path = "../evx-runtime", features = ["text"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+base64 = "0.22"
+hex = "0.4"
+
+[dev-dependencies]
+evx-activation = { path = "../evx-activation", features = ["fixtures"] }
+# The content tests sign a root content.json with a real owner key and bind
+# the program from the stored bytes, exactly as the node does.
+evx-declaration = { path = "../evx-declaration" }
+epix-content = { path = "../epix-content" }
+epix-crypt = { path = "../epix-crypt" }
+ed25519-dalek = { version = "3", default-features = false }
+rand = "0.9"
+tempfile = "3"

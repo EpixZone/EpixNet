@@ -1,0 +1,8 @@
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-sdk android:minSdkVersion="34" android:targetSdkVersion="36" />
+    <application>
+        <service android:name="zone.epix.evx.RuntimeService"
+            android:exported="false" android:isolatedProcess="true"
+            android:useAppZygote="false" android:stopWithTask="true" />
+    </application>
+</manifest>

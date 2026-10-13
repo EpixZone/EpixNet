@@ -14,6 +14,8 @@ pub mod command;
 pub mod config_schema;
 pub mod conn_pool;
 pub mod feed;
+/// The inert `/list/<xite>/?evx=1` EVX inspection panel.
+mod evx_view;
 mod file_revert;
 pub mod geoip;
 pub mod local_feed;
@@ -149,7 +151,7 @@ impl UiServer {
             .route("/EpixNet-Internal/Status", get(serve_status))
             .route(NMH_RESOLVE_PATH, axum::routing::post(serve_nmh_resolve))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
-            .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))
+            .route(BIGFILE_UPLOAD_PATH, axum::routing::post(bigfile_upload))
             .route("/uimedia/{*path}", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page).post(serve_plugins_post))
             .route("/Config", get(serve_config_page).post(serve_config_post))
@@ -502,19 +504,34 @@ Add it to the ui_host config key, or access the UI                  by IP."
     // the per-handler CSRF token - so a route that forgets its token check is
     // still not reachable from a hostile page.
     if !matches!(req.method(), &axum::http::Method::GET | &axum::http::Method::HEAD | &axum::http::Method::OPTIONS)
-        && !unsafe_method_is_same_origin(req.headers(), &host_raw)
+        && !unsafe_method_is_same_origin(req.headers(), req.uri().path(), &host_raw)
     {
         return (StatusCode::FORBIDDEN, "Cross-origin write blocked").into_response();
     }
 
+    // A CORS-mode request from the sandboxed inner frame (an opaque origin)
+    // says `Origin: null`. Decide once whether this one may read the file; the
+    // gate below refuses it otherwise, and an authorised one gets the
+    // `Access-Control-Allow-Origin: null` the browser needs to hand the bytes
+    // to the page - whether or not the gate itself is switched on.
+    let null_read = if req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some("null") {
+        Some(null_origin_read(&ctx, req.headers(), req.uri().path(), req.uri().query()).await)
+    } else {
+        None
+    };
+
     if ctx.state.ui_check_cors().await
-        && is_cross_origin_request(&ctx, req.headers(), req.uri().path(), &host_raw).await
+        && is_cross_origin_request(&ctx, req.headers(), req.uri().path(), &host_raw, null_read).await
     {
         return (StatusCode::FORBIDDEN, "Cross-origin request blocked").into_response();
     }
 
     let operator_page = is_operator_path(req.uri().path());
     let mut response = next.run(req).await;
+    if null_read == Some(NullOriginRead::Authorised) {
+        response.headers_mut().insert(header::ACCESS_CONTROL_ALLOW_ORIGIN, "null".parse().unwrap());
+        response.headers_mut().insert(header::VARY, "Origin".parse().unwrap());
+    }
     if operator_page {
         // Operator forms include the node-wide CSRF token and must never be
         // embedded as a script-readable frame in xite content.
@@ -551,7 +568,8 @@ async fn operator_origin_gate(
         });
     }
     // Always protect the token, even if general cross-xite CORS checks are off.
-    is_cross_origin_request(ctx, headers, path, host).await
+    // An opaque-origin page never reaches node controls (no null-origin read).
+    is_cross_origin_request(ctx, headers, path, host, None).await
         .then(|| (StatusCode::FORBIDDEN, "Xite access to node controls blocked").into_response())
 }
 
@@ -563,7 +581,17 @@ async fn operator_origin_gate(
 /// (the desktop shell's own fetches, curl, the admin socket) have no ambient
 /// credentials to abuse - the browser-driven attack this blocks always carries
 /// at least one of the two.
-fn unsafe_method_is_same_origin(headers: &header::HeaderMap, host: &str) -> bool {
+fn unsafe_method_is_same_origin(headers: &header::HeaderMap, path: &str, host: &str) -> bool {
+    // The sandboxed inner frame is an opaque origin, so its one legitimate
+    // write - the Bigfile upload POST - looks cross-site. That route is
+    // authorised by its one-time `upload_nonce` (issued over the wrapper's
+    // WebSocket to the page that asked), not by the origin; everything else
+    // a null origin posts is refused like any other cross-site write.
+    if path == BIGFILE_UPLOAD_PATH
+        && headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some("null")
+    {
+        return true;
+    }
     if let Some(xite) = headers.get("sec-fetch-site").and_then(|v| v.to_str().ok()) {
         return xite == "same-origin" || xite == "none";
     }
@@ -604,12 +632,90 @@ fn strip_port(host: &str) -> &str {
     host.rsplit_once(':').map(|(h, _)| h).unwrap_or(host)
 }
 
-/// EpixNet's `isCrossOriginRequest`, same decision order.
+/// `POST /EpixNet-Internal/BigfileUpload?upload_nonce=…`, the one write a
+/// xite page makes over HTTP.
+const BIGFILE_UPLOAD_PATH: &str = "/EpixNet-Internal/BigfileUpload";
+
+/// Whether a request carrying `Origin: null` may read what it asked for.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NullOriginRead {
+    Authorised,
+    Refused,
+}
+
+/// Decide a null-origin read. The sandboxed inner frame sends `Origin: null`
+/// on every CORS-mode request: the XHR/fetch calls the frame library keys
+/// with the xite's `ajax_key`, plus its module scripts and CSS fonts, which
+/// carry no key. Any other opaque document (a sandboxed frame on some other
+/// page) sends the very same header, so a null origin is authorised only by
+///
+/// 1. a valid `ajax_key`: it names the source xite, and the read passes when
+///    the target is that xite or one it holds `Cors:<target>` for; or
+/// 2. a request kind that executes or renders the file without exposing its
+///    bytes to script (`Sec-Fetch-Dest: font` or `script`, set by the browser
+///    and not forgeable), for the xite's own fonts and ES modules; or
+/// 3. the Bigfile upload POST, authorised by its own one-time nonce.
+///
+/// Everything else - a keyless fetch of a xite file, any node page - is
+/// refused, so a foreign opaque page learns nothing it could not already.
+async fn null_origin_read(
+    ctx: &Ctx,
+    headers: &header::HeaderMap,
+    path: &str,
+    query: Option<&str>,
+) -> NullOriginRead {
+    if path == BIGFILE_UPLOAD_PATH {
+        return NullOriginRead::Authorised;
+    }
+    if is_public_ui_path(path) || is_backup_path(path) || is_operator_path(path) {
+        return NullOriginRead::Refused;
+    }
+    let Some(target) = path.trim_start_matches('/').split('/').next().filter(|s| !s.is_empty()) else {
+        return NullOriginRead::Refused;
+    };
+    // Only files. The wrapper route (`/{address}/`, directories) carries the
+    // xite's secret keys and is for the chrome alone: a page reading its own
+    // wrapper document with its ajax key would learn its wrapper key.
+    let rest = path.trim_start_matches('/').split_once('/').map(|(_, r)| r).unwrap_or("");
+    if rest.is_empty() || rest.ends_with('/') {
+        return NullOriginRead::Refused;
+    }
+    let ajax_key = query
+        .unwrap_or("")
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("ajax_key="))
+        .filter(|k| !k.is_empty());
+    if let Some(key) = ajax_key {
+        let Some(source) = ctx.state.xite_by_ajax_key(key).await else {
+            return NullOriginRead::Refused;
+        };
+        let target = ctx.state.canonical_key(target).await;
+        return if source == target || ctx.state.has_cors_permission(&source, &target).await {
+            NullOriginRead::Authorised
+        } else {
+            NullOriginRead::Refused
+        };
+    }
+    let mode = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok());
+    let dest = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok());
+    if mode == Some("cors") && matches!(dest, Some("font") | Some("script")) {
+        return NullOriginRead::Authorised;
+    }
+    NullOriginRead::Refused
+}
+
+/// EpixNet's `isCrossOriginRequest`, same decision order, extended for the
+/// opaque-origin inner frame: it sends no `Referer` at all and `Origin: null`
+/// only on CORS-mode requests, so its loads arrive as either a null origin
+/// (decided by `null_read`, see [`null_origin_read`]) or as a no-cors request
+/// with neither header (`Sec-Fetch-Mode: no-cors`, which cannot read the
+/// bytes it fetches - scripts, styles, images).
 async fn is_cross_origin_request(
     ctx: &Ctx,
     headers: &header::HeaderMap,
     path: &str,
     host: &str,
+    null_read: Option<NullOriginRead>,
 ) -> bool {
     // User navigation is always allowed.
     if headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) == Some("navigate") {
@@ -627,8 +733,23 @@ async fn is_cross_origin_request(
     }
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
-    // Untraceable requests are blocked for xite paths (checked below for /).
+    // A null origin is the sandboxed inner frame or some other opaque page;
+    // it passes only when the read was authorised (key, or an opaque kind).
+    if origin == Some("null") {
+        return null_read != Some(NullOriginRead::Authorised);
+    }
+    // Untraceable requests are blocked for xite paths (checked below for /) -
+    // except the inner frame's own no-cors subresource loads, which carry no
+    // Referer (opaque origin) and no Origin (no-cors) but a browser-set
+    // `Sec-Fetch-Mode: no-cors`: a script, stylesheet or image the page runs
+    // or renders without being able to read it. Node pages that hold secrets
+    // (backup, operator forms) stay blocked regardless.
     if origin.is_none() && referer.is_none() && !is_public_ui_path(path) {
+        let no_cors = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok()) == Some("no-cors")
+            && headers.contains_key("sec-fetch-dest");
+        if no_cors && !is_backup_path(path) && !is_operator_path(path) {
+            return false;
+        }
         return true;
     }
     // A foreign origin never reads xite content.
@@ -704,6 +825,9 @@ fn referer_xite(_ctx: &Ctx, referer: &str, _host: &str) -> Option<String> {
         .unwrap_or(after_scheme);
     let (ref_host, ref_path) = after_scheme.split_once('/').unwrap_or((after_scheme, ""));
     let ref_host = strip_port(ref_host);
+    // A page on its content host (`talk.content.epix`) is the `talk.epix` xite.
+    let content_xite = content_host_xite(ref_host);
+    let ref_host = content_xite.as_deref().unwrap_or(ref_host);
     // A xite can be served nested under another xite's proxy host: clicking a
     // xite in the dashboard lands the iframe on `dashboard.epix/epix1talk…/`,
     // so that page's OWN resources carry a referer like
@@ -754,6 +878,35 @@ fn is_global_path(path: &str) -> bool {
 fn is_proxy_host(host: &str) -> bool {
     (host.ends_with(".epix") && !host.is_empty())
         || (host.starts_with("epix1") && host.len() > 20 && !host.contains('.'))
+}
+
+/// The reserved label under which a xite's CONTENT is served in host mode.
+/// `talk.epix` is the wrapper's origin (the chrome the user trusts and sees
+/// in the URL bar); `talk.content.epix` is the xite page's own origin, so the
+/// page can keep `allow-same-origin` - storage, service workers, a real
+/// origin of its own - without ever sharing the wrapper's. Names are single
+/// labels, so a three-label host can never be a xite name, and the label
+/// itself is refused as a name (`xite_domain_name`) so no xite can sit above
+/// another's content hosts. See docs/wrapper-sandbox.md.
+const CONTENT_HOST_LABEL: &str = "content";
+
+/// Marks a request the proxy rewrite took from a content host, so handlers
+/// know the xite page (not the wrapper) is the client. Stripped from incoming
+/// requests like [`PROXY_REWRITE_MARKER`].
+const CONTENT_HOST_MARKER: &str = "x-epix-content-host";
+
+/// `talk.content.epix` -> `talk.epix`: the xite host a content host serves
+/// for, or `None` when `host` is not a content host.
+fn content_host_xite(host: &str) -> Option<String> {
+    let suffix = format!(".{CONTENT_HOST_LABEL}.epix");
+    let label = host.strip_suffix(suffix.as_str())?;
+    (!label.is_empty() && !label.contains('.')).then(|| format!("{label}.epix"))
+}
+
+/// `talk.epix` (or a bare `epix1…` address) -> `talk.content.epix`.
+fn content_host_for(xite_host: &str) -> String {
+    let label = xite_host.strip_suffix(".epix").unwrap_or(xite_host);
+    format!("{label}.{CONTENT_HOST_LABEL}.epix")
 }
 
 /// True if a path segment plausibly references a xite we could fetch on
@@ -816,6 +969,7 @@ const PROXY_REWRITE_MARKER: &str = "x-epix-host-rewrite";
 /// can apply the identical rewrite.
 pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Request {
     req.headers_mut().remove(PROXY_REWRITE_MARKER);
+    req.headers_mut().remove(CONTENT_HOST_MARKER);
     let host = req
         .headers()
         .get(header::HOST)
@@ -840,8 +994,13 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
     if (first_seg.starts_with("epix1") && first_seg.len() > 20) || first_seg.ends_with(".epix") {
         return req;
     }
+    // A content host (`talk.content.epix`) serves its xite's files: route it
+    // under the xite's path, marked so the handlers never render the wrapper
+    // there and never take a chrome-host request for one.
+    let content_host = content_host_xite(&host);
+    let xite_host = content_host.clone().unwrap_or_else(|| host.clone());
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
-    let new_paq = format!("/{host}{path}{query}");
+    let new_paq = format!("/{xite_host}{path}{query}");
     let mut parts = req.uri().clone().into_parts();
     parts.scheme = None;
     parts.authority = None;
@@ -853,6 +1012,12 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
                 PROXY_REWRITE_MARKER,
                 axum::http::HeaderValue::from_static("1"),
             );
+            if content_host.is_some() {
+                req.headers_mut().insert(
+                    CONTENT_HOST_MARKER,
+                    axum::http::HeaderValue::from_static("1"),
+                );
+            }
         }
     }
     req
@@ -1275,7 +1440,23 @@ async fn render_wrapper(
         let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
         return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
     }
+    // The wrapper is chrome: it lives on the xite host only. A document
+    // navigation that reached a content host (a `_top` link from inside the
+    // page, a typed URL) lands back on the chrome host, same path and query.
+    if headers.contains_key(CONTENT_HOST_MARKER) {
+        let Some(origin) = cross_xite_origin(&requested) else {
+            return (StatusCode::BAD_REQUEST, "invalid xite navigation target").into_response();
+        };
+        let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
+        return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
+    }
     let proxy_mode = host == requested;
+    // In host mode the xite page gets an origin of its own, distinct from this
+    // wrapper's: the iframe loads from the content host, and because that is
+    // a real origin the page may keep `allow-same-origin`. In path mode (the
+    // loopback UI, the Android shell) every xite shares the node's origin, so
+    // the page stays an opaque origin there.
+    let site_file_server = if proxy_mode { format!("//{}", content_host_for(&host)) } else { String::new() };
 
     // The path segment may be a `.epix` name (xID) or the bech32 address; the
     // node's identity for a xite is ALWAYS the bech32 address, so translate
@@ -1459,7 +1640,7 @@ async fn render_wrapper(
     // query on boot to route. Without this the inner page always reloads at
     // its default view.
     let query_string = match raw_query.as_deref().filter(|q| !q.is_empty()) {
-        Some(q) => format!("?{}&wrapper_nonce={nonce}", escape_query(q)),
+        Some(q) => format!("?{q}&wrapper_nonce={nonce}"),
         None => format!("?wrapper_nonce={nonce}"),
     };
     // The xite's real permissions (empty until the user grants one). This is
@@ -1492,8 +1673,29 @@ async fn render_wrapper(
     let file_url = if resolving { "about:blank".to_string() } else { file_url };
     let is_homepage = node_home == requested || node_home == address;
 
-    // wrapper_key == the bech32 address for this single-user local node, so
-    // the WS session and every command bind to the address, never the name.
+    // The xite's secret wrapper/AJAX keys (EpixNet's `site.settings`): the
+    // wrapper opens its WebSocket with `wrapper_key`, which is what makes that
+    // socket the trusted chrome for this address; `ajax_key` is handed to the
+    // inner page (`wrapperGetAjaxKey`) so its opaque-origin fetches of its own
+    // files pass the cross-origin gate. Neither is ever in `siteInfo`.
+    let (wrapper_key, ajax_key) = if resolving {
+        (String::new(), String::new())
+    } else {
+        ctx.state.wrapper_keys(&address).await
+    };
+    // `allow-same-origin` is safe exactly when the page's origin is not the
+    // wrapper's: in host mode the frame is on the content host (its own real
+    // origin). In path mode it would make the page the wrapper - able to open
+    // the WebSocket as this origin and script a wrapper through a popup - so
+    // only the user's NOSANDBOX grant adds it there (the prompt says so).
+    let sandbox_permissions = if proxy_mode || permissions.iter().any(|p| p == "NOSANDBOX") {
+        "allow-same-origin".to_string()
+    } else {
+        String::new()
+    };
+    // Grants are impossible on a public gateway (the node refuses them from
+    // every visitor); the wrapper skips the dead-end prompt when it knows.
+    let ui_restrict = ctx.state.ui_restrict().await;
     let themeclass = ctx.state.theme_class().await;
     let lang = ctx.state.ui_language().await;
     // Wrapper page hints from the root content.json (UiRequest parity):
@@ -1508,7 +1710,8 @@ async fn render_wrapper(
                 .filter(|value| !value.trim().is_empty());
             let theme = themeclass.trim_start_matches("theme-");
             let themed_key = format!("background-color-{theme}");
-            let background = hint(&themed_key).or_else(|| hint("background-color"));
+            let background = hint(&themed_key).and_then(wrapper_background_color)
+                .or_else(|| hint("background-color").and_then(wrapper_background_color));
             if let Some(color) = background {
                 style.push_str(&format!("background-color: {};", html_escape(color)));
             }
@@ -1529,29 +1732,30 @@ async fn render_wrapper(
         (meta, style)
     };
     let vars: Vec<(&str, String)> = vec![
-        ("title", title),
+        ("title", html_escape(&title)),
         ("rev", "1".into()),
         ("meta_tags", meta_tags),
         ("body_style", body_style),
-        ("themeclass", themeclass),
+        ("themeclass", html_escape(&themeclass)),
         ("script_nonce", script_nonce.clone()),
-        ("homepage", homepage),
-        ("site_file_server", String::new()),
-        ("file_url", file_url),
-        ("file_inner_path", inner_path.clone()),
-        ("query_string", query_string),
-        ("address", wrapper_identity.clone()),
+        ("homepage", html_escape(&homepage)),
+        ("site_file_server", script_string(&site_file_server)),
+        ("file_url", script_string(&file_url)),
+        ("file_inner_path", script_string(&inner_path)),
+        ("query_string", script_string(&query_string)),
+        ("address", script_string(&wrapper_identity)),
         ("wrapper_nonce", nonce),
-        ("wrapper_key", wrapper_identity.clone()),
-        ("ajax_key", wrapper_identity),
+        ("wrapper_key", wrapper_key),
+        ("ajax_key", ajax_key),
         ("postmessage_nonce_security", nonce_security.to_string()),
-        ("permissions", json!(permissions).to_string()),
+        ("permissions", script_json(&json!(permissions))),
         ("show_loadingscreen", if loading { "true" } else { "false" }.into()),
-        ("resolving_host", resolving_host.clone()),
+        ("resolving_host", script_string(&resolving_host)),
         ("is_homepage", if is_homepage { "true" } else { "false" }.into()),
-        ("sandbox_permissions", String::new()),
+        ("sandbox_permissions", sandbox_permissions),
+        ("ui_restrict", if ui_restrict { "true" } else { "false" }.into()),
         ("server_url", String::new()),
-        ("lang", lang),
+        ("lang", html_escape(&lang)),
     ];
     let mut html = render(WRAPPER_HTML, &vars);
     // NoNewSites gateway: every page carries the read-only banner.
@@ -1562,6 +1766,7 @@ async fn render_wrapper(
         [
             (header::CONTENT_TYPE, "text/html; charset=utf-8".to_string()),
             (header::CONTENT_SECURITY_POLICY, wrapper_csp(&script_nonce)),
+            (header::X_FRAME_OPTIONS, "DENY".to_string()),
             (header::REFERRER_POLICY, "same-origin".to_string()),
             (header::CACHE_CONTROL, "no-cache, no-store, private, must-revalidate, max-age=0".to_string()),
         ],
@@ -2494,9 +2699,24 @@ apply();\
 apply();\
 })();</script>";
 
+/// Query of the file manager. `evx=1` adds the EVX inspection panel
+/// (`docs/evx-milestone-2.md` section 6); that exact value and nothing else,
+/// so a link cannot half-ask for it.
+#[derive(Deserialize)]
+struct FileManagerQuery {
+    evx: Option<String>,
+}
+
 /// `GET /list/<address>/<inner_path>` - the UiFileManager file browser. Lists a
-/// directory inside a xite with links to navigate and open files.
-async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+/// directory inside a xite with links to navigate and open files. With
+/// `?evx=1` the listing is headed by the inert EVX inspection panel when the
+/// xite's root declares an `evx` section (see [`evx_view`]).
+async fn serve_file_manager(
+    State(ctx): State<Ctx>,
+    Path(path): Path<String>,
+    Query(query): Query<FileManagerQuery>,
+    headers: axum::http::HeaderMap,
+) -> Response {
     if !ctx.state.plugin_enabled("UiFileManager").await {
         return (StatusCode::NOT_FOUND, "UiFileManager plugin is disabled").into_response();
     }
@@ -2519,12 +2739,70 @@ async fn serve_file_manager(State(ctx): State<Ctx>, Path(path): Path<String>) ->
         }
     }
     let theme = ctx.state.theme_class().await;
-    ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_file_manager(&address, &inner, &entries, &theme))
+    // The EVX panel reads the stored root content.json BYTES, as the EVX
+    // service does (`docs/evx-milestone-2.md` section 4): the decoded
+    // `AppState::content` value has already collapsed a duplicated key, and
+    // the panel must not call verified and valid what the service refuses as
+    // malformed. All of it is display: nothing here opens a program file or
+    // links the runtime, so the panel is as safe to serve as the listing
+    // itself. The grant is left out entirely on a restricted (public
+    // gateway) node, like the revert links above.
+    let content = ctx.state.content(&address).await;
+    let evx = if query.evx.as_deref() == Some("1") {
+        let restricted = ctx.state.ui_restrict().await;
+        let grant = if restricted { None } else { ctx.state.evx_grant_summary(&address) };
+        // The root is bounded by the xite's own size limit, the guard it was
+        // stored under; a read failure (no root on disk) is no declaration.
+        let limit = u64::try_from(ctx.state.size_limit_bytes(&address).await).unwrap_or(0);
+        let raw = match ctx.state.xite_storage(&address).await {
+            Some(storage) => storage.read_bounded("content.json", limit).ok(),
+            None => None,
+        };
+        // Program links go to `/raw/<xite>/<path>`, which only the loopback
+        // origin serves as itself: on a transparent proxy host that path is
+        // routed under the host's own xite and sent to its content host, so
+        // there the panel shows the paths as text.
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(strip_port).unwrap_or("");
+        match raw {
+            Some(raw) => {
+                let facts = evx_view::XiteFacts {
+                    address: &address,
+                    complete: ctx.state.xite_core_complete(&address).await,
+                    grant: grant.as_ref(),
+                    restricted,
+                    linkable: !is_proxy_host(host),
+                };
+                evx_view::render(&raw, &facts)
+                    .map(EvxBlock::Panel)
+                    .unwrap_or(EvxBlock::None)
+            }
+            None => EvxBlock::None,
+        }
+    } else if evx_view::declares_evx(content.as_ref()) {
+        EvxBlock::Link
+    } else {
+        EvxBlock::None
+    };
+    (
+        [(header::CONTENT_TYPE, "text/html; charset=utf-8")],
+        render_file_manager(&address, &inner, &entries, &theme, evx),
+    )
         .into_response()
 }
 
+/// What the file manager shows about EVX above the listing.
+enum EvxBlock {
+    /// The xite declares nothing, or the panel was asked for and there is
+    /// nothing to inspect: the listing exactly as before EVX existed.
+    None,
+    /// The xite declares an `evx` section: a link to the inspection view.
+    Link,
+    /// The rendered inspection panel.
+    Panel(String),
+}
+
 /// Render the file browser for a xite directory.
-fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &str) -> String {
+fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &str, evx: EvxBlock) -> String {
     let esc = attr_escape;
     // Escape URL segments independently so literal '#', '%', quotes and
     // non-ASCII filenames survive navigation without becoming markup.
@@ -2602,12 +2880,20 @@ fn render_file_manager(address: &str, inner: &str, entries: &[Value], theme: &st
         }
         heading
     };
+    let evx = match evx {
+        EvxBlock::None => String::new(),
+        EvxBlock::Link => format!(
+            "<p class='evx-link'><a href='/list/{url_address}?evx=1'>EVX declaration</a></p>"
+        ),
+        EvxBlock::Panel(panel) => panel,
+    };
     let body = format!(
         "<style>.row{{padding:10px 0;border-bottom:1px solid var(--epix-border);overflow:hidden}}\
           .name{{font-size:15px;overflow-wrap:anywhere}} .name.dir{{font-weight:600}}\
           .size{{float:right;color:var(--epix-text-low);font-size:13px;margin-left:12px}}\
-          .revert{{float:right;margin-left:16px;font-size:13px}}</style>\
-         <div class='files'>{rows}</div>"
+          .revert{{float:right;margin-left:16px;font-size:13px}}\
+          .evx-link{{margin:0 0 12px;font-size:13px}}</style>\
+         {evx}<div class='files'>{rows}</div>"
     );
     // From the file browser, the fixbutton returns to the xite being browsed.
     page_shell("Files", &heading, "", &body, address, theme)
@@ -2781,17 +3067,32 @@ window.addEventListener('touchmove',move,{passive:true});window.addEventListener
 b.addEventListener('click',function(e){if(b._dragged){e.preventDefault();b._dragged=false;}});\
 })();</script>";
 
-/// Replace known `{name}` tokens; JS braces (not a known name) are left intact.
-/// Escape a raw query string for embedding in the wrapper template (it lands
-/// inside a script string that sets the iframe src). Mirrors EpixNet's
-/// xescape: html chars become entities so the value cannot break out of the
-/// string or the script tag; backslashes are doubled.
-fn escape_query(q: &str) -> String {
-    q.replace('\\', "\\\\")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
-        .replace('\'', "&#x27;")
+/// JSON embedded in an HTML script must also prevent the HTML parser from
+/// recognizing a closing script tag, even inside a JavaScript string.
+fn script_json(value: &Value) -> String {
+    value.to_string()
+        .replace('<', "\\u003c")
+        .replace('>', "\\u003e")
+        .replace('&', "\\u0026")
+        .replace('\u{2028}', "\\u2028")
+        .replace('\u{2029}', "\\u2029")
+}
+
+/// String contents for the wrapper template's double-quoted JS literals.
+fn script_string(value: &str) -> String {
+    let encoded = script_json(&json!(value));
+    encoded[1..encoded.len() - 1].to_string()
+}
+
+/// A publisher can request a background color, never another CSS declaration
+/// that hides or repositions the trusted consent surface. The browser still
+/// validates the color; this alphabet excludes declaration delimiters, escapes,
+/// comments and markup while retaining ordinary CSS color functions.
+fn wrapper_background_color(value: &str) -> Option<&str> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 128 && value.chars().all(|ch| {
+        ch.is_ascii_alphanumeric() || matches!(ch, '#' | '(' | ')' | ',' | '.' | '%' | ' ' | '-' | '+' | '/' | '_')
+    })).then_some(value)
 }
 
 /// Drop a `wrapper_nonce=…` pair from a raw query string, keeping the rest.
@@ -2803,10 +3104,26 @@ fn strip_wrapper_nonce(q: &str) -> String {
 }
 
 fn render(template: &str, vars: &[(&str, String)]) -> String {
-    let mut out = template.to_string();
-    for (k, v) in vars {
-        out = out.replace(&format!("{{{k}}}"), v);
+    // Scan only the template, never substituted values. Publisher text can
+    // contain `{script_nonce}` or `{wrapper_key}` without receiving either.
+    // Unknown braces belong to the template's JavaScript and stay unchanged.
+    let mut out = String::with_capacity(template.len());
+    let mut remaining = template;
+    while let Some(open) = remaining.find('{') {
+        out.push_str(&remaining[..open]);
+        let after_open = &remaining[open + 1..];
+        if let Some(close) = after_open.find('}') {
+            let key = &after_open[..close];
+            if let Some((_, value)) = vars.iter().find(|(name, _)| *name == key) {
+                out.push_str(value);
+                remaining = &after_open[close + 1..];
+                continue;
+            }
+        }
+        out.push('{');
+        remaining = after_open;
     }
+    out.push_str(remaining);
     out
 }
 
@@ -2861,6 +3178,7 @@ fn download_wait_response(is_html: bool) -> Response {
 <html lang="en" data-epix-load-state="waiting">
 <head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
 <meta http-equiv="refresh" content="30"><title>Waiting for this xite - EpixNet</title>
+<script>try{var n=(location.search.match(/wrapper_nonce=([A-Za-z0-9]+)/)||[])[1];parent.postMessage({cmd:"innerLoadState",params:"waiting",wrapper_nonce:n},"*")}catch(e){}</script>
 <style>body{margin:0;background:#101116;color:#eeeef5;font:16px/1.6 system-ui,sans-serif;display:grid;min-height:100vh;place-items:center}main{max-width:28rem;padding:2rem}h1{font-size:1.5rem}p{color:#b2b4c7}a{color:#a8a0ff}</style></head>
 <body><main><h1>Waiting for this xite</h1><p>The download isn't ready yet. This page will try again automatically.</p><a href="/Config">Connection settings</a></main></body></html>"#)
     } else {
@@ -2906,6 +3224,34 @@ async fn serve_file(
                 .filter(|s| !s.is_empty())
                 .map(String::from);
             return render_wrapper(ctx, address, inner, wrapper_request_path(&uri), outer_query, headers).await;
+        }
+    }
+    // In host mode the chrome host serves only the wrapper. Every xite FILE
+    // belongs on the content host: an HTML file served raw here - in a frame
+    // some page opened, with a nonce it guessed - would run as the wrapper's
+    // origin, which is the one thing the content host exists to prevent.
+    // A host-form request (the rewrite marker: the host IS this xite) moves
+    // to the xite's content host. A path-form request on a xite host
+    // (`dashboard.epix/epix1talk…/img/x.png`, a link or resource naming
+    // another xite by path) keeps serving nested when it is an opaque
+    // subresource or comes from a client without fetch metadata, exactly as
+    // the browser proxy's canonical redirect does; anything that could run or
+    // be read is sent to that xite's own origin (and on to its content host).
+    {
+        let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).map(strip_port).unwrap_or("");
+        if is_proxy_host(host) && !headers.contains_key(CONTENT_HOST_MARKER) {
+            let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
+            if headers.contains_key(PROXY_REWRITE_MARKER) {
+                let target = format!("//{}/{path}{query}", content_host_for(host));
+                return Redirect::temporary(&target).into_response();
+            }
+            let dest = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok());
+            let opaque = dest.is_none_or(|d| matches!(d, "image" | "font" | "audio" | "video" | "track"));
+            if !opaque {
+                if let Some(origin) = cross_xite_origin(&address) {
+                    return Redirect::temporary(&format!("//{origin}/{path}{query}")).into_response();
+                }
+            }
         }
     }
     // Release a one-time wrapper nonce if the inner frame passed one (tracks
@@ -3320,9 +3666,9 @@ fn parse_range(header: &str, total: u64) -> Option<(u64, Option<u64>)> {
 /// Normal xite files carry **no** Content-Security-Policy - matching EpixNet,
 /// which only sends the restrictive `sandbox` CSP for `raw`/noscript requests.
 /// The inner content is sandboxed by the wrapper's iframe `sandbox` attribute
-/// (`allow-scripts allow-same-origin …`); putting `default-src 'none'; sandbox
-/// (no allow-scripts)` on the file itself would block the xite's own scripts and
-/// - now that we serve over https (a secure context) - its service worker.
+/// (`allow-scripts …` without `allow-same-origin`, so the page is an opaque
+/// origin); putting `default-src 'none'; sandbox (no allow-scripts)` on the
+/// file itself would block the xite's own scripts.
 fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap {
     let mut pairs = vec![
         (header::CONTENT_TYPE, content_type.to_string()),
@@ -3467,7 +3813,7 @@ fn wrapper_csp(script_nonce: &str) -> String {
     format!(
         "default-src 'none'; script-src 'nonce-{script_nonce}' 'wasm-unsafe-eval'; \
          img-src * blob: data:; media-src * blob: data:; font-src * data:; \
-         style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *"
+         style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *; frame-ancestors 'none'"
     )
 }
 
@@ -3536,20 +3882,49 @@ async fn ws_upgrade(
     // local command API (EpixNet's allowed_ws_origins check).
     let host = headers.get(header::HOST).and_then(|v| v.to_str().ok()).unwrap_or("");
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok()).unwrap_or("");
+    // The xite page is never the wrapper. In path mode it is an opaque origin
+    // (the iframe sandbox has no `allow-same-origin`), so a WebSocket it
+    // opens itself says `Origin: null`; in host mode it lives on a content
+    // host, which is neither a wrapper origin nor a host the wrapper
+    // connects to. Refuse both before anything else.
+    if origin == "null" {
+        return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
+    }
     let origin_host = origin.rsplit("://").next().unwrap_or("");
+    if content_host_xite(strip_port(origin_host)).is_some() || content_host_xite(strip_port(host)).is_some() {
+        return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
+    }
     if !ctx.state.is_ws_origin_allowed(origin_host, host) {
         return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
     }
-    // wrapper_key == xite address for this node. The wrapper embeds the bech32
-    // address, but resolve a `.epix` name too (older wrappers, manual clients)
-    // so the session always binds to the address. A wrapper in resolving mode
-    // (the name has no address yet) sends an empty key: that session binds to
-    // no xite at all, not to "".
-    let xite = match q.wrapper_key.or(q.xite).filter(|key| !key.is_empty()) {
-        Some(key) => Some(ctx.state.canonical_key(&key).await),
-        None => None,
+    // The wrapper page embeds its xite's secret `wrapper_key` (a random value
+    // only the wrapper receives); presenting it binds the session to that
+    // xite AND marks the socket as the wrapper chrome, which is what lets its
+    // elevated-id commands carry authority. Any other key is taken as an
+    // address or `.epix` name (older wrappers, manual clients, tests): the
+    // session binds to the address but is a page-level session with no
+    // wrapper authority. A wrapper in resolving mode (the name has no address
+    // yet) sends an empty key: that session binds to no xite at all.
+    // The loopback rule above lets any local app open a page-level socket;
+    // the wrapper's authority additionally needs the wrapper's own origin
+    // (the request host, or a host the wrapper was served from) - a key that
+    // leaked to some other local origin buys nothing.
+    let wrapper_origin = origin_host.is_empty()
+        // Ports are part of an origin. Another server on the same loopback
+        // host must not acquire wrapper authority if it learns a key.
+        || origin_host == host
+        || ctx.state.is_served_wrapper_host(origin_host);
+    let (xite, wrapper) = match q.wrapper_key.filter(|key| !key.is_empty()) {
+        Some(key) => match ctx.state.xite_by_wrapper_key(&key).await {
+            Some(address) => (Some(address), wrapper_origin),
+            None => (Some(ctx.state.canonical_key(&key).await), false),
+        },
+        None => match q.xite.filter(|key| !key.is_empty()) {
+            Some(key) => (Some(ctx.state.canonical_key(&key).await), false),
+            None => (None, false),
+        },
     };
-    ws.on_upgrade(move |socket| handle_ws(socket, ctx, xite))
+    ws.on_upgrade(move |socket| handle_ws(socket, ctx, xite, wrapper))
 }
 
 /// One item pumped from the shared event broadcast to a connection's queue.
@@ -3561,9 +3936,14 @@ enum Pumped {
     Lagged,
 }
 
-async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>) {
+async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>, wrapper: bool) {
     use futures_util::{SinkExt, StreamExt};
-    let session = std::sync::Arc::new(WsSession::new(ctx.state.clone(), xite));
+    let session = if wrapper {
+        WsSession::new_wrapper(ctx.state.clone(), xite)
+    } else {
+        WsSession::new(ctx.state.clone(), xite)
+    };
+    let session = std::sync::Arc::new(session);
     // Don't read the broadcast directly in the select loop below: while
     // `sink.send` waits on a slow socket (a backgrounded tab that stops
     // reading), a sync burst - one setSiteInfo per arriving file - wraps the
@@ -3729,6 +4109,17 @@ async fn handle_text(ctx: &Ctx, session: &WsSession, text: &str) -> String {
     // A reply to a server-pushed confirm/prompt: resolve the waiting callback
     // rather than dispatching it as a command. `to` is the pushed event's id.
     if cmd == "response" {
+        // Only the wrapper chrome (an elevated id on a socket that presented
+        // the xite's `wrapper_key`) or the operator socket may answer a pushed
+        // confirm or prompt. Callback ids are sequential, so a page forwarding
+        // `response` frames with guessed `to` values, or opening its own
+        // socket, could otherwise accept its own dialogs.
+        if !crate::command::is_wrapper_authority(session, id) {
+            ctx.state
+                .log("WARNING", format!("ws response with non-wrapper id {id} ignored"))
+                .await;
+            return String::new();
+        }
         if let Some(to) = req.get("to").and_then(|v| v.as_i64()) {
             let result = req.get("result").cloned().unwrap_or(Value::Null);
             ctx.state.resolve_callback(to, result);
@@ -3777,6 +4168,30 @@ async fn ui_password_gate(
         .and_then(|v| v.to_str().ok());
     if uipassword::session_valid(&uipassword::cookie_session_id(cookie)) {
         return next.run(request).await;
+    }
+    // Host mode: the wrapper on the chrome host holds the session cookie, but
+    // the xite page lives on its content host, which the browser scopes that
+    // host-only cookie away from. The wrapper's iframe document request
+    // carries a wrapper nonce that was issued only to a wrapper render this
+    // gate already admitted, so it proves the session: answer it and hand
+    // the content host a session of its own for the page's later requests.
+    if request.headers().contains_key(CONTENT_HOST_MARKER) {
+        let nonce = request
+            .uri()
+            .query()
+            .unwrap_or("")
+            .split('&')
+            .find_map(|kv| kv.strip_prefix("wrapper_nonce="))
+            .filter(|n| !n.is_empty())
+            .map(str::to_string);
+        if nonce.as_deref().is_some_and(|n| ctx.state.wrapper_nonce_outstanding(n)) {
+            let mut response = next.run(request).await;
+            let sid = uipassword::session_create();
+            if let Ok(value) = format!("session_id={sid}; path=/; max-age=2592000").parse() {
+                response.headers_mut().append(header::SET_COOKIE, value);
+            }
+            return response;
+        }
     }
     login_page(false)
 }
@@ -3953,32 +4368,45 @@ mod csrf_tests {
         // The classic CSRF shape: a form on evil.example auto-submitting to the
         // node. The browser sets Origin itself and script cannot forge it.
         let h = headers(&[("origin", "https://evil.example")]);
-        assert!(!unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        assert!(!unsafe_method_is_same_origin(&h, "/Config", "127.0.0.1:42222"));
         // Sec-Fetch-Xite is decisive even when an Origin looks plausible.
         let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "http://127.0.0.1:42222")]);
-        assert!(!unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        assert!(!unsafe_method_is_same_origin(&h, "/Config", "127.0.0.1:42222"));
     }
 
     #[test]
     fn the_nodes_own_pages_still_post() {
         let h = headers(&[("sec-fetch-site", "same-origin")]);
-        assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        assert!(unsafe_method_is_same_origin(&h, "/Config", "127.0.0.1:42222"));
         // Older browsers send no Sec-Fetch-Xite; Origin carries it instead.
         let h = headers(&[("origin", "http://127.0.0.1:42222")]);
-        assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        assert!(unsafe_method_is_same_origin(&h, "/Config", "127.0.0.1:42222"));
         // A LAN bind is the same case with a different host.
         let h = headers(&[("origin", "http://192.168.1.9:42222")]);
-        assert!(unsafe_method_is_same_origin(&h, "192.168.1.9:42222"));
+        assert!(unsafe_method_is_same_origin(&h, "/Config", "192.168.1.9:42222"));
+    }
+
+    #[test]
+    fn the_opaque_inner_frame_may_post_only_a_bigfile_upload() {
+        // The sandboxed xite frame is an opaque origin: its one legitimate
+        // write is the nonce-authorised upload. Any other null-origin write,
+        // and any cross-site write, stays refused.
+        let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "null")]);
+        assert!(unsafe_method_is_same_origin(&h, super::BIGFILE_UPLOAD_PATH, "127.0.0.1:42222"));
+        assert!(!unsafe_method_is_same_origin(&h, "/Config", "127.0.0.1:42222"));
+        assert!(!unsafe_method_is_same_origin(&h, "/Plugins", "127.0.0.1:42222"));
+        let h = headers(&[("sec-fetch-site", "cross-site"), ("origin", "https://evil.example")]);
+        assert!(!unsafe_method_is_same_origin(&h, super::BIGFILE_UPLOAD_PATH, "127.0.0.1:42222"));
     }
 
     #[test]
     fn non_browser_clients_are_not_locked_out() {
         // curl / the desktop shell / the admin socket send neither header and
         // carry no ambient cookie for a hostile page to ride.
-        assert!(unsafe_method_is_same_origin(&headers(&[]), "127.0.0.1:42222"));
+        assert!(unsafe_method_is_same_origin(&headers(&[]), "/Config", "127.0.0.1:42222"));
         // A browser-initiated top-level POST to a typed URL reports "none".
         let h = headers(&[("sec-fetch-site", "none")]);
-        assert!(unsafe_method_is_same_origin(&h, "127.0.0.1:42222"));
+        assert!(unsafe_method_is_same_origin(&h, "/Config", "127.0.0.1:42222"));
     }
 }
 
@@ -4056,6 +4484,13 @@ mod range_tests {
 #[cfg(test)]
 mod csp_tests {
     use super::wrapper_csp;
+
+    #[test]
+    fn consent_wrapper_cannot_be_framed() {
+        let csp = wrapper_csp("NONCE123");
+        assert!(csp.split(';').any(|directive| directive.trim() == "frame-ancestors 'none'"),
+            "the wrapper's permission and EVX dialogs must not be exposed to clickjacking: {csp}");
+    }
 
     #[test]
     fn passive_media_is_cross_origin_but_scripts_stay_nonce_locked() {

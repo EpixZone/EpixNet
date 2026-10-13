@@ -37,6 +37,13 @@ async-trait = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 fslock-guard = "0.8"
 
+[target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
+# The EVX service includes a Unix process supervisor and descriptor-based
+# workspace. Unsupported products omit both execution and management until
+# they have a confined backend. The mobile FFI and native messaging host
+# also leave the optional feature disabled on supported desktop targets.
+epix-evx = { path = "../epix-evx", optional = true }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
@@ -44,8 +51,16 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [features]
-default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery"]
+default = ["tor", "i2p-embedded", "mesh", "inbound-seeding", "local-discovery", "evx"]
 tor = ["epix-runtime/tor"]
+# The EVX service (the `Evx` plugin and its `evx*` commands). In the node
+# default, so macOS/Linux desktop and server carry it; the mobile FFI and the native
+# messaging host take `default-features = false` and never enable it, so
+# neither links Wasmtime (CI asserts `cargo tree -i wasmtime` is empty for
+# both). Off or on unsupported targets, no Evx plugin is registered and its
+# commands are unknown. Enabling the feature cannot bypass the target gate.
+evx = ["dep:epix-evx"]
+apple-xpc = ["evx", "epix-evx/apple-xpc"]
 # In-process Tor pluggable transports (Snowflake) for censored networks. Off by
 # default; forwards to the runtime and activates the Config-page toggle.
 bridges = ["tor", "epix-runtime/bridges", "epix-ui/bridges"]

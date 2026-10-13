@@ -1,6 +1,6 @@
 # Linux desktop installers
 
-`build-linux.sh` stages the browser, native messaging host, standalone server,
+`build-linux.sh` stages the browser, native messaging host, standalone server, EVX worker,
 matching Firefox ESR, policies and icons once, then produces:
 
 | Format | Target desktops (x86_64) |
@@ -43,6 +43,16 @@ removal deletes those installed files but leaves all user profiles, keys and
 xites alone. The preinstall hook refuses an upgrade while an executable from
 `/opt/epixnet` is running. It does not kill processes. No service or login
 autostart is enabled by installation.
+
+Every format keeps `evx-worker` beside the node executable. Packaging rejects
+a missing, symlinked, non-executable or mismatched-architecture worker. Worker
+presence does not establish sandbox support; EVX requires the runtime's Linux
+confinement checks to succeed on the installed host.
+
+EVX execution requires Landlock ABI 3 or newer, seccomp filters, descriptor
+sealing and kernel process accounting. A distribution supported by the desktop
+package can still have a kernel that cannot run EVX. Missing confinement fails
+closed; upgrading or enabling a security module is an operator decision.
 
 The AppImage bundles GTK resources and shared libraries with linuxdeploy's GTK
 plugin. Firefox and the native host remain beside the launcher, including in
@@ -104,6 +114,7 @@ option and arrange output-directory ownership for your user.
 ```sh
 python3 packaging/test-firefox-download.py
 python3 packaging/linux/test-packaging.py
+python3 packaging/linux/test-evx-package.py
 shellcheck packaging/linux/*.sh packaging/linux/AppRun packaging/fetch-firefox-esr.sh
 desktop-file-validate packaging/linux/epix.desktop
 cd dist
@@ -118,6 +129,31 @@ characters in the pathname. The build/release workflows install the generated
 compatibility workflow checks installation, reinstallation and removal on
 Ubuntu 24.04, Debian 12 and Fedora 44, plus AppImage loaders on Arch and
 openSUSE Tumbleweed. Ubuntu 24.04 also runs the desktop startup test.
+
+The EVX package tests use inert ELF-header fixtures, check build/staging and
+native package metadata, and inspect a real tar archive. They substitute the
+external AppImage and native-package tools. Install tests also check the
+worker in the actual installed or extracted bundle.
+
+On a supported native Linux host, verify the executable itself as an ordinary
+user. This runs 14 harmless native authority probes and a confined compiler and
+guest roundtrip against only temporary fixtures:
+
+```sh
+python3 packaging/linux/verify-evx-worker.py /opt/epixnet/evx-worker
+# Or pass the worker from the extracted AppImage or tarball.
+```
+
+The verifier fails when Landlock is unavailable, a forbidden operation succeeds,
+or the compiled artifact cannot execute. It reports the kernel, ABI and worker
+digest so acceptance evidence identifies the exact executable. See
+[`docs/evx-linux-acceptance.md`](../../docs/evx-linux-acceptance.md) for executed
+tests and remaining platform coverage.
+
+CI also runs the verifier with `--require-privileged-parent` under a test parent
+holding `CAP_SYS_RESOURCE`. The worker must discard that inherited capability
+and still refuse to raise its hard CPU limit. This requires no global capability
+or security-policy changes.
 
 The smoke test uses an isolated profile and checks that the actual Firefox
 window process stays running and loads `https://dashboard.epix/`. It enables
