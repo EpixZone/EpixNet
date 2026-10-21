@@ -426,7 +426,7 @@ dependencies = [
  "tor-config-path",
  "tor-dircommon",
  "tor-dirmgr",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-guardmgr",
  "tor-hsclient",
  "tor-hscrypto",
@@ -441,10 +441,10 @@ dependencies = [
  "tor-proto",
  "tor-protover",
  "tor-ptmgr",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -3098,7 +3098,7 @@ dependencies = [
  "tor-cell",
  "tor-hsservice",
  "tor-proto",
- "tor-rtcompat",
+ "tor-rtcompat 0.47.0",
  "tracing",
 ]
 
@@ -6836,6 +6836,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "retry-error"
+version = "0.14.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "90a0dea62e6084ede74beea58ee263fd2d70bdb59260a3bf3ede338dfb76f5cc"
+dependencies = [
+ "humantime",
+ "web-time",
+]
+
+[[package]]
 name = "rfc6979"
 version = "0.4.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -8400,10 +8410,10 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tor-basic-utils",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8429,7 +8439,7 @@ dependencies = [
  "thiserror 2.0.21",
  "tracing",
  "weak-table",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8445,7 +8455,7 @@ dependencies = [
  "getrandom 0.4.3",
  "safelog",
  "thiserror 2.0.21",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-llcrypto",
  "zeroize",
 ]
@@ -8471,7 +8481,7 @@ dependencies = [
  "tor-basic-utils",
  "tor-bytes",
  "tor-cert",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-linkspec",
  "tor-llcrypto",
@@ -8495,9 +8505,9 @@ dependencies = [
  "thiserror 2.0.21",
  "tor-bytes",
  "tor-checkable",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-llcrypto",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8527,20 +8537,20 @@ dependencies = [
  "tor-basic-utils",
  "tor-cell",
  "tor-config",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-keymgr",
  "tor-linkspec",
  "tor-llcrypto",
  "tor-memquota",
  "tor-netdir",
  "tor-proto",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tor-socksproto",
  "tor-units",
  "tracing",
  "url",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8554,7 +8564,7 @@ dependencies = [
  "signature 2.2.0",
  "thiserror 2.0.21",
  "tor-llcrypto",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8579,7 +8589,7 @@ dependencies = [
  "oneshot-fused-workaround",
  "pin-project",
  "rand 0.10.3",
- "retry-error",
+ "retry-error 0.13.0",
  "safelog",
  "serde",
  "thiserror 2.0.21",
@@ -8589,7 +8599,7 @@ dependencies = [
  "tor-chanmgr",
  "tor-config",
  "tor-dircommon",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-guardmgr",
  "tor-linkspec",
  "tor-memquota",
@@ -8599,12 +8609,12 @@ dependencies = [
  "tor-proto",
  "tor-protover",
  "tor-relay-selection",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tor-units",
  "tracing",
  "void",
  "weak-table",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8636,8 +8646,8 @@ dependencies = [
  "thiserror 2.0.21",
  "toml 1.1.2+spec-1.1.0",
  "tor-basic-utils",
- "tor-error",
- "tor-rtcompat",
+ "tor-error 0.46.0",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "void",
 ]
@@ -8652,8 +8662,8 @@ dependencies = [
  "serde",
  "shellexpand",
  "thiserror 2.0.21",
- "tor-error",
- "tor-general-addr",
+ "tor-error 0.46.0",
+ "tor-general-addr 0.46.0",
 ]
 
 [[package]]
@@ -8668,7 +8678,7 @@ dependencies = [
  "imara-diff",
  "static_assertions",
  "thiserror 2.0.21",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-llcrypto",
  "tor-netdoc",
 ]
@@ -8691,15 +8701,15 @@ dependencies = [
  "memchr",
  "thiserror 2.0.21",
  "tor-circmgr",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-linkspec",
  "tor-llcrypto",
  "tor-netdoc",
  "tor-proto",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tracing",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8766,7 +8776,7 @@ dependencies = [
  "tor-consdiff",
  "tor-dirclient",
  "tor-dircommon",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-guardmgr",
  "tor-llcrypto",
  "tor-netdir",
@@ -8774,10 +8784,10 @@ dependencies = [
  "tor-persist",
  "tor-proto",
  "tor-protover",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8789,13 +8799,31 @@ dependencies = [
  "derive_more 2.1.1",
  "futures",
  "paste",
- "retry-error",
+ "retry-error 0.13.0",
  "static_assertions",
  "strum",
  "thiserror 2.0.21",
  "tracing",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
+]
+
+[[package]]
+name = "tor-error"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ca01de513501849b2298e4f16f8760832ef43344b10fe17600daed9a35128b24"
+dependencies = [
+ "derive_more 2.1.1",
+ "futures",
+ "paste",
+ "retry-error 0.14.0",
+ "static_assertions",
+ "strum",
+ "thiserror 2.0.21",
+ "tracing",
+ "void",
+ "web-time-compat 0.3.0",
 ]
 
 [[package]]
@@ -8803,6 +8831,17 @@ name = "tor-general-addr"
 version = "0.46.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7b45ecd95dbf79070f9e477e1d84b22e47f03b2ab2f853abe31887daa9090cf0"
+dependencies = [
+ "derive_more 2.1.1",
+ "thiserror 2.0.21",
+ "void",
+]
+
+[[package]]
+name = "tor-general-addr"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "72965a7044f573bb121467404d423d296592dd3cef87ad7aca4c96cc2b65e75a"
 dependencies = [
  "derive_more 2.1.1",
  "thiserror 2.0.21",
@@ -8839,7 +8878,7 @@ dependencies = [
  "tor-basic-utils",
  "tor-config",
  "tor-dircommon",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-linkspec",
  "tor-llcrypto",
  "tor-netdir",
@@ -8848,10 +8887,10 @@ dependencies = [
  "tor-proto",
  "tor-protover",
  "tor-relay-selection",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tor-units",
  "tracing",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8871,7 +8910,7 @@ dependencies = [
  "oneshot-fused-workaround",
  "postage",
  "rand 0.10.3",
- "retry-error",
+ "retry-error 0.13.0",
  "safelog",
  "slotmap-careful",
  "strum",
@@ -8884,7 +8923,7 @@ dependencies = [
  "tor-circmgr",
  "tor-config",
  "tor-dirclient",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-keymgr",
  "tor-linkspec",
@@ -8895,9 +8934,9 @@ dependencies = [
  "tor-persist",
  "tor-proto",
  "tor-protover",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tracing",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -8923,13 +8962,13 @@ dependencies = [
  "thiserror 2.0.21",
  "tor-basic-utils",
  "tor-bytes",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-key-forge",
  "tor-llcrypto",
  "tor-memquota",
  "tor-units",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
  "zeroize",
 ]
 
@@ -8960,7 +8999,7 @@ dependencies = [
  "postage",
  "rand 0.10.3",
  "rand_core 0.10.1",
- "retry-error",
+ "retry-error 0.13.0",
  "safelog",
  "serde",
  "serde_with",
@@ -8974,7 +9013,7 @@ dependencies = [
  "tor-config",
  "tor-config-path",
  "tor-dirclient",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-keymgr",
  "tor-linkspec",
@@ -8986,10 +9025,10 @@ dependencies = [
  "tor-proto",
  "tor-protover",
  "tor-relay-selection",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -9010,7 +9049,7 @@ dependencies = [
  "tor-bytes",
  "tor-cert",
  "tor-checkable",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-llcrypto",
 ]
 
@@ -9043,7 +9082,7 @@ dependencies = [
  "tor-bytes",
  "tor-config",
  "tor-config-path",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-key-forge",
  "tor-llcrypto",
@@ -9051,7 +9090,7 @@ dependencies = [
  "tracing",
  "visibility",
  "walkdir",
- "web-time-compat",
+ "web-time-compat 0.2.0",
  "zeroize",
 ]
 
@@ -9118,7 +9157,7 @@ dependencies = [
  "signature 2.2.0",
  "subtle",
  "thiserror 2.0.21",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-memquota-cost",
  "visibility",
  "x25519-dalek 2.0.1",
@@ -9134,11 +9173,11 @@ dependencies = [
  "futures",
  "humantime",
  "thiserror 2.0.21",
- "tor-error",
- "tor-rtcompat",
+ "tor-error 0.46.0",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "weak-table",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -9165,10 +9204,10 @@ dependencies = [
  "tor-async-utils",
  "tor-basic-utils",
  "tor-config",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-log-ratelim",
  "tor-memquota-cost",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "void",
 ]
@@ -9206,7 +9245,7 @@ dependencies = [
  "thiserror 2.0.21",
  "time",
  "tor-basic-utils",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-linkspec",
  "tor-llcrypto",
@@ -9215,7 +9254,7 @@ dependencies = [
  "tor-units",
  "tracing",
  "typed-index-collections",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -9260,14 +9299,14 @@ dependencies = [
  "tor-cell",
  "tor-cert",
  "tor-checkable",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-linkspec",
  "tor-llcrypto",
  "tor-protover",
  "tor-units",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
  "zeroize",
 ]
 
@@ -9295,10 +9334,10 @@ dependencies = [
  "time",
  "tor-async-utils",
  "tor-basic-utils",
- "tor-error",
+ "tor-error 0.46.0",
  "tracing",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -9352,21 +9391,21 @@ dependencies = [
  "tor-cert",
  "tor-checkable",
  "tor-config",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-hscrypto",
  "tor-linkspec",
  "tor-llcrypto",
  "tor-log-ratelim",
  "tor-memquota",
  "tor-protover",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tor-rtmock",
  "tor-units",
  "tracing",
  "typenum",
  "visibility",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
  "zeroize",
 ]
 
@@ -9406,13 +9445,13 @@ dependencies = [
  "tor-chanmgr",
  "tor-config",
  "tor-config-path",
- "tor-error",
+ "tor-error 0.46.0",
  "tor-linkspec",
  "tor-proto",
- "tor-rtcompat",
+ "tor-rtcompat 0.46.0",
  "tor-socksproto",
  "tracing",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -9458,11 +9497,48 @@ dependencies = [
  "thiserror 2.0.21",
  "tokio",
  "tokio-util",
- "tor-error",
- "tor-general-addr",
+ "tor-error 0.46.0",
+ "tor-general-addr 0.46.0",
  "tracing",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
+ "zeroize",
+]
+
+[[package]]
+name = "tor-rtcompat"
+version = "0.47.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "99036f7a4fa9735e0beac7f241592da1a072c94a018e4fa702001700f5922291"
+dependencies = [
+ "amplify",
+ "async-trait",
+ "async_executors",
+ "asynchronous-codec",
+ "cfg-if",
+ "coarsetime",
+ "derive_builder_fork_arti",
+ "derive_more 2.1.1",
+ "dyn-clone",
+ "educe 0.4.23",
+ "futures",
+ "futures-rustls",
+ "hex",
+ "libc",
+ "paste",
+ "pin-project",
+ "rustls",
+ "rustls-pki-types",
+ "rustls-webpki",
+ "socket2 0.6.5",
+ "thiserror 2.0.21",
+ "tokio",
+ "tokio-util",
+ "tor-error 0.47.0",
+ "tor-general-addr 0.47.0",
+ "tracing",
+ "void",
+ "web-time-compat 0.3.0",
  "zeroize",
 ]
 
@@ -9487,13 +9563,13 @@ dependencies = [
  "slotmap-careful",
  "strum",
  "thiserror 2.0.21",
- "tor-error",
- "tor-general-addr",
- "tor-rtcompat",
+ "tor-error 0.46.0",
+ "tor-general-addr 0.46.0",
+ "tor-rtcompat 0.46.0",
  "tracing",
  "tracing-test",
  "void",
- "web-time-compat",
+ "web-time-compat 0.2.0",
 ]
 
 [[package]]
@@ -9510,7 +9586,7 @@ dependencies = [
  "subtle",
  "thiserror 2.0.21",
  "tor-bytes",
- "tor-error",
+ "tor-error 0.46.0",
 ]
 
 [[package]]
@@ -10155,6 +10231,15 @@ name = "web-time-compat"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af46dad42aa37be3b4a116fe613365f991b8bdae6cd6ce82d84fa9f9e8f70ae4"
+dependencies = [
+ "web-time",
+]
+
+[[package]]
+name = "web-time-compat"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b1c38a07cb4a2705c91feaedc9013a65481ec1b38d818b885d642b9f06ec6edd"
 dependencies = [
  "web-time",
 ]
