@@ -1,9 +1,8 @@
 name: Build
 
-# On-demand test builds - no tag, no signing, no Release. Trigger from the
-# Actions tab -> "Build" -> "Run workflow", optionally picking one platform to
-# build faster. The artifacts (unsigned) are attached to the run for download.
-# For a real signed release, push a `v*` tag (that's release.yml).
+# Proposed temporary test-branch variant. Dispatch Build with platform=windows.
+# Windows uploads bounded #599 diagnostics only. No installer, signing, tag, or release.
+# macOS/Linux jobs below are unchanged and skipped by platform=windows.
 
 on:
   workflow_dispatch:
@@ -11,7 +10,7 @@ on:
       platform:
         description: Platform to build
         type: choice
-        default: all
+        default: windows
         options: [all, macos, linux, windows]
 
 permissions:
@@ -89,27 +88,160 @@ jobs:
 
   windows:
     if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
-    runs-on: windows-latest
+    name: Windows issue 599 (${{ matrix.case }})
+    runs-on: windows-2025
+    timeout-minutes: 100
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - case: baseline
+            source: b11eb00e861b3341fad562d2c2b5f7ac9d1748c1
+          - case: fixed
+            source: 7e0ec091d2137b0ff3c7ef2010fadeeefc00bf1a
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_TARGET_DIR: ${{ runner.temp }}/issue-599-target
+      PYTHONDONTWRITEBYTECODE: "1"
     steps:
-      - uses: actions/checkout@v7.0.1
+      - name: Check out temporary test branch containing the fixture
+        uses: actions/checkout@v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out exact source revision separately
+        uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ matrix.source }}
+          path: source
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - name: Install protoc (mesh transport build dep)
-        run: choco install protoc -y --no-progress
-      - name: Install NSIS
-        run: choco install nsis -y --no-progress
-      - name: Fetch Firefox ESR to bundle
-        shell: bash
-        run: packaging/fetch-firefox-esr.sh win64
-      - name: Build installer (unsigned)
-        shell: bash
-        env:
-          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+      - name: Install protoc
+        timeout-minutes: 10
         run: |
-          export PATH="/c/Program Files (x86)/NSIS:$PATH"
-          packaging/windows/build-windows.sh
-      - uses: actions/upload-artifact@v7
+          choco install protoc -y --no-progress
+          if ($LASTEXITCODE -ne 0) { throw "protoc installation failed" }
+          protoc --version
+          if ($LASTEXITCODE -ne 0) { throw "protoc unavailable" }
+      - name: Record source, fixture, and runner identity
+        env:
+          EXPECTED_SOURCE: ${{ matrix.source }}
+          CASE_NAME: ${{ matrix.case }}
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $actual = (git -C source rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $env:EXPECTED_SOURCE) { throw "source revision mismatch" }
+          $os = Get-CimInstance Win32_OperatingSystem
+          $cpu = Get-CimInstance Win32_Processor
+          $free = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($env:RUNNER_TEMP)).AvailableFreeSpace
+          $metadata = @{
+            case = $env:CASE_NAME; source_revision = $actual
+            fixture_revision = (git rev-parse HEAD).Trim()
+            fixture_sha256 = (Get-FileHash packaging/windows/issue-599-windows-fixture.py -Algorithm SHA256).Hash.ToLowerInvariant()
+            cargo_lock_sha256 = (Get-FileHash source/Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
+            image_os = $env:ImageOS; image_version = $env:ImageVersion
+            os_caption = $os.Caption; os_version = $os.Version; os_build = $os.BuildNumber
+            total_visible_memory_kib = $os.TotalVisibleMemorySize; free_memory_kib = $os.FreePhysicalMemory
+            cpu_names = @($cpu.Name); logical_cpus = $env:NUMBER_OF_PROCESSORS
+            rustc = @(rustc -Vv); cargo = @(cargo --version); python = @(python --version)
+            target = "x86_64-pc-windows-msvc"; profile = "dev"; jobs = 2; incremental = 0; debuginfo = 0
+            free_bytes_before_build = $free
+            scope = "Controlled Windows Server API comparison, not reporter Windows 10 UI or exact dataset"
+          }
+          $metadata | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 evidence/runner.json
+          if ($free -lt 12GB) { throw "need 12 GiB free before compiling" }
+      - name: Validate fixture transport helpers
+        timeout-minutes: 2
+        run: |
+          python packaging/windows/issue-599-windows-selftest.py
+          if ($LASTEXITCODE -ne 0) { throw "fixture self-tests failed" }
+      - name: Build only the native server with time and disk bounds
+        id: build
+        timeout-minutes: 65
+        run: |
+          $build = $null
+          $report = @{ started_utc = [DateTime]::UtcNow.ToString("o"); passed = $false }
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          try {
+            $build = Start-Process cargo -ArgumentList @("build", "--locked", "-p", "epix-server", "--target", "x86_64-pc-windows-msvc") -WorkingDirectory source -PassThru -NoNewWindow -RedirectStandardOutput "$pwd/evidence/build-stdout.log" -RedirectStandardError "$pwd/evidence/build-stderr.log"
+            $report.owned_cargo_pid = $build.Id
+            do {
+              Start-Sleep -Seconds 20
+              $free = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($env:RUNNER_TEMP)).AvailableFreeSpace
+              $targetBytes = (Get-ChildItem $env:CARGO_TARGET_DIR -File -Recurse -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+              $logBytes = (Get-ChildItem evidence/build-*.log -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum).Sum
+              $report.minimum_free_bytes = if ($report.ContainsKey("minimum_free_bytes")) { [Math]::Min($report.minimum_free_bytes, $free) } else { $free }
+              $report.target_bytes = $targetBytes
+              if ($free -lt 4GB) { throw "free disk fell below 4 GiB" }
+              if ($targetBytes -gt 20GB) { throw "target exceeded 20 GiB" }
+              if ($logBytes -gt 32MB) { throw "build logs exceeded 32 MiB" }
+              if ($watch.Elapsed.TotalMinutes -gt 60) { throw "compilation exceeded 60 minutes" }
+              $build.Refresh()
+            } while (-not $build.HasExited)
+            $build.WaitForExit()
+            $report.exit_code = $build.ExitCode
+            if ($build.ExitCode -ne 0) { throw "cargo failed with exit code $($build.ExitCode)" }
+            $report.passed = $true
+          } catch {
+            $report.error = $_.Exception.Message
+            throw
+          } finally {
+            if ($null -ne $build -and -not $build.HasExited) {
+              taskkill /PID $build.Id /T /F | Out-Null
+              $build.WaitForExit(10000) | Out-Null
+            }
+            $report.seconds = $watch.Elapsed.TotalSeconds
+            $report.finished_utc = [DateTime]::UtcNow.ToString("o")
+            $report | ConvertTo-Json -Depth 8 | Set-Content -Encoding utf8 evidence/build.json
+          }
+      - name: Run offline WebSocket signing, responsiveness, and recovery fixture
+        id: fixture
+        # Baseline failure is expected evidence, not a green baseline assertion.
+        continue-on-error: ${{ matrix.case == 'baseline' }}
+        timeout-minutes: 20
+        env:
+          SOURCE_REVISION: ${{ matrix.source }}
+          CASE_NAME: ${{ matrix.case }}
+        run: |
+          python packaging/windows/issue-599-windows-fixture.py --binary "$env:CARGO_TARGET_DIR/x86_64-pc-windows-msvc/debug/epix-server.exe" --output "$pwd/evidence" --source-revision $env:SOURCE_REVISION --case $env:CASE_NAME
+          if ($LASTEXITCODE -ne 0) { throw "fixture failed or was inconclusive; inspect result.json" }
+      - name: Record actual step outcomes
+        if: always()
+        env:
+          BUILD_OUTCOME: ${{ steps.build.outcome }}
+          FIXTURE_OUTCOME: ${{ steps.fixture.outcome }}
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          @{ build = $env:BUILD_OUTCOME; fixture = $env:FIXTURE_OUTCOME; captured_utc = [DateTime]::UtcNow.ToString("o") } | ConvertTo-Json | Set-Content -Encoding utf8 evidence/outcomes.json
+      - name: Remove only disposable fixture roots and target
+        if: always()
+        timeout-minutes: 3
+        run: |
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          $parent = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd('\')
+          $roots = @(Get-ChildItem -LiteralPath $parent -Directory -Filter "epix-issue599-*" -ErrorAction SilentlyContinue)
+          if (Test-Path -LiteralPath $env:CARGO_TARGET_DIR) { $roots += Get-Item -LiteralPath $env:CARGO_TARGET_DIR }
+          $removed = @()
+          foreach ($root in $roots) {
+            if ($root.Parent.FullName.TrimEnd('\') -ne $parent) { throw "cleanup path escaped runner temp" }
+            if (($root.Attributes -band [IO.FileAttributes]::ReparsePoint) -ne 0) { throw "refusing reparse-point cleanup" }
+            Remove-Item -LiteralPath $root.FullName -Recurse -Force
+            $removed += $root.Name
+          }
+          @{ removed_owned_roots = $removed; free_bytes_after = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($parent)).AvailableFreeSpace } | ConvertTo-Json | Set-Content -Encoding utf8 evidence/workflow-cleanup.json
+      - name: Upload bounded diagnostic evidence only
+        if: always()
+        uses: actions/upload-artifact@v7
         with:
-          name: epix-windows-unsigned
-          path: dist/Epix-Setup-*.exe
+          name: issue-599-windows-${{ matrix.case }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            evidence/*.json
+            evidence/*.log
+          if-no-files-found: error
+          retention-days: 7
