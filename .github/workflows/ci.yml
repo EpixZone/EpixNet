@@ -16,7 +16,7 @@ permissions: {}
 
 jobs:
   android-wallet-staging:
-    name: Android wallet staging regressions
+    name: Android shell regressions
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -28,6 +28,12 @@ jobs:
           distribution: temurin
           java-version: '21'
       - run: python3 shells/android/tests/run-wallet-staging-regressions.py
+      - name: Test Android startup and controls
+        run: |
+          export KOTLINC="$(command -v kotlinc)"
+          "$KOTLINC" -version
+          python3 shells/android/tests/run-startup-regressions.py
+          python3 shells/android/tests/run-toolbar-regressions.py
 
   linux-packaging:
     name: Linux packaging (${{ matrix.os }})
