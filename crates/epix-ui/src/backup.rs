@@ -547,13 +547,17 @@ fn stage_archive(
     let file = std::fs::File::open(backup_path).map_err(|e| e.to_string())?;
     let mut zip: BackupArchive = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|_| "Not a valid backup archive".to_string())?;
-    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("Invalid backup file name: {e}"))?;
     let mut staged_files = Vec::new();
-    for name in names {
+    for (index, name) in names.into_iter().enumerate() {
         if name == "manifest.json" || !entry_allowed(&name, allowed_files, allowed_xites) {
             continue;
         }
-        if stage_entry(&mut zip, &name, password, encrypted, pending)? {
+        if stage_entry(&mut zip, index, &name, password, encrypted, pending)? {
             staged_files.push(name);
         }
     }
@@ -580,14 +584,17 @@ fn stage_archive(
 /// the entry was skipped (a directory or symlink), not staged.
 fn stage_entry(
     zip: &mut BackupArchive,
+    index: usize,
     name: &str,
     password: Option<&str>,
     encrypted: bool,
     pending: &Path,
 ) -> Result<bool, String> {
+    // ZIP 9 indexes names by their original bytes. Keep the decoded name for
+    // path checks, but use its index so legacy CP437 names remain readable.
     let mut entry = match password {
-        Some(pwd) => zip.by_name_decrypt(name, pwd.as_bytes()),
-        None => zip.by_name(name),
+        Some(pwd) => zip.by_index_decrypt(index, pwd.as_bytes()),
+        None => zip.by_index(index),
     }
     .map_err(|e| match e {
         zip::result::ZipError::InvalidPassword => "Wrong password".to_string(),
@@ -1615,7 +1622,7 @@ mod tests {
         // No caches, no backups dir, forward slashes only.
         let f = std::fs::File::open(root.join("backups").join(&name)).unwrap();
         let mut zip = zip::ZipArchive::new(f).unwrap();
-        let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        let names: Vec<String> = zip.file_names().map(|name| name.unwrap().into_owned()).collect();
         assert!(names.iter().all(|n| !n.contains('\\')));
         assert!(names.iter().all(|n| !n.starts_with("backups/")));
         assert!(names.iter().all(|n| !n.starts_with("tor/")));
@@ -1623,7 +1630,7 @@ mod tests {
         assert!(names.iter().any(|n| n == "private/users.json"));
         assert!(names.iter().any(|n| n.starts_with("data/") && n.ends_with("sub/index.html")));
         // Manifest is entry 0 (readable first even when streaming).
-        assert_eq!(zip.by_index(0).unwrap().name(), "manifest.json");
+        assert_eq!(zip.by_index(0).unwrap().name().unwrap(), "manifest.json");
     }
 
     #[test]
@@ -1634,9 +1641,48 @@ mod tests {
             create_backup(root, &["keys".to_string()], None, "0.9", "epix-backup").unwrap();
         let f = std::fs::File::open(root.join("backups").join(&name)).unwrap();
         let zip = zip::ZipArchive::new(f).unwrap();
-        let names: Vec<&str> = zip.file_names().collect();
+        let names: Vec<String> = zip.file_names().map(|name| name.unwrap().into_owned()).collect();
         assert_eq!(names.len(), 2); // manifest + users.json
-        assert!(names.contains(&"private/users.json"));
+        assert!(names.iter().any(|name| name == "private/users.json"));
+    }
+
+    #[test]
+    fn restore_preserves_unicode_file_names() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let xite = std::fs::read_dir(root.join("data")).unwrap().next().unwrap().unwrap();
+        let path = xite.path().join("sub/café.txt");
+        std::fs::write(&path, b"unicode filename").unwrap();
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        stage_restore(root, &root.join("backups").join(name), &all_components(), None, "0.9").unwrap();
+        let staged = root.join(PENDING_DIR).join(path.strip_prefix(root).unwrap());
+        assert_eq!(std::fs::read(staged).unwrap(), b"unicode filename");
+    }
+
+    #[test]
+    fn restore_preserves_legacy_cp437_file_names() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let xite = std::fs::read_dir(root.join("data")).unwrap().next().unwrap().unwrap();
+        std::fs::write(xite.path().join("sub/caf_.txt"), b"legacy filename").unwrap();
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let path = root.join("backups").join(name);
+
+        // Replace the ASCII placeholder in both headers with CP437 e-acute.
+        // Both names have eight bytes, so offsets and lengths stay unchanged.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offsets: Vec<_> = bytes.windows(b"caf_.txt".len())
+            .enumerate().filter_map(|(i, part)| (part == b"caf_.txt").then_some(i))
+            .collect();
+        assert_eq!(offsets.len(), 2);
+        for offset in offsets {
+            bytes[offset + 3] = 0x82;
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        stage_restore(root, &path, &all_components(), None, "0.9").unwrap();
+        let staged = root.join(PENDING_DIR).join(xite.path().strip_prefix(root).unwrap()).join("sub/café.txt");
+        assert_eq!(std::fs::read(staged).unwrap(), b"legacy filename");
     }
 
     #[test]

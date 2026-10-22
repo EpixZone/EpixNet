@@ -10182,13 +10182,15 @@ impl AppState {
         };
 
         // A single non-address top-level dir wraps the real content.
-        let tops: std::collections::HashSet<String> = (0..zip.len())
-            .filter_map(|i| {
-                let name = zip.by_index(i).ok()?.name().to_string();
-                Some(name.split('/').next()?.to_string())
-            })
-            .filter(|t| !t.is_empty())
-            .collect();
+        // Decode every name before extracting anything, propagating any
+        // filename errors from the archive reader.
+        let mut tops = std::collections::HashSet::new();
+        for name in zip.file_names() {
+            let name = name.map_err(|e| format!("Invalid bundle file name: {e}"))?;
+            if let Some(top) = name.split('/').next().filter(|top| !top.is_empty()) {
+                tops.insert(top.to_string());
+            }
+        }
         let prefix = match tops.len() {
             1 => {
                 let top = tops.iter().next().unwrap();
@@ -10203,7 +10205,7 @@ impl AppState {
             if entry.is_dir() {
                 continue;
             }
-            let name = entry.name().to_string();
+            let name = entry.name().map_err(|e| format!("Invalid bundle file name: {e}"))?.into_owned();
             let Some(rel) = name.strip_prefix(&prefix) else { continue;
             };
             let Some((address, inner)) = rel.split_once('/') else { continue;
@@ -33640,7 +33642,14 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
     use std::io::Read;
     if archive_path.ends_with(".zip") {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
-        let mut file = zip.by_name(within).ok()?;
+        // ZIP 9 indexes raw filename bytes; a decoded CP437 name therefore
+        // needs an index lookup instead of a UTF-8 by_name lookup.
+        let index = zip.index_for_name(within).or_else(|| {
+            zip.file_names().enumerate().find_map(|(index, name)| {
+                (name.ok()?.as_ref() == within).then_some(index)
+            })
+        })?;
+        let mut file = zip.by_index(index).ok()?;
         let mut out = Vec::new();
         file.read_to_end(&mut out).ok()?;
         Some(out)
@@ -43744,6 +43753,67 @@ mod tests {
         state.notification_mute(false, None).await;
         state.notification_mute(true, Some("1Chat")).await;
         assert_eq!(state.notification_mute_status().await["site_mutes"]["1Chat"], true);
+    }
+
+    #[tokio::test]
+    async fn filepack_reads_zip_filenames_with_cp437_fallback() {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in [
+            ("dir/cafX.txt", &b"legacy CP437 bytes"[..]),
+            ("modern/café.txt", &b"UTF-8 bytes"[..]),
+            ("plain.txt", &b"ASCII bytes"[..]),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        let mut archive = writer.finish().unwrap().into_inner();
+        // Replace the same-width ASCII placeholder in both ZIP headers. The
+        // UTF-8 flag remains clear, and 0x82 is CP437's encoding of é.
+        let offsets: Vec<_> = archive.windows(b"dir/cafX.txt".len())
+            .enumerate()
+            .filter_map(|(index, part)| (part == b"dir/cafX.txt").then_some(index))
+            .collect();
+        assert_eq!(offsets.len(), 2);
+        for offset in offsets {
+            archive[offset + b"dir/caf".len()] = 0x82;
+        }
+        let corrupt_offset = {
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&archive)).unwrap();
+            assert!(zip.index_for_name("dir/café.txt").is_none());
+            let file = zip.by_index(0).unwrap();
+            assert_eq!(file.name_raw(), b"dir/caf\x82.txt");
+            assert_eq!(file.flags().as_u16() & 0x800, 0);
+            assert_eq!(file.name().unwrap(), "dir/café.txt");
+            file.data_start().unwrap() as usize
+        };
+
+        let directory = tempdir().unwrap();
+        let storage = XiteStorage::new(directory.path());
+        storage.write("pack.zip", &archive).unwrap();
+        let state = AppState::new("test");
+        state.add_xite("1Pack", XiteEntry { storage: storage.clone(), content: None }).await;
+        for (name, expected) in [
+            ("dir/café.txt", &b"legacy CP437 bytes"[..]),
+            ("modern/café.txt", &b"UTF-8 bytes"[..]),
+            ("plain.txt", &b"ASCII bytes"[..]),
+        ] {
+            let bytes = state.read_file("1Pack", &format!("pack.zip/{name}")).await;
+            assert_eq!(bytes.as_deref(), Some(expected), "{name}");
+        }
+        assert!(state.read_file("1Pack", "pack.zip/missing.txt").await.is_none());
+        assert!(state.read_file("1Pack", "../pack.zip/plain.txt").await.is_none());
+
+        state.set_plugin_enabled("FilePack", false).await;
+        assert!(state.read_file("1Pack", "pack.zip/dir/café.txt").await.is_none());
+        state.set_plugin_enabled("FilePack", true).await;
+        // The fallback still reads through ZipFile, preserving its CRC check.
+        archive[corrupt_offset] ^= 1;
+        storage.write("pack.zip", &archive).unwrap();
+        assert!(state.read_file("1Pack", "pack.zip/dir/café.txt").await.is_none());
     }
 
     #[tokio::test]
