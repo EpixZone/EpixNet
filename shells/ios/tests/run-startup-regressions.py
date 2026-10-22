@@ -6,6 +6,7 @@ replace UIKit rendering on an iOS simulator or device.
 """
 import pathlib
 import subprocess
+import sys
 import tempfile
 
 source = (pathlib.Path(__file__).resolve().parents[1] / 'EpixBrowser/AppDelegate.swift').read_text()
@@ -332,4 +333,7 @@ with tempfile.TemporaryDirectory(prefix='epix-ios-startup-') as directory:
     (path / 'main.swift').write_text(body)
     subprocess.run(['swiftc', '-module-cache-path', str(path / 'cache'), str(path / 'main.swift'),
                     '-o', str(path / 'regressions')], check=True)
-    raise SystemExit(subprocess.run([str(path / 'regressions')]).returncode)
+    subprocess.run([str(path / 'regressions')], check=True)
+    raise SystemExit(subprocess.run([
+        sys.executable, str(pathlib.Path(__file__).resolve().with_name('run-foreground-regressions.py'))
+    ]).returncode)

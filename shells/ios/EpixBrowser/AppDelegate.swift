@@ -644,6 +644,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                 DispatchQueue.main.async {
                     self.browserProxy = self.node.browserProxy()
                     self.applyClearnetRouting()
+                    // The first active callback can precede node startup.
+                    self.wakeNodeForForeground()
                     self.stopStartupPolling()
                     self.setStartupProgress(
                         title: "Opening Epix Browser", detail: "Waiting for your first page to appear.",
@@ -798,6 +800,16 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 
     func applicationDidBecomeActive(_ application: UIApplication) {
         walletVC?.view.viewWithTag(73491)?.removeFromSuperview()
+        wakeNodeForForeground()
+    }
+
+    /// Returning on the same network still needs a fresh xite update check.
+    private func wakeNodeForForeground() {
+        guard UIApplication.shared.applicationState == .active else { return }
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self, self.node.state() == .serving else { return }
+            self.node.networkChanged()
+        }
     }
 
     func applicationDidEnterBackground(_ application: UIApplication) {
