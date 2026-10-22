@@ -6,6 +6,13 @@ updates:
       interval: weekly
     open-pull-requests-limit: 10
     groups:
+      # Arti shares runtime types and safelog traits across these dependencies.
+      # Include major updates too: pre-1.0 minor bumps can be incompatible.
+      arti:
+        patterns:
+          - "arti-client"
+          - "tor-*"
+          - "safelog"
       # Batch low-risk patch/minor bumps into one PR to cut noise.
       patch-and-minor:
         update-types:
