@@ -255,6 +255,23 @@ a {
 
 /* Fixbutton #50, #53 */
 
+#wrapper-controls {
+	position: fixed;
+	left: 0;
+	top: 0;
+	width: 100%;
+	height: 100%;
+	transform-origin: 0 0;
+	overflow: clip;
+	z-index: 998;
+	pointer-events: none;
+}
+
+#wrapper-controls .fixbutton {
+	pointer-events: auto;
+	touch-action: none;
+}
+
 .fixbutton {
 	position: absolute;
 	right: 35px;

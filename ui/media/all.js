@@ -618,6 +618,114 @@ if (window.getComputedStyle(document.body).transform) {
 });
 
 
+/* Wrapper controls use their own coordinates. Compensate the xite's initial
+   viewport scale, while leaving subsequent user pinch zoom intact. */
+(function () {
+  function WrapperChrome() {
+    this.element = document.getElementById("wrapper-controls");
+    this.baseline = this.metrics().scale;
+    this.scale = this.baseline;
+    this.viewport = this.viewportContent();
+    this.physicalWidth = 0;
+    this.frame = null;
+    this.pendingViewport = 0;
+    this.update = this.update.bind(this);
+    this.schedule = this.schedule.bind(this);
+    window.addEventListener("resize", this.schedule);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", this.schedule);
+      window.visualViewport.addEventListener("scroll", this.schedule);
+    }
+    this.update();
+  }
+
+  WrapperChrome.prototype.viewportContent = function () {
+    var tags = document.querySelectorAll('meta[name="viewport"]');
+    return tags.length ? tags[tags.length - 1].content : "";
+  };
+
+  WrapperChrome.prototype.metrics = function () {
+    var viewport = window.visualViewport;
+    return {
+      scale: viewport && viewport.scale > 0 ? viewport.scale : 1,
+      width: viewport ? viewport.width : document.documentElement.clientWidth,
+      height: viewport ? viewport.height : document.documentElement.clientHeight,
+      left: viewport ? viewport.pageLeft : window.pageXOffset,
+      top: viewport ? viewport.pageTop : window.pageYOffset
+    };
+  };
+
+  WrapperChrome.prototype.beforeViewportChange = function (content) {
+    var before = this.metrics(), generation = ++this.pendingViewport, self = this;
+    this.viewport = content;
+    // Layout responds asynchronously to meta changes. Ordinary resize/scroll
+    // events must never adopt the user's current pinch as the author baseline.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        if (generation !== self.pendingViewport) return;
+        var after = self.metrics();
+        // Desktop browsers can ignore viewport directives altogether. Keep the
+        // existing baseline when an edit has no observable viewport effect.
+        if (Math.abs(after.scale - before.scale) > 0.001) {
+          self.baseline = after.scale;
+        }
+        self.pendingViewport = 0;
+        self.physicalWidth = after.width * after.scale;
+        self.update();
+      });
+    });
+  };
+
+  WrapperChrome.prototype.schedule = function () {
+    if (this.frame !== null) return;
+    this.frame = requestAnimationFrame(this.update);
+  };
+
+  WrapperChrome.prototype.update = function () {
+    this.frame = null;
+    var viewport = this.metrics(), physicalWidth = viewport.width * viewport.scale;
+    // A numeric width with no initial scale fits the page again on rotation.
+    // Follow the browser's actual scale change, including its clamps. Desktop
+    // browsers that ignore the directive keep their scale. Keyboard height
+    // changes and pinch/pan do not change the physical viewport width.
+    if (!this.pendingViewport && this.physicalWidth > 0 && Math.abs(physicalWidth - this.physicalWidth) > 1 &&
+        /(?:^|[,;\s])width\s*=\s*\d/i.test(this.viewport) &&
+        !/(?:^|[,;\s])initial-scale\s*=/i.test(this.viewport)) {
+      this.baseline *= viewport.scale / this.scale;
+    }
+    this.scale = viewport.scale;
+    this.physicalWidth = physicalWidth;
+    this.width = viewport.width * this.baseline;
+    this.height = viewport.height * this.baseline;
+    this.left = viewport.left;
+    this.top = viewport.top;
+    var offsetLeft = this.left - window.pageXOffset, offsetTop = this.top - window.pageYOffset;
+    var signature = [this.width, this.height, this.left, this.top, offsetLeft, offsetTop, this.baseline].join(",");
+    if (signature === this.signature) return;
+    this.signature = signature;
+    var style = this.element.style;
+    style.width = this.width + "px";
+    style.height = this.height + "px";
+    style.transform = "translate(" + offsetLeft + "px," + offsetTop + "px) scale(" + (1 / this.baseline) + ")";
+    style.setProperty("--controls-width", this.width + "px");
+    style.setProperty("--controls-height", this.height + "px");
+    this.element.classList.toggle("controls-narrow", this.width <= 640);
+    this.element.classList.toggle("controls-compact-menu", this.width <= 800);
+    window.dispatchEvent(new Event("epixchromechange"));
+  };
+
+  WrapperChrome.prototype.point = function (pageX, pageY) {
+    return {left: (pageX - this.left) * this.baseline, top: (pageY - this.top) * this.baseline};
+  };
+
+  WrapperChrome.prototype.position = function (element) {
+    var bounds = element.getBoundingClientRect();
+    return this.point(bounds.left + window.pageXOffset, bounds.top + window.pageYOffset);
+  };
+
+  window.WrapperChrome = WrapperChrome;
+})();
+
 /* ---- Fixbutton.coffee ---- */
 
 
@@ -1489,6 +1597,7 @@ if (window.getComputedStyle(document.body).transform) {
           return _this.ws.cmd("siteSetSettingsValue", ["modified_files_notification", true]);
         };
       })(this);
+      this.chrome = new WrapperChrome();
       this.fixbutton = new Fixbutton();
       window.addEventListener("message", this.onMessageInner, false);
       this.inner = document.getElementById("inner-iframe").contentWindow;
@@ -2121,9 +2230,11 @@ if (window.getComputedStyle(document.body).transform) {
     Wrapper.prototype.setViewport = function (viewport) {
       var element = $("#viewport");
       if (!element.length) {
+        if (this.chrome) this.chrome.beforeViewportChange(viewport);
         return $('<meta name="viewport" id="viewport">').attr("content", viewport).appendTo("head");
       } else if (element.attr("content") !== viewport) {
         // Repeated download progress must not reset the user's zoom.
+        if (this.chrome) this.chrome.beforeViewportChange(viewport);
         return element.attr("content", viewport);
       }
     };

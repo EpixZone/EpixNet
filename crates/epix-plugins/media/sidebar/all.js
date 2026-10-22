@@ -144,7 +144,7 @@
           };
         })(this));
         this.text.is_bottom = true;
-        this.container.appendTo(document.body);
+        this.container.appendTo(this.sidebar.wrapper.chrome.element);
         this.tag = this.container.find(".console");
         ref = this.tab_types;
         for (j = 0, len = ref.length; j < len; j++) {
@@ -367,10 +367,11 @@
     slice = [].slice;
 
   Menu = (function() {
-    function Menu(button) {
+    function Menu(button, chrome) {
       this.button = button;
+      this.chrome = chrome;
       this.elem = $(".menu.template").clone().removeClass("template");
-      this.elem.appendTo("body");
+      this.elem.appendTo(this.chrome.element);
       this.items = [];
     }
 
@@ -380,7 +381,7 @@
         window.visible_menu.hide();
         return this.hide();
       } else {
-        button_pos = this.button.offset();
+        button_pos = this.chrome.position(this.button[0]);
         left = button_pos.left;
         this.elem.css({
           "top": button_pos.top + this.button.outerHeight(),
@@ -388,8 +389,8 @@
         });
         this.button.addClass("menu-active");
         this.elem.addClass("visible");
-        if (this.elem.position().left + this.elem.width() + 20 > window.innerWidth) {
-          this.elem.css("left", window.innerWidth - this.elem.width() - 20);
+        if (this.chrome.position(this.elem[0]).left + this.elem.width() + 20 > this.chrome.width) {
+          this.elem.css("left", this.chrome.width - this.elem.width() - 20);
         }
         if (window.visible_menu) {
           window.visible_menu.hide();
@@ -508,7 +509,7 @@
 
 /* via http://jsfiddle.net/elGrecode/00dgurnn/ */
 
-window.initScrollable = function () {
+window.initScrollable = function (chrome) {
 
     var scrollContainer = document.querySelector('.scrollable'),
         scrollContentWrapper = document.querySelector('.scrollable .content-wrapper'),
@@ -517,6 +518,7 @@ window.initScrollable = function () {
         scrollerBeingDragged = false,
         scroller,
         topPosition,
+        normalizedPosition,
         scrollerHeight;
 
     function calculateScrollerHeight() {
@@ -537,7 +539,7 @@ window.initScrollable = function () {
     }
 
     function startDrag(evt) {
-        normalizedPosition = evt.pageY;
+        normalizedPosition = chrome.point(evt.pageX, evt.pageY).top;
         contentPosition = scrollContentWrapper.scrollTop;
         scrollerBeingDragged = true;
         window.addEventListener('mousemove', scrollBarScroll);
@@ -552,7 +554,7 @@ window.initScrollable = function () {
     function scrollBarScroll(evt) {
         if (scrollerBeingDragged === true) {
             evt.preventDefault();
-            var mouseDifferential = evt.pageY - normalizedPosition;
+            var mouseDifferential = chrome.point(evt.pageX, evt.pageY).top - normalizedPosition;
             var scrollEquivalent = mouseDifferential * (scrollContentWrapper.scrollHeight / scrollContainer.offsetHeight);
             scrollContentWrapper.scrollTop = contentPosition + scrollEquivalent;
         }
@@ -632,8 +634,8 @@ window.initScrollable = function () {
       this.fixbutton_inity = 15;
       this.fixbutton_targetx = 0;
       this.move_lock = null;
-      this.page_width = $(window).width();
-      this.page_height = $(window).height();
+      this.page_width = this.wrapper.chrome.width;
+      this.page_height = this.wrapper.chrome.height;
       this.frame = $("#inner-iframe");
       this.initFixbutton();
       this.dragStarted = 0;
@@ -660,17 +662,11 @@ window.initScrollable = function () {
           _this.fixbutton.off("click touchend touchcancel");
           _this.dragStarted = +(new Date);
           $(".drag-bg").remove();
-          $("<div class='drag-bg'></div>").appendTo(document.body);
+          $("<div class='drag-bg'></div>").appendTo(_this.wrapper.chrome.element);
           return $("body").one("mousemove touchmove", function(e) {
-            var mousex, mousey;
-            mousex = e.pageX;
-            mousey = e.pageY;
-            if (!mousex) {
-              mousex = e.originalEvent.touches[0].pageX;
-              mousey = e.originalEvent.touches[0].pageY;
-            }
-            _this.fixbutton_addx = _this.fixbutton.offset().left - mousex;
-            _this.fixbutton_addy = _this.fixbutton.offset().top - mousey;
+            var pointer = _this.pointer(e), position = _this.wrapper.chrome.position(_this.fixbutton[0]);
+            _this.fixbutton_addx = position.left - pointer.left;
+            _this.fixbutton_addy = position.top - pointer.top;
             return _this.startDrag();
           });
         };
@@ -684,23 +680,30 @@ window.initScrollable = function () {
         };
       })(this));
       this.resized();
-      return $(window).on("resize", this.resized);
+      return $(window).on("epixchromechange.sidebar", this.resized);
+    };
+
+    Sidebar.prototype.pointer = function(e) {
+      var event = e.originalEvent || e;
+      var pointer = event.touches && event.touches.length ? event.touches[0] : e;
+      return this.wrapper.chrome.point(pointer.pageX, pointer.pageY);
     };
 
     Sidebar.prototype.resized = function() {
-      this.page_width = $(window).width();
-      this.page_height = $(window).height();
+      this.page_width = this.wrapper.chrome.width;
+      this.page_height = this.wrapper.chrome.height;
       this.width = this.page_width <= 640 ? this.page_width : 420;
       this.fixbutton_initx = this.page_width - 75;
-      if (this.opened) {
-        return this.fixbutton.css({
-          left: this.fixbutton_initx - this.width
-        });
-      } else {
-        return this.fixbutton.css({
-          left: this.fixbutton_initx
-        });
-      }
+      // A resize can change both the responsive drawer width and the current
+      // console height. Keep the panel translation and handle in the same space.
+      if (this.fixbutton.hasClass("dragging")) this.stopDrag();
+      this.fixbutton_targetx = this.opened ? this.fixbutton_initx - this.width : this.fixbutton_initx;
+      this.fixbutton_targety = this.console.opened ? this.page_height - this.fixbutton_inity - 50 : this.fixbutton_inity;
+      this.fixbutton.stop().css({left: this.fixbutton_targetx, top: this.fixbutton_targety});
+      if (this.tag) this.tag.css("transform", "translateX(-" + (this.opened ? this.width : 0) + "px)");
+      if (this.console.tag) this.console.tag.css("transform", "translateY(" + (this.console.opened ? this.fixbutton_targety - this.fixbutton_inity : 0) + "px)");
+      if (this.scrollable && this.container) this.scrollable();
+      if (window.visible_menu) window.visible_menu.hide();
     };
 
     Sidebar.prototype.startDrag = function() {
@@ -716,8 +719,8 @@ window.initScrollable = function () {
           var moved_x, moved_y;
           _this.stopDrag();
           _this.fixbutton.removeClass("dragging");
-          moved_x = Math.abs(_this.fixbutton.offset().left - _this.fixbutton_initx);
-          moved_y = Math.abs(_this.fixbutton.offset().top - _this.fixbutton_inity);
+          moved_x = Math.abs(_this.wrapper.chrome.position(_this.fixbutton[0]).left - _this.fixbutton_initx);
+          moved_y = Math.abs(_this.wrapper.chrome.position(_this.fixbutton[0]).top - _this.fixbutton_inity);
           if (moved_x > 5 || moved_y > 10) {
             return e.preventDefault();
           }
@@ -735,10 +738,6 @@ window.initScrollable = function () {
 
     Sidebar.prototype.waitMove = function(e) {
       var moved_x, moved_y;
-      document.body.style.perspective = "1000px";
-      document.body.style.height = "100%";
-      document.body.style.willChange = "perspective";
-      document.documentElement.style.height = "100%";
       moved_x = Math.abs(parseInt(this.fixbutton[0].style.left) - this.fixbutton_targetx);
       moved_y = Math.abs(parseInt(this.fixbutton[0].style.top) - this.fixbutton_targety);
       if (moved_x > 5 && (+(new Date)) - this.dragStarted + moved_x > 50) {
@@ -775,14 +774,6 @@ window.initScrollable = function () {
           }
         };
       })(this));
-      $(window).off("resize");
-      $(window).on("resize", (function(_this) {
-        return function() {
-          $(document.body).css("height", $(window).height());
-          _this.scrollable();
-          return _this.resized();
-        };
-      })(this));
       this.wrapper.setXiteInfo = (function(_this) {
         return function(xite_info) {
           _this.setXiteInfo(xite_info);
@@ -810,10 +801,10 @@ window.initScrollable = function () {
       this.when_loaded = $.Deferred();
       if (!this.container) {
         this.container = $("<div class=\"sidebar-container\"><div class=\"sidebar scrollable\"><div class=\"content-wrapper\"><div class=\"content\">\n</div></div></div></div>");
-        this.container.appendTo(document.body);
+        this.container.appendTo(this.wrapper.chrome.element);
         this.tag = this.container.find(".sidebar");
         this.updateHtmlTag();
-        return this.scrollable = window.initScrollable();
+        return this.scrollable = window.initScrollable(this.wrapper.chrome);
       }
     };
 
@@ -922,12 +913,9 @@ window.initScrollable = function () {
 
     Sidebar.prototype.animDrag = function(e) {
       var mousex, mousey, overdrag, overdrag_percent, targetx, targety;
-      mousex = e.pageX;
-      mousey = e.pageY;
-      if (!mousex && e.originalEvent.touches) {
-        mousex = e.originalEvent.touches[0].pageX;
-        mousey = e.originalEvent.touches[0].pageY;
-      }
+      var pointer = this.pointer(e);
+      mousex = pointer.left;
+      mousey = pointer.top;
       overdrag = this.fixbutton_initx - this.width - mousex;
       if (overdrag > 0) {
         overdrag_percent = 1 + overdrag / 300;
@@ -974,7 +962,7 @@ window.initScrollable = function () {
         return;
       }
       this.fixbutton.removeClass("dragging");
-      if (this.fixbutton_targetx !== this.fixbutton.offset().left || this.fixbutton_targety !== this.fixbutton.offset().top) {
+      if (this.fixbutton_targetx !== this.wrapper.chrome.position(this.fixbutton[0]).left || this.fixbutton_targety !== this.wrapper.chrome.position(this.fixbutton[0]).top) {
         if (this.move_lock === "y") {
           top = this.fixbutton_targety;
           left = this.fixbutton_initx;
@@ -1341,7 +1329,7 @@ window.initScrollable = function () {
           return false;
         };
       })(this));
-      menu = new Menu(this.tag.find("#menu-sign-publish"));
+      menu = new Menu(this.tag.find("#menu-sign-publish"), this.wrapper.chrome);
       menu.elem.css("margin-top", "-130px");
       menu.addItem("Sign", (function(_this) {
         return function() {
@@ -1434,8 +1422,6 @@ window.initScrollable = function () {
     };
 
     Sidebar.prototype.onClosed = function() {
-      $(window).off("resize");
-      $(window).on("resize", this.resized);
       $(document.body).css("transition", "0.6s ease-in-out").removeClass("body-sidebar").on(transitionEnd, (function(_this) {
         return function(e) {
           if (e.target === document.body && !$(document.body).hasClass("body-sidebar") && !$(document.body).hasClass("body-console")) {
