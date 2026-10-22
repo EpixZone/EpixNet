@@ -128,6 +128,20 @@ uncaught page errors. It observed attempt 3 begin automatically while keeping
 the same wrapper, then restored and retained progress at three of six files.
 All **23 wrapper JavaScript tests and one generated proxy-routing test** passed.
 
+The wrapper control geometry has a separate browser fixture using the same
+dependencies:
+
+```sh
+EPIX_BROWSER_TEST_TOOLS=/tmp/epix-browser-tools/node_modules \
+  node ui/tests/control-scale-browser.cjs
+```
+
+It exercises the production drawer and button at author scales 0.5, 1, and 2,
+rotation, mouse and touch drags, delayed viewport metadata, and user zoom.
+Author viewport strings must remain unchanged, and user zoom must still enlarge
+the controls. Browser zoom emulation establishes geometry and input behavior;
+it does not replace physical-device pinch or Android keyboard testing.
+
 ### Compiled macOS browser
 
 Built `epix-browser` with the published wallet pin and opened packaged Firefox

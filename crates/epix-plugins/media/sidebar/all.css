@@ -2,9 +2,9 @@
 /* ---- Console.css ---- */
 
 
-.console-container { width: 100%; z-index: 998; position: absolute; top: -100vh; padding-bottom: 100%; }
+.console-container { width: 100%; z-index: 998; position: absolute; top: calc(0px - var(--controls-height)); padding-bottom: 100%; pointer-events: auto; }
 .console-container .console {
-    background-color: #151517; height: 100vh; transform: translateY(0px);
+    background-color: #151517; height: var(--controls-height); transform: translateY(0px);
     padding-top: 80px; box-sizing: border-box; border-bottom: 1px solid #2E2E32;
 }
 
@@ -89,9 +89,7 @@ body.theme-dark .menu-item:hover { background-color: #2E2E32; }
 body.theme-dark .menu-item:active, body.theme-dark .menu-item:focus { background-color: #8A4BDB; color: #FEFEFE; }
 body.theme-dark .menu-item-separator { border-top-color: #404045; }
 
-@media only screen and (max-width: 800px) {
-.menu, .menu.visible { position: absolute; left: unset !important; right: 20px; }
-}
+.controls-compact-menu .menu { left: unset !important; right: 20px; }
 
 /* ---- Scrollbable.css ---- */
 
@@ -141,7 +139,7 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
     z-index: 999;
 }
 
-.drag-bg { width: 100%; height: 100%; position: fixed; }
+.drag-bg { width: 100%; height: 100%; position: absolute; pointer-events: auto; touch-action: none; }
 .fixbutton.dragging { cursor: grabbing; }
 .fixbutton-bg:active { cursor: grabbing; }
 
@@ -160,9 +158,9 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
 .sidebar .link-outline:hover { border-color: #72747B; }
 /* SIDEBAR */
 
-.sidebar-container { width: 100%; height: 100%; overflow: hidden; position: fixed; top: 0px; z-index: 2; }
+.sidebar-container { width: 100%; height: 100%; overflow: hidden; position: absolute; top: 0px; z-index: 2; pointer-events: auto; }
 .sidebar {
-    background-color: #151517; position: fixed; backface-visibility: hidden;
+    background-color: #151517; position: absolute; backface-visibility: hidden;
     right: -1200px; height: 100%; width: 1200px; border-left: 1px solid #2E2E32;
     font-family: Inter, -apple-system, 'Segoe UI', Roboto, sans-serif;
 }
@@ -435,16 +433,14 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
 .opt-failed { color: #C6314A; }
 
 /* Small screen: full-width sheet, 44px touch targets, globe behind a button. */
-@media screen and (max-width: 640px) {
-    .sidebar .content { width: 100vw; padding: 0px 16px 24px; }
-    .sidebar h1 { margin: 0px -16px 16px; padding-left: 16px; }
-    .sidebar .close { margin-right: -4px; }
-    .scrollable.showScroll::after { left: calc(100vw - 7px); }
-    .scroller { left: calc(100vw - 8px); }
-    .sidebar .button { height: 44px; line-height: 42px; }
-    .sidebar .fields .text { height: 44px; }
-    .sidebar .fields select { height: 44px; }
-    .sidebar .link-right::after { content: ''; position: absolute; left: -8px; right: -8px; top: -14px; bottom: -14px; }
-    .console-container .console { height: calc(100vh + 80px); }
-    .console-tabs a { padding: 11px 16px; }
-}
+.controls-narrow .sidebar .content { width: var(--controls-width); padding: 0px 16px 24px; }
+.controls-narrow .sidebar h1 { margin: 0px -16px 16px; padding-left: 16px; }
+.controls-narrow .sidebar .close { margin-right: -4px; }
+.controls-narrow .scrollable.showScroll::after { left: calc(var(--controls-width) - 7px); }
+.controls-narrow .scroller { left: calc(var(--controls-width) - 8px); }
+.controls-narrow .sidebar .button { height: 44px; line-height: 42px; }
+.controls-narrow .sidebar .fields .text { height: 44px; }
+.controls-narrow .sidebar .fields select { height: 44px; }
+.controls-narrow .sidebar .link-right::after { content: ''; position: absolute; left: -8px; right: -8px; top: -14px; bottom: -14px; }
+.controls-narrow .console-container .console { height: calc(var(--controls-height) + 80px); }
+.controls-narrow .console-tabs a { padding: 11px 16px; }
