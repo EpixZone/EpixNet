@@ -1516,6 +1516,7 @@ if (window.getComputedStyle(document.body).transform) {
       this.announcer_line = null;
       this.web_notifications = {};
       this.is_title_changed = false;
+      this.is_viewport_changed = false;
       this.allowed_event_constructors = [window.MouseEvent, window.KeyboardEvent, window.PointerEvent];
       window.onload = this.onPageLoad;
       document.getElementById("inner-iframe").addEventListener("load", this.onPageLoad);
@@ -2113,10 +2114,17 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.actionSetViewport = function (message) {
       this.log("actionSetViewport", message);
-      if ($("#viewport").length > 0) {
-        return $("#viewport").attr("content", this.toHtmlSafe(message.params));
-      } else {
-        return $('<meta name="viewport" id="viewport">').attr("content", this.toHtmlSafe(message.params)).appendTo("head");
+      this.is_viewport_changed = true;
+      return this.setViewport(String(this.toHtmlSafe(message.params)));
+    };
+
+    Wrapper.prototype.setViewport = function (viewport) {
+      var element = $("#viewport");
+      if (!element.length) {
+        return $('<meta name="viewport" id="viewport">').attr("content", viewport).appendTo("head");
+      } else if (element.attr("content") !== viewport) {
+        // Repeated download progress must not reset the user's zoom.
+        return element.attr("content", viewport);
       }
     };
 
@@ -2626,6 +2634,13 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.setXiteInfo = function (xite_info) {
       var ref, ref1, ref2, ref3;
+      // On a first network visit, the manifest arrives after the wrapper was
+      // rendered. Apply its hint without replacing an explicit xite choice.
+      var viewport = xite_info.content && xite_info.content.viewport;
+      if (xite_info.address === (this.address || window.address) &&
+          !this.is_viewport_changed && typeof viewport === "string" && viewport.trim()) {
+        this.setViewport(viewport);
+      }
       // Clone progress carries only settings.size, not an authoritative
       // permissions/identity snapshot. Preserve fields from the latest full
       // snapshot so progress cannot erase a grant or switch local storage to
