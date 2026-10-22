@@ -5,6 +5,7 @@ edition = "2021"
 description = "Per-install TLS origins for embedded Epix browsers"
 
 [dependencies]
+epix-core = { path = "../epix-core" }
 rcgen = "0.14"
 rustls = { version = "0.23", features = ["ring"] }
 tokio-rustls = "0.26"
