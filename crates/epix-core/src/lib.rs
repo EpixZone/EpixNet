@@ -5,12 +5,14 @@
 //! builds on these types and the [`Emitter`] trait.
 
 pub mod address;
+pub mod attempt;
 pub mod emitter;
 pub mod error;
 pub mod peer;
 pub mod time;
 
 pub use address::{classify_label, Address, LabelClass};
+pub use attempt::{AttemptError, DeferredAttempt};
 pub use emitter::{CollectingEmitter, Emitter, NoopEmitter};
 pub use error::{Error, Result};
 pub use peer::{route_all_via_overlay, set_route_all_via_overlay, IpType, PeerAddr};
