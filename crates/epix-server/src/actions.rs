@@ -310,10 +310,12 @@ async fn dispatch(
                             }
                             println!("{} xite(s) [offline]", xites.len());
                         }
-                        "siteDelete" if !state.remove_xite(&address).await => {
-                            return Err(format!("Unknown xite: {address}"));
+                        "siteDelete" => {
+                            if !state.try_remove_xite(&address).await? {
+                                return Err(format!("Unknown xite: {address}"));
+                            }
+                            println!("Deleted {address} [offline]");
                         }
-                        "siteDelete" => println!("Deleted {address} [offline]"),
                         // No network stack offline: register it so the node
                         // clones it on the next start.
                         _ => {

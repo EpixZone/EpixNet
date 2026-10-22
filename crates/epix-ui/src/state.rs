@@ -4105,6 +4105,7 @@ pub struct AppState {
     /// stale ordinary writer cannot resurrect a deleted canonical.
     metadata_persistence_lock: tokio::sync::Mutex<()>,
     removal_retries: std::sync::Mutex<std::collections::HashSet<String>>,
+    deletion_reserve: Option<crate::deletion_reserve::DeletionReserve>,
     /// Derived feed artifacts per `address -> feed name -> artifacts`. A pure,
     /// recomputable read cache over the xite's signed OR-set records (see
     /// [`crate::feed`]); never persisted, rebuilt on demand and on merge.
@@ -5550,6 +5551,9 @@ impl AppState {
     /// added to `AppState` is initialized once instead of in two places that
     /// have to be kept in step.
     fn build(version: impl Into<String>, persist: Persistence) -> Arc<Self> {
+        let deletion_reserve = persist.xites_path.as_ref()
+            .and_then(|path| path.parent())
+            .map(|directory| crate::deletion_reserve::DeletionReserve::new(directory.to_path_buf()));
         let state = Arc::new(Self {
             self_weak: std::sync::OnceLock::new(),
             version: version.into(),
@@ -5559,6 +5563,7 @@ impl AppState {
             xite_registry_lock: tokio::sync::Mutex::new(()),
             metadata_persistence_lock: tokio::sync::Mutex::new(()),
             removal_retries: std::sync::Mutex::new(std::collections::HashSet::new()),
+            deletion_reserve,
             feed_cache: RwLock::new(HashMap::new()),
             feed_cache_epochs: RwLock::new(HashMap::new()),
             feed_object_owners: std::sync::Mutex::new(HashMap::new()),
@@ -5700,6 +5705,7 @@ impl AppState {
             multi_users_path: persist.multi_users_path,
         });
         let _ = state.self_weak.set(Arc::downgrade(&state));
+        state.replenish_deletion_reserve();
         state
     }
 
@@ -7813,9 +7819,32 @@ impl AppState {
     ) -> Result<(), String> {
         let Some(path) = self.xite_removals_path() else { return Ok(());
         };
-        let bytes = serde_json::to_vec_pretty(intents)
-            .map_err(|error| format!("could not encode removal intents: {error}"))?;
-        Self::write_durable_private_file(&path, &bytes)
+        if intents.len() > MAX_XITE_REMOVAL_INTENTS {
+            return Err("removal-intent entry limit exceeded".to_string());
+        }
+        let bytes = crate::deletion_reserve::encode_bounded(intents, MAX_XITE_REMOVAL_INTENT_BYTES as usize)?;
+        if let Some(reserve) = &self.deletion_reserve {
+            reserve.write_journal("xite-removals.json", &bytes)
+                .map_err(|error| format!("could not durably replace {}: {error}", path.display()))?;
+        } else {
+            Self::write_durable_private_file(&path, &bytes)?;
+        }
+        if intents.is_empty() {
+            self.replenish_deletion_reserve();
+        }
+        Ok(())
+    }
+
+    fn replenish_deletion_reserve(&self) {
+        let Some(reserve) = &self.deletion_reserve else { return };
+        // Startup may be recovering a removal. Its journal and Store cleanup
+        // need free space first; a corrupt journal also fails closed here.
+        if !self.read_xite_removal_intents().is_ok_and(|intents| intents.is_empty()) {
+            return;
+        }
+        if let Err(error) = reserve.ensure() {
+            eprintln!("[WARN] Deletion reserve is unavailable: {error}. Deletion may require free device storage.");
+        }
     }
 
     fn xite_registry_bytes(
@@ -8040,9 +8069,9 @@ impl AppState {
         }
     }
 
-    /// One boot-time removal: user data, persisted metadata, then the tree -
-    /// each failure leaves the intent journaled and moves on. True = fully
-    /// removed.
+    /// Remove a Store-safe tree before rewriting metadata so its bytes can
+    /// provide recovery space. The durable intent remains until every phase
+    /// succeeds and continues to exclude the canonical throughout recovery.
     async fn finish_one_boot_xite_removal(
         &self,
         canonical: &str,
@@ -8052,22 +8081,6 @@ impl AppState {
             self.log(
                 "ERROR",
                 format!("Refusing invalid xite-removal address {canonical}"),
-            )
-            .await;
-            return false;
-        }
-        if let Err(error) = self.delete_user_xite_data(&intent.keys).await {
-            self.log(
-                "WARN",
-                format!("Pending user cleanup for removed xite {canonical}: {error}"),
-            )
-            .await;
-            return false;
-        }
-        if let Err(error) = self.delete_xite_persisted_metadata(canonical, &intent.keys).await {
-            self.log(
-                "WARN",
-                format!("Pending metadata cleanup for removed xite {canonical}: {error}"),
             )
             .await;
             return false;
@@ -8093,13 +8106,31 @@ impl AppState {
                 self.log("WARN", format!("Pending xite removal: {error}")).await;
             }
         }
-        removed
+        if !removed {
+            return false;
+        }
+        if let Err(error) = self.delete_user_xite_data(&intent.keys).await {
+            self.log(
+                "WARN",
+                format!("Pending user cleanup for removed xite {canonical}: {error}"),
+            )
+            .await;
+            return false;
+        }
+        if let Err(error) = self.delete_xite_persisted_metadata(canonical, &intent.keys).await {
+            self.log(
+                "WARN",
+                format!("Pending metadata cleanup for removed xite {canonical}: {error}"),
+            )
+            .await;
+            return false;
+        }
+        true
     }
 
-    /// Finish removal intents whose tree may still be the canonical backing
-    /// for Store extern objects. Called only under the activation write gate,
-    /// after incoming Store reconciliation has internalized every extern not
-    /// authorized by the current accepted index.
+    /// Finish removal intents whose tree may still back Store objects. The
+    /// activation write gate is held, and the accepted indexes describe the
+    /// remaining verified memberships before ownership is reconciled here.
     async fn finish_store_xite_removals(
         &self,
         store: Arc<epix_blob::store::Store>,
@@ -8129,9 +8160,9 @@ impl AppState {
             return Ok(());
         }
 
-        // Make exclusion durable before any retained root is removed. All
-        // other registry writers take the same mutex, so no stale snapshot can
-        // resurrect one of these canonicals after this point.
+        // Compact the registry while holding its writer lock. The durable
+        // receipts already exclude these canonicals, so a full filesystem
+        // may defer this replacement until safe target bytes are reclaimed.
         let excluded = pending
             .iter()
             .map(|(canonical, _)| canonical.clone())
@@ -8140,7 +8171,7 @@ impl AppState {
             let xites = self.xites.read().await;
             Self::xite_registry_bytes(&xites, &excluded)?
         };
-        self.write_xite_registry_bytes(&registry)?;
+        let registry_persisted = self.write_xite_registry_bytes(&registry).is_ok();
 
         let mut completed = Vec::new();
         let mut failures = Vec::new();
@@ -8156,6 +8187,13 @@ impl AppState {
             }
             let mut current = intent.clone();
             if current.store_cleanup_required {
+                let warnings = self.release_xite_removal_ownership(
+                    &canonical, &current, &store,
+                ).await;
+                if !warnings.is_empty() {
+                    failures.extend(warnings);
+                    continue;
+                }
                 let entries = store.extern_entries().map_err(|error| {
                     format!("could not inspect pending Store cleanup: {error}")
                 })?;
@@ -8219,6 +8257,16 @@ impl AppState {
                     continue;
                 }
             }
+            let mut roots_removed = true;
+            for root in &roots {
+                if let Err(error) = remove_xite_directory_durable(root) {
+                    roots_removed = false;
+                    failures.push(error);
+                }
+            }
+            if !roots_removed {
+                continue;
+            }
             if let Err(error) = self.delete_user_xite_data(&current.keys).await {
                 failures.push(format!("could not persist user cleanup for {canonical}: {error}"));
                 continue;
@@ -8232,20 +8280,19 @@ impl AppState {
                 ));
                 continue;
             }
-            let mut roots_removed = true;
-            for root in &roots {
-                if let Err(error) = remove_xite_directory_durable(root) {
-                    roots_removed = false;
-                    failures.push(error);
-                }
-            }
-            if !roots_removed {
-                continue;
-            }
             completed.push(canonical);
         }
-        for canonical in completed {
-            intents.remove(&canonical);
+        let registry_persisted = registry_persisted || match self.write_xite_registry_bytes(&registry) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(format!("could not persist registry cleanup: {error}"));
+                false
+            }
+        };
+        if registry_persisted {
+            for canonical in completed {
+                intents.remove(&canonical);
+            }
         }
         self.write_xite_removal_intents(&intents)?;
         if failures.is_empty() {
@@ -19874,10 +19921,29 @@ impl AppState {
             tally.xites = tally.xites.saturating_add(1);
             verified.push((candidate.canonical.clone(), index));
         }
+        // Retained removal roots are deliberately absent from the serving
+        // registry. Their authenticated Extern rows may still be the only
+        // backing for another owner. Preserve them through reconciliation;
+        // removal will release obsolete owners before copying survivors.
+        let mut removal_roots = Vec::new();
+        for (canonical, intent) in self.read_xite_removal_intents()? {
+            if !intent.store_cleanup_required
+                || !self.removal_intent_matches_store(&intent, &store)
+                || self.has_any_alias(&canonical).await
+            {
+                continue;
+            }
+            let roots = self.validated_removal_roots(&canonical, &intent)?;
+            if self.removal_root_is_reused(&canonical, &roots).await {
+                return Err(format!("pending removal {canonical} shares a storage root with a served xite"));
+            }
+            removal_roots.extend(roots);
+        }
         let (registered, skipped) = Self::reconcile_and_register_verified_store(
             store.clone(),
             authorized,
             registrations,
+            removal_roots,
         )
         .await?;
         tally.registered = registered;
@@ -19900,18 +19966,17 @@ impl AppState {
                 ));
             }
         }
-        // A pending removal may still need this incoming Store to preserve
-        // the last valid Extern copy. Do that before changing the accepted
-        // indexes or releasing ownership in the Store that remains exposed
-        // when activation returns an error.
-        if let Err(error) = self.finish_store_xite_removals(store.clone()).await {
+        // Cleanup must use the freshly verified declarations for owner
+        // reconciliation and rehoming. The activation gate still excludes
+        // mutation, and no Store is exposed until every phase succeeds.
+        {
             let _ownership = self.manifest_ownership_lock.lock().unwrap();
-            let _ = self.transition_manifest_object_owners(
-                &store,
-                &std::collections::HashSet::new(),
-            );
-            return Err(error);
+            self.install_verified_store_indexes(verified);
         }
+        // Keep incoming ownership on failure. An earlier receipt may already
+        // have removed its root after preserving another xite's only bytes;
+        // clearing all claims here would destroy that surviving copy.
+        self.finish_store_xite_removals(store.clone()).await?;
         let mut previous_release_warnings = Vec::new();
         {
             let _ownership = self.manifest_ownership_lock.lock().unwrap();
@@ -19926,7 +19991,6 @@ impl AppState {
                     }
                 }
             }
-            self.install_verified_store_indexes(verified);
         }
         *self.edx_store.write().await = Some(store);
         self.store_mutation_blocked.store(false, Ordering::Release);
@@ -20662,6 +20726,7 @@ impl AppState {
         store: Arc<epix_blob::store::Store>,
         authorized: std::collections::HashSet<(epix_blob::ObjId, PathBuf)>,
         registrations: Vec<(Address, XiteStorage, Vec<VerifiedManifestUnit>)>,
+        removal_roots: Vec<PathBuf>,
     ) -> Result<(usize, usize), String> {
         tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
             let entries = store.extern_entries().map_err(|error| error.to_string())?;
@@ -20671,7 +20736,9 @@ impl AppState {
                     .map_err(|error| format!("could not reconcile extern {}: {error}", entry.id))?;
             }
             for entry in store.extern_entries().map_err(|error| error.to_string())? {
-                if !authorized.contains(&(entry.id, entry.path.clone())) {
+                if !authorized.contains(&(entry.id, entry.path.clone()))
+                    && !Self::removal_entry_is_under_roots(&entry.path, &removal_roots)
+                {
                     store
                         .retire_extern_mapping_at(entry.id, &entry.path)
                         .map_err(|error| {
@@ -32232,13 +32299,13 @@ impl AppState {
         Ok(ids)
     }
 
-    async fn settle_xite_removal_owners(
+    async fn release_xite_removal_ownership(
         &self,
         canonical: &str,
         intent: &XiteRemovalIntent,
-        store: Arc<epix_blob::store::Store>,
+        store: &epix_blob::store::Store,
     ) -> Vec<String> {
-        if !self.removal_intent_matches_store(intent, &store) {
+        if !self.removal_intent_matches_store(intent, store) {
             return vec![format!(
                 "pending removal {canonical} belongs to another Store"
             )];
@@ -32251,7 +32318,20 @@ impl AppState {
                 ));
             }
         }
-        warnings.extend(self.reconcile_manifest_object_owners(&store));
+        warnings.extend(self.reconcile_manifest_object_owners(store));
+        warnings
+    }
+
+    async fn settle_xite_removal_owners(
+        &self,
+        canonical: &str,
+        intent: &XiteRemovalIntent,
+        store: Arc<epix_blob::store::Store>,
+    ) -> Vec<String> {
+        let mut warnings = self.release_xite_removal_ownership(canonical, intent, &store).await;
+        if !self.removal_intent_matches_store(intent, &store) {
+            return warnings;
+        }
         let mut ids = match Self::removal_rehome_ids(intent) {
             Ok(ids) => ids,
             Err(error) => {
@@ -32335,6 +32415,19 @@ impl AppState {
                 return false;
             }
         }
+        let roots = match self.validated_removal_roots(canonical, &intent) {
+            Ok(roots) => roots,
+            Err(_) => return false,
+        };
+        if self.removal_root_is_reused(canonical, &roots).await {
+            return false;
+        }
+        if roots
+            .iter()
+            .any(|root| remove_xite_directory_durable(root).is_err())
+        {
+            return false;
+        }
         let excluded = std::collections::HashSet::from([canonical.to_string()]);
         let registry = {
             let xites = self.xites.read().await;
@@ -32349,19 +32442,6 @@ impl AppState {
                 .delete_xite_persisted_metadata(canonical, &intent.keys)
                 .await
                 .is_err()
-        {
-            return false;
-        }
-        let roots = match self.validated_removal_roots(canonical, &intent) {
-            Ok(roots) => roots,
-            Err(_) => return false,
-        };
-        if self.removal_root_is_reused(canonical, &roots).await {
-            return false;
-        }
-        if roots
-            .iter()
-            .any(|root| remove_xite_directory_durable(root).is_err())
         {
             return false;
         }
@@ -32466,6 +32546,13 @@ impl AppState {
     }
 
     pub async fn remove_xite(&self, address: &str) -> bool {
+        self.try_remove_xite(address).await.unwrap_or(false)
+    }
+
+    /// Accept a durable removal, preserving the cause when it cannot start.
+    /// `Ok(false)` means no membership or pending receipt exists. `Ok(true)`
+    /// retains the existing accepted-removal contract: cleanup may be pending.
+    pub async fn try_remove_xite(&self, address: &str) -> Result<bool, String> {
         let canonical = self.canonical_key(address).await;
         let address = canonical.as_str();
         // Removal takes visible time (locks, durable intent, directory
@@ -32489,11 +32576,11 @@ impl AppState {
                 Err(error) => {
                     self.log("ERROR", format!("Xite removal completion failed: {error}"))
                         .await;
-                    false
+                    Err(format!("Xite removal completion failed: {error}"))
                 }
             };
         self.end_xite_update(address);
-        if !removed {
+        if !matches!(&removed, Ok(true)) {
             // The row survives a failed removal: retire its pill quietly (the
             // caller's command reply carries the error) so it does not read
             // as deleting forever.
@@ -32502,7 +32589,7 @@ impl AppState {
         removed
     }
 
-    async fn remove_xite_owned(&self, address: &str) -> bool {
+    async fn remove_xite_owned(&self, address: &str) -> Result<bool, String> {
         // Stop the detached download before waiting for its activation and
         // manifest guards. No old task may recreate progress after cleanup.
         let canonical = self.canonical_key(address).await;
@@ -32556,19 +32643,17 @@ impl AppState {
         let Some((canonical, keys, cache_keys, roots)) = target else {
             let pending = self
                 .read_xite_removal_intents()
-                .ok()
-                .and_then(|intents| {
-                    intents.into_iter().find_map(|(canonical, intent)| {
-                        (canonical == address || intent.keys.iter().any(|key| key == address))
-                            .then_some(canonical)
-                    })
+                .map_err(|error| format!("Could not inspect pending xite removal: {error}"))?
+                .into_iter().find_map(|(canonical, intent)| {
+                    (canonical == address || intent.keys.iter().any(|key| key == address))
+                        .then_some(canonical)
                 });
             drop(registry);
             drop(_activation);
-            let Some(canonical) = pending else { return false };
+            let Some(canonical) = pending else { return Ok(false) };
             self.schedule_xite_removal_retry(&canonical);
             let _ = self.retry_pending_xite_removal_once(&canonical).await;
-            return true;
+            return Ok(true);
         };
         if self.removal_root_is_reused(&canonical, &roots).await {
             self.log(
@@ -32578,7 +32663,7 @@ impl AppState {
                 ),
             )
             .await;
-            return false;
+            return Err(format!("Refusing to remove {canonical}: its storage root is shared by another served xite"));
         }
         let _manifest = match self
             .acquire_manifest_mutex(&canonical, "content.json")
@@ -32588,7 +32673,7 @@ impl AppState {
             Err(error) => {
                 self.log("ERROR", format!("Could not lock {canonical} for deletion: {error}"))
                     .await;
-                return false;
+                return Err(format!("Could not lock {canonical} for deletion: {error}"));
             }
         };
         let tree = self.tree_mutation_lock(&canonical).lock_owned().await;
@@ -32614,7 +32699,7 @@ impl AppState {
                     drop(_manifest);
                     self.log("ERROR", format!("Could not start xite removal: {error}"))
                         .await;
-                    return false;
+                    return Err(format!("Could not start xite removal: {error}"));
                 }
             };
             let store_root = if let Some(store) = store.as_deref() {
@@ -32625,14 +32710,14 @@ impl AppState {
                         drop(_manifest);
                         self.log("ERROR", format!("Could not start xite removal: {error}"))
                             .await;
-                        return false;
+                        return Err(format!("Could not start xite removal: {error}"));
                     }
                 }
             } else if dormant_store {
                 let Some(data_root) = self.data_root.as_ref() else {
                     drop(tree);
                     drop(_manifest);
-                    return false;
+                    return Err("Could not bind dormant Store removal: no data root".to_string());
                 };
                 match tokio::fs::canonicalize(data_root.join("edx-store")).await {
                     Ok(root) => Some(root),
@@ -32644,7 +32729,7 @@ impl AppState {
                             format!("Could not bind dormant Store removal: {error}"),
                         )
                         .await;
-                        return false;
+                        return Err(format!("Could not bind dormant Store removal: {error}"));
                     }
                 }
             } else {
@@ -32664,7 +32749,7 @@ impl AppState {
                 drop(_manifest);
                 self.log("ERROR", format!("Could not start xite removal: {error}"))
                     .await;
-                return false;
+                return Err(format!("Could not start xite removal: {error}"));
             }
             intents.insert(canonical.clone(), intent);
             if let Err(error) = self.write_xite_removal_intents(&intents) {
@@ -32684,7 +32769,7 @@ impl AppState {
                     drop(_manifest);
                     self.log("ERROR", format!("Could not start xite removal: {error}"))
                         .await;
-                    return false;
+                    return Err(format!("Could not start xite removal: {error}"));
                 }
                 self.log(
                     "WARN",
@@ -32696,7 +32781,7 @@ impl AppState {
                 let Some(path) = self.xite_removals_path() else {
                     drop(tree);
                     drop(_manifest);
-                    return false;
+                    return Err("Could not confirm xite removal: journal path disappeared".to_string());
                 };
                 if sync_parent_directory(&path).is_err() {
                     // Do not hold the global activation writer through a
@@ -32711,7 +32796,7 @@ impl AppState {
                     drop(registry);
                     drop(_activation);
                     self.schedule_xite_removal_retry(&canonical);
-                    return true;
+                    return Ok(true);
                 }
             }
             intent_persisted = true;
@@ -32760,7 +32845,39 @@ impl AppState {
             }
         }
 
-        // Preserve every exact Store object before the xite tree disappears.
+        // The intent now excludes this membership durably. Release its
+        // accepted declarations before preserving Extern rows: an object
+        // with no surviving owner can be retired without an object-sized
+        // copy. Independent references and shared declarations remain in
+        // Store's typed ownership ledger and are preserved below.
+        let mut removed_keys = Vec::new();
+        {
+            let mut xites = self.xites.write().await;
+            for key in &keys {
+                if let Some(xite) = xites.remove(key) {
+                    if let Some(display) = xite.display {
+                        removed_keys.push(display);
+                    }
+                    removed_keys.push(key.clone());
+                }
+            }
+        }
+        self.replace_verified_object_paths(&canonical, Vec::new());
+        self.replace_verified_manifest_chains(&canonical, HashMap::new());
+        self.replace_verified_manifest_contents(&canonical, &[]);
+        let mut ownership_warnings = if feed_cleanup_complete {
+            Vec::new()
+        } else {
+            vec![format!(
+                "could not release all feed ownership for removed xite {canonical}"
+            )]
+        };
+        ownership_warnings.extend(store
+            .as_deref()
+            .map(|store| self.reconcile_manifest_object_owners(store))
+            .unwrap_or_default());
+
+        // Preserve every surviving Store object before the tree disappears.
         // This walks Store's authenticated extern index, not raw child
         // manifests. A stale rejected child therefore cannot name and delete
         // an unrelated object, and bundles/shards follow their typed owner
@@ -32869,33 +32986,6 @@ impl AppState {
                 ));
             }
         }
-
-        let mut removed_keys = Vec::new();
-        {
-            let mut xites = self.xites.write().await;
-            for key in &keys {
-                if let Some(xite) = xites.remove(key) {
-                    if let Some(display) = xite.display {
-                        removed_keys.push(display);
-                    }
-                    removed_keys.push(key.clone());
-                }
-            }
-        }
-        self.replace_verified_object_paths(&canonical, Vec::new());
-        self.replace_verified_manifest_chains(&canonical, HashMap::new());
-        self.replace_verified_manifest_contents(&canonical, &[]);
-        let mut ownership_warnings = if feed_cleanup_complete {
-            Vec::new()
-        } else {
-            vec![format!(
-                "could not release all feed ownership for removed xite {canonical}"
-            )]
-        };
-        ownership_warnings.extend(store
-            .as_deref()
-            .map(|store| self.reconcile_manifest_object_owners(store))
-            .unwrap_or_default());
 
         let mut roots_removed = store_cleanup_complete;
         if store_cleanup_complete {
@@ -33013,7 +33103,7 @@ impl AppState {
         if intent_remaining {
             self.schedule_xite_removal_retry(&canonical);
         }
-        true
+        Ok(true)
     }
 
     /// Drop the per-xite user data (derived auth keys, cert binding, feed
@@ -40400,6 +40490,269 @@ mod tests {
         }
     }
 
+    struct PendingRemovalBacking {
+        address: String,
+        storage: XiteStorage,
+        bytes: Vec<u8>,
+        id: epix_blob::ObjId,
+    }
+
+    struct PendingStoreRemovalFixture {
+        _dir: tempfile::TempDir,
+        state: Arc<AppState>,
+        store: Arc<epix_blob::store::Store>,
+        removed: Vec<PendingRemovalBacking>,
+        survivor: Option<String>,
+    }
+
+    async fn pending_store_removal_fixture(
+        count: usize,
+        shared_bundle: bool,
+        independent_reference: bool,
+    ) -> PendingStoreRemovalFixture {
+        let dir = tempdir().unwrap();
+        let state = AppState::with_data_dir("pending-store-removal-test", dir.path());
+        let mut removed = Vec::new();
+        for _ in 0..count {
+            let key = epix_crypt::new_seed();
+            let address = epix_crypt::privatekey_to_address(&key).unwrap();
+            let storage = XiteStorage::new(dir.path().join("data").join(&address));
+            let bytes = random_upload_bytes(200 * 1024);
+            let id = epix_blob::ObjId::of(&bytes);
+            storage.write("payload.bin", &bytes).unwrap();
+            let mut content = json!({
+                "address": address.clone(),
+                "modified": 1.0,
+                "edx": 1,
+                "files": { "payload.bin": {
+                    "size": bytes.len(),
+                    "sha512": XiteStorage::hash_bytes(&bytes),
+                    "b3": id.to_string(),
+                } },
+            });
+            epix_content::sign(&mut content, &key).unwrap();
+            storage.write("content.json", &serde_json::to_vec(&content).unwrap()).unwrap();
+            state.add_xite(&address, XiteEntry {
+                storage: storage.clone(),
+                content: Some(content),
+            }).await;
+            removed.push(PendingRemovalBacking { address, storage, bytes, id });
+        }
+        removed.sort_by(|left, right| left.address.cmp(&right.address));
+
+        let survivor = if shared_bundle {
+            let key = epix_crypt::new_seed();
+            let address = epix_crypt::privatekey_to_address(&key).unwrap();
+            let storage = XiteStorage::new(dir.path().join("data").join(&address));
+            let bundles = removed.iter().enumerate().map(|(seq, backing)| {
+                (backing.id.to_string(), json!({ "size": backing.bytes.len(), "seq": seq }))
+            }).collect::<serde_json::Map<String, Value>>();
+            let mut content = json!({
+                "address": address.clone(),
+                "modified": 1.0,
+                "edx": 1,
+                "files": {},
+                "bundles": bundles,
+            });
+            epix_content::sign(&mut content, &key).unwrap();
+            storage.write("content.json", &serde_json::to_vec(&content).unwrap()).unwrap();
+            state.add_xite(&address, XiteEntry {
+                storage,
+                content: Some(content),
+            }).await;
+            Some(address)
+        } else {
+            None
+        };
+
+        let store_path = dir.path().join("edx-store");
+        let store_config = || epix_blob::store::StoreConfig {
+            xite_root: Some(dir.path().join("data")),
+            ..Default::default()
+        };
+        let store = Arc::new(epix_blob::store::Store::open_with(&store_path, store_config()).unwrap());
+        // Establish durable typed manifest claims using the real activation path.
+        state.set_edx_store(store.clone()).await.unwrap();
+        for backing in &removed {
+            assert!(store.manifest_claimed(backing.id).unwrap());
+            assert_eq!(store.ref_delta(backing.id, 0).unwrap(), 1);
+            assert!(store.extern_entries().unwrap().iter().any(|entry| {
+                entry.id == backing.id && entry.path == backing.storage.path("payload.bin").unwrap()
+            }));
+            if independent_reference {
+                assert_eq!(store.ref_delta(backing.id, 1).unwrap(), 2);
+            }
+        }
+        state.persist_xites().await;
+        let store_root = AppState::store_receipt_root(&store).unwrap();
+        let intents = removed.iter().map(|backing| {
+            (backing.address.clone(), XiteRemovalIntent {
+                keys: vec![backing.address.clone()],
+                roots: vec![backing.storage.root().to_path_buf()],
+                store_root: Some(store_root.clone()),
+                store_cleanup_required: true,
+                owner_cleanup_required: true,
+                rehome_ids: Vec::new(),
+            })
+        }).collect::<std::collections::BTreeMap<_, _>>();
+        state.write_xite_removal_intents(&intents).unwrap();
+        // Crash point: intent durable, but old membership and tree still exist.
+        drop(state);
+        drop(store);
+        let store = Arc::new(epix_blob::store::Store::open_with(&store_path, store_config()).unwrap());
+        let restarted = AppState::with_data_dir("pending-store-removal-test", dir.path());
+        assert_eq!(restarted.restore_xites().await, usize::from(shared_bundle));
+        for backing in &removed {
+            assert!(!restarted.has_xite(&backing.address).await);
+            assert!(backing.storage.root().exists());
+            assert_eq!(store.read_bytes(backing.id, 2).unwrap(), backing.bytes);
+        }
+        PendingStoreRemovalFixture { _dir: dir, state: restarted, store, removed, survivor }
+    }
+
+    fn block_pending_removal_copy(
+        fixture: &PendingStoreRemovalFixture,
+        id: epix_blob::ObjId,
+    ) -> PathBuf {
+        let blocked = fixture.store.root().join("sparse").join(id.to_string());
+        std::fs::create_dir_all(&blocked).unwrap();
+        blocked
+    }
+
+    #[tokio::test]
+    async fn restart_removal_releases_a_sole_manifest_owner_without_copying() {
+        let fixture = pending_store_removal_fixture(1, false, false).await;
+        let backing = &fixture.removed[0];
+        let _blocked = block_pending_removal_copy(&fixture, backing.id);
+        fixture.state.set_edx_store(fixture.store.clone()).await.unwrap();
+        assert!(!backing.storage.root().exists());
+        assert!(!fixture.store.contains(backing.id).unwrap());
+        assert!(!fixture.store.manifest_claimed(backing.id).unwrap());
+        assert!(fixture.state.read_xite_removal_intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_restart_preservation_keeps_independent_bytes_receipt_and_reference_for_retry() {
+        let fixture = pending_store_removal_fixture(1, false, true).await;
+        let backing = &fixture.removed[0];
+        let blocked = block_pending_removal_copy(&fixture, backing.id);
+        assert!(fixture.state.set_edx_store(fixture.store.clone()).await.is_err());
+        assert!(backing.storage.root().exists());
+        assert_eq!(backing.storage.read("payload.bin").unwrap(), backing.bytes);
+        assert_eq!(fixture.store.read_bytes(backing.id, 3).unwrap(), backing.bytes);
+        assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1);
+        assert!(!fixture.store.manifest_claimed(backing.id).unwrap());
+        assert!(fixture.state.read_xite_removal_intents().unwrap()[&backing.address].store_cleanup_required);
+        assert!(fixture.state.edx_store().await.is_none());
+
+        std::fs::remove_dir(&blocked).unwrap();
+        fixture.state.set_edx_store(fixture.store.clone()).await.unwrap();
+        assert!(!backing.storage.root().exists());
+        assert_eq!(fixture.store.read_bytes(backing.id, 4).unwrap(), backing.bytes);
+        assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1, "retry must not release the independent ref");
+        assert!(fixture.state.read_xite_removal_intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_removal_failure_keeps_a_completed_removals_shared_sparse_bytes() {
+        let fixture = pending_store_removal_fixture(2, true, false).await;
+        let first = &fixture.removed[0];
+        let second = &fixture.removed[1];
+        assert!(first.address < second.address);
+        let blocked = block_pending_removal_copy(&fixture, second.id);
+        assert!(fixture.state.set_edx_store(fixture.store.clone()).await.is_err());
+
+        assert!(!first.storage.root().exists(), "first receipt must complete before second fails");
+        assert!(second.storage.root().exists());
+        let intents = fixture.state.read_xite_removal_intents().unwrap();
+        assert!(!intents.contains_key(&first.address));
+        assert!(intents[&second.address].store_cleanup_required);
+        assert_eq!(fixture.store.read_bytes(first.id, 3).unwrap(), first.bytes,
+            "failed activation must not discard the completed removal's only remaining bytes");
+        assert_eq!(fixture.store.read_bytes(second.id, 3).unwrap(), second.bytes);
+        for backing in &fixture.removed {
+            assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1);
+            assert!(fixture.store.manifest_claimed(backing.id).unwrap());
+        }
+
+        std::fs::remove_dir(&blocked).unwrap();
+        fixture.state.set_edx_store(fixture.store.clone()).await.unwrap();
+        for backing in &fixture.removed {
+            assert!(!backing.storage.root().exists());
+            assert_eq!(fixture.store.read_bytes(backing.id, 4).unwrap(), backing.bytes);
+            assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1);
+            assert!(fixture.store.manifest_claimed(backing.id).unwrap());
+            let paths = fixture.state.edx_paths.read().unwrap();
+            assert!(paths.get(&backing.id).unwrap().iter().any(|candidate| {
+                Some(&candidate.canonical) == fixture.survivor.as_ref()
+                    && candidate.kind == ObjectDeclarationKind::Bundle
+            }));
+        }
+        assert!(fixture.store.extern_entries().unwrap().is_empty());
+        assert!(fixture.state.read_xite_removal_intents().unwrap().is_empty());
+    }
+
+
+    #[tokio::test]
+    async fn store_safe_removal_reclaims_payload_before_blocked_user_metadata_then_converges() {
+        // Exercise both startup replay and the already-running retry path.
+        for boot_replay in [true, false] {
+            let fixture = pending_store_removal_fixture(1, false, false).await;
+            let backing = &fixture.removed[0];
+            assert!(fixture.store.release_manifest_and_delete_unowned(backing.id).unwrap());
+            let mut intents = fixture.state.read_xite_removal_intents().unwrap();
+            let intent = intents.get_mut(&backing.address).unwrap();
+            intent.store_cleanup_required = false;
+            intent.owner_cleanup_required = false;
+            intent.rehome_ids.clear();
+            fixture.state.write_xite_removal_intents(&intents).unwrap();
+
+            // Load the original fixture identity before blocking its persistence.
+            let boot_state = boot_replay.then(|| AppState::with_data_dir(
+                "pending-store-removal-test", fixture._dir.path()));
+            let users = fixture._dir.path().join("private/users.json");
+            let original_users = std::fs::read(&users).unwrap();
+            std::fs::remove_file(&users).unwrap();
+            std::fs::create_dir(&users).unwrap();
+            let replay = if let Some(replay) = boot_state {
+                assert_eq!(replay.restore_xites().await, 0);
+                replay
+            } else {
+                assert!(!fixture.state.retry_pending_xite_removal_once(&backing.address).await);
+                fixture.state.clone()
+            };
+            assert!(!backing.storage.root().exists(),
+                "Store-safe payload must be reclaimed even while users.json cannot be replaced");
+            assert!(!replay.has_xite(&backing.address).await);
+            assert!(replay.read_xite_removal_intents().unwrap().contains_key(&backing.address),
+                "metadata failure must retain the durable exclusion receipt");
+
+            std::fs::remove_dir(&users).unwrap();
+            std::fs::write(&users, original_users).unwrap();
+            assert!(replay.retry_pending_xite_removal_once(&backing.address).await);
+            assert!(replay.read_xite_removal_intents().unwrap().is_empty());
+            assert!(!backing.storage.root().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_unshared_extern_does_not_need_a_payload_copy() {
+        let fixture = shared_extern_fixture(false, true).await;
+        assert!(fixture.state.remove_xite(&fixture.address_b).await);
+        assert!(fixture.store.manifest_owned_ids().unwrap().contains(&fixture.id));
+        assert!(fixture.store.extern_entries().unwrap().iter().any(|entry| {
+            entry.id == fixture.id && entry.path == fixture.storage_a.path("shared.bin").unwrap()
+        }));
+        // Copying into sparse storage must fail. With no remaining independent
+        // owner, deletion should release the row instead of trying that copy.
+        let blocked_copy = fixture.store.root().join("sparse").join(fixture.id.to_string());
+        std::fs::create_dir(&blocked_copy).unwrap();
+        assert!(fixture.state.remove_xite(&fixture.address_a).await);
+        assert!(!fixture.storage_a.root().exists(), "unshared deletion tried to copy its payload");
+        assert!(!fixture.store.contains(fixture.id).unwrap());
+        assert!(!fixture.store.manifest_owned_ids().unwrap().contains(&fixture.id));
+    }
+
     #[tokio::test]
     async fn remove_retires_a_corrupt_exact_owner_missing_from_the_manifest() {
         let fixture = shared_extern_fixture(false, true).await;
@@ -42867,6 +43220,35 @@ mod tests {
         assert!(!state.no_new_xites().await);
         state.config_set("no_new_sites", serde_json::json!(true)).await;
         assert!(state.no_new_xites().await);
+    }
+
+    #[test]
+    fn removal_journal_write_limits_preserve_installed_receipts_and_reserve() {
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        let path = state.xite_removals_path().unwrap();
+        state.write_xite_removal_intents(&Default::default()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let reserve = root.path().join("private/deletion-reserve");
+        let reserve_size = std::fs::metadata(&reserve).unwrap().len();
+
+        let large = std::collections::BTreeMap::from([(
+            "large".to_string(),
+            XiteRemovalIntent {
+                keys: vec!["x".repeat(MAX_XITE_REMOVAL_INTENT_BYTES as usize)],
+                ..Default::default()
+            },
+        )]);
+        assert!(state.write_xite_removal_intents(&large).unwrap_err().contains("size limit"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::metadata(&reserve).unwrap().len(), reserve_size);
+
+        let many = (0..=MAX_XITE_REMOVAL_INTENTS)
+            .map(|index| (index.to_string(), XiteRemovalIntent::default()))
+            .collect();
+        assert!(state.write_xite_removal_intents(&many).unwrap_err().contains("entry limit"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::metadata(&reserve).unwrap().len(), reserve_size);
     }
 
     #[tokio::test]
