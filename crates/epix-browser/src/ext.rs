@@ -309,8 +309,8 @@ fn install_addon_xpi(
 
     let file = std::fs::File::create(&xpi_path).map_err(|e| format!("create xpi: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts: zip::write::FileOptions<'_, ()> =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     write_dir_to_zip(&mut zip, dir, "", &opts, stamp)?;
     for (name, bytes) in extra_files {
         zip.start_file(*name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
@@ -626,7 +626,7 @@ fn write_dir_to_zip(
     zip: &mut zip::ZipWriter<std::fs::File>,
     dir: &Dir,
     prefix: &str,
-    opts: &zip::write::FileOptions<'_, ()>,
+    opts: &zip::write::SimpleFileOptions,
     stamp: u32,
 ) -> Result<(), String> {
     for file in dir.files() {
