@@ -2596,8 +2596,10 @@ if (window.getComputedStyle(document.body).transform) {
       } catch (_) {} // A navigated cross-origin frame is outside this wrapper.
       if (this.xite_link_document === doc) return;
       if (this.xite_link_observer) this.xite_link_observer.disconnect();
+      if (this.xite_link_cleanup) this.xite_link_cleanup();
       this.xite_link_document = doc;
       this.xite_link_observer = null;
+      this.xite_link_cleanup = null;
       if (!doc) return;
       var wrapper = this;
       var rewritten = new WeakMap();
@@ -2630,6 +2632,27 @@ if (window.getComputedStyle(document.body).transform) {
           (node.localName === "base" || !!node.querySelector("base"));
       }
       scan(doc);
+      var lastBase = doc.baseURI;
+      var lastLocation = doc.location.href;
+      function revalidate(event) {
+        // History navigation can change relative URL resolution without any
+        // DOM mutation. Refresh before the browser previews or follows a link.
+        if (doc.baseURI !== lastBase || doc.location.href !== lastLocation) {
+          lastBase = doc.baseURI;
+          lastLocation = doc.location.href;
+          scan(doc);
+        } else if (event.type !== "pointermove") {
+          var node = event.target;
+          if (node && !node.closest) node = node.parentElement;
+          var anchor = node && node.closest && node.closest("a[href],area[href]");
+          if (anchor) normalize(anchor);
+        }
+      }
+      var interactions = ["pointerover", "pointermove", "focusin", "click", "auxclick", "contextmenu", "dragstart"];
+      interactions.forEach(function (type) { doc.addEventListener(type, revalidate, true); });
+      this.xite_link_cleanup = function () {
+        interactions.forEach(function (type) { doc.removeEventListener(type, revalidate, true); });
+      };
       this.xite_link_observer = new window.MutationObserver(function (changes) {
         // A changed base affects every relative link. Otherwise inspect only
         // changed links and subtrees, including editors entering/leaving edit mode.

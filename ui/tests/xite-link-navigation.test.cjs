@@ -150,7 +150,7 @@ class Element {
 class Document extends Element {
   constructor(url) {
     super("#document"); this.nodeType = 9; this.location = new URL(url);
-    this.observers = new Set(); this.ownerDocument = this;
+    this.observers = new Set(); this.ownerDocument = this; this.listeners = new Map();
   }
   get baseURI() {
     const base = this.querySelector("base[href]");
@@ -162,6 +162,18 @@ class Document extends Element {
         observer.changes.push(change);
       }
     }
+  }
+  addEventListener(type, callback, capture) {
+    assert.equal(capture, true, "revalidate before native or page link actions");
+    if (!this.listeners.has(type)) this.listeners.set(type, new Set());
+    this.listeners.get(type).add(callback);
+  }
+  removeEventListener(type, callback, capture) {
+    assert.equal(capture, true);
+    this.listeners.get(type)?.delete(callback);
+  }
+  interact(type, target) {
+    for (const callback of this.listeners.get(type) || []) callback({ type, target });
   }
   flush() {
     for (let round = 0; round < 20; round++) {
@@ -248,6 +260,30 @@ test("editor transitions preserve raw links and later display uses the edited de
   assert.equal(link.getAttribute("href"), "edited.epix/", "edits replace the old authored URL");
 });
 
+test("history path changes without DOM mutations preserve relative links before browser interactions", () => {
+  for (const type of ["pointerover", "pointermove", "focusin", "click", "auxclick", "contextmenu", "dragstart"]) {
+    const f = fixture();
+    const link = f.doc.append(new Element("a", { href: "target.epix/" }));
+    const text = link.append(new Element("span"));
+    const rootLink = f.doc.append(new Element("a", { href: "/other.epix/" }));
+    f.start();
+    assert.equal(link.getAttribute("href"), "https://target.epix/");
+    // Like pushState, this changes document/base URLs without a DOM mutation.
+    f.doc.location = new URL("/docs/", f.doc.location);
+    f.doc.flush();
+    f.doc.interact(type, text);
+    assert.equal(new URL(link.getAttribute("href"), link.baseURI).href,
+      "https://blog.epix/docs/target.epix/", type);
+    assert.equal(rootLink.getAttribute("href"), "https://other.epix/", "root links keep their destination");
+    f.doc.location = new URL("/index.html", f.doc.location);
+    f.doc.interact(type, text);
+    assert.equal(link.getAttribute("href"), "https://target.epix/", "back navigation permits canonical links again");
+    f.doc.flush();
+    f.doc.interact("pointermove", text);
+    assert.equal([...f.doc.observers][0].changes.length, 0, "ordinary pointer movement does not mutate anchors");
+  }
+});
+
 test("navigating the frame disconnects the old observer and never inspects a foreign origin", () => {
   const f = fixture();
   f.start(); f.wrapper.updateXiteLinks();
@@ -257,7 +293,10 @@ test("navigating the frame disconnects the old observer and never inspects a for
   f.frame.contentDocument = foreign;
   f.wrapper.updateXiteLinks();
   assert.equal(f.doc.observers.size, 0);
+  assert.equal([...f.doc.listeners.values()].reduce((count, callbacks) => count + callbacks.size, 0), 0,
+    "the old document retains no interaction listeners");
   assert.equal(foreign.observers.size, 0);
+  assert.equal(foreign.listeners.size, 0);
   assert.equal(untouched.getAttribute("href"), "target.epix/");
   const next = new Document(DESKTOP);
   const link = next.append(new Element("a", { href: "target.epix/" }));
@@ -268,4 +307,5 @@ test("navigating the frame disconnects the old observer and never inspects a for
   Object.defineProperty(f.frame, "contentDocument", { get() { throw new Error("cross-origin access"); } });
   assert.doesNotThrow(() => f.wrapper.updateXiteLinks());
   assert.equal(next.observers.size, 0);
+  assert.equal([...next.listeners.values()].reduce((count, callbacks) => count + callbacks.size, 0), 0);
 });
