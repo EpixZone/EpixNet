@@ -4577,6 +4577,10 @@ pub struct AppState {
     /// Fired when the runtime-contributed tracker set changes, so the announce
     /// loop can run early instead of waiting out its period.
     trackers_changed: Arc<tokio::sync::Notify>,
+    /// Coalesced update requests belong to a registration, so deletion and
+    /// re-add cannot turn an old wake into work for the replacement xite.
+    xite_update_requests: std::sync::Mutex<HashMap<String, u64>>,
+    update_requests_changed: Arc<tokio::sync::Notify>,
     /// Fired when the Tor bridges setting (`tor_use_bridges`) changes, so the
     /// Tor loop can re-bootstrap through (or away from) Snowflake without a
     /// node restart.
@@ -5687,6 +5691,8 @@ impl AppState {
             gossip_trackers: RwLock::new(Vec::new()),
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
+            xite_update_requests: std::sync::Mutex::new(HashMap::new()),
+            update_requests_changed: Arc::new(tokio::sync::Notify::new()),
             tor_config_changed: Arc::new(tokio::sync::Notify::new()),
             #[cfg(feature = "multiuser")]
             multi_users: RwLock::new(persist.multi_users),
@@ -6140,6 +6146,65 @@ impl AppState {
     /// The signal fired when the runtime-contributed tracker set changes.
     pub fn trackers_changed(&self) -> Arc<tokio::sync::Notify> {
         self.trackers_changed.clone()
+    }
+
+    /// Wake the runtime's bounded update coordinator.
+    pub fn update_requests_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.update_requests_changed.clone()
+    }
+
+    /// Request an early update for a registered, serving xite. Propagation
+    /// hints use signed addresses, while the registry may use an alias.
+    pub async fn request_xite_update(&self, address: &str) {
+        let requested = {
+            let xites = self.xites.read().await;
+            let mut pending = self.xite_update_requests.lock().unwrap();
+            let mut requested = false;
+            for (key, xite) in xites.iter() {
+                if xite.settings.serving && (key == address
+                    || canonical_address(xite.content.as_ref(), key) == address)
+                {
+                    pending.insert(key.clone(), xite.membership_generation);
+                    requested = true;
+                }
+            }
+            requested
+        };
+        if requested {
+            self.update_requests_changed.notify_one();
+        }
+    }
+
+    /// Startup, foreground, and transport readiness refresh all serving xites.
+    pub async fn request_all_xite_updates(&self) {
+        let requested = {
+            let xites = self.xites.read().await;
+            let mut pending = self.xite_update_requests.lock().unwrap();
+            for (key, xite) in xites.iter().filter(|(_, xite)| xite.settings.serving) {
+                pending.insert(key.clone(), xite.membership_generation);
+            }
+            !pending.is_empty()
+        };
+        if requested {
+            self.update_requests_changed.notify_one();
+        }
+    }
+
+    /// Drain requests atomically. Wakes arriving during a pass remain queued.
+    pub fn take_xite_update_requests(&self) -> HashMap<String, u64> {
+        std::mem::take(&mut *self.xite_update_requests.lock().unwrap())
+    }
+
+    /// Recheck before dispatch and each update stage, including user content.
+    pub async fn xite_update_is_current(&self, address: &str, generation: u64) -> bool {
+        self.xites.read().await.get(address).is_some_and(|xite| {
+            xite.settings.serving && xite.membership_generation == generation
+        })
+    }
+
+    /// Runtime startup can precede installation of the node's EDX fetcher.
+    pub async fn edx_fetcher_ready(&self) -> bool {
+        self.edx_fetcher.read().await.is_some()
     }
 
     /// The Tor loop awaits this to re-bootstrap when the bridges setting changes.
@@ -8400,6 +8465,7 @@ impl AppState {
         // dashboard row live, like EpixNet's peers_added.
         if grew {
             self.wake_clone_retry(address);
+            self.request_xite_update(address).await;
             self.push_xite_info(address).await;
         }
     }
@@ -9207,7 +9273,7 @@ impl AppState {
         }
     }
 
-    /// Announce a xite to each tracker in turn, recording per-tracker stats and
+    /// Announce a xite to trackers concurrently, recording per-tracker stats and
     /// folding the peers found into the xite's registry. Returns all peers.
     pub async fn announce_to_trackers(
         &self,
@@ -9297,12 +9363,12 @@ impl AppState {
         if seeded {
             self.push_announcer_info(&key).await;
         }
-        let all = self.absorb_announce_results(set, &key).await;
+        let registration = membership.map(|generation| (address, generation));
+        let all = self.absorb_announce_results(set, &key, registration).await;
         let _activation = self.xite_activation_gate.clone().read_owned().await;
         if membership.is_some() && self.xite_membership_generation(address).await != membership {
             return Vec::new();
         }
-        self.add_peers(address, all.clone()).await;
         let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
         self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len()),
         ).await;
@@ -9323,6 +9389,7 @@ impl AppState {
             std::time::Duration,
         )>,
         xite_key: &str,
+        registration: Option<(&str, u64)>,
     ) -> Vec<PeerAddr> {
         let mut all: Vec<PeerAddr> = Vec::new();
         while let Some(res) = set.join_next().await {
@@ -9332,6 +9399,14 @@ impl AppState {
             self.record_tracker_backoff(&tracker, xite_key, result.is_ok()).await;
             match result {
                 Ok(peers) => {
+                    // Use a healthy tracker's answer immediately. A stalled
+                    // tracker must not hold these peers until its timeout.
+                    if let Some((address, generation)) = registration {
+                        let _activation = self.xite_activation_gate.clone().read_owned().await;
+                        if self.xite_membership_generation(address).await == Some(generation) {
+                            self.add_peers(address, peers.iter().cloned()).await;
+                        }
+                    }
                     // AnnounceShare: remember a tracker that answered - even
                     // with zero peers; small peer-trackers usually know nobody
                     // for a given xite - so it is reused (and shared) across
@@ -9833,6 +9908,7 @@ impl AppState {
             // announce loop so onion trackers gated during boot get tried
             // seconds after Tor comes up, not at the next periodic pass.
             self.trackers_changed.notify_one();
+            self.request_all_xite_updates().await;
         }
     }
 
@@ -10971,6 +11047,7 @@ impl AppState {
     pub async fn network_changed(self: &Arc<Self>) {
         epix_chain::wake_light_client();
         self.trackers_changed.notify_one();
+        self.request_all_xite_updates().await;
         if let Some(hook) = self.on_demand.read().await.clone() {
             hook.network_changed();
         }
@@ -13206,8 +13283,19 @@ impl AppState {
     /// verify it and download the changed files (updating live worker stats).
     /// Returns true if an update was applied. This is the node's re-sync step.
     pub async fn resync_xite(self: &Arc<Self>, address: &str) -> Result<bool, String> {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return Ok(false);
+        };
+        self.resync_xite_for_registration(address, generation).await
+    }
+
+    /// An automatic request must still belong to the registration that queued
+    /// it when a peer's answer is ready to enter the manifest transaction.
+    pub async fn resync_xite_for_registration(
+        self: &Arc<Self>, address: &str, generation: u64,
+    ) -> Result<bool, String> {
         // A paused xite (sitePause) is not re-synced until resumed.
-        if !self.is_serving(address).await {
+        if !self.xite_update_is_current(address, generation).await {
             return Ok(false);
         }
         // Nudge the optional retry loop: a resync may have brought a new
@@ -13289,7 +13377,7 @@ impl AppState {
                 continue;
             }
             return self
-                .resync_apply_newer(address, &canonical, &view.storage, bytes, peers.clone())
+                .resync_apply_newer(address, generation, &canonical, &view.storage, bytes, peers.clone())
                 .await;
         }
         if !answered {
@@ -13384,6 +13472,7 @@ impl AppState {
     async fn resync_apply_newer(
         self: &Arc<Self>,
         address: &str,
+        generation: u64,
         canonical: &str,
         storage: &XiteStorage,
         bytes: Vec<u8>,
@@ -13400,6 +13489,11 @@ impl AppState {
         let update_guard = self
             .acquire_manifest_guard(canonical, "content.json")
             .await?;
+        // The peer request can outlive removal and re-add at the same path.
+        // The activation guard now excludes replacement through the commit.
+        if !self.xite_update_is_current(address, generation).await {
+            return Ok(false);
+        }
         // The candidate was selected before waiting for the transaction. Read
         // the authoritative version again after acquiring it and discard a
         // candidate that another path made stale while this resync waited.
@@ -13725,7 +13819,9 @@ impl AppState {
     /// during the probe's flight stays claimed by whoever holds it).
     pub async fn note_probe_outcome(&self, addr: &PeerAddr, ok: bool) {
         let now = now_secs();
-        for x in self.xites.write().await.values_mut() {
+        let mut revived = Vec::new();
+        let mut xites = self.xites.write().await;
+        for (address, x) in xites.iter_mut() {
             let Some(p) = x.peers.get_mut(addr) else { continue;
             };
             if p.connection_errors == 0 {
@@ -13733,9 +13829,16 @@ impl AppState {
             }
             if ok {
                 p.note_probe_ok(now);
+                if x.settings.serving {
+                    revived.push(address.clone());
+                }
             } else if !p.connected {
                 p.note_probe_fail(now);
             }
+        }
+        drop(xites);
+        for address in revived {
+            self.request_xite_update(&address).await;
         }
     }
 
@@ -19226,6 +19329,7 @@ impl AppState {
     pub async fn set_rns_transport(&self, transport: Arc<dyn Transport>) {
         *self.rns_transport.write().await = Some(transport);
         self.recompose_transport().await;
+        self.request_all_xite_updates().await;
     }
 
     /// Rebuild the composed transport from the base + the overlay layers.
@@ -19269,7 +19373,10 @@ impl AppState {
             // Same rule as set_tor_status: an I2P reachability move regates
             // i2p trackers, so the announce loop should run early.
             self.trackers_changed.notify_one();
-            if ready { self.wake_waiting_clone_retries(); }
+            if ready {
+                self.wake_waiting_clone_retries();
+                self.request_all_xite_updates().await;
+            }
         }
     }
 
@@ -19843,6 +19950,8 @@ impl AppState {
     /// Install the EDX verified-streaming fetcher (set by the node).
     pub async fn set_edx_fetcher(&self, fetcher: Arc<dyn EdxFetcher>) {
         *self.edx_fetcher.write().await = Some(fetcher);
+        self.request_all_xite_updates().await;
+        self.trackers_changed.notify_one();
     }
 
     /// Install the warm pool's link opener (set by the node).
@@ -21159,9 +21268,25 @@ impl AppState {
     /// Sync a xite's included / per-user content via the installed
     /// [`ContentSyncer`]; rebuilds the db when anything new arrived.
     pub async fn sync_user_content(&self, address: &str) -> u64 {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return 0;
+        };
+        self.sync_user_content_for_registration(address, generation).await
+    }
+
+    /// Keep the hook and its completion notifications attached to the caller's
+    /// registration. Already-admitted child writes retain their own signed
+    /// manifest authority; this boundary check does not cancel those writes.
+    pub async fn sync_user_content_for_registration(&self, address: &str, generation: u64) -> u64 {
         let hook = self.content_syncer.read().await.clone();
         let Some(hook) = hook else { return 0 };
+        if !self.xite_update_is_current(address, generation).await {
+            return 0;
+        }
         let (bytes, files) = hook.sync_user_content(address).await;
+        if !self.xite_update_is_current(address, generation).await {
+            return 0;
+        }
         if bytes > 0 {
             self.rebuild_xite_db(address).await;
             // A merged xite's fresh rows must reach its merger's db too (its
@@ -25917,6 +26042,17 @@ impl AppState {
         &self,
         request: MergeFetchRequest<'_>,
     ) -> MergeFetchOutcome {
+        let Some(generation) = self.xite_membership_generation(request.address).await else {
+            return MergeFetchOutcome::default();
+        };
+        self.fetch_and_merge_records_for_registration(request, generation).await
+    }
+
+    async fn fetch_and_merge_records_for_registration(
+        &self,
+        request: MergeFetchRequest<'_>,
+        generation: u64,
+    ) -> MergeFetchOutcome {
         let MergeFetchRequest {
             address,
             inner_path,
@@ -25937,6 +26073,9 @@ impl AppState {
             let Some(e) = x.get(address) else {
                 return MergeFetchOutcome::default();
             };
+            if !e.settings.serving || e.membership_generation != generation {
+                return MergeFetchOutcome::default();
+            }
             (e.storage.clone(), canonical_address(e.content.as_ref(), address),
             )
         };
@@ -26006,7 +26145,9 @@ impl AppState {
         let current_matches = {
             let xites = self.xites.read().await;
             xites.get(address).is_some_and(|xite| {
-                canonical_address(xite.content.as_ref(), address) == canonical
+                xite.settings.serving
+                    && xite.membership_generation == generation
+                    && canonical_address(xite.content.as_ref(), address) == canonical
                     && xite.storage.root() == storage.root()
             })
         };
@@ -26109,7 +26250,18 @@ impl AppState {
     /// "no change" and never fetches them - only this unconditional per-record
     /// merge does. Idempotent (grow-only union), so an extra call is harmless.
     pub async fn resync_merge_files_for(self: &Arc<Self>, address: &str) {
-        if !self.is_serving(address).await {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return;
+        };
+        self.resync_merge_files_for_registration(address, generation).await;
+    }
+
+    /// Pull every merge file for one registration, retaining its identity
+    /// across discovery and each network wait before guarded file commits.
+    pub async fn resync_merge_files_for_registration(
+        self: &Arc<Self>, address: &str, generation: u64,
+    ) {
+        if !self.xite_update_is_current(address, generation).await {
             return;
         }
         // The pool is SHUFFLED every pass, and each file unions copies from
@@ -26137,8 +26289,11 @@ impl AppState {
         let mut manifests: Vec<_> = manifests.into_iter().collect();
         manifests.sort_by(|left, right| left.0.cmp(&right.0));
         for (content_path, content) in manifests {
+            if !self.xite_update_is_current(address, generation).await {
+                return;
+            }
             let (f, u) = self
-                .resync_merge_dir(address, &content_path, &content, &peers)
+                .resync_merge_dir_for_registration(address, generation, &content_path, &content, &peers)
                 .await;
             files += f;
             unserved += u;
@@ -26170,6 +26325,21 @@ impl AppState {
         content: &Value,
         peers: &[PeerAddr],
     ) -> (usize, usize) {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return (0, 0);
+        };
+        self.resync_merge_dir_for_registration(address, generation, content_path, content, peers)
+            .await
+    }
+
+    async fn resync_merge_dir_for_registration(
+        &self,
+        address: &str,
+        generation: u64,
+        content_path: &str,
+        content: &Value,
+        peers: &[PeerAddr],
+    ) -> (usize, usize) {
         let merge_paths = epix_content::declared_merge_files(content);
         if merge_paths.is_empty() {
             return (0, 0);
@@ -26178,9 +26348,12 @@ impl AppState {
         let mut files = 0usize;
         let mut unserved = 0usize;
         for rel in merge_paths {
+            if !self.xite_update_is_current(address, generation).await {
+                break;
+            }
             let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
             let outcome = self
-                .fetch_and_merge_records(
+                .fetch_and_merge_records_for_registration(
                     MergeFetchRequest {
                         address,
                         inner_path: &mpath,
@@ -26190,7 +26363,7 @@ impl AppState {
                         sender_peers: peers,
                         union_from: MERGE_SWEEP_UNION,
                         transaction: None,
-                    })
+                    }, generation)
                 .await;
             files += 1;
             if outcome.served == 0 {
@@ -32564,6 +32737,7 @@ impl AppState {
             self.clone_statuses.lock().unwrap().retain(|key, _| !remove.contains(key));
             self.clone_retry_wakes.lock().unwrap().retain(|key, _| !remove.contains(key));
             self.clone_retry_dirty.lock().unwrap().retain(|key| !remove.contains(key));
+            self.xite_update_requests.lock().unwrap().retain(|key, _| !remove.contains(key));
             self.clones_in_flight.lock().unwrap().retain(|key| !remove.contains(key));
         }
 
@@ -35013,6 +35187,116 @@ mod tests {
                 assert!(error.to_string().contains(&format!("{name} lane {lane}")));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn update_requests_coalesce_aliases_and_ignore_paused_or_replaced_registrations() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("updates");
+        let address = DASHBOARD_XITE_ADDRESS;
+        let alias = "updates.epix";
+        let storage = XiteStorage::new(dir.path().join(address));
+        state.add_xite(alias, XiteEntry {
+            storage: storage.clone(), content: Some(json!({"address":address, "files":{}})),
+        }).await;
+        let generation = state.xite_membership_generation(alias).await.unwrap();
+        for requested in [alias, address, alias, "unregistered.epix"] {
+            state.request_xite_update(requested).await;
+        }
+        assert_eq!(state.take_xite_update_requests(), HashMap::from([(alias.to_string(), generation)]));
+        assert!(state.take_xite_update_requests().is_empty());
+        assert!(state.xite_update_is_current(alias, generation).await);
+
+        state.xites.write().await.get_mut(alias).unwrap().settings.serving = false;
+        state.request_xite_update(address).await;
+        state.request_all_xite_updates().await;
+        assert!(state.take_xite_update_requests().is_empty());
+        assert!(!state.xite_update_is_current(alias, generation).await);
+        state.xites.write().await.get_mut(alias).unwrap().settings.serving = true;
+        state.request_xite_update(alias).await;
+        assert!(state.remove_xite(alias).await);
+        assert!(state.take_xite_update_requests().is_empty(), "deletion removes pending wakes");
+        state.add_xite(alias, XiteEntry {
+            storage, content: Some(json!({"address":address, "files":{}})),
+        }).await;
+        assert!(!state.xite_update_is_current(alias, generation).await);
+        state.request_xite_update(address).await;
+        let replacement = state.take_xite_update_requests()[alias];
+        assert_ne!(replacement, generation);
+        assert!(state.xite_update_is_current(alias, replacement).await);
+    }
+
+    #[tokio::test]
+    async fn update_requests_follow_new_peers_foreground_and_overlay_readiness() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("updates");
+        let address = DASHBOARD_XITE_ADDRESS;
+        state.add_xite(address, XiteEntry {
+            storage: XiteStorage::new(dir.path()), content: Some(json!({"address":address, "files":{}})),
+        }).await;
+        let generation = state.xite_membership_generation(address).await.unwrap();
+        let expected = HashMap::from([(address.to_string(), generation)]);
+        let peer = PeerAddr::parse("198.18.0.7:26552").unwrap();
+        state.add_peers(address, [peer.clone()]).await;
+        assert_eq!(state.take_xite_update_requests(), expected);
+        state.add_peers(address, [peer.clone()]).await;
+        assert!(state.take_xite_update_requests().is_empty(), "duplicate PEX is not new evidence");
+
+        state.note_edx_dials(address, vec![(peer.clone(), false)]).await;
+        let backoff = state.xites.read().await[address].peers.get(&peer).unwrap().probe_after;
+        state.network_changed().await;
+        assert_eq!(state.take_xite_update_requests(), expected, "same-network foreground refreshes complete xites");
+        assert_eq!(state.xites.read().await[address].peers.get(&peer).unwrap().probe_after, backoff,
+            "foreground must not erase peer failure backoff");
+        state.note_probe_outcome(&peer, false).await;
+        assert!(state.take_xite_update_requests().is_empty());
+        state.note_probe_outcome(&peer, true).await;
+        assert_eq!(state.take_xite_update_requests(), expected, "real reachability revives updates");
+
+        state.set_i2p_status(json!({"phase":"Starting"})).await;
+        assert!(state.take_xite_update_requests().is_empty());
+        state.set_i2p_status(json!({"phase":"Ready"})).await;
+        assert_eq!(state.take_xite_update_requests(), expected);
+        state.set_i2p_status(json!({"phase":"Ready", "bytes":1234})).await;
+        assert!(state.take_xite_update_requests().is_empty(), "status counters do not queue another pass");
+        state.set_tor_status(true, "OK").await;
+        assert_eq!(state.take_xite_update_requests(), expected);
+        state.set_tor_status(true, "OK").await;
+        assert!(state.take_xite_update_requests().is_empty());
+        state.set_rns_transport(Arc::new(epix_transport::TcpTransport)).await;
+        assert_eq!(state.take_xite_update_requests(), expected,
+            "mesh readiness retries xites skipped before its transport existed");
+    }
+
+    #[tokio::test]
+    async fn late_tracker_results_do_not_attach_to_a_replacement_registration() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("updates");
+        let address = DASHBOARD_XITE_ADDRESS;
+        let storage = XiteStorage::new(dir.path().join(address));
+        state.add_xite(address, XiteEntry { storage: storage.clone(), content: None }).await;
+        let generation = state.xite_membership_generation(address).await.unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let peer = PeerAddr::parse("198.18.0.7:26552").unwrap();
+        let mut results = tokio::task::JoinSet::new();
+        results.spawn({
+            let peer = peer.clone();
+            async move {
+                wait.await.unwrap();
+                (epix_xite::Tracker::parse("198.18.0.1:26552").unwrap(),
+                    Ok(vec![peer]), std::time::Duration::from_millis(10))
+            }
+        });
+        let draining = tokio::spawn({
+            let state = state.clone();
+            async move { state.absorb_announce_results(results, address, Some((address, generation))).await }
+        });
+        assert!(state.remove_xite(address).await);
+        state.add_xite(address, XiteEntry { storage, content: None }).await;
+        release.send(()).unwrap();
+        assert_eq!(draining.await.unwrap(), vec![peer]);
+        assert!(state.connectable_peers(address, 10).await.is_empty());
+        assert!(state.take_xite_update_requests().is_empty());
     }
 
     #[tokio::test]
@@ -37773,10 +38057,12 @@ mod tests {
         let resync_state = state.clone();
         let resync_addr = addr.clone();
         let resync_storage = storage.clone();
+        let generation = state.xite_membership_generation(&addr).await.unwrap();
         let mut resync = tokio::spawn(async move {
             resync_state
                 .resync_apply_newer(
                     &resync_addr,
+                    generation,
                     &resync_addr,
                     &resync_storage,
                     v2,

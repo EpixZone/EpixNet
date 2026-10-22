@@ -231,6 +231,17 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         splashAnimationsActive = true
         animateSplashMark()
+        wakeNodeForForeground()
+    }
+
+    /** A foreground return can need fresh xite content without a network change. */
+    private fun wakeNodeForForeground() {
+        if (!splashAnimationsActive) return
+        scope.launch(Dispatchers.IO) {
+            runCatching {
+                if (node.state() == NodeState.SERVING) node.networkChanged()
+            }
+        }
     }
 
     override fun onConfigurationChanged(newConfig: Configuration) {
@@ -1365,6 +1376,9 @@ class MainActivity : AppCompatActivity() {
             applyClearnetRouting()
             val display = bootNode(target)
             if (generation != startupGeneration) return@launch
+            // onResume can arrive before the node exists. Repeat its wake once
+            // this boot completes, or leave it to the next resume if backgrounded.
+            wakeNodeForForeground()
             // Load the dashboard even if boot reported a problem: the node
             // serves its own loading/error wrapper on loopback, which is more
             // useful than a blank page and lets the user retry.

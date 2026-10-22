@@ -8,6 +8,7 @@ import os
 import pathlib
 import re
 import subprocess
+import sys
 import tempfile
 
 
@@ -102,4 +103,6 @@ with tempfile.TemporaryDirectory(prefix="epix-android-startup-tests-") as direct
                     "-no-reflect", "-include-runtime", "-d", str(test / "tests.jar")], check=True)
     result = subprocess.run([str(pathlib.Path(os.environ["JAVA_HOME"]) / "bin/java"),
                              "-jar", str(test / "tests.jar")])
-    raise SystemExit(result.returncode)
+    result.check_returncode()
+    raise SystemExit(subprocess.run([
+        sys.executable, str(root / "tests/run-foreground-regressions.py")]).returncode)

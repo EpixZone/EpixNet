@@ -680,3 +680,74 @@ async fn newly_created_and_resigned_owned_xites_remain_discoverable() {
         }
     }
 }
+
+// A responding tracker must make its peers usable while another tracker's
+// handshake remains stalled. Only physical streams are substituted here.
+#[tokio::test]
+async fn responding_tracker_peers_are_visible_before_a_stalled_tracker_finishes() {
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
+
+    let network = Arc::new(Network::default());
+    let fast_addr = PeerAddr::parse("8.8.4.4:26552").unwrap();
+    let slow_addr = PeerAddr::parse("1.1.1.1:26552").unwrap();
+    let seed_addr = PeerAddr::parse("8.8.8.8:26552").unwrap();
+    let fast = Node::new(&network, Some(fast_addr.clone()), false, true).await;
+    let client = Node::new(&network, None, false, true).await;
+    let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+    client.register(&address).await;
+    fast.state.tracker_announce(&[epix_discovery::address_hash(&address)], &seed_addr).await;
+
+    let release = Arc::new(tokio::sync::Notify::new());
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let finished = Arc::new(tokio::sync::Notify::new());
+    let stalled: EdxHook = Arc::new({
+        let release = release.clone();
+        let entered = entered.clone();
+        let finished = finished.clone();
+        move |_, stream| {
+            let release = release.clone();
+            let entered = entered.clone();
+            let finished = finished.clone();
+            Box::pin(async move {
+                entered.notify_one();
+                release.notified().await;
+                drop(stream);
+                finished.notify_one();
+            })
+        }
+    });
+    network.routes.lock().unwrap().insert(slow_addr.clone(), stalled);
+    let trackers = [fast_addr, slow_addr.clone()].map(|addr| {
+        Tracker::parse(&format!("{}://{addr}", addr.scheme())).unwrap()
+    });
+    let mut announcing = tokio::spawn({
+        let state = client.state.clone();
+        let address = address.clone();
+        async move { state.announce_to_trackers(&address, &trackers).await }
+    });
+    let stalled_started = timeout(Duration::from_secs(2), entered.notified()).await;
+    let visible = timeout(Duration::from_secs(2), async {
+        loop {
+            if client.state.connectable_peers(&address, 10).await.contains(&seed_addr) {
+                break;
+            }
+            sleep(Duration::from_millis(10)).await;
+        }
+    }).await;
+    let was_still_running = !announcing.is_finished();
+
+    network.routes.lock().unwrap().remove(&slow_addr);
+    release.notify_one();
+    let stalled_finished = timeout(Duration::from_secs(2), finished.notified()).await;
+    let completed = timeout(Duration::from_secs(5), &mut announcing).await;
+    if completed.is_err() {
+        announcing.abort();
+        let _ = announcing.await;
+    }
+    assert!(stalled_started.is_ok(), "the second tracker must really stall");
+    assert!(stalled_finished.is_ok(), "the test-owned stalled stream must stop");
+    assert!(completed.is_ok(), "the announce must stop after releasing the stream");
+    assert!(was_still_running, "the stalled tracker must still hold the overall announce open");
+    assert!(visible.is_ok(), "a fast tracker's peers must not wait for the slow tracker timeout");
+}

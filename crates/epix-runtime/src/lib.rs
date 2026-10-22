@@ -19,7 +19,7 @@
 use epix_core::PeerAddr;
 use epix_ui::conn_pool::LinkOpener;
 use epix_ui::{AppState, UpdateOutcome, UPDATE_PHASE_CHECKING};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::Notify;
@@ -1061,7 +1061,8 @@ async fn wakeup_loop(state: Arc<AppState>, tor_always: bool, shutdown: Arc<Notif
                 )
                 .await;
             // Kick the announce loop (it selects on this) and refresh peers.
-            state.trackers_changed().notify_waiters();
+            state.trackers_changed().notify_one();
+            state.request_all_xite_updates().await;
             // manage_connections dials peers; in Always mode wait for Tor first
             // so a resume during the Tor bootstrap window can't dial clearnet
             // and leak our IP.
@@ -1073,118 +1074,508 @@ async fn wakeup_loop(state: Arc<AppState>, tor_always: bool, shutdown: Arc<Notif
     }
 }
 
-/// Re-sync every xite (fetch a newer content.json + changed files).
+/// At most four xites run automatic update work at once. A slow peer must not
+/// hold every other xite behind its transport-specific dial timeout.
+const UPDATE_CONCURRENCY: usize = 4;
+
+#[derive(Clone, Copy)]
+struct PendingUpdate {
+    generation: u64,
+    periodic: bool,
+}
+
+/// Ordered, coalesced work owned by the update coordinator. A new readiness
+/// request moves ahead of the remaining periodic backlog, but an address that
+/// is already active keeps one follow-up behind the waiting work rather than
+/// starting a second pass or repeatedly jumping ahead of startup requests.
+#[derive(Default)]
+struct PendingUpdates {
+    requests: HashMap<String, PendingUpdate>,
+    order: VecDeque<String>,
+}
+
+impl PendingUpdates {
+    fn add(
+        &mut self, address: String, generation: u64, periodic: bool, active: &HashSet<String>,
+    ) {
+        let request = self.requests.entry(address.clone()).or_insert(PendingUpdate {
+            generation,
+            periodic,
+        });
+        if request.generation != generation {
+            *request = PendingUpdate { generation, periodic };
+        } else {
+            request.periodic |= periodic;
+        }
+        self.order.retain(|queued| queued != &address);
+        if periodic || active.contains(&address) {
+            self.order.push_back(address);
+        } else {
+            self.order.push_front(address);
+        }
+    }
+
+    fn next(&mut self, active: &HashSet<String>) -> Option<(String, PendingUpdate)> {
+        let index = self.order.iter().position(|address| !active.contains(address))?;
+        let address = self.order.remove(index)?;
+        let request = self.requests.remove(&address)?;
+        Some((address, request))
+    }
+}
+
+/// Clear the UI phase even if a pass panics, is aborted at shutdown, or becomes
+/// ineligible after deletion/pause. The coordinator owns automatic exclusion;
+/// the phase itself is only presentation state, not a synchronization primitive.
+struct UpdatePhase {
+    state: Arc<AppState>,
+    address: String,
+}
+
+impl UpdatePhase {
+    fn begin(state: Arc<AppState>, address: String) -> Self {
+        state.begin_xite_update(&address);
+        Self { state, address }
+    }
+}
+
+impl Drop for UpdatePhase {
+    fn drop(&mut self) {
+        self.state.end_xite_update(&self.address);
+    }
+}
+
+async fn update_xite(
+    state: Arc<AppState>,
+    address: String,
+    request: PendingUpdate,
+    tor_always: bool,
+    shutdown: Arc<Notify>,
+) -> Option<UpdateOutcome> {
+    // Re-check routing for every dispatched pass, including recovery after an
+    // earlier successful Tor bootstrap. No eager path may use startup TCP in
+    // Always mode. The installed transport also fails closed during recovery.
+    if !await_tor_routed(&state, tor_always, &shutdown).await
+        || !state.xite_update_is_current(&address, request.generation).await
+    {
+        return None;
+    }
+    if !request.periodic {
+        let networks = state.dialable_networks().await;
+        // connectable_peers intentionally has a last-resort fallback to peers
+        // on unavailable overlays. Eager checks must not consume that fallback
+        // and poison a warming overlay's dial cache. Its Ready event retries.
+        if !state.connectable_peers(&address, 10).await.iter()
+            .any(|peer| networks.can_dial(peer))
+        {
+            return None;
+        }
+    }
+    let phase = UpdatePhase::begin(state.clone(), address.clone());
+    state.push_xite_info_event(&address, UPDATE_PHASE_CHECKING).await;
+    let applied = state.resync_xite_for_registration(&address, request.generation).await;
+    if !state.xite_update_is_current(&address, request.generation).await {
+        return None;
+    }
+    let user_bytes = state.sync_user_content_for_registration(&address, request.generation).await;
+    if !state.xite_update_is_current(&address, request.generation).await {
+        return None;
+    }
+    // Merge records can change without advancing the root manifest. Keep the
+    // same unconditional per-xite pull used by manual and propagation updates.
+    state.resync_merge_files_for_registration(&address, request.generation).await;
+    if !state.xite_update_is_current(&address, request.generation).await {
+        return None;
+    }
+    drop(phase);
+    Some(match applied {
+        Ok(true) => UpdateOutcome::Applied,
+        Ok(false) if user_bytes > 0 => UpdateOutcome::Applied,
+        Ok(false) => UpdateOutcome::NoChange,
+        Err(_) => UpdateOutcome::Failed,
+    })
+}
+
+/// Process startup/readiness/peer wakes and the periodic fallback through one
+/// coordinator. JoinSet owns every active task, so dropping or shutting down
+/// this loop cancels its work instead of leaving detached scans behind.
 async fn resync_loop(
     state: Arc<AppState>,
     tor_always: bool,
     shutdown: Arc<Notify>,
     period: Duration,
 ) {
-    // Initial user-content pass shortly after start (own task, so the resync
-    // ticker isn't delayed): xites cloned before the recursive-content
-    // feature (or while this node was offline) backfill their included and
-    // per-user data without waiting a full period.
-    {
-        let state = state.clone();
-        let shutdown = shutdown.clone();
-        tokio::spawn(async move {
-            tokio::select! {
-                _ = shutdown.notified() => return,
-                _ = tokio::time::sleep(Duration::from_secs(20)) => {}
-            }
-            // sync_user_content dials peers; in Always mode wait for Tor first
-            // so the 20s pass can't race the Tor bootstrap and leak our IP.
-            if !await_tor_routed(&state, tor_always, &shutdown).await {
-                return;
-            }
-            for address in state.xite_addresses().await {
-                state.sync_user_content(&address).await;
-            }
-        });
-    }
-    // The resync tick itself dials peers to fetch updates; hold it until Tor
-    // routes our traffic in Always mode.
-    if !await_tor_routed(&state, tor_always, &shutdown).await {
-        return;
-    }
+    let requests_changed = state.update_requests_changed();
     let mut tick = interval(period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     tick.tick().await;
-    // Per shard-file backoff for the volunteer sweep below, so files that
-    // held nothing are not re-dialed every tick. Loop-local: it dies with
-    // the loop, and the sweep is called from nowhere else.
-    let mut volunteer_backoff = std::collections::HashMap::new();
+    state.request_all_xite_updates().await;
+
+    let mut pending = PendingUpdates::default();
+    let mut active = HashSet::new();
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut identities = HashMap::new();
+    // Maintenance has one owned slot and retains its volunteer backoff between
+    // passes. It never occupies the update coordinator while waiting on I/O.
+    let mut maintenance = tokio::task::JoinSet::new();
+    let mut maintenance_due = false;
+    let mut volunteer_backoff = HashMap::new();
+
     loop {
+        for (address, generation) in state.take_xite_update_requests() {
+            pending.add(address, generation, false, &active);
+        }
+        if state.edx_fetcher_ready().await {
+            while jobs.len() < UPDATE_CONCURRENCY {
+                let Some((address, request)) = pending.next(&active) else { break };
+                if !state.xite_update_is_current(&address, request.generation).await {
+                    continue;
+                }
+                active.insert(address.clone());
+                let handle = jobs.spawn(update_xite(
+                    state.clone(), address.clone(), request, tor_always, shutdown.clone(),
+                ));
+                identities.insert(handle.id(), (address, request.generation));
+            }
+            if maintenance_due && maintenance.is_empty() {
+                maintenance_due = false;
+                let state = state.clone();
+                let shutdown = shutdown.clone();
+                let mut backoff = std::mem::take(&mut volunteer_backoff);
+                maintenance.spawn(async move {
+                    if await_tor_routed(&state, tor_always, &shutdown).await {
+                        state.retry_pending_updates().await;
+                        state.reverify_incomplete_indexes().await;
+                        let freed = state.enforce_optional_limit().await;
+                        if freed > 0 {
+                            state.log("INFO", format!("Optional-file cleanup freed {freed} bytes")).await;
+                        }
+                        crate::edx::volunteer_sweep(&state, &mut backoff).await;
+                    }
+                    backoff
+                });
+            }
+        }
         tokio::select! {
             _ = shutdown.notified() => break,
+            _ = requests_changed.notified() => {},
             _ = tick.tick() => {
-                for address in state.xite_addresses().await {
-                    // Show the pass on the dashboard: the quiet "Checking..."
-                    // pill while we ask peers whether anything is newer, which
-                    // becomes "Updating..." only if one of them says yes (see
-                    // `resync_apply_newer`), then an `updated` outcome event.
-                    // The phase is registered BEFORE the event so the pushed
-                    // siteInfo carries it. The pill only clears on a matching
-                    // outcome event, never on a plain refresh.
-                    state.begin_xite_update(&address);
-                    state.push_xite_info_event(&address, UPDATE_PHASE_CHECKING).await;
-                    // The pass runs on its own task so a panic in one xite's
-                    // sync can't kill this loop (which would strand the pill
-                    // and end all future resyncs) - it surfaces as a JoinError
-                    // and counts as a failed update.
-                    let joined = tokio::spawn({
-                        let state = state.clone();
-                        let address = address.clone();
-                        async move {
-                            let applied = state.resync_xite(&address).await;
-                            // New and updated user content (posts, comments)
-                            // rides the same cycle, and counts as an update in
-                            // its own right: a pass that pulled a new post did
-                            // bring something, even when the root content.json
-                            // was already current.
-                            let user_bytes = state.sync_user_content(&address).await;
-                            match applied {
-                                Ok(true) => UpdateOutcome::Applied,
-                                Ok(false) if user_bytes > 0 => UpdateOutcome::Applied,
-                                Ok(false) => UpdateOutcome::NoChange,
-                                Err(_) => UpdateOutcome::Failed,
-                            }
-                        }
-                    })
-                    .await;
-                    state.end_xite_update(&address);
-                    let outcome = match joined {
-                        Ok(outcome) => outcome,
-                        Err(e) => {
-                            state
-                                .log("ERROR", format!("Resync pass for {address} died: {e}"))
-                                .await;
-                            UpdateOutcome::Failed
-                        }
-                    };
-                    state.push_update_result(&address, outcome).await;
+                state.request_all_xite_updates().await;
+                for (address, generation) in state.take_xite_update_requests() {
+                    pending.add(address, generation, true, &active);
                 }
-                // Verified updates whose files couldn't all be fetched are
-                // held uncommitted (the previous version keeps serving);
-                // re-fetch their missing files and commit the completed ones.
-                state.retry_pending_updates().await;
-                // A child manifest stored in a tree but missing from its
-                // verified index (withheld during a chain outage, restored
-                // from a backup, a legacy copy no peer re-serves) is not
-                // re-walked by anything above: re-verify those xites.
-                state.reverify_incomplete_indexes().await;
-                // Anti-entropy for merge files (posts.json): re-pull + merge
-                // from peers so a node that missed a live push still converges.
-                state.resync_merge_files().await;
-                // OptionalManager: keep optional files under the size cap.
-                let freed = state.enforce_optional_limit().await;
-                if freed > 0 {
-                    state.log("INFO", format!("Optional-file cleanup freed {freed} bytes")).await;
+                maintenance_due = true;
+            },
+            joined = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                let Some(joined) = joined else { continue };
+                let id = match &joined {
+                    Ok((id, _)) => *id,
+                    Err(error) => error.id(),
+                };
+                let Some((address, generation)) = identities.remove(&id) else { continue };
+                active.remove(&address);
+                let outcome = match joined {
+                    Ok((_, outcome)) => outcome,
+                    Err(error) => {
+                        state.log("ERROR", format!("Resync pass for {address} died: {error}")).await;
+                        Some(UpdateOutcome::Failed)
+                    }
+                };
+                if let Some(outcome) = outcome {
+                    if state.xite_update_is_current(&address, generation).await {
+                        state.push_update_result(&address, outcome).await;
+                    }
                 }
-                // Volunteer role: hold our slice of the encrypted shards of
-                // whatever private content we have manifests for.
-                crate::edx::volunteer_sweep(&state, &mut volunteer_backoff).await;
+            },
+            joined = maintenance.join_next(), if !maintenance.is_empty() => {
+                match joined {
+                    Some(Ok(backoff)) => volunteer_backoff = backoff,
+                    Some(Err(error)) => {
+                        state.log("ERROR", format!("Resync maintenance died: {error}")).await;
+                    }
+                    None => {}
+                }
+            },
+        }
+    }
+    jobs.shutdown().await;
+    maintenance.shutdown().await;
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn pending_updates_keep_one_followup_and_replace_old_registration_policy() {
+        let mut queue = PendingUpdates::default();
+        let active = HashSet::from(["active".to_string()]);
+        queue.add("active".into(), 1, true, &active);
+        queue.add("waiting".into(), 2, true, &active);
+        for _ in 0..20 {
+            queue.add("active".into(), 1, false, &active);
+        }
+        assert_eq!(queue.next(&active).unwrap().0, "waiting");
+        assert!(queue.next(&active).is_none(), "an active xite retains its follow-up");
+        let (_, request) = queue.next(&HashSet::new()).unwrap();
+        assert!(request.periodic, "an eager wake must not erase periodic fallback work");
+        assert!(queue.next(&HashSet::new()).is_none(), "repeated wakes coalesce");
+
+        queue.add("readded".into(), 3, true, &active);
+        queue.add("readded".into(), 4, false, &active);
+        let (_, request) = queue.next(&HashSet::new()).unwrap();
+        assert_eq!(request.generation, 4);
+        assert!(!request.periodic, "a new registration must not inherit old periodic work");
+    }
+
+    #[test]
+    fn active_followups_do_not_starve_waiting_startup_requests() {
+        let mut queue = PendingUpdates::default();
+        let running: Vec<_> = (0..UPDATE_CONCURRENCY).map(|index| format!("running-{index}")).collect();
+        let mut active: HashSet<_> = running.iter().cloned().collect();
+        queue.add("startup-first".into(), 1, false, &active);
+        queue.add("startup-second".into(), 2, false, &active);
+
+        for (completed, expected) in running.iter().zip(["startup-second", "startup-first"]) {
+            for _ in 0..20 {
+                for address in &running {
+                    queue.add(address.clone(), 3, false, &active);
+                }
             }
+            // A newly ready idle xite still gets a prompt first pass.
+            queue.add("newly-ready".into(), 4, false, &active);
+            let (address, request) = queue.next(&active).unwrap();
+            assert_eq!(address, "newly-ready");
+            assert!(!request.periodic);
+
+            active.remove(completed);
+            let (address, request) = queue.next(&active).unwrap();
+            assert_eq!(address, expected, "a freed slot must serve waiting startup work first");
+            assert!(!request.periodic, "queue priority must not enable periodic fallback dialing");
+            // Keep the other slots occupied while the next wave arrives.
+            active.insert(completed.clone());
+        }
+
+        active.clear();
+        let mut followups = HashSet::new();
+        while let Some((address, request)) = queue.next(&active) {
+            assert!(!request.periodic, "active eager follow-ups stay eager");
+            followups.insert(address);
+        }
+        assert_eq!(followups, running.into_iter().collect(), "each active xite keeps one follow-up");
+    }
+
+    struct ActiveCall(Arc<AtomicUsize>);
+    impl Drop for ActiveCall {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    struct BlockingContent {
+        entered: tokio::sync::mpsc::UnboundedSender<String>,
+        release: tokio::sync::Semaphore,
+        active: Arc<AtomicUsize>,
+        peak: AtomicUsize,
+        panic_next: std::sync::Mutex<Option<String>>,
+    }
+
+    #[async_trait::async_trait]
+    impl epix_ui::ContentSyncer for BlockingContent {
+        async fn sync_user_content(&self, address: &str) -> (u64, Vec<String>) {
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            let _active = ActiveCall(self.active.clone());
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            self.entered.send(address.to_string()).unwrap();
+            self.release.acquire().await.unwrap().forget();
+            let panic_now = {
+                let mut next = self.panic_next.lock().unwrap();
+                if next.as_deref() == Some(address) {
+                    next.take();
+                    true
+                } else {
+                    false
+                }
+            };
+            assert!(!panic_now, "test-owned content sync panic");
+            (0, Vec::new())
+        }
+    }
+
+    struct AbortTask(tokio::task::AbortHandle);
+    impl Drop for AbortTask {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+
+    #[derive(Default)]
+    struct CountingTransport {
+        calls: AtomicUsize,
+        dialed: Notify,
+    }
+
+    #[async_trait::async_trait]
+    impl epix_transport::Transport for CountingTransport {
+        fn scheme(&self) -> &'static str { "test" }
+        async fn dial(&self, _: &PeerAddr) -> epix_core::Result<epix_transport::PeerStream> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.dialed.notify_one();
+            Err(epix_core::Error::Other("test transport has no remote endpoint".into()))
+        }
+    }
+
+    async fn registered_update_target(state: &Arc<AppState>, data: &std::path::Path, peer: PeerAddr) -> String {
+        let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state.add_xite(&address, epix_ui::XiteEntry {
+            storage: epix_xite::XiteStorage::new(data.join("data").join(&address)),
+            content: None,
+        }).await;
+        state.add_peers(&address, [peer]).await;
+        address
+    }
+
+    #[tokio::test]
+    async fn eager_updates_skip_unavailable_overlay_until_ready() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::new("overlay-update");
+        let transport = Arc::new(CountingTransport::default());
+        state.set_i2p_transport(transport.clone()).await;
+        state.set_i2p_status(serde_json::json!({"phase":"Starting"})).await;
+        let peer = PeerAddr::parse("shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:26552").unwrap();
+        let address = registered_update_target(&state, data.path(), peer.clone()).await;
+        // Pin the trap: the ordinary selector deliberately returns this peer
+        // through its unavailable-network fallback even before I2P is Ready.
+        assert!(state.connectable_peers(&address, 10).await.contains(&peer));
+        assert!(crate::edx::enable_serving(&state, data.path(), epix_crypt::new_seed(), None).await.is_some());
+        let shutdown = Arc::new(Notify::new());
+        let mut coordinator = tokio::spawn(resync_loop(
+            state.clone(), false, shutdown.clone(), Duration::from_secs(3600),
+        ));
+        let _abort = AbortTask(coordinator.abort_handle());
+        assert!(tokio::time::timeout(Duration::from_millis(100), transport.dialed.notified()).await.is_err());
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0, "eager work must not dial the Starting overlay");
+        state.set_i2p_status(serde_json::json!({"phase":"Ready"})).await;
+        tokio::time::timeout(Duration::from_secs(2), transport.dialed.notified())
+            .await.expect("the actual Ready event must retry the skipped update promptly");
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), &mut coordinator).await.unwrap().unwrap();
+        assert_eq!(state.xite_update_phase(&address), None);
+    }
+
+    #[tokio::test]
+    async fn eager_updates_in_tor_always_wait_for_routed_transport() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::new("tor-update");
+        let plain = Arc::new(CountingTransport::default());
+        let routed = Arc::new(CountingTransport::default());
+        state.set_transport(plain.clone()).await;
+        state.set_tor_status(false, "Bootstrapping").await;
+        let address = registered_update_target(&state, data.path(), PeerAddr::parse("8.8.8.8:26552").unwrap()).await;
+        assert!(crate::edx::enable_serving(&state, data.path(), epix_crypt::new_seed(), None).await.is_some());
+        let shutdown = Arc::new(Notify::new());
+        let mut coordinator = tokio::spawn(resync_loop(
+            state.clone(), true, shutdown.clone(), Duration::from_secs(3600),
+        ));
+        let _abort = AbortTask(coordinator.abort_handle());
+        assert!(tokio::time::timeout(Duration::from_millis(100), plain.dialed.notified()).await.is_err());
+        assert_eq!(plain.calls.load(Ordering::SeqCst), 0, "Always must never use the initial plain transport");
+        // Match production ordering: routed transport first, then Ready state.
+        state.set_transport(routed.clone()).await;
+        state.set_tor_status(true, "Always").await;
+        tokio::time::timeout(Duration::from_secs(2), routed.dialed.notified())
+            .await.expect("an update must proceed after the routed transport becomes ready");
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), &mut coordinator).await.unwrap().unwrap();
+        assert_eq!(plain.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.xite_update_phase(&address), None);
+    }
+
+    #[tokio::test]
+    async fn offline_runtime_ignores_queued_update_and_network_wakes() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::new("offline-update");
+        let transport = Arc::new(CountingTransport::default());
+        state.set_transport(transport.clone()).await;
+        let address = registered_update_target(&state, data.path(), PeerAddr::parse("8.8.8.8:26552").unwrap()).await;
+        assert!(crate::edx::enable_serving(&state, data.path(), epix_crypt::new_seed(), None).await.is_some());
+        let mut runtime = NodeRuntime::with_config(state.clone(), vec![], RuntimeConfig {
+            offline: true,
+            resync_interval: Duration::from_millis(20),
+            ..RuntimeConfig::default()
+        });
+        runtime.start().await;
+        state.network_changed().await;
+        let dial = tokio::time::timeout(Duration::from_millis(100), transport.dialed.notified()).await;
+        runtime.shutdown().await;
+        assert!(dial.is_err(), "offline start must not spawn the eager or periodic update worker");
+        assert_eq!(transport.calls.load(Ordering::SeqCst), 0);
+        assert_eq!(state.xite_update_phase(&address), None);
+    }
+
+    #[tokio::test]
+    async fn update_coordinator_waits_for_edx_bounds_work_and_keeps_inflight_wakes() {
+        let data = tempfile::tempdir().unwrap();
+        let state = AppState::new("update-coordinator");
+        let (entered, mut entries) = tokio::sync::mpsc::unbounded_channel();
+        let syncer = Arc::new(BlockingContent {
+            entered,
+            release: tokio::sync::Semaphore::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: AtomicUsize::new(0),
+            panic_next: std::sync::Mutex::new(None),
+        });
+        state.set_content_syncer(syncer.clone()).await;
+        let mut addresses = Vec::new();
+        for _ in 0..5 {
+            let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+            state.add_xite(&address, epix_ui::XiteEntry {
+                storage: epix_xite::XiteStorage::new(data.path().join("data").join(&address)),
+                content: None,
+            }).await;
+            state.add_peers(&address, [PeerAddr::parse("8.8.8.8:26552").unwrap()]).await;
+            addresses.push(address);
+        }
+        let shutdown = Arc::new(Notify::new());
+        let mut coordinator = tokio::spawn(resync_loop(
+            state.clone(), false, shutdown.clone(), Duration::from_secs(3600),
+        ));
+        let _abort = AbortTask(coordinator.abort_handle());
+        assert!(tokio::time::timeout(Duration::from_millis(100), entries.recv()).await.is_err(),
+            "startup work must wait for outbound EDX installation");
+        // Install the real fetcher without a peer transport. Root checks fail
+        // promptly, then the actual update pipeline reaches our gated content
+        // hook. This tests scheduling without making an external dial.
+        assert!(crate::edx::enable_serving(&state, data.path(), epix_crypt::new_seed(), None).await.is_some());
+        let mut first = Vec::new();
+        for _ in 0..UPDATE_CONCURRENCY {
+            first.push(tokio::time::timeout(Duration::from_secs(2), entries.recv())
+                .await.unwrap().unwrap());
+        }
+        assert_eq!(first.iter().collect::<HashSet<_>>().len(), UPDATE_CONCURRENCY);
+        assert!(tokio::time::timeout(Duration::from_millis(100), entries.recv()).await.is_err(),
+            "the fifth xite must wait for an owned worker slot");
+        let repeated = first[0].clone();
+        for _ in 0..20 {
+            state.request_xite_update(&repeated).await;
+        }
+        *syncer.panic_next.lock().unwrap() = Some(repeated.clone());
+        syncer.release.add_permits(UPDATE_CONCURRENCY);
+        let mut next = Vec::new();
+        for _ in 0..2 {
+            next.push(tokio::time::timeout(Duration::from_secs(2), entries.recv())
+                .await.unwrap().unwrap());
+        }
+        assert!(next.contains(&repeated), "a wake during the panicking pass must survive");
+        assert!(next.iter().any(|address| !first.contains(address)), "the queued fifth xite must run");
+        assert_eq!(syncer.peak.load(Ordering::SeqCst), UPDATE_CONCURRENCY);
+        assert!(tokio::time::timeout(Duration::from_millis(100), entries.recv()).await.is_err(),
+            "twenty wakes must produce only one follow-up");
+        shutdown.notify_waiters();
+        tokio::time::timeout(Duration::from_secs(2), &mut coordinator).await.unwrap().unwrap();
+        assert_eq!(syncer.active.load(Ordering::SeqCst), 0, "shutdown owns and cancels active passes");
+        for address in addresses {
+            assert_eq!(state.xite_update_phase(&address), None, "shutdown clears every update phase");
         }
     }
 }
@@ -1266,31 +1657,9 @@ async fn propagation_loop(
                         continue;
                     }
                     state.log("INFO", format!("Propagation hint: resyncing {address}")).await;
-                    // Mirror the resync tick's per-xite work for this one xite:
-                    // root content.json + changed files, then user content
-                    // (posts/comments), then an unconditional merge-record pull
-                    // (upvotes/comments live in CRDT merge files that bypass hash
-                    // sync, so a "content already current" resync never fetches
-                    // them). Each fires its own file_done/updated events, so open
-                    // pages re-query as the data lands.
-                    //
-                    // Bracketed like the tick above so the row shows what is
-                    // happening: a hint means a peer told us this xite moved,
-                    // so the pill usually goes checking -> updating -> the file
-                    // countdown rather than quietly retiring.
-                    state.begin_xite_update(&address);
-                    state.push_xite_info_event(&address, UPDATE_PHASE_CHECKING).await;
-                    let applied = state.resync_xite(&address).await;
-                    let user_bytes = state.sync_user_content(&address).await;
-                    state.resync_merge_files_for(&address).await;
-                    state.end_xite_update(&address);
-                    let outcome = match applied {
-                        Ok(true) => UpdateOutcome::Applied,
-                        Ok(false) if user_bytes > 0 => UpdateOutcome::Applied,
-                        Ok(false) => UpdateOutcome::NoChange,
-                        Err(_) => UpdateOutcome::Failed,
-                    };
-                    state.push_update_result(&address, outcome).await;
+                    // All automatic refreshes share the same bounded worker,
+                    // including hints that arrive while a pass is still active.
+                    state.request_xite_update(&address).await;
                 }
             }
         }
