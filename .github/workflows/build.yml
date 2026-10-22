@@ -106,7 +106,6 @@ jobs:
       CARGO_BUILD_JOBS: "2"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
-      CARGO_TARGET_DIR: ${{ runner.temp }}/issue-599-target
       PYTHONDONTWRITEBYTECODE: "1"
     steps:
       - name: Check out temporary test branch containing the fixture
@@ -135,6 +134,7 @@ jobs:
           CASE_NAME: ${{ matrix.case }}
         run: |
           New-Item -ItemType Directory -Force evidence | Out-Null
+          "CARGO_TARGET_DIR=$(Join-Path $env:RUNNER_TEMP 'issue-599-target')" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
           $actual = (git -C source rev-parse HEAD).Trim()
           if ($LASTEXITCODE -ne 0 -or $actual -cne $env:EXPECTED_SOURCE) { throw "source revision mismatch" }
           $os = Get-CimInstance Win32_OperatingSystem
