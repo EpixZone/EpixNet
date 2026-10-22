@@ -6,7 +6,9 @@
 //! alerts. Do not move these back inline; see .github/codeql/codeql-config.yml.
 
 use super::*;
+use std::cell::Cell;
 use std::collections::HashMap;
+use std::io::{self, Write};
 
 fn shard_map(enc: &Encrypted) -> HashMap<Hash, Vec<u8>> {
     enc.shards.iter().cloned().collect()
@@ -32,6 +34,237 @@ fn convergent_round_trip_multi_chunk() {
     let shards = shard_map(&enc);
     let got = decrypt(enc.mode, &enc.chunks, salt, |a| shards.get(a).cloned()).unwrap();
     assert_eq!(got, d);
+}
+
+#[test]
+fn streaming_matches_decrypt_and_finishes_each_chunk_before_fetching_the_next() {
+    struct ShortWriter<'a> {
+        expected: &'a [u8],
+        written: &'a Cell<usize>,
+        largest: usize,
+        calls: usize,
+    }
+    impl Write for ShortWriter<'_> {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.largest = self.largest.max(bytes.len());
+            self.calls += 1;
+            let count = bytes.len().min(7001);
+            let start = self.written.get();
+            assert_eq!(&bytes[..count], &self.expected[start..start + count]);
+            self.written.set(start + count);
+            Ok(count)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("flushing belongs to the caller");
+        }
+    }
+
+    let plain = data(CHUNK_SIZE * 2 + 17);
+    let key = b3(b"streaming-round-trip");
+    for mode in [Mode::SaltedConvergent, Mode::RandomKey] {
+        let enc = match mode {
+            Mode::SaltedConvergent => encrypt_convergent(&plain, &key),
+            Mode::RandomKey => encrypt_random_key(&plain, &key),
+        };
+        let shards = shard_map(&enc);
+        assert_eq!(
+            decrypt(mode, &enc.chunks, &key, |addr| shards.get(addr).cloned()).unwrap(),
+            plain
+        );
+        let written = Cell::new(0);
+        let mut writer = ShortWriter { expected: &plain, written: &written, largest: 0, calls: 0 };
+        let mut fetched = 0;
+        let count = decrypt_into(
+            mode,
+            &enc.chunks,
+            &key,
+            |addr| {
+                assert_eq!(written.get(), fetched * CHUNK_SIZE);
+                assert_eq!(*addr, enc.chunks[fetched].cipher_addr);
+                fetched += 1;
+                Ok(shards[addr].clone())
+            },
+            &mut writer,
+        )
+        .unwrap();
+        assert_eq!(count, plain.len() as u64);
+        assert_eq!(written.get(), plain.len());
+        assert_eq!(fetched, 3);
+        assert_eq!(writer.largest, CHUNK_SIZE);
+        assert!(writer.calls > fetched, "short writes must be retried");
+    }
+}
+
+#[test]
+fn streaming_and_buffered_decrypt_reject_incorrect_declared_lengths() {
+    let plain = data(CHUNK_SIZE + 32);
+    let key = b3(b"declared-length");
+    for mode in [Mode::SaltedConvergent, Mode::RandomKey] {
+        let enc = match mode {
+            Mode::SaltedConvergent => encrypt_convergent(&plain, &key),
+            Mode::RandomKey => encrypt_random_key(&plain, &key),
+        };
+        let shards = shard_map(&enc);
+        for wrong_length in [31, 33] {
+            let mut chunks = enc.chunks.clone();
+            chunks[1].len = wrong_length;
+            let mut out = Vec::new();
+            let result = decrypt_into(mode, &chunks, &key, |addr| Ok(shards[addr].clone()), &mut out);
+            assert_eq!(result, Err(SelfEncError::PlaintextLengthMismatch(1)));
+            assert_eq!(out, plain[..CHUNK_SIZE], "invalid chunk must never reach the writer");
+            assert_eq!(
+                decrypt(mode, &chunks, &key, |addr| shards.get(addr).cloned()),
+                Err(SelfEncError::PlaintextLengthMismatch(1))
+            );
+        }
+    }
+}
+
+#[test]
+fn streaming_rejects_oversized_declared_chunk_before_fetching_any_shards() {
+    let enc = encrypt_convergent(&data(CHUNK_SIZE + 1), b"size-limit");
+    let mut chunks = enc.chunks;
+    chunks[1].len = CHUNK_SIZE as u32 + 1;
+    let mut out = Vec::new();
+    let result = decrypt_into(
+        enc.mode,
+        &chunks,
+        b"size-limit",
+        |_| panic!("all declared lengths must be checked before fetching"),
+        &mut out,
+    );
+    assert_eq!(result, Err(SelfEncError::ChunkTooLarge(1)));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn streaming_rejects_oversized_ciphertext_before_decrypting() {
+    let ciphertext = vec![0; CHUNK_SIZE + 17];
+    let chunk = ChunkRef { plain_hash: b3(b""), cipher_addr: b3(&ciphertext), len: 0 };
+    let mut out = Vec::new();
+    let result = decrypt_into(
+        Mode::SaltedConvergent,
+        &[chunk],
+        b"size-limit",
+        |_| Ok(ciphertext.clone()),
+        &mut out,
+    );
+    assert_eq!(result, Err(SelfEncError::ChunkTooLarge(0)));
+    assert!(out.is_empty());
+}
+
+#[test]
+fn streaming_verifies_ciphertext_and_plaintext_before_writing() {
+    let key = b3(b"streaming-integrity");
+    let enc = encrypt_random_key(&data(100), &key);
+    let mut damaged = enc.shards[0].1.clone();
+    damaged[0] ^= 1;
+    let mut out = Vec::new();
+    assert_eq!(
+        decrypt_into(enc.mode, &enc.chunks, &key, |_| Ok(damaged.clone()), &mut out),
+        Err(SelfEncError::CorruptShard(enc.chunks[0].cipher_addr))
+    );
+    assert!(out.is_empty());
+
+    let mut chunks = enc.chunks.clone();
+    chunks[0].plain_hash[0] ^= 1;
+    assert_eq!(
+        decrypt_into(enc.mode, &chunks, &key, |_| Ok(enc.shards[0].1.clone()), &mut out),
+        Err(SelfEncError::PlaintextHashMismatch(0))
+    );
+    assert!(out.is_empty());
+    assert_eq!(
+        decrypt_into(enc.mode, &enc.chunks, b"wrong-key", |_| Ok(enc.shards[0].1.clone()), &mut out),
+        Err(SelfEncError::DecryptFailed(0))
+    );
+    assert!(out.is_empty());
+}
+
+#[test]
+fn streaming_propagates_fetch_cancellation_without_fetching_later_chunks() {
+    let plain = data(CHUNK_SIZE * 2 + 1);
+    let enc = encrypt_convergent(&plain, b"fetch-cancel");
+    let mut fetched = 0;
+    let mut out = Vec::new();
+    let result = decrypt_into(
+        enc.mode,
+        &enc.chunks,
+        b"fetch-cancel",
+        |addr| {
+            fetched += 1;
+            match fetched {
+                1 => {
+                    assert_eq!(*addr, enc.shards[0].0);
+                    Ok(enc.shards[0].1.clone())
+                }
+                2 => Err(io::Error::new(io::ErrorKind::Interrupted, "export cancelled")),
+                _ => panic!("fetch cancellation must stop the stream"),
+            }
+        },
+        &mut out,
+    );
+    assert_eq!(
+        result,
+        Err(SelfEncError::Io { kind: io::ErrorKind::Interrupted, message: "export cancelled".into() })
+    );
+    assert_eq!(fetched, 2);
+    assert_eq!(out, plain[..CHUNK_SIZE]);
+}
+
+#[test]
+fn streaming_propagates_writer_failure_without_fetching_later_chunks() {
+    struct FailingWriter(Vec<u8>);
+    impl Write for FailingWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            if self.0.is_empty() {
+                self.0.extend_from_slice(&bytes[..11]);
+                Ok(11)
+            } else {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "export cancelled"))
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            panic!("flushing belongs to the caller");
+        }
+    }
+    let plain = data(CHUNK_SIZE + 1);
+    let enc = encrypt_convergent(&plain, b"writer-cancel");
+    let mut writer = FailingWriter(Vec::new());
+    let mut fetched = 0;
+    let result = decrypt_into(
+        enc.mode,
+        &enc.chunks,
+        b"writer-cancel",
+        |addr| {
+            fetched += 1;
+            assert_eq!(fetched, 1, "writer cancellation must stop further fetches");
+            assert_eq!(*addr, enc.shards[0].0);
+            Ok(enc.shards[0].1.clone())
+        },
+        &mut writer,
+    );
+    assert_eq!(
+        result,
+        Err(SelfEncError::Io { kind: io::ErrorKind::BrokenPipe, message: "export cancelled".into() })
+    );
+    assert_eq!(writer.0, plain[..11]);
+}
+
+#[test]
+fn streaming_rejects_a_writer_that_makes_no_progress() {
+    let enc = encrypt_convergent(b"nonempty", b"zero-writer");
+    // A full slice writer returns Ok(0), which write_all must reject.
+    let mut full: &mut [u8] = &mut [];
+    let result = decrypt_into(
+        enc.mode,
+        &enc.chunks,
+        b"zero-writer",
+        |_| Ok(enc.shards[0].1.clone()),
+        &mut full,
+    );
+    assert!(matches!(result, Err(SelfEncError::Io { kind: io::ErrorKind::WriteZero, .. })));
 }
 
 #[test]

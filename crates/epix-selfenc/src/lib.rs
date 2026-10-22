@@ -176,31 +176,104 @@ pub fn decrypt(
     mut fetch: impl FnMut(&Hash) -> Option<Vec<u8>>,
 ) -> Result<Vec<u8>, SelfEncError> {
     let mut out = Vec::new();
+    decrypt_chunks(
+        mode,
+        chunks,
+        key_material,
+        |addr| fetch(addr).ok_or(SelfEncError::MissingShard(*addr)),
+        |plain| {
+            out.extend_from_slice(plain);
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+/// Decrypt to a writer without accumulating the whole plaintext file.
+///
+/// The key material and ciphertext format are the same as [`decrypt`]. At
+/// most one ciphertext chunk and one plaintext chunk are held at a time.
+/// Declared chunk lengths must not exceed [`CHUNK_SIZE`], and each chunk's
+/// ciphertext address, plaintext hash, and exact length are checked before
+/// its plaintext is written. Returns the total number of plaintext bytes.
+///
+/// Fetch and writer errors stop processing without fetching later chunks.
+/// Cancellation can be reported through either callback's I/O error. As
+/// with [`std::io::Write::write_all`], an interrupted write is retried; use
+/// another error kind for writer cancellation. An error may leave a verified
+/// prefix in the writer, including a partial chunk when the writer fails.
+/// The caller owns rollback and flushing the destination.
+pub fn decrypt_into(
+    mode: Mode,
+    chunks: &[ChunkRef],
+    key_material: &[u8],
+    mut fetch: impl FnMut(&Hash) -> std::io::Result<Vec<u8>>,
+    mut writer: impl std::io::Write,
+) -> Result<u64, SelfEncError> {
+    decrypt_chunks(
+        mode,
+        chunks,
+        key_material,
+        |addr| fetch(addr).map_err(io_error),
+        |plain| writer.write_all(plain).map_err(io_error),
+    )
+}
+
+fn io_error(error: std::io::Error) -> SelfEncError {
+    SelfEncError::Io { kind: error.kind(), message: error.to_string() }
+}
+
+fn decrypt_chunks(
+    mode: Mode,
+    chunks: &[ChunkRef],
+    key_material: &[u8],
+    mut fetch: impl FnMut(&Hash) -> Result<Vec<u8>, SelfEncError>,
+    mut emit: impl FnMut(&[u8]) -> Result<(), SelfEncError>,
+) -> Result<u64, SelfEncError> {
+    let declared_size = chunks.iter().enumerate().try_fold(0u64, |total, (i, chunk)| {
+        if u64::from(chunk.len) > CHUNK_SIZE as u64 {
+            return Err(SelfEncError::ChunkTooLarge(i));
+        }
+        total.checked_add(u64::from(chunk.len)).ok_or(SelfEncError::SizeOverflow)
+    })?;
+    let mut written = 0u64;
     let zero = [0u8; 32];
     for (i, chunk) in chunks.iter().enumerate() {
-        let ct = fetch(&chunk.cipher_addr).ok_or(SelfEncError::MissingShard(chunk.cipher_addr))?;
+        let ct = fetch(&chunk.cipher_addr)?;
+        // XChaCha20-Poly1305 adds a 16-byte authentication tag. Bound the
+        // input before hashing or asking the AEAD to allocate plaintext.
+        if ct.len() > CHUNK_SIZE + 16 {
+            return Err(SelfEncError::ChunkTooLarge(i));
+        }
         if b3(&ct) != chunk.cipher_addr {
             return Err(SelfEncError::CorruptShard(chunk.cipher_addr));
         }
+        let index = u64::try_from(i).map_err(|_| SelfEncError::SizeOverflow)?;
         let key = match mode {
             Mode::SaltedConvergent => {
                 let prev1 = if i >= 1 { &chunks[i - 1].plain_hash } else { &zero };
                 let prev2 = if i >= 2 { &chunks[i - 2].plain_hash } else { &zero };
-                convergent_key(key_material, &chunk.plain_hash, prev1, prev2, i as u64)
+                convergent_key(key_material, &chunk.plain_hash, prev1, prev2, index)
             }
             Mode::RandomKey => {
-                blake3::derive_key(KDF_CONTEXT, &[key_material, &(i as u64).to_le_bytes()].concat())
+                blake3::derive_key(KDF_CONTEXT, &[key_material, &index.to_le_bytes()].concat())
             }
         };
         let pt = aead(&key)
-            .decrypt(&nonce_for(NONCE_CHUNK, i as u64), ct.as_slice())
+            .decrypt(&nonce_for(NONCE_CHUNK, index), ct.as_slice())
             .map_err(|_| SelfEncError::DecryptFailed(i))?;
+        drop(ct);
+        if pt.len() as u64 != u64::from(chunk.len) {
+            return Err(SelfEncError::PlaintextLengthMismatch(i));
+        }
         if b3(&pt) != chunk.plain_hash {
             return Err(SelfEncError::PlaintextHashMismatch(i));
         }
-        out.extend_from_slice(&pt);
+        written = written.checked_add(pt.len() as u64).ok_or(SelfEncError::SizeOverflow)?;
+        emit(&pt)?;
     }
-    Ok(out)
+    debug_assert_eq!(written, declared_size);
+    Ok(written)
 }
 
 /// Serialize + symmetrically encrypt a data-map (the outer bootstrap
@@ -315,6 +388,10 @@ pub enum SelfEncError {
     CorruptShard(Hash),
     DecryptFailed(usize),
     PlaintextHashMismatch(usize),
+    PlaintextLengthMismatch(usize),
+    ChunkTooLarge(usize),
+    SizeOverflow,
+    Io { kind: std::io::ErrorKind, message: String },
     DatamapDecryptFailed,
     MalformedDatamap,
 }

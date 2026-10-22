@@ -3145,6 +3145,7 @@ dependencies = [
  "epix-protocol",
  "epix-reticulum",
  "epix-search",
+ "epix-selfenc",
  "epix-transport",
  "epix-user",
  "epix-worker",
