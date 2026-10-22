@@ -15,6 +15,8 @@ pub mod config_schema;
 pub mod conn_pool;
 pub mod feed;
 mod file_revert;
+mod xite_zip;
+mod xite_zip_http;
 pub mod geoip;
 pub mod local_feed;
 mod nmh_auth;
@@ -83,6 +85,7 @@ struct Ctx {
     state: Arc<AppState>,
     registry: Arc<CommandRegistry>,
     media: Arc<MediaBundle>,
+    zip_exports: Arc<tokio::sync::Semaphore>,
     /// The BitTorrent streaming engine backing `/bt/stream`. Present only in a
     /// `bittorrent` build; the iOS binary has neither the field nor the route.
     #[cfg(feature = "bittorrent")]
@@ -128,6 +131,7 @@ impl UiServer {
                 state,
                 registry: Arc::new(registry),
                 media: Arc::new(media),
+                zip_exports: Arc::new(tokio::sync::Semaphore::new(1)),
                 #[cfg(feature = "bittorrent")]
                 bt,
             },
@@ -147,6 +151,7 @@ impl UiServer {
         let router = Router::new()
             .route("/", get(health))
             .route("/EpixNet-Internal/Status", get(serve_status))
+            .route("/EpixNet-Internal/Zip", get(xite_zip_http::download))
             .route(NMH_RESOLVE_PATH, axum::routing::post(serve_nmh_resolve))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))

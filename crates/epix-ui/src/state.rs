@@ -1,6 +1,8 @@
 //! Shared server state: the xites this node serves (with their runtime
 //! settings + stats), the local user identity, and node metadata.
 
+mod xite_export;
+
 use epix_core::{Address, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{DialableNets, Peer, PeerCounts, Peers};

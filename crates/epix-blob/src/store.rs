@@ -246,6 +246,43 @@ struct SlabMeta {
     sealed: bool,
 }
 
+/// Hash and copy from the same pinned file reads. Never re-read a mutable
+/// source after verifying it, and never allocate according to its total size.
+fn copy_verified_file_range(
+    file: &File,
+    offset: u64,
+    size: u64,
+    id: ObjId,
+    range: Range<u64>,
+    mut out: impl Write,
+    mut check: impl FnMut() -> io::Result<()>,
+) -> io::Result<u64> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buffer = [0u8; 64 * 1024];
+    let mut position = 0u64;
+    while position < size {
+        check()?;
+        let length = (size - position).min(buffer.len() as u64) as usize;
+        let read_offset = offset.checked_add(position).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "object offset overflow")
+        })?;
+        positioned_io::ReadAt::read_exact_at(file, read_offset, &mut buffer[..length])?;
+        hasher.update(&buffer[..length]);
+        let next = position + length as u64;
+        let start = range.start.max(position);
+        let end = range.end.min(next);
+        if start < end {
+            out.write_all(&buffer[(start - position) as usize..(end - position) as usize])?;
+        }
+        position = next;
+    }
+    check()?;
+    if hasher.finalize().as_bytes() != &id.0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, format!("complete bytes for {id} are corrupt")));
+    }
+    Ok(range.end - range.start)
+}
+
 /// Tuning knobs (tests shrink these radically).
 #[derive(Clone, Debug)]
 pub struct StoreConfig {
@@ -3453,14 +3490,15 @@ impl Store {
         }
         let bytes = match rec.loc {
             Loc::Slab { slab, off } => {
-                let b = self.read_slab(slab, off, rec.size)?;
-                if !verified::verify_whole(&b, id) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("slab bytes for {id} are corrupt"),
-                    ));
-                }
-                b[start as usize..end as usize].to_vec()
+                // Complete inserts can be large. Retain only this range while
+                // verifying the entire slab record with fixed scratch space.
+                let f = self.slab_reader(slab)?;
+                let capacity = usize::try_from(end - start).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "requested range is too large")
+                })?;
+                let mut bytes = Vec::with_capacity(capacity);
+                copy_verified_file_range(&f, off, rec.size, id, start..end, &mut bytes, || Ok(()))?;
+                bytes
             }
             Loc::Sparse => {
                 let groups = crate::bitfield::groups_for_bytes(&(start..end));
@@ -3528,6 +3566,47 @@ impl Store {
             self.touch(id, now)?;
         }
         Ok(bytes)
+    }
+
+    /// Copy a range of a COMPLETE object with fixed scratch memory, verifying
+    /// the whole object's BLAKE3 digest in one pass. Unlike repeated range
+    /// reads this also handles large slab records in linear time.
+    ///
+    /// Bytes reach `out` before final verification. The caller MUST discard
+    /// that output on ANY error; this API is for transactional destinations
+    /// such as a temporary archive, not an HTTP response or a peer stream.
+    /// `check` runs between reads, including outside the selected range, so
+    /// the caller can cancel long verification passes. The return value is
+    /// the number of requested bytes copied.
+    pub fn copy_verified_range(
+        &self,
+        id: ObjId,
+        range: Range<u64>,
+        out: impl Write,
+        now: u64,
+        check: impl FnMut() -> io::Result<()>,
+    ) -> io::Result<u64> {
+        let rec = self.required(id)?;
+        if !rec.is_complete() {
+            return Err(io::Error::new(io::ErrorKind::NotFound, format!("{id} incomplete")));
+        }
+        if range.start > range.end || range.end > rec.size {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "range exceeds object size"));
+        }
+        let copied = match rec.loc {
+            Loc::Slab { slab, off } => {
+                let file = self.slab_reader(slab)?;
+                copy_verified_file_range(&file, off, rec.size, id, range, out, check)?
+            }
+            Loc::Sparse | Loc::Extern => {
+                let file = self.open_data_file(id, &rec)?;
+                copy_verified_file_range(&file, 0, rec.size, id, range, out, check)?
+            }
+        };
+        if rec.last_access < now {
+            self.touch(id, now)?;
+        }
+        Ok(copied)
     }
 
     fn read_slab(&self, slab: u32, off: u64, size: u64) -> io::Result<Vec<u8>> {
@@ -6533,6 +6612,42 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn slab_range_checks_bytes_outside_the_requested_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        // A preceding object makes the slab offset nonzero; the selected
+        // window crosses a streaming buffer boundary and ends mid-buffer.
+        let prefix = b"neighbor slab object";
+        store.insert_bytes(ObjId::of(prefix), Ns::Plain, prefix, 1).unwrap();
+        let data = test_data(200_000);
+        let id = ObjId::of(&data);
+        store.insert_bytes(id, Ns::Plain, &data, 1).unwrap();
+        assert_eq!(store.read_range(id, 65_530, 28, 2).unwrap(), data[65_530..65_558]);
+        assert_eq!(store.read_range(id, 199_990, u64::MAX, 2).unwrap(), data[199_990..]);
+        let mut selected = Vec::new();
+        assert_eq!(store.copy_verified_range(id, 65_530..65_558, &mut selected, 2, || Ok(())).unwrap(), 28);
+        assert_eq!(selected, data[65_530..65_558]);
+        assert_eq!(store.copy_verified_range(id, 0..200_001, io::sink(), 2, || Ok(())).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+        let mut checks = 0;
+        let mut cancelled_output = Vec::new();
+        let error = store.copy_verified_range(id, 190_000..200_000, &mut cancelled_output, 2, || {
+            checks += 1;
+            if checks == 2 { Err(io::Error::other("cancelled")) } else { Ok(()) }
+        }).unwrap_err();
+        assert_eq!(error.to_string(), "cancelled");
+        assert!(cancelled_output.is_empty(), "cancellation is checked before reaching the selected window");
+        let Loc::Slab { slab, off } = store.required(id).unwrap().loc else {
+            panic!("complete insert must use a slab");
+        };
+        let mut file = OpenOptions::new().write(true).open(store.slab_path(slab)).unwrap();
+        positioned_io::WriteAt::write_all_at(&mut file, off + 150_000, &[data[150_000] ^ 1]).unwrap();
+        assert_eq!(store.read_range(id, 65_530, 28, 3).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        assert_eq!(store.copy_verified_range(id, 65_530..65_558, io::sink(), 3, || Ok(())).unwrap_err().kind(), io::ErrorKind::InvalidData);
+        file.set_len(off + 10).unwrap();
+        assert_eq!(store.read_range(id, 0, 3, 3).unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
     }
 
     #[test]

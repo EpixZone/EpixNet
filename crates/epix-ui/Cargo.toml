@@ -9,6 +9,7 @@ epix-core = { path = "../epix-core" }
 epix-content = { path = "../epix-content" }
 epix-xite = { path = "../epix-xite" }
 epix-blob = { path = "../epix-blob" }
+epix-selfenc = { path = "../epix-selfenc" }
 # Deterministic feed organization (segments, checkpoints, index-by-target,
 # reaction counts, rollups). The node derives these read-only from the signed
 # OR-set records it already stores; see src/feed.rs.
@@ -56,6 +57,7 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tar = "0.4.46"
 zip = { version = "9.0.5", default-features = false, features = ["deflate", "aes-crypto"] }
 getrandom = { version = "0.4" }
+tempfile = "3"
 sha3 = { version = "0.12", optional = true }
 # default-features off: postcard's default heapless support drags the
 # unmaintained atomic-polyfill (RUSTSEC-2023-0089); we only need std.
@@ -97,5 +99,4 @@ epix-crypt = { path = "../epix-crypt" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
-tempfile = "3"
 reqwest = { version = "0.12", default-features = false }

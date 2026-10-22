@@ -102,6 +102,14 @@ until a verified replacement is available. Revert is available for files
 declared in xites you own; it cannot undo changes that have already been signed
 or restore `content.json` itself.
 
+The xite sidebar's **Save as .zip** downloads its signed public files and
+manifests, including downloaded optional files and locally stored public shards.
+It excludes private encrypted files, unsigned edits, and node settings or keys.
+If a required file is missing or changed, the download reports an error. Finish
+downloading or signing the xite before retrying. Exports run one at a time and
+use temporary disk space, with limits of 8 GiB per file and 16 GiB of file data
+per archive.
+
 The same binary doubles as the authoring and diagnostics CLI, with the
 action name as the first argument (the EpixNet CLI shape):
 
