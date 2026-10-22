@@ -13,6 +13,7 @@ pub mod chart;
 pub mod command;
 pub mod config_schema;
 pub mod conn_pool;
+mod deletion_reserve;
 pub mod feed;
 mod file_revert;
 mod xite_zip;

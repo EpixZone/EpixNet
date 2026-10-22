@@ -3552,7 +3552,7 @@ impl WsCommand for MergerXiteDelete {
             return Err("Not a merger xite".into());
         }
         for target in arg_addresses(p) {
-            s.state.remove_xite(&require_address(&target)?).await;
+            s.state.try_remove_xite(&require_address(&target)?).await?;
         }
         s.state.rebuild_merger_dbs().await;
         Ok(Value::from("ok"))
@@ -3686,7 +3686,7 @@ impl WsCommand for XiteDelete {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = target_address(s, p)?;
-        if s.state.remove_xite(&address).await {
+        if s.state.try_remove_xite(&address).await? {
             Ok(Value::from("ok"))
         } else {
             Err(format!("Unknown xite: {address}"))
