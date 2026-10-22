@@ -1575,6 +1575,7 @@ if (window.getComputedStyle(document.body).transform) {
       this.siteSign = bind(this.siteSign, this);
       this.onWrapperLoad = bind(this.onWrapperLoad, this);
       this.onPageLoad = bind(this.onPageLoad, this);
+      this.updateXiteLinks = bind(this.updateXiteLinks, this);
       this.onCloseWebsocket = bind(this.onCloseWebsocket, this);
       this.onOpenWebsocket = bind(this.onOpenWebsocket, this);
       this.handleMessage = bind(this.handleMessage, this);
@@ -1629,6 +1630,8 @@ if (window.getComputedStyle(document.body).transform) {
       this.allowed_event_constructors = [window.MouseEvent, window.KeyboardEvent, window.PointerEvent];
       window.onload = this.onPageLoad;
       document.getElementById("inner-iframe").addEventListener("load", this.onPageLoad);
+      document.getElementById("inner-iframe").addEventListener("load", this.updateXiteLinks);
+      this.updateXiteLinks();
       window.onhashchange = (function (_this) {
         return function (e) {
           var src;
@@ -2513,6 +2516,142 @@ if (window.getComputedStyle(document.body).transform) {
         _this.notifications.close($(".notification-sync"));
         _this.content_sync = null;
       }, 12000);
+    };
+
+    // Legacy path-form xite links already redirect when followed. Give native
+    // hover, copy and open-in-new-tab actions that same destination beforehand.
+    // The server still validates navigation and enforces origin permissions.
+    Wrapper.prototype.canonicalXiteLink = function (href, base, documentUrl, target) {
+      function xiteOrigin(reference) {
+        var dotted = /\.epix$/i.test(reference);
+        var label = dotted ? reference.slice(0, -5) : reference;
+        var folded = label.toLowerCase();
+        var charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        if (/^epix1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}$/i.test(label) &&
+            (label === folded || label === label.toUpperCase())) {
+          // Classic Bech32, HRP "epix", exactly 20 bytes. Validate before
+          // folding case, so mixed-case address typos never become origins.
+          var values = [3, 3, 3, 3, 0, 5, 16, 9, 24];
+          for (var i = 5; i < folded.length; i++) values.push(charset.indexOf(folded[i]));
+          var checksum = 1;
+          var generators = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+          for (var value of values) {
+            var high = checksum >>> 25;
+            checksum = ((checksum & 0x1ffffff) << 5) ^ value;
+            for (var bit = 0; bit < 5; bit++) {
+              if ((high >>> bit) & 1) checksum ^= generators[bit];
+            }
+          }
+          if (checksum === 1) return folded + ".epix";
+        }
+        // Address-shaped labels are never xID names, including bad checksums.
+        if (/^epix1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{20,}$/.test(folded)) return null;
+        if (dotted && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(folded)) return folded + ".epix";
+        return null;
+      }
+      if (typeof href !== "string" || !href || href !== href.trim() ||
+          /^[?#]/.test(href) || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(href) ||
+          /[\x00-\x1f\x7f\\]/.test(href)) return null;
+      try {
+        var doc = new URL(documentUrl);
+        var url = new URL(href, base);
+        if ((doc.protocol !== "https:" && doc.protocol !== "http:") ||
+            url.origin !== doc.origin || url.username || url.password ||
+            url.searchParams.has("wrapper_nonce")) return null;
+        var path = url.pathname.slice(1);
+        var first = path.split("/")[0];
+        var origin = xiteOrigin(first);
+        // href retains empty query/fragment delimiters as well as encoded bytes.
+        var suffix = url.href.slice(url.origin.length + url.pathname.length);
+        if (xiteOrigin(doc.hostname)) {
+          if (!origin) return null;
+          return doc.protocol + "//" + origin + "/" + path.slice(first.length + 1) + suffix;
+        }
+        // Invalid proxy hosts must not fall through to the node's path mode.
+        if (/\.epix$/i.test(doc.hostname) ||
+            (/^epix1/i.test(doc.hostname) && doc.hostname.length > 20 && doc.hostname.indexOf(".") < 0)) return null;
+        var source = xiteOrigin(doc.pathname.split("/")[1]);
+        if (!source || origin !== source) return null;
+        path = path.slice(first.length + 1);
+        first = path.split("/")[0];
+        origin = xiteOrigin(first);
+        if (!origin) return null;
+        var rest = path.slice(first.length + 1);
+        // An iframe HTML file stays in its current wrapper. Only a root or
+        // directory, or an HTML document opened outside the iframe, redirects.
+        var topLevel = /^(?:_top|_parent|_blank)$/i.test(target || "");
+        if (rest && !rest.endsWith("/") && !(topLevel && /\.html?$/.test(rest))) return null;
+        return doc.origin + "/" + origin + "/" + rest + suffix;
+      } catch (_) {
+        return null;
+      }
+    };
+
+    Wrapper.prototype.updateXiteLinks = function () {
+      var doc = null;
+      try {
+        var candidate = document.getElementById("inner-iframe").contentDocument;
+        if (candidate && candidate.location.origin === window.location.origin &&
+            /^(?:https?:)$/.test(candidate.location.protocol)) doc = candidate;
+      } catch (_) {} // A navigated cross-origin frame is outside this wrapper.
+      if (this.xite_link_document === doc) return;
+      if (this.xite_link_observer) this.xite_link_observer.disconnect();
+      this.xite_link_document = doc;
+      this.xite_link_observer = null;
+      if (!doc) return;
+      var wrapper = this;
+      var rewritten = new WeakMap();
+      function normalize(anchor) {
+        if (!anchor.matches || !anchor.matches("a[href],area[href]")) return;
+        var current = anchor.getAttribute("href");
+        var previous = rewritten.get(anchor);
+        var raw = previous && current === previous.canonical ? previous.raw : current;
+        var canonical = null;
+        if (!anchor.hasAttribute("download") && !anchor.closest("[contenteditable]")) {
+          var baseTarget = doc.querySelector("base[target]");
+          var target = anchor.hasAttribute("target") ? anchor.getAttribute("target") :
+            (baseTarget ? baseTarget.getAttribute("target") : "");
+          canonical = wrapper.canonicalXiteLink(raw, anchor.baseURI, doc.location.href, target);
+        }
+        if (canonical && canonical !== raw) {
+          rewritten.set(anchor, { raw: raw, canonical: canonical });
+          if (current !== canonical) anchor.setAttribute("href", canonical);
+        } else {
+          rewritten.delete(anchor);
+          if (current !== raw) anchor.setAttribute("href", raw);
+        }
+      }
+      function scan(node) {
+        normalize(node);
+        if (node.querySelectorAll) node.querySelectorAll("a[href],area[href]").forEach(normalize);
+      }
+      function hasBase(node) {
+        return node.nodeType === 1 &&
+          (node.localName === "base" || !!node.querySelector("base"));
+      }
+      scan(doc);
+      this.xite_link_observer = new window.MutationObserver(function (changes) {
+        // A changed base affects every relative link. Otherwise inspect only
+        // changed links and subtrees, including editors entering/leaving edit mode.
+        var baseChanged = changes.some(function (change) {
+          return change.target.localName === "base" ||
+            (change.type === "childList" &&
+              (Array.from(change.addedNodes).some(hasBase) || Array.from(change.removedNodes).some(hasBase)));
+        });
+        if (baseChanged) return scan(doc);
+        changes.forEach(function (change) {
+          if (change.type === "attributes") {
+            if (change.attributeName === "contenteditable") scan(change.target);
+            else normalize(change.target);
+          } else {
+            change.addedNodes.forEach(scan);
+          }
+        });
+      });
+      this.xite_link_observer.observe(doc, {
+        subtree: true, childList: true, attributes: true,
+        attributeFilter: ["href", "target", "download", "contenteditable"]
+      });
     };
 
     Wrapper.prototype.loadingDocumentReady = function () {
