@@ -139,7 +139,7 @@ class TransportTests(unittest.TestCase):
                 for _ in range(20):
                     connection.sendall(frame(b'{"cmd":"pushed"}'))
                     time.sleep(0.04)
-            except (BrokenPipeError, ConnectionResetError):
+            except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
                 pass
         server = MockServer(handler)
         started = time.monotonic()
