@@ -41,6 +41,9 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
       - name: Install packaging test dependencies
         run: |
           sudo apt-get update
@@ -49,6 +52,7 @@ jobs:
         run: |
           python3 packaging/test-firefox-download.py -v
           python3 packaging/linux/test-packaging.py -v
+          python3 packaging/linux/test-autostart.py -v
 
   build-test:
     name: Build & test
