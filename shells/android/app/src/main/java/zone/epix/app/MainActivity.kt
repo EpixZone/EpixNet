@@ -4,6 +4,7 @@ import android.app.AlertDialog
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.GradientDrawable
 import android.net.Uri
@@ -105,7 +106,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var backButton: TextView
     private lateinit var forwardButton: TextView
     private lateinit var tabCountView: TextView
-    /// The address-bar row and bottom toolbar, for scroll-away chrome.
+    /// Existing rows are reordered without detaching the page or its session.
+    private lateinit var browserChrome: LinearLayout
+    private var browserControlsPosition = BrowserControlsPosition.AUTOMATIC
+    /// The address and navigation rows, for scroll-away chrome.
     private lateinit var topBar: View
     private lateinit var bottomBar: View
     private var chromeHidden = false
@@ -163,6 +167,9 @@ class MainActivity : AppCompatActivity() {
         super.onCreate(savedInstanceState)
 
         torClearnet = getPreferences(Context.MODE_PRIVATE).getBoolean(PREF_TOR_CLEARNET, true)
+        browserControlsPosition = BrowserControlsPosition.fromStored(
+            getPreferences(Context.MODE_PRIVATE).getString(PREF_BROWSER_CONTROLS_POSITION, null),
+        )
 
         val container = FrameLayout(this)
         container.addView(
@@ -224,6 +231,11 @@ class MainActivity : AppCompatActivity() {
         super.onResume()
         splashAnimationsActive = true
         animateSplashMark()
+    }
+
+    override fun onConfigurationChanged(newConfig: Configuration) {
+        super.onConfigurationChanged(newConfig)
+        applyBrowserControlsPosition()
     }
 
     /**
@@ -753,7 +765,34 @@ class MainActivity : AppCompatActivity() {
         currentTab.session.loadUri(nodeUrl(target))
     }
 
-    /** The browser chrome: address bar + Epix icon on top, the page below. */
+    /** Move existing rows without losing page state, address focus, or selection. */
+    private fun applyBrowserControlsPosition() {
+        if (!::browserChrome.isInitialized) return
+        val atBottom = browserControlsPosition.isAtBottom(
+            resources.configuration.orientation == Configuration.ORIENTATION_LANDSCAPE,
+        )
+        val order = if (atBottom) {
+            listOf(pageFrame, topBar, offlineBanner, bottomBar)
+        } else {
+            listOf(topBar, offlineBanner, bottomBar, pageFrame)
+        }
+        if (order.indices.all { browserChrome.getChildAt(it) === order[it] }) return
+        // Reordering must not animate the entire Gecko surface across the
+        // screen. Keep the existing hide/reveal transition for later scrolls.
+        val transition = browserChrome.layoutTransition
+        browserChrome.layoutTransition = null
+        order.forEach { browserChrome.bringChildToFront(it) }
+        browserChrome.layoutTransition = transition
+    }
+
+    private fun setBrowserControlsPosition(position: BrowserControlsPosition) {
+        browserControlsPosition = position
+        getPreferences(Context.MODE_PRIVATE).edit()
+            .putString(PREF_BROWSER_CONTROLS_POSITION, position.preferenceValue).apply()
+        applyBrowserControlsPosition()
+    }
+
+    /** The browser chrome: address and navigation rows around the page. */
     private fun buildBrowserChrome(): View {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -858,6 +897,8 @@ class MainActivity : AppCompatActivity() {
         root.addView(pageFrame, LinearLayout.LayoutParams(-1, 0, 1f))
         bottomBar = buildToolbar()
         root.addView(bottomBar, LinearLayout.LayoutParams(-1, -2))
+        browserChrome = root
+        applyBrowserControlsPosition()
         return root
     }
 
@@ -1496,6 +1537,25 @@ class MainActivity : AppCompatActivity() {
             row.addView(toggle)
             layout.addView(row)
 
+            val controlsPosition = android.widget.Button(this@MainActivity).apply {
+                isAllCaps = false
+                text = "Browser controls: ${browserControlsPosition.label}"
+                setOnClickListener {
+                    val positions = BrowserControlsPosition.entries
+                    val labels = arrayOf("Automatic (bottom in portrait, top in landscape)", "Top", "Bottom")
+                    AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Browser controls")
+                        .setSingleChoiceItems(labels, positions.indexOf(browserControlsPosition)) { dialog, selected ->
+                            setBrowserControlsPosition(positions[selected])
+                            text = "Browser controls: ${browserControlsPosition.label}"
+                            dialog.dismiss()
+                        }
+                        .setNegativeButton("Cancel", null)
+                        .show()
+                }
+            }
+            layout.addView(controlsPosition, LinearLayout.LayoutParams(-1, -2))
+
             AlertDialog.Builder(this@MainActivity)
                 .setTitle("Epix")
                 .setView(layout)
@@ -1990,6 +2050,7 @@ class MainActivity : AppCompatActivity() {
         private const val SOCKS_PORT = 43111
         private const val PREF_TOR_CLEARNET = "torClearnet"
         private const val PREF_CLEARNET_ALLOW = "clearnetAllow"
+        private const val PREF_BROWSER_CONTROLS_POSITION = "browserControlsPosition"
 
         // The embedded node's UI server (bootNode's uiAddr): the EpixNet
         // default port. The app boots the node itself, so unlike the desktop

@@ -162,6 +162,11 @@ notarized release build, and Windows/Linux installers.
 
 ### Android (`android/`) - Kotlin + GeckoView
 
+Browser controls sit at the bottom in portrait and at the top in landscape.
+Long-press the wallet button, then choose **Browser controls** to keep them at
+the **Top** or **Bottom**, or return to **Automatic**. The choice is saved across
+restarts, and rotating the device keeps the current tab and address text.
+
 Verified end to end on an arm64 emulator (Android 16 / API 37): the node boots
 in-process, Tor bootstraps, the dashboard clones from the network and renders,
 and `epix://` deep links clone + open xites. Run from the repo root:
