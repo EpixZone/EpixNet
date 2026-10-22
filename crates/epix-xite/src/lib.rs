@@ -8,7 +8,7 @@ pub mod piecemap;
 pub mod xite;
 pub mod storage;
 
-pub use announcer::{announce, SelfAdvert, Tracker};
+pub use announcer::{announce, announce_attempt, SelfAdvert, Tracker};
 pub use epix_discovery::OnionSigner;
 pub use hashfield::Hashfield;
 pub use settings::{content_stats, Cache, ContentStats, OptionalFileStat, XiteSettings};

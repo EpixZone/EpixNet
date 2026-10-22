@@ -3,7 +3,7 @@
 
 mod xite_export;
 
-use epix_core::{Address, PeerAddr};
+use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{DialableNets, Peer, PeerCounts, Peers};
 use epix_transport::Transport;
@@ -432,6 +432,17 @@ pub trait EdxFetcher: Send + Sync {
     /// opaque here - `epix-discovery` owns both encode and decode.
     async fn announce(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String>;
 
+    /// Preserve whether an announce was deferred locally without a new dial.
+    /// Existing fetchers report real failures unless they explicitly carry
+    /// that distinction from their connection pool.
+    async fn announce_attempt(
+        &self,
+        peer: PeerAddr,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, AttemptError<String>> {
+        self.announce(peer, payload).await.map_err(AttemptError::Failed)
+    }
+
     /// Store-and-forward hints after the `after` cursor over EDX
     /// (`Req::UpdatesSince`): `(xite, modified)` pairs plus the peer's current
     /// head, which the caller keeps as its next cursor.
@@ -471,6 +482,14 @@ struct EdxAnnounceSender {
 impl epix_discovery::AnnounceSender for EdxAnnounceSender {
     async fn send(&self, tracker: &PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         self.fetcher.announce(tracker.clone(), payload).await
+    }
+
+    async fn send_attempt(
+        &self,
+        tracker: &PeerAddr,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, AttemptError<String>> {
+        self.fetcher.announce_attempt(tracker.clone(), payload).await
     }
 }
 
@@ -9421,11 +9440,11 @@ impl AppState {
                 let started = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(75),
-                    epix_xite::announce(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert,
+                    epix_xite::announce_attempt(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert,
                     ),
                 )
                 .await
-                .unwrap_or_else(|_| Err("announce timed out".into()));
+                .unwrap_or_else(|_| Err(AttemptError::Failed("announce timed out".into())));
                 (tracker, result, started.elapsed())
             });
         }
@@ -9457,7 +9476,7 @@ impl AppState {
         &self,
         mut set: tokio::task::JoinSet<(
             epix_xite::Tracker,
-            Result<Vec<PeerAddr>, String>,
+            Result<Vec<PeerAddr>, AttemptError<String>>,
             std::time::Duration,
         )>,
         xite_key: &str,
@@ -9466,6 +9485,14 @@ impl AppState {
         let mut all: Vec<PeerAddr> = Vec::new();
         while let Some(res) = set.join_next().await {
             let Ok((tracker, result, latency)) = res else { continue;
+            };
+            let result = match result {
+                Err(AttemptError::Deferred(reason)) => {
+                    self.mark_tracker_deferred(&tracker, reason).await;
+                    continue;
+                }
+                Err(AttemptError::Failed(error)) => Err(error),
+                Ok(peers) => Ok(peers),
             };
             self.record_tracker(&tracker, &result, latency).await;
             self.record_tracker_backoff(&tracker, xite_key, result.is_ok()).await;
@@ -9520,6 +9547,7 @@ impl AppState {
             json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": now })
         });
         let obj = entry.as_object_mut().expect("tracker stat object");
+        obj.remove("deferred_reason");
         let bump = |o: &mut serde_json::Map<String, Value>, k: &str, by: i64| {
             let v = o.get(k).and_then(|v| v.as_i64()).unwrap_or(0) + by;
             o.insert(k.to_string(), json!(v));
@@ -9583,23 +9611,48 @@ impl AppState {
     /// whether a new entry was created.
     async fn mark_tracker_announcing(&self, tracker: &epix_xite::Tracker) -> bool {
         let key = tracker_stat_key(tracker);
-        let now = now_secs();
         let mut stats = self.tracker_stats.write().await;
         if let Some(entry) = stats.get_mut(&key) {
-            // A gated entry whose overlay came back up is being tried now.
-            let gated = entry.get("status").and_then(|s| s.as_str()) == Some("gated");
-            if gated {
+            // A previously skipped tracker is eligible for another attempt.
+            let skipped = matches!(entry.get("status").and_then(|s| s.as_str()), Some("gated" | "deferred"));
+            if skipped {
                 if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("status".into(), json!("announcing"));
+                    let status = if obj.get("num_request").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                        "announcing"
+                    } else if obj.get("num_error").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                        "error"
+                    } else {
+                        "announced"
+                    };
+                    obj.insert("status".into(), json!(status));
                 }
             }
-            return gated;
+            return skipped;
         }
         stats.insert(
             key,
-            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": now }),
+            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": 0 }),
         );
         true
+    }
+
+    /// A pool failure may have come from another xite or a non-tracker call.
+    /// Do not leave its first tracker placeholder announcing forever, but
+    /// never let a late follower overwrite a real outcome or a gated status.
+    async fn mark_tracker_deferred(&self, tracker: &epix_xite::Tracker, reason: DeferredAttempt) {
+        let key = tracker_stat_key(tracker);
+        let mut stats = self.tracker_stats.write().await;
+        let entry = stats.entry(key).or_insert_with(|| {
+            json!({ "status": "deferred", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": 0 })
+        });
+        if entry.get("num_request").and_then(Value::as_u64) == Some(0)
+            && matches!(entry.get("status").and_then(Value::as_str), Some("announcing" | "deferred"))
+        {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("status".into(), json!("deferred"));
+                obj.insert("deferred_reason".into(), json!(reason.to_string()));
+            }
+        }
     }
 
     /// Mark a tracker skipped because its overlay is down (Tor off for an
@@ -9636,7 +9689,7 @@ impl AppState {
     }
 
     /// Per-tracker announce stats for the dashboard. `announcerStats`.
-    /// Overlay-gated entries (skipped, never tried - Tor/I2P down) are
+    /// Overlay-gated or locally deferred entries (skipped, never tried) are
     /// excluded: the shipped dashboard counts every entry in its ratio
     /// denominator and only "announced" in the numerator, so including
     /// them turns a healthy 4/4 pill into a 4/9 warning over trackers
@@ -9647,13 +9700,13 @@ impl AppState {
                 .read()
                 .await
                 .iter()
-                .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) != Some("gated"))
+                .filter(|(_, v)| !matches!(v.get("status").and_then(Value::as_str), Some("gated" | "deferred")))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         )
     }
 
-    /// [`Self::announcer_stats`] including overlay-gated entries, so the
+    /// [`Self::announcer_stats`] including overlay-gated and deferred entries, so the
     /// dashboard's health drawer can list every tracker the node plans to
     /// try once its overlay comes up. Served only to a caller that asks
     /// (`announcerStats {planned: true}`): the shipped dashboard counts
@@ -35134,6 +35187,243 @@ mod tests {
         let other = PeerAddr::parse("9.9.9.9:2222").unwrap();
         let resp = state.announce_serve(&ask, &other).await;
         assert_eq!(resp.peers[0].unpack(), vec![PeerAddr::Onion { host: onion, port: 26959 }]);
+    }
+
+    async fn absorb_tracker_attempt(
+        state: &AppState,
+        tracker: &epix_xite::Tracker,
+        xite: &str,
+        result: Result<Vec<PeerAddr>, AttemptError<String>>,
+    ) {
+        let tracker = tracker.clone();
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async move { (tracker, result, std::time::Duration::from_millis(10)) });
+        state.absorb_announce_results(set, xite, None).await;
+    }
+
+    #[tokio::test]
+    async fn first_deferred_tracker_stays_untried_until_a_real_result() {
+        for reason in [DeferredAttempt::NegativeDialCache, DeferredAttempt::FailedDialFollower] {
+            let state = AppState::new("tracker-deferred-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            let key = tracker_stat_key(&tracker);
+            assert!(state.mark_tracker_announcing(&tracker).await);
+            absorb_tracker_attempt(&state, &tracker, "follower", Err(AttemptError::Deferred(reason))).await;
+            let planned = state.announcer_stats_planned().await;
+            let entry = &planned[&key];
+            assert_eq!(entry["status"], "deferred");
+            assert_eq!(entry["deferred_reason"], reason.to_string());
+            for field in ["num_request", "num_success", "num_error", "time_request", "time_success", "time_first_request"] {
+                assert_eq!(entry[field], 0, "no real attempt: {field}");
+            }
+            assert!(entry.get("time_last_error").is_none());
+            assert!(entry.get("last_error").is_none());
+            assert!(state.announcer_stats().await.get(&key).is_none());
+            assert!(state.tracker_backoff.read().await.is_empty());
+
+            assert!(state.mark_tracker_announcing(&tracker).await);
+            assert_eq!(state.announcer_stats().await[&key]["status"], "announcing");
+            absorb_tracker_attempt(&state, &tracker, "follower", Ok(Vec::new())).await;
+            let stats = state.announcer_stats().await;
+            let entry = &stats[&key];
+            assert_eq!(entry["status"], "announced");
+            assert_eq!(entry["num_request"], 1);
+            assert_eq!(entry["num_success"], 1);
+            assert_eq!(entry["num_error"], 0);
+            assert!(entry["time_first_request"].as_i64().unwrap() > 0);
+            assert!(entry.get("deferred_reason").is_none());
+            assert!(state.tracker_backoff.read().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_followers_cannot_overwrite_another_xites_real_result() {
+        for follower_first in [false, true] {
+            for succeeded in [false, true] {
+                let state = AppState::new("tracker-ordering-test");
+                let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+                let key = tracker_stat_key(&tracker);
+                state.mark_tracker_announcing(&tracker).await;
+                let follower = || Err(AttemptError::Deferred(DeferredAttempt::FailedDialFollower));
+                if follower_first {
+                    absorb_tracker_attempt(&state, &tracker, "follower", follower()).await;
+                }
+                let result = if succeeded { Ok(Vec::new()) } else { Err(AttemptError::Failed("dial failed".into())) };
+                absorb_tracker_attempt(&state, &tracker, "leader", result).await;
+                let winner = state.announcer_stats().await[&key].clone();
+                if !follower_first {
+                    absorb_tracker_attempt(&state, &tracker, "follower", follower()).await;
+                }
+                assert_eq!(state.announcer_stats().await[&key], winner);
+                assert_eq!(winner["num_request"], 1);
+                assert_eq!(winner["status"], if succeeded { "announced" } else { "error" });
+                let backoff = state.tracker_backoff.read().await;
+                assert!(!backoff.contains_key(&(key.clone(), "follower".into())));
+                assert_eq!(backoff.contains_key(&(key, "leader".into())), !succeeded);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_deferred_tracker_does_not_override_overlay_gating() {
+        let state = AppState::new("tracker-gating-test");
+        let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+        let key = tracker_stat_key(&tracker);
+        state.mark_tracker_announcing(&tracker).await;
+        state.mark_tracker_gated(&tracker).await;
+        let gated = state.announcer_stats_planned().await[&key].clone();
+        absorb_tracker_attempt(&state, &tracker, "follower", Err(AttemptError::Deferred(DeferredAttempt::FailedDialFollower))).await;
+        assert_eq!(state.announcer_stats_planned().await[&key], gated);
+        assert!(state.announcer_stats().await.get(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn reactivated_tracker_keeps_its_last_verdict_when_retry_is_deferred() {
+        for succeeded in [false, true] {
+            let state = AppState::new("tracker-reactivation-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            let key = tracker_stat_key(&tracker);
+            let result = if succeeded { Ok(Vec::new()) } else { Err(AttemptError::Failed("dial failed".into())) };
+            absorb_tracker_attempt(&state, &tracker, "fixture", result).await;
+            let previous = state.announcer_stats().await[&key].clone();
+            state.mark_tracker_gated(&tracker).await;
+            assert!(state.announcer_stats().await.get(&key).is_none());
+            assert!(state.mark_tracker_announcing(&tracker).await);
+            assert_eq!(state.announcer_stats().await[&key], previous);
+            absorb_tracker_attempt(&state, &tracker, "fixture", Err(AttemptError::Deferred(DeferredAttempt::NegativeDialCache))).await;
+            assert_eq!(state.announcer_stats().await[&key], previous);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_tracker_does_not_trigger_shared_tracker_eviction() {
+        for reason in [DeferredAttempt::NegativeDialCache, DeferredAttempt::FailedDialFollower] {
+            let state = AppState::new("tracker-eviction-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            let key = tracker_stat_key(&tracker);
+            state.config_set("shared_trackers", json!([tracker.to_string()])).await;
+            state.tracker_stats.write().await.insert(key.clone(), json!({
+                "status": "error", "num_request": SHARED_TRACKER_ERROR_LIMIT,
+                "num_error": SHARED_TRACKER_ERROR_LIMIT, "num_success": 0,
+                "time_first_request": now_secs() - SHARED_TRACKER_DEAD_SECS - 1,
+                "time_success": 0, "last_error": "original failure"
+            }));
+            let before = state.announcer_stats().await[&key].clone();
+            absorb_tracker_attempt(&state, &tracker, "follower", Err(AttemptError::Deferred(reason))).await;
+            assert_eq!(state.announcer_stats().await[&key], before);
+            assert_eq!(state.config_get("shared_trackers").await, Some(json!([tracker.to_string()])));
+            assert!(state.tracker_backoff.read().await.is_empty());
+            // The fixture really is eligible for eviction on its next real failure.
+            absorb_tracker_attempt(&state, &tracker, "leader", Err(AttemptError::Failed("new failure".into()))).await;
+            assert_eq!(state.config_get("shared_trackers").await, Some(json!([])));
+        }
+    }
+
+    #[tokio::test]
+    async fn genuine_tracker_errors_with_cache_diagnostics_still_back_off() {
+        for reason in [DeferredAttempt::NegativeDialCache, DeferredAttempt::FailedDialFollower] {
+            let state = AppState::new("tracker-diagnostic-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            for _ in 0..6 {
+                absorb_tracker_attempt(&state, &tracker, "fixture", Err(AttemptError::Failed(reason.to_string()))).await;
+            }
+            let stats = state.announcer_stats().await;
+            let entry = &stats[tracker_stat_key(&tracker)];
+            assert_eq!(entry["num_request"], 6);
+            assert_eq!(entry["num_error"], 6);
+            assert_eq!(entry["last_error"], reason.to_string());
+            assert!(state.tracker_backed_off(&tracker, "fixture").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_dial_results_do_not_count_as_fresh_tracker_failures() {
+        // A cached refusal and a caller queued behind the same failed dial
+        // both report the original attempt; neither attempted another dial.
+        let mut observed = Vec::new();
+        for deferred in [
+            DeferredAttempt::NegativeDialCache,
+            DeferredAttempt::FailedDialFollower,
+        ] {
+            let state = AppState::new("tracker-cache-test");
+            let tracker = epix_xite::Tracker::Epix(PeerAddr::parse(
+                "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:0",
+            ).unwrap());
+            let key = tracker_stat_key(&tracker);
+            let pair = (key.clone(), "fixture-xite".to_string());
+            let mut set = tokio::task::JoinSet::new();
+            let first_tracker = tracker.clone();
+            set.spawn(async move {
+                (first_tracker, Err(AttemptError::Failed("protocol: i2p connect fixture: transient failure".to_string())),
+                    std::time::Duration::from_millis(10))
+            });
+            state.absorb_announce_results(set, "fixture-xite", None).await;
+            let first_stats = state.tracker_stats.read().await[&key].clone();
+            let first_backoff = state.tracker_backoff.read().await[&pair];
+            for _ in 0..5 {
+                let mut set = tokio::task::JoinSet::new();
+                let tracker = tracker.clone();
+                set.spawn(async move {
+                    (tracker, Err(AttemptError::Deferred(deferred)), std::time::Duration::ZERO)
+                });
+                state.absorb_announce_results(set, "fixture-xite", None).await;
+            }
+            let backed_off = state.tracker_backed_off(&tracker, "fixture-xite").await;
+            let later_backoff = state.tracker_backoff.read().await[&pair];
+            let later_stats = state.tracker_stats.read().await[&key].clone();
+            eprintln!("issue585_tracker_report={}", json!({
+                "deferred": deferred.to_string(),
+                "backed_off": backed_off,
+                "first_backoff": first_backoff,
+                "later_backoff": later_backoff,
+                "first_stats": first_stats,
+                "later_stats": later_stats,
+            }));
+            observed.push((deferred, backed_off, first_backoff, later_backoff, first_stats, later_stats));
+        }
+        // Both suppression paths must preserve the same genuine outcome.
+        for (deferred, backed_off, first_backoff, later_backoff, first_stats, later_stats) in observed {
+            assert!(
+                !backed_off,
+                "one actual dial must not become six-minute backoff through {deferred}"
+            );
+            assert_eq!(later_backoff, first_backoff,
+                "suppression must not advance the failure streak or last-attempt stamp");
+            assert_eq!(later_stats, first_stats,
+                "keep the actual attempt count, latency, and original diagnostic");
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_tracker_failures_keep_the_existing_backoff() {
+        let state = AppState::new("tracker-real-failures-test");
+        let tracker = epix_xite::Tracker::Epix(PeerAddr::parse("203.0.113.9:26552").unwrap());
+        let key = tracker_stat_key(&tracker);
+        let pair = (key.clone(), "fixture-xite".to_string());
+        for attempt in 0..6 {
+            let mut set = tokio::task::JoinSet::new();
+            let tracker = tracker.clone();
+            set.spawn(async move {
+                (tracker, Err(AttemptError::Failed(format!("protocol: independent transport attempt {attempt} failed"))),
+                    std::time::Duration::from_millis(10))
+            });
+            state.absorb_announce_results(set, "fixture-xite", None).await;
+        }
+        assert_eq!(state.tracker_stats.read().await[&key]["num_request"], 6);
+        assert_eq!(state.tracker_stats.read().await[&key]["num_error"], 6);
+        assert!(state.tracker_backed_off(&tracker, "fixture-xite").await);
+        assert!(!state.tracker_backed_off(&tracker, "another-xite").await);
+        state.tracker_backoff.write().await.get_mut(&pair).unwrap().1 = now_secs() - 300;
+        assert!(state.tracker_backed_off(&tracker, "fixture-xite").await);
+        state.tracker_backoff.write().await.get_mut(&pair).unwrap().1 = now_secs() - 360;
+        assert!(!state.tracker_backed_off(&tracker, "fixture-xite").await);
+        let mut set = tokio::task::JoinSet::new();
+        let recovered = tracker.clone();
+        set.spawn(async move { (recovered, Ok(Vec::new()), std::time::Duration::ZERO) });
+        state.absorb_announce_results(set, "fixture-xite", None).await;
+        assert!(!state.tracker_backoff.read().await.contains_key(&pair));
+        assert_eq!(state.tracker_stats.read().await[&key]["num_error"], 0);
+        assert_eq!(state.tracker_stats.read().await[&key]["num_success"], 1);
     }
 
     #[tokio::test]

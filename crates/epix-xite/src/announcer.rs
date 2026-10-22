@@ -1,7 +1,9 @@
 //! Peer announcing: discover peers for a xite across one or more trackers.
 
-use epix_core::PeerAddr;
-use epix_discovery::{address_hash, discover_via_epix_tracker, AnnounceParams, AnnounceSender};
+use epix_core::{AttemptError, PeerAddr};
+use epix_discovery::{
+    address_hash, discover_via_epix_tracker_attempt, AnnounceParams, AnnounceSender,
+};
 
 pub use epix_discovery::Tracker;
 
@@ -73,22 +75,26 @@ async fn ask_tracker(
     xite_address: &str,
     port: u16,
     params: &AnnounceParams<'_>,
-) -> Result<Vec<PeerAddr>, String> {
+) -> Result<Vec<PeerAddr>, AttemptError<String>> {
     match tracker {
-        Tracker::Epix(addr) => discover_via_epix_tracker(sender, addr, params)
+        Tracker::Epix(addr) => discover_via_epix_tracker_attempt(sender, addr, params)
             .await
-            .map_err(|e| e.to_string()),
+            .map_err(|error| error.map_failure(|error| error.to_string())),
         Tracker::Bt(url) => {
             #[cfg(feature = "bittorrent")]
             {
-                epix_discovery::announce_bittorrent(url, xite_address, port).await
+                epix_discovery::announce_bittorrent(url, xite_address, port)
+                    .await
+                    .map_err(AttemptError::Failed)
             }
             #[cfg(not(feature = "bittorrent"))]
             {
                 // Imported configs and xite manifests may still contain BT
                 // URLs. A build without BT must never contact those trackers.
                 let _ = (url, xite_address, port);
-                Err("BitTorrent tracker discovery is not available in this build".into())
+                Err(AttemptError::Failed(
+                    "BitTorrent tracker discovery is not available in this build".into(),
+                ))
             }
         }
     }
@@ -109,14 +115,35 @@ fn fold_peers(peers: &mut Vec<PeerAddr>, found: Vec<PeerAddr>) {
 /// discovered peers. `Ok` as soon as ANY tracker answered - a reachable
 /// tracker that knows zero peers is a success, not an error, or a small
 /// peer-tracker that nobody announced to yet would be scored dead forever.
-/// `Err` (the last tracker's error) only when every tracker failed, so a
-/// single-tracker call reports that tracker's reachability exactly.
+/// `Err` only when no tracker answered. Genuine failures take precedence over
+/// local dial deferrals, so a single-tracker call reports its result exactly.
 pub async fn announce(
     sender: &dyn AnnounceSender,
     xite_address: &str,
     trackers: &[Tracker],
     advert: &SelfAdvert,
 ) -> Result<Vec<PeerAddr>, String> {
+    announce_attempt(sender, xite_address, trackers, advert)
+        .await
+        .map_err(|error| match error {
+            AttemptError::Failed(error) => error,
+            // Deferrals originate in the Epix tracker path. Keep its legacy
+            // protocol-error prefix for callers using the string API.
+            AttemptError::Deferred(reason) => {
+                epix_core::Error::Protocol(reason.to_string()).to_string()
+            }
+        })
+}
+
+/// Announce while preserving local dial deferrals for attempt accounting.
+/// Any successful answer wins, even if it contains no peers. Otherwise the
+/// last genuine failure wins; only an entirely deferred set returns Deferred.
+pub async fn announce_attempt(
+    sender: &dyn AnnounceSender,
+    xite_address: &str,
+    trackers: &[Tracker],
+    advert: &SelfAdvert,
+) -> Result<Vec<PeerAddr>, AttemptError<String>> {
     let hash = address_hash(xite_address);
     let mut need_types: Vec<&str> = if advert.want_clearnet {
         vec!["ipv4", "ipv6"]
@@ -159,27 +186,36 @@ pub async fn announce(
     };
     let mut peers: Vec<PeerAddr> = Vec::new();
     let mut answered = trackers.is_empty();
-    let mut last_error = String::new();
+    let mut last_failure = None;
+    let mut last_deferred = None;
     for tracker in trackers {
         match ask_tracker(sender, tracker, xite_address, advert.port, &params).await {
             Ok(found) => {
                 answered = true;
                 fold_peers(&mut peers, found);
             }
-            Err(e) => last_error = e,
+            Err(AttemptError::Failed(error)) => last_failure = Some(error),
+            Err(AttemptError::Deferred(reason)) => last_deferred = Some(reason),
         }
     }
     if answered {
         Ok(peers)
+    } else if let Some(error) = last_failure {
+        Err(AttemptError::Failed(error))
+    } else if let Some(reason) = last_deferred {
+        Err(AttemptError::Deferred(reason))
     } else {
-        Err(last_error)
+        Ok(peers)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use epix_core::DeferredAttempt;
     use epix_discovery::tracker_pc::{self, AnnounceResp, PeerBuckets};
+    use std::collections::VecDeque;
+    use std::sync::Mutex;
 
     /// A tracker that always answers, with the compact ipv4 peers it is given.
     struct Answering(Vec<Vec<u8>>);
@@ -353,5 +389,180 @@ mod tests {
         .await
         .expect("one live tracker carries the announce");
         assert_eq!(peers, vec![PeerAddr::parse("1.2.3.4:11111").unwrap()]);
+    }
+
+    enum Outcome {
+        Failed(&'static str),
+        Deferred(DeferredAttempt),
+        Peers(Vec<Vec<u8>>),
+    }
+
+    struct Outcomes(Mutex<VecDeque<Outcome>>);
+
+    #[async_trait::async_trait]
+    impl AnnounceSender for Outcomes {
+        async fn send(&self, _tracker: &PeerAddr, _payload: Vec<u8>) -> Result<Vec<u8>, String> {
+            panic!("announce must preserve typed outcomes");
+        }
+
+        async fn send_attempt(
+            &self,
+            tracker: &PeerAddr,
+            payload: Vec<u8>,
+        ) -> Result<Vec<u8>, AttemptError<String>> {
+            let outcome = self
+                .0
+                .lock()
+                .unwrap()
+                .pop_front()
+                .expect("one outcome per tracker");
+            match outcome {
+                Outcome::Failed(error) => Err(AttemptError::Failed(error.to_string())),
+                Outcome::Deferred(reason) => Err(AttemptError::Deferred(reason)),
+                Outcome::Peers(peers) => Answering(peers)
+                    .send(tracker, payload)
+                    .await
+                    .map_err(AttemptError::Failed),
+            }
+        }
+    }
+
+    async fn announce_outcomes(
+        outcomes: Vec<Outcome>,
+    ) -> Result<Vec<PeerAddr>, AttemptError<String>> {
+        let tracker = one_tracker().remove(0);
+        let trackers = vec![tracker; outcomes.len()];
+        let sender = Outcomes(Mutex::new(outcomes.into()));
+        let result = announce_attempt(&sender, "epix1xyz", &trackers, &SelfAdvert::default()).await;
+        assert!(
+            sender.0.lock().unwrap().is_empty(),
+            "all tracker replies are folded"
+        );
+        result
+    }
+
+    #[tokio::test]
+    async fn mixed_deferred_results_do_not_hide_the_last_genuine_failure() {
+        use DeferredAttempt::{FailedDialFollower, NegativeDialCache};
+        for outcomes in [
+            vec![
+                Outcome::Failed("first dial failed"),
+                Outcome::Deferred(NegativeDialCache),
+            ],
+            vec![
+                Outcome::Deferred(FailedDialFollower),
+                Outcome::Failed("first dial failed"),
+            ],
+            vec![
+                Outcome::Failed("earlier failure"),
+                Outcome::Deferred(NegativeDialCache),
+                Outcome::Failed("first dial failed"),
+                Outcome::Deferred(FailedDialFollower),
+            ],
+        ] {
+            assert_eq!(
+                announce_outcomes(outcomes).await.unwrap_err(),
+                AttemptError::Failed("protocol: first dial failed".to_string())
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn wholly_deferred_trackers_preserve_the_last_local_reason() {
+        for reasons in [
+            [
+                DeferredAttempt::NegativeDialCache,
+                DeferredAttempt::FailedDialFollower,
+            ],
+            [
+                DeferredAttempt::FailedDialFollower,
+                DeferredAttempt::NegativeDialCache,
+            ],
+        ] {
+            let outcomes = reasons.iter().copied().map(Outcome::Deferred).collect();
+            assert_eq!(
+                announce_outcomes(outcomes).await.unwrap_err(),
+                AttemptError::Deferred(reasons[1])
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failure_text_matching_a_local_reason_remains_a_failure() {
+        for text in [
+            "recent dial failure (negative cache)",
+            "dial in flight failed",
+        ] {
+            assert_eq!(
+                announce_outcomes(vec![
+                    Outcome::Failed(text),
+                    Outcome::Deferred(DeferredAttempt::NegativeDialCache)
+                ])
+                .await
+                .unwrap_err(),
+                AttemptError::Failed(format!("protocol: {text}"))
+            );
+        }
+    }
+
+    #[cfg(not(feature = "bittorrent"))]
+    #[tokio::test]
+    async fn unsupported_tracker_failure_is_not_hidden_by_a_deferred_epix_tracker() {
+        let mut trackers = vec![Tracker::Bt("http://127.0.0.1:1/announce".to_string())];
+        trackers.extend(one_tracker());
+        let sender = Outcomes(Mutex::new(
+            vec![Outcome::Deferred(DeferredAttempt::NegativeDialCache)].into(),
+        ));
+        let error = announce_attempt(&sender, "epix1xyz", &trackers, &SelfAdvert::default())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error,
+            AttemptError::Failed(
+                "BitTorrent tracker discovery is not available in this build".to_string()
+            )
+        );
+        assert!(sender.0.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn empty_or_successful_answers_win_over_failures_and_deferrals() {
+        assert!(announce_outcomes(Vec::new()).await.unwrap().is_empty());
+        for peers in [Vec::new(), vec![vec![1, 2, 3, 4, 0x67, 0x2B]]] {
+            let result = announce_outcomes(vec![
+                Outcome::Deferred(DeferredAttempt::NegativeDialCache),
+                Outcome::Peers(peers.clone()),
+                Outcome::Failed("dial failed"),
+                Outcome::Peers(peers.clone()),
+                Outcome::Deferred(DeferredAttempt::FailedDialFollower),
+            ])
+            .await
+            .unwrap();
+            let expected = if peers.is_empty() {
+                Vec::new()
+            } else {
+                vec![PeerAddr::parse("1.2.3.4:11111").unwrap()]
+            };
+            assert_eq!(
+                result, expected,
+                "successful peer replies remain deduplicated"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_announce_preserves_deferred_protocol_diagnostics() {
+        for reason in [
+            DeferredAttempt::NegativeDialCache,
+            DeferredAttempt::FailedDialFollower,
+        ] {
+            let sender = Outcomes(Mutex::new(vec![Outcome::Deferred(reason)].into()));
+            assert_eq!(
+                announce(&sender, "epix1xyz", &one_tracker(), &SelfAdvert::default())
+                    .await
+                    .unwrap_err(),
+                format!("protocol: {reason}")
+            );
+        }
     }
 }

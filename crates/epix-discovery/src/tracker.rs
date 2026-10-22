@@ -6,7 +6,7 @@
 //! transport or runtime dependency (the same seam the DHT uses for `Kad`).
 
 use crate::tracker_pc;
-use epix_core::{Error, PeerAddr, Result};
+use epix_core::{AttemptError, Error, PeerAddr, Result};
 
 /// Signs a tracker's onion-ownership challenge with the onion identity key.
 ///
@@ -31,7 +31,23 @@ pub trait OnionSigner: Send + Sync {
 /// tracker either way.
 #[async_trait::async_trait]
 pub trait AnnounceSender: Send + Sync {
-    async fn send(&self, tracker: &PeerAddr, payload: Vec<u8>) -> std::result::Result<Vec<u8>, String>;
+    async fn send(
+        &self,
+        tracker: &PeerAddr,
+        payload: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, String>;
+
+    /// Preserve local dial suppression without interpreting error text.
+    /// Legacy senders report every error as a genuine failed attempt.
+    async fn send_attempt(
+        &self,
+        tracker: &PeerAddr,
+        payload: Vec<u8>,
+    ) -> std::result::Result<Vec<u8>, AttemptError<String>> {
+        self.send(tracker, payload)
+            .await
+            .map_err(AttemptError::Failed)
+    }
 }
 
 /// Parameters for an `announce` request.
@@ -68,16 +84,35 @@ pub async fn discover_via_epix_tracker(
     tracker: &PeerAddr,
     params: &AnnounceParams<'_>,
 ) -> Result<Vec<PeerAddr>> {
-    let req = tracker_pc::encode_request(&tracker_pc::build_request(params))?;
-    let reply = sender.send(tracker, req).await.map_err(Error::Protocol)?;
-    let parsed = tracker_pc::parse_reply(&reply)?;
+    discover_via_epix_tracker_attempt(sender, tracker, params)
+        .await
+        .map_err(|error| match error {
+            AttemptError::Failed(error) => error,
+            AttemptError::Deferred(reason) => Error::Protocol(reason.to_string()),
+        })
+}
+
+/// Discover peers while preserving whether a local dial was deferred.
+/// A registration-only second call never changes a successful first result.
+pub async fn discover_via_epix_tracker_attempt(
+    sender: &dyn AnnounceSender,
+    tracker: &PeerAddr,
+    params: &AnnounceParams<'_>,
+) -> std::result::Result<Vec<PeerAddr>, AttemptError<Error>> {
+    let req = tracker_pc::encode_request(&tracker_pc::build_request(params))
+        .map_err(AttemptError::Failed)?;
+    let reply = sender
+        .send_attempt(tracker, req)
+        .await
+        .map_err(|error| error.map_failure(Error::Protocol))?;
+    let parsed = tracker_pc::parse_reply(&reply).map_err(AttemptError::Failed)?;
 
     if let Some(challenge) = &parsed.onion_sign_this {
         if let Some(signed) = tracker_pc::build_signed_request(params, challenge) {
             if let Ok(bytes) = tracker_pc::encode_request(&signed) {
                 // Registration only: a failure here shouldn't cost us the peers
                 // the first reply handed back.
-                let _ = sender.send(tracker, bytes).await;
+                let _ = sender.send_attempt(tracker, bytes).await;
             }
         }
     }
@@ -88,6 +123,7 @@ pub async fn discover_via_epix_tracker(
 mod tests {
     use super::*;
     use crate::tracker_pc::{AnnounceResp, PeerBuckets};
+    use epix_core::DeferredAttempt;
     use std::sync::Mutex;
 
     struct FakeSigner;
@@ -124,7 +160,11 @@ mod tests {
                     ipv4: vec![vec![1, 2, 3, 4, 0x67, 0x2B]],
                     ..Default::default()
                 }],
-                onion_sign_this: if first { "prove-it".into() } else { String::new() },
+                onion_sign_this: if first {
+                    "prove-it".into()
+                } else {
+                    String::new()
+                },
                 error: String::new(),
             };
             tracker_pc::encode_reply(&resp).map_err(|e| e.to_string())
@@ -156,7 +196,9 @@ mod tests {
         let signer = FakeSigner;
         let hashes = [[5u8; 32]];
         let onions = ["aaaabbbbccccdddd".to_string()];
-        let tracker = ChallengingTracker { seen: Mutex::new(Vec::new()) };
+        let tracker = ChallengingTracker {
+            seen: Mutex::new(Vec::new()),
+        };
         let addr = PeerAddr::parse("127.0.0.1:26552").unwrap();
 
         let peers =
@@ -178,9 +220,13 @@ mod tests {
     #[tokio::test]
     async fn no_signer_means_a_single_announce() {
         let hashes = [[5u8; 32]];
-        let tracker = ChallengingTracker { seen: Mutex::new(Vec::new()) };
+        let tracker = ChallengingTracker {
+            seen: Mutex::new(Vec::new()),
+        };
         let addr = PeerAddr::parse("127.0.0.1:26552").unwrap();
-        discover_via_epix_tracker(&tracker, &addr, &params(&hashes, &[], None)).await.unwrap();
+        discover_via_epix_tracker(&tracker, &addr, &params(&hashes, &[], None))
+            .await
+            .unwrap();
         assert_eq!(tracker.seen.lock().unwrap().len(), 1);
     }
 
@@ -205,5 +251,185 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("EDX dial timed out"));
+    }
+
+    struct DeferredSender(DeferredAttempt);
+
+    #[async_trait::async_trait]
+    impl AnnounceSender for DeferredSender {
+        async fn send(
+            &self,
+            _tracker: &PeerAddr,
+            _payload: Vec<u8>,
+        ) -> std::result::Result<Vec<u8>, String> {
+            panic!("typed discovery must not discard the deferral marker");
+        }
+
+        async fn send_attempt(
+            &self,
+            _tracker: &PeerAddr,
+            _payload: Vec<u8>,
+        ) -> std::result::Result<Vec<u8>, AttemptError<String>> {
+            Err(AttemptError::Deferred(self.0))
+        }
+    }
+
+    #[tokio::test]
+    async fn local_deferrals_survive_discovery_and_legacy_diagnostics() {
+        let addr = PeerAddr::parse("127.0.0.1:26552").unwrap();
+        let hashes = [[5u8; 32]];
+        for reason in [
+            DeferredAttempt::NegativeDialCache,
+            DeferredAttempt::FailedDialFollower,
+        ] {
+            let sender = DeferredSender(reason);
+            let error =
+                discover_via_epix_tracker_attempt(&sender, &addr, &params(&hashes, &[], None))
+                    .await
+                    .unwrap_err();
+            assert!(matches!(error, AttemptError::Deferred(actual) if actual == reason));
+            let legacy = discover_via_epix_tracker(&sender, &addr, &params(&hashes, &[], None))
+                .await
+                .unwrap_err();
+            assert!(matches!(legacy, Error::Protocol(text) if text == reason.to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_and_remote_error_text_cannot_claim_a_deferral() {
+        struct TextError {
+            text: String,
+            remote: bool,
+        }
+        #[async_trait::async_trait]
+        impl AnnounceSender for TextError {
+            async fn send(
+                &self,
+                _tracker: &PeerAddr,
+                _payload: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, String> {
+                if self.remote {
+                    tracker_pc::encode_reply(&AnnounceResp {
+                        peers: Vec::new(),
+                        onion_sign_this: String::new(),
+                        error: self.text.clone(),
+                    })
+                    .map_err(|error| error.to_string())
+                } else {
+                    Err(self.text.clone())
+                }
+            }
+        }
+        let addr = PeerAddr::parse("127.0.0.1:26552").unwrap();
+        let hashes = [[5u8; 32]];
+        for reason in [
+            DeferredAttempt::NegativeDialCache,
+            DeferredAttempt::FailedDialFollower,
+        ] {
+            for remote in [false, true] {
+                let sender = TextError {
+                    text: reason.to_string(),
+                    remote,
+                };
+                let error =
+                    discover_via_epix_tracker_attempt(&sender, &addr, &params(&hashes, &[], None))
+                        .await
+                        .unwrap_err();
+                let expected = if remote {
+                    format!("announce: {reason}")
+                } else {
+                    reason.to_string()
+                };
+                assert!(
+                    matches!(error, AttemptError::Failed(Error::Protocol(text)) if text == expected)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_malformed_reply_is_a_failed_attempt() {
+        struct Malformed;
+        #[async_trait::async_trait]
+        impl AnnounceSender for Malformed {
+            async fn send(
+                &self,
+                _tracker: &PeerAddr,
+                _payload: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, String> {
+                Ok(Vec::new())
+            }
+        }
+        let addr = PeerAddr::parse("127.0.0.1:26552").unwrap();
+        let hashes = [[5u8; 32]];
+        let error =
+            discover_via_epix_tracker_attempt(&Malformed, &addr, &params(&hashes, &[], None))
+                .await
+                .unwrap_err();
+        assert!(
+            matches!(error, AttemptError::Failed(Error::Protocol(text)) if text.starts_with("announce reply decode:"))
+        );
+    }
+
+    #[tokio::test]
+    async fn registration_only_deferral_preserves_discovered_peers() {
+        struct RegistrationDeferred {
+            first: ChallengingTracker,
+            reason: DeferredAttempt,
+        }
+        #[async_trait::async_trait]
+        impl AnnounceSender for RegistrationDeferred {
+            async fn send(
+                &self,
+                _tracker: &PeerAddr,
+                _payload: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, String> {
+                panic!("registration must use the typed sender too");
+            }
+
+            async fn send_attempt(
+                &self,
+                tracker: &PeerAddr,
+                payload: Vec<u8>,
+            ) -> std::result::Result<Vec<u8>, AttemptError<String>> {
+                let request = tracker_pc::decode_request(&payload)
+                    .map_err(AttemptError::Failed)
+                    .map_err(|error| error.map_failure(|error| error.to_string()))?;
+                if request.need_num == 0 {
+                    assert_eq!(request.onion_sign_this, "prove-it");
+                    assert_eq!(request.onion_signs[0].0, vec![7; 32]);
+                    self.first.seen.lock().unwrap().push(request);
+                    Err(AttemptError::Deferred(self.reason))
+                } else {
+                    self.first
+                        .send(tracker, payload)
+                        .await
+                        .map_err(AttemptError::Failed)
+                }
+            }
+        }
+        let addr = PeerAddr::parse("127.0.0.1:26552").unwrap();
+        let hashes = [[5u8; 32]];
+        let onions = ["aaaabbbbccccdddd".to_string()];
+        for reason in [
+            DeferredAttempt::NegativeDialCache,
+            DeferredAttempt::FailedDialFollower,
+        ] {
+            let sender = RegistrationDeferred {
+                first: ChallengingTracker {
+                    seen: Mutex::new(Vec::new()),
+                },
+                reason,
+            };
+            let peers = discover_via_epix_tracker_attempt(
+                &sender,
+                &addr,
+                &params(&hashes, &onions, Some(&FakeSigner)),
+            )
+            .await
+            .unwrap();
+            assert_eq!(peers, vec![PeerAddr::parse("1.2.3.4:11111").unwrap()]);
+            assert_eq!(sender.first.seen.lock().unwrap().len(), 2);
+        }
     }
 }

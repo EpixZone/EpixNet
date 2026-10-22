@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use epix_blob::policy::{FetchTier, OrderPolicy};
 use epix_blob::store::Store;
 use epix_blob::{Ns, ObjId};
-use epix_core::PeerAddr;
+use epix_core::{AttemptError, DeferredAttempt, PeerAddr};
 use epix_edx::choke::{Choker, Reach};
 use epix_edx::conn::{Conn, Incoming};
 use epix_edx::msg::{caps, Hello, Req};
@@ -1662,6 +1662,9 @@ impl LinkActivityState {
     }
 }
 
+#[cfg(test)]
+type DialGateTestPause = (tokio::sync::oneshot::Sender<()>, tokio::sync::oneshot::Receiver<()>);
+
 #[derive(Default)]
 struct LinkPool {
     conns: Mutex<HashMap<LinkKey, PooledLink>>,
@@ -1677,6 +1680,9 @@ struct LinkPool {
     /// /Stats, and on Tor a fresh circuit apiece. Losers of the race wait here
     /// and take the winner's link.
     dialing: Mutex<HashMap<LinkKey, Arc<tokio::sync::Mutex<()>>>>,
+    /// One-shot, pool-local checkpoint for the cache/gate race test.
+    #[cfg(test)]
+    before_dial_gate: Mutex<Option<DialGateTestPause>>,
 }
 
 /// One pooled link, plus when it was last handed out. The instant is what
@@ -1798,7 +1804,12 @@ impl LinkPool {
     ///
     /// The gate is only ever held across `dial`, which the caller bounds by the
     /// peer's connect timeout, so a stalled peer cannot park it indefinitely.
-    async fn get_or_dial<F, Fut>(&self, peer: &PeerAddr, lane: u8, dial: F) -> Result<Link, String>
+    async fn get_or_dial<F, Fut>(
+        &self,
+        peer: &PeerAddr,
+        lane: u8,
+        dial: F,
+    ) -> Result<Link, AttemptError<String>>
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<OpenedLink, String>>,
@@ -1806,24 +1817,29 @@ impl LinkPool {
         if let Some(hit) = self.live(peer, lane) {
             return Ok(hit);
         }
-        {
-            let mut failed = self.failed.lock().expect("link pool");
-            failed.retain(|_, at| at.elapsed() < LINK_NEGATIVE_TTL);
-            if failed.contains_key(&(peer.clone(), lane)) {
-                return Err("recent dial failure (negative cache)".to_string());
-            }
+        if self.recent_failure(peer, lane) {
+            return Err(AttemptError::Deferred(DeferredAttempt::NegativeDialCache));
         }
+        #[cfg(test)]
+        self.pause_before_dial_gate().await;
         let gate = self.dial_gate(peer, lane);
         let Ok(_held) = gate.try_lock() else {
             // Another caller is dialing this very peer and lane. Wait it out
             // rather than opening a second link on the same lane.
             let _queued = gate.lock().await;
-            return self.live(peer, lane).ok_or_else(|| "dial in flight failed".to_string());
+            return self.live(peer, lane).ok_or(AttemptError::Deferred(
+                DeferredAttempt::FailedDialFollower,
+            ));
         };
         // The lookup above and the gate are two steps: a dial may have completed
         // and cached between them.
         if let Some(hit) = self.live(peer, lane) {
             return Ok(hit);
+        }
+        // A failed dial can also finish between the first lookup and gate
+        // acquisition. Suppress that retry without extending the failure TTL.
+        if self.recent_failure(peer, lane) {
+            return Err(AttemptError::Deferred(DeferredAttempt::NegativeDialCache));
         }
         let opened = match dial().await {
             Ok(opened) => opened,
@@ -1832,7 +1848,7 @@ impl LinkPool {
                     .lock()
                     .expect("link pool")
                     .insert((peer.clone(), lane), std::time::Instant::now());
-                return Err(error);
+                return Err(AttemptError::Failed(error));
             }
         };
         self.failed.lock().expect("link pool").remove(&(peer.clone(), lane));
@@ -1844,6 +1860,21 @@ impl LinkPool {
         );
         self.store(peer.clone(), lane, opened);
         Ok(link)
+    }
+
+    fn recent_failure(&self, peer: &PeerAddr, lane: u8) -> bool {
+        let mut failed = self.failed.lock().expect("link pool");
+        failed.retain(|_, at| at.elapsed() < LINK_NEGATIVE_TTL);
+        failed.contains_key(&(peer.clone(), lane))
+    }
+
+    #[cfg(test)]
+    async fn pause_before_dial_gate(&self) {
+        let pause = self.before_dial_gate.lock().expect("dial gate test pause").take();
+        if let Some((entered, resume)) = pause {
+            let _ = entered.send(());
+            let _ = resume.await;
+        }
     }
 
     /// This peer+lane's dial gate, created on first use. Gates nobody is
@@ -2452,6 +2483,15 @@ impl RuntimeEdxFetcher {
     /// [`Transport::dial_lane`]). Pooled per lane, so a lane's circuit is
     /// reused by later windows rather than rebuilt.
     async fn link_lane(&self, peer: &PeerAddr, lane: u8) -> Result<Link, String> {
+        self.link_lane_attempt(peer, lane).await.map_err(|error| error.to_string())
+    }
+
+    /// Preserve whether this caller actually dialed for tracker accounting.
+    async fn link_lane_attempt(
+        &self,
+        peer: &PeerAddr,
+        lane: u8,
+    ) -> Result<Link, AttemptError<String>> {
         self.link_pool
             .get_or_dial(peer, lane, || async {
                 let transport = self.state.transport().await.ok_or("no transport")?;
@@ -2473,17 +2513,30 @@ impl RuntimeEdxFetcher {
         F: FnOnce(Conn) -> Fut,
         Fut: std::future::Future<Output = std::io::Result<T>>,
     {
-        let (conn, _identity, reg, _activity) = self.link(peer).await?;
+        self.control_attempt(peer, label, f).await.map_err(|error| error.to_string())
+    }
+
+    async fn control_attempt<T, F, Fut>(
+        &self,
+        peer: &PeerAddr,
+        label: &str,
+        f: F,
+    ) -> Result<T, AttemptError<String>>
+    where
+        F: FnOnce(Conn) -> Fut,
+        Fut: std::future::Future<Output = std::io::Result<T>>,
+    {
+        let (conn, _identity, reg, _activity) = self.link_lane_attempt(peer, 0).await?;
         reg.note_cmd_sent(label, None);
         match tokio::time::timeout(EDX_FETCH_TIMEOUT, f(conn)).await {
             Ok(Ok(v)) => Ok(v),
             Ok(Err(e)) => {
                 self.link_pool.evict(peer);
-                Err(e.to_string())
+                Err(AttemptError::Failed(e.to_string()))
             }
             Err(_) => {
                 self.link_pool.evict(peer);
-                Err("EDX control request timed out".into())
+                Err(AttemptError::Failed("EDX control request timed out".into()))
             }
         }
     }
@@ -5711,7 +5764,15 @@ impl EdxFetcher for RuntimeEdxFetcher {
     }
 
     async fn announce(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
-        self.control(&peer, "Announce", move |conn| async move {
+        self.announce_attempt(peer, payload).await.map_err(|error| error.to_string())
+    }
+
+    async fn announce_attempt(
+        &self,
+        peer: PeerAddr,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, AttemptError<String>> {
+        self.control_attempt(&peer, "Announce", move |conn| async move {
             epix_edx::fetch::announce(&conn, payload).await
         })
         .await
@@ -9992,6 +10053,357 @@ mod tests {
         drop(conn);
         tokio::time::advance(LINK_POOL_IDLE + std::time::Duration::from_secs(1)).await;
         assert!(pool.live(&peer, 0).is_none(), "once nobody is using it, an idle link is swept");
+    }
+
+    /// A real Ready SAM client can see one transient destination failure.
+    /// Suppressed retries are not six independent tracker failures.
+    #[cfg(feature = "i2p")]
+    #[test]
+    fn ready_sam_cached_refusals_do_not_extend_tracker_backoff() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        // Own the runtime as well as the fake server. I2p::spawn internally
+        // detaches its bringup/accept task, so runtime teardown must cancel it
+        // even if the scenario panics. All temp data outlives that teardown.
+        let data = tempfile::tempdir().unwrap();
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        let report = runtime.block_on(async {
+            let tracker_data = data.path().join("tracker");
+            tokio::fs::create_dir_all(&tracker_data).await.unwrap();
+            let tracker_state = AppState::with_data_dir("sam-tracker", &tracker_data);
+            let serve = ensure_edx_serve(
+                &new_serve_cell(ControlHandles::detached()),
+                &tracker_state,
+            ).await.unwrap();
+            let hook = serve.overlay_hook();
+            let address = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+            // This peer is returned in a tracker reply only, never dialed.
+            let known = PeerAddr::parse("203.0.113.9:26552").unwrap();
+            tracker_state.tracker_announce(&[epix_discovery::address_hash(address)], &known).await;
+            let peer = PeerAddr::I2p { dest: format!("{}.b32", "a".repeat(52)), port: 0 };
+            let tracker = epix_xite::Tracker::Epix(peer.clone());
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let sam_port = listener.local_addr().unwrap().port();
+            let connects = Arc::new(AtomicUsize::new(0));
+            let sessions = Arc::new(AtomicUsize::new(0));
+            let recovered = Arc::new(AtomicBool::new(false));
+            let connect_ids = Arc::new(Mutex::new(Vec::<String>::new()));
+            let (stop_tx, mut stop_rx) = tokio::sync::oneshot::channel::<()>();
+            let (calls, creates, ready, ids) =
+                (connects.clone(), sessions.clone(), recovered.clone(), connect_ids.clone());
+            let server = tokio::spawn(async move {
+                let mut handlers = tokio::task::JoinSet::new();
+                let mut errors = Vec::new();
+                loop {
+                    tokio::select! {
+                        _ = &mut stop_rx => break,
+                        result = handlers.join_next(), if !handlers.is_empty() => {
+                            match result.unwrap() {
+                                Ok(Ok(())) => {},
+                                Ok(Err(error)) => errors.push(error),
+                                Err(error) => errors.push(error.to_string()),
+                            }
+                        },
+                        accepted = listener.accept() => {
+                            let (stream, _) = accepted.unwrap();
+                            let (hook, calls, creates, ready, ids) =
+                                (hook.clone(), calls.clone(), creates.clone(), ready.clone(), ids.clone());
+                            handlers.spawn(async move {
+                                let mut io = BufReader::new(stream);
+                                let mut line = String::new();
+                                if io.read_line(&mut line).await.map_err(|e| e.to_string())? == 0 {
+                                    return Ok::<_, String>(());
+                                }
+                                if !line.starts_with("HELLO VERSION") {
+                                    return Err(format!("unexpected SAM hello: {line}"));
+                                }
+                                io.write_all(b"HELLO REPLY RESULT=OK VERSION=3.1\n").await.map_err(|e| e.to_string())?;
+                                line.clear();
+                                if io.read_line(&mut line).await.map_err(|e| e.to_string())? == 0 {
+                                    return Ok(());
+                                }
+                                if line.starts_with("SESSION CREATE") {
+                                    creates.fetch_add(1, Ordering::SeqCst);
+                                    // Yosemite's create-session tracing reads the first ten
+                                    // destination bytes; the fixture identity must be long enough.
+                                    io.write_all(b"SESSION STATUS RESULT=OK DESTINATION=test-private-key\n").await.map_err(|e| e.to_string())?;
+                                } else if line.starts_with("STREAM ACCEPT") {
+                                    io.write_all(b"STREAM STATUS RESULT=OK\n").await.map_err(|e| e.to_string())?;
+                                } else if line.starts_with("STREAM CONNECT") {
+                                    calls.fetch_add(1, Ordering::SeqCst);
+                                    ids.lock().unwrap().push(line.split_whitespace().find(|v| v.starts_with("ID=")).unwrap().to_owned());
+                                    if !ready.load(Ordering::SeqCst) {
+                                        io.write_all(b"STREAM STATUS RESULT=CANT_REACH_PEER\n").await.map_err(|e| e.to_string())?;
+                                        return Ok(());
+                                    }
+                                    io.write_all(b"STREAM STATUS RESULT=OK\n").await.map_err(|e| e.to_string())?;
+                                    // BufReader preserves any bytes buffered after the SAM line.
+                                    hook(PeerAddr::I2p { dest: String::new(), port: 0 }, Box::pin(io)).await;
+                                    return Ok(());
+                                } else {
+                                    return Err(format!("unexpected SAM command: {line}"));
+                                }
+                                // Keep session control and pending accept sockets alive.
+                                line.clear();
+                                let _ = io.read_line(&mut line).await;
+                                Ok(())
+                            });
+                        }
+                    }
+                }
+                handlers.abort_all();
+                while let Some(result) = handlers.join_next().await {
+                    match result {
+                        Ok(Ok(())) => {},
+                        Ok(Err(error)) => errors.push(error),
+                        Err(error) if error.is_cancelled() => {},
+                        Err(error) => errors.push(error.to_string()),
+                    }
+                }
+                errors
+            });
+
+            let scenario = tokio::time::timeout(std::time::Duration::from_secs(12), async {
+                let client_data = data.path().join("client");
+                let i2p_data = client_data.join("i2p");
+                tokio::fs::create_dir_all(&i2p_data).await.unwrap();
+                tokio::fs::write(i2p_data.join("destination.key"), "AQID\ntest-private-key\n").await.unwrap();
+                let client = AppState::with_data_dir("sam-client", &client_data);
+                client.set_transport(Arc::new(TcpTransport)).await;
+                client.set_edx_store(Arc::new(Store::open(&client_data.join("store")).unwrap())).await.unwrap();
+                let fetcher = Arc::new(RuntimeEdxFetcher::new(client.clone(), epix_crypt::new_seed(), None));
+                client.set_edx_fetcher(fetcher.clone()).await;
+                let (i2p, inbound) = epix_i2p::I2p::spawn(epix_i2p::I2pConfig {
+                    mode: epix_i2p::I2pMode::External,
+                    sam_tcp_port: sam_port,
+                    data_dir: i2p_data,
+                });
+                client.set_i2p_transport(Arc::new(i2p.transport())).await;
+                client.set_i2p_status(serde_json::json!({"phase": "Starting"})).await;
+                client.announce_to_trackers(address, std::slice::from_ref(&tracker)).await;
+                let pre_ready_calls = connects.load(Ordering::SeqCst);
+                let pre_ready_empty = fetcher.link_pool.failed.lock().unwrap().is_empty();
+                while i2p.status().await.phase != epix_i2p::I2pPhase::Ready {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                // Mirror the real SAM status just as the runtime status loop does.
+                let status = i2p.status().await;
+                let actual_phase = status.phase.label();
+                client.set_i2p_status(serde_json::json!({"phase": actual_phase.clone()})).await;
+                client.announce_to_trackers(address, std::slice::from_ref(&tracker)).await;
+                let first = client.announcer_stats().await;
+                let failed_at = *fetcher.link_pool.failed.lock().unwrap().get(&(peer.clone(), 0)).unwrap();
+                for _ in 0..5 {
+                    client.announce_to_trackers(address, std::slice::from_ref(&tracker)).await;
+                }
+                let repeated = client.announcer_stats().await;
+                let attempts_after_polls = connects.load(Ordering::SeqCst);
+                let timestamp_unchanged = fetcher.link_pool.failed.lock().unwrap().get(&(peer.clone(), 0)) == Some(&failed_at);
+                // LinkPool uses std::Instant, not Tokio's virtual clock. Age
+                // only its private fixture entry; do not wait 45 real seconds.
+                fetcher.link_pool.failed.lock().unwrap().insert(
+                    (peer.clone(), 0),
+                    std::time::Instant::now() - LINK_NEGATIVE_TTL,
+                );
+                recovered.store(true, Ordering::SeqCst);
+                let found = client.announce_to_trackers(address, std::slice::from_ref(&tracker)).await;
+                let final_stats = client.announcer_stats().await;
+                // Confirm the shared pool is usable at the same expiry boundary.
+                let direct_pool_ready = fetcher.link(&peer).await.is_ok();
+                let final_attempts = connects.load(Ordering::SeqCst);
+                let session_count = sessions.load(Ordering::SeqCst);
+                let used_ids = connect_ids.lock().unwrap().clone();
+                fetcher.link_pool.conns.lock().unwrap().clear();
+                drop(inbound);
+                (pre_ready_calls, pre_ready_empty, first, repeated, attempts_after_polls,
+                    timestamp_unchanged, found, final_stats, direct_pool_ready, final_attempts,
+                    session_count, used_ids, tracker.to_string(), known, actual_phase)
+            }).await;
+            let _ = stop_tx.send(());
+            let errors = server.await.unwrap();
+            (scenario, errors)
+        });
+        // Cancels the library's detached SAM accept loop and EDX tasks too.
+        runtime.shutdown_timeout(std::time::Duration::from_secs(1));
+        let (scenario, server_errors) = report;
+        assert!(server_errors.is_empty(), "SAM fixture errors: {server_errors:?}");
+        let (pre_ready_calls, pre_ready_empty, first, repeated, attempts_after_polls,
+            timestamp_unchanged, found, final_stats, direct_pool_ready, final_attempts,
+            session_count, used_ids, key, known, actual_phase) = scenario.expect("bounded SAM scenario");
+        eprintln!("issue585_report={}", serde_json::json!({
+            "sam_phase": actual_phase,
+            "pre_ready_calls": pre_ready_calls,
+            "pre_ready_cache_empty": pre_ready_empty,
+            "first_stats": first[&key],
+            "stats_after_cached_polls": repeated[&key],
+            "actual_dials_after_cached_polls": attempts_after_polls,
+            "negative_cache_timestamp_unchanged": timestamp_unchanged,
+            "direct_pool_recovery_at_45_seconds": direct_pool_ready,
+            "public_announce_recovered_at_45_seconds": found.contains(&known),
+            "final_stats": final_stats[&key],
+            "final_actual_dials": final_attempts,
+            "sam_session_count": session_count,
+            "connect_ids": used_ids,
+            "fake_handler_errors": server_errors,
+        }));
+        assert_eq!(actual_phase, "Ready");
+        assert_eq!(pre_ready_calls, 0, "Starting tracker announces are gated");
+        assert!(pre_ready_empty, "gating must not create negative-cache entries");
+        assert_eq!(first[&key]["num_request"], 1);
+        assert_eq!(first[&key]["num_error"], 1);
+        assert_eq!(attempts_after_polls, 1, "only the first poll dials SAM");
+        assert!(timestamp_unchanged, "cached polls must not extend the pool's TTL");
+        assert!(direct_pool_ready, "pool recovery must succeed at its 45s boundary");
+        assert_eq!(final_attempts, 2, "one failed stream and one recovered EDX link");
+        assert_eq!(session_count, 2, "one inbound and one reusable outbound SAM session");
+        assert_eq!(used_ids.len(), 2);
+        assert_eq!(used_ids[0], used_ids[1], "a destination refusal does not kill the SAM session");
+        // Suppressed retries preserve the real attempt's counters and diagnostic.
+        assert_eq!(repeated[&key]["num_request"], 1, "cached refusals are not new network attempts");
+        assert_eq!(repeated[&key]["num_error"], 1, "one failure must not become six");
+        assert_eq!(repeated[&key]["last_error"], first[&key]["last_error"]);
+        assert!(found.contains(&known), "tracker must recover without a synthetic six-minute ban");
+        assert_eq!(final_stats[&key]["num_request"], 2);
+        assert_eq!(final_stats[&key]["num_success"], 1);
+        assert_eq!(final_stats[&key]["num_error"], 0);
+    }
+
+    async fn poll_once_pending<F: std::future::Future>(
+        mut future: std::pin::Pin<&mut F>,
+    ) -> bool {
+        std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(future.as_mut().poll(cx).is_pending())
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn cached_dial_results_preserve_attempt_kind_and_expiry() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let peer = PeerAddr::parse("198.51.100.14:26552").unwrap();
+        // A real dial failure can contain either legacy diagnostic. Its text
+        // must never turn it into a deferred result.
+        for diagnostic in ["recent dial failure (negative cache)", "dial in flight failed"] {
+            let pool = LinkPool::default();
+            let dials = AtomicUsize::new(0);
+            let first = pool.get_or_dial(&peer, 0, || async {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Err::<OpenedLink, String>(diagnostic.into())
+            }).await;
+            assert_eq!(first.err(), Some(AttemptError::Failed(diagnostic.into())));
+            let key = (peer.clone(), 0);
+            let failed_at = pool.failed.lock().unwrap()[&key];
+            let cached = pool.get_or_dial(&peer, 0, || async {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Err::<OpenedLink, String>("unexpected retry".into())
+            }).await;
+            assert_eq!(cached.err(), Some(AttemptError::Deferred(DeferredAttempt::NegativeDialCache)));
+            assert_eq!(dials.load(Ordering::SeqCst), 1);
+            assert_eq!(pool.failed.lock().unwrap()[&key], failed_at);
+
+            let expired = std::time::Instant::now() - LINK_NEGATIVE_TTL;
+            pool.failed.lock().unwrap().insert(key.clone(), expired);
+            let retried = pool.get_or_dial(&peer, 0, || async {
+                dials.fetch_add(1, Ordering::SeqCst);
+                Err::<OpenedLink, String>(diagnostic.into())
+            }).await;
+            assert_eq!(retried.err(), Some(AttemptError::Failed(diagnostic.into())));
+            assert_eq!(dials.load(Ordering::SeqCst), 2, "expiry permits a real new attempt");
+            assert!(pool.failed.lock().unwrap()[&key] > expired);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_failed_dial_follower_is_deferred_without_another_attempt() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = LinkPool::default();
+        let peer = PeerAddr::parse("198.51.100.15:26552").unwrap();
+        let dials = AtomicUsize::new(0);
+        let (finish, wait) = tokio::sync::oneshot::channel();
+        let mut leader = Box::pin(pool.get_or_dial(&peer, 0, || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            wait.await.unwrap();
+            Err::<OpenedLink, String>("actual connection failure".into())
+        }));
+        assert!(poll_once_pending(leader.as_mut()).await, "leader holds the dial gate");
+        let mut follower = Box::pin(pool.get_or_dial(&peer, 0, || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            Err::<OpenedLink, String>("unexpected follower dial".into())
+        }));
+        assert!(poll_once_pending(follower.as_mut()).await, "follower queued before failure");
+        finish.send(()).unwrap();
+        let first = leader.await;
+        let failed_at = pool.failed.lock().unwrap()[&(peer.clone(), 0)];
+        let queued = follower.await;
+        // Both owned futures have completed before checking their outcomes.
+        assert_eq!(first.err(), Some(AttemptError::Failed("actual connection failure".into())));
+        assert_eq!(queued.err(), Some(AttemptError::Deferred(DeferredAttempt::FailedDialFollower)));
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        assert_eq!(pool.failed.lock().unwrap()[&(peer, 0)], failed_at);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_dial_does_not_give_its_follower_a_new_failure() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = LinkPool::default();
+        let peer = PeerAddr::parse("198.51.100.16:26552").unwrap();
+        let dials = AtomicUsize::new(0);
+        let mut leader = Box::pin(pool.get_or_dial(&peer, 0, || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            std::future::pending::<Result<OpenedLink, String>>().await
+        }));
+        assert!(poll_once_pending(leader.as_mut()).await);
+        let mut follower = Box::pin(pool.get_or_dial(&peer, 0, || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            Err::<OpenedLink, String>("unexpected follower dial".into())
+        }));
+        assert!(poll_once_pending(follower.as_mut()).await);
+        drop(leader);
+        let queued = follower.await;
+        assert_eq!(queued.err(), Some(AttemptError::Deferred(DeferredAttempt::FailedDialFollower)));
+        assert!(pool.failed.lock().unwrap().is_empty(), "cancellation did not cache a failed dial");
+        assert_eq!(dials.load(Ordering::SeqCst), 1);
+        let next = pool.get_or_dial(&peer, 0, || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            Err::<OpenedLink, String>("new connection failure".into())
+        }).await;
+        assert_eq!(next.err(), Some(AttemptError::Failed("new connection failure".into())));
+        assert_eq!(dials.load(Ordering::SeqCst), 2, "a later independent caller may dial");
+    }
+
+    #[tokio::test]
+    async fn a_failure_between_cache_lookup_and_gate_is_not_redialed() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let pool = LinkPool::default();
+        let peer = PeerAddr::parse("198.51.100.17:26552").unwrap();
+        let dials = AtomicUsize::new(0);
+        let (entered, at_gate) = tokio::sync::oneshot::channel();
+        let (resume, wait) = tokio::sync::oneshot::channel();
+        *pool.before_dial_gate.lock().unwrap() = Some((entered, wait));
+        let mut late = Box::pin(pool.get_or_dial(&peer, 0, || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            Err::<OpenedLink, String>("unexpected stale-lookup dial".into())
+        }));
+        assert!(poll_once_pending(late.as_mut()).await);
+        at_gate.await.unwrap();
+        // Complete an independent dial after the paused caller saw no cached
+        // failure, but before that caller can take the now-free dial gate.
+        let winner = pool.get_or_dial(&peer, 0, || async {
+            dials.fetch_add(1, Ordering::SeqCst);
+            Err::<OpenedLink, String>("completed connection failure".into())
+        }).await;
+        let failed_at = pool.failed.lock().unwrap()[&(peer.clone(), 0)];
+        resume.send(()).unwrap();
+        let resumed = late.await;
+        assert_eq!(winner.err(), Some(AttemptError::Failed("completed connection failure".into())));
+        assert_eq!(resumed.err(), Some(AttemptError::Deferred(DeferredAttempt::NegativeDialCache)));
+        assert_eq!(dials.load(Ordering::SeqCst), 1, "the post-gate lookup suppresses the retry");
+        assert_eq!(pool.failed.lock().unwrap()[&(peer, 0)], failed_at);
     }
 
     /// A dial that fails must not be retried by everyone queued behind it: each
