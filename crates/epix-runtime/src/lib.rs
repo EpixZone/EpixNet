@@ -2374,20 +2374,37 @@ async fn i2p_loop(
 /// forwarded ports.
 #[cfg(feature = "inbound-seeding")]
 async fn upnp_loop(state: Arc<AppState>, port: u16, clearnet: bool, shutdown: Arc<Notify>) {
+    upnp_loop_with_local_ip(state, port, clearnet, shutdown, local_ipv4).await;
+}
+
+#[cfg(feature = "inbound-seeding")]
+async fn upnp_loop_with_local_ip(
+    state: Arc<AppState>,
+    port: u16,
+    clearnet: bool,
+    shutdown: Arc<Notify>,
+    local_ip: impl FnOnce() -> Option<std::net::IpAddr>,
+) {
     use igd_next::aio::tokio::search_gateway;
     use igd_next::{PortMappingProtocol, SearchOptions};
     use std::net::SocketAddr;
 
+    // Tor Always serves through its onion service and loopback listener.
+    // Do not inspect LAN routes, discover a gateway, or publish a public IP.
+    if !clearnet {
+        return;
+    }
+
     // A clearnet node with a directly-routable path (configured IP, or a
     // dial-back-confirmed public IP) needs no UPnP: the status is settled and
     // the task just holds until shutdown. Only a NAT'd host falls through.
-    if clearnet && resolve_direct_port_status(&state, port).await {
+    if resolve_direct_port_status(&state, port).await {
         shutdown.notified().await;
         state.set_port_status(false, None).await;
         return;
     }
 
-    let Some(local_ip) = local_ipv4() else {
+    let Some(local_ip) = local_ip() else {
         state.log("INFO", "UPnP: no local IPv4 address; skipping port mapping").await;
         return;
     };
@@ -2594,6 +2611,25 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tor_always_skips_upnp_without_inspecting_lan_or_changing_port_status() {
+        for configured_ip in [None, Some("203.0.113.1")] {
+            let state = crate::AppState::new("test");
+            state.config_set("ip_external", serde_json::json!(configured_ip)).await;
+            let before = state.port_status().await;
+            let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
+            tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                super::upnp_loop_with_local_ip(state.clone(), 43111, false, shutdown, || {
+                    panic!("Tor Always must not inspect LAN routing or discover a UPnP gateway")
+                }),
+            )
+            .await
+            .expect("Tor Always must finish without waiting for a gateway or shutdown");
+            assert_eq!(state.port_status().await, before);
+        }
     }
 
     #[test]
