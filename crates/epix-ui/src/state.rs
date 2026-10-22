@@ -623,6 +623,17 @@ static BIGFILE_AFTER_MANIFEST_COMMIT_PAUSE: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 #[cfg(test)]
+type RootSignPreparationPause = (
+    std::sync::mpsc::Sender<()>,
+    Arc<tokio::sync::Notify>,
+    Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+);
+#[cfg(test)]
+static ROOT_SIGN_PREPARATION_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, RootSignPreparationPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
 static ROOT_SIGN_BEFORE_CACHE_PAUSE: std::sync::LazyLock<
     std::sync::Mutex<
         Option<(
@@ -633,7 +644,17 @@ static ROOT_SIGN_BEFORE_CACHE_PAUSE: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 #[cfg(test)]
+static ROOT_COMMIT_PREFLIGHT_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<
+        HashMap<PathBuf, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[cfg(test)]
 type DbTestPause = std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+>;
+#[cfg(test)]
+type StoreTestPause = std::sync::Mutex<
     Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
 >;
 #[cfg(test)]
@@ -4400,6 +4421,8 @@ pub struct AppState {
     db_rebuilds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     // A fixture's synchronization hooks must not pause another AppState.
     #[cfg(test)]
+    store_before_exposure_pause: StoreTestPause,
+    #[cfg(test)]
     merger_db_before_install_pause: DbTestPause,
     #[cfg(test)]
     db_query_after_receipt_pause: DbTestPause,
@@ -5650,6 +5673,8 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
             db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            store_before_exposure_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             merger_db_before_install_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -11425,6 +11450,7 @@ impl AppState {
         let merged_source = content.get("merged_type").and_then(Value::as_str).is_some();
         let digest = epix_blob::ObjId::of(bytes);
         if transaction.lease.canonical != canonical
+            || transaction.lease.storage_root != storage.root()
             || transaction.lease.governing != "content.json"
             || transaction.lease.modified != modified
             || transaction.lease.digest != digest
@@ -11497,7 +11523,6 @@ impl AppState {
                 return false;
             }
         };
-        let accepted_db_paths = &accepted_db_snapshot.paths;
         let previous_archive_contents = self
             .verified_manifest_contents
             .read()
@@ -11510,24 +11535,96 @@ impl AppState {
             .iter()
             .map(|manifest| (manifest.inner_path.clone(), manifest.content.clone()))
             .collect::<HashMap<_, _>>();
-        let (archive_targets, archive_prune_dirs) = match Self::accepted_archive_plan(
-            storage,
-            "content.json",
-            &content,
-            &previous_archive_contents,
-            &protected_archive_contents,
-        ) {
-            Ok(plan) => plan,
+        let database_rows = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter(|(key, xite)| {
+                    xite.storage.root() == storage.root()
+                        && (keys.contains(key)
+                            || canonical_address(xite.content.as_ref(), key) == canonical)
+                })
+                .map(|(key, xite)| {
+                    (
+                        key.clone(),
+                        xite.membership_generation,
+                        canonical_address(xite.content.as_ref(), key),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        #[cfg(test)]
+        {
+            let pause = ROOT_COMMIT_PREFLIGHT_PAUSES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(storage.root())
+                .cloned();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                let _ = release.acquire().await;
+            }
+        }
+        // Full-file verification and private database construction must not
+        // exclude readers of unrelated xites or occupy an async worker. The
+        // worker owns the tree guard and transaction authority until it stops,
+        // even if the task awaiting it is cancelled.
+        let worker_transaction = ManifestTransaction { lease: transaction.lease.clone() };
+        let worker_content = content.clone();
+        let worker_bytes = bytes.to_vec();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let result = (|| -> Result<_, String> {
+                let prepared = commit_xite
+                    .prepare_root_archive_update(&worker_bytes, size_limit)
+                    .map_err(|error| format!("preparing content.json failed: {error}"))?;
+                commit_xite.content = Some(worker_content.clone());
+                if !Self::files_needed_for_transaction(&commit_xite, &worker_transaction).is_empty() {
+                    return Err("root candidate lost a required file before commit".into());
+                }
+                let (archive_targets, archive_prune_dirs) = Self::accepted_archive_plan(
+                    &commit_xite.storage,
+                    "content.json",
+                    &worker_content,
+                    &previous_archive_contents,
+                    &protected_archive_contents,
+                )?;
+                let databases = database_rows
+                    .into_iter()
+                    .map(|(key, generation, canonical)| {
+                        // Keep a separate private pool for each served alias,
+                        // matching the previous per-row construction.
+                        let built = build_xite_db(
+                            &commit_xite.storage,
+                            &muted,
+                            &accepted_db_snapshot.paths,
+                            Some(&accepted_db_snapshot.values),
+                        );
+                        (key, (generation, canonical, built))
+                    })
+                    .collect::<HashMap<_, _>>();
+                Ok((commit_xite, prepared, archive_targets, archive_prune_dirs, databases))
+            })();
+            (tree, result)
+        })
+        .await;
+        let (tree, prepared) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
-                drop(tree);
-                self.log(
-                    "ERROR",
-                    format!("Could not build accepted archive plan for {canonical}: {error}"),
-                )
-                .await;
+                self.log("ERROR", format!("Root preflight worker failed for {canonical}: {error}"))
+                    .await;
                 return false;
             }
         };
+        let (mut commit_xite, prepared, archive_targets, archive_prune_dirs, mut databases) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(tree);
+                    self.log("ERROR", format!("Root preflight failed for {canonical}: {error}"))
+                        .await;
+                    return false;
+                }
+            };
         // Every await that can cancel the caller is complete before the first
         // governing-manifest write. From here through the disk commit, index
         // swap, pending-version update, and in-memory root adoption is one
@@ -11547,14 +11644,24 @@ impl AppState {
                 if self.pending_root_blocks(canonical, modified, digest) {
                     return Err(format!("root candidate was superseded: {canonical}@{modified}"));
                 }
-                let prepared = commit_xite
-                    .prepare_root_archive_update(bytes, size_limit)
-                    .map_err(|error| {
-                        format!("preparing content.json for {canonical} failed: {error}")
-                    })?;
-                commit_xite.content = Some(content.clone());
-                if !Self::files_needed_for_transaction(&commit_xite, transaction).is_empty() {
-                    return Err("root candidate lost a required file before commit".into());
+                let matching_rows = xites
+                    .iter()
+                    .filter(|(key, xite)| {
+                        xite.storage.root() == storage.root()
+                            && (keys.contains(key)
+                                || canonical_address(xite.content.as_ref(), key) == canonical)
+                    })
+                    .count();
+                if matching_rows != databases.len()
+                    || databases.iter().any(|(key, (generation, bound_canonical, _))| {
+                        xites.get(key).is_none_or(|xite| {
+                            xite.storage.root() != storage.root()
+                                || xite.membership_generation != *generation
+                                || canonical_address(xite.content.as_ref(), key) != *bound_canonical
+                        })
+                    })
+                {
+                    return Err("root candidate membership changed during preflight".into());
                 }
                 if transaction.lease.stages_files() {
                     let governing_path = storage
@@ -11649,12 +11756,8 @@ impl AppState {
                     author_optout = true;
                 }
                 xite.content = Some(content.clone());
-                let (db, schema) = match build_xite_db(
-                    &xite.storage,
-                    &muted,
-                    accepted_db_paths,
-                    Some(&accepted_db_snapshot.values),
-                ) {
+                let (_, _, built) = databases.remove(key).expect("preflight membership checked");
+                let (db, schema) = match built {
                     Some((db, schema)) => (Some(db), Some(schema)),
                     None => (None, None),
                 };
@@ -19992,6 +20095,18 @@ impl AppState {
                 }
             }
         }
+        // Test cancellation at the exact boundary: reconciliation is done,
+        // but the owned activation writer must still prevent exposure.
+        #[cfg(test)]
+        let pause = self.store_before_exposure_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            let _permit = release.acquire().await;
+        }
         *self.edx_store.write().await = Some(store);
         self.store_mutation_blocked.store(false, Ordering::Release);
         for warning in previous_release_warnings {
@@ -25252,32 +25367,66 @@ impl AppState {
             }
             current.content.clone()
         };
-        let addr = Address::parse(canonical.clone()).map_err(|error| error.to_string())?;
-        let mut view = Xite::new(addr, storage.clone());
-        view.content = match storage.read("content.json") {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|error| format!("could not parse content.json before signing: {error}"))?,
-            ),
-            Err(epix_core::Error::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound => managed_content,
-            Err(error) => {
-                return Err(format!("could not read content.json before signing: {error}"));
-            }
+        let worker_storage = storage.clone();
+        let worker_canonical = canonical.clone();
+        let version = self.version.clone();
+        let privatekey = privatekey.to_owned();
+        let manifest_guard = ManifestGuard {
+            _activation: Some(activation),
+            _manifest: Some(manifest),
         };
-        if let Some(map) = view.content.as_mut().and_then(Value::as_object_mut) {
-            map.insert("epixnet_version".into(), json!(self.version));
-        }
-        let previous_modified = view
-            .content
-            .as_ref()
-            .and_then(|content| content.get("modified"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let modified = (now_secs() as f64).max(previous_modified + 1.0);
-        let prepared = view
-            .prepare_sign_opts(privatekey, modified, opts)
-            .map_err(|error| error.to_string())?;
+        // Hashing and bundle preparation can take seconds. Keep their locks
+        // inside the blocking worker so even a dropped awaiter cannot release
+        // mutation authority before that worker has finished reading files.
+        let (prepared, manifest_guard, tree) = tokio::task::spawn_blocking(move || {
+            let storage = worker_storage;
+            let canonical = worker_canonical;
+            let result = (|| -> Result<epix_xite::PreparedRootSign, String> {
+                #[cfg(test)]
+                {
+                    let pause = ROOT_SIGN_PREPARATION_PAUSES.lock().unwrap()
+                        .get(storage.root()).cloned();
+                    if let Some((entered, ready, release)) = pause {
+                        let _ = entered.send(());
+                        ready.notify_one();
+                        let (lock, changed) = &*release;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = changed.wait(released).unwrap();
+                        }
+                    }
+                }
+                let addr = Address::parse(canonical.clone()).map_err(|error| error.to_string())?;
+                let mut view = Xite::new(addr, storage.clone());
+                view.content = match storage.read("content.json") {
+                    Ok(bytes) => Some(
+                        serde_json::from_slice::<Value>(&bytes)
+                            .map_err(|error| format!("could not parse content.json before signing: {error}"))?,
+                    ),
+                    Err(epix_core::Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound => managed_content,
+                    Err(error) => {
+                        return Err(format!("could not read content.json before signing: {error}"));
+                    }
+                };
+                if let Some(map) = view.content.as_mut().and_then(Value::as_object_mut) {
+                    map.insert("epixnet_version".into(), json!(version));
+                }
+                let previous_modified = view
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get("modified"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let modified = (now_secs() as f64).max(previous_modified + 1.0);
+                view.prepare_sign_opts(&privatekey, modified, opts)
+                    .map_err(|error| error.to_string())
+            })();
+            (result, manifest_guard, tree)
+        })
+        .await
+        .map_err(|error| format!("Root signing preparation failed: {error}"))?;
+        let prepared = prepared?;
         let content = prepared.content().clone();
         let bytes = prepared.bytes().to_vec();
         let sign_cache = prepared.sign_cache().map(<[u8]>::to_vec);
@@ -25300,10 +25449,7 @@ impl AppState {
             &canonical,
             "content.json",
             &bytes,
-            ManifestGuard {
-                _activation: Some(activation),
-                _manifest: Some(manifest),
-            },
+            manifest_guard,
         )?;
         let keys = self.alias_keys(&canonical, address).await;
         // Ownership is derived from the already-proven private key, so make
@@ -32511,8 +32657,24 @@ impl AppState {
     /// [`Self::activation_read_fresh`] can hold fresh mutations back.
     async fn acquire_activation_write(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         use std::sync::atomic::Ordering;
+        struct PendingWriter<'a> {
+            waiting: &'a std::sync::atomic::AtomicUsize,
+            landed: &'a tokio::sync::Notify,
+        }
+        impl Drop for PendingWriter<'_> {
+            fn drop(&mut self) {
+                self.waiting.fetch_sub(1, Ordering::SeqCst);
+                self.landed.notify_waiters();
+            }
+        }
         let _turn = self.activation_writer_turnstile.lock().await;
         self.activation_writers_waiting.fetch_add(1, Ordering::SeqCst);
+        // Cancellation while polling must release the fresh-mutation barrier
+        // and wake readers which already observed this pending writer.
+        let pending = PendingWriter {
+            waiting: &self.activation_writers_waiting,
+            landed: &self.activation_writer_landed,
+        };
         let mut delay = std::time::Duration::from_millis(5);
         let guard = loop {
             if let Ok(guard) = self.xite_activation_gate.clone().try_write_owned() {
@@ -32521,8 +32683,7 @@ impl AppState {
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(std::time::Duration::from_millis(100));
         };
-        self.activation_writers_waiting.fetch_sub(1, Ordering::SeqCst);
-        self.activation_writer_landed.notify_waiters();
+        drop(pending);
         guard
     }
 
@@ -39714,30 +39875,38 @@ mod tests {
             )
             .unwrap(),
         );
-        let manifest_ownership = state.manifest_ownership_lock.lock().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        struct ReleaseStorePause(Arc<tokio::sync::Semaphore>);
+        impl Drop for ReleaseStorePause {
+            fn drop(&mut self) {
+                // A failed assertion must not strand detached installation.
+                self.0.close();
+            }
+        }
+        let _release_on_drop = ReleaseStorePause(release.clone());
+        *state.store_before_exposure_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
         let install_state = state.clone();
         let install_store = store.clone();
         let install = tokio::spawn(async move {
             install_state.set_edx_store(install_store).await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if store.is_complete(id).unwrap_or(false) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Store reconciliation never reached cache installation");
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("Store reconciliation never reached the exposure boundary");
+        assert!(store.is_complete(id).unwrap());
         install.abort();
-        let _ = install.await;
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), install)
+            .await
+            .expect("Store installation caller did not cancel");
+        assert!(cancelled.unwrap_err().is_cancelled());
         assert!(state.edx_store.read().await.is_none());
         assert!(
             state.xite_activation_gate.clone().try_read_owned().is_err(),
             "caller cancellation released the Store activation writer"
         );
-        drop(manifest_ownership);
+        release.add_permits(1);
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -40109,6 +40278,80 @@ mod tests {
         assert_eq!(
             state.edx_object_path(&id),
             Some((address, "asset.bin".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_store_install_does_not_block_fresh_mutations() {
+        let directory = tempdir().unwrap();
+        let state = AppState::new("test");
+        let store = Arc::new(
+            epix_blob::store::Store::open(directory.path().join("store")).unwrap(),
+        );
+        // Hold installation before it acquires the writer and starts its
+        // detached completion, as an active signing transaction would.
+        let active_transaction = state.xite_activation_gate.clone().read_owned().await;
+        let install_state = state.clone();
+        let install = tokio::spawn(async move { install_state.set_edx_store(store).await });
+        let reached_pending = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            async {
+                while state
+                    .activation_writers_waiting
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .is_ok();
+        let install_was_waiting = !install.is_finished();
+
+        // Poll once to register this fresh reader on Notify before aborting.
+        // A new reader alone would test the decrement but miss a lost wakeup.
+        let waiting_reader = state.activation_read_fresh();
+        tokio::pin!(waiting_reader);
+        let reader_was_waiting = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::future::Future::poll(waiting_reader.as_mut(), cx).is_pending(),
+            )
+        })
+        .await;
+        install.abort();
+        let install_was_cancelled = matches!(
+            install.await,
+            Err(error) if error.is_cancelled()
+        );
+        drop(active_transaction);
+
+        // Both bounds detect a stranded barrier after all legitimate blockers
+        // are gone. Join the aborted writer before checking either reader.
+        let waiting_reader_woke = reader_was_waiting
+            && tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                waiting_reader.as_mut(),
+            )
+            .await
+            .is_ok();
+        let fresh_reader_available = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.activation_read_fresh(),
+        )
+        .await
+        .is_ok();
+        let waiters = state
+            .activation_writers_waiting
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(reached_pending, "Store installation never became a pending writer");
+        assert!(install_was_waiting && install_was_cancelled);
+        assert!(reader_was_waiting, "fresh mutation bypassed the pending writer");
+        assert!(
+            waiting_reader_woke && fresh_reader_available && waiters == 0,
+            "cancelled installation stranded the mutation barrier: \
+             waiting writers={waiters}, waiting reader woke={waiting_reader_woke}, \
+             fresh reader available={fresh_reader_available}",
         );
     }
 
@@ -43629,6 +43872,189 @@ mod tests {
         assert_eq!(storage_b.read("content.json").unwrap(), root_b_bytes);
     }
 
+    struct RootCommitPreflightPause {
+        root: PathBuf,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl RootCommitPreflightPause {
+        fn new(storage: &XiteStorage) -> Self {
+            let pause = Self {
+                root: storage.root().to_path_buf(),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            };
+            ROOT_COMMIT_PREFLIGHT_PAUSES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(pause.root.clone(), (pause.entered.clone(), pause.release.clone()));
+            pause
+        }
+    }
+
+    impl Drop for RootCommitPreflightPause {
+        fn drop(&mut self) {
+            ROOT_COMMIT_PREFLIGHT_PAUSES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.root);
+            self.release.add_permits(1);
+        }
+    }
+
+    async fn add_root_preflight_test_xite(
+        state: &AppState,
+        root: PathBuf,
+        database: bool,
+    ) -> (String, String, XiteStorage) {
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let storage = XiteStorage::new(root);
+        storage.write("asset.bin", b"initial").unwrap();
+        if database {
+            storage.write(
+                "dbschema.json",
+                br#"{"db_name":"Preflight","db_file":"preflight.db","version":2,
+                     "maps":{"data.json":{"to_table":[{"node":"post","table":"post"}]}},
+                     "tables":{"post":{"cols":[["title","TEXT"],["json_id","INTEGER"]]}}}"#,
+            ).unwrap();
+            storage.write("data.json", br#"{"post":[{"title":"before"}]}"#).unwrap();
+        }
+        let mut xite = Xite::new(Address::parse(address.clone()).unwrap(), storage.clone());
+        xite.sign_opts(&key, 1.0, epix_xite::SignOpts::default()).unwrap();
+        state.add_xite(
+            &address,
+            XiteEntry { storage: storage.clone(), content: xite.content },
+        ).await;
+        (address, key, storage)
+    }
+
+    #[tokio::test]
+    async fn root_preflight_keeps_neighbors_available_and_preserves_database_receipts() {
+        let directory = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (address, key, storage) =
+            add_root_preflight_test_xite(&state, directory.path().join("signing"), true).await;
+        let (neighbor, neighbor_key, neighbor_storage) =
+            add_root_preflight_test_xite(&state, directory.path().join("neighbor"), false).await;
+        let alias = "preflight.epix";
+        state.add_xite(
+            alias,
+            XiteEntry {
+                storage: storage.clone(),
+                content: Some(serde_json::from_slice(&storage.read("content.json").unwrap()).unwrap()),
+            },
+        ).await;
+        state.write_file(&address, "data.json", br#"{"post":[{"title":"after"}]}"#)
+            .await.unwrap();
+        let captured_filter_epoch = state.db_filter_epoch();
+        let pause = RootCommitPreflightPause::new(&storage);
+        let signing_state = state.clone();
+        let signing_address = address.clone();
+        let signing = tokio::spawn(async move {
+            signing_state.sign_xite(&signing_address, &key).await
+        });
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(5), pause.entered.notified(),
+        ).await.is_ok();
+        let neighbor_state = state.clone();
+        let neighbor_address = neighbor.clone();
+        let mut editing = tokio::spawn(async move {
+            let info = neighbor_state.xite_info(&neighbor_address).await;
+            neighbor_state.write_file(&neighbor_address, "neighbor.txt", b"edited").await?;
+            Ok::<_, String>(info)
+        });
+        let editing_while_paused = tokio::time::timeout(
+            std::time::Duration::from_secs(1), &mut editing,
+        ).await;
+        let neighbor_was_available = editing_while_paused.is_ok();
+        // Model a filter change after the snapshot. Adoption must keep the
+        // captured epoch so queries reject this DB until its lazy rebuild.
+        state.bump_db_filter_epoch();
+        drop(pause);
+        let signed = signing.await;
+        let edited = match editing_while_paused {
+            Ok(result) => result,
+            Err(_) => editing.await,
+        };
+        assert!(entered, "signing never reached root preflight");
+        assert!(neighbor_was_available, "preflight blocked the neighbor's registry access");
+        let info = edited.unwrap().unwrap();
+        assert_eq!(info["address"], neighbor);
+        assert_eq!(neighbor_storage.read("neighbor.txt").unwrap(), b"edited");
+        signed.unwrap().unwrap();
+        let (primary_db, alias_db) = {
+            let xites = state.xites.read().await;
+            let primary = &xites[&address];
+            let alias = &xites[alias];
+            for xite in [primary, alias] {
+                assert_eq!(xite.db_filter_epoch, captured_filter_epoch);
+                assert_eq!(xite.db_verified_epoch, state.verified_index_epoch(&address));
+                assert_eq!(xite.db_source_epoch, state.db_source_epoch(&address));
+            }
+            assert!(state.current_db_query_receipt(&address, primary).is_none());
+            (primary.db.clone().unwrap(), alias.db.clone().unwrap())
+        };
+        assert_eq!(primary_db.query("SELECT title FROM post", &[]).unwrap()[0]["title"], "after");
+        primary_db.execute("UPDATE post SET title = 'primary only'", &[]).unwrap();
+        assert_eq!(alias_db.query("SELECT title FROM post", &[]).unwrap()[0]["title"], "after");
+        // The public query path must rebuild a stale filtered receipt, not
+        // expose the private test edit from the invalidated database.
+        assert_eq!(state.db_query(&address, "SELECT title FROM post", &Value::Null)
+            .await.unwrap()[0]["title"], "after");
+        state.sign_xite(&neighbor, &neighbor_key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_root_preflight_preserves_authority_and_allows_later_signing() {
+        let directory = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (address, key, storage) =
+            add_root_preflight_test_xite(&state, directory.path().join("signing"), true).await;
+        let (neighbor, neighbor_key, _) =
+            add_root_preflight_test_xite(&state, directory.path().join("neighbor"), false).await;
+        let original_root = storage.read("content.json").unwrap();
+        let original_cache = storage.read(".sign-cache.json").unwrap();
+        let original_managed = state.xites.read().await[&address].content.clone();
+        let original_index_epoch = state.verified_index_epoch(&address);
+        let original_db_generation = state.xites.read().await[&address].db_generation;
+        let pause = RootCommitPreflightPause::new(&storage);
+        let signing_state = state.clone();
+        let signing_address = address.clone();
+        let signing_key = key.clone();
+        let signing = tokio::spawn(async move {
+            signing_state.sign_xite(&signing_address, &signing_key).await
+        });
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(5), pause.entered.notified(),
+        ).await.is_ok();
+        // Deliberate external corruption after the candidate was hashed.
+        // Equal length ensures the final content verification is exercised.
+        let corrupted = storage.write("asset.bin", b"changed");
+        drop(pause);
+        let signed = signing.await;
+        assert!(entered, "signing never reached root preflight");
+        corrupted.unwrap();
+        assert!(signed.unwrap().is_err(), "a changed required file was committed");
+        assert_eq!(storage.read("content.json").unwrap(), original_root);
+        assert_eq!(storage.read(".sign-cache.json").unwrap(), original_cache);
+        assert_eq!(state.verified_index_epoch(&address), original_index_epoch);
+        {
+            let xites = state.xites.read().await;
+            let current = &xites[&address];
+            assert_eq!(current.content, original_managed);
+            assert_eq!(current.db_generation, original_db_generation);
+            assert_eq!(current.db.as_ref().unwrap().query("SELECT title FROM post", &[])
+                .unwrap()[0]["title"], "before");
+        }
+        state.write_file(&neighbor, "neighbor.txt", b"after failure").await.unwrap();
+        state.sign_xite(&neighbor, &neighbor_key).await.unwrap();
+        state.write_file(&address, "asset.bin", b"initial").await.unwrap();
+        state.sign_xite(&address, &key).await.unwrap();
+        assert_eq!(state.xite_info(&address).await["settings"]["own"], true);
+    }
+
     #[tokio::test]
     async fn root_sign_preserves_a_malformed_authoritative_manifest() {
         let dir = tempdir().unwrap();
@@ -43660,6 +44086,50 @@ mod tests {
         let error = state.sign_xite(&address, &key).await.unwrap_err();
         assert!(error.contains("parse content.json"), "{error}");
         assert_eq!(storage.read("content.json").unwrap(), malformed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_sign_preparation_keeps_the_async_worker_available() {
+        let fixture = shared_extern_fixture(false, true).await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        ROOT_SIGN_PREPARATION_PAUSES.lock().unwrap().insert(
+            fixture.storage_a.root().to_path_buf(), (entered_tx, ready.clone(), release.clone()),
+        );
+        // A separate OS thread always releases the synchronous pause. An
+        // async timeout alone cannot rescue a monopolized current-thread runtime.
+        let supervisor = std::thread::spawn(move || {
+            let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+            let neighbor_during_preparation = entered
+                && neighbor_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            let (lock, changed) = &*release;
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
+            (entered, neighbor_during_preparation)
+        });
+        let state = fixture.state.clone();
+        let address = fixture.address_a.clone();
+        let key = fixture.key_a.clone();
+        let signing = tokio::spawn(async move { state.sign_xite(&address, &key).await });
+        let state = fixture.state.clone();
+        let neighbor_address = fixture.address_b.clone();
+        let neighbor = tokio::spawn(async move {
+            ready.notified().await;
+            let info = state.xite_info(&neighbor_address).await;
+            let _ = neighbor_tx.send(());
+            info
+        });
+        let signed = tokio::time::timeout(std::time::Duration::from_secs(5), signing).await;
+        let info = tokio::time::timeout(std::time::Duration::from_secs(5), neighbor).await;
+        let (entered, neighbor_during_preparation) = supervisor.join().unwrap();
+        ROOT_SIGN_PREPARATION_PAUSES.lock().unwrap().remove(fixture.storage_a.root());
+        let signed = signed.expect("signing did not settle").unwrap().unwrap();
+        assert_eq!(fixture.storage_a.read("content.json").unwrap(), signed);
+        assert_eq!(info.expect("neighbor did not settle").unwrap()["address"], fixture.address_b);
+        assert!(entered && neighbor_during_preparation,
+            "synchronous root signing preparation monopolized the async worker");
     }
 
     #[tokio::test]
