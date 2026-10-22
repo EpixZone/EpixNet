@@ -18,7 +18,7 @@ arti-client = { version = "0.46", default-features = false, features = [
 # Arti exposes these crates' types and traits across its public API. Update
 # the Tor family and safelog together to keep runtime and display traits shared.
 tor-hsservice = "0.46"
-safelog = "0.9"
+safelog = "0.10"
 tor-rtcompat = { version = "0.47", features = ["tokio", "rustls"] }
 tor-cell = "0.46"
 tor-proto = "0.46"
