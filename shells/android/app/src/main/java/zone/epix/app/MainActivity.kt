@@ -108,6 +108,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
     /** One open tab: its Gecko session and the per-tab navigation state. */
     private class Tab(val session: GeckoSession) {
         var url: String = ""
+        var hasNonBlankLocation = false
         var title: String = ""
         var canGoBack = false
         var canGoForward = false
@@ -376,6 +377,11 @@ class MainActivity : AppCompatActivity(), WalletHost {
                 hasUserGesture: Boolean,
             ) {
                 if (!ownsSession(session) || url == null) return
+                // A new Gecko session can report its initial blank document
+                // after loadUri. Preserve the requested URL until navigation
+                // reports a nonblank location, including for background tabs.
+                if (url == "about:blank" && !tab.hasNonBlankLocation && restorableUrl(tab.url)) return
+                if (url != "about:blank") tab.hasNonBlankLocation = true
                 tab.url = url
                 if (tab === currentTab && !addressBar.hasFocus()) {
                     addressBar.setText(friendlyUrl(url))

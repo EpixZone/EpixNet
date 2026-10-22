@@ -44,6 +44,12 @@ def declaration(name):
     return matches[0].replace("private val", "val", 1)
 
 
+tab_classes = re.findall(r"^    private class Tab\(.*?^    }", source, re.M | re.S)
+location_callbacks = re.findall(r"^            override fun onLocationChange\(.*?^            }", source, re.M | re.S)
+if len(tab_classes) != 1 or len(location_callbacks) != 1:
+    raise SystemExit("Expected one production Tab class and location callback")
+
+
 kotlin = r'''
 package zone.epix.app
 import java.io.File
@@ -122,13 +128,23 @@ class Mark { fun clearAnimation() {} }
 class Presentation { fun reset() {} }
 enum class SplashStage { PREPARING, CONNECTING, OPENING }
 class GeckoSession {
+    class PermissionDelegate { class ContentPermission }
     var opened = false
     val urls = mutableListOf<String>()
     var onLoad: ((String) -> Unit)? = null
     fun open(runtime: Any) { opened = true }
     fun loadUri(url: String) { urls.add(url); onLoad?.invoke(url) }
 }
-class Tab(val session: GeckoSession = GeckoSession()) { var url = "" }
+// INSERT_PRODUCTION_TAB
+interface LocationCallbacks {
+    fun onLocationChange(session: GeckoSession, url: String?,
+                         perms: MutableList<GeckoSession.PermissionDelegate.ContentPermission>, hasUserGesture: Boolean)
+}
+class AddressBar {
+    var value = ""
+    fun hasFocus() = false
+    fun setText(text: String) { value = text }
+}
 class Bundle {
     val values = mutableMapOf<String, Any>()
     fun putStringArrayList(key: String, value: ArrayList<String>) { values[key] = value }
@@ -179,7 +195,9 @@ class Shell : Activity() {
     var restoredUrls: List<String>? = null
     var restoredSelection = 0
     var walletUserEngaged = false
-    val tabs = mutableListOf(Tab())
+    val tabs = mutableListOf(Tab(GeckoSession()))
+    val addressBar = AddressBar()
+    fun friendlyUrl(url: String) = url // Display boundary; retained Tab URL is production state.
     val ownedSessions = mutableSetOf<GeckoSession>()
     var currentTabIndex = 0
     val currentTab get() = tabs[currentTabIndex]
@@ -236,7 +254,11 @@ class Shell : Activity() {
         activityJob.cancel()
     }
 '''
+kotlin = kotlin.replace("// INSERT_PRODUCTION_TAB", tab_classes[0].replace("private class", "class", 1))
 kotlin += declaration("localUiReady") + "\n"
+kotlin += "\n    fun deliverLocation(tab: Tab, url: String?) {\n        val callback = object : LocationCallbacks {\n"
+kotlin += location_callbacks[0]
+kotlin += "\n        }\n        callback.onLocationChange(tab.session, url, mutableListOf(), false)\n    }\n"
 kotlin += "\n".join(method(name) for name in (
     "onResume", "onPause", "wakeNodeForForeground", "bootAndOpen", "retryBoot", "resetConfigAndRetry",
     "onNewIntent", "intentTarget", "xiteRewrite", "nodeUrl", "onSaveInstanceState", "restorableUrl",
@@ -396,6 +418,39 @@ fun main() {
     val encodedTarget = "talk.epix/%E2%9C%93/a%20b?q=a%2Fb#part%20two"
     val encodedIntent = Intent(Uri.parse("epix://$encodedTarget"))
     val encodedUrl = "http://127.0.0.1:42222/$encodedTarget"
+    val locationUrls = listOf("https://example.test/?Case=AbC#FragmentCase", encodedUrl)
+    var locationState: Bundle? = null
+    repeat(3) { generation -> scenario { restored ->
+        restored.restoredUrls = locationState?.urls() ?: locationUrls
+        restored.restoredSelection = locationState?.selected() ?: 0
+        restored.bootAndOpen("dashboard.epix"); Scheduler.drain()
+        EmbeddedNodeHost.complete(NodeState.SERVING); Scheduler.drain()
+        // Gecko's new sessions report their initial document after loadUri
+        // has been issued. The selected tab can finish before a background
+        // tab has reported its real location, then Android recreates again.
+        restored.tabs.forEach { restored.deliverLocation(it, "about:blank") }
+        restored.deliverLocation(restored.tabs.first(), locationUrls.first())
+        val saved = Bundle()
+        restored.onSaveInstanceState(saved)
+        verify(saved.urls() == locationUrls && saved.selected() == 0,
+            "recreation $generation retains the background URL across initial about:blank callbacks")
+        verify(restored.tabs.map { it.url } == locationUrls,
+            "initial placeholder callbacks cannot replace seeded restored URL state")
+        locationState = saved
+
+        val redirect = "https://example.test/redirected%20page?q=a%2Fb#changed"
+        restored.deliverLocation(restored.tabs.last(), redirect)
+        verify(restored.tabs.last().url == redirect, "real background redirect still replaces the saved location")
+        restored.deliverLocation(restored.tabs.first(), "about:blank")
+        val deliberateBlank = Bundle()
+        restored.onSaveInstanceState(deliberateBlank)
+        verify(restored.tabs.first().url == "about:blank" && deliberateBlank.urls() == listOf(redirect),
+            "ordinary about:blank after real navigation remains visible and is excluded from restoration")
+        restored.deliverLocation(restored.tabs.last(), null)
+        restored.ownedSessions.remove(restored.tabs.last().session)
+        restored.deliverLocation(restored.tabs.last(), "https://closed.example.test/")
+        verify(restored.tabs.last().url == redirect, "null or closed-session location callbacks cannot change retained state")
+    } }
     val restoredUrls = listOf(encodedUrl, "https://example.test/a%20b?first=x%2Fy#second")
     var pendingState: Bundle? = null
     repeat(3) { generation -> scenario { restored ->
