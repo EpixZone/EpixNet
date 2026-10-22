@@ -1172,7 +1172,10 @@ mod tests {
         // The icon-size list was patched from [16,48] to a lone 48. Identify it
         // by the status-color map that immediately follows it, and confirm the
         // old list is gone everywhere.
-        let names: Vec<String> = zip.file_names().map(String::from).collect();
+        let names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.expect("wallet XPI entry name must decode").into_owned())
+            .collect();
         let mut found_patch = false;
         for name in names.iter().filter(|n| n.ends_with(".js")) {
             let mut s = String::new();
