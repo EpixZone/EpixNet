@@ -28,6 +28,11 @@ permanent folder. If your desktop cannot mount AppImages, run it with
 `--appimage-extract-and-run`. This format requires glibc 2.35 or newer; Alpine
 Linux's musl C library is not supported.
 
+We recommend [Gear Lever](https://gearlever.mijorus.it/) for managing the
+AppImage. It can keep AppImages in one folder and add EpixNet to your
+applications menu. Install Gear Lever using its official instructions, then
+open the downloaded EpixNet AppImage with it to integrate the app.
+
 On Ubuntu 24.04 and newer, the AppImage asks for administrator approval on
 first launch if the browser sandbox needs permission. Approve the system
 password prompt and EpixNet continues automatically. Later launches reuse
