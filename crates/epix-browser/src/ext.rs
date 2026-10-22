@@ -309,8 +309,8 @@ fn install_addon_xpi(
 
     let file = std::fs::File::create(&xpi_path).map_err(|e| format!("create xpi: {e}"))?;
     let mut zip = zip::ZipWriter::new(file);
-    let opts: zip::write::FileOptions<'_, ()> =
-        zip::write::FileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
     write_dir_to_zip(&mut zip, dir, "", &opts, stamp)?;
     for (name, bytes) in extra_files {
         zip.start_file(*name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
@@ -626,7 +626,7 @@ fn write_dir_to_zip(
     zip: &mut zip::ZipWriter<std::fs::File>,
     dir: &Dir,
     prefix: &str,
-    opts: &zip::write::FileOptions<'_, ()>,
+    opts: &zip::write::SimpleFileOptions,
     stamp: u32,
 ) -> Result<(), String> {
     for file in dir.files() {
@@ -1172,7 +1172,10 @@ mod tests {
         // The icon-size list was patched from [16,48] to a lone 48. Identify it
         // by the status-color map that immediately follows it, and confirm the
         // old list is gone everywhere.
-        let names: Vec<String> = zip.file_names().map(String::from).collect();
+        let names: Vec<String> = zip
+            .file_names()
+            .map(|name| name.expect("wallet XPI entry name must decode").into_owned())
+            .collect();
         let mut found_patch = false;
         for name in names.iter().filter(|n| n.ends_with(".js")) {
             let mut s = String::new();
