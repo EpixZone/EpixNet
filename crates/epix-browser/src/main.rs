@@ -251,6 +251,11 @@ async fn boot(
     #[cfg(target_os = "linux")]
     linux_sandbox::prepare(&firefox, background, &progress)?;
 
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Err(error) = autostart::refresh_enabled() {
+        eprintln!("Could not refresh Open at Login: {error}");
+    }
+
     // The local CA for secure `https://*.epix` origins.
     let ca = Arc::new(
         LocalCa::load_or_create(&data_root.join("browser-ca"))
