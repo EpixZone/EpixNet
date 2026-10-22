@@ -7386,6 +7386,13 @@ impl AppState {
     /// The cache entry beats the display alias whenever it exists, so the
     /// wrapper, the node and the background verifier agree on one address.
     pub async fn resolve_name_verified(&self, name: &str) -> Option<(String, bool)> {
+        // Addresses and address-shaped typos are never registry names, even
+        // when an old cache contains a same-string registration.
+        let label = name.rsplit_once('.').map_or(name, |(label, _)| label);
+        if epix_core::classify_label(label) != epix_core::LabelClass::Name {
+            return None;
+        }
+        let name = name.to_ascii_lowercase();
         let finality_required = epix_chain::verify_finality_enabled();
         // Entries are `{"address": …, "resolved_at": …, "finality_height": …,
         // "finality_digest": …}`, an older unbound object, or a legacy string.
@@ -7394,13 +7401,15 @@ impl AppState {
                 .await
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Map<String, Value>>(&b).ok())
-                .and_then(|cache| cache.get(name).cloned()),
+                .and_then(|cache| cache.get(&name)
+                    .or_else(|| cache.iter().find(|(key, _)| key.eq_ignore_ascii_case(&name)).map(|(_, entry)| entry))
+                    .cloned()),
             None => None,
         };
         let xites = self.xites.read().await;
         let served = xites
             .iter()
-            .find(|(_, x)| x.display.as_deref() == Some(name))
+            .find(|(_, x)| x.display.as_deref().is_some_and(|display| display.eq_ignore_ascii_case(&name)))
             .map(|(address, _)| address.as_str());
         select_name_mapping(
             finality_required,
@@ -7480,6 +7489,9 @@ impl AppState {
     /// input unchanged if the name is unknown (lookups then miss cleanly).
     pub async fn canonical_key(&self, address_or_name: &str) -> String {
         if !address_or_name.contains('.') {
+            if epix_core::classify_label(address_or_name) == epix_core::LabelClass::Address {
+                return address_or_name.to_ascii_lowercase();
+            }
             return address_or_name.to_string();
         }
         // `<bech32>.epix` is the dotted ALIAS for a bare address: browsers
@@ -7490,10 +7502,12 @@ impl AppState {
         // checksum) is a mistyped or forged address: passed through unchanged,
         // and every resolve path refuses it, so a typo-squatted name can never
         // serve in an address's place.
-        if let Some(label) = address_or_name.strip_suffix(".epix") {
+        if let Some((label, _)) = address_or_name.rsplit_once('.')
+            .filter(|(_, suffix)| suffix.eq_ignore_ascii_case("epix"))
+        {
             if !label.contains('.') {
                 match epix_core::classify_label(label) {
-                    epix_core::LabelClass::Address => return label.to_string(),
+                    epix_core::LabelClass::Address => return label.to_ascii_lowercase(),
                     epix_core::LabelClass::AddressShaped => return address_or_name.to_string(),
                     epix_core::LabelClass::Name => {}
                 }
@@ -10830,7 +10844,7 @@ impl AppState {
         let xites = self.xites.read().await;
         xites
             .iter()
-            .find(|(_, x)| x.display.as_deref() == Some(name))
+            .find(|(_, x)| x.display.as_deref().is_some_and(|display| display.eq_ignore_ascii_case(name)))
             .map(|(address, _)| address.clone())
     }
 
@@ -10844,7 +10858,7 @@ impl AppState {
         detail: Option<String>,
     ) {
         let mut statuses = self.resolve_status.write().await;
-        let entry = statuses.entry(host.to_string()).or_insert_with(|| ResolveStatus {
+        let entry = statuses.entry(host.to_ascii_lowercase()).or_insert_with(|| ResolveStatus {
             last_observed: None,
             state: String::new(),
             reason: None,
@@ -10867,7 +10881,7 @@ impl AppState {
     pub async fn resolve_status_resolved(&self, host: &str, address: &str, verified: bool) {
         self.resolve_status_set(host, "resolved", None, None).await;
         let mut statuses = self.resolve_status.write().await;
-        if let Some(entry) = statuses.get_mut(host) {
+        if let Some(entry) = statuses.get_mut(&host.to_ascii_lowercase()) {
             entry.address = Some(address.to_string());
             entry.verified = verified;
         }
@@ -10875,13 +10889,13 @@ impl AppState {
 
     /// One more resolve attempt for `host` (drives "attempt N" on screen).
     pub async fn resolve_status_attempt(&self, host: &str) {
-        if let Some(entry) = self.resolve_status.write().await.get_mut(host) {
+        if let Some(entry) = self.resolve_status.write().await.get_mut(&host.to_ascii_lowercase()) {
             entry.attempts += 1;
         }
     }
 
     pub async fn resolve_status(&self, host: &str) -> Option<ResolveStatus> {
-        self.resolve_status.read().await.get(host).cloned()
+        self.resolve_status.read().await.get(&host.to_ascii_lowercase()).cloned()
     }
 
     /// Hosts whose resolution is parked on something outside the node's
@@ -10922,7 +10936,7 @@ impl AppState {
     pub async fn resolve_status_json(&self, host: &str) -> Value {
         let status = {
             let mut statuses = self.resolve_status.write().await;
-            statuses.get_mut(host).map(|status| {
+            statuses.get_mut(&host.to_ascii_lowercase()).map(|status| {
                 status.last_observed = Some(std::time::Instant::now());
                 status.clone()
             })
@@ -33210,21 +33224,21 @@ impl AppState {
     /// `HTTP_HOST` to `allowed_ws_origins` when it serves the wrapper).
     pub fn allow_ws_origin(&self, host: &str) {
         if !host.is_empty() {
-            self.allowed_ws_origins.lock().unwrap().insert(host.to_string());
+            self.allowed_ws_origins.lock().unwrap().insert(host.to_ascii_lowercase());
         }
     }
 
     /// Whether a WebSocket `Origin` host is allowed: same as the request host,
     /// loopback, or a previously-served wrapper host.
     pub fn is_ws_origin_allowed(&self, origin_host: &str, request_host: &str) -> bool {
-        if origin_host.is_empty() || origin_host == request_host {
+        if origin_host.is_empty() || origin_host.eq_ignore_ascii_case(request_host) {
             return true;
         }
         let host_only = origin_host.split(':').next().unwrap_or(origin_host);
         if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "[::1]" {
             return true;
         }
-        self.allowed_ws_origins.lock().unwrap().contains(origin_host)
+        self.allowed_ws_origins.lock().unwrap().contains(&origin_host.to_ascii_lowercase())
     }
 
     /// Move a per-xite user identity (derived xite keys, cert binding, feed

@@ -165,7 +165,7 @@ fn strip_scheme(arg: &str) -> &str {
 /// Normalize a launch argument into a resolver target: strip the scheme
 /// (`epix://`, `https://`, ...) and any path/query so `epix://talk.epix/topic/1`
 /// becomes `talk.epix` (the host is the xite; the path is opened inside the
-/// wrapper afterwards). A raw address or bare name passes through unchanged.
+/// wrapper afterwards). Only the host's ASCII case is normalized.
 pub fn parse_target(arg: &str) -> String {
     let s = strip_scheme(arg);
     // Host is everything up to the first `/`, `?`, or `#`.
@@ -174,7 +174,18 @@ pub fn parse_target(arg: &str) -> String {
     if host.is_empty() {
         arg.to_string()
     } else {
+        normalize_resolve_target(host)
+    }
+}
+
+/// Validate the original address spelling before folding case. Lowercasing
+/// mixed-case Bech32 first would repair an invalid address into a valid one.
+fn normalize_resolve_target(host: &str) -> String {
+    let (label, _) = host.rsplit_once('.').unwrap_or((host, "epix"));
+    if epix_core::classify_label(label) == epix_core::LabelClass::AddressShaped {
         host.to_string()
+    } else {
+        host.to_ascii_lowercase()
     }
 }
 
@@ -228,6 +239,8 @@ fn select_launch_from(
     lookup: impl Fn(&str) -> Option<CachedResolution>,
     on_disk: impl Fn(&str) -> bool,
 ) -> Result<LaunchSelection, String> {
+    let target = normalize_resolve_target(target);
+    let target = target.as_str();
     let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
     match epix_core::classify_label(name) {
         epix_core::LabelClass::Address => {
@@ -390,18 +403,20 @@ async fn try_resolve_on_chain_bound(
     // forged address and is refused outright - otherwise an attacker could
     // register the typo-space around a real address as names and phish.
     match epix_core::classify_label(name) {
-        epix_core::LabelClass::Address => return Ok((name.to_string(), None)),
+        epix_core::LabelClass::Address => return Ok((name.to_ascii_lowercase(), None)),
         epix_core::LabelClass::AddressShaped => {
             return Err(ResolveError::MistypedAddress(address_shaped_target_error(name, tld)));
         }
         epix_core::LabelClass::Name => {}
     }
+    let name = name.to_ascii_lowercase();
+    let tld = tld.to_ascii_lowercase();
     // The shared resolver follows the configured endpoint list and rotates
     // to the next endpoint when one fails; a throwaway single-endpoint
     // resolver here made api.epix.zone alone a single point of failure.
     let resolver = epix_chain::shared_resolver();
     let (domain, binding) = resolver
-        .resolve_fresh_bound(name, tld)
+        .resolve_fresh_bound(&name, &tld)
         .await
         .map_err(ResolveError::Chain)?;
     let address = domain.xite_address().ok_or_else(|| {
@@ -3019,6 +3034,11 @@ impl epix_ui::OnDemandResolver for OnDemand {
         {
             return Ok(());
         }
+        // Preserve the complete local-entry fast path, including old serving
+        // keys. Only an actual resolve uses the normalized host spelling.
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
+        let key = self.state.canonical_key(host).await;
         if self.network_disabled {
             self.state.set_clone_status(&key, "paused", Some("offline_policy"), None);
             self.state
@@ -3042,7 +3062,7 @@ impl epix_ui::OnDemandResolver for OnDemand {
         let Resolved { address, verified } = resolved?;
         // The homepage's name just resolved: record what it points to, and
         // whether the chain said so, for serverInfo and the verifier.
-        if self.state.homepage().await.as_deref() == Some(host) {
+        if self.state.homepage().await.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(host)) {
             self.state.set_launch_status(host, Some(&address), verified).await;
         }
         // Coalesce concurrent clones on the RESOLVED address: the first does
@@ -3098,7 +3118,8 @@ impl epix_ui::OnDemandResolver for OnDemand {
     }
 
     fn is_resolving(&self, host: &str) -> bool {
-        self.resolving.lock().map(|hosts| hosts.contains(host)).unwrap_or(true)
+        let host = normalize_resolve_target(host);
+        self.resolving.lock().map(|hosts| hosts.contains(&host)).unwrap_or(true)
     }
 
     async fn cancel(&self, address: &str) {
@@ -3127,6 +3148,8 @@ impl epix_ui::OnDemandResolver for OnDemand {
         if self.network_disabled {
             return None;
         }
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let name = host.strip_suffix(".epix")?;
         if name.is_empty()
             || name.len() > 63
@@ -3228,6 +3251,8 @@ impl OnDemand {
     /// names use their verified mapping (fresh or stale), and an unverified
     /// (superseded) mapping only when the xite is already registered.
     async fn resolve_host_cached_only(&self, host: &str) -> Option<Resolved> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         match epix_core::classify_label(name) {
             epix_core::LabelClass::Address => {
@@ -3250,6 +3275,8 @@ impl OnDemand {
     /// the saved mapping when the chain does not answer. A successful chain
     /// lookup is written back to the cache. Never clones.
     async fn resolve_host(&self, host: &str) -> Result<Resolved, ResolveError> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         // Every label classifies against the address space, including dotless
         // inputs. Short `epix1…` branding names remain names; checksum-valid
@@ -3533,15 +3560,18 @@ impl OnDemand {
 
     /// Claim the resolve slot for `host`, or `None` if another caller holds it.
     fn claim_resolve_slot(&self, host: &str) -> Option<ResolveSlot> {
+        let host = normalize_resolve_target(host);
         let mut set = self.resolving.lock().ok()?;
-        if !set.insert(host.to_string()) {
+        if !set.insert(host.clone()) {
             return None;
         }
-        Some(ResolveSlot { set: self.resolving.clone(), host: host.to_string() })
+        Some(ResolveSlot { set: self.resolving.clone(), host })
     }
 
     /// Wait for the resolve (and clone) another caller is running for `host`.
     async fn wait_for_resolve(&self, host: &str) -> Result<(), String> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         for _ in 0..600 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let key = self.state.canonical_key(host).await;
@@ -3563,6 +3593,8 @@ impl OnDemand {
     /// answer with no proof behind it. Gives up after [`RESOLVE_BUDGET`]; the
     /// published status stays, and a Retry or a network change starts over.
     async fn resolve_with_status(&self, host: &str) -> Result<Resolved, String> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let (name, _tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         let is_name = epix_core::classify_label(name) == epix_core::LabelClass::Name;
         let needs_chain = is_name && needs_chain_resolve(&self.data_root, host);
@@ -5014,16 +5046,22 @@ struct CachedResolution {
 /// an attacker could have planted, so they resolve fresh, once.
 fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<CachedResolution> {
     let cache = read_resolve_cache(data_root);
+    let canonical = normalize_resolve_target(full);
+    // Prefer current lowercase keys, but keep caches written by older builds
+    // usable without rewriting their finality bindings or timestamps.
+    let entry = cache.get(&canonical).or_else(|| {
+        cache.iter().find(|(key, _)| key.eq_ignore_ascii_case(&canonical)).map(|(_, value)| value)
+    })?;
     let finality_required =
         epix_chain::verify_finality_enabled() && cache_target_requires_finality(full);
-    parse_cached_resolution(cache.get(full)?, finality_required, |height, digest| {
+    parse_cached_resolution(entry, finality_required, |height, digest| {
         epix_chain::finality_checkpoint_matches(height, digest)
     })
 }
 
 fn cache_target_requires_finality(full: &str) -> bool {
     let (label, tld) = full.rsplit_once('.').unwrap_or((full, "epix"));
-    !(tld == "epix" && epix_core::classify_label(label) == epix_core::LabelClass::Address)
+    !(tld.eq_ignore_ascii_case("epix") && epix_core::classify_label(label) == epix_core::LabelClass::Address)
 }
 
 fn parse_cached_resolution(
@@ -5274,6 +5312,7 @@ fn write_resolve_cache_bound_checked(
         &std::path::Path,
     ) -> std::io::Result<bool>,
 ) -> std::io::Result<ResolveCacheWriteOutcome> {
+    let full = normalize_resolve_target(full);
     let path = resolve_cache_path(data_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -5293,14 +5332,14 @@ fn write_resolve_cache_bound_checked(
     let mut cache = read_resolve_cache_for_update(&path)?;
 
     // A delayed writer must never downgrade a newer binding already published
-    // for the same name, even if its caller supplies a faulty current-binding
-    // predicate.
+    // for the same name in any casing, even if its caller supplies a faulty
+    // current-binding predicate.
     if let Some((height, _)) = binding {
         let existing_height = cache
-            .get(full)
-            .and_then(serde_json::Value::as_object)
-            .and_then(|entry| entry.get("finality_height"))
-            .and_then(serde_json::Value::as_u64);
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(&full))
+            .filter_map(|(_, entry)| entry.get("finality_height").and_then(serde_json::Value::as_u64))
+            .max();
         if existing_height.is_some_and(|existing| existing > *height) {
             return Ok(ResolveCacheWriteOutcome::Superseded);
         }
@@ -5314,7 +5353,7 @@ fn write_resolve_cache_bound_checked(
         entry["finality_height"] = serde_json::json!(height);
         entry["finality_digest"] = serde_json::json!(digest);
     }
-    cache.insert(full.to_string(), entry);
+    cache.insert(full, entry);
     let bytes = serde_json::to_vec_pretty(&cache).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -6113,6 +6152,163 @@ mod tests {
         assert_eq!(parse_inner_path("epix://talk.epix"), "");
         assert_eq!(parse_inner_path("talk.epix/a"), "/a");
         assert_eq!(parse_inner_path("https://talk.epix/?Topic:123_mud.epix"), "/?Topic:123_mud.epix");
+    }
+
+    #[test]
+    fn domain_case_launch_normalizes_only_valid_targets_and_keeps_inner_url() {
+        let suffix = "/Docs/Mixed%23Name.html?Token=AbC%2FZ#KeepCase";
+        let url = format!("https://TaLk.EPIX{suffix}");
+        assert_eq!(parse_target(&url), "talk.epix");
+        assert_eq!(parse_inner_path(&url), suffix);
+        for target in ["TaLk.EPIX", "TALK", "Epix1Shop.EpIx"] {
+            let expected = if target.contains('.') {
+                target.to_ascii_lowercase()
+            } else {
+                format!("{}.epix", target.to_ascii_lowercase())
+            };
+            assert!(matches!(
+                select_launch_from(target, |key| {
+                    assert_eq!(key, expected);
+                    None
+                }, |_| false).unwrap(),
+                LaunchSelection::Deferred { display } if display == expected
+            ));
+        }
+        let uppercase = DASHBOARD_XITE_ADDRESS.to_ascii_uppercase();
+        for target in [uppercase.clone(), format!("{uppercase}.EpIx")] {
+            assert!(matches!(
+                select_launch_from(&parse_target(&target), |_| panic!("address must not use cache"), |_| false).unwrap(),
+                LaunchSelection::Resolved { address, verified: true, .. }
+                    if address == DASHBOARD_XITE_ADDRESS
+            ));
+        }
+        let mixed = format!("E{}", &DASHBOARD_XITE_ADDRESS[1..]);
+        let typo = format!("{}q", &DASHBOARD_XITE_ADDRESS[..DASHBOARD_XITE_ADDRESS.len() - 1]);
+        for label in [mixed, typo.to_ascii_uppercase()] {
+            for target in [label.clone(), format!("{label}.EPIX")] {
+                assert_eq!(parse_target(&target), target, "invalid spelling must not be repaired");
+                assert!(select_launch_from(&target, |_| panic!("invalid address must not use cache"), |_| false).is_err());
+                assert!(cache_target_requires_finality(&target));
+            }
+        }
+    }
+
+    #[test]
+    fn domain_case_cache_reads_legacy_keys_and_prefers_canonical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let other = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+        let cache = serde_json::json!({
+            "TaLk.EPIX": { "address": other, "resolved_at": now_secs() },
+            "LEGACY.EPIX": DASHBOARD_XITE_ADDRESS,
+        });
+        std::fs::write(resolve_cache_path(root), serde_json::to_vec(&cache).unwrap()).unwrap();
+        for name in ["talk.epix", "Talk.EPIX", "TALK.EPIX"] {
+            assert_eq!(validated_cached_resolution(root, name).unwrap().address, other);
+            assert!(!needs_chain_resolve(root, name));
+        }
+        let legacy = validated_cached_resolution(root, "Legacy.epix").unwrap();
+        assert_eq!(legacy.address, DASHBOARD_XITE_ADDRESS);
+        assert!(legacy.verified);
+        assert!(!legacy.fresh, "a legacy string keeps its expired-cache semantics");
+
+        write_resolve_cache(root, "TALK.EPIX", DASHBOARD_XITE_ADDRESS);
+        let saved = read_resolve_cache(root);
+        assert_eq!(saved["talk.epix"]["address"], DASHBOARD_XITE_ADDRESS);
+        assert!(saved.contains_key("TaLk.EPIX"), "reading must not rewrite old entries");
+        for name in ["talk.epix", "TaLk.EPIX", "TALK.EPIX"] {
+            assert_eq!(validated_cached_resolution(root, name).unwrap().address, DASHBOARD_XITE_ADDRESS);
+        }
+    }
+
+    #[test]
+    fn domain_case_cache_writer_cannot_downgrade_a_legacy_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = resolve_cache_path(dir.path());
+        let initial = serde_json::to_vec(&serde_json::json!({
+            "TaLk.EPIX": {
+                "address": DASHBOARD_XITE_ADDRESS, "resolved_at": now_secs(),
+                "finality_height": 42, "finality_digest": "42".repeat(32),
+            }
+        })).unwrap();
+        std::fs::write(&path, &initial).unwrap();
+        let stale = (41, "41".repeat(32));
+        let outcome = write_resolve_cache_bound_checked(
+            dir.path(), "TALK.EPIX", "older", Some(&stale), true,
+            |_, _, _, _| panic!("a stale spelling must fail before publication"),
+        ).unwrap();
+        assert_eq!(outcome, ResolveCacheWriteOutcome::Superseded);
+        assert_eq!(std::fs::read(&path).unwrap(), initial);
+
+        let current = (43, "43".repeat(32));
+        let outcome = write_resolve_cache_bound_checked(
+            dir.path(), "TALK.EPIX", DASHBOARD_XITE_ADDRESS, Some(&current), true,
+            |height, digest, temporary, destination| {
+                assert_eq!((height, digest), (43, current.1.as_str()));
+                publish_resolve_cache_temp(temporary, destination)?;
+                Ok(true)
+            },
+        ).unwrap();
+        assert_eq!(outcome, ResolveCacheWriteOutcome::Published);
+        let saved = read_resolve_cache(dir.path());
+        assert_eq!(saved["talk.epix"]["finality_height"], 43);
+        assert_eq!(saved["TaLk.EPIX"]["finality_height"], 42);
+    }
+
+    #[tokio::test]
+    async fn domain_case_on_demand_shares_slots_and_rejects_invalid_addresses() {
+        use epix_ui::OnDemandResolver as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        let resolver = OnDemand {
+            state: state.clone(), data_root: dir.path().to_path_buf(), trackers: vec![],
+            network_disabled: false, me: std::sync::Weak::new(),
+            in_flight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            in_flight_token: std::sync::atomic::AtomicU64::new(0),
+            tor_expected: std::sync::atomic::AtomicBool::new(false),
+            tor_always: std::sync::atomic::AtomicBool::new(false),
+            resolving: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            verifier_wake: tokio::sync::Notify::new(),
+        };
+        let slot = resolver.claim_resolve_slot("Talk.EPIX").unwrap();
+        assert!(resolver.is_resolving("tAlK.ePiX"));
+        assert!(resolver.claim_resolve_slot("talk.epix").is_none());
+        drop(slot);
+        assert!(!resolver.is_resolving("TALK.EPIX"));
+        assert!(resolver.claim_resolve_slot("TALK.EPIX").is_some());
+
+        write_resolve_cache(dir.path(), "talk.epix", DASHBOARD_XITE_ADDRESS);
+        let expected = Resolved { address: DASHBOARD_XITE_ADDRESS.into(), verified: true };
+        for name in ["Talk.EPIX", "TALK.epix", "tAlK.ePiX"] {
+            assert_eq!(resolver.resolve_host_cached_only(name).await, Some(expected.clone()));
+            assert_eq!(resolver.resolve_host(name).await.unwrap(), expected);
+            assert_eq!(resolver.resolve_with_status(name).await.unwrap(), expected);
+            let status = state.resolve_status("talk.epix").await.unwrap();
+            assert_eq!(status.state, "resolved");
+            assert_eq!(status.address.as_deref(), Some(DASHBOARD_XITE_ADDRESS));
+        }
+        let uppercase = DASHBOARD_XITE_ADDRESS.to_ascii_uppercase();
+        assert_eq!(resolver.resolve_host(&format!("{uppercase}.EPIX")).await.unwrap(), expected);
+        assert_eq!(resolver.resolve_host_cached_only(&uppercase).await, Some(expected));
+        let mixed = format!("E{}", &DASHBOARD_XITE_ADDRESS[1..]);
+        let typo = format!("{}q", &DASHBOARD_XITE_ADDRESS[..DASHBOARD_XITE_ADDRESS.len() - 1]);
+        for label in [mixed, typo.to_ascii_uppercase()] {
+            let host = format!("{label}.EPIX");
+            write_resolve_cache(dir.path(), &host, DASHBOARD_XITE_ADDRESS);
+            write_resolve_cache(dir.path(), &host.to_ascii_lowercase(), DASHBOARD_XITE_ADDRESS);
+            assert!(!needs_chain_resolve(dir.path(), &host));
+            assert_eq!(resolver.resolve_host_cached_only(&host).await, None);
+            assert!(matches!(resolver.resolve_host(&host).await, Err(ResolveError::MistypedAddress(_))));
+            assert!(matches!(try_resolve_on_chain_bound(&label, "EPIX").await, Err(ResolveError::MistypedAddress(_))));
+        }
+        // Old registered keys still use their exact spelling for the local
+        // owned-xite shortcut; they are not necessarily domain names.
+        let legacy = "LegacyLocalKey";
+        state.add_xite(legacy, XiteEntry {
+            storage: XiteStorage::new(dir.path().join("legacy")), content: None,
+        }).await;
+        state.set_owned(legacy, true).await;
+        resolver.ensure(legacy).await.unwrap();
     }
 
     #[test]

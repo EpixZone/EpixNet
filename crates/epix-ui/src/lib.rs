@@ -682,7 +682,7 @@ fn url_is_same_host(url: &str, host: &str) -> bool {
         .split('/')
         .next()
         .unwrap_or("");
-    strip_port(url_host) == strip_port(host)
+    strip_port(url_host).eq_ignore_ascii_case(strip_port(host))
 }
 
 /// The xite a referer URL points at: the nested path segment if it is itself a
@@ -752,6 +752,7 @@ fn is_global_path(path: &str) -> bool {
 /// or a bare bech32 `epix1…` address Firefox routed to us - rather than the
 /// loopback UI bind.
 fn is_proxy_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
     (host.ends_with(".epix") && !host.is_empty())
         || (host.starts_with("epix1") && host.len() > 20 && !host.contains('.'))
 }
@@ -759,6 +760,7 @@ fn is_proxy_host(host: &str) -> bool {
 /// True if a path segment plausibly references a xite we could fetch on
 /// demand: a `.epix` name (xID) or a bech32 `epix1…` address.
 fn plausible_xite_ref(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
     s.ends_with(".epix") || (s.starts_with("epix1") && s.len() > 20)
 }
 
@@ -767,7 +769,10 @@ fn plausible_xite_ref(s: &str) -> bool {
 /// bypass filters), so a bare address is always presented as this dotted alias
 /// in URLs; checksum-validated, so a look-alike xID name never collapses.
 fn address_alias(host: &str) -> Option<&str> {
-    let label = host.strip_suffix(".epix")?;
+    let (label, suffix) = host.rsplit_once('.')?;
+    if !suffix.eq_ignore_ascii_case("epix") {
+        return None;
+    }
     (!label.contains('.') && epix_core::classify_label(label) == epix_core::LabelClass::Address)
         .then_some(label)
 }
@@ -777,8 +782,8 @@ fn address_alias(host: &str) -> Option<&str> {
 /// name (or an already-dotted alias) passes through unchanged. Public so the
 /// desktop browser applies the same rule to its homepage / start URL.
 pub fn aliased_origin(xite_ref: &str) -> String {
-    if xite_ref.starts_with("epix1") && !xite_ref.contains('.') {
-        format!("{xite_ref}.epix")
+    if epix_core::classify_label(xite_ref) == epix_core::LabelClass::Address {
+        format!("{}.epix", xite_ref.to_ascii_lowercase())
     } else {
         xite_ref.to_string()
     }
@@ -787,13 +792,13 @@ pub fn aliased_origin(xite_ref: &str) -> String {
 /// An untrusted path segment may become an origin only when it names a
 /// supported xite. Decoded URL delimiters must never enter the authority.
 fn cross_xite_origin(xite_ref: &str) -> Option<String> {
+    if epix_core::classify_label(xite_ref) == epix_core::LabelClass::Address {
+        return Some(aliased_origin(xite_ref));
+    }
+    if address_alias(xite_ref).is_some() {
+        return Some(xite_ref.to_ascii_lowercase());
+    }
     let normalized = xite_ref.to_ascii_lowercase();
-    if epix_core::classify_label(&normalized) == epix_core::LabelClass::Address {
-        return Some(aliased_origin(&normalized));
-    }
-    if address_alias(&normalized).is_some() {
-        return Some(normalized);
-    }
     state::xite_domain_name(&normalized).filter(|name| name == &normalized)
 }
 
@@ -837,7 +842,7 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
     // this host's path; the wrapper redirects such a document to the xite's
     // own origin.
     let first_seg = path.trim_start_matches('/').split('/').next().unwrap_or("");
-    if (first_seg.starts_with("epix1") && first_seg.len() > 20) || first_seg.ends_with(".epix") {
+    if plausible_xite_ref(first_seg) {
         return req;
     }
     let query = req.uri().query().map(|q| format!("?{q}")).unwrap_or_default();
@@ -1275,13 +1280,15 @@ async fn render_wrapper(
         let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
         return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
     }
-    let proxy_mode = host == requested;
+    let proxy_mode = host.eq_ignore_ascii_case(&requested);
 
     // The path segment may be a `.epix` name (xID) or the bech32 address; the
     // node's identity for a xite is ALWAYS the bech32 address, so translate
     // once here and key everything below (state lookups, wrapper identity,
     // the WS session) by the address.
     let mut address = ctx.state.canonical_key(&requested).await;
+    let address_form = epix_core::classify_label(&requested) == epix_core::LabelClass::Address
+        || address_alias(&requested).is_some();
     let mut loading = false;
     // Set when the name has no address yet: the wrapper is served in
     // resolving mode (no xite identity, no inner document, polls
@@ -1341,7 +1348,7 @@ async fn render_wrapper(
         // network, the name registry, Tor - stop waiting and serve the
         // resolving screen instead: it explains the wait, shows progress, and
         // reloads itself the moment the name lands.
-        if !requested.starts_with("epix1") {
+        if !address_form {
             for _ in 0..20 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let key = ctx.state.canonical_key(&requested).await;
@@ -1370,8 +1377,10 @@ async fn render_wrapper(
                     // was refused by policy, not "not found" on the chain, and
                     // retrying can never fix a bad checksum.
                     if matches!(
-                        requested.strip_suffix(".epix").map(epix_core::classify_label),
-                        Some(epix_core::LabelClass::AddressShaped)
+                        epix_core::classify_label(requested.rsplit_once('.')
+                            .filter(|(_, suffix)| suffix.eq_ignore_ascii_case("epix"))
+                            .map_or(requested.as_str(), |(label, _)| label)),
+                        epix_core::LabelClass::AddressShaped
                     ) {
                         return (
                             StatusCode::NOT_FOUND,
@@ -1418,8 +1427,6 @@ async fn render_wrapper(
     // Reverse lookup is independent of address discovery, including before
     // content.json arrives. Only a verified name-to-this-address binding may
     // change the visible origin; saved display metadata is not proof.
-    let address_form = epix_core::classify_label(&requested) == epix_core::LabelClass::Address
-        || address_alias(&requested).is_some();
     if address_form {
         ctx.state.request_xite_domain(&address).await;
         if let Some(domain) = ctx.state.verified_xite_domain(&address).await {

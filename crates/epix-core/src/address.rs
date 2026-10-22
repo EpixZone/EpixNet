@@ -76,7 +76,11 @@ pub fn classify_label(label: &str) -> LabelClass {
     if epix_crypt::is_valid_address(label) {
         return LabelClass::Address;
     }
-    let shaped = label
+    // Check the original checksum first: Bech32 rejects mixed case. Folding
+    // only the shape check keeps mixed-case address typos out of the name
+    // registry without turning them into valid addresses.
+    let folded = label.to_ascii_lowercase();
+    let shaped = folded
         .strip_prefix("epix1")
         .filter(|rest| rest.len() >= 20)
         .is_some_and(|rest| rest.chars().all(|c| BECH32_CHARSET.contains(c)));
@@ -105,18 +109,22 @@ mod tests {
     fn classify_label_partitions_the_address_space() {
         // A checksum-valid address is the alias, never a name.
         assert_eq!(classify_label(DASH), LabelClass::Address);
+        assert_eq!(classify_label(&DASH.to_ascii_uppercase()), LabelClass::Address);
+        assert_eq!(classify_label(&format!("E{}", &DASH[1..])), LabelClass::AddressShaped);
         // One character off: address-shaped, refused as a name (typo-squat).
         let mut typo = DASH.to_string();
         typo.pop();
         typo.push('q');
         assert_ne!(typo, DASH);
         assert_eq!(classify_label(&typo), LabelClass::AddressShaped);
+        assert_eq!(classify_label(&typo.to_ascii_uppercase()), LabelClass::AddressShaped);
         // A truncated-but-still-long fake is refused too.
         assert_eq!(classify_label(&DASH[..30]), LabelClass::AddressShaped);
         // Short or non-charset epix1 brandings are ordinary names: under the
         // 20-char floor, or containing letters bech32 never uses (o, b, i).
         assert_eq!(classify_label("epix1fans"), LabelClass::Name);
         assert_eq!(classify_label("epix1shop"), LabelClass::Name);
+        assert_eq!(classify_label("Epix1Shop"), LabelClass::Name);
         assert_eq!(classify_label("epix1bobsbigblog2026extra"), LabelClass::Name);
         // Non-epix1 labels are names regardless of shape.
         assert_eq!(classify_label("talk"), LabelClass::Name);
