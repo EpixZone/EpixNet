@@ -32,6 +32,19 @@ jobs:
         run: |
           export KOTLINC="$(command -v kotlinc)"
           "$KOTLINC" -version
+          export COROUTINES_JAR="$RUNNER_TEMP/kotlinx-coroutines-core-jvm-1.9.0.jar"
+          curl --fail --location --silent --show-error --retry 3 --connect-timeout 10 --max-time 120 \
+            https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.9.0/kotlinx-coroutines-core-jvm-1.9.0.jar \
+            --output "$COROUTINES_JAR"
+          echo "ad89c2892235e670f222d819cb3d81188143cb19a05b59df9889ae4269f5c70a  $COROUTINES_JAR" | sha256sum --check
+          python3 shells/android/tests/run-node-host-regressions.py
+          python3 shells/android/tests/run-browser-host-regressions.py
+          python3 shells/android/tests/run-browser-settings-regressions.py
+          python3 shells/android/tests/run-pending-operations-regressions.py
+          python3 shells/android/tests/run-guarded-session-regressions.py
+          python3 shells/android/tests/run-picked-file-regressions.py
+          python3 shells/android/tests/run-file-response-regressions.py
+          python3 shells/android/tests/run-activity-lifecycle-regressions.py
           python3 shells/android/tests/run-startup-regressions.py
           python3 shells/android/tests/run-toolbar-regressions.py
 
