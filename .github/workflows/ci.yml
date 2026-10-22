@@ -89,23 +89,15 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test bounded apt mirror fallback
+        run: python3 scripts/test_ci_install_apt_deps.py -v
       - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge; GTK/AppIndicator for the system tray)
-        # `timeout` per apt call + retry: a stalled Azure apt mirror otherwise
-        # hangs the step for the full 6h job timeout (observed on this branch).
-        env:
-          DEBIAN_FRONTEND: noninteractive
+        # Bound stalled downloads and leave Azure after the first failure.
         run: |
-          for i in 1 2 3; do
-            if sudo timeout 300 apt-get update && \
-               sudo timeout 300 apt-get install -y --no-install-recommends \
-                 protobuf-compiler libudev-dev pkg-config libgtk-3-dev \
-                 libayatana-appindicator3-dev libxdo-dev; then
-              exit 0
-            fi
-            echo "::warning::apt attempt $i failed or timed out; retrying in 15s"
-            sleep 15
-          done
-          echo "::error::apt-get failed after 3 attempts"; exit 1
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+            python3 scripts/ci_install_apt_deps.py \
+              protobuf-compiler libudev-dev pkg-config libgtk-3-dev \
+              libayatana-appindicator3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
@@ -154,6 +146,28 @@ jobs:
       - name: Test metadata-private channel crates
         run: cargo test -p epix-chain -p epix-envelope -p epix-channel -p epix-pairwise-engine -p epix-group-engine -p epix-rln -p epix-plugins -p epix-node -p epix-nmh -p epix-ffi --locked
 
+  windows-time-regressions:
+    name: Windows saturating time regressions
+    runs-on: windows-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      # This excluded vendored crate has a standalone dependency graph. Avoid
+      # building or caching the full workspace to exercise Windows clock limits.
+      - name: Test Windows clock limits and coarse-clock progress
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/saturating-time-tests
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+        run: cargo test --manifest-path vendor/saturating-time/Cargo.toml
+
   mobile-profiles:
     name: Mobile feature profiles
     runs-on: ubuntu-latest
@@ -166,18 +180,9 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux build deps (protoc)
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
-          for i in 1 2 3; do
-            if sudo timeout 300 apt-get update && \
-               sudo timeout 300 apt-get install -y --no-install-recommends protobuf-compiler pkg-config; then
-              exit 0
-            fi
-            echo "::warning::apt attempt $i failed or timed out; retrying in 15s"
-            sleep 15
-          done
-          echo "::error::apt-get failed after 3 attempts"; exit 1
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+            python3 scripts/ci_install_apt_deps.py protobuf-compiler pkg-config
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable

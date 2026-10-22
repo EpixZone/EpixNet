@@ -8,7 +8,7 @@ epix-core = { path = "../epix-core" }
 epix-transport = { path = "../epix-transport" }
 # rustls instead of the default native-tls: pure Rust, so the same build works
 # on desktop and Android (native-tls needs an OpenSSL for the NDK target).
-arti-client = { version = "0.46", default-features = false, features = [
+arti-client = { version = "0.47", default-features = false, features = [
     "tokio",
     "rustls",
     "compression",
@@ -17,11 +17,11 @@ arti-client = { version = "0.46", default-features = false, features = [
 ] }
 # Arti exposes these crates' types and traits across its public API. Update
 # the Tor family and safelog together to keep runtime and display traits shared.
-tor-hsservice = "0.46"
-safelog = "0.9"
+tor-hsservice = "0.47"
+safelog = "0.10"
 tor-rtcompat = { version = "0.47", features = ["tokio", "rustls"] }
-tor-cell = "0.46"
-tor-proto = "0.46"
+tor-cell = "0.47"
+tor-proto = "0.47"
 # rustls 0.23 won't auto-pick a crypto provider when several are in the tree;
 # we install `ring` explicitly before bootstrap (see `install_crypto_provider`).
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
