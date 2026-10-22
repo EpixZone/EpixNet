@@ -25,7 +25,7 @@ uuid = { version = "1", features = ["v4"] }
 # The bundled WebExtension is embedded and written out as an XPI into the
 # managed profile at launch.
 include_dir = "0.7"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Desktop system tray (macOS menu bar / Windows notification area / Linux
 # StatusNotifier-AppIndicator). Keeps the node's stats visible while it runs in
 # the background after the browser window closes. `tao` owns the main-thread
@@ -81,7 +81,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Verify the downloaded wallet archive against shells/wallet-ext.sha256
 # before extracting it into the packaged extension.
 sha2 = "0.11"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Windows: embed packaging/windows/app.ico in the exe (Explorer, taskbar).
 [target.'cfg(windows)'.build-dependencies]

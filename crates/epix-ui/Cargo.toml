@@ -54,7 +54,7 @@ maxminddb = { version = "0.32", features = ["mmap"] }
 flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tar = "0.4.46"
-zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate", "aes-crypto"] }
 getrandom = { version = "0.4" }
 sha3 = { version = "0.12", optional = true }
 # default-features off: postcard's default heapless support drags the
