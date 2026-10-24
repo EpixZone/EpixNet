@@ -471,7 +471,10 @@ tor_bootstrap=info";
 /// `EPIX_LOG` (or `RUST_LOG`), else [`DEFAULT_LOG_FILTER`]. `try_init` never
 /// panics if a host shell (or a second `boot`) already installed a subscriber.
 fn init_logging() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::filter::FilterExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{fmt, EnvFilter, Layer as _};
     let filter = std::env::var("EPIX_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
@@ -479,7 +482,68 @@ fn init_logging() {
         .and_then(|s| EnvFilter::try_new(&s).ok())
         .unwrap_or_else(|| EnvFilter::new(DEFAULT_LOG_FILTER));
     // No ANSI: this stream is usually a file, and colour escapes only litter it.
-    let _ = fmt().with_env_filter(filter).with_ansi(false).try_init();
+    let _ = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_filter(filter.and(RepeatedWarningThrottle)),
+        )
+        .try_init();
+}
+
+/// A per-layer filter that tames the one third-party warning known to repeat
+/// on a timer for as long as its condition lasts: emissary's "cannot publish
+/// lease set, no inbound tunnels", once a second. Every occurrence is handed
+/// to [`epix_runtime::i2p_health`], which keeps the streak the I2P status
+/// loop turns into a single operator-facing warning; only the first of a
+/// streak and a periodic heartbeat reach the output. Everything else passes
+/// untouched, so the env filter alone decides what is logged.
+struct RepeatedWarningThrottle;
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S> for RepeatedWarningThrottle {
+    fn enabled(
+        &self,
+        _meta: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let target = event.metadata().target();
+        if target != epix_runtime::i2p_health::LEASE_SET_BLOCKED_TARGET {
+            return true;
+        }
+        let mut message = EventMessage::default();
+        event.record(&mut message);
+        if !epix_runtime::i2p_health::is_lease_set_blocked_event(target, &message.0) {
+            return true;
+        }
+        epix_runtime::i2p_health::note_lease_set_blocked()
+    }
+}
+
+/// Captures an event's `message` field as text (the format string, already
+/// rendered) so a filter can match on it; other fields are ignored.
+#[derive(Default)]
+struct EventMessage(String);
+
+impl tracing::field::Visit for EventMessage {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_string();
+        }
+    }
 }
 
 /// Local startup work reported by [`boot_with_progress`]. Network bootstrap
@@ -5666,6 +5730,51 @@ mod tests {
         ] {
             assert!(light_client_clock_skew_hint(error).is_none(), "{error}");
         }
+    }
+
+    /// A layer that counts the events the throttle lets through to it.
+    struct CountEvents(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountEvents {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn repeated_warning_throttle_drops_only_emissarys_lease_set_repeats() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::Layer as _;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(CountEvents(seen.clone()).with_filter(RepeatedWarningThrottle));
+        tracing::subscriber::with_default(subscriber, || {
+            // The per-second repeat: the first of the streak passes, the
+            // next ones (same second, same streak) are swallowed.
+            for _ in 0..5 {
+                tracing::warn!(
+                    target: "emissary::destination::lease-set",
+                    local = %"oLt8E42s",
+                    "cannot publish lease set, no inbound tunnels",
+                );
+            }
+            // Other warnings from that target, and from anywhere else, pass.
+            tracing::warn!(
+                target: "emissary::destination::lease-set",
+                "non-existent inbound tunnel about to expire",
+            );
+            tracing::warn!(target: "emissary::tunnel::pool", "tunnel build failed");
+            tracing::info!("unrelated");
+        });
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Acquire), 1 + 3);
+        assert!(
+            epix_runtime::i2p_health::inbound_tunnels_missing().is_some(),
+            "the streak was recorded for the I2P status loop"
+        );
     }
 
     #[tokio::test]
