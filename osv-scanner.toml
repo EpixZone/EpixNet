@@ -14,6 +14,10 @@ reason = "bincode unmaintained; migration tracked separately."
 id = "RUSTSEC-2024-0436"
 reason = "paste unmaintained (proc-macro, low risk)."
 
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+reason = "crypto-bigint timing variability. Our k256 stack is on the patched 0.7 line; the remaining copy is crypto-bigint 0.5.5 via emissary-core -> p256 0.13 (no patched 0.5), used only to verify other routers' public RouterInfo signatures, so no secret reaches the affected operations. Drop when emissary moves to p256 0.14."
+
 # arkworks zk stack (RLN anti-spam via the vendored rln crate).
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0388"
