@@ -27,6 +27,7 @@ use tokio::task::JoinHandle;
 use tokio::time::{interval, MissedTickBehavior};
 
 pub mod edx;
+pub mod i2p_health;
 #[cfg(feature = "local-discovery")]
 pub mod local;
 pub mod xfer;
@@ -2699,8 +2700,40 @@ async fn i2p_loop(
     // Poll live status (phase, peers, tunnels, destination) into the app state
     // for the Stats page until shutdown.
     let mut announced_b32 = false;
+    // One WARN per stretch without inbound tunnels (see `i2p_health`), and one
+    // INFO when they return; never a line per tick.
+    let mut warned_missing_tunnels = false;
     loop {
         let s = i2p.status().await;
+        let missing_tunnels = i2p_health::inbound_tunnels_missing();
+        match missing_tunnels {
+            Some(missing)
+                if !warned_missing_tunnels && missing.for_secs >= i2p_health::WARN_AFTER_SECS =>
+            {
+                warned_missing_tunnels = true;
+                state
+                    .log(
+                        "WARN",
+                        i2p_health::missing_tunnels_warning(
+                            &missing,
+                            s.connected_routers,
+                            s.tunnels_built,
+                            s.tunnel_failures,
+                        ),
+                    )
+                    .await;
+            }
+            None if warned_missing_tunnels => {
+                warned_missing_tunnels = false;
+                state
+                    .log(
+                        "INFO",
+                        "I2P: inbound tunnels are back; peers can reach this node over I2P again",
+                    )
+                    .await;
+            }
+            _ => {}
+        }
         // Publish only after an EDX accept handler is installed: a download-only
         // node can dial I2P but must not announce an unserved destination.
         // Once ready, publish our `.b32.i2p` (minus the `.i2p` suffix) so PEX
@@ -2727,6 +2760,7 @@ async fn i2p_loop(
                 "connected_routers": s.connected_routers,
                 "tunnels_built": s.tunnels_built,
                 "tunnel_failures": s.tunnel_failures,
+                "inbound_tunnels_missing_secs": missing_tunnels.map(|m| m.for_secs),
             }))
             .await;
         tokio::select! {
