@@ -14,6 +14,15 @@ ignore = [
     "RUSTSEC-2025-0141",
     # RUSTSEC-2024-0436: paste unmaintained (proc-macro, low risk).
     "RUSTSEC-2024-0436",
+    # RUSTSEC-2026-0387: crypto-bigint timing variability, patched in 0.7.6.
+    # Our own k256/elliptic-curve stack is on the patched 0.7 line. The ignore
+    # covers the OTHER copy, crypto-bigint 0.5.5, pulled by the embedded I2P
+    # router (emissary-core -> p256 0.13), for which no patched 0.5 exists.
+    # emissary uses p256 only to VERIFY other routers' ECDSA-P256 RouterInfo
+    # signatures (public keys, public data): no secret integer ever goes
+    # through the affected operations, so the side channel has nothing to
+    # leak. Drop this when emissary moves to p256 0.14.
+    "RUSTSEC-2026-0387",
 
     # --- arkworks zk stack (RLN anti-spam, epix-rln -> vendored rln) --------
     # RUSTSEC-2024-0388: derivative unmaintained (build-time proc-macro used by
