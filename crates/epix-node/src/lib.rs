@@ -4149,6 +4149,8 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         // the app should not wait 15 minutes for names to resolve. Once
         // trusted, settle into the regular cadence.
         let mut fast_retry_secs = 5u64;
+        // One WARN per clock-skew failure streak (see log_xid_lightclient_outcome).
+        let mut warned_clock_skew = false;
         loop {
             let mut cfg = xid_lightclient_config(&state, &data_root).await;
             let mut rpc_candidates = rpc_candidates_for(&cfg, preferred.as_deref());
@@ -4166,7 +4168,7 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             // Only that transition retries - not every tick, or an hourly
             // UpToDate would re-index the whole deferred set forever.
             let anchored_now = before.is_none() && epix_chain::pinned_validators().is_some();
-            log_xid_lightclient_outcome(&state, before, outcome).await;
+            log_xid_lightclient_outcome(&state, before, outcome, &mut warned_clock_skew).await;
             if anchored_now {
                 on_trust_anchored(&state).await;
             }
@@ -4334,10 +4336,6 @@ fn pinned_set_changed(old: &epix_chain::PinnedSet, new: &epix_chain::PinnedSet) 
         })
 }
 
-/// Log one light-client advance outcome at the right level: set changes at
-/// INFO, routine advances at DEBUG, an unextendable anchor at WARN, transient
-/// errors (RPC hiccup, Tor not up yet) at DEBUG — the active pin is untouched
-/// in every non-advanced case and the next tick retries.
 /// One light-client advance cycle, rotating across the candidate RPCs on
 /// failure. The URL that answers moves to the front, so the next cycle starts
 /// on the endpoint that actually works - the pin must keep advancing inside
@@ -4367,11 +4365,26 @@ async fn advance_with_rpc_rotation(
     outcome
 }
 
+/// Log one light-client advance outcome at the right level: set changes at
+/// INFO, routine advances at DEBUG, an unextendable anchor at WARN, transient
+/// errors (RPC hiccup, Tor not up yet) at DEBUG — the active pin is untouched
+/// in every non-advanced case and the next tick retries.
+///
+/// One transient-looking error is not transient: a header rejected as "from
+/// the future" means this machine's clock is behind the chain by more than
+/// the verifier's drift allowance, and no retry can succeed until the clock
+/// is fixed. That one is raised to WARN with the fix spelled out, once per
+/// failure streak (`warned_clock_skew`), so a default INFO log shows the
+/// cause instead of only the downstream "trust not established" symptoms.
 async fn log_xid_lightclient_outcome(
     state: &AppState,
     before: Option<epix_chain::PinnedSet>,
     outcome: Result<epix_chain::Advance, String>,
+    warned_clock_skew: &mut bool,
 ) {
+    if outcome.is_ok() {
+        *warned_clock_skew = false;
+    }
     match outcome {
         Ok(epix_chain::Advance::Advanced { height, validators }) => {
             let set_changed = match (&before, epix_chain::pinned_validators()) {
@@ -4403,11 +4416,38 @@ async fn log_xid_lightclient_outcome(
                 .await;
         }
         Err(e) => {
+            if let Some(hint) = light_client_clock_skew_hint(&e) {
+                if !*warned_clock_skew {
+                    *warned_clock_skew = true;
+                    state.log("WARN", hint).await;
+                    return;
+                }
+            }
             state
                 .log("DEBUG", format!("xID finality: light client: {e}"))
                 .await;
         }
     }
+}
+
+/// The operator-facing explanation when a light-client error is really a
+/// local clock problem. The CometBFT verifier rejects a header whose time is
+/// more than `max_clock_drift` ahead of the local clock as "from the future";
+/// on a live chain that only happens when THIS machine's clock is behind (a
+/// classic after sleep/hibernate, and on WSL2). Everything downstream then
+/// fails closed with "trust not established", which points nowhere near the
+/// cause, so name the cause and the fix.
+fn light_client_clock_skew_hint(error: &str) -> Option<String> {
+    if !error.contains("header from the future") {
+        return None;
+    }
+    Some(format!(
+        "xID finality: the light client rejected the chain head because this machine's clock \
+         is behind the chain by more than the allowed drift ({error}). xID names cannot \
+         resolve until the system clock is corrected: re-sync it with NTP (for example \
+         `sudo chronyc makestep`, or on WSL2 restart WSL); the light client retries on its \
+         own once the clock is right"
+    ))
 }
 
 /// Wire up the [`AppState`], plugins, background runtime, and UI server for a
@@ -5602,6 +5642,31 @@ mod navigation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn clock_skew_hint_names_the_clock_for_a_future_header() {
+        let error = "light client: header 6212615 REJECTED: header from the future: \
+                     header_time=2026-10-24T20:48:25Z now=2026-10-24T20:47:39Z \
+                     max_clock_drift=30s (leaving current pin untouched)";
+        let hint = light_client_clock_skew_hint(error).expect("future header is clock skew");
+        assert!(hint.contains("clock"), "{hint}");
+        assert!(hint.contains("NTP"), "{hint}");
+        assert!(
+            hint.contains("header 6212615"),
+            "keeps the verifier detail: {hint}"
+        );
+    }
+
+    #[test]
+    fn clock_skew_hint_leaves_other_light_client_errors_alone() {
+        for error in [
+            "light client: rpc request failed: Tor-always mode: chain RPC blocked until Tor is ready",
+            "network bootstrap: only 1/4 sources reachable (need 2)",
+            "light client: header 5 REJECTED: insufficient signers overlap (leaving current pin untouched)",
+        ] {
+            assert!(light_client_clock_skew_hint(error).is_none(), "{error}");
+        }
+    }
 
     #[tokio::test]
     async fn boot_progress_reports_data_failure_without_prepared() {
