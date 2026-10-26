@@ -578,9 +578,46 @@ pub async fn boot_with_progress(
     opts: NodeOptions,
     report: impl Fn(BootStage) + Send + Sync,
 ) -> Result<(UiServer, RunningNode), String> {
-    init_logging();
     report(BootStage::PreparingData);
-    std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
+    let lease = epix_ui::data_relocation::DataRootLease::acquire(&opts.data_root)
+        .map_err(|e| format!("Cannot open data directory {}: {e}", opts.data_root.display()))?;
+    boot_with_data_lease(opts, Arc::new(lease), report).await
+}
+
+/// Prepare the desktop-selected root before a shell opens CA/profile data.
+/// An embedding app or explicit environment root never applies desktop moves.
+pub fn prepare_data_root() -> Result<Arc<epix_ui::data_relocation::DataRootLease>, String> {
+    // Desktop shutdown has a bounded wait for blocking work. Keep ownership
+    // until process exit even if the last async AppState drops before a writer.
+    static PROCESS_LEASES: std::sync::Mutex<Vec<Arc<epix_ui::data_relocation::DataRootLease>>> =
+        std::sync::Mutex::new(Vec::new());
+    let prepared = if let Some(root) = std::env::var_os("EPIX_DATA_DIR").filter(|v| !v.is_empty()) {
+        epix_ui::data_relocation::DataRootLease::acquire(std::path::Path::new(&root))
+    } else {
+        epix_ui::data_relocation::prepare_startup(
+            &epix_ui::paths::default_conf_path(),
+            &epix_ui::paths::default_data_root(),
+        )
+    };
+    let lease = Arc::new(prepared.map_err(|e| format!("Cannot prepare the data directory: {e}"))?);
+    PROCESS_LEASES.lock().unwrap().push(lease.clone());
+    Ok(lease)
+}
+
+/// Boot using a root already prepared by the desktop shell. Ownership spans
+/// migration, shell setup, node startup and the lifetime of all state writers.
+pub async fn boot_with_data_lease(
+    mut opts: NodeOptions,
+    lease: Arc<epix_ui::data_relocation::DataRootLease>,
+    report: impl Fn(BootStage) + Send + Sync,
+) -> Result<(UiServer, RunningNode), String> {
+    init_logging();
+    let selected = opts.data_root.canonicalize()
+        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
+    if selected != lease.root() {
+        return Err("The prepared data directory does not match the requested node root".to_string());
+    }
+    opts.data_root = lease.root().to_path_buf();
     // A restore staged by the Backup & Restore wizard applies now, before
     // anything reads the data dir (users.json, sites.json, config).
     epix_ui::backup::apply_pending_restore(&opts.data_root);
@@ -615,7 +652,7 @@ pub async fn boot_with_progress(
     let (launch, startup_network_policy) =
         prepare_startup_launch_with(&opts, arm_startup_network_policy)?;
 
-    serve(opts, launch, xid_finality, startup_network_policy, &report).await
+    serve(opts, lease, launch, xid_finality, startup_network_policy, &report).await
 }
 
 
@@ -991,6 +1028,19 @@ fn publish_nmh_endpoint(
 /// server binary and the FFI background thread.
 pub async fn run(opts: NodeOptions) -> Result<(), String> {
     let (server, running) = boot(opts).await?;
+    serve_standalone(server, running).await
+}
+
+/// Run a desktop server with the ownership retained by `prepare_data_root`.
+pub async fn run_with_data_lease(
+    opts: NodeOptions,
+    lease: Arc<epix_ui::data_relocation::DataRootLease>,
+) -> Result<(), String> {
+    let (server, running) = boot_with_data_lease(opts, lease, |_| {}).await?;
+    serve_standalone(server, running).await
+}
+
+async fn serve_standalone(server: UiServer, running: RunningNode) -> Result<(), String> {
     // A standalone binary can relaunch itself for the Config page's restart.
     // Shells that call `boot` directly register their own argv (the desktop
     // browser) or none at all (the mobile apps, where the node is a library
@@ -4518,12 +4568,13 @@ fn light_client_clock_skew_hint(error: &str) -> Option<String> {
 /// launch target. Returns the server future + handle.
 async fn serve(
     opts: NodeOptions,
+    lease: Arc<epix_ui::data_relocation::DataRootLease>,
     launch: LaunchTarget,
     xid_finality: XidFinalityBoot,
     startup_network_policy: StartupNetworkPolicy,
     report: &(dyn Fn(BootStage) + Send + Sync),
 ) -> Result<(UiServer, RunningNode), String> {
-    let state = AppState::with_data_dir(&opts.version, &opts.data_root);
+    let state = AppState::with_data_dir_leased(&opts.version, lease);
     // Set BEFORE any xite is restored: a node that is offline by policy will
     // never anchor chain trust, so a withheld xID verdict there is terminal
     // rather than something to retry. Deciding this later (the chain route is
@@ -4614,7 +4665,7 @@ async fn serve(
     // programmatically by an embedding shell). The choice persists as
     // `data_dir` in the default location's epixnet.conf, Python-style.
     let env_pinned = std::env::var("EPIX_DATA_DIR").map(|v| !v.is_empty()).unwrap_or(false);
-    if !env_pinned && opts.data_root == epix_ui::paths::data_root() {
+    if !env_pinned && epix_ui::paths::data_root().canonicalize().ok().as_ref() == Some(&opts.data_root) {
         state.set_data_dir_conf(epix_ui::paths::default_data_root().join("epixnet.conf"));
     }
 
@@ -5787,9 +5838,54 @@ mod tests {
             stages.lock().unwrap().push(stage);
         })
         .await;
-        assert!(matches!(result, Err(error) if error.contains("create data root")));
+        assert!(matches!(result, Err(error) if error.contains("Cannot open data directory")));
         assert_eq!(*stages.lock().unwrap(), vec![BootStage::PreparingData]);
         assert_eq!(tokio::fs::read(&root).await.unwrap(), b"existing file");
+    }
+
+    #[test]
+    fn desktop_data_ownership_outlives_returned_state_handles() {
+        const WORKER: &str = "EPIX_DESKTOP_LEASE_WORKER";
+        if std::env::var_os(WORKER).is_some() {
+            let lease = prepare_data_root().unwrap();
+            let root = lease.root().to_path_buf();
+            drop(lease);
+            assert!(epix_ui::data_relocation::DataRootLease::acquire(&root).is_err(),
+                "bounded runtime shutdown must not release desktop ownership early");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::desktop_data_ownership_outlives_returned_state_handles"])
+            .env(WORKER, "1")
+            .env("EPIX_DATA_DIR", root.path())
+            .status().unwrap();
+        assert!(status.success());
+        assert!(epix_ui::data_relocation::DataRootLease::acquire(root.path()).is_ok(),
+            "process exit releases ownership");
+    }
+
+    #[tokio::test]
+    async fn boot_refuses_a_busy_data_root_before_opening_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = epix_ui::data_relocation::DataRootLease::acquire(dir.path()).unwrap();
+        let result = boot(NodeOptions::new(dir.path(), "dashboard.epix")).await;
+        assert!(result.is_err());
+        assert!(!dir.path().join("private/users.json").exists());
+        assert!(!dir.path().join("xid_lc_state.json").exists());
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn boot_rejects_a_prepared_lease_for_another_root() {
+        let held = tempfile::tempdir().unwrap();
+        let requested = tempfile::tempdir().unwrap();
+        let lease = epix_ui::data_relocation::DataRootLease::acquire(held.path()).unwrap();
+        let result = boot_with_data_lease(
+            NodeOptions::new(requested.path(), "dashboard.epix"), Arc::new(lease), |_| {},
+        ).await;
+        assert!(matches!(result, Err(error) if error.contains("does not match")));
+        assert!(!requested.path().join("private").exists());
     }
 
     #[test]
@@ -5869,6 +5965,8 @@ mod tests {
         );
         assert!(running.state.offline_by_policy());
         assert_eq!(running.address, DASHBOARD_XITE_ADDRESS);
+        assert!(epix_ui::data_relocation::DataRootLease::acquire(dir.path()).is_err(),
+            "node state must retain exclusive ownership after boot returns");
         drop(server);
     }
 

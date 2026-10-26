@@ -149,9 +149,9 @@ jobs:
         run: cargo test -p epix-chain -p epix-envelope -p epix-channel -p epix-pairwise-engine -p epix-group-engine -p epix-rln -p epix-plugins -p epix-node -p epix-nmh -p epix-ffi --locked
 
   windows-time-regressions:
-    name: Windows saturating time regressions
+    name: Windows filesystem and time regressions
     runs-on: windows-latest
-    timeout-minutes: 5
+    timeout-minutes: 15
     permissions:
       contents: read
     steps:
@@ -169,6 +169,16 @@ jobs:
           CARGO_PROFILE_TEST_DEBUG: "0"
           CARGO_INCREMENTAL: "0"
         run: cargo test --manifest-path vendor/saturating-time/Cargo.toml
+      - name: Test Windows data moves and canonical PAC paths
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+          EPIX_TEST_FETCH_DEPS: "1"
+        run: |
+          python scripts/test_data_relocation.py
+          node --test crates/epix-browser/tests/pac-routing.test.cjs
 
   mobile-profiles:
     name: Mobile feature profiles

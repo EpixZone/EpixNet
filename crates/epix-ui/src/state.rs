@@ -4603,6 +4603,8 @@ pub struct AppState {
     /// node's data root is user-relocatable (a desktop node not pinned by
     /// `EPIX_DATA_DIR`). `set_data_dir` persists the choice there.
     data_dir_conf: std::sync::Mutex<Option<PathBuf>>,
+    /// Held while any runtime task can write this data root.
+    data_root_lease: std::sync::OnceLock<Arc<crate::data_relocation::DataRootLease>>,
     /// Trackers contributed at runtime (the Beacon plugin's live list),
     /// folded into every announce alongside the configured ones. Replaced
     /// wholesale on each refresh - not persisted, the plugin's book is.
@@ -5736,6 +5738,7 @@ impl AppState {
             data_root: persist.data_root,
             xites_path: persist.xites_path,
             data_dir_conf: std::sync::Mutex::new(None),
+            data_root_lease: std::sync::OnceLock::new(),
             extra_trackers: RwLock::new(Vec::new()),
             gossip_trackers: RwLock::new(Vec::new()),
             bootstrap_trackers: RwLock::new(Vec::new()),
@@ -5765,6 +5768,19 @@ impl AppState {
     /// live in `<root>/private/` and each xite's files in `<root>/data/<addr>/`.
     /// Upgrading from the Python client to this node therefore needs no
     /// migration - the identity, certs, and downloaded xites are read in place.
+    pub fn with_data_dir_leased(
+        version: impl Into<String>,
+        lease: Arc<crate::data_relocation::DataRootLease>,
+    ) -> Arc<Self> {
+        let state = Self::with_data_dir(version, lease.root());
+        // The local lease is held throughout construction, before any database
+        // opens. Keep it until the last runtime task releases AppState.
+        assert!(state.data_root_lease.set(lease).is_ok());
+        state
+    }
+
+    /// Construct disk-backed state when the caller already owns its lifecycle.
+    /// Production node and offline CLI entry points use `with_data_dir_leased`.
     pub fn with_data_dir(version: impl Into<String>, data_root: impl Into<PathBuf>) -> Arc<Self> {
         let data_root = data_root.into();
         let dir = data_root.join("private");
@@ -6574,7 +6590,7 @@ impl AppState {
                 continue;
             }
             let (value, default) = if *key == "data_dir" {
-                (json!(self.data_dir_value()), json!(self.data_dir_default()))
+                (json!(self.data_dir_config_value()), json!(self.data_dir_default()))
             } else {
                 (self.config_get(key).await.unwrap_or_else(|| json!(default)), json!(default),
                 )
@@ -6625,12 +6641,13 @@ impl AppState {
                 }
             }
         }
-        // data_dir applies from epixnet.conf on the next start: pending when
-        // the staged root (or the default, when the entry was removed) is not
-        // the one this run opened.
+        // The effective config remains unchanged until an offline move has
+        // completed. A queued request must still show the restart control.
         let conf = self.data_dir_conf.lock().unwrap().clone();
         if let (Some(conf), Some(root)) = (conf, &self.data_root) {
-            let staged = crate::paths::read_conf_data_dir(&conf)
+            let staged = crate::data_relocation::pending_target(&conf)
+                .ok().flatten()
+                .or_else(|| crate::paths::read_conf_data_dir(&conf))
                 .unwrap_or_else(crate::paths::default_data_root);
             if crate::paths::resolve_data_directory(&staged).ok()
                 != crate::paths::resolve_data_directory(root).ok()
@@ -6691,6 +6708,14 @@ impl AppState {
         self.data_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
     }
 
+    /// Saved destination shown in Config while a move waits for restart.
+    pub fn data_dir_config_value(&self) -> String {
+        let conf = self.data_dir_conf.lock().unwrap().clone();
+        conf.and_then(|conf| crate::data_relocation::pending_target(&conf).ok().flatten())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| self.data_dir_value())
+    }
+
     /// The staged Epix Wallet web app (`<data_root>/wallet-ui`), if present.
     /// The mobile shells copy their bundled wallet build here so the UI
     /// server can serve it as a plain web app - their WebViews cannot run
@@ -6706,12 +6731,9 @@ impl AppState {
         crate::paths::default_data_root().display().to_string()
     }
 
-    /// Change where EpixNet stores its data. Copies `private/` and `data/`
-    /// to the new location (unless it already holds an identity), then records
-    /// the choice as `data_dir` in `epixnet.conf` - the same key the Python
-    /// client uses. The old directory is left in place as a backup; the node
-    /// switches to the new one on the next start. An empty path resets to the
-    /// per-OS default. Returns the message to show the user.
+    /// Queue a data move for the next start, before databases and writers open.
+    /// The current root and effective config stay unchanged until the copy has
+    /// completed. The old private/data directories remain as a backup.
     pub async fn set_data_dir(&self, new_dir: &str) -> Result<String, String> {
         let conf = self
             .data_dir_conf
@@ -6721,8 +6743,6 @@ impl AppState {
             .ok_or("The data directory is fixed for this node (set via EPIX_DATA_DIR or the embedding app)")?;
         let current = self.data_root.as_ref().ok_or("This node keeps no data on disk")?
             .canonicalize().map_err(|e| format!("Could not resolve the current data directory: {e}"))?;
-
-        // Resolve the input: empty resets to the default; "~" expands.
         let mut input = new_dir.trim().to_string();
         if let Some(rest) = input.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
@@ -6731,50 +6751,15 @@ impl AppState {
         }
         let default = crate::paths::resolve_data_directory(&crate::paths::default_data_root())
             .map_err(|e| format!("Could not resolve the default data directory: {e}"))?;
-        let target = if input.is_empty() { default.clone() } else { PathBuf::from(&input) };
-        let target = crate::paths::resolve_data_directory(&target)
-            .map_err(|e| format!("Invalid data directory: {e}"))?;
-        if target == current {
-            // Nothing to copy, but the conf must still match (e.g. resetting a
-            // stale data_dir line while already running on the default root).
-            crate::paths::write_conf_data_dir(&conf, (target != default).then_some(target.as_path()),
-            )
-                .map_err(|e| format!("Could not save {}: {e}", conf.display()))?;
-            return Ok(format!("Data directory is already {}", target.display()));
-        }
-        if target.starts_with(&current) || current.starts_with(&target) {
-            return Err("The new data directory can't be inside the current one (or contain it)".to_string(),
-            );
-        }
-
-        validate_data_destination(&target)?;
-
-        // Copy the node's data over unless the target already holds an
-        // identity of its own (then switching must not overwrite it).
-        if !target.join("private/users.json").exists() && current.join("private").exists() {
-            let (from, to) = (current.clone(), target.clone());
-            tokio::task::spawn_blocking(move || {
-                for sub in ["private", "data"] {
-                    let src = from.join(sub);
-                    if src.exists() {
-                        copy_dir_all(&src, &to.join(sub))?;
-                    }
-                }
-                Ok::<(), std::io::Error>(())
-            })
-            .await
-            .map_err(|e| format!("copy task failed: {e}"))?
-            .map_err(|e| format!("Could not copy the data to {}: {e}", target.display()))?;
-        }
-
-        crate::paths::write_conf_data_dir(&conf, (target != default).then_some(target.as_path()))
-            .map_err(|e| format!("Could not save {}: {e}", conf.display()))?;
-        self.log("INFO", format!("Data directory set to {} (was {})", target.display(), current.display()),
-        ).await;
-        Ok(format!(
-            "Data directory set to {}. Restart EpixNet to start using it; the old directory is kept as a backup.",
-            target.display()
-        ))
+        let target = if input.is_empty() { default.clone() } else { PathBuf::from(input) };
+        let message = tokio::task::spawn_blocking(move || {
+            crate::data_relocation::queue_request(&conf, &current, &target, &default)
+        })
+        .await
+        .map_err(|e| format!("Could not queue the data directory change: {e}"))?
+        .map_err(|e| format!("Could not queue the data directory change: {e}"))?;
+        self.log("INFO", &message).await;
+        Ok(message)
     }
 
     /// Set a node config value (`configSet`), persisted to `data_dir/config.json`.
@@ -34164,86 +34149,6 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
     }
 }
 
-/// An existing identity must be inside the selected root, not behind a link.
-fn validate_data_destination(target: &std::path::Path) -> Result<(), String> {
-    for (sub, directory) in [("private", true), ("data", true), ("private/users.json", false)] {
-        match std::fs::symlink_metadata(target.join(sub)) {
-            Ok(meta) => {
-                let kind = meta.file_type();
-                let valid = if directory { kind.is_dir() } else { kind.is_file() };
-                if !valid {
-                    return Err(format!("The destination {sub} must not be a link or special file"));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Could not inspect destination {sub}: {e}")),
-        }
-    }
-    Ok(())
-}
-
-/// Recursively copy a directory (for `set_data_dir`'s move to a new root).
-/// Reject links and special files, and never overwrite destination files.
-/// A selected directory may already contain entries not written by the node.
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-    if !std::fs::symlink_metadata(src)?.file_type().is_dir() {
-        return Err(Error::new(ErrorKind::InvalidInput, "Source must be a directory, not a link"));
-    }
-    match std::fs::symlink_metadata(dst) {
-        Ok(meta) if !meta.file_type().is_dir() => {
-            return Err(Error::new(ErrorKind::InvalidInput, "Destination must be a directory, not a link"));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir_all(dst)?,
-        Err(e) => return Err(e),
-    }
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let to = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else if file_type.is_file() {
-            copy_data_file(src, &entry.file_name(), &to)?;
-        } else {
-            return Err(Error::new(ErrorKind::InvalidInput, "Data directories cannot contain links or special files"));
-        }
-    }
-    Ok(())
-}
-
-/// Copy one regular file without following a source link or replacing a target.
-fn copy_data_file(src: &std::path::Path, name: &std::ffi::OsStr, to: &std::path::Path) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-    #[cfg(unix)]
-    let mut input = {
-        use rustix::fs::{Mode, OFlags};
-        let fd = rustix::fs::open(src.join(name),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK, Mode::empty())?;
-        std::fs::File::from(fd)
-    };
-    #[cfg(windows)]
-    let mut input = epix_fs::open_regular_file_beneath(src, std::path::Path::new(name))?;
-    #[cfg(not(any(unix, windows)))]
-    let mut input = std::fs::File::open(src.join(name))?;
-    if !input.metadata()?.is_file() {
-        return Err(Error::new(ErrorKind::InvalidInput, "Source must be a regular file"));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Keep private keys owner-only throughout the copy.
-        options.mode(0o600);
-    }
-    let mut output = options.open(to)?;
-    std::io::copy(&mut input, &mut output)?;
-    output.set_permissions(input.metadata()?.permissions())?;
-    Ok(())
-}
-
 /// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
 /// current directory). Uses `statvfs` on unix.
 fn free_space(path: Option<&std::path::Path>) -> i64 {
@@ -45793,7 +45698,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_data_dir_copies_data_and_persists_to_conf() {
+    async fn set_data_dir_queues_without_copying_live_data() {
         let old = tempdir().unwrap();
         let new = tempdir().unwrap();
         let conf_dir = tempdir().unwrap();
@@ -45801,6 +45706,7 @@ mod tests {
         let s = AppState::with_data_dir("test", old.path());
         // Not relocatable until the server marks the root as such.
         assert!(s.set_data_dir("/anywhere").await.is_err());
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
         s.set_data_dir_conf(&conf);
 
         // Relative and nested targets are refused.
@@ -45809,11 +45715,60 @@ mod tests {
 
         let target = new.path().join("EpixData");
         s.set_data_dir(target.to_str().unwrap()).await.unwrap();
-        // The identity was copied and the choice recorded Python-style.
-        assert!(target.join("private/users.json").exists());
-        assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(target.canonicalize().unwrap()));
+        // Live files remain untouched and effective config still names the source.
+        assert!(!target.join("private/users.json").exists());
+        assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(old.path().to_path_buf()));
+        assert_eq!(crate::data_relocation::pending_target(&conf).unwrap(),
+            Some(crate::paths::resolve_data_directory(&target).unwrap()));
+        assert_eq!(s.data_dir_value(), old.path().display().to_string());
+        assert_eq!(s.data_dir_config_value(),
+            crate::paths::resolve_data_directory(&target).unwrap().display().to_string());
         // The old root stays in place as a backup.
         assert!(old.path().join("private/users.json").exists());
+    }
+
+    #[tokio::test]
+    async fn queued_move_waits_for_writers_and_copies_latest_saved_state() {
+        let old = tempdir().unwrap();
+        let new = tempdir().unwrap();
+        let conf_dir = tempdir().unwrap();
+        let conf = conf_dir.path().join("epixnet.conf");
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
+        let lease = crate::data_relocation::DataRootLease::acquire(old.path()).unwrap();
+        let state = AppState::with_data_dir_leased("test", Arc::new(lease));
+        state.set_data_dir_conf(&conf);
+        let target = new.path().join("moved");
+        state.set_data_dir(target.to_str().unwrap()).await.unwrap();
+        assert!(crate::data_relocation::prepare_startup(&conf, old.path()).is_err());
+        assert!(!target.join("private/users.json").exists());
+        // Edits after pressing Save must be present in the eventual snapshot.
+        state.set_global_settings(json!({"theme":"dark"})).await;
+        state.config_set("offline", json!(true)).await;
+        let latest_identity = std::fs::read(old.path().join("private/users.json")).unwrap();
+        let latest_config = std::fs::read(old.path().join("private/config.json")).unwrap();
+        drop(state);
+        let moved = crate::data_relocation::prepare_startup(&conf, old.path()).unwrap();
+        assert_eq!(moved.root(), target.canonicalize().unwrap());
+        assert_eq!(std::fs::read(target.join("private/users.json")).unwrap(), latest_identity);
+        assert_eq!(std::fs::read(target.join("private/config.json")).unwrap(), latest_config);
+        assert_eq!(std::fs::read(old.path().join("private/users.json")).unwrap(), latest_identity);
+    }
+
+    #[tokio::test]
+    async fn queued_data_move_can_be_cancelled_by_selecting_the_current_root() {
+        let old = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let conf_dir = tempdir().unwrap();
+        let conf = conf_dir.path().join("epixnet.conf");
+        let state = AppState::with_data_dir("test", old.path());
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
+        state.set_data_dir_conf(&conf);
+        state.set_data_dir(target.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(state.restart_pending_keys().await, vec!["data_dir".to_string()]);
+        state.set_data_dir(old.path().to_str().unwrap()).await.unwrap();
+        assert!(crate::data_relocation::pending_target(&conf).unwrap().is_none());
+        assert!(state.restart_pending_keys().await.is_empty());
+        assert!(!target.path().join("private").exists());
     }
 
     #[cfg(unix)]
@@ -45824,6 +45779,8 @@ mod tests {
         let current = root.path().join("current");
         let state = AppState::with_data_dir("test", &current);
         let conf = root.path().join("epixnet.conf");
+        crate::paths::write_conf_data_dir(&conf, Some(&current)).unwrap();
+        let original_conf = std::fs::read(&conf).unwrap();
         state.set_data_dir_conf(&conf);
         state.snapshot_boot_config().await;
         let alias = root.path().join("alias");
@@ -45832,7 +45789,7 @@ mod tests {
         for target in [alias.join("nested"), root.path().join("../other"),
             root.path().join("new\nui_ip=0.0.0.0"), root.path().to_path_buf()] {
             assert!(state.set_data_dir(target.to_str().unwrap()).await.is_err(), "{target:?}");
-            assert!(!conf.exists(), "Rejected paths must not change configuration");
+            assert_eq!(std::fs::read(&conf).unwrap(), original_conf, "Rejected paths must not change configuration");
         }
         // An alias of the current root is a no-op, not a recursive copy or a
         // spurious restart requirement caused by /var vs /private/var on macOS.
@@ -45848,41 +45805,12 @@ mod tests {
         let conf_dir = tempdir().unwrap();
         let state = AppState::with_data_dir("test", old.path());
         let conf = conf_dir.path().join("epixnet.conf");
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
+        let original_conf = std::fs::read(&conf).unwrap();
         state.set_data_dir_conf(&conf);
         std::os::unix::fs::symlink(old.path().join("private"), new.path().join("private")).unwrap();
         assert!(state.set_data_dir(new.path().to_str().unwrap()).await.is_err());
-        assert!(!conf.exists());
-    }
-
-    #[test]
-    fn data_directory_copy_preserves_existing_files() {
-        let source = tempdir().unwrap();
-        let target = tempdir().unwrap();
-        std::fs::write(source.path().join("data"), b"new").unwrap();
-        std::fs::write(target.path().join("data"), b"existing").unwrap();
-        assert!(copy_dir_all(source.path(), target.path()).is_err());
-        assert_eq!(std::fs::read(target.path().join("data")).unwrap(), b"existing");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn data_directory_copy_rejects_source_and_destination_links() {
-        use std::os::unix::fs::symlink;
-        let source = tempdir().unwrap();
-        let target = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let external_file = outside.path().join("secret");
-        std::fs::write(&external_file, b"external").unwrap();
-        symlink(&external_file, source.path().join("link")).unwrap();
-        assert!(copy_dir_all(source.path(), target.path()).is_err());
-        assert!(!target.path().join("link").exists());
-        std::fs::remove_file(source.path().join("link")).unwrap();
-
-        std::fs::create_dir(source.path().join("private")).unwrap();
-        std::fs::write(source.path().join("private/secret"), b"node").unwrap();
-        symlink(outside.path(), target.path().join("private")).unwrap();
-        assert!(copy_dir_all(source.path(), target.path()).is_err());
-        assert_eq!(std::fs::read(external_file).unwrap(), b"external");
+        assert_eq!(std::fs::read(&conf).unwrap(), original_conf);
     }
 
     #[tokio::test]
@@ -45983,7 +45911,7 @@ mod tests {
         s.snapshot_boot_config().await;
         assert!(s.restart_pending_keys().await.is_empty());
 
-        // Staging a move in epixnet.conf pends data_dir until the next start.
+        // A pending move pends data_dir without changing the effective config.
         let target = target.path().join("new-root");
         s.set_data_dir(target.to_str().unwrap()).await.unwrap();
         assert_eq!(s.restart_pending_keys().await, vec!["data_dir".to_string()]);

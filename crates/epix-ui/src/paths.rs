@@ -158,8 +158,12 @@ pub fn remove_conf_keys(conf: &Path, keys: &[&str]) -> std::io::Result<()> {
 /// preserving every other line. Creates the file with the Python client's
 /// header if it doesn't exist.
 pub fn write_conf_data_dir(conf: &Path, dir: Option<&Path>) -> std::io::Result<()> {
-    let mut lines: Vec<String> = std::fs::read_to_string(conf)
-        .unwrap_or_default()
+    let text = crate::data_relocation::read_config(conf)?.unwrap_or_default();
+    crate::data_relocation::atomic_write_config(conf, render_conf_data_dir(&text, dir).as_bytes())
+}
+
+pub(crate) fn render_conf_data_dir(text: &str, dir: Option<&Path>) -> String {
+    let mut lines: Vec<String> = text
         .lines()
         .filter(|l| l.trim().split_once('=').map(|(k, _)| k.trim()) != Some("data_dir"))
         .map(str::to_string)
@@ -174,10 +178,7 @@ pub fn write_conf_data_dir(conf: &Path, dir: Option<&Path>) -> std::io::Result<(
         let at = lines.iter().position(|l| l.trim() == "[global]").unwrap() + 1;
         lines.insert(at, format!("data_dir = {}", dir.display()));
     }
-    if let Some(parent) = conf.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(conf, lines.join("\n") + "\n")
+    lines.join("\n") + "\n"
 }
 
 fn home() -> PathBuf {

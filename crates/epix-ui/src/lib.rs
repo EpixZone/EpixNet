@@ -13,6 +13,7 @@ pub mod chart;
 pub mod command;
 pub mod config_schema;
 pub mod conn_pool;
+pub mod data_relocation;
 mod deletion_reserve;
 pub mod feed;
 mod file_revert;
@@ -1826,13 +1827,14 @@ async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
             Redirect::to("/Config?cleared=1").into_response()
         }
         // The restart bar's button: stop the node and relaunch once the
-        // process is gone. The page returned keeps polling and comes back to
-        // /Config when the node answers again.
+        // process is gone. A data move selects a different browser profile;
+        // that path explains how to reopen instead of polling with the old CA.
         "restart" => {
+            let data_move = ctx.state.restart_pending_keys().await.iter().any(|key| key == "data_dir");
             ctx.state.push_notification("info", "Restarting...", 5000);
             ctx.state.shutdown(true).await;
             let theme = ctx.state.theme_class().await;
-            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme))
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme, data_move))
                 .into_response()
         }
         _ => Redirect::to("/Config").into_response(),
@@ -1893,7 +1895,7 @@ async fn save_config_values(
     Redirect::to(&to).into_response()
 }
 
-/// `data_dir` is special: it persists to epixnet.conf and copies the data to
+/// `data_dir` is special: it queues a move that copies the data to
 /// the new location, so its outcome is reported back on the page. `None` when
 /// it was not submitted or did not change.
 async fn apply_data_dir(
@@ -1901,7 +1903,7 @@ async fn apply_data_dir(
     params: &std::collections::HashMap<String, String>,
 ) -> Option<(bool, String)> {
     let dir = params.get("data_dir")?;
-    if dir.trim() == ctx.state.data_dir_value() {
+    if dir.trim() == ctx.state.data_dir_config_value() {
         return None;
     }
     Some(match ctx.state.set_data_dir(dir).await {
@@ -1948,10 +1950,10 @@ async fn serve_config_page(
     }
     let mut values = Vec::new();
     for (section, key, label, default, kind) in crate::state::CONFIG_SCHEMA {
-        // data_dir isn't in config.json: its value is the live data root and
+        // data_dir isn't in config.json: show the pending destination if any, and
         // its default the per-OS conventional location.
         let (val, default) = if *key == "data_dir" {
-            (ctx.state.data_dir_value(), ctx.state.data_dir_default())
+            (ctx.state.data_dir_config_value(), ctx.state.data_dir_default())
         } else {
             let val = ctx
                 .state
@@ -1997,7 +1999,15 @@ async fn serve_config_page(
 /// page itself polls until /Config answers again and then returns there. The
 /// meta refresh is the no-JS fallback (its first hits may error while the
 /// node is down; the JS poll swallows those).
-fn render_restarting_page(theme: &str) -> String {
+fn render_restarting_page(theme: &str, data_move: bool) -> String {
+    if data_move {
+        return page_shell("Restarting", "Moving node data", "",
+            "<p class='sub'>EpixNet is restarting and moving its node data. \
+             When the EpixNet tray is ready, close this browser window and open Epix Browser from the tray. \
+             This window uses the previous folder's browser profile.</p>\
+             <p class='sub'>Browser profiles and wallet extension storage remain in their original folder. \
+             The original node data is also kept as a backup.</p>", "", theme);
+    }
     let body = "<meta http-equiv='refresh' content='6;url=/Config'>\
         <p class='sub'>EpixNet is restarting. This page returns to the settings when the node is back - \
         if it does not, reload it manually.</p>\
@@ -2206,6 +2216,9 @@ fn render_config_page(
         } else {
             let note = if coming_soon {
                 "<span class='default'> - coming soon (not yet supported)</span>"
+            } else if *key == "data_dir" {
+                "<br>Copies node identities, settings and downloaded xites to a new folder. \
+                 Browser profiles and wallet extension storage remain in their original folder."
             } else {
                 ""
             };
@@ -3919,6 +3932,21 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod data_move_page_tests {
+    #[test]
+    fn relocated_browser_gets_reopen_instructions_without_polling_the_old_profile() {
+        let page = super::render_restarting_page("theme-light", true);
+        assert!(page.contains("close this browser window"));
+        assert!(page.contains("open Epix Browser from the tray"));
+        assert!(page.contains("wallet extension storage remain in their original folder"));
+        assert!(!page.contains("http-equiv='refresh'"));
+        assert!(!page.contains("fetch('/Config'"));
+        let ordinary = super::render_restarting_page("theme-light", false);
+        assert!(ordinary.contains("fetch('/Config'"));
+    }
 }
 
 // ---- Benchmark: /Benchmark diagnostics page --------------------------------

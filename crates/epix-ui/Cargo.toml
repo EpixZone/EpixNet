@@ -68,6 +68,7 @@ rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 epix-fs = { path = "../epix-fs" }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_SystemServices"] }
 
 [features]
 # Test support: an offline chain stand-in and an identity helper that lets
@@ -93,6 +94,7 @@ bittorrent = ["dep:epix-bt"]
 bridges = []
 
 [dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
 epix-reticulum = { path = "../epix-reticulum" }
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }

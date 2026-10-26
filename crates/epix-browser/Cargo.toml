@@ -21,6 +21,7 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "s
 tower = { version = "0.5", features = ["util"] }
 axum = "0.8"
 serde_json = "1"
+url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 # The bundled WebExtension is embedded and written out as an XPI into the
 # managed profile at launch.

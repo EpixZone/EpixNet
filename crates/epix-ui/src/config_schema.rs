@@ -157,12 +157,12 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "bool",
     ),
     // --- Storage. `data_dir` is special: the value is the live data root and
-    // the setting persists to `epixnet.conf` (see `AppState::set_data_dir`),
+    // the move is queued for restart (see `AppState::set_data_dir`),
     // not config.json - config.json lives inside the directory it would name.
     (
         "Storage",
         "data_dir",
-        "Data directory (existing data is copied there; restart EpixNet to apply)",
+        "Data directory (node data is copied on restart; the old copy is kept)",
         "",
         "text",
     ),

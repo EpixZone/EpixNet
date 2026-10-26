@@ -249,10 +249,10 @@ async fn boot(
     let target = epix_node::parse_target(raw_arg);
     progress.report(startup::Stage::Preparing);
 
-    let data_root = epix_node::data_root();
-    tokio::fs::create_dir_all(&data_root)
-        .await
-        .map_err(|e| format!("Cannot create the data folder: {e}"))?;
+    // Finish queued moves before CA/profile files or node databases open.
+    let data_lease = tokio::task::spawn_blocking(epix_node::prepare_data_root)
+        .await.map_err(|e| format!("Cannot prepare the data folder: {e}"))??;
+    let data_root = data_lease.root().to_path_buf();
 
     let firefox = find_firefox().ok_or_else(|| {
         "The Epix Browser engine was not found. Reinstall EpixNet.".to_string()
@@ -287,7 +287,7 @@ async fn boot(
         version: env!("EPIX_VERSION").to_string(),
         rev: env!("EPIX_GIT_REV").to_string(),
     };
-    let (server, running) = epix_node::boot_with_progress(opts, |stage| {
+    let (server, running) = epix_node::boot_with_data_lease(opts, data_lease, |stage| {
         progress.report(stage.into());
     })
     .await
@@ -1215,7 +1215,7 @@ fn write_profile(
          }}\n"
     );
     std::fs::write(&pac_path, pac)?;
-    let pac_url = file_url(&pac_path);
+    let pac_url = file_url(&pac_path)?;
 
     // failover_direct=false: when a proxy connection hiccups, necko's default
     // is to silently retry DIRECT - for a `.epix` host that means a clearnet
@@ -1317,21 +1317,24 @@ user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
     Ok(())
 }
 
-/// A `file://` URL Firefox will load for a local path. On Unix a path already
-/// starts with `/`, so `file://` + `/x` is the well-formed `file:///x`. On
-/// Windows the path is `C:\dir\f`, which must become `file:///C:/dir/f`
-/// (forward slashes, the extra slash before the drive) - the naive
-/// `file://C:\dir\f` is not a valid URL and Firefox silently ignores the PAC,
-/// so `.epix` routing and clearnet-through-Tor both break. Spaces (common under
-/// `C:\Users\First Last\`) are percent-encoded.
-fn file_url(path: &Path) -> String {
-    let p = path.display().to_string().replace('\\', "/").replace(' ', "%20");
-    if p.starts_with('/') {
-        format!("file://{p}")
-    } else {
-        format!("file:///{p}")
-    }
+/// Encode the complete native path, including Windows canonical drive and UNC
+/// prefixes. URL delimiters in filenames must not become a query or fragment.
+fn file_url(path: &Path) -> std::io::Result<String> {
+    url::Url::from_file_path(path)
+        .map(String::from)
+        .map_err(|()| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot represent PAC path as an absolute file URL: {}",
+                    path.display()
+                ),
+            )
+        })
 }
+
+#[cfg(test)]
+mod file_url_tests;
 
 /// Poll `addr` until a TCP connection succeeds or `timeout` elapses.
 async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
