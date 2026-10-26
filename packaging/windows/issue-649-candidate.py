@@ -57,7 +57,7 @@ def main():
     out=a.output.resolve();out.mkdir(parents=True,exist_ok=True)
     spec=importlib.util.spec_from_file_location('owned',HERE/'issue-649-owned-job.py');owned=importlib.util.module_from_spec(spec);spec.loader.exec_module(owned)
     root=Path(tempfile.mkdtemp(prefix='epix-issue649-candidate-',dir=os.environ['RUNNER_TEMP']));roots=[root];jobs=[];handles=[];browser=None
-    report={'source_revision':actual,'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'scope':'Actual newly built Rust candidate and SHA-verified baseline Firefox, offline disposable identity, no external publishing. Native Windows Server is not the reporter Windows 10.','owned_roots':[str(root)],'checks':{},'errors':[]}
+    report={'source_revision':actual,'started_utc':datetime.datetime.now(datetime.timezone.utc).isoformat(),'scope':'Actual Rust candidate and SHA-verified baseline Firefox, offline disposable identity, no external publishing. Native Windows Server is not the reporter Windows 10. Headless Firefox and supported EPIX_NO_SPLASH exercise profile/PAC/CA and normal launcher IPC; this is not visible-window or native tray interaction proof.','owned_roots':[str(root)],'checks':{},'errors':[]}
     def save():(out/'candidate-result.json').write_text(json.dumps(report,indent=2)+'\n',encoding='utf8')
     def stop():
         nonlocal browser
@@ -98,7 +98,8 @@ def main():
         report['runtime']={'baseline_installer_sha256':b.RELEASE_SHA,'launcher_sha256':sha(launcher),'nmh_sha256':sha(launcher.parent/'epix-nmh.exe'),'baseline_launcher_sha256':original,'firefox_sha256':sha(launcher.parent/'firefox/firefox.exe'),'candidate_binaries':{x.name:sha(x) for x in a.candidate.iterdir() if x.is_file()}}
         env={k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','SYSTEMDRIVE','COMSPEC','PATHEXT','PATH','PROCESSOR_ARCHITECTURE','NUMBER_OF_PROCESSORS','OS'}}
         for name in ('home','appdata','localappdata','tmp'):(root/name).mkdir()
-        env.update(HOME=str(root/'home'),USERPROFILE=str(root/'home'),APPDATA=str(root/'appdata'),LOCALAPPDATA=str(root/'localappdata'),TEMP=str(root/'tmp'),TMP=str(root/'tmp'),EPIX_TOR='disable',TOKIO_WORKER_THREADS='2',MOZ_MARIONETTE='1',MOZ_HEADLESS='1')
+        env.update(HOME=str(root/'home'),USERPROFILE=str(root/'home'),APPDATA=str(root/'appdata'),LOCALAPPDATA=str(root/'localappdata'),TEMP=str(root/'tmp'),TMP=str(root/'tmp'),EPIX_TOR='disable',TOKIO_WORKER_THREADS='2',MOZ_MARIONETTE='1',MOZ_HEADLESS='1',EPIX_NO_SPLASH='1')
+        report['browser_environment']={'MOZ_HEADLESS':'1','EPIX_NO_SPLASH':'1','scope':'Supported headless fixture configuration; no production rendering or browser logic changes.'}
         policy=launcher.parent/'firefox/distribution/policies.json';policy_before=sha(policy);value=json.loads(policy.read_text(encoding='utf-8-sig'));value.setdefault('policies',{}).setdefault('Certificates',{}).setdefault('Install',[]).append(str(root/'localappdata/Mozilla/Certificates/epix-ca.pem'));policy.write_text(json.dumps(value),encoding='utf8')
         report['certificate_policy']={'original_sha256':policy_before,'fixture_sha256':sha(policy),'change':'Absolute disposable CA install path only. acceptInsecureCerts=false; no trust bypass.'}
         source=root/'appdata/EpixNet';(source/'private').mkdir(parents=True);(source/'data'/DASHBOARD).mkdir(parents=True)
@@ -108,7 +109,13 @@ def main():
         conf=source/'epixnet.conf';pending=source/'.epixnet-relocation.json'
         def runtime_ready(data):
             port=int((data/'ui_port').read_text());code,_,body=request(port,'/EpixNet-Internal/Status')
-            return (port,json.loads(body)) if code==200 else None
+            if code!=200:return None
+            # The node starts serving before profile setup/browser launch and
+            # shell restart registration complete. Do not mistake that early
+            # readiness for a fully started desktop shell.
+            config_code,_,config=request(port,'/Config')
+            if config_code!=200 or b"id='restart-btn'" not in config:return None
+            return port,json.loads(body)
         def describe_runtime(port,status,pid=None):
             check(status.get('connections',{}).get('total')==0,'unexpected peer connection')
             detail={'pid':pid,'port':port,'status':{k:status.get(k)for k in ('serving','tor_enabled','i2p_enabled','mesh_enabled','connections')},'direct_config_http':request(port,'/Config')[0],'direct_stats_http':request(port,'/Stats')[0],'stats_json':json.loads(request(port,'/StatsJson')[2])}
