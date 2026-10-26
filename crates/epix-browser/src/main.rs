@@ -153,14 +153,22 @@ fn main() {
     };
 
     let handle = rt.handle().clone();
-    let outcome = startup::run(&rt, !background, move |progress| async move {
-        let (ready, child) = boot(&raw_arg, background, progress).await?;
-        Ok(tray::TrayContext {
-            ready,
-            child,
-            rt: handle,
-            open_rx,
-        })
+    let outcome = startup::run(&rt, !background, move |progress| {
+        // This closure runs on main before its future is spawned or polled.
+        let window_size = if background {
+            None
+        } else {
+            browser_process::gamescope_window_size()
+        };
+        async move {
+            let (ready, child) = boot(&raw_arg, background, progress, window_size).await?;
+            Ok(tray::TrayContext {
+                ready,
+                child,
+                rt: handle,
+                open_rx,
+            })
+        }
     });
     match outcome {
         Ok(startup::Outcome::Finished) => {}
@@ -236,6 +244,7 @@ async fn boot(
     raw_arg: &str,
     background: bool,
     progress: startup::Progress,
+    window_size: Option<browser_process::BrowserWindowSize>,
 ) -> Result<(Ready, Option<std::process::Child>), String> {
     let target = epix_node::parse_target(raw_arg);
     progress.report(startup::Stage::Preparing);
@@ -371,7 +380,7 @@ async fn boot(
     let launch_url = handoff
         .as_ref()
         .map_or(start_url.as_str(), |handoff| handoff.url());
-    let mut child = launch_browser(background, &firefox, &profile, launch_url)?;
+    let mut child = launch_browser(background, &firefox, &profile, launch_url, window_size)?;
     if let Some(handoff) = &mut handoff {
         wait_for_browser_window(handoff, &mut child, Duration::from_secs(60)).await?;
     }
@@ -676,13 +685,14 @@ fn launch_browser(
     firefox: &Path,
     profile: &Path,
     start_url: &str,
+    window_size: Option<browser_process::BrowserWindowSize>,
 ) -> Result<Option<std::process::Child>, String> {
     if background {
         println!("· background mode: node + tray up, no browser window");
         return Ok(None);
     }
     println!("· launching Epix Browser at {start_url}");
-    let mut cmd = browser_process::browser_command(firefox, profile);
+    let mut cmd = browser_process::browser_command(firefox, profile, window_size);
     match cmd.arg(start_url).spawn() {
         Ok(mut child) => {
             // `--no-remote --new-instance` on a profile another Firefox already
@@ -1362,7 +1372,7 @@ mod startup_tests {
         let profile = tempfile::tempdir().unwrap();
         std::fs::write(profile.path().join("user.js"),
             "user_pref(\"browser.aboutwelcome.enabled\", false);\nuser_pref(\"browser.shell.checkDefaultBrowser\", false);\n").unwrap();
-        let mut child = Some(browser_process::browser_command(&firefox, profile.path())
+        let mut child = Some(browser_process::browser_command(&firefox, profile.path(), None)
             .arg("about:blank").spawn().unwrap());
         let result = wait_for_native_browser_window(&mut child, Duration::from_secs(20)).await;
         let visible = !browser_process::visible_windows(child.as_mut().unwrap()).is_empty();

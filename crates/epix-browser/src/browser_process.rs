@@ -3,6 +3,52 @@
 use std::path::Path;
 use std::process::Command;
 
+/// Firefox dimensions in logical application pixels, not physical display pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BrowserWindowSize {
+    width: i32,
+    height: i32,
+}
+
+impl BrowserWindowSize {
+    #[cfg(any(target_os = "linux", test))]
+    fn new(width: i32, height: i32) -> Option<Self> {
+        (width > 0 && height > 0).then_some(Self { width, height })
+    }
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn gamescope_desktop(desktop: &str) -> bool {
+    desktop
+        .split(':')
+        .any(|name| name.eq_ignore_ascii_case("gamescope"))
+}
+
+/// Best-effort Gamescope sizing. Call on the main thread before starting an
+/// async boot, or from the tray's main-thread fresh-open path. Return only
+/// copied dimensions so no GTK object crosses into the async runtime.
+#[cfg(target_os = "linux")]
+pub fn gamescope_window_size() -> Option<BrowserWindowSize> {
+    use gtk::gdk::prelude::*;
+
+    if !gamescope_desktop(&std::env::var("XDG_CURRENT_DESKTOP").ok()?)
+        || !crate::tray::display_available()
+    {
+        return None;
+    }
+    gtk::init().ok()?;
+    let display = gtk::gdk::Display::default()?;
+    let monitor = display.primary_monitor().or_else(|| display.monitor(0))?;
+    // GDK geometry already uses logical pixels, including GDK_SCALE.
+    let geometry = monitor.geometry();
+    BrowserWindowSize::new(geometry.width(), geometry.height())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn gamescope_window_size() -> Option<BrowserWindowSize> {
+    None
+}
+
 #[derive(Clone, Copy)]
 enum Platform {
     #[cfg(any(windows, test))]
@@ -14,17 +60,26 @@ enum Platform {
 }
 
 /// Build the same fresh-instance command for initial launch and tray reopen.
-pub fn browser_command(firefox: &Path, profile: &Path) -> Command {
+pub fn browser_command(
+    firefox: &Path,
+    profile: &Path,
+    window_size: Option<BrowserWindowSize>,
+) -> Command {
     #[cfg(windows)]
     let platform = Platform::Windows;
     #[cfg(target_os = "macos")]
     let platform = Platform::Mac;
     #[cfg(all(unix, not(target_os = "macos")))]
     let platform = Platform::Linux;
-    browser_command_for(platform, firefox, profile)
+    browser_command_for(platform, firefox, profile, window_size)
 }
 
-fn browser_command_for(platform: Platform, firefox: &Path, profile: &Path) -> Command {
+fn browser_command_for(
+    platform: Platform,
+    firefox: &Path,
+    profile: &Path,
+    window_size: Option<BrowserWindowSize>,
+) -> Command {
     let mut command = Command::new(firefox);
     // The profile belongs to EpixNet. Skip the downgrade dialog if another
     // Firefox version touched it, and keep the instance isolated from the
@@ -47,6 +102,10 @@ fn browser_command_for(platform: Platform, firefox: &Path, profile: &Path) -> Co
         #[cfg(any(all(unix, not(target_os = "macos")), test))]
         Platform::Linux => {
             command.args(["--class", "EpixNet", "--name", "EpixNet"]);
+            if let Some(size) = window_size {
+                command.arg("--width").arg(size.width.to_string());
+                command.arg("--height").arg(size.height.to_string());
+            }
         }
     }
     command
@@ -104,6 +163,7 @@ mod tests {
             Platform::Windows,
             Path::new("Firefox Browser/firefox.exe"),
             Path::new("User Data/managed profile"),
+            None,
         );
         assert!(
             command.get_args().any(|arg| arg == "--wait-for-browser"),
@@ -123,7 +183,8 @@ mod tests {
     #[test]
     fn native_platform_commands_preserve_profile_isolation_and_linux_window_identity() {
         for platform in [Platform::Mac, Platform::Linux] {
-            let command = browser_command_for(platform, Path::new("firefox"), Path::new("profile"));
+            let command =
+                browser_command_for(platform, Path::new("firefox"), Path::new("profile"), None);
             let arguments = args(&command);
             assert_eq!(
                 &arguments[..5],
@@ -147,9 +208,84 @@ mod tests {
         }
         // Exercise the real host selection as well as the portable fixtures.
         assert_eq!(
-            browser_command(Path::new("firefox"), Path::new("profile")).get_program(),
+            browser_command(Path::new("firefox"), Path::new("profile"), None).get_program(),
             "firefox"
         );
+    }
+
+    #[test]
+    fn gamescope_requires_an_exact_desktop_token() {
+        for desktop in ["gamescope", "GAMESCOPE", "KDE:gamescope", "gamescope:GNOME"] {
+            assert!(gamescope_desktop(desktop), "{desktop}");
+        }
+        for desktop in [
+            "",
+            "GNOME",
+            "SteamDeck",
+            "SteamTenfoot",
+            "notgamescope",
+            "gamescope-session",
+            "KDE gamescope",
+            " gamescope ",
+        ] {
+            assert!(!gamescope_desktop(desktop), "{desktop}");
+        }
+    }
+
+    #[test]
+    fn unavailable_monitor_dimensions_do_not_produce_a_window_size() {
+        for (width, height) in [(0, 800), (1280, 0), (-1, 800), (1280, -1)] {
+            assert_eq!(BrowserWindowSize::new(width, height), None);
+        }
+    }
+
+    #[test]
+    fn linux_size_arguments_preserve_logical_pixels_and_profile_flags() {
+        for (width, height) in [(1280, 800), (960, 540)] {
+            let mut command = browser_command_for(
+                Platform::Linux,
+                Path::new("Firefox Browser/firefox"),
+                Path::new("User Data/managed profile"),
+                BrowserWindowSize::new(width, height),
+            );
+            command.arg("https://dashboard.epix/");
+            let arguments = args(&command);
+            assert_eq!(
+                &arguments[..9],
+                &[
+                    "--allow-downgrade",
+                    "--profile",
+                    "User Data/managed profile",
+                    "--no-remote",
+                    "--new-instance",
+                    "--class",
+                    "EpixNet",
+                    "--name",
+                    "EpixNet",
+                ]
+            );
+            assert_eq!(arguments[9], "--width");
+            assert_eq!(arguments[10], OsStr::new(&width.to_string()));
+            assert_eq!(arguments[11], "--height");
+            assert_eq!(arguments[12], OsStr::new(&height.to_string()));
+            assert_eq!(arguments[13], "https://dashboard.epix/");
+            assert_eq!(arguments.len(), 14);
+        }
+    }
+
+    #[test]
+    fn other_platforms_ignore_gamescope_dimensions() {
+        for platform in [Platform::Windows, Platform::Mac] {
+            let original =
+                browser_command_for(platform, Path::new("firefox"), Path::new("profile"), None);
+            let sized = browser_command_for(
+                platform,
+                Path::new("firefox"),
+                Path::new("profile"),
+                BrowserWindowSize::new(1280, 800),
+            );
+            assert_eq!(args(&sized), args(&original));
+        }
     }
 }
 
