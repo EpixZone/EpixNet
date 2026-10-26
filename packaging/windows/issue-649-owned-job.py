@@ -27,6 +27,9 @@ class WindowsJob:
         self.kernel.CreateJobObjectW.restype = wintypes.HANDLE
         self.kernel.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
         self.kernel.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+        self.kernel.QueryInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+        self.kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        self.kernel.OpenProcess.restype = wintypes.HANDLE
         self.kernel.CloseHandle.argtypes = [wintypes.HANDLE]
         self.handle = self.kernel.CreateJobObjectW(None, None)
         require(bool(self.handle), 'CreateJobObject failed')
@@ -53,3 +56,30 @@ class WindowsJob:
             if self.handle:
                 self.kernel.CloseHandle(self.handle)
                 self.handle = None
+
+    def process_ids(self):
+        """Read actual membership, including detached relaunch descendants."""
+        with self.lock:
+            require(bool(self.handle), 'Job already closed')
+            slots = 256
+            while slots <= 8192:
+                buffer = ctypes.create_string_buffer(8 + ctypes.sizeof(ctypes.c_size_t) * slots)
+                if self.kernel.QueryInformationJobObject(self.handle, 3, buffer, len(buffer), None):
+                    count = ctypes.c_uint32.from_buffer(buffer, 4).value
+                    require(count <= slots, 'Invalid Job process list')
+                    return list((ctypes.c_size_t * count).from_buffer(buffer, 8))
+                if ctypes.get_last_error() != 234:
+                    raise OSError(ctypes.get_last_error(), 'QueryInformationJobObject failed')
+                slots *= 2
+            raise RuntimeError('Owned Job process count exceeds bound')
+
+    def adopt_verified_pid(self, pid):
+        """Caller must first verify this PID is its exact fixture executable."""
+        process = self.kernel.OpenProcess(0x0100 | 0x0001, False, pid)
+        require(bool(process), 'Cannot open verified process for Job ownership')
+        try:
+            with self.lock:
+                if not self.handle or not self.kernel.AssignProcessToJobObject(self.handle, process):
+                    raise OSError(ctypes.get_last_error(), 'Cannot adopt verified process')
+        finally:
+            self.kernel.CloseHandle(process)

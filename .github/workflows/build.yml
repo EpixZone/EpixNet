@@ -1,41 +1,52 @@
 name: Build
 
-# Temporary QA branch only. Baseline source and packaged release are immutable.
-# No installer build, signing, publication, or production fix occurs here.
+# Temporary QA branch only. The required exact source commit is built natively.
+# No signing, publication, production commit or permission escalation occurs.
 on:
   workflow_dispatch:
     inputs:
-      platform:
-        description: Bounded native baseline target
-        type: choice
-        default: windows
-        options: [windows]
+      candidate_revision:
+        description: Frozen integrated candidate commit (40 lowercase hexadecimal characters)
+        required: true
+        type: string
 permissions:
   contents: read
 jobs:
   windows-data-directory:
-    name: Windows data directory baseline
+    name: Windows candidate relocation
     runs-on: windows-2025
-    timeout-minutes: 22
+    timeout-minutes: 120
     defaults:
       run:
         shell: pwsh
     env:
       PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_BUILD_JOBS: '2'
     steps:
       - name: Check out QA fixture only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
-      - name: Check out exact current baseline separately
+      - name: Validate immutable candidate input
+        env:
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+        run: |
+          if ($env:CANDIDATE_REVISION -cnotmatch '^[0-9a-f]{40}$') { throw 'exact candidate commit required' }
+      - name: Check out integrated candidate separately
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: b5353fb1ab2440652b2bff23cbb99c819df783f6
+          ref: ${{ inputs.candidate_revision }}
           path: source
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
         with:
-          toolchain: stable
+          toolchain: 1.99.1
+          targets: x86_64-pc-windows-msvc
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38
+        with:
+          node-version: 22.22.1
+      - name: Install protocol compiler
+        run: choco install protoc -y --no-progress
       - name: Record runner and source provenance
         run: |
           New-Item -ItemType Directory -Force evidence | Out-Null
@@ -43,20 +54,20 @@ jobs:
           @{
             source_revision = (git -C source rev-parse HEAD).Trim()
             fixture_revision = (git rev-parse HEAD).Trim()
-            fixture_sha256 = (Get-FileHash packaging/windows/issue-649-baseline.py -Algorithm SHA256).Hash.ToLowerInvariant()
+            fixture_sha256 = (Get-FileHash packaging/windows/issue-649-candidate.py -Algorithm SHA256).Hash.ToLowerInvariant()
             owned_process_helper_sha256 = (Get-FileHash packaging/windows/issue-649-owned-job.py -Algorithm SHA256).Hash.ToLowerInvariant()
+            lock_sha256 = (Get-FileHash source/Cargo.lock -Algorithm SHA256).Hash.ToLowerInvariant()
             browser_source_sha256 = (Get-FileHash source/crates/epix-browser/src/main.rs -Algorithm SHA256).Hash.ToLowerInvariant()
-            paths_source_sha256 = (Get-FileHash source/crates/epix-ui/src/paths.rs -Algorithm SHA256).Hash.ToLowerInvariant()
+            wallet_revision = (Get-Content source/shells/wallet-ext.rev -Raw).Trim()
             os_caption = $os.Caption; os_version = $os.Version; os_build = $os.BuildNumber
             image_os = $env:ImageOS; image_version = $env:ImageVersion
-            rustc = @(rustc -Vv); python = @(python --version)
+            rustc = @(rustc -Vv); python = @(python --version); node = @(node --version)
             volumes = @(Get-Volume | Select-Object DriveLetter, FileSystemType, UniqueId, Size, SizeRemaining)
-            free_bytes = [IO.DriveInfo]::new([IO.Path]::GetPathRoot($env:RUNNER_TEMP)).AvailableFreeSpace
           } | ConvertTo-Json -Depth 6 | Set-Content evidence/runner.json -Encoding utf8
-      - name: Download and verify the immutable packaged baseline
+      - name: Download verified Firefox install-tree control
         timeout-minutes: 5
         run: |
-          $root = Join-Path $env:RUNNER_TEMP 'issue-649-package'
+          $root = Join-Path $env:RUNNER_TEMP 'issue-649-candidate-package'
           New-Item -ItemType Directory -Force $root | Out-Null
           $installer = Join-Path $root 'Epix-Setup-0.5.23.exe'
           Invoke-WebRequest 'https://github.com/EpixZone/EpixNet/releases/download/v0.5.23/Epix-Setup-0.5.23.exe' -OutFile $installer
@@ -64,36 +75,61 @@ jobs:
           if ($hash -cne 'ed18f5dd2c2e6935b30d4bc36d3b3fda53581f88d93c923690c591d1b80f1bba') { throw 'release digest mismatch' }
           & 7z x $installer "-o$root/extracted" -y | Out-File evidence/extract.log
           if ($LASTEXITCODE -ne 0) { throw 'installer extraction failed' }
-      - name: Native path helper and real Config relocation baseline
-        id: fixture
-        timeout-minutes: 13
+      - name: Build actual candidate with bounded resources
+        timeout-minutes: 67
+        env:
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
         run: |
-          $root = Join-Path $env:RUNNER_TEMP 'issue-649-package'
-          python packaging/windows/issue-649-baseline.py --source source --installer "$root/Epix-Setup-0.5.23.exe" --package "$root/extracted" --output evidence
-          if ($LASTEXITCODE -ne 0) { throw 'fixture incomplete; inspect retained evidence' }
-      - name: Clean owned extracted package and record outcome
+          python packaging/windows/issue-649-build.py --source source --output evidence --revision $env:CANDIDATE_REVISION
+          if ($LASTEXITCODE -ne 0) { throw 'candidate build failed; inspect retained evidence' }
+      - name: Run native production PAC regression harness
+        timeout-minutes: 4
+        run: |
+          $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'issue-649-candidate-cargo'
+          Push-Location source
+          try {
+            node --test crates/epix-browser/tests/pac-routing.test.cjs 2>&1 | Tee-Object ../evidence/native-pac-tests.log
+            if ($LASTEXITCODE -ne 0) { throw 'native PAC regressions failed' }
+          } finally { Pop-Location }
+      - name: Run exact native Windows private-data ACL regression
+        timeout-minutes: 14
+        env:
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+        run: |
+          python packaging/windows/issue-649-build.py --source source --output evidence --revision $env:CANDIDATE_REVISION --acl-test-only
+          if ($LASTEXITCODE -ne 0) { throw 'native Windows ACL regression failed; inspect retained evidence' }
+      - name: Real Config queue, cross-volume restart and integrity acceptance
+        id: fixture
+        timeout-minutes: 15
+        env:
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+        run: |
+          $root = Join-Path $env:RUNNER_TEMP 'issue-649-candidate-package'
+          python packaging/windows/issue-649-candidate.py --source source --package "$root/extracted" --installer "$root/Epix-Setup-0.5.23.exe" --candidate evidence/candidate-binaries --expected-revision $env:CANDIDATE_REVISION --output evidence
+          if ($LASTEXITCODE -ne 0) { throw 'candidate runtime failed; inspect retained evidence' }
+      - name: Remove owned package and intermediate build directories
         if: always()
-        timeout-minutes: 2
+        timeout-minutes: 4
         env:
           FIXTURE_OUTCOME: ${{ steps.fixture.outcome }}
         run: |
           New-Item -ItemType Directory -Force evidence | Out-Null
-          $root = Join-Path $env:RUNNER_TEMP 'issue-649-package'
-          if (Test-Path -LiteralPath $root) { Remove-Item -LiteralPath $root -Recurse -Force }
-          @{
-            fixture_outcome = $env:FIXTURE_OUTCOME
-            package_removed = !(Test-Path -LiteralPath $root)
-            finished_utc = [DateTime]::UtcNow.ToString('o')
-          } | ConvertTo-Json | Set-Content evidence/workflow-outcome.json -Encoding utf8
-      - name: Upload bounded diagnostics, not disposable profiles or keys
+          $removed = @()
+          foreach ($name in @('issue-649-candidate-package','issue-649-candidate-target','issue-649-candidate-cargo')) {
+            $path = Join-Path $env:RUNNER_TEMP $name
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Recurse -Force }
+            $removed += @{ path = $path; removed = !(Test-Path -LiteralPath $path) }
+          }
+          @{ fixture_outcome = $env:FIXTURE_OUTCOME; owned_cleanup = $removed; finished_utc = [DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Depth 5 | Set-Content evidence/workflow-outcome.json -Encoding utf8
+      - name: Upload candidate and bounded diagnostics, never profiles or keys
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: issue-649-windows-baseline-${{ github.run_id }}-${{ github.run_attempt }}
+          name: issue-649-windows-candidate-${{ github.run_id }}-${{ github.run_attempt }}
           path: |
             evidence/*.json
             evidence/*.log
             evidence/*.png
-            evidence/*.rs
+            evidence/candidate-binaries/*
           if-no-files-found: error
           retention-days: 7
