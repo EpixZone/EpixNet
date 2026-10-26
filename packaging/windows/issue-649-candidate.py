@@ -197,10 +197,13 @@ def main():
         browser.screenshot(out/'normal-restart-old-window.png');save()
         # The relocation contract moves private/ and data/, not the old browser
         # profile. Reopen through ordinary launcher IPC to use the target profile.
-        handles_value=browser.cmd('WebDriver:GetWindowHandles',{})
-        if isinstance(handles_value,dict):handles_value=handles_value['value']
-        for handle in handles_value:
-            browser.cmd('WebDriver:SwitchToWindow',{'handle':handle});browser.cmd('WebDriver:CloseWindow',{})
+        # Closing the last WebDriver window can leave a headless automation
+        # process listening. Use Firefox's supported normal application quit,
+        # equivalent to closing the browser application, without taskkill.
+        quit_response=browser.cmd('Marionette:Quit',{})
+        if isinstance(quit_response,dict) and 'value' in quit_response:quit_response=quit_response['value']
+        check(quit_response.get('cause')=='shutdown' and quit_response.get('forced') is False,'old browser did not acknowledge an ordinary application quit')
+        report['normal_restart']['old_browser_close']={'command':'Marionette:Quit (default eAttemptQuit)','response':quit_response};save()
         browser.s.close();browser=None
         def marionette_closed():
             try:
