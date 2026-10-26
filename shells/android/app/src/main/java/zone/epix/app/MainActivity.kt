@@ -25,6 +25,8 @@ import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
+import androidx.core.view.WindowInsetsControllerCompat
+import androidx.core.view.WindowCompat
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -136,6 +138,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
     private lateinit var topBar: View
     private lateinit var bottomBar: View
     private var chromeHidden = false
+    private var fullScreenSession: GeckoSession? = null
     private var lastTouchY = 0f
     private var touchAccum = 0f
     private var currentDisplay: String = ""
@@ -293,6 +296,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
     private fun ownsSession(session: GeckoSession): Boolean = !disposed && session in ownedSessions
 
     private fun disposeSession(session: GeckoSession) {
+        leaveFullScreen(session)
         if (!ownedSessions.remove(session)) return
         pendingOperations.cancelOwner(session)
         dialogs.filterValues { it === session }.keys.toList().forEach { it.dismiss() }
@@ -356,6 +360,12 @@ class MainActivity : AppCompatActivity(), WalletHost {
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         applyBrowserControlsPosition()
+        if (fullScreenSession != null) applyFullScreenPresentation()
+    }
+
+    override fun onWindowFocusChanged(hasFocus: Boolean) {
+        super.onWindowFocusChanged(hasFocus)
+        if (hasFocus && fullScreenSession != null) applyFullScreenPresentation()
     }
 
     /**
@@ -492,6 +502,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
         session.progressDelegate = object : GeckoSession.ProgressDelegate {
             override fun onPageStart(session: GeckoSession, url: String) {
                 if (!ownsSession(session)) return
+                leaveFullScreen(session)
                 if (session === startupSession && url == startupPageUrl) {
                     startupPageStarted = true
                 }
@@ -517,6 +528,18 @@ class MainActivity : AppCompatActivity(), WalletHost {
         // Android equivalent, backed by plain AlertDialogs.
         session.promptDelegate = buildPromptDelegate()
         session.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onFullScreen(session: GeckoSession, fullScreen: Boolean) {
+                handleFullScreen(session, fullScreen)
+            }
+
+            override fun onCrash(session: GeckoSession) {
+                if (ownsSession(session)) leaveFullScreen(session, exitPage = false)
+            }
+
+            override fun onKill(session: GeckoSession) {
+                if (ownsSession(session)) leaveFullScreen(session, exitPage = false)
+            }
+
             override fun onTitleChange(session: GeckoSession, title: String?) {
                 if (ownsSession(session)) tab.title = title ?: ""
             }
@@ -535,8 +558,9 @@ class MainActivity : AppCompatActivity(), WalletHost {
     /** Put tab `index` on screen and sync the chrome to it. */
     private fun showTab(index: Int) {
         if (disposed || index !in tabs.indices) return
+        if (fullScreenSession !== tabs[index].session) leaveFullScreen()
         currentTabIndex = index
-        setChromeHidden(false)
+        setChromeHidden(fullScreenSession === currentTab.session)
         val tab = currentTab
         if (geckoView.session !== tab.session) {
             leaveAddressEditing()
@@ -553,6 +577,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
     private fun closeTab(index: Int) {
         if (disposed || index !in tabs.indices) return
         val tab = tabs[index]
+        leaveFullScreen(tab.session)
         if (tabs.size == 1) {
             // Last tab: reuse it for a fresh dashboard rather than exiting.
             currentDisplay = "dashboard.epix"
@@ -878,7 +903,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
      */
     override fun dispatchTouchEvent(ev: android.view.MotionEvent): Boolean {
         // Not while booting (the splash swallows taps) or typing an address.
-        if (splashOverlay != null || addressBar.hasFocus()) {
+        if (splashOverlay != null || addressBar.hasFocus() || fullScreenSession != null) {
             return super.dispatchTouchEvent(ev)
         }
         when (ev.actionMasked) {
@@ -917,15 +942,60 @@ class MainActivity : AppCompatActivity(), WalletHost {
     /** Keep toolbar and hardware/gesture Back tied to the selected tab. */
     private fun refreshBackNavigation() {
         if (disposed || tabs.isEmpty()) return
-        val canGoBack = currentTab.canGoBack
+        val canGoBack = fullScreenSession === currentTab.session || currentTab.canGoBack
         backButton.alpha = if (canGoBack) 1f else DISABLED_ALPHA
         browserBackCallback.isEnabled = canGoBack
     }
 
     private fun goBackInCurrentTab() {
-        if (disposed || tabs.isEmpty() || !currentTab.canGoBack) return
+        if (disposed || tabs.isEmpty()) return
+        if (fullScreenSession === currentTab.session) {
+            leaveFullScreen()
+            return
+        }
+        if (!currentTab.canGoBack) return
         leaveAddressEditing()
         currentTab.session.goBack()
+    }
+
+    /** DOM fullscreen belongs to the selected tab, not to the whole runtime. */
+    private fun handleFullScreen(session: GeckoSession, enabled: Boolean) {
+        if (!ownsSession(session)) return
+        if (!enabled) {
+            leaveFullScreen(session, exitPage = false)
+            return
+        }
+        if (tabs.getOrNull(currentTabIndex)?.session !== session || walletDialog?.isShowing == true) {
+            session.exitFullScreen()
+            return
+        }
+        fullScreenSession = session
+        applyFullScreenPresentation()
+    }
+
+    /** Clear ownership before Gecko's asynchronous exit callback can arrive. */
+    private fun leaveFullScreen(session: GeckoSession? = fullScreenSession, exitPage: Boolean = true) {
+        if (session == null || fullScreenSession !== session) return
+        fullScreenSession = null
+        applyFullScreenPresentation()
+        if (exitPage && session.isOpen) session.exitFullScreen()
+    }
+
+    private fun applyFullScreenPresentation() {
+        val fullScreen = fullScreenSession != null
+        setChromeHidden(fullScreen)
+        WindowCompat.setDecorFitsSystemWindows(window, !fullScreen)
+        WindowCompat.getInsetsController(window, window.decorView).apply {
+            systemBarsBehavior = if (fullScreen) {
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            } else {
+                WindowInsetsControllerCompat.BEHAVIOR_DEFAULT
+            }
+            if (fullScreen) hide(WindowInsetsCompat.Type.systemBars())
+            else show(WindowInsetsCompat.Type.systemBars())
+        }
+        ViewCompat.requestApplyInsets(browserChrome)
+        refreshBackNavigation()
     }
 
     /** Navigation ends address editing so the bar can reflect the new page. */
@@ -1967,6 +2037,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
         heightFraction: Double = 0.82,
         openSession: Boolean = true,
     ): GeckoSession {
+        leaveFullScreen()
         // One wallet surface at a time: a tab opened from the popup (register,
         // sign approval) replaces the popup's dialog.
         walletDialog?.dismiss()

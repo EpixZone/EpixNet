@@ -167,6 +167,7 @@ internal open class Activity {
 }
 
 internal class Shell(private val manager: ConnectivityManager?) : Activity() {
+    private fun leaveFullScreen(session: GeckoSession) {}
     val node = Node()
     private var disposed = false
     private var connectivityRegistration: Pair<ConnectivityManager, ConnectivityManager.NetworkCallback>? = null

@@ -114,6 +114,8 @@ internal class Shell(val preferences: Preferences = Preferences(), initialize: B
     val topBar = View("address")
     val offlineBanner = View("offline")
     val bottomBar = View("navigation")
+    var fullScreenSession: Any? = null
+    fun applyFullScreenPresentation() {}
     fun getPreferences(mode: Int): Preferences {
         check(mode == Context.MODE_PRIVATE)
         return preferences
