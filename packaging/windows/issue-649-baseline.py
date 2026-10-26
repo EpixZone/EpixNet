@@ -201,7 +201,21 @@ def main():
         if '/Config?error=' in (report['move']['location'] or ''):
             # Preserve the actual active-copy failure, then isolate the independent
             # PAC restart behavior using the supported existing-identity switch.
-            report['active_copy_failure']=dict(report['move']);save();stop()
+            report['active_copy_failure']=dict(report['move']);save()
+            # Read source files only; a throwaway destination identifies the
+            # first Windows sharing lock without overwriting the partial move.
+            copy_probe=root/'copy-probe';copy_probe.mkdir()
+            probe={'scanned_files':0,'failures':[],'scope':'Read/copy active disposable source into an owned scratch destination; no source edits'}
+            for part in ('private','data'):
+                for source_file in (default/part).rglob('*'):
+                    if not source_file.is_file():continue
+                    probe['scanned_files']+=1
+                    check(probe['scanned_files']<=20000,'copy probe file bound reached')
+                    dest=copy_probe/'one-file'
+                    try:shutil.copyfile(source_file,dest)
+                    except OSError as error:probe['failures'].append({'source_relative_path':str(source_file.relative_to(default)),'winerror':getattr(error,'winerror',None),'errno':error.errno,'message':str(error)})
+                    finally:dest.unlink(missing_ok=True)
+            report['active_copy_probe']=probe;save();stop()
             target.mkdir(parents=True,exist_ok=True)
             for part in ('private','data'):
                 if (default/part).exists():shutil.copytree(default/part,target/part,dirs_exist_ok=True)
