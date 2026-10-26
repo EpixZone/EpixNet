@@ -49,7 +49,8 @@ class Marionette:
     def __init__(self, port):
         self.s=socket.create_connection(('127.0.0.1',port),timeout=5);self.s.settimeout(35);self.n=0
         check(self.recv().get('marionetteProtocol')==3,'unexpected Marionette protocol')
-        self.cmd('WebDriver:NewSession',{'acceptInsecureCerts':False,'pageLoadStrategy':'normal'})
+        session=self.cmd('WebDriver:NewSession',{'acceptInsecureCerts':False,'pageLoadStrategy':'normal'})
+        check(session['capabilities']['acceptInsecureCerts'] is False,'certificate verification bypassed')
         self.cmd('WebDriver:SetTimeouts',{'pageLoad':20000,'script':20000,'implicit':0})
     def recv(self):
         prefix=b''
@@ -148,6 +149,12 @@ def main():
         env={k:v for k,v in os.environ.items() if k.upper() in {'SYSTEMROOT','WINDIR','SYSTEMDRIVE','COMSPEC','PATHEXT','PATH','PROCESSOR_ARCHITECTURE','NUMBER_OF_PROCESSORS','OS'}}
         for name in ('home','appdata','localappdata','tmp'): (root/name).mkdir()
         env.update(HOME=str(root/'home'),USERPROFILE=str(root/'home'),APPDATA=str(root/'appdata'),LOCALAPPDATA=str(root/'localappdata'),TEMP=str(root/'tmp'),TMP=str(root/'tmp'),EPIX_TOR='disable',TOKIO_WORKER_THREADS='2',MOZ_MARIONETTE='1',MOZ_HEADLESS='1')
+        policy=launcher.parent/'firefox/distribution/policies.json'
+        original_policy=sha(policy);policy_value=json.loads(policy.read_text(encoding='utf8-sig'))
+        install=policy_value.setdefault('policies',{}).setdefault('Certificates',{}).setdefault('Install',[])
+        install.append(str(root/'localappdata/Mozilla/Certificates/epix-ca.pem'))
+        policy.write_text(json.dumps(policy_value),encoding='utf8')
+        report['fixture_certificate_policy']={'original_sha256':original_policy,'fixture_sha256':sha(policy),'change':'Add absolute path to the disposable QA CA; Windows known-folder lookup ignores isolated APPDATA. No trust bypass; acceptInsecureCerts=false.'}
         default=root/'appdata/EpixNet';(default/'private').mkdir(parents=True)
         (default/'private/config.json').write_text(json.dumps({'offline':True,'xid_lc_enabled':False,'chain_rpc_url':'http://127.0.0.1:9','chain_evm_rpc_url':'http://127.0.0.1:9'}))
         # Public harmless data is copied alongside the generated identity without exposing either identity or its keys.
@@ -175,9 +182,9 @@ def main():
             try:return Marionette(2828)
             except (OSError,RuntimeError):return None
         browser=wait(connect,60)
-        report['before']['page']=browser.page('http://dashboard.epix/')
+        report['before']['page']=browser.page('https://dashboard.epix/')
         report['before']['screenshot_error']=browser.screenshot(out/'before-dashboard.png')
-        report['tls_scope']='Disposable APPDATA differs from Windows known-folder certificate lookup. Follow the product HTTP fallback; no TLS trust assertion or certificate bypass.'
+        report['tls_scope']='Disposable absolute certificate policy path compensates Windows known-folder lookup; actual bundled Firefox verifies the QA local CA with acceptInsecureCerts=false.'
         for case in report['cases']:
             blank=browser.page('about:blank')
             check(blank.get('uri')=='about:blank' and not blank.get('navigation_error'),'failed to clear prior case document')
@@ -191,11 +198,26 @@ def main():
         target=alternate/'EpixNet moved';body=urlencode({'csrf':match[1],'data_dir':str(target),'offline':'on','xid_lc_enabled':'false'}).encode()
         code,headers,_=request(port,'/Config',body);report['move']={'http_status':code,'location':headers.get('location') or headers.get('Location'),'requested':str(target)}
         check(code in (302,303),'Config move not redirected')
+        if '/Config?error=' in (report['move']['location'] or ''):
+            # Preserve the actual active-copy failure, then isolate the independent
+            # PAC restart behavior using the supported existing-identity switch.
+            report['active_copy_failure']=dict(report['move']);save();stop()
+            target.mkdir(parents=True,exist_ok=True)
+            for part in ('private','data'):
+                if (default/part).exists():shutil.copytree(default/part,target/part,dirs_exist_ok=True)
+            report['stopped_copy_control']={'identity_present':(target/'private/users.json').exists(),'scope':'Only disposable fixture data, copied after all owned app processes stop. This does not repair or pass the failing live Config copy.'}
+            check(report['stopped_copy_control']['identity_present'],'copied target has no fixture identity')
+            port,report['control_default_restart']=launch(default,'control-default')
+            code,_,body=request(port,'/Config');check(code==200,'Config control not reachable')
+            match=re.search(r"name=['\"]csrf['\"]\s+value=['\"]([^'\"]+)",body.decode());check(match,'control CSRF missing')
+            code,headers,_=request(port,'/Config',urlencode({'csrf':match[1],'data_dir':str(target),'offline':'on','xid_lc_enabled':'false'}).encode())
+            report['move_existing_identity']={'http_status':code,'location':headers.get('location') or headers.get('Location')}
+            check(code in (302,303) and '/Config?done=' in (report['move_existing_identity']['location'] or ''),'existing identity Config switch failed')
         conf=(default/'epixnet.conf').read_text();value=re.search(r'^data_dir\s*=\s*(.+)$',conf,re.M);check(value,'Config omitted new data root')
         report['move']['persisted_data_dir']=value[1];report['move']['copy_marker_matches']=(target/'data/qa-copy-marker/marker.txt').read_bytes()==(default/'data/qa-copy-marker/marker.txt').read_bytes()
         report['move']['identity_copy_present']=(target/'private/users.json').exists();save();stop()
         moved=Path(value[1]);port,report['after']=launch(moved,'after');save()
-        browser=wait(connect,60);report['after']['page']=browser.page('http://dashboard.epix/');report['after']['screenshot_error']=browser.screenshot(out/'after-dashboard.png')
+        browser=wait(connect,60);report['after']['page']=browser.page('https://dashboard.epix/');report['after']['screenshot_error']=browser.screenshot(out/'after-dashboard.png')
         prefs=(moved/'firefox-profile/user.js').read_text();report['after']['pac_url']=re.search(r'user_pref\("network.proxy.autoconfig_url", (.+)\);',prefs)[1]
         report['after']['pac_exists']=(moved/'firefox-profile/epix.pac').exists()
         report['after']['direct_node_config_page']=browser.page('http://127.0.0.1:'+str(port)+'/Config');browser.screenshot(out/'after-direct-config.png')
