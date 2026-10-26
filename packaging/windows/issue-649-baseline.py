@@ -28,7 +28,7 @@ def extract_function(source, name):
 def request(port, path, body=None):
     c = http.client.HTTPConnection('127.0.0.1', port, timeout=15)
     try:
-        headers = {'Origin':f'http://127.0.0.1:{port}'}
+        headers = {'Origin':f'http://127.0.0.1:{port}', 'Referer':f'http://127.0.0.1:{port}{path}'}
         if body is not None: headers['Content-Type']='application/x-www-form-urlencoded'
         c.request('POST' if body is not None else 'GET',path,body,headers)
         r=c.getresponse(); data=r.read(4*1024*1024)
@@ -175,11 +175,14 @@ def main():
             try:return Marionette(2828)
             except (OSError,RuntimeError):return None
         browser=wait(connect,60)
-        report['before']['page']=browser.page('https://dashboard.epix/')
+        report['before']['page']=browser.page('http://dashboard.epix/')
         report['before']['screenshot_error']=browser.screenshot(out/'before-dashboard.png')
+        report['tls_scope']='Disposable APPDATA differs from Windows known-folder certificate lookup. Follow the product HTTP fallback; no TLS trust assertion or certificate bypass.'
         for case in report['cases']:
+            blank=browser.page('about:blank')
+            check(blank.get('uri')=='about:blank' and not blank.get('navigation_error'),'failed to clear prior case document')
             case['firefox']=browser.page(case['file_url'])
-            case['firefox_file_loaded']='function FindProxyForURL' in (case['firefox'].get('text') or '')
+            case['firefox_file_loaded']=not case['firefox'].get('navigation_error') and 'function FindProxyForURL' in (case['firefox'].get('text') or '')
         save()
         prefs=(default/'firefox-profile/user.js').read_text();report['before']['pac_url']=re.search(r'user_pref\("network.proxy.autoconfig_url", (.+)\);',prefs)[1]
         # Read Config token only in memory, never place the page or token in artifacts.
@@ -192,7 +195,7 @@ def main():
         report['move']['persisted_data_dir']=value[1];report['move']['copy_marker_matches']=(target/'data/qa-copy-marker/marker.txt').read_bytes()==(default/'data/qa-copy-marker/marker.txt').read_bytes()
         report['move']['identity_copy_present']=(target/'private/users.json').exists();save();stop()
         moved=Path(value[1]);port,report['after']=launch(moved,'after');save()
-        browser=wait(connect,60);report['after']['page']=browser.page('https://dashboard.epix/');report['after']['screenshot_error']=browser.screenshot(out/'after-dashboard.png')
+        browser=wait(connect,60);report['after']['page']=browser.page('http://dashboard.epix/');report['after']['screenshot_error']=browser.screenshot(out/'after-dashboard.png')
         prefs=(moved/'firefox-profile/user.js').read_text();report['after']['pac_url']=re.search(r'user_pref\("network.proxy.autoconfig_url", (.+)\);',prefs)[1]
         report['after']['pac_exists']=(moved/'firefox-profile/epix.pac').exists()
         report['after']['direct_node_config_page']=browser.page('http://127.0.0.1:'+str(port)+'/Config');browser.screenshot(out/'after-direct-config.png')
