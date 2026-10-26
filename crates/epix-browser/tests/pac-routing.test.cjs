@@ -17,7 +17,9 @@ test("generated PAC URLs preserve native paths and route onion services through 
     assert.ok(start >= 0, `missing production ${name}`);
     return source.slice(start, source.indexOf("\n}", start) + 2);
   };
-  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "epix-pac-regressions-")));
+  // Native resolution matches Rust's canonicalize, including Windows 8.3
+  // aliases and macOS's /var symlink.
+  const root = fs.realpathSync.native(fs.mkdtempSync(path.join(os.tmpdir(), "epix-pac-regressions-")));
   try {
     // Compile the production functions with the workspace's exact URL library,
     // without building the browser or reimplementing native path conversion.
@@ -68,7 +70,7 @@ fn main() {
         user_pref: (key, value) => prefs.set(key, value),
       });
       const pacUrl = prefs.get("network.proxy.autoconfig_url");
-      const pacPath = path.join(profile, "epix.pac");
+      const pacPath = fs.realpathSync.native(path.join(profile, "epix.pac"));
       assert.equal(pacUrl, pathToFileURL(pacPath).href);
       assert.equal(new URL(pacUrl).search, "");
       assert.equal(new URL(pacUrl).hash, "");
