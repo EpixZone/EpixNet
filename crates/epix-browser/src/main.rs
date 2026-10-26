@@ -394,9 +394,10 @@ async fn boot(
 
     // A Config-page restart relaunches this executable in background mode:
     // the node comes back up without popping a second browser window, and the
-    // already-open window reconnects on its own.
+    // already-open window reconnects on its own unless a data move changes the
+    // browser profile. That restart page asks the user to reopen from the tray.
     if let Some(exe) = epix_ui::self_exe() {
-        running.state.set_restart_argv(vec![exe, "--background".to_string()]);
+        running.state.set_managed_browser_restart_argv(vec![exe, "--background".to_string()]);
     }
 
     // I2P on/off comes from the node config (the boot above defaults it to

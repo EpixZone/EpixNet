@@ -180,6 +180,29 @@ jobs:
           python scripts/test_data_relocation.py
           node --test crates/epix-browser/tests/pac-routing.test.cjs
 
+  apple-filesystem-regressions:
+    name: Apple filesystem regressions
+    runs-on: macos-14
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings"
+      EPIX_TEST_FETCH_DEPS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - name: Test native directory ownership, recovery and PAC paths
+        run: |
+          python3 scripts/test_data_relocation.py
+          node --test crates/epix-browser/tests/pac-routing.test.cjs
+
   mobile-profiles:
     name: Mobile feature profiles
     runs-on: ubuntu-latest

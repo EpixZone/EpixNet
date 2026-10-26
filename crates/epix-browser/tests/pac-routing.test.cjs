@@ -17,7 +17,7 @@ test("generated PAC URLs preserve native paths and route onion services through 
     assert.ok(start >= 0, `missing production ${name}`);
     return source.slice(start, source.indexOf("\n}", start) + 2);
   };
-  const root = fs.mkdtempSync(path.join(os.tmpdir(), "epix-pac-regressions-"));
+  const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "epix-pac-regressions-")));
   try {
     // Compile the production functions with the workspace's exact URL library,
     // without building the browser or reimplementing native path conversion.
@@ -53,6 +53,9 @@ fn main() {
       CARGO_BUILD_JOBS: "2", CARGO_INCREMENTAL: "0", CARGO_PROFILE_DEV_DEBUG: "0", CARGO_PROFILE_TEST_DEBUG: "0" };
     const cargo = process.env.CARGO || "cargo";
     const options = { env, timeout: 180000, stdio: "pipe" };
+    if (process.env.EPIX_TEST_FETCH_DEPS === "1") {
+      execFileSync(cargo, ["fetch", "--manifest-path", manifest], options);
+    }
     process.stdout.write(execFileSync(cargo, ["test", "--offline", "--manifest-path", manifest], options));
     const profileRoot = path.join(root, "First Last #100%20 Zoë 雪");
     fs.mkdirSync(profileRoot);

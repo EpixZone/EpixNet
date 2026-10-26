@@ -4322,10 +4322,9 @@ pub struct AppState {
     /// key "pending restart" when its saved value has drifted from this. None
     /// until snapshotted (test/in-memory nodes never are, so nothing pends).
     boot_config: std::sync::Mutex<Option<HashMap<String, String>>>,
-    /// The argv a requested restart relaunches with. Set by the embedding
-    /// shell - the desktop browser relaunches itself with `--background` so no
-    /// second window pops. None relaunches the current exe with its own args.
-    restart_argv: std::sync::Mutex<Option<Vec<String>>>,
+    /// The command and browser-profile behavior registered by the embedding
+    /// shell. Without a command, a restart request shuts down without relaunch.
+    restart_command: std::sync::Mutex<Option<RestartCommand>>,
     /// Names of loaded plugins/features, reported in `serverInfo` (the dashboard
     /// menu shows plugin-gated items like Stats from this).
     plugins: RwLock<Vec<String>>,
@@ -5478,6 +5477,11 @@ pub fn self_exe() -> Option<String> {
     exe.is_file().then(|| exe.display().to_string())
 }
 
+struct RestartCommand {
+    argv: Vec<String>,
+    managed_browser_profile: bool,
+}
+
 /// Launch a detached helper that waits for this process to die, then starts
 /// the node again with `argv`. The wait matters: the single-instance guard
 /// and the bound ports are only free once the old process is gone. Only ever
@@ -5663,7 +5667,7 @@ impl AppState {
             config: RwLock::new(persist.config),
             config_path: persist.config_path,
             boot_config: std::sync::Mutex::new(None),
-            restart_argv: std::sync::Mutex::new(None),
+            restart_command: std::sync::Mutex::new(None),
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
@@ -6663,13 +6667,27 @@ impl AppState {
     /// `--background`); without it a restart request is a plain shutdown and
     /// the Config page words its restart bar accordingly.
     pub fn set_restart_argv(&self, argv: Vec<String>) {
-        *self.restart_argv.lock().unwrap() = Some(argv);
+        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+            argv, managed_browser_profile: false,
+        });
+    }
+
+    /// Register a shell whose browser profile changes with the data root.
+    pub fn set_managed_browser_restart_argv(&self, argv: Vec<String>) {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+            argv, managed_browser_profile: true,
+        });
+    }
+
+    pub fn restart_uses_managed_browser_profile(&self) -> bool {
+        self.restart_command.lock().unwrap().as_ref()
+            .is_some_and(|command| command.managed_browser_profile)
     }
 
     /// Whether a restart can actually relaunch the node (a shell registered
     /// a relaunch argv).
     pub fn can_restart(&self) -> bool {
-        self.restart_argv.lock().unwrap().is_some()
+        self.restart_command.lock().unwrap().is_some()
     }
 
     /// Stop the node process; with `restart` a detached helper waits for this
@@ -6684,7 +6702,9 @@ impl AppState {
         .await;
         self.persist_peers().await;
         self.persist_xites().await;
-        let argv = if restart { self.restart_argv.lock().unwrap().clone() } else { None };
+        let argv = if restart {
+            self.restart_command.lock().unwrap().as_ref().map(|command| command.argv.clone())
+        } else { None };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             if let Some(argv) = argv {
@@ -45739,7 +45759,9 @@ mod tests {
         state.set_data_dir_conf(&conf);
         let target = new.path().join("moved");
         state.set_data_dir(target.to_str().unwrap()).await.unwrap();
-        assert!(crate::data_relocation::prepare_startup(&conf, old.path()).is_err());
+        let default = crate::paths::default_data_root();
+        let busy = crate::data_relocation::prepare_startup(&conf, &default).unwrap_err();
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
         assert!(!target.join("private/users.json").exists());
         // Edits after pressing Save must be present in the eventual snapshot.
         state.set_global_settings(json!({"theme":"dark"})).await;
@@ -45747,11 +45769,21 @@ mod tests {
         let latest_identity = std::fs::read(old.path().join("private/users.json")).unwrap();
         let latest_config = std::fs::read(old.path().join("private/config.json")).unwrap();
         drop(state);
-        let moved = crate::data_relocation::prepare_startup(&conf, old.path()).unwrap();
+        let moved = crate::data_relocation::prepare_startup(&conf, &default).unwrap();
         assert_eq!(moved.root(), target.canonicalize().unwrap());
         assert_eq!(std::fs::read(target.join("private/users.json")).unwrap(), latest_identity);
         assert_eq!(std::fs::read(target.join("private/config.json")).unwrap(), latest_config);
         assert_eq!(std::fs::read(old.path().join("private/users.json")).unwrap(), latest_identity);
+    }
+
+    #[test]
+    fn managed_browser_restart_is_explicit_and_resets_for_standalone_registration() {
+        let state = AppState::new("test");
+        assert!(!state.restart_uses_managed_browser_profile());
+        state.set_managed_browser_restart_argv(vec!["epix-browser".into(), "--background".into()]);
+        assert!(state.restart_uses_managed_browser_profile());
+        state.set_restart_argv(vec!["epix-server".into()]);
+        assert!(!state.restart_uses_managed_browser_profile());
     }
 
     #[tokio::test]

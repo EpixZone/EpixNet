@@ -627,11 +627,22 @@ impl Directory {
                 _ => return Err(invalid("Invalid directory component")),
             }
         }
-        let mut current = Self::anchor(&anchor)?;
-        for name in names {
-            current = current.child(&name, create)?;
+        #[cfg(any(target_os = "linux", target_os = "android"))]
+        {
+            Self::walk_search_only(&anchor, &names, create)
         }
-        Ok(current)
+        #[cfg(target_vendor = "apple")]
+        {
+            Self::open_apple(path, create)
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
+        {
+            let mut current = Self::anchor(&anchor)?;
+            for name in names {
+                current = current.child(&name, create)?;
+            }
+            Ok(current)
+        }
     }
 
     fn identity(&self) -> io::Result<Identity> {
@@ -791,6 +802,83 @@ fn file_identity(file: &File) -> io::Result<Identity> {
 
 #[cfg(unix)]
 impl Directory {
+    /// Ancestors may allow search without directory listing, notably Android's
+    /// /data. O_PATH pins each inode without asking to enumerate it. Only the
+    /// final node-owned directory is reopened for reading and syncing.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    fn walk_search_only(anchor: &Path, names: &[OsString], create: bool) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+        let search = OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let readable = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+        let mut directory: File = rustix::fs::open(anchor, search, Mode::empty())?.into();
+        let mut path = anchor.to_path_buf();
+        for name in names {
+            let next = match rustix::fs::openat(&directory, name, search, Mode::empty()) {
+                Ok(file) => file,
+                Err(rustix::io::Errno::NOENT) if create => {
+                    // An O_PATH descriptor cannot be fsynced. Before creating
+                    // anything, obtain a readable handle to the same parent
+                    // inode so the new entry can be made durable. Existing
+                    // protected ancestors never need this extra access.
+                    let parent: File =
+                        rustix::fs::openat(&directory, ".", readable, Mode::empty())?.into();
+                    match rustix::fs::mkdirat(&directory, name, Mode::from_raw_mode(0o700)) {
+                        Ok(()) => parent.sync_all()?,
+                        Err(rustix::io::Errno::EXIST) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                    rustix::fs::openat(&directory, name, search, Mode::empty())?
+                }
+                Err(error) => return Err(error.into()),
+            };
+            directory = next.into();
+            path.push(name);
+        }
+        let file = rustix::fs::openat(&directory, ".", readable, Mode::empty())?;
+        Ok(Self {
+            path,
+            file: file.into(),
+        })
+    }
+
+    /// macOS 11 and iOS 14 support a kernel-checked whole-path no-symlink open.
+    /// Opening only the final directory avoids requesting list permission on
+    /// app-container ancestors. O_SEARCH would raise the supported OS minimum.
+    #[cfg(target_vendor = "apple")]
+    fn open_apple(path: &Path, create: bool) -> io::Result<Self> {
+        use rustix::fs::{Mode, OFlags};
+        // Darwin rejects combining O_NOFOLLOW_ANY with ordinary O_NOFOLLOW.
+        let flags = OFlags::RDONLY
+            | OFlags::DIRECTORY
+            | OFlags::CLOEXEC
+            | OFlags::from_bits_retain(libc::O_NOFOLLOW_ANY as _);
+        match rustix::fs::open(path, flags, Mode::empty()) {
+            Ok(file) => Ok(Self {
+                path: path.to_path_buf(),
+                file: file.into(),
+            }),
+            Err(rustix::io::Errno::NOENT) if create => {
+                let parent = Self::open(
+                    path.parent()
+                        .ok_or_else(|| invalid("Directory has no parent"))?,
+                    true,
+                )?;
+                let name = path
+                    .file_name()
+                    .ok_or_else(|| invalid("Directory has no name"))?;
+                match parent.create_child(name) {
+                    Ok(directory) => Ok(directory),
+                    Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                        parent.child(name, false)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "android", target_vendor = "apple")))]
     fn anchor(path: &Path) -> io::Result<Self> {
         use rustix::fs::{Mode, OFlags};
         let file = rustix::fs::open(
@@ -1462,6 +1550,62 @@ mod tests {
             &fixture.default
         )
         .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn owned_roots_below_search_only_ancestors_can_be_leased_and_created() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let restricted = temp.path().canonicalize().unwrap().join("search-only");
+        let owned = restricted.join("owned");
+        std::fs::create_dir_all(&owned).unwrap();
+        std::fs::set_permissions(&restricted, std::fs::Permissions::from_mode(0o111)).unwrap();
+        // Restore permissions even if an assertion below fails so the fixture
+        // cannot leave an inaccessible temporary tree behind.
+        struct Restore(PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+        let _restore = Restore(restricted);
+        for root in [owned.clone(), owned.join("new/nested")] {
+            let lease = DataRootLease::acquire(&root).unwrap();
+            assert_eq!(lease.root(), root);
+            assert_eq!(
+                DataRootLease::acquire(&root).unwrap_err().kind(),
+                io::ErrorKind::WouldBlock
+            );
+            std::fs::write(root.join("sentinel"), b"owned directory is usable").unwrap();
+            lease.directory.assert_bound().unwrap();
+            drop(lease);
+            assert_eq!(
+                std::fs::read(root.join("sentinel")).unwrap(),
+                b"owned directory is usable"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn search_only_traversal_does_not_follow_ancestor_links() {
+        use std::os::unix::fs::symlink;
+        let temp = tempfile::tempdir().unwrap();
+        let base = temp.path().canonicalize().unwrap();
+        let outside = base.join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::write(outside.join("sentinel"), b"outside unchanged").unwrap();
+        symlink(&outside, base.join("link")).unwrap();
+        // Directory::open consumes an already normalized bound path. It must
+        // reject a replacement link even though the explicit operator root
+        // normalizer intentionally accepts existing aliases before binding.
+        assert!(Directory::open(&base.join("link/new"), true).is_err());
+        assert!(!outside.join("new").exists());
+        assert_eq!(
+            std::fs::read(outside.join("sentinel")).unwrap(),
+            b"outside unchanged"
+        );
     }
 
     #[cfg(unix)]

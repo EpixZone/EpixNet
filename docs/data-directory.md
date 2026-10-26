@@ -13,8 +13,9 @@ xites and statistics. Browser profiles, wallet extension storage, browser
 certificates and other files outside those two directories remain in their
 original folder. An existing destination profile keeps its own data.
 
-After using the Config restart button for a data move, wait for the EpixNet tray
-to return, close the old browser window, and open Epix Browser from the tray.
+In the desktop app, after using Config's restart button for a data move, wait
+for the EpixNet tray to return, close the old browser window, and open Epix
+Browser from the tray.
 The old window uses the previous folder's profile and certificate trust. The
 restart page shows these instructions instead of reloading that window.
 
@@ -50,6 +51,6 @@ modules, including interrupted-copy recovery and SQLite WAL preservation. Run
 settings and native file URLs. On a fresh machine, set `EPIX_TEST_FETCH_DEPS=1`
 for the latter command to download its locked test dependencies first.
 
-The Windows CI job runs both suites. Runtime acceptance also needs the built
+The Windows and macOS CI jobs run both suites. Runtime acceptance also needs the built
 launcher, Config restart, distinct disk volumes, and the reopened browser's
 HTTPS pages.

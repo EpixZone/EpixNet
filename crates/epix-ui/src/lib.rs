@@ -1834,7 +1834,7 @@ async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
             ctx.state.push_notification("info", "Restarting...", 5000);
             ctx.state.shutdown(true).await;
             let theme = ctx.state.theme_class().await;
-            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme, data_move))
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme, data_move, ctx.state.restart_uses_managed_browser_profile()))
                 .into_response()
         }
         _ => Redirect::to("/Config").into_response(),
@@ -1995,12 +1995,10 @@ async fn serve_config_page(
         .into_response()
 }
 
-/// The page shown after the restart button: the node is going down, so the
-/// page itself polls until /Config answers again and then returns there. The
-/// meta refresh is the no-JS fallback (its first hits may error while the
-/// node is down; the JS poll swallows those).
-fn render_restarting_page(theme: &str, data_move: bool) -> String {
-    if data_move {
+/// A managed browser needs a fresh profile after a data move. Other restarts
+/// poll until /Config answers again, with a meta refresh as the no-JS fallback.
+fn render_restarting_page(theme: &str, data_move: bool, managed_browser: bool) -> String {
+    if data_move && managed_browser {
         return page_shell("Restarting", "Moving node data", "",
             "<p class='sub'>EpixNet is restarting and moving its node data. \
              When the EpixNet tray is ready, close this browser window and open Epix Browser from the tray. \
@@ -3938,14 +3936,17 @@ fn percent_decode(s: &str) -> String {
 mod data_move_page_tests {
     #[test]
     fn relocated_browser_gets_reopen_instructions_without_polling_the_old_profile() {
-        let page = super::render_restarting_page("theme-light", true);
+        let page = super::render_restarting_page("theme-light", true, true);
         assert!(page.contains("close this browser window"));
         assert!(page.contains("open Epix Browser from the tray"));
         assert!(page.contains("wallet extension storage remain in their original folder"));
         assert!(!page.contains("http-equiv='refresh'"));
         assert!(!page.contains("fetch('/Config'"));
-        let ordinary = super::render_restarting_page("theme-light", false);
-        assert!(ordinary.contains("fetch('/Config'"));
+        for (data_move, managed_browser) in [(true, false), (false, true), (false, false)] {
+            let ordinary = super::render_restarting_page("theme-light", data_move, managed_browser);
+            assert!(ordinary.contains("fetch('/Config'"));
+            assert!(!ordinary.contains("open Epix Browser from the tray"));
+        }
     }
 }
 
