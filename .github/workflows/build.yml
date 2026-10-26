@@ -9,8 +9,14 @@ on:
         description: Frozen integrated candidate commit (40 lowercase hexadecimal characters)
         required: true
         type: string
+      reuse_artifact_run:
+        description: Optional exact earlier QA run ID for runtime-only replay; never replaces fresh final acceptance
+        required: false
+        default: ''
+        type: string
 permissions:
   contents: read
+  actions: read
 jobs:
   windows-data-directory:
     name: Windows candidate relocation
@@ -30,8 +36,10 @@ jobs:
       - name: Validate immutable candidate input
         env:
           CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+          REUSE_ARTIFACT_RUN: ${{ inputs.reuse_artifact_run }}
         run: |
           if ($env:CANDIDATE_REVISION -cnotmatch '^[0-9a-f]{40}$') { throw 'exact candidate commit required' }
+          if ($env:REUSE_ARTIFACT_RUN -and $env:REUSE_ARTIFACT_RUN -cnotmatch '^[1-9][0-9]{0,15}$') { throw 'numeric immutable prior run ID required' }
       - name: Check out integrated candidate separately
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
@@ -77,6 +85,7 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'installer extraction failed' }
       - name: Restore bounded native dependencies and intermediates
         id: native-cache
+        if: inputs.reuse_artifact_run == ''
         uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
         with:
           path: |
@@ -88,13 +97,25 @@ jobs:
             issue649-windows2025-rust1.99.1-release-opt1-cgu256-v1-${{ hashFiles('source/Cargo.lock') }}-
       - name: Build actual candidate with bounded resources
         id: candidate-build
+        if: inputs.reuse_artifact_run == ''
         timeout-minutes: 67
         env:
           CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
         run: |
           python packaging/windows/issue-649-build.py --source source --output evidence --revision $env:CANDIDATE_REVISION
           if ($LASTEXITCODE -ne 0) { throw 'candidate build failed; inspect retained evidence' }
+      - name: Verify and reuse earlier exact candidate binaries for runtime-only replay
+        if: inputs.reuse_artifact_run != ''
+        timeout-minutes: 6
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REUSE_ARTIFACT_RUN: ${{ inputs.reuse_artifact_run }}
+          CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
+        run: |
+          python packaging/windows/issue-649-reuse.py --run $env:REUSE_ARTIFACT_RUN --revision $env:CANDIDATE_REVISION --output evidence
+          if ($LASTEXITCODE -ne 0) { throw 'exact candidate artifact verification failed' }
       - name: Run native production PAC regression harness
+        if: inputs.reuse_artifact_run == ''
         timeout-minutes: 4
         run: |
           $env:CARGO_HOME = Join-Path $env:RUNNER_TEMP 'issue-649-candidate-cargo'
@@ -104,6 +125,7 @@ jobs:
             if ($LASTEXITCODE -ne 0) { throw 'native PAC regressions failed' }
           } finally { Pop-Location }
       - name: Run exact native Windows private-data ACL regression
+        if: inputs.reuse_artifact_run == ''
         timeout-minutes: 14
         env:
           CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
