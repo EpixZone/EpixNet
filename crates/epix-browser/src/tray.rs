@@ -528,7 +528,9 @@ fn target_url(scheme: &str, arg: &str) -> String {
 /// still running, asks Firefox (remote) to raise it - best-effort.
 fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url: &str) {
     let spawn_fresh = |child: &mut Option<Child>| {
-        let mut cmd = crate::browser_process::browser_command(firefox, profile);
+        // Query again on the tray thread: Gamescope's resolution can change while closed.
+        let window_size = crate::browser_process::gamescope_window_size();
+        let mut cmd = crate::browser_process::browser_command(firefox, profile, window_size);
         if let Ok(c) = cmd.arg(url).spawn() {
             *child = Some(c);
         }
