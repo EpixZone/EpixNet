@@ -150,7 +150,7 @@ def main():
         for name in ('home','appdata','localappdata','tmp'): (root/name).mkdir()
         env.update(HOME=str(root/'home'),USERPROFILE=str(root/'home'),APPDATA=str(root/'appdata'),LOCALAPPDATA=str(root/'localappdata'),TEMP=str(root/'tmp'),TMP=str(root/'tmp'),EPIX_TOR='disable',TOKIO_WORKER_THREADS='2',MOZ_MARIONETTE='1',MOZ_HEADLESS='1')
         policy=launcher.parent/'firefox/distribution/policies.json'
-        original_policy=sha(policy);policy_value=json.loads(policy.read_text(encoding='utf8-sig'))
+        original_policy=sha(policy);policy_value=json.loads(policy.read_text(encoding='utf-8-sig'))
         install=policy_value.setdefault('policies',{}).setdefault('Certificates',{}).setdefault('Install',[])
         install.append(str(root/'localappdata/Mozilla/Certificates/epix-ca.pem'))
         policy.write_text(json.dumps(policy_value),encoding='utf8')
