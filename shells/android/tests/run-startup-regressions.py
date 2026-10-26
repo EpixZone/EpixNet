@@ -43,6 +43,7 @@ internal class Shell {
     var hidden = false
     val startupPresentation = StartupPresentation()
     fun hideSplash() { hidden = true }
+    fun leaveFullScreen(session: GeckoSession) {}
     fun updateSplash(stage: SplashStage) { startupPresentation.advance(stage) }
 '''
 kotlin += ownership[0].replace("private fun", "fun", 1) + "\n"
