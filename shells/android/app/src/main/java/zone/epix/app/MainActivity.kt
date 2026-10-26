@@ -73,6 +73,7 @@ import uniffi.epix_ffi.TorStatus
 class MainActivity : AppCompatActivity(), WalletHost {
 
     private lateinit var geckoView: GeckoView
+    private val geckoInsets = GeckoViewInsets()
     private lateinit var addressBar: EditText
     private lateinit var torBadge: GradientDrawable
     private lateinit var runtime: GeckoRuntime
@@ -1139,7 +1140,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
             visibility = View.GONE
         }
         root.addView(offlineBanner, LinearLayout.LayoutParams(-1, -2))
-        geckoView = GeckoView(this)
+        geckoView = WindowGeckoView(this, geckoInsets)
         // The page cover follows the saved theme beneath the separate branded
         // startup overlay, so it matches the node's loading screen.
         geckoView.coverUntilFirstPaint(pageBackground())
@@ -2053,7 +2054,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
                 if (ownsSession(session)) canGoBack = value
             }
         }
-        val view = GeckoView(this).apply {
+        val view = WindowGeckoView(this, geckoInsets).apply {
             setSession(popupSession)
             // Dark until the wallet page paints (it flashes white otherwise
             // while the bundles parse; the page itself then shows the inline
