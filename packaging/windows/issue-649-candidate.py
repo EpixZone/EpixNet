@@ -127,7 +127,7 @@ def main():
             def ready():
                 if proc.poll() is not None:raise RuntimeError('candidate exited '+str(proc.returncode))
                 return runtime_ready(data)
-            port,status=wait(ready,120);check(json.loads((data/'private/config.json').read_text()).get('offline') in (True,'true'),'offline config lost')
+            port,status=wait(ready,120);check(json.loads((data/'private/config.json').read_text(encoding='utf8')).get('offline') in (True,'true'),'offline config lost')
             return port,describe_runtime(port,status,proc.pid),proc
         def connect():
             try:return Marionette(2828)
@@ -139,7 +139,7 @@ def main():
             report[label]['screenshot_error']=browser.screenshot(out/(label+'-dashboard.png'))
             payload=browser.page('https://dashboard.epix/qa-move-marker.txt');report[label]['content_page']=payload
             check(not payload.get('navigation_error') and ('after-queue' in (payload.get('text')or'') if label!='before' else 'before queue' in (payload.get('text')or'')),'local .epix content not served')
-            prefs=(data/'firefox-profile/user.js').read_text();pac=json.loads(re.search(r'user_pref\("network.proxy.autoconfig_url", (.+)\);',prefs)[1]);parts=urlsplit(pac)
+            prefs=(data/'firefox-profile/user.js').read_text(encoding='utf8');pac=json.loads(re.search(r'user_pref\("network.proxy.autoconfig_url", (.+)\);',prefs)[1]);parts=urlsplit(pac)
             report[label]['pac']={'url':pac,'query':parts.query,'fragment':parts.fragment,'decoded_path':unquote(parts.path),'exists':(data/'firefox-profile/epix.pac').exists()}
             check(not parts.query and not parts.fragment and parts.scheme=='file','PAC URL split or malformed')
             check(not pac.startswith('file:////?/'),'verbatim path became PAC URL query')
@@ -221,7 +221,7 @@ def main():
         report['after']['users_sha256']=sha(target/'private/users.json');check(report['after']['users_sha256']==report['stopped_source_users_sha256'],'identity bytes changed during migration')
         check((target/'data'/DASHBOARD/'qa-move-marker.txt').read_text(encoding='utf8')==MARKER,'latest content lost');check((target/'private/qa-late-state.json').read_bytes()==(source/'private/qa-late-state.json').read_bytes(),'late private state lost')
         report['after']['chart']=chart(target/'private/chart.db');check(report['after']['chart']['integrity']==['ok'],'moved Stats DB corrupt');check(report['after']['chart']['sentinel_rows']==report['stopped_source_chart']['sentinel_rows'],'Stats history lost')
-        persisted=re.search(r'^data_dir\s*=\s*(.+)$',conf.read_text(),re.M);check(persisted,'committed conf missing data_dir');check(os.path.samefile(persisted[1],target),'conf points to wrong target')
+        persisted=re.search(r'^data_dir\s*=\s*(.+)$',conf.read_text(encoding='utf8'),re.M);check(persisted,'committed conf missing data_dir');check(os.path.samefile(persisted[1],target),'conf points to wrong target')
         check(not pending.exists(),'completed relocation left pending marker');check(sha(source/'private/users.json')==report['stopped_source_users_sha256'],'source identity backup changed');check(marker.read_text(encoding='utf8')==MARKER,'source content backup changed')
         report['checks'].update(queue_without_live_copy=True,late_content_preserved=True,identity_preserved=True,stats_history_and_integrity=True,source_backup_retained=True,distinct_ntfs_volumes=True,special_path_characters=True,https_epix_navigation=True)
         save()
