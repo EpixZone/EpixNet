@@ -229,6 +229,8 @@ def main():
         quit_log=(root/'quit.raw.log').open('wb');handles.append(quit_log);quit_job=owned.WindowsJob();jobs.append(quit_job)
         quit_process=quit_job.launch([str(launcher),'--quit'],env=env,cwd=launcher.parent,stdout=quit_log,stderr=subprocess.STDOUT);quit_process.wait(timeout=40);check(quit_process.returncode==0,'normal --quit failed')
         report['normal_restart']['quit_exit_code']=quit_process.returncode
+        wait(lambda:not any(restarted['ProcessId'] in job.process_ids()for job in jobs),30)
+        report['normal_restart']['quit_node_exited_before_owned_cleanup']=True
         stop();port,report['second_restart'],_=launch(target,'second-restart');browser_check('second_restart',target,port)
         check(sha(target/'private/users.json')==report['stopped_source_users_sha256'],'second restart changed identity');check(chart(target/'private/chart.db')['sentinel_rows']==report['stopped_source_chart']['sentinel_rows'],'second restart lost Stats history')
         report['checks']['idempotent_second_restart']=True;report['completed']=True
