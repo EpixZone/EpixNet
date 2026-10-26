@@ -1620,6 +1620,9 @@ if (window.getComputedStyle(document.body).transform) {
       this.inner_loaded = false;
       this.inner_ready = false;
       this.wrapperWsInited = false;
+      this.inner_document = null;
+      this.iframe_reload_request = null;
+      this.iframe_recovery_pending = false;
       this.xite_error = null;
       this.address = null;
       this.opener_tested = false;
@@ -1765,6 +1768,9 @@ if (window.getComputedStyle(document.body).transform) {
         this.log("Message nonce error:", message.wrapper_nonce, '!=', window.wrapper_nonce);
         return;
       }
+      if (message.cmd === "innerReady" && e.source !== this.inner) {
+        return;
+      }
       return this.handleMessage(message);
     };
 
@@ -1791,13 +1797,9 @@ if (window.getComputedStyle(document.body).transform) {
       var cmd, query, ref;
       cmd = message.cmd;
       if (cmd === "innerReady") {
+        if (!this.syncInnerDocument()) return;
         this.inner_ready = true;
-        if (this.ws.ws.readyState === 1 && !this.wrapperWsInited) {
-          this.sendInner({
-            "cmd": "wrapperOpenedWebsocket"
-          });
-          return this.wrapperWsInited = true;
-        }
+        return this.announceWebsocket();
       } else if (cmd === "innerLoaded" || cmd === "wrapperInnerLoaded") {
         if (window.location.hash) {
           $("#inner-iframe")[0].src += window.location.hash;
@@ -2338,12 +2340,7 @@ if (window.getComputedStyle(document.body).transform) {
           "channels": ["siteChanged", "serverChanged"]
         });
       }
-      if (!this.wrapperWsInited && this.inner_ready) {
-        this.sendInner({
-          "cmd": "wrapperOpenedWebsocket"
-        });
-        this.wrapperWsInited = true;
-      }
+      this.announceWebsocket();
       if (window.show_loadingscreen) {
         this.ws.cmd("serverInfo", [], (function (_this) {
           return function (server_info) {
@@ -2380,6 +2377,8 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.onCloseWebsocket = function (e) {
       this.wrapperWsInited = false;
+      this.clearIframeReload();
+      this.iframe_recovery_pending = false;
       return setTimeout(((function (_this) {
         return function () {
           // The delay keeps a blip from flashing a banner, but a throttled
@@ -2677,6 +2676,33 @@ if (window.getComputedStyle(document.body).transform) {
       });
     };
 
+    Wrapper.prototype.syncInnerDocument = function () {
+      var doc = null;
+      try {
+        var frame = document.getElementById("inner-iframe");
+        doc = frame && frame.contentDocument;
+      } catch (_) {}
+      // A reload keeps its WindowProxy and may keep its URL, but creates a new client.
+      if (!doc || doc !== this.inner_document) {
+        this.inner_document = doc;
+        this.inner_ready = false;
+        this.wrapperWsInited = false;
+        if (this.iframe_reload_request) {
+          this.clearIframeReload();
+          this.iframe_recovery_pending = false;
+        }
+      }
+      return doc;
+    };
+
+    Wrapper.prototype.announceWebsocket = function () {
+      if (this.syncInnerDocument() && this.inner_ready &&
+          this.ws.ws.readyState === 1 && !this.wrapperWsInited) {
+        this.wrapperWsInited = true;
+        return this.sendInner({ "cmd": "wrapperOpenedWebsocket" });
+      }
+    };
+
     Wrapper.prototype.loadingDocumentReady = function () {
       try {
         var frame = document.getElementById("inner-iframe");
@@ -2692,6 +2718,7 @@ if (window.getComputedStyle(document.body).transform) {
     Wrapper.prototype.onPageLoad = function (e) {
       var ref;
       this.log("onPageLoad");
+      this.syncInnerDocument();
       this.inner_loaded = this.loadingDocumentReady();
       this.iframe_recovery_pending = false;
       if (window.resolving_host) {
@@ -3238,16 +3265,68 @@ if (window.getComputedStyle(document.body).transform) {
       return false;
     };
 
+    Wrapper.prototype.clearIframeReload = function () {
+      var request = this.iframe_reload_request;
+      this.iframe_reload_request = null;
+      // The transport keeps callbacks; release only this request's captured document.
+      if (request && this.ws.waiting_cb[request.id] === request.callback) {
+        delete this.ws.waiting_cb[request.id];
+      }
+    };
+
     Wrapper.prototype.reloadIframe = function () {
-      var src;
-      src = $("iframe").attr("src");
-      return this.ws.cmd("serverGetWrapperNonce", [], (function (_this) {
-        return function (wrapper_nonce) {
-          src = src.replace(/wrapper_nonce=[A-Za-z0-9]+/, "wrapper_nonce=" + wrapper_nonce);
+      this.clearIframeReload();
+      this.iframe_recovery_pending = false;
+      // The reconnect snapshot retries waiting pages. Do not queue a nonce on a lost socket.
+      if (!this.ws.ws || this.ws.ws.readyState !== 1) return;
+      var frame = document.getElementById("inner-iframe");
+      var src = frame && frame.getAttribute("src");
+      var doc = this.syncInnerDocument();
+      if (!frame || !doc || typeof src !== "string") {
+        this.iframe_recovery_pending = false;
+        return;
+      }
+      var request = { document: doc, href: doc.location.href, src: src, id: this.ws.next_message_id };
+      this.ws.next_message_id += 1;
+      this.iframe_reload_request = request;
+      this.iframe_recovery_pending = true;
+      request.callback = (function (_this) {
+        return function (result) {
+          if (_this.iframe_reload_request !== request) return;
+          _this.clearIframeReload();
+          var currentDocument = _this.syncInnerDocument();
+          if (document.getElementById("inner-iframe") !== frame ||
+              frame.getAttribute("src") !== request.src || currentDocument !== request.document ||
+              !currentDocument || currentDocument.location.href !== request.href) {
+            _this.iframe_recovery_pending = false;
+            return;
+          }
+          var nonce = typeof result === "string" ? result : result && result.wrapper_nonce;
+          if ((result && result.error) || typeof nonce !== "string" || !nonce || /[^A-Za-z0-9]/.test(nonce)) {
+            _this.iframe_recovery_pending = false;
+            _this.log("Invalid wrapper nonce response");
+            return;
+          }
+          // Replace only the nonce field; legacy routes can depend on exact query bytes.
+          var hashAt = src.indexOf("#");
+          var hash = hashAt < 0 ? "" : src.slice(hashAt);
+          src = hashAt < 0 ? src : src.slice(0, hashAt);
+          var queryAt = src.indexOf("?");
+          var query = queryAt < 0 ? "" : src.slice(queryAt + 1);
+          src = queryAt < 0 ? src : src.slice(0, queryAt);
+          var replaced = false;
+          query = query.replace(/(^|&)wrapper_nonce(?:=[^&]*)?(?=&|$)/g, function (_, separator) {
+            replaced = true;
+            return separator + "wrapper_nonce=" + nonce;
+          });
+          if (!replaced) query += (query && !/&$/.test(query) ? "&" : "") + "wrapper_nonce=" + nonce;
+          src += "?" + query + hash;
           _this.log("Reloading iframe using url", src);
-          return $("iframe").attr("src", src);
+          window.wrapper_nonce = nonce;
+          return frame.setAttribute("src", src);
         };
-      })(this));
+      })(this);
+      return this.ws.send({ "cmd": "serverGetWrapperNonce", "params": [], "id": request.id }, request.callback);
     };
 
     Wrapper.prototype.log = function () {
