@@ -75,7 +75,19 @@ jobs:
           if ($hash -cne 'ed18f5dd2c2e6935b30d4bc36d3b3fda53581f88d93c923690c591d1b80f1bba') { throw 'release digest mismatch' }
           & 7z x $installer "-o$root/extracted" -y | Out-File evidence/extract.log
           if ($LASTEXITCODE -ne 0) { throw 'installer extraction failed' }
+      - name: Restore bounded native dependencies and intermediates
+        id: native-cache
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/issue-649-candidate-target
+            ${{ runner.temp }}/issue-649-candidate-cargo/registry
+            ${{ runner.temp }}/issue-649-candidate-cargo/git
+          key: issue649-windows2025-rust1.99.1-release-opt1-cgu256-v1-${{ hashFiles('source/Cargo.lock') }}-${{ inputs.candidate_revision }}
+          restore-keys: |
+            issue649-windows2025-rust1.99.1-release-opt1-cgu256-v1-${{ hashFiles('source/Cargo.lock') }}-
       - name: Build actual candidate with bounded resources
+        id: candidate-build
         timeout-minutes: 67
         env:
           CANDIDATE_REVISION: ${{ inputs.candidate_revision }}
@@ -107,6 +119,16 @@ jobs:
           $root = Join-Path $env:RUNNER_TEMP 'issue-649-candidate-package'
           python packaging/windows/issue-649-candidate.py --source source --package "$root/extracted" --installer "$root/Epix-Setup-0.5.23.exe" --candidate evidence/candidate-binaries --expected-revision $env:CANDIDATE_REVISION --output evidence
           if ($LASTEXITCODE -ne 0) { throw 'candidate runtime failed; inspect retained evidence' }
+      - name: Preserve bounded build cache before removing local intermediates
+        if: always() && steps.candidate-build.outcome == 'success' && steps.native-cache.outputs.cache-hit != 'true'
+        timeout-minutes: 8
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ${{ runner.temp }}/issue-649-candidate-target
+            ${{ runner.temp }}/issue-649-candidate-cargo/registry
+            ${{ runner.temp }}/issue-649-candidate-cargo/git
+          key: ${{ steps.native-cache.outputs.cache-primary-key }}
       - name: Remove owned package and intermediate build directories
         if: always()
         timeout-minutes: 4

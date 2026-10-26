@@ -14,7 +14,13 @@ def main():
  label='candidate-windows-acl' if a.acl_test_only else 'candidate-build';deadline_seconds=720 if a.acl_test_only else 3900
  report={'source_revision':actual,'command':command,'environment':{k:v for k,v in env.items()if k.startswith(('CARGO_','EPIX_VERSION'))},'started_epoch':time.time(),'status':'building','target_cap_bytes':20*1024**3,'target_volume_free_floor_bytes':30*1024**3,'system_volume_free_floor_bytes':10*1024**3,'build_timeout_seconds':deadline_seconds}
  def save():(out/(label+'.json')).write_text(json.dumps(report,indent=2)+'\n')
- def size(path):return sum(x.stat().st_size for x in path.rglob('*')if x.is_file())
+ def size(path):
+  total=0
+  for item in path.rglob('*'):
+   try:
+    if item.is_file():total+=item.stat().st_size
+   except FileNotFoundError:pass # Cargo can rename or remove a temporary file between samples.
+  return total
  save();job=owned.WindowsJob();proc=None
  try:
   with (out/(label+'.log')).open('wb') as log:
