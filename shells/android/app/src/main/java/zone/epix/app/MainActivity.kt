@@ -70,7 +70,7 @@ import uniffi.epix_ffi.TorStatus
  * through Tor) and opens the Epix panel - current xite, Tor status, our onion
  * address - when tapped.
  */
-class MainActivity : AppCompatActivity(), WalletHost {
+class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
 
     private lateinit var geckoView: GeckoView
     private val geckoInsets = GeckoViewInsets()
@@ -84,6 +84,10 @@ class MainActivity : AppCompatActivity(), WalletHost {
     private var connectivityRegistration: Pair<android.net.ConnectivityManager,
         android.net.ConnectivityManager.NetworkCallback>? = null
     private var browserAttachment: Long? = null
+    private var addonAttachment: Long? = null
+    private var addonDialog: AlertDialog? = null
+    private var addonDialogContent: LinearLayout? = null
+    private val addonPopups = mutableMapOf<String, AlertDialog>()
     private var bootResult: BootResult? = null
     private var bootJob: Job? = null
     private var pendingTarget = "dashboard.epix"
@@ -100,6 +104,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
     private val pickedDirectories = mutableSetOf<java.io.File>()
 
     override val walletHostActive: Boolean get() = !disposed
+    override val addonHostActive: Boolean get() = !disposed
     private val localUiReady: Boolean get() = !disposed && bootResult?.succeeded == true
 
     /// Held only while LAN peer discovery is on, so the Wi-Fi stack stops
@@ -209,25 +214,43 @@ class MainActivity : AppCompatActivity(), WalletHost {
         setContentView(container)
         watchConnectivity()
 
-        runtime = EmbeddedBrowserHost.runtime(applicationContext)
-        // Keep the existing page console and DevTools diagnostics available.
-        runtime.settings.consoleOutputEnabled = true
-        runtime.settings.remoteDebuggingEnabled = true
-        applyClearnetRouting()
-        browserAttachment = EmbeddedBrowserHost.attach(this)
-        installWallet()
-        newTab(GeckoSession().apply { open(runtime) })
-        onBackPressedDispatcher.addCallback(this, browserBackCallback)
-        // The page, not the address bar, starts focused - otherwise the
-        // keyboard pops over the app on every launch.
-        geckoView.requestFocus()
-
-        // The xite to open: from an epix:// launch intent, else the dashboard.
         restoredUrls = savedInstanceState?.getStringArrayList("browser.urls")
             ?.filter(::restorableUrl)?.takeIf { it.isNotEmpty() }
         restoredSelection = savedInstanceState?.getInt("browser.selected", 0) ?: 0
         walletUserEngaged = savedInstanceState?.getBoolean("wallet.engaged", false) ?: false
-        bootAndOpen(savedInstanceState?.getString("browser.target") ?: intentTarget(intent) ?: "dashboard.epix")
+        pendingTarget = savedInstanceState?.getString("browser.target") ?: intentTarget(intent) ?: "dashboard.epix"
+        // A verified profile is selected before Gecko can activate installed extensions.
+        setBrowserControlsEnabled(false)
+        scope.launch {
+            try {
+                val profile = VerifiedAddonManager.prepareProfile(filesDir)
+                if (disposed) return@launch
+                runtime = EmbeddedBrowserHost.runtime(applicationContext, profile.directory.absolutePath, profile.configFile.absolutePath)
+                runtime.settings.consoleOutputEnabled = true
+                runtime.settings.remoteDebuggingEnabled = BuildConfig.DEBUG
+                applyClearnetRouting()
+                VerifiedAddonManager.initialize(runtime, profile)
+                addonAttachment = VerifiedAddonManager.attach(this@MainActivity)
+                browserAttachment = EmbeddedBrowserHost.attach(this@MainActivity)
+                installWallet()
+                newTab(GeckoSession().apply { open(runtime) })
+                onBackPressedDispatcher.addCallback(this@MainActivity, browserBackCallback)
+                geckoView.requestFocus()
+                setBrowserControlsEnabled(true)
+                bootAndOpen(pendingTarget)
+            } catch (error: Exception) {
+                if (!disposed) {
+                    splashStatus?.text = "Browser could not start"
+                    splashDetail?.text = error.message ?: "The extension profile could not be verified."
+                    splashProgress?.visibility = View.GONE
+                    showOwnedDialog(AlertDialog.Builder(this@MainActivity)
+                        .setTitle("Browser profile could not be verified")
+                        .setMessage(error.message ?: "The extension startup policy is unavailable.")
+                        .setPositiveButton("Try again") { _, _ -> recreate() }
+                        .setNegativeButton("Close") { _, _ -> finish() }.create())
+                }
+            }
+        }
 
         // Reflect the Tor state in the icon's badge, at the extension's cadence.
         scope.launch {
@@ -258,6 +281,11 @@ class MainActivity : AppCompatActivity(), WalletHost {
         startupGeneration++
         browserAttachment?.let { EmbeddedBrowserHost.detach(it) }
         browserAttachment = null
+        addonAttachment?.let { VerifiedAddonManager.detach(it) }
+        addonAttachment = null
+        addonDialogContent = null
+        addonDialog = null
+        addonPopups.clear()
         connectivityRegistration?.let { (manager, callback) ->
             runCatching { manager.unregisterNetworkCallback(callback) }
         }
@@ -314,6 +342,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
         session.contentDelegate = null
         session.promptDelegate = null
         session.permissionDelegate = null
+        VerifiedAddonManager.unbindSession(session)
         wallet?.let { session.webExtensionController.setTabDelegate(it, null) }
         session.close()
     }
@@ -380,6 +409,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
         check(!disposed)
         ownedSessions.add(session)
         val tab = Tab(session)
+        VerifiedAddonManager.bindSession(session)
         session.navigationDelegate = object : GeckoSession.NavigationDelegate {
             override fun onLocationChange(
                 session: GeckoSession,
@@ -572,6 +602,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
         refreshBackNavigation()
         forwardButton.alpha = if (tab.canGoForward) 1f else DISABLED_ALPHA
         tabCountView.text = tabs.size.toString()
+        VerifiedAddonManager.selectSession(tab.session)
     }
 
     /** Close tab `index`. The browser always keeps at least one tab. */
@@ -1016,6 +1047,8 @@ class MainActivity : AppCompatActivity(), WalletHost {
         pendingTarget = target
         currentDisplay = target
         restoredUrls = null
+        // Profile verification can still be running before the first session exists.
+        if (tabs.isEmpty()) return
         if (splashOverlay == null && localUiReady) currentTab.session.loadUri(nodeUrl(target))
         else bootAndOpen(target)
     }
@@ -1614,6 +1647,7 @@ class MainActivity : AppCompatActivity(), WalletHost {
                 loadStartupPage(currentTab.session, errorPage(result.error))
                 return@launch
             }
+            VerifiedAddonManager.refresh()
             acquireMulticastLockIfDiscovering()
             wakeNodeForForeground()
             updateSplash(SplashStage.CONNECTING)
@@ -1783,6 +1817,11 @@ class MainActivity : AppCompatActivity(), WalletHost {
                 }
             }
             layout.addView(controlsPosition, LinearLayout.LayoutParams(-1, -2))
+            layout.addView(android.widget.Button(this@MainActivity).apply {
+                text = "Extensions"
+                isAllCaps = false
+                setOnClickListener { showAddonManager() }
+            }, LinearLayout.LayoutParams(-1, -2))
 
             val panel = AlertDialog.Builder(this@MainActivity)
                 .setTitle("Epix")
@@ -1791,6 +1830,177 @@ class MainActivity : AppCompatActivity(), WalletHost {
                 .create()
             showOwnedDialog(panel)
         }
+    }
+
+    private fun setBrowserControlsEnabled(enabled: Boolean) {
+        fun apply(view: View) {
+            view.isEnabled = enabled
+            if (view is android.view.ViewGroup) for (index in 0 until view.childCount) apply(view.getChildAt(index))
+        }
+        apply(topBar); apply(bottomBar)
+    }
+
+    private fun showAddonManager() {
+        if (disposed || !::runtime.isInitialized) return
+        addonDialog?.let { it.show(); return }
+        val layout = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(8), dp(20), 0)
+        }
+        val source = EditText(this).apply {
+            hint = "Xite URL ending in .xpi"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT or android.text.InputType.TYPE_TEXT_VARIATION_URI
+            setSingleLine(true)
+            if (tabs.isNotEmpty() && currentTab.url.substringBefore('?').endsWith(".xpi")) setText(currentTab.url)
+        }
+        layout.addView(label("Install a package published on a signed xite. Xite publisher and Mozilla signatures are both checked."))
+        layout.addView(source)
+        layout.addView(android.widget.Button(this).apply {
+            text = "Verify and install"
+            isAllCaps = false
+            setOnClickListener { VerifiedAddonManager.install(source.text.toString().trim()) }
+        })
+        val dynamic = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        addonDialogContent = dynamic
+        layout.addView(dynamic)
+        val scroll = android.widget.ScrollView(this).apply { addView(layout) }
+        val dialog = AlertDialog.Builder(this).setTitle("Extensions").setView(scroll)
+            .setNegativeButton("Close", null).setNeutralButton("Refresh") { _, _ -> VerifiedAddonManager.refresh() }.create()
+        addonDialog = dialog
+        showOwnedDialog(dialog) {
+            addonDialog = null; addonDialogContent = null
+            VerifiedAddonManager.cancel()
+        }
+        onAddonsChanged()
+        VerifiedAddonManager.refresh()
+    }
+
+    override fun onAddonsChanged() {
+        if (disposed) return
+        addonPopups.toMap().forEach { (id, dialog) ->
+            if (VerifiedAddonManager.extensions.none { it.id == id && it.metaData.enabled }) dialog.dismiss()
+        }
+        val content = addonDialogContent ?: return
+        content.removeAllViews()
+        content.addView(label(VerifiedAddonManager.message.take(600)))
+        if (VerifiedAddonManager.busy) content.addView(android.widget.Button(this).apply {
+            text = "Cancel pending install"; isAllCaps = false
+            setOnClickListener { VerifiedAddonManager.cancel() }
+        })
+        for (extension in VerifiedAddonManager.extensions) {
+            val ownership = VerifiedAddonManager.ownership.firstOrNull { it.addonId == extension.id }
+            content.addView(label("\n${extension.metaData.name ?: extension.id} ${extension.metaData.version}\n${extension.id}\n" +
+                if (ownership == null) "Not installed through a verified xite" else "Publisher: ${ownership.publisher}"))
+            fun button(title: String, enabled: Boolean = true, action: () -> Unit) {
+                content.addView(android.widget.Button(this).apply {
+                    text = title; isAllCaps = false; isEnabled = enabled && !VerifiedAddonManager.busy
+                    setOnClickListener { action() }
+                })
+            }
+            button("Permissions") {
+                val metadata = extension.metaData
+                val required = (metadata.requiredPermissions + metadata.requiredOrigins + metadata.requiredDataCollectionPermissions).joinToString("\n").ifEmpty { "None" }
+                val granted = (metadata.grantedOptionalPermissions + metadata.grantedOptionalOrigins + metadata.grantedOptionalDataCollectionPermissions).joinToString("\n").ifEmpty { "None" }
+                val text = TextView(this).apply {
+                    this.text = "Required:\n$required\n\nGranted optional permissions:\n$granted\n\nLoopback host access can cover multiple xites."
+                    setPadding(dp(20), dp(10), dp(20), dp(10))
+                }
+                showOwnedDialog(AlertDialog.Builder(this).setTitle("Extension permissions")
+                    .setView(android.widget.ScrollView(this).apply { addView(text) })
+                    .setPositiveButton("Close", null).create())
+            }
+            if (ownership != null) {
+                button("Open extension", extension.metaData.enabled) {
+                    addonDialog?.dismiss()
+                    if (tabs.isNotEmpty()) VerifiedAddonManager.clickAction(extension, currentTab.session)
+                }
+                button(if (extension.metaData.enabled) "Disable" else "Enable") { VerifiedAddonManager.setEnabled(extension, !extension.metaData.enabled) }
+                button("Update from xite") {
+                    val url = EditText(this).apply { setText(ownership.sourceUrl); setSingleLine(true) }
+                    showOwnedDialog(AlertDialog.Builder(this).setTitle("Verify an extension update").setView(url)
+                        .setMessage("The update must keep the same publisher and extension ID.")
+                        .setPositiveButton("Verify") { _, _ -> VerifiedAddonManager.install(url.text.toString().trim(), extension.id) }
+                        .setNegativeButton("Cancel", null).create())
+                }
+            }
+            button("Remove") {
+                showOwnedDialog(AlertDialog.Builder(this).setTitle("Remove extension?")
+                    .setMessage(extension.metaData.name ?: extension.id)
+                    .setPositiveButton("Remove") { _, _ -> VerifiedAddonManager.uninstall(extension) }
+                    .setNegativeButton("Cancel", null).create())
+            }
+        }
+    }
+
+    override fun askAddonPermission(title: String, message: String, answer: (Boolean) -> Unit) {
+        if (disposed) { answer(false); return }
+        var answered = false
+        fun settle(allowed: Boolean) { if (!answered) { answered = true; answer(allowed) } }
+        val text = TextView(this).apply { this.text = message; setPadding(dp(20), dp(10), dp(20), dp(10)); setTextIsSelectable(true) }
+        val scroll = android.widget.ScrollView(this).apply { addView(text) }
+        val dialog = AlertDialog.Builder(this).setTitle(title.take(160)).setView(scroll)
+            .setPositiveButton("Allow") { _, _ -> settle(true) }
+            .setNegativeButton("Cancel") { _, _ -> settle(false) }.create()
+        showOwnedDialog(dialog) { settle(false) }
+    }
+
+    override fun onAddonNewTab(source: WebExtension, details: WebExtension.CreateTabDetails): GeckoResult<GeckoSession>? {
+        if (disposed || !AddonPolicy.permitsNavigation(source.metaData.baseUrl, details.url)) return null
+        val session = GeckoSession()
+        val created = newTab(session, select = false)
+        geckoView.post { if (ownsSession(session) && details.active != false) showTab(tabs.indexOf(created)) }
+        return admitSession(session)
+    }
+
+    override fun onAddonOptions(source: WebExtension) {
+        val target = source.metaData.optionsPageUrl ?: return
+        if (disposed || !AddonPolicy.permitsNavigation(source.metaData.baseUrl, target)) return
+        newTab(GeckoSession().apply { open(runtime); loadUri(target) })
+    }
+
+    override fun onAddonCloseTab(session: GeckoSession): Boolean {
+        val index = tabs.indexOfFirst { it.session === session }
+        if (disposed || index < 0) return false
+        if (tabs.size == 1) newTab(GeckoSession().apply { open(runtime); loadUri(nodeUrl("dashboard.epix")) })
+        closeTab(index)
+        return true
+    }
+
+    override fun onAddonSelectTab(session: GeckoSession): Boolean {
+        val index = tabs.indexOfFirst { it.session === session }
+        if (disposed || index < 0) return false
+        showTab(index)
+        return true
+    }
+
+    override fun onAddonPopup(source: WebExtension, action: WebExtension.Action): GeckoResult<GeckoSession>? {
+        if (disposed) return null
+        addonPopups[source.id]?.let { it.dismiss(); return null }
+        val session = GeckoSession()
+        ownedSessions.add(session)
+        session.promptDelegate = buildPromptDelegate()
+        session.navigationDelegate = object : GeckoSession.NavigationDelegate {
+            override fun onLoadRequest(session: GeckoSession, request: GeckoSession.NavigationDelegate.LoadRequest): GeckoResult<org.mozilla.geckoview.AllowOrDeny>? =
+                if (ownsSession(session) && AddonPolicy.permitsNavigation(source.metaData.baseUrl, request.uri)) null else GeckoResult.deny()
+        }
+        val view = WindowGeckoView(this, geckoInsets).apply {
+            setSession(session)
+            layoutParams = LinearLayout.LayoutParams(-1, (resources.displayMetrics.heightPixels * 0.6).toInt())
+        }
+        popupViews[session] = view
+        val dialog = AlertDialog.Builder(this).setTitle(source.metaData.name ?: source.id)
+            .setView(view).setNegativeButton("Close", null).create()
+        session.contentDelegate = object : GeckoSession.ContentDelegate {
+            override fun onCloseRequest(session: GeckoSession) { dialog.dismiss() }
+        }
+        // Ordinary extension UI receives no wallet permission or native message delegate.
+        session.open(runtime)
+        addonPopups[source.id] = dialog
+        showOwnedDialog(dialog, session) {
+            addonPopups.remove(source.id)
+            disposeSession(session)
+        }
+        return admitSession(session)
     }
 
     /**

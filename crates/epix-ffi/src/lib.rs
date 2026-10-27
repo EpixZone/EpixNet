@@ -10,6 +10,8 @@
 //! this crate's exported types (proc-macro mode - no UDL).
 
 use epix_browser_net::{ca::LocalCa, proxy};
+mod addons;
+pub use addons::*;
 use epix_node::{boot_with_progress, AppState, NodeOptions, RunningNode};
 extern "C" { #[link_name = "dup2"] fn libc_dup2(oldfd: i32, newfd: i32) -> i32; }
 use std::sync::{

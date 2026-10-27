@@ -157,6 +157,12 @@ internal object EmbeddedBrowserHost {
     val detached = mutableListOf<Long>()
     fun detach(token: Long) { detached.add(token) }
 }
+internal object VerifiedAddonManager {
+    val detached = mutableListOf<Long>()
+    val unbound = mutableListOf<GeckoSession>()
+    fun detach(token: Long) { detached.add(token) }
+    fun unbindSession(session: GeckoSession) { unbound.add(session) }
+}
 internal object FileDisposal {
     val paths = mutableListOf<File>()
 }
@@ -172,6 +178,10 @@ internal class Shell(private val manager: ConnectivityManager?) : Activity() {
     private var disposed = false
     private var connectivityRegistration: Pair<ConnectivityManager, ConnectivityManager.NetworkCallback>? = null
     private var browserAttachment: Long? = null
+    private var addonAttachment: Long? = null
+    private var addonDialogContent: Any? = null
+    private var addonDialog: AlertDialog? = null
+    private val addonPopups = mutableMapOf<String, AlertDialog>()
     private val ownedSessions = mutableSetOf<GeckoSession>()
     private val popupViews = mutableMapOf<GeckoSession, GeckoView>()
     private val dialogs = mutableMapOf<AlertDialog, GeckoSession?>()
@@ -239,6 +249,8 @@ internal class Shell(private val manager: ConnectivityManager?) : Activity() {
     }
     fun populate(id: Long) {
         browserAttachment = id
+        addonAttachment = id
+        addonDialogContent = Any()
         wallet = Any()
         val main = GeckoSession()
         val popup = GeckoSession()
@@ -291,7 +303,8 @@ internal class Shell(private val manager: ConnectivityManager?) : Activity() {
     fun lateReply() { operations.forEach { it.complete { lateReplyCompletions++ } } }
     fun lateRegistration(): PendingOperations.Operation = pendingOperations.register { replyCancellations++ }
     fun assertClean(verify: (Boolean, String) -> Unit) {
-        verify(disposed && connectivityRegistration == null && browserAttachment == null, "destroy drops registrations and attachment")
+        verify(disposed && connectivityRegistration == null && browserAttachment == null && addonAttachment == null, "destroy drops registrations and attachment")
+        verify(addonDialogContent == null && addonDialog == null && addonPopups.isEmpty(), "extension UI references are cleared")
         verify(activityJob.isCompleted && activityJob.children.none(), "real Activity job is completed without children")
         verify(ownedSessions.isEmpty() && popupViews.isEmpty() && tabs.isEmpty(), "all Activity session collections are empty")
         verify(sessions.none { it.isOpen } && sessions.all { it.closes == 1 }, "all open sessions close exactly once")
@@ -385,6 +398,9 @@ fun main() {
         verify(shells.sumOf { it.liveJobs } == 0 && shells.flatMap { it.sessions }.none { it.isOpen },
             "three destroyed activities leave zero jobs or open sessions")
         verify(EmbeddedBrowserHost.detached == listOf(1L, 2L, 3L), "each destroyed Activity detaches its own browser token")
+        verify(VerifiedAddonManager.detached == listOf(1L, 2L, 3L), "each destroyed Activity detaches its own extension token")
+        verify(VerifiedAddonManager.unbound.toSet() == shells.flatMap { it.sessions }.toSet() && VerifiedAddonManager.unbound.size == 6,
+            "each owned session drops extension delegates exactly once")
         verify(FileDisposal.paths.map { it.name } == listOf("fixture-picked-1", "fixture-picked-2", "fixture-picked-3"),
             "each Activity schedules disposal of its own picked files")
         val late = shells.last().lateRegistration()

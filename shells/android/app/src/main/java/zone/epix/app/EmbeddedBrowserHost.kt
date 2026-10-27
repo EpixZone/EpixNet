@@ -52,13 +52,17 @@ internal object EmbeddedBrowserHost {
     private var walletIdentity: Pair<String, String>? = null
     private val mainHandler = Handler(Looper.getMainLooper())
 
-    fun runtime(context: Context): GeckoRuntime {
+    fun runtime(context: Context, profilePath: String? = null, configurationPath: String? = null): GeckoRuntime {
         requireMainThread()
         return browserRuntime ?: GeckoRuntime.create(
             context.applicationContext,
             GeckoRuntimeSettings.Builder()
                 // Gecko's media permission observer runs in child processes.
                 .extensionsProcessEnabled(true)
+                .apply {
+                    profilePath?.let { arguments(arrayOf("-profile", it)) }
+                    configurationPath?.let { configFilePath(it) }
+                }
                 .build(),
         ).also { browserRuntime = it }
     }

@@ -17,7 +17,7 @@ parser.add_argument('--android-root', type=pathlib.Path, default=here.parents[1]
 root = parser.parse_args().android_root
 source = root / 'app/src/main/java/zone/epix/app/WindowGeckoView.kt'
 activity = (source.parent / 'MainActivity.kt').read_text()
-assert activity.count('WindowGeckoView(this, geckoInsets)') == 2, 'Route both main and wallet views'
+assert activity.count('WindowGeckoView(this, geckoInsets)') == 3, 'Route main, wallet and ordinary extension popup views'
 assert ' = GeckoView(this)' not in activity, 'Stock views would overwrite the shared root listener'
 
 files = {

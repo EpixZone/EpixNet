@@ -63,6 +63,10 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
 
+object VerifiedAddonManager {
+    var refreshes = 0
+    fun refresh() { refreshes++ }
+}
 object Scheduler {
     var lane = "MAIN"
         private set
@@ -478,6 +482,15 @@ fun main() {
         restored.onSaveInstanceState(saved)
         verify(saved.urls() == restoredUrls && saved.selected() == 1 && restored.currentTabIndex == 1,
             "eventual boot after repeated recreation restores both encoded links and selected tab")
+    }
+    scenario { waitingForProfile ->
+        waitingForProfile.tabs.clear()
+        waitingForProfile.restoredUrls = listOf("https://old.example.test/")
+        waitingForProfile.onNewIntent(encodedIntent); Scheduler.drain()
+        verify(EmbeddedNodeHost.requests.isEmpty() && waitingForProfile.bootJob == null,
+            "an intent during profile verification cannot boot before the first session exists")
+        verify(waitingForProfile.pendingTarget == encodedTarget && waitingForProfile.restoredUrls == null,
+            "an intent during profile verification retains its target and supersedes restored tabs")
     }
     scenario { early ->
         early.bootAndOpen("old.epix"); Scheduler.drain()

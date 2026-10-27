@@ -372,22 +372,7 @@ fn prepare_with_hook(
     }
     if effective == plan.target {
         // A crash after config commit must not undo a completed move.
-        if plan.operation == Operation::CopyNew {
-            let snapshot = plan
-                .snapshot
-                .as_ref()
-                .ok_or_else(|| invalid("Missing committed move record"))?;
-            if snapshot.parts.len() != PARTS.len() {
-                return Err(invalid("Incomplete committed move record"));
-            }
-            for (name, identity) in &snapshot.parts {
-                if target.directory.child(name.as_ref(), false)?.identity()? != *identity {
-                    return Err(invalid(
-                        "Committed data directory does not match its move record",
-                    ));
-                }
-            }
-        }
+        validate_committed_move(&target.directory, &plan)?;
         control.assert_bound()?;
         target.directory.assert_bound()?;
         finish(&control, &target.directory, &plan)?;
@@ -406,48 +391,13 @@ fn prepare_with_hook(
             ));
         }
     } else {
-        require_empty_parts(&target.directory)?;
-        let name = random_name(".epixnet-relocation-")?;
-        let stage = target.directory.create_child(name.as_ref())?;
-        plan.snapshot = Some(Snapshot {
-            name,
-            identity: stage.identity()?,
-            parts: Vec::new(),
-        });
-        save_plan(&control, &plan)?;
-        checkpoint("stage-created")?;
-        for part in PARTS {
-            let output = stage.create_child(part.as_ref())?;
-            if let Some(input) = source.directory.optional_child(part.as_ref())? {
-                copy_tree(&input, &output)?;
-            }
-            output.sync()?;
-            checkpoint(part)?;
-        }
-        if !has_identity(&stage)? {
-            return Err(invalid("The source identity disappeared during the move"));
-        }
-        let parts = PARTS
-            .iter()
-            .map(|name| {
-                Ok((
-                    name.to_string(),
-                    stage.child(name.as_ref(), false)?.identity()?,
-                ))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        plan.snapshot.as_mut().unwrap().parts = parts;
-        stage.sync()?;
-        save_plan(&control, &plan)?;
-        checkpoint("snapshot-ready")?;
-        for part in PARTS {
-            stage.move_new(part.as_ref(), &target.directory, part.as_ref())?;
-            checkpoint(if part == "private" {
-                "promoted-private"
-            } else {
-                "promoted-data"
-            })?;
-        }
+        copy_new_parts(
+            &control,
+            &source.directory,
+            &target.directory,
+            &mut plan,
+            &mut checkpoint,
+        )?;
     }
     checkpoint("before-config")?;
     source.directory.assert_bound()?;
@@ -474,6 +424,78 @@ fn prepare_with_hook(
     finish(&control, &target.directory, &plan)?;
     target.directory.assert_bound()?;
     Ok(target)
+}
+
+fn validate_committed_move(target: &Directory, plan: &Plan) -> io::Result<()> {
+    if plan.operation == Operation::CopyNew {
+        let snapshot = plan
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| invalid("Missing committed move record"))?;
+        if snapshot.parts.len() != PARTS.len() {
+            return Err(invalid("Incomplete committed move record"));
+        }
+        for (name, identity) in &snapshot.parts {
+            if target.child(name.as_ref(), false)?.identity()? != *identity {
+                return Err(invalid(
+                    "Committed data directory does not match its move record",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_new_parts(
+    control: &Directory,
+    source: &Directory,
+    target: &Directory,
+    plan: &mut Plan,
+    checkpoint: &mut impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<()> {
+    require_empty_parts(target)?;
+    let name = random_name(".epixnet-relocation-")?;
+    let stage = target.create_child(name.as_ref())?;
+    plan.snapshot = Some(Snapshot {
+        name,
+        identity: stage.identity()?,
+        parts: Vec::new(),
+    });
+    save_plan(control, plan)?;
+    checkpoint("stage-created")?;
+    for part in PARTS {
+        let output = stage.create_child(part.as_ref())?;
+        if let Some(input) = source.optional_child(part.as_ref())? {
+            copy_tree(&input, &output)?;
+        }
+        output.sync()?;
+        checkpoint(part)?;
+    }
+    if !has_identity(&stage)? {
+        return Err(invalid("The source identity disappeared during the move"));
+    }
+    let parts = PARTS
+        .iter()
+        .map(|name| {
+            Ok((
+                name.to_string(),
+                stage.child(name.as_ref(), false)?.identity()?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    plan.snapshot.as_mut().unwrap().parts = parts;
+    stage.sync()?;
+    save_plan(control, plan)?;
+    checkpoint("snapshot-ready")?;
+    for part in PARTS {
+        stage.move_new(part.as_ref(), target, part.as_ref())?;
+        checkpoint(if part == "private" {
+            "promoted-private"
+        } else {
+            "promoted-data"
+        })?;
+    }
+    Ok(())
 }
 
 fn finish(control: &Directory, target: &Directory, plan: &Plan) -> io::Result<()> {
@@ -609,6 +631,227 @@ struct Directory {
     file: File,
     #[cfg(windows)]
     _parents: Vec<File>,
+}
+
+/// Scoped private storage for native credentials and addon receipts. The parent
+/// is selected by native code, never a page request. Every leaf stays relative
+/// to a pinned directory, and existing directories must already be private.
+#[derive(Debug)]
+pub(crate) struct ProtectedDirectory(Directory);
+
+/// Pinned read-only view used only for a node-selected xite root. It keeps the
+/// strict regular-file reader semantics while bounding each relative read.
+#[derive(Debug)]
+pub(crate) struct NativeReadDirectory(Directory);
+
+impl NativeReadDirectory {
+    pub(crate) fn open(path: &Path) -> io::Result<Self> {
+        Ok(Self(Directory::open(path, false)?))
+    }
+    pub(crate) fn assert_bound(&self) -> io::Result<()> {
+        self.0.assert_bound()
+    }
+    pub(crate) fn read(&self, path: &str, limit: u64) -> io::Result<Vec<u8>> {
+        self.0.assert_bound()?;
+        let mut names = path.split('/').peekable();
+        let mut child = None;
+        while let Some(name) = names.next() {
+            if !single_name(name.as_ref()) {
+                return Err(invalid("Invalid native read path"));
+            }
+            let parent = child.as_ref().unwrap_or(&self.0);
+            if names.peek().is_none() {
+                let bytes = read_bounded(parent.read_file(name.as_ref())?, limit)?;
+                parent.assert_bound()?;
+                self.0.assert_bound()?;
+                return Ok(bytes);
+            }
+            child = Some(parent.child(name.as_ref(), false)?);
+        }
+        Err(invalid("Empty native read path"))
+    }
+}
+
+impl ProtectedDirectory {
+    pub(crate) fn open_child(parent: &Path, name: &str) -> io::Result<Self> {
+        let parent = Directory::open(&trusted_root(parent)?, false)?;
+        Self::child_of(&parent, name)
+    }
+
+    fn child_of(parent: &Directory, name: &str) -> io::Result<Self> {
+        parent.assert_bound()?;
+        let child = match parent.create_child(name.as_ref()) {
+            Ok(child) => child,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                parent.child(name.as_ref(), false)?
+            }
+            Err(error) => return Err(error),
+        };
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let meta = child.file.metadata()?;
+            // SAFETY: geteuid takes no arguments and cannot fail.
+            if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "Native storage must be owner-only",
+                ));
+            }
+        }
+        #[cfg(windows)]
+        windows_permissions::verify_private_directory(&child.file)?;
+        parent.assert_bound()?;
+        child.assert_bound()?;
+        Ok(Self(child))
+    }
+
+    pub(crate) fn child(&self, name: &str) -> io::Result<Self> {
+        Self::child_of(&self.0, name)
+    }
+
+    pub(crate) fn read(&self, name: &str, limit: u64) -> io::Result<Option<Vec<u8>>> {
+        self.0.assert_bound()?;
+        let bytes = self
+            .0
+            .read_optional(name.as_ref())?
+            .map(|file| read_bounded(file, limit))
+            .transpose()?;
+        self.0.assert_bound()?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn write(&self, name: &str, bytes: &[u8]) -> io::Result<()> {
+        self.0.assert_bound()?;
+        drop(self.0.read_optional(name.as_ref())?);
+        let temporary = random_name(".epix-write-")?;
+        let result = (|| {
+            let mut file = self.0.create_file(temporary.as_ref())?;
+            file.write_all(bytes)?;
+            file.sync_all()?;
+            drop(file);
+            self.0.assert_bound()?;
+            self.0.replace(temporary.as_ref(), name.as_ref())
+        })();
+        if result.is_err() {
+            let _ = self.0.remove_optional_file(temporary.as_ref());
+        }
+        result
+    }
+
+    pub(crate) fn create_new(&self, name: &str, bytes: &[u8]) -> io::Result<PathBuf> {
+        self.0.assert_bound()?;
+        let mut file = self.0.create_file(name.as_ref())?;
+        let result = file.write_all(bytes).and_then(|()| file.sync_all());
+        drop(file);
+        if let Err(error) = result {
+            let _ = self.0.remove_optional_file(name.as_ref());
+            return Err(error);
+        }
+        self.0.sync()?;
+        self.0.assert_bound()?;
+        Ok(self.0.path.join(name))
+    }
+
+    pub(crate) fn path(&self, name: &str) -> io::Result<PathBuf> {
+        if !single_name(name.as_ref()) {
+            return Err(invalid("Invalid native storage name"));
+        }
+        self.0.assert_bound()?;
+        Ok(self.0.path.join(name))
+    }
+
+    pub(crate) fn remove(&self, name: &str) -> io::Result<()> {
+        self.0.assert_bound()?;
+        self.0.remove_optional_file(name.as_ref())
+    }
+
+    pub(crate) fn discard_addon_spools_except(&self, keep: Option<&str>) -> io::Result<()> {
+        self.0.assert_bound()?;
+        let names = self.0.names()?;
+        if names.len() > 64 {
+            return Err(invalid("Unexpected native spool count"));
+        }
+        for name in names {
+            let Some(name) = name.to_str() else { continue };
+            let spool = name
+                .strip_suffix(".xpi")
+                .is_some_and(|id| lower_hex(id, 64));
+            let temporary = name
+                .strip_prefix(".epix-write-")
+                .is_some_and(|id| lower_hex(id, 32));
+            if (spool && Some(name) != keep) || temporary {
+                self.0.remove_optional_file(name.as_ref())?;
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn addon_profile(&self, id: &str) -> io::Result<Self> {
+        if !lower_hex(id, 64) {
+            return Err(invalid("Invalid addon profile ID"));
+        }
+        let names = self.0.names()?;
+        let profiles = names
+            .iter()
+            .filter_map(|n| n.to_str())
+            .filter(|n| lower_hex(n, 64))
+            .count();
+        if names.len() > 64 || (profiles >= 16 && !names.iter().any(|n| n == id)) {
+            return Err(invalid("Persistent addon profile limit"));
+        }
+        self.child(id)
+    }
+
+    /// Count owned stage and interrupted receipt files, including profiles
+    /// not opened in this process. Never delete another profile's receipt.
+    pub(crate) fn addon_spool_bytes(&self) -> io::Result<u64> {
+        self.0.assert_bound()?;
+        let names = self.0.names()?;
+        if names.len() > 64 {
+            return Err(invalid("Unexpected addon profile count"));
+        }
+        let mut total = 0u64;
+        let mut profiles = 0;
+        for name in names {
+            let Some(id) = name.to_str().filter(|n| lower_hex(n, 64)) else {
+                continue;
+            };
+            profiles += 1;
+            if profiles > 16 {
+                return Err(invalid("Persistent addon profile limit"));
+            }
+            let directory = Self::child_of(&self.0, id)?;
+            let files = directory.0.names()?;
+            if files.len() > 64 {
+                return Err(invalid("Unexpected native spool count"));
+            }
+            for file in files {
+                let Some(name) = file.to_str() else { continue };
+                let spool = name
+                    .strip_suffix(".xpi")
+                    .is_some_and(|id| lower_hex(id, 64));
+                let temporary = name
+                    .strip_prefix(".epix-write-")
+                    .is_some_and(|id| lower_hex(id, 32));
+                if spool || temporary {
+                    total = total
+                        .checked_add(directory.0.read_file(file.as_ref())?.metadata()?.len())
+                        .ok_or_else(|| invalid("Native addon storage size overflow"))?;
+                }
+            }
+            directory.0.assert_bound()?;
+        }
+        self.0.assert_bound()?;
+        Ok(total)
+    }
+}
+
+fn lower_hex(value: &str, length: usize) -> bool {
+    value.len() == length
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 impl Directory {

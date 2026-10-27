@@ -5268,6 +5268,89 @@ async fn send_update_request(
 
 #[async_trait::async_trait]
 impl EdxFetcher for RuntimeEdxFetcher {
+    async fn fetch_addon_object(
+        &self,
+        address: &str,
+        object: EdxObjectRef,
+    ) -> Result<Vec<u8>, String> {
+        if object.size == 0 || object.size > epix_ui::addons::MAX_ARCHIVE_BYTES {
+            return Err("Addon object size is outside the allowed range".into());
+        }
+        epix_core::Address::parse(address.to_owned()).map_err(|e| e.to_string())?;
+        let store = self.state.edx_store().await.ok_or("No EDX store")?;
+        // Run quota cleanup even when the caller drops this future. The hold
+        // is declared afterward so it drops before the cleanup guard.
+        struct Cleanup(Arc<Store>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = self.0.enforce_quota(store_quota());
+            }
+        }
+        let _cleanup = Cleanup(store.clone());
+        let _hold = store.hold_eviction(object.id);
+        let read_complete = || -> Result<Option<Vec<u8>>, String> {
+            let Some((size, complete)) = store.info(object.id).map_err(|e| e.to_string())? else {
+                return Ok(None);
+            };
+            if size != object.size {
+                return Err("Cached addon object size differs from signed declaration".into());
+            }
+            if !complete {
+                return Ok(None);
+            }
+            // Never allocate from mutable Store metadata. Cap the requested
+            // range and recheck the whole-object root before returning bytes.
+            let bytes = store
+                .read_range(object.id, 0, object.size, now_secs())
+                .map_err(|e| e.to_string())?;
+            if bytes.len() as u64 != object.size || ObjId::of(&bytes) != object.id {
+                return Err("Cached addon object differs from signed hash".into());
+            }
+            Ok(Some(bytes))
+        };
+        if let Some(bytes) = read_complete()? {
+            return Ok(bytes);
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(60), async {
+            let _claim = self
+                .claim_object(&store, object.id, Ns::Plain, object.size, now_secs())
+                .map_err(|e| e.to_string())?;
+            // This deliberately avoids build_peers' detached dial driver and
+            // file paths, bundle expansion, warmup and background materialize.
+            // Swarm owns its request futures, so cancelling this future drops
+            // the requests. Shared authenticated links may remain pooled.
+            for peer in self.state.fetch_session_peers(address, 8).await {
+                let Ok((conn, identity, reg, _activity)) = self.link(&peer).await else {
+                    continue;
+                };
+                reg.note_cmd_sent("GetBitfield", Some(address));
+                let Ok(Ok((size, bits))) = tokio::time::timeout(
+                    EDX_FETCH_TIMEOUT,
+                    epix_edx::fetch::fetch_bitfield(&conn, object.id),
+                ).await else { continue };
+                let groups = object.size.div_ceil(epix_blob::bitfield::GROUP_BYTES);
+                if size != object.size || bits.ranges().iter().any(|r| r.end > groups) {
+                    continue;
+                }
+                let label = peer.to_string();
+                let handle = PeerHandle {
+                    conn, class: Class::of_addr(&peer), bits, label: label.clone(),
+                };
+                let needed = needed_groups(&store, object.id, object.size)
+                    .map_err(|e| e.to_string())?;
+                let mut swarm = Swarm::new(store.clone(), object.id, object.size)
+                    .with_observer(self.xfer.scope(object.id, address));
+                if let Ok(report) = swarm.fetch(&needed, &[handle], Deadline::tight(), now_secs()).await {
+                    self.credit(address, &report, &HashMap::from([(label, identity.node_pk)]), now_secs()).await;
+                }
+                if let Some(bytes) = read_complete()? {
+                    return Ok(bytes);
+                }
+            }
+            Err("Signed addon object is unavailable from the known peers".into())
+        }).await.map_err(|_| "Addon object download timed out".to_owned())?
+    }
+
     async fn fetch_file(&self, address: &str, inner_path: &str) -> Result<bool, String> {
         // Tight, not background: this is the on-demand path, so something is
         // waiting on these bytes RIGHT NOW - the page the user has open asked
@@ -6041,6 +6124,64 @@ mod tests {
     };
     use epix_ui::state::XiteEntry;
     use epix_xite::{Xite, XiteStorage};
+
+    #[tokio::test]
+    async fn addon_object_download_rejects_limits_and_cached_size_mismatch() {
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir("addon-object", root.path());
+        let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let fetcher = RuntimeEdxFetcher::new(state.clone(), epix_crypt::new_seed(), None);
+        let bytes = b"bounded immutable package".to_vec();
+        let object = EdxObjectRef { id: ObjId::of(&bytes), size: bytes.len() as u64 };
+        // These reject before Store or transport lookup, never reserving disk.
+        for size in [0, epix_ui::addons::MAX_ARCHIVE_BYTES + 1, u64::MAX] {
+            assert!(fetcher.fetch_addon_object(&address, EdxObjectRef { size, ..object }).await.unwrap_err().contains("allowed range"));
+        }
+        let store = Arc::new(Store::open(root.path().join("objects")).unwrap());
+        store.insert_bytes(object.id, Ns::Plain, &bytes, now_secs()).unwrap();
+        state.set_edx_store(store.clone()).await.unwrap();
+        assert_eq!(fetcher.fetch_addon_object(&address, object).await.unwrap(), bytes);
+        assert!(fetcher.fetch_addon_object(&address, EdxObjectRef { size: object.size + 1, ..object }).await.unwrap_err().contains("size differs"));
+        assert_eq!(store.info(object.id).unwrap(), Some((object.size, true)));
+    }
+
+    #[tokio::test]
+    async fn addon_object_download_uses_exact_loopback_object_without_materializing_path() {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = (0..190_000).map(|n| (n % 251) as u8).collect();
+        let object = EdxObjectRef { id: ObjId::of(&bytes), size: bytes.len() as u64 };
+        let source_store = Arc::new(Store::open(source.path().join("objects")).unwrap());
+        source_store.insert_bytes(object.id, Ns::Plain, &bytes, now_secs()).unwrap();
+        let serving = AppState::with_data_dir("addon-source", source.path());
+        serving.set_edx_store(source_store.clone()).await.unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let peer = PeerAddr::Ip(listener.local_addr().unwrap());
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            serving, source_store, epix_crypt::new_seed(), None,
+            ControlHandles::detached(), false, None,
+        ));
+        let server_task = tokio::spawn(async move { server.serve(listener).await });
+        let state = AppState::with_data_dir("addon-destination", destination.path());
+        let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let xite_path = destination.path().join("data").join(&address);
+        state.add_xite(&address, XiteEntry { storage: XiteStorage::new(&xite_path), content: None }).await;
+        let store = Arc::new(Store::open(destination.path().join("objects")).unwrap());
+        state.set_edx_store(store.clone()).await.unwrap();
+        state.set_transport(Arc::new(TcpTransport)).await;
+        state.add_peers(&address, [peer]).await;
+        let fetcher = RuntimeEdxFetcher::new(state, epix_crypt::new_seed(), None);
+        let fetched = tokio::time::timeout(std::time::Duration::from_secs(15), fetcher.fetch_addon_object(&address, object)).await.unwrap().unwrap();
+        assert_eq!(fetched, bytes);
+        assert_eq!(store.info(object.id).unwrap(), Some((object.size, true)));
+        assert!(!xite_path.join("extension.xpi").exists());
+        // No manifest exists to resolve: this succeeds only through the fixed
+        // hash contract, not the mutable-path file downloader.
+        assert!(!xite_path.join("content.json").exists());
+        drop(fetcher);
+        server_task.abort();
+        let _ = server_task.await;
+    }
 
     struct RejectPoolRescan;
 

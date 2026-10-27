@@ -104,6 +104,8 @@ class GeckoRuntimeSettings(val extensionsProcessEnabled: Boolean) {
     class Builder {
         private var extensions = false
         fun extensionsProcessEnabled(enabled: Boolean): Builder { extensions = enabled; return this }
+        fun arguments(args: Array<String>): Builder { check(args.size == 2 && args[0] == "-profile"); return this }
+        fun configFilePath(path: String): Builder { check(path.isNotBlank()); return this }
         fun build() = GeckoRuntimeSettings(extensions)
     }
 }

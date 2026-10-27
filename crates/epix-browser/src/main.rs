@@ -15,6 +15,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
+mod addons;
+mod addons_metadata;
 use epix_browser_net::ca;
 mod eepsite;
 mod browser_process;
@@ -70,6 +72,7 @@ pub struct Ready {
     pub display: String,
     pub firefox: PathBuf,
     pub profile: PathBuf,
+    pub addon_credentials: epix_ui::addon_broker::AddonLaunchCredentials,
     pub start_url: String,
     /// The scheme the managed browser uses (`https` with a trusted CA, else
     /// `http`); used to build URLs for reopen requests from later launches.
@@ -294,6 +297,7 @@ async fn boot(
     .map_err(|e| format!("Could not start the local node: {e}"))?;
     let display = running.display.clone();
     let ui_addr = running.ui_addr;
+    let addon_broker = server.addon_broker();
 
     // The proxy serves the same router (with the transparent-proxy host rewrite)
     // over TLS + plain http. Build it before the plain server consumes `server`.
@@ -355,9 +359,9 @@ async fn boot(
     // Write the managed profile (CA injected so https://*.epix is trusted), then
     // install the theme + wallet extension into it.
     progress.report(startup::Stage::Profile);
-    let (profile, secure) = setup_profile(
-        &data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &firefox, &ca,
-    )?;
+    let (profile, secure, addon_credentials) = setup_profile(
+        &data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &firefox, &ca, &addon_broker, ui_addr,
+    ).await?;
     ensure_search_policy(&firefox);
     progress.report(startup::Stage::Wallet);
     install_addons(&profile, &firefox, ext_capable);
@@ -380,7 +384,7 @@ async fn boot(
     let launch_url = handoff
         .as_ref()
         .map_or(start_url.as_str(), |handoff| handoff.url());
-    let mut child = launch_browser(background, &firefox, &profile, launch_url, window_size)?;
+    let mut child = launch_browser(background, &firefox, &profile, launch_url, window_size, &addon_credentials)?;
     if let Some(handoff) = &mut handoff {
         wait_for_browser_window(handoff, &mut child, Duration::from_secs(60)).await?;
     }
@@ -414,6 +418,7 @@ async fn boot(
         display,
         firefox,
         profile,
+        addon_credentials,
         start_url,
         scheme: scheme.to_string(),
         version: env!("EPIX_VERSION").to_string(),
@@ -514,7 +519,7 @@ fn spawn_eepsite_proxy(state: Arc<epix_ui::AppState>, book_path: PathBuf) {
 /// falls back to http (re-writing the profile without secure origins). A failure
 /// to write the profile at all is fatal.
 #[allow(clippy::too_many_arguments)]
-fn setup_profile(
+async fn setup_profile(
     data_root: &Path,
     proxy_addr: SocketAddr,
     socks_addr: SocketAddr,
@@ -523,15 +528,19 @@ fn setup_profile(
     ext_capable: bool,
     firefox: &Path,
     ca: &LocalCa,
-) -> Result<(PathBuf, bool), String> {
+    addon_broker: &epix_ui::addon_broker::AddonBroker,
+    ui_addr: SocketAddr,
+) -> Result<(PathBuf, bool, epix_ui::addon_broker::AddonLaunchCredentials), String> {
     let profile = data_root.join("firefox-profile");
     if let Err(e) =
         write_profile(&profile, proxy_addr, socks_addr, display, true, tor_clearnet, ext_capable)
     {
         return Err(format!("Could not prepare the browser profile: {e}"));
     }
+    let credentials = addon_broker.register_profile(&profile, ui_addr).await?;
+    addons::preflight(firefox, &profile, credentials.profile_id())?;
     let secure = match install_ca(&profile, firefox, ca) {
-        Ok(()) => ensure_ca_imported(&profile, firefox, ca),
+        Ok(()) => ensure_ca_imported(&profile, firefox, ca, &credentials),
         Err(e) => {
             eprintln!("· note: could not install the local CA ({e}); falling back to http");
             false
@@ -541,7 +550,7 @@ fn setup_profile(
         let _ =
             write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
     }
-    Ok((profile, secure))
+    Ok((profile, secure, credentials))
 }
 
 /// Whether the profile's NSS DB (`cert9.db`) holds this exact CA cert. NSS
@@ -574,7 +583,7 @@ fn profile_trusts_ca(profile: &Path, ca: &LocalCa) -> bool {
 /// child means waiting for the real browser. The first warm-up run absorbs the add-on
 /// churn; the import lands in it or in the (churn-free) run after it. Falls
 /// back to http only if the CA never shows up.
-fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
+fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa, credentials: &epix_ui::addon_broker::AddonLaunchCredentials) -> bool {
     if profile_trusts_ca(profile, ca) {
         return true;
     }
@@ -584,7 +593,13 @@ fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
     // (e.g. as a symlink) by another local user.
     let shot = profile.join("ca-warmup.png");
     for _ in 0..3 {
-        let child = ca_warmup_command(profile, firefox, &shot)
+        if let Err(error) = addons::preflight(firefox, profile, credentials.profile_id()) {
+            eprintln!("· extension-manager preflight failed: {error}");
+            return false;
+        }
+        let mut command = ca_warmup_command(profile, firefox, &shot);
+        credentials.configure_command(&mut command);
+        let child = command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -687,13 +702,16 @@ fn launch_browser(
     profile: &Path,
     start_url: &str,
     window_size: Option<browser_process::BrowserWindowSize>,
+    credentials: &epix_ui::addon_broker::AddonLaunchCredentials,
 ) -> Result<Option<std::process::Child>, String> {
     if background {
         println!("· background mode: node + tray up, no browser window");
         return Ok(None);
     }
+    addons::preflight(firefox, profile, credentials.profile_id())?;
     println!("· launching Epix Browser at {start_url}");
     let mut cmd = browser_process::browser_command(firefox, profile, window_size);
+    credentials.configure_command(&mut cmd);
     match cmd.arg(start_url).spawn() {
         Ok(mut child) => {
             // `--no-remote --new-instance` on a profile another Firefox already

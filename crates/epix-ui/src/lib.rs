@@ -6,6 +6,8 @@
 //! `/EpixNet-Internal/Websocket?wrapper_key=…`. Commands are dispatched through
 //! the [`CommandRegistry`], which the plugin system extends.
 
+pub mod addons;
+pub mod addon_broker;
 pub mod backup;
 #[cfg(feature = "benchmark")]
 pub mod benchmark;
@@ -85,6 +87,7 @@ pub struct MediaBundle {
 #[derive(Clone)]
 struct Ctx {
     state: Arc<AppState>,
+    addon_broker: addon_broker::AddonBroker,
     registry: Arc<CommandRegistry>,
     media: Arc<MediaBundle>,
     zip_exports: Arc<tokio::sync::Semaphore>,
@@ -130,6 +133,7 @@ impl UiServer {
         };
         Self {
             ctx: Ctx {
+                addon_broker: addon_broker::AddonBroker::new(state.clone()),
                 state,
                 registry: Arc::new(registry),
                 media: Arc::new(media),
@@ -149,12 +153,19 @@ impl UiServer {
         self
     }
 
+    /// Native launcher handle. Registration happens before any browser starts.
+    pub fn addon_broker(&self) -> addon_broker::AddonBroker {
+        self.ctx.addon_broker.clone()
+    }
+
     pub fn router(&self) -> Router {
         let router = Router::new()
             .route("/", get(health))
             .route("/EpixNet-Internal/Status", get(serve_status))
             .route("/EpixNet-Internal/Zip", get(xite_zip_http::download))
             .route(NMH_RESOLVE_PATH, axum::routing::post(serve_nmh_resolve))
+            .route(addon_broker::PATH, axum::routing::post(addon_broker::serve)
+                .layer(axum::extract::DefaultBodyLimit::max(addon_broker::MAX_REQUEST_BYTES)))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route("/EpixNet-Internal/BigfileUpload", axum::routing::post(bigfile_upload))
             .route("/uimedia/{*path}", get(serve_uimedia))
@@ -3792,7 +3803,9 @@ async fn ui_password_gate(
         return next.run(request).await;
     }
     let path = request.uri().path();
-    if path == "/Login" || path.ends_with("favicon.ico") {
+    // The native addon endpoint has independent per-run authentication. It
+    // never inherits page cookies or grants access to other UI routes.
+    if path == "/Login" || path.ends_with("favicon.ico") || path == addon_broker::PATH {
         return next.run(request).await;
     }
     let cookie = request

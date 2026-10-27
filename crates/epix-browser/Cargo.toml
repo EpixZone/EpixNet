@@ -21,6 +21,8 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "s
 tower = { version = "0.5", features = ["util"] }
 axum = "0.8"
 serde_json = "1"
+serde = "1"
+sha2 = "0.11"
 url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 # The bundled WebExtension is embedded and written out as an XPI into the
@@ -53,6 +55,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_SystemServices",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Native startup-panel widgets share Tao's existing platform UI stack.
 [target.'cfg(target_os = "macos")'.dependencies]

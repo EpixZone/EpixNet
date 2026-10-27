@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; font: 15px system-ui, sans-serif; background: Canvas; color: CanvasText; }
+body { margin: 0 auto; padding: 28px; max-width: 760px; }
+h1 { margin: 0 0 10px; font-size: 26px; } h2 { font-size: 19px; }
+p { line-height: 1.5; } section { margin-top: 28px; border-top: 1px solid GrayText; padding-top: 12px; }
+label { display: block; font-weight: 600; margin-bottom: 8px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; }
+input { flex: 1; min-width: 260px; padding: 10px; border: 1px solid GrayText; border-radius: 5px; }
+button { padding: 9px 14px; border: 1px solid GrayText; border-radius: 5px; cursor: pointer; }
+button:disabled { cursor: default; opacity: .55; }
+#status { padding: 12px; background: color-mix(in srgb, CanvasText 7%, Canvas); border-radius: 5px; white-space: pre-wrap; }
+dl { display: grid; grid-template-columns: 115px 1fr; gap: 7px 12px; } dt { font-weight: 600; } dd { margin: 0; overflow-wrap: anywhere; }
+#permissions { white-space: pre-wrap; overflow-wrap: anywhere; }
+.extension { padding: 14px 0; border-bottom: 1px solid color-mix(in srgb, GrayText 40%, Canvas); }
+.extension h3 { margin: 0 0 8px; } .extension p { overflow-wrap: anywhere; }
+[hidden] { display: none !important; }

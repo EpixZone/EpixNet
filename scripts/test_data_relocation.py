@@ -47,7 +47,9 @@ def main():
         # Reuse the repository's checksummed transitive resolutions. Cargo adds
         # only this tiny harness package; the repository lock is never changed.
         shutil.copyfile(root / "Cargo.lock", harness / "Cargo.lock")
-        modules = "".join(f'#[path={quoted(root / "crates/epix-ui/src" / (name + ".rs"))}]\npub mod {name};\n'
+        # This isolated harness omits the production addon and broker callers of
+        # the scoped filesystem helpers. Keep production warnings enforced.
+        modules = "".join(f'#[allow(dead_code)]\n#[path={quoted(root / "crates/epix-ui/src" / (name + ".rs"))}]\npub mod {name};\n'
                           for name in ["paths", "data_relocation"])
         (harness / "lib.rs").write_text(modules, encoding="utf-8")
         environment = os.environ.copy()
