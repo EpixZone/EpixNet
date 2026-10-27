@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 
 ROOT = Path(__file__).resolve().parent
-MODULE_FILES = ("chrome.manifest", "manager.sys.mjs", "policy.sys.mjs", "manager.xhtml", "manager.css", "compatibility.json")
+MODULE_FILES = ("chrome.manifest", "manager.sys.mjs", "policy.sys.mjs", "theme.sys.mjs", "manager.xhtml", "manager.css", "compatibility.json")
 
 def install(resources: Path):
     if not resources.is_dir() or resources.is_symlink():
@@ -18,6 +18,9 @@ def install(resources: Path):
     destination.mkdir(parents=True, exist_ok=True)
     for name in MODULE_FILES:
         shutil.copyfile(ROOT / name, destination / name)
+    theme = destination / "theme"
+    theme.mkdir(exist_ok=True)
+    shutil.copyfile(ROOT.parent.parent / "shells" / "epix-theme" / "manifest.json", theme / "manifest.json")
     pref = resources / "defaults" / "pref"
     pref.mkdir(parents=True, exist_ok=True)
     shutil.copyfile(ROOT / "epix-addons.js", pref / "epix-addons.js")

@@ -1,11 +1,12 @@
 import { LIMITS, validateCandidate, parseMirror, validateClient, signatureAccepted, macInput, InstallGuard } from './policy.sys.mjs';
+import { installPackagedTheme } from './theme.sys.mjs';
 const { AddonManager } = ChromeUtils.importESModule('resource://gre/modules/AddonManager.sys.mjs');
 const { setTimeout, clearTimeout } = ChromeUtils.importESModule('resource://gre/modules/Timer.sys.mjs');
 const { CustomizableUI } = ChromeUtils.importESModule('moz-src:///browser/components/customizableui/CustomizableUI.sys.mjs');
 const RESOURCE = 'resource://epix-addon-installer/';
 const HEX = /^[0-9a-f]{64}$/;
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
-let initialized = false, profile, profileId, client, credential, guard, session, connection, operation, unavailable = null;
+let initialized = false, profile, profileId, client, credential, guard, session, connection, operation, themeReady, unavailable = null;
 const views = new Set(), renders = new WeakMap(), browserWindows = new WeakMap();
 const api = {
   signed: AddonManager.SIGNEDSTATE_SIGNED, downloaded: AddonManager.STATE_DOWNLOADED,
@@ -131,6 +132,7 @@ async function connect() {
   if (connection) return connection;
   connection = (async () => {
     await AddonManager.readyPromise;
+    await themeReady;
     session = await request({ command: 'open' });
     // Bundled wallet/theme startup work must settle before clean enrollment.
     let state;
@@ -309,7 +311,7 @@ function openManager(browserWindow) {
 export function initialize() {
   if (initialized) throw new Error('Extension manager already initialized.');
   const version = Services.appinfo.version.split('.').map(Number);
-  if (version[0] !== 153 || version[1] < 4 || typeof AddonManager.getInstallForFile !== 'function' || typeof AddonManager.installAddonFromAOM !== 'function' || typeof AddonManager.getAllInstalls !== 'function' || api.known.some(value => !Number.isInteger(value))) throw new Error('Unsupported Firefox extension engine.');
+  if (version[0] !== 153 || version[1] < 4 || typeof AddonManager.getInstallForFile !== 'function' || typeof AddonManager.installAddonFromAOM !== 'function' || typeof AddonManager.getAllInstalls !== 'function' || typeof AddonManager.maybeInstallBuiltinAddon !== 'function' || typeof AddonManager.installBuiltinAddon !== 'function' || api.known.some(value => !Number.isInteger(value))) throw new Error('Unsupported Firefox extension engine.');
   profile = Services.dirsvc.get('ProfD', Ci.nsIFile);
   const identity = JSON.parse(readText(child(profile, 'epix-addons', 'profile.json'), 4096));
   if (identity.protocol !== 1 || !HEX.test(identity.profile_id)) throw new Error('Invalid extension profile identity.'); profileId = identity.profile_id;
@@ -318,6 +320,8 @@ export function initialize() {
   if (!HEX.test(credential) || Services.env.get('EPIX_ADDON_BROKER_CLIENT') !== client.client_id) throw new Error('Extension launcher credentials are unavailable.');
   guard = new InstallGuard({ mirror: mirror(), inspectFile: digest, sameFile: (a, b) => !!a && a.equals(b), signature: engineAccepted, onUnavailable: () => { unavailable = 'The extension guard failed. Close this browser and reopen it from EpixNet.'; } });
   AddonManager.addInstallListener(guard); initialized = true;
+  themeReady = installPackagedTheme(AddonManager, Services.prefs, child(profile, '.epix-theme-activated').exists());
+  themeReady.catch(error => Components.utils.reportError(`Packaged Epix theme unavailable: ${error.message}`));
   CustomizableUI.createWidget({ id: 'epix-xite-extensions', label: 'EpixNet Extensions', tooltiptext: 'Manage extensions from verified xites', defaultArea: CustomizableUI.AREA_NAVBAR, removable: false, onCreated: node => node.setAttribute('image', 'chrome://mozapps/skin/extensions/extension.svg'), onCommand: event => { const window = browserWindowForCommand(event); if (window) openManager(window); } });
   // Keep the pre-stage guard alive even if the local node is temporarily absent.
   Services.obs.addObserver(function started() {

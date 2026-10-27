@@ -97,6 +97,21 @@ This boundary protects against untrusted xites and ordinary extensions. It
 does not claim protection against a compromised browser engine, a privileged
 extension, or a local process with the user's native access.
 
+## Packaged desktop theme
+
+The Epix theme is a static application resource registered through Firefox's
+built-in add-on API. It contains only light and dark colors, and the launcher
+checks its manifest and registration module against the exact bundled bytes
+before opening Firefox. It is not an AMO-signed download or an extension from
+a xite. Its updates ship with EpixNet.
+
+Existing profiles migrate the old unsigned theme through Firefox's add-on
+lifecycle. The current theme selection is preserved, including a deliberate
+switch back to the System theme. The launcher no longer repacks the theme or
+edits Firefox's add-on database to activate it. This does not change the
+signature requirements for extensions installed from xites or the separate
+bundled-wallet installation policy.
+
 ## Local desktop builds
 
 The platform packaging scripts stage the fixed adapter into the bundled

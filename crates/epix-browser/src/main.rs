@@ -673,14 +673,7 @@ fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
     if let Err(e) = ext::install_extension(profile) {
         eprintln!("· note: could not install the wallet extension: {e}");
     }
-    // The Epix theme add-on (light + dark chrome colours).
-    if let Err(e) = ext::install_theme_addon(profile) {
-        eprintln!("· note: could not install the theme add-on: {e}");
-    }
-    // Make the Epix theme the active one the first time it is available (Firefox
-    // installs a sideloaded theme disabled). Runs before Firefox launches and
-    // only acts once, so switching themes later sticks.
-    ext::activate_theme_once(profile);
+    // Firefox registers the packaged Epix theme through its built-in add-on API.
     // Profiles that installed the wallet before the manifest pinned it to the
     // toolbar: move it out of the puzzle-piece menu.
     ext::ensure_wallet_pinned(profile);
@@ -1276,10 +1269,8 @@ fn write_profile(
     // Load and auto-enable the bundled (unsigned) extension from the profile.
     // Only on editions that allow it; harmless prefs otherwise.
     let ext_prefs = if ext_capable {
-        // Note: the Epix theme is *not* forced here via extensions.activeThemeID.
-        // A sideloaded theme installs disabled and that pref alone won't switch
-        // to it; ext::activate_theme_once handles activation in the add-on DB,
-        // once, so a user who later picks another theme keeps it.
+        // The packaged static theme uses Firefox's built-in lifecycle. This
+        // legacy unsigned-extension setting is still needed by the wallet.
         "user_pref(\"xpinstall.signatures.required\", false);\n\
          user_pref(\"extensions.autoDisableScopes\", 0);\n\
          user_pref(\"extensions.enabledScopes\", 5);\n\
