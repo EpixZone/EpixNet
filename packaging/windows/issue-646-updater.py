@@ -79,6 +79,7 @@ def main():
   sock=socket.socket();sock.bind(('127.0.0.1',0));port=sock.getsockname()[1];sock.close()
   prefs={'marionette.port':port,'browser.shell.checkDefaultBrowser':False,'browser.aboutwelcome.enabled':False,'termsofuse.bypassNotification':True,'browser.startup.homepage_override.mstone':'ignore','network.proxy.type':1,'network.proxy.http':'127.0.0.1','network.proxy.http_port':9,'network.proxy.ssl':'127.0.0.1','network.proxy.ssl_port':9,'network.proxy.no_proxies_on':'127.0.0.1, localhost','datareporting.policy.dataSubmissionEnabled':False,'extensions.update.enabled':False}
   (profile/'user.js').write_text(''.join('user_pref('+json.dumps(k)+','+json.dumps(v)+');\n' for k,v in prefs.items()))
+  env.pop('MOZ_APP_SILENT_START',None)  # Updater-only environment must not suppress a normal browser window.
   env.update(EPIX_ADDON_BROKER_CLIENT=client,EPIX_ADDON_BROKER_SECRET=secret,MOZ_MARIONETTE='1',MOZ_HEADLESS='1')
   log=(out/'firefox.log').open('wb');logs.append(log);job=joblib.WindowsJob();jobs.append(job);extended='\\\\?\\'+str(profile.resolve());proc=job.launch([str(ff/'firefox.exe'),'--no-remote','--profile',extended,'--marionette','--remote-allow-system-access','--width','1280','--height','900','about:blank'],cwd=ff,env=env,stdout=log,stderr=subprocess.STDOUT)
   connection_errors=[]
