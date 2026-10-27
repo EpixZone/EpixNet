@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Compile the shell's URL methods and test them on a connected Android emulator.
 
-Set ANDROID_HOME, JAVA_HOME and KOTLINC (the kotlinc executable). D8_JAR can
+Set ANDROID_HOME, JAVA_HOME and KOTLINC (the kotlinc executable). ANDROID_JAR can
+override the compile platform. D8_JAR can
 override the SDK's dex compiler (Kotlin 2.3 needs R8/D8 8.13.19+). Tests use real
 Android Uri/Intent implementations; browser widgets are small test doubles.
 The shared Rust core and GeckoView rendering are not exercised by this script.
@@ -16,7 +17,7 @@ import tempfile
 source = (pathlib.Path(__file__).resolve().parents[1]
           / "app/src/main/java/zone/epix/app/MainActivity.kt").read_text()
 sdk = pathlib.Path(os.environ["ANDROID_HOME"])
-android_jar = sdk / "platforms/android-36/android.jar"
+android_jar = pathlib.Path(os.environ.get("ANDROID_JAR", sdk / "platforms/android-36/android.jar"))
 adb = str(sdk / "platform-tools/adb")
 
 
@@ -44,8 +45,13 @@ class AddressBar { val windowToken = Any(); fun clearFocus() {} }
 class Session { var url = ""; fun loadUri(value: String) { url = value } }
 class Tab { val session = Session() }
 class Shell {
+    var disposed = false
+    var localUiReady = true
+    var pendingTarget = "dashboard.epix"
+    var restoredUrls: List<String>? = null
     var currentDisplay = "dashboard.epix"
     val currentTab = Tab()
+    val tabs = listOf(currentTab)
     val addressBar = AddressBar()
     fun getSystemService(name: String): Any = InputMethodManager()
 '''
@@ -79,6 +85,17 @@ fun main() {
     verify(shell.xiteRewrite("https://example.com/path") == null, "ordinary HTTPS URL is unchanged")
     verify(shell.intentTarget(Intent(Intent.ACTION_VIEW, Uri.parse("https://example.com"))) == null,
         "non-Epix external URLs are rejected")
+    for (path in listOf("Backup", "Backup?tab=restore", "Backup?restore=epix-backup.zip", "Config", "Stats", "Plugins")) {
+        val original = base + path
+        val displayed = shell.friendlyUrl(original)
+        verify(displayed == original, "node page must retain its local origin: $original -> $displayed")
+        shell.navigate(displayed)
+        verify(shell.currentTab.session.url == original,
+            "resubmitting a node page must not resolve a xite or search: $original -> ${shell.currentTab.session.url}")
+    }
+    verify(shell.friendlyUrl(base + "dashboard.epix/") == "dashboard.epix", "xite roots remain abbreviated")
+    verify(shell.friendlyUrl(base + "talk.epix/posts/42?sort=new#reply") == "talk.epix/posts/42?sort=new#reply",
+        "xite routes remain abbreviated without losing query or fragment")
     shell.navigate("two words")
     verify(shell.currentTab.session.url == "https://duckduckgo.com/?q=two+words", "search still works")
     println("$failures Android URL regression failure(s)")
@@ -86,7 +103,7 @@ fun main() {
 }
 '''
 
-methods = ["navigate", "searchUrl", "xiteRewrite", "nodeUrl", "intentTarget"]
+methods = ["navigate", "searchUrl", "friendlyUrl", "xiteRewrite", "nodeUrl", "intentTarget"]
 kotlin = stub + "\n".join(method(name) for name in methods)
 kotlin += "\n    companion object {\n"
 kotlin += "\n".join(constant(name) for name in ["UI_PORT", "NODE_BASE", "XITE_ADDRESS", "BARE_XITE_NAME", "SEARCH_BASE"])
