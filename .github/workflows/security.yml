@@ -59,12 +59,21 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: google/osv-scanner-action/osv-scanner-action@b1d267aea5211fa648d9d442fa64b90dbdcbdd36 # v2.7.0
-        with:
-          # osv-scanner.toml holds the accepted-advisory ignore list.
-          scan-args: |-
-            --config=osv-scanner.toml
-            --lockfile=Cargo.lock
+      - name: Test temporary OSV range correction
+        run: python3 -m unittest discover -s scripts -p test_osv_ci_config.py
+      - name: Prepare OSV policy for this lockfile
+        run: python3 scripts/osv_ci_config.py
+      - name: Scan Cargo.lock with OSV 2.7.0
+        # The action wrapper converts exit 128 to success, even with the false
+        # flag in scan-args. Call the same scanner directly to preserve errors.
+        # Keep this restricted to the inventory checked by osv_ci_config.py.
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" --workdir /workspace \
+            --entrypoint /root/osv-scanner \
+            ghcr.io/google/osv-scanner-action:v2.7.0@sha256:d54770fe0b09493894e76a02aaed9f51a0513fa57c5186452a755d257b0068a6 \
+            scan source --config=.osv-scanner-ci.toml --lockfile=Cargo.lock \
+            --allow-no-lockfiles=false
 
   semgrep:
     name: semgrep (SAST)
