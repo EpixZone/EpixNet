@@ -2,6 +2,7 @@
 //! settings + stats), the local user identity, and node metadata.
 
 mod xite_export;
+pub(crate) mod addon_install;
 
 use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
 use epix_db::{Database, DbSchema};
@@ -271,6 +272,18 @@ impl UpdatePayload {
 /// crate stays free of the transport/swarm dependency, like the resolvers.
 #[async_trait::async_trait]
 pub trait EdxFetcher: Send + Sync {
+    /// Fetch one previously authorized flat addon object, never a mutable path.
+    /// Implementations must cap size at addons::MAX_ARCHIVE_BYTES and return
+    /// only bytes matching both fields. Dropping this future cancels its owned
+    /// requests; it must not detach a downloader or materialize a xite file.
+    async fn fetch_addon_object(
+        &self,
+        _address: &str,
+        _object: EdxObjectRef,
+    ) -> Result<Vec<u8>, String> {
+        Err("Bounded addon download is unavailable".into())
+    }
+
     /// Fetch `inner_path` of `address` from EDX peers, verify it against its
     /// `b3` root, and write it into the xite's storage. `Ok(true)` when the
     /// file is present afterward; `Err` when the EDX fetch could not complete
@@ -4127,6 +4140,7 @@ const XID_RETRY_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_se
 const XID_RETRY_BACKOFF_MAX_SECS: u64 = 30 * 60;
 
 pub struct AppState {
+    addon_profiles: std::sync::Mutex<crate::addons::Profiles>,
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
     self_weak: std::sync::OnceLock<std::sync::Weak<AppState>>,
@@ -5603,6 +5617,7 @@ impl AppState {
             .and_then(|path| path.parent())
             .map(|directory| crate::deletion_reserve::DeletionReserve::new(directory.to_path_buf()));
         let state = Arc::new(Self {
+            addon_profiles: std::sync::Mutex::new(crate::addons::Profiles::default()),
             self_weak: std::sync::OnceLock::new(),
             version: version.into(),
             rev: RwLock::new("0".to_string()),

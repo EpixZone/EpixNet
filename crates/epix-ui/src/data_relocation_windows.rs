@@ -249,6 +249,10 @@ fn verify_private_acl(file: &File, expected_sid: &str, directory: bool) -> io::R
 
 /// Return the verified handle without delete sharing so the caller can retain
 /// it without a path-reopen gap. Existing paths and unsupported ACL storage fail.
+pub(super) fn verify_private_directory(file: &File) -> io::Result<()> {
+    verify_private_acl(file, &current_user_sid()?, true)
+}
+
 pub(super) fn create_private_directory(path: &Path, parent: &File) -> io::Result<File> {
     let mut flags = 0;
     // SAFETY: parent is a pinned directory handle; optional outputs are null.

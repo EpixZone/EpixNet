@@ -20,6 +20,18 @@ retains storage access. This does not replace an Xcode build or simulator test.
 
 ## Android navigation
 
+The native xite extension manager has a separate policy and profile regression
+runner:
+
+```sh
+python3 shells/android/tests/run-addon-policy-regressions.py
+```
+
+It covers the production policy, profile metadata and lifecycle boundaries
+with JVM fixtures. Full APK installation, real Gecko permission prompts,
+updates and restart recovery require the native acceptance checks described
+in [xite extensions](../docs/xite-extensions.md#validation).
+
 With one running Android emulator, JDK 17+, Kotlin, and Android SDK platform
 and build tools 36 installed:
 

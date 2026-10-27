@@ -39,6 +39,10 @@ class GeckoSession {
     fun goBack() { backs++ }
     fun loadUri(url: String) { loads.add(url) }
 }
+object VerifiedAddonManager {
+    var activeSession: GeckoSession? = null
+    fun selectSession(session: GeckoSession) { activeSession = session }
+}
 class GeckoView(private var attached: GeckoSession?) {
     val session get() = attached
     fun releaseSession() { attached = null }

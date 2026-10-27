@@ -66,6 +66,7 @@ if [ "$PHASE" != "pack" ]; then
   }
 }
 POLICIES
+  python3 "$REPO_ROOT/packaging/firefox-addons/install.py" "$STAGE/firefox"
   echo "· staged: $STAGE"
 fi
 

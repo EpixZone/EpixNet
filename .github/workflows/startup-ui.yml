@@ -10,7 +10,7 @@ on:
       - 'shells/android/app/src/main/java/zone/epix/app/**'
       - 'shells/android/tests/**'
       - 'crates/epix-browser/src/startup*'
-      - 'crates/epix-ffi/src/lib.rs'
+      - 'crates/epix-ffi/src/**'
       - '.github/workflows/startup-ui.yml'
 
 permissions:
