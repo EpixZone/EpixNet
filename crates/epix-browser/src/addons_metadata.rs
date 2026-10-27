@@ -448,6 +448,54 @@ fn ordinary(value: &Value, id: &str, version: &str, path: &Path, kind: u8) -> Re
     Ok(())
 }
 
+// A native uninstall may remove the archive before Gecko flushes its caches.
+// Only the exact durable uninstall can explain that absence. This permits no
+// package to activate and never edits Firefox's database or startup cache.
+fn interrupted_uninstall(
+    profile: &Path,
+    mirror: &Value,
+    expected: &HashMap<String, Expected>,
+    installed: &HashMap<String, String>,
+) -> Result<Option<(String, String)>, String> {
+    let Some(pending) = mirror.get("pending").filter(|p| {
+        matches!(
+            p.get("phase").and_then(Value::as_str),
+            Some("Uninstalling" | "NeedsReconciliation")
+        ) && p.get("uninstall_id").is_some_and(|v| !v.is_null())
+    }) else {
+        return Ok(None);
+    };
+    if pending.get("candidate") != Some(&Value::Null)
+        || !hash_valid(field(pending, "operation_id")?)
+    {
+        return Err(invalid("ambiguous pending uninstall"));
+    }
+    let id = field(pending, "uninstall_id")?;
+    let owner = expected
+        .get(id)
+        .filter(|v| v.versions.len() == 1 && v.staged.is_none())
+        .ok_or_else(|| invalid("pending uninstall has no exact owner"))?;
+    if installed.contains_key(id) {
+        return Ok(None);
+    }
+    for path in [
+        profile.join("extensions").join(format!("{id}.xpi")),
+        profile.join("extensions/staged").join(format!("{id}.xpi")),
+        profile.join("extensions").join(id),
+        profile.join("extensions/staged").join(id),
+    ] {
+        match std::fs::symlink_metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => {
+                return Err(invalid(
+                    "pending uninstall still has an archive or alternate entry",
+                ));
+            }
+        }
+    }
+    Ok(Some((id.into(), owner.versions[0].version.clone())))
+}
+
 /// `approved_candidate` is supplied only after the launcher validates the
 /// profile's native Allow marker against this exact pending operation.
 pub(super) fn check(
@@ -476,6 +524,7 @@ pub(super) fn check(
             staged.insert(id.clone(), v);
         }
     }
+    let removed = interrupted_uninstall(profile, mirror, &expected, &installed)?;
     if let Some(bytes) = read_optional(&profile.join("extensions.json"), METADATA_LIMIT as u64)? {
         let db = json(&bytes)?;
         if db.get("schemaVersion").and_then(Value::as_u64) != Some(DB_SCHEMA) {
@@ -494,9 +543,17 @@ pub(super) fn check(
             if !seen.insert(id) {
                 return Err(invalid("duplicate managed database identity"));
             }
-            let version = installed.get(id).ok_or_else(|| {
-                invalid("database references missing or unapproved managed archive")
-            })?;
+            let version = installed
+                .get(id)
+                .or_else(|| {
+                    removed
+                        .as_ref()
+                        .filter(|(removed_id, _)| removed_id == id)
+                        .map(|(_, version)| version)
+                })
+                .ok_or_else(|| {
+                    invalid("database references missing or unapproved managed archive")
+                })?;
             ordinary(addon, id, version, &base.join(format!("{id}.xpi")), 0)?;
         }
     }
@@ -535,9 +592,17 @@ pub(super) fn check(
                     {
                         return Err(invalid("duplicate or redirected startup location"));
                     }
-                    let version = versions.get(id).ok_or_else(|| {
-                        invalid("startup references missing or unapproved managed archive")
-                    })?;
+                    let version = versions
+                        .get(id)
+                        .or_else(|| {
+                            removed
+                                .as_ref()
+                                .filter(|(removed_id, _)| kind == 1 && removed_id == id)
+                                .map(|(_, version)| version)
+                        })
+                        .ok_or_else(|| {
+                            invalid("startup references missing or unapproved managed archive")
+                        })?;
                     let path = if kind == 1 {
                         base.join(format!("{id}.xpi"))
                     } else {
@@ -753,6 +818,62 @@ mod tests {
         f.cache["app-profile"]["staged"][ID] = record(&f.profile, "1.0", true, false);
         f.save();
         assert!(check(&f.profile, &f.mirror, None).is_err());
+    }
+    #[test]
+    fn addons_metadata_recovers_only_exact_interrupted_uninstall_without_cache_writes() {
+        for phase in ["Uninstalling", "NeedsReconciliation"] {
+            let mut f = Fixture::new();
+            f.mirror["pending"] = json!({"operation_id":"a".repeat(64),"phase":phase,"candidate":null,"uninstall_id":ID});
+            std::fs::remove_file(f.profile.join(format!("extensions/{ID}.xpi"))).unwrap();
+            f.save();
+            let db = std::fs::read(f.profile.join("extensions.json")).unwrap();
+            let cache = std::fs::read(f.profile.join("addonStartup.json.lz4")).unwrap();
+            check(&f.profile, &f.mirror, None).unwrap();
+            assert_eq!(
+                std::fs::read(f.profile.join("extensions.json")).unwrap(),
+                db
+            );
+            assert_eq!(
+                std::fs::read(f.profile.join("addonStartup.json.lz4")).unwrap(),
+                cache
+            );
+        }
+    }
+    #[test]
+    fn addons_metadata_interrupted_uninstall_never_admits_replacement_or_redirect() {
+        for mutation in 0..12 {
+            let mut f = Fixture::new();
+            f.mirror["pending"] = json!({"operation_id":"a".repeat(64),"phase":"NeedsReconciliation","candidate":null,"uninstall_id":ID});
+            let archive = f.profile.join(format!("extensions/{ID}.xpi"));
+            std::fs::remove_file(&archive).unwrap();
+            match mutation {
+                0 => f.mirror["pending"] = Value::Null,
+                1 => f.mirror["pending"]["phase"] = json!("Cancelled"),
+                2 => f.mirror["pending"]["operation_id"] = json!("bad"),
+                3 => f.mirror["pending"]["uninstall_id"] = json!("other@example.invalid"),
+                4 => f.mirror["pending"]["candidate"] = owner("2.0", NEW),
+                5 => f.db["addons"][0]["version"] = json!("2.0"),
+                6 => f.db["addons"][0]["rootURI"] = json!("jar:file:///outside.xpi!/"),
+                7 => f.cache["app-profile"]["addons"][ID]["signedState"] = json!(0),
+                8 => {
+                    std::fs::write(&archive, NEW).unwrap();
+                }
+                9 => {
+                    std::fs::write(f.profile.join(format!("extensions/staged/{ID}.xpi")), OLD)
+                        .unwrap();
+                }
+                10 => {
+                    std::fs::create_dir(f.profile.join("extensions").join(ID)).unwrap();
+                }
+                11 => f.cache["app-profile"]["staged"][ID] = record(&f.profile, "1.0", true, false),
+                _ => unreachable!(),
+            }
+            f.save();
+            assert!(
+                check(&f.profile, &f.mirror, None).is_err(),
+                "mutation {mutation}"
+            );
+        }
     }
     #[test]
     fn addons_metadata_bounds_lz4_json_and_schema() {
