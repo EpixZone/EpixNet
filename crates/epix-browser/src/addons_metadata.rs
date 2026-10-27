@@ -310,6 +310,20 @@ fn root_uri(path: &Path) -> Result<String, String> {
     let uri = url::Url::from_file_path(path).map_err(|_| invalid("profile archive path"))?;
     Ok(format!("jar:{uri}!/"))
 }
+// ESR 153 serializes a verbatim Windows disk path using its literal device
+// prefix in the file URL. Admit only this observed disk spelling; UNC and
+// device namespaces have no equivalent enrollment contract here.
+#[cfg(any(windows, test))]
+fn windows_verbatim_disk_uri(uri: &str) -> Option<String> {
+    let tail = uri
+        .strip_prefix("file://///%3F/")
+        .or_else(|| uri.strip_prefix("file://///%3f/"))?;
+    let bytes = tail.as_bytes();
+    if bytes.len() < 3 || !bytes[0].is_ascii_alphabetic() || bytes[1..3] != *b":/" {
+        return None;
+    }
+    Some(format!("file:///{tail}"))
+}
 fn packed_file_uri_matches(uri: &str, path: &Path) -> bool {
     let Some(file_uri) = uri.strip_prefix("jar:").and_then(|s| s.strip_suffix("!/")) else {
         return false;
@@ -320,6 +334,18 @@ fn packed_file_uri_matches(uri: &str, path: &Path) -> bool {
     {
         return false;
     }
+    #[cfg(windows)]
+    let normalized;
+    #[cfg(windows)]
+    let file_uri = if file_uri.starts_with("file:////") {
+        let Some(value) = windows_verbatim_disk_uri(file_uri) else {
+            return false;
+        };
+        normalized = value;
+        normalized.as_str()
+    } else {
+        file_uri
+    };
     // Allow equivalent percent spelling (Gecko escapes ';' as `%3b`), but
     // never let URL normalization hide a dot segment or encoded separator.
     for part in file_uri.split('/') {
@@ -938,6 +964,47 @@ mod tests {
             assert!(!packed_file_uri_matches(&bad, &path), "{bad}");
         }
         assert!(!packed_file_uri_matches(&uri, &f.profile.join("other.xpi")));
+    }
+    #[test]
+    fn addons_metadata_handles_only_observed_windows_verbatim_disk_uri() {
+        // Retained actual Firefox 153.4 Windows metadata after native Allow.
+        let actual = "file://///%3F/D:/a/_temp/epix646-update-g70p78gh/profile%20space%20%C3%A9%20%E9%9B%AA%20%3b%23literal%2520/extensions/uBlock0@raymondhill.net.xpi";
+        let ordinary = actual.replacen("file://///%3F/", "file:///", 1);
+        assert_eq!(windows_verbatim_disk_uri(actual), Some(ordinary.clone()));
+        assert_eq!(
+            windows_verbatim_disk_uri(&actual.replace("%3F", "%3f")),
+            Some(ordinary)
+        );
+        for bad in [
+            actual.replace("%3F/D:/", "%3F/UNC/server/share/"),
+            actual.replace("%3F/D:/", "%3F/GLOBALROOT/Device/"),
+            actual.replace("%3F/D:/", "%3F/D:"),
+            actual.replace("%3F/D:/", "%3F//D:/"),
+            actual.replace("%3F/D:/", "%3F/%44:/"),
+            actual.replace("%3F", "%253F"),
+            actual.replace("file://///", "file://localhost///"),
+        ] {
+            assert!(windows_verbatim_disk_uri(&bad).is_none(), "{bad}");
+        }
+        #[cfg(windows)]
+        {
+            let path = Path::new(
+                r"\\?\D:\a\_temp\epix646-update-g70p78gh\profile space é 雪 ;#literal%20\extensions\uBlock0@raymondhill.net.xpi",
+            );
+            let uri = format!("jar:{actual}!/");
+            assert!(packed_file_uri_matches(&uri, path));
+            for bad in [
+                uri.replace("/D:/", "/C:/"),
+                uri.replace("/extensions/", "/outside/"),
+                uri.replace("/extensions/", "/%2e%2e/extensions/"),
+                uri.replace("/extensions/", "/%2fextensions/"),
+                uri.replace("/extensions/", "/%5cextensions/"),
+                uri.replace("!/", "?ignored!/"),
+                uri.replace("!/", "#ignored!/"),
+            ] {
+                assert!(!packed_file_uri_matches(&bad, path), "{bad}");
+            }
+        }
     }
     #[cfg(unix)]
     #[test]

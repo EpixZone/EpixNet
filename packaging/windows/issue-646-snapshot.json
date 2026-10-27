@@ -5,7 +5,7 @@
   "status_at_snapshot": "Real desktop native first Add, same-permission update Cancel and Allow passed; restart/uninstall acceptance continuing independently.",
   "files": {
     "crates/epix-browser/src/addons.rs": "d245171699f019f5a9d39c4393e0bc62988bd084bd99c7f093b110cea6c9d55f",
-    "crates/epix-browser/src/addons_metadata.rs": "59d63df07d3669b2350432539d49f9613eabe9be1ce9dc140d54172ff85968fb",
+    "crates/epix-browser/src/addons_metadata.rs": "929613270d11cc656aa2d527c9877a4e3f443f93f226bc5f477d029ad2605ef9",
     "packaging/firefox-addons/chrome.manifest": "f05bbffbaa1f07cb5901f8f0bc82f234c7c91518480107f9e4045a765c627ae3",
     "packaging/firefox-addons/manager.sys.mjs": "7d75e3557351551368f6053d30bfc6b52f322ec2b4a4ca5ed4021f11eb28258c",
     "packaging/firefox-addons/policy.sys.mjs": "dafa36488ca8ab861135309922131060e06a02c533da1a671c24bcdefee16760",
@@ -16,5 +16,5 @@
     "packaging/firefox-addons/epix-addons.js": "0f935b9e080f82ce1f174d5fd63155428d46aae7015b18a2199bc89bd84d923d",
     "packaging/firefox-addons/install.py": "f24204da947dbccbc840fe3df9881df4152ac42d017e93d2fdfda65011c8f054"
   },
-  "reader_followup": "Narrow interrupted-uninstall receipt recovery,9 focused tests passed; actual unchanged-profile restart acceptance continuing."
+  "reader_followup": "Actual Windows extended disk URI recognition plus interrupted-uninstall recovery.10 host tests passed; native Windows module tests and actual cache acceptance required."
 }
