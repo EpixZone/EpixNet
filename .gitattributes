@@ -1,0 +1,5 @@
+
+# QA snapshots preserve the reviewed bytes on Windows.
+/packaging/firefox-addons/* text eol=lf
+/crates/epix-browser/src/addons.rs text eol=lf
+/crates/epix-browser/src/addons_metadata.rs text eol=lf

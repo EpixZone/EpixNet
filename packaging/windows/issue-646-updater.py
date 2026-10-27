@@ -25,7 +25,7 @@ def main():
  a=argparse.ArgumentParser();a.add_argument('--output',type=Path,required=True);a.add_argument('--metadata-reader',type=Path,required=True);args=a.parse_args()
  check(sys.platform=='win32','native Windows required');out=args.output.resolve();out.mkdir(exist_ok=True)
  root=Path(tempfile.mkdtemp(prefix='epix646-update-',dir=os.environ['RUNNER_TEMP']));check(shutil.disk_usage(root).free>30*1024**3,'30GiB floor')
- jobs=[];logs=[];browser=None;server=None;report={'scope':'Official Windows complete MAR with unmodified updater signature verification, exact production adapter resources and isolated synthetic authenticated broker. Native AOM addon/cache fixture and actual production Rust preflight modules. Not the complete EpixNet launcher or xite-download integration.','root':str(root),'headless':True,'diagnostics':'Marionette chrome context is enabled only for this disposable profile. Production adapter files are unchanged. Toolbar manager opens through its real command handler; addon permission uses a WebDriver native element click with isTrusted assertion.','passed':False,'cases':{},'errors':[]}
+ jobs=[];logs=[];browser=None;server=None;proc=None;profile=None;report={'scope':'Official Windows complete MAR with unmodified updater signature verification, exact production adapter resources and isolated synthetic authenticated broker. Native AOM addon/cache fixture and actual production Rust preflight modules. Not the complete EpixNet launcher or xite-download integration.','root':str(root),'headless':True,'diagnostics':'Marionette chrome context is enabled only for this disposable profile. Production adapter files are unchanged. Toolbar manager opens through its real command handler; addon permission uses a WebDriver native element click with isTrusted assertion.','passed':False,'cases':{},'errors':[]}
  def result():save(out/'result.json',report)
  def stop_all():
   for j in jobs:j.close()
@@ -81,7 +81,14 @@ def main():
   (profile/'user.js').write_text(''.join('user_pref('+json.dumps(k)+','+json.dumps(v)+');\n' for k,v in prefs.items()))
   env.update(EPIX_ADDON_BROKER_CLIENT=client,EPIX_ADDON_BROKER_SECRET=secret,MOZ_MARIONETTE='1',MOZ_HEADLESS='1')
   log=(out/'firefox.log').open('wb');logs.append(log);job=joblib.WindowsJob();jobs.append(job);extended='\\\\?\\'+str(profile.resolve());proc=job.launch([str(ff/'firefox.exe'),'--no-remote','--profile',extended,'--marionette','--remote-allow-system-access','--width','1280','--height','900','about:blank'],cwd=ff,env=env,stdout=log,stderr=subprocess.STDOUT)
-  browser=driver.wait(lambda:driver.Marionette(port),60);browser.cmd('Marionette:SetContext',{'value':'chrome'})
+  connection_errors=[]
+  def connect():
+   try:return driver.Marionette(port)
+   except (OSError,RuntimeError) as error:
+    text=str(error)
+    if text not in connection_errors:connection_errors.append(text)
+    return None
+  browser=driver.wait(connect,60);report['marionette_initial_connection_errors']=connection_errors;browser.cmd('Marionette:SetContext',{'value':'chrome'})
   def js(script,args=[]):return browser.cmd('WebDriver:ExecuteScript',{'script':script,'args':args,'newSandbox':False,'sandbox':'default'})['value']
   state=driver.wait(lambda:js("const w=Services.wm.getMostRecentWindow('navigator:browser');const b=w?.document.getElementById('epix-xite-extensions');return b?{version:Services.appinfo.version,profile:Services.dirsvc.get('ProfD',Ci.nsIFile).path,widget:b.getAttribute('label'),appUpdatesAllowed:Services.policies.isAllowed('appUpdate'),errors:Services.console.getMessageArray().map(x=>x.message).filter(x=>/EpixNet extension manager unavailable/.test(x))}:null;"),45);report['native_startup']=state;check(state['version']=='153.4.0' and state['appUpdatesAllowed'] and not state['errors'],'updated native bootstrap failed or updater policy disabled');browser.screenshot(out/'updated-browser.png');result()
   js("const w=Services.wm.getMostRecentWindow('navigator:browser');w.document.getElementById('epix-xite-extensions').doCommand();return true;")
@@ -101,7 +108,12 @@ def main():
   report['metadata_reader_returncode']=run([args.metadata_reader,ff/'firefox.exe',profile,pid],'production-metadata-reader',timeout=30);check(report['metadata_reader_returncode']==0,'production Windows metadata preflight rejected actual cache')
   report['requests']=requests;report['passed']=True;result()
  except Exception as e:
-  report['errors'].append(str(e));(out/'exception.log').write_text(traceback.format_exc());result();raise
+  report['errors'].append(str(e))
+  if proc is not None:report['browser_returncode']=proc.poll()
+  if 'connection_errors' in locals():report['marionette_initial_connection_errors']=connection_errors
+  if profile is not None and profile.exists():
+   report['profile_file_inventory']=[{'path':str(p.relative_to(profile)),'bytes':p.stat().st_size} for p in list(profile.rglob('*'))[:4096] if p.is_file()]
+  (out/'exception.log').write_text(traceback.format_exc());result();raise
  finally:
   if browser:
    try:browser.close()

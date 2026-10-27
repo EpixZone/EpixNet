@@ -15,10 +15,14 @@ def wait(fn, seconds=60):
 class Marionette:
     def __init__(self, port):
         self.s=socket.create_connection(('127.0.0.1',port),timeout=5);self.s.settimeout(35);self.n=0
-        check(self.recv().get('marionetteProtocol')==3,'unexpected Marionette protocol')
-        session=self.cmd('WebDriver:NewSession',{'acceptInsecureCerts':False,'pageLoadStrategy':'normal'})
-        check(session['capabilities']['acceptInsecureCerts'] is False,'certificate verification bypassed')
-        self.cmd('WebDriver:SetTimeouts',{'pageLoad':20000,'script':20000,'implicit':0})
+        try:
+            check(self.recv().get('marionetteProtocol')==3,'unexpected Marionette protocol')
+            session=self.cmd('WebDriver:NewSession',{'acceptInsecureCerts':False,'pageLoadStrategy':'normal'})
+            check(session['capabilities']['acceptInsecureCerts'] is False,'certificate verification bypassed')
+            self.cmd('WebDriver:SetTimeouts',{'pageLoad':20000,'script':20000,'implicit':0})
+        except Exception:
+            self.s.close()
+            raise
     def recv(self):
         prefix=b''
         while not prefix.endswith(b':'):
