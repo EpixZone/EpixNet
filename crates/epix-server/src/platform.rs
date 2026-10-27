@@ -1,5 +1,5 @@
 //! Platform integration for a persistent desktop node: the data directory, a
-//! single-instance lock, and log-file rotation. Replaces the earlier
+//! and log-file rotation. Node ownership is enforced by epix-node. Replaces the earlier
 //! temp-directory data location so a node keeps its identity, xites, and config
 //! across restarts in the conventional per-OS location.
 
@@ -15,47 +15,6 @@ use std::path::PathBuf;
 /// under `data/` - so a Python install's identity and xites carry over as-is.
 pub fn data_root() -> PathBuf {
     epix_node::data_root()
-}
-
-/// Acquire the single-instance lock in `root/lock.pid`. Returns the held lock
-/// (keep it alive for the process lifetime) on success, or `Err` if another
-/// instance already holds it. On non-unix targets this is a no-op success.
-pub fn acquire_lock(root: &std::path::Path) -> Result<InstanceLock, ()> {
-    let path = root.join("lock.pid");
-    #[cfg(unix)]
-    {
-        use std::io::Write;
-        use std::os::unix::io::AsRawFd;
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(&path)
-            .map_err(|_| ())?;
-        // Non-blocking exclusive lock; EWOULDBLOCK means another node holds it.
-        // SAFETY: plain FFI on a raw fd borrowed from `file`, which is open and
-        // outlives the call; flock reads no memory through the fd.
-        // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
-        let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-        if rc != 0 {
-            return Err(());
-        }
-        // Record our PID for humans inspecting the file.
-        let mut f = &file;
-        let _ = f.set_len(0);
-        let _ = writeln!(f, "{}", std::process::id());
-        Ok(InstanceLock { _file: Some(file) })
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = std::fs::write(&path, std::process::id().to_string());
-        Ok(InstanceLock { _file: None })
-    }
-}
-
-/// Holds the single-instance lock; dropping it (at process exit) releases it.
-pub struct InstanceLock {
-    _file: Option<std::fs::File>,
 }
 
 /// Rotate `root/debug.log` if it exceeds `max_bytes` (rename to `debug.log.old`,
@@ -100,15 +59,4 @@ mod tests {
         assert!(!dir.path().join("debug.log.old").exists());
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn lock_is_exclusive() {
-        let dir = tempfile::tempdir().unwrap();
-        let first = acquire_lock(dir.path()).expect("first lock");
-        // A second acquire in-process on the same file also conflicts (flock is
-        // per open-file-description; a fresh open here contends).
-        assert!(acquire_lock(dir.path()).is_err(), "second lock is refused");
-        drop(first);
-        assert!(acquire_lock(dir.path()).is_ok(), "lock is free after drop");
-    }
 }

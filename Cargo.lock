@@ -2544,6 +2544,7 @@ dependencies = [
  "tokio",
  "tower",
  "tray-icon",
+ "url",
  "uuid",
  "windows-sys 0.61.2",
  "winreg",
@@ -3129,6 +3130,7 @@ dependencies = [
  "maxminddb",
  "postcard",
  "reqwest",
+ "rusqlite",
  "rustix",
  "serde",
  "serde_json",
@@ -3140,6 +3142,7 @@ dependencies = [
  "tokio-tungstenite 0.30.0",
  "tokio-util",
  "tower",
+ "windows-sys 0.61.2",
  "zip",
 ]
 

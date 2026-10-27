@@ -1087,7 +1087,7 @@ impl WsCommand for ConfigSet {
             _ => (None, Value::Null),
         };
         let key = key.ok_or("configSet: key required")?;
-        // data_dir persists to epixnet.conf (and copies the data over), not
+        // data_dir queues an offline move for the next start, not
         // config.json - config.json lives inside the directory it would name.
         if key == "data_dir" {
             let dir = value.as_str().unwrap_or_default();
