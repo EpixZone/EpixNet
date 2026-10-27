@@ -1,12 +1,28 @@
 //! Native addon operations bound to the accepted, live signed manifest chain.
-use super::*;
-use crate::addons::*;
+use super::{
+    AppState, EdxObjectRef, VerifiedAuthorityContext, VerifiedDeclarationSection,
+    VerifiedFileDeclaration, canonical_address,
+};
 use crate::addons::{
-    Ledger, MAX_AUTHORITY_BYTES, MAX_LEDGER_BYTES, MAX_MANIFEST_BYTES, Profile, Result,
-    check_cancel, fail, now_ms, random_id, valid_id,
+    AddonAction, AddonCandidate, AddonEngine, AddonEngineOutcome, AddonError, AddonErrorCode,
+    AddonInstalled, AddonInventory, AddonOwnership, AddonPhase, AddonPrepareRequest, AddonSession,
+    AddonSnapshot, CANDIDATE_LIFETIME_MS, Ledger, MAX_ARCHIVE_BYTES, MAX_AUTHORITY_BYTES,
+    MAX_LEDGER_BYTES, MAX_MANAGED_ADDONS, MAX_MANIFEST_BYTES, Profile, Result, StagedAddon,
+    check_cancel, check_managed_count, fail, now_ms, random_id, valid_id,
 };
 use crate::data_relocation::{NativeReadDirectory, ProtectedDirectory};
-use std::io::Write;
+use epix_core::Address;
+use serde_json::Value;
+use sha2::{Digest, Sha256};
+use std::{
+    collections::HashMap,
+    io::Write,
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+};
 
 #[derive(Clone)]
 pub(crate) struct AuthorityStamp {
@@ -117,6 +133,74 @@ fn archive_hashes(bytes: &[u8], entry: &Value) -> Result<()> {
         );
     }
     Ok(())
+}
+fn verify_live_authority(
+    stamp: &AuthorityStamp,
+    cancel: &AtomicBool,
+    xid_map: &epix_content::XidMap,
+) -> Result<Vec<(String, String)>> {
+    let mut live = HashMap::new();
+    let mut hashes = Vec::new();
+    let mut total = 0;
+    for (index, path) in std::iter::once("content.json")
+        .chain(stamp.declaration.authority_chain.iter().map(String::as_str))
+        .enumerate()
+    {
+        check_cancel(cancel)?;
+        let bytes = stamp
+            .root
+            .read(path, MAX_MANIFEST_BYTES)
+            .map_err(authority_error)?;
+        total += bytes.len();
+        if total > MAX_AUTHORITY_BYTES {
+            return fail(
+                AddonErrorCode::LimitExceeded,
+                "Live authority exceeds limit",
+            );
+        }
+        let value = crate::addons::unique_json(&bytes).map_err(authority_error)?;
+        if value
+            .get("signs")
+            .and_then(Value::as_object)
+            .is_some_and(|s| s.len() > 64)
+            || value
+                .get("signers")
+                .and_then(Value::as_array)
+                .is_some_and(|s| s.len() > 64)
+        {
+            return fail(
+                AddonErrorCode::LimitExceeded,
+                "Authority signer count limit",
+            );
+        }
+        let context = VerifiedAuthorityContext {
+            canonical: &stamp.canonical,
+            contents: &live,
+            xid_map,
+            storage: None,
+            staged: None,
+        };
+        if index > 0 {
+            let parent = if index == 1 {
+                "content.json"
+            } else {
+                &stamp.declaration.authority_chain[index - 2]
+            };
+            if epix_content::verify::governing_content_path(path, &context).as_deref()
+                != Some(parent)
+            {
+                return Err(authority_error("Delegation parent changed"));
+            }
+        }
+        epix_content::verify_content_file(path, &value, bytes.len() as i64, &context)
+            .map_err(authority_error)?;
+        if stamp.accepted.get(path) != Some(&value) {
+            return Err(changed("Stored manifest differs from accepted authority"));
+        }
+        hashes.push((path.into(), hex::encode(Sha256::digest(&bytes))));
+        live.insert(path.into(), value);
+    }
+    Ok(hashes)
 }
 impl AppState {
     #[cfg(test)]
@@ -369,67 +453,7 @@ impl AppState {
             }
         }
         stamp.root.assert_bound().map_err(changed)?;
-        let mut live = HashMap::new();
-        let mut hashes = Vec::new();
-        let mut total = 0;
-        for (index, path) in std::iter::once("content.json")
-            .chain(stamp.declaration.authority_chain.iter().map(String::as_str))
-            .enumerate()
-        {
-            check_cancel(cancel)?;
-            let bytes = stamp
-                .root
-                .read(path, MAX_MANIFEST_BYTES)
-                .map_err(authority_error)?;
-            total += bytes.len();
-            if total > MAX_AUTHORITY_BYTES {
-                return fail(
-                    AddonErrorCode::LimitExceeded,
-                    "Live authority exceeds limit",
-                );
-            }
-            let value = crate::addons::unique_json(&bytes).map_err(authority_error)?;
-            if value
-                .get("signs")
-                .and_then(Value::as_object)
-                .is_some_and(|s| s.len() > 64)
-                || value
-                    .get("signers")
-                    .and_then(Value::as_array)
-                    .is_some_and(|s| s.len() > 64)
-            {
-                return fail(
-                    AddonErrorCode::LimitExceeded,
-                    "Authority signer count limit",
-                );
-            }
-            let context = VerifiedAuthorityContext {
-                canonical: &stamp.canonical,
-                contents: &live,
-                xid_map: &xid_map,
-                storage: None,
-                staged: None,
-            };
-            if index > 0 {
-                let parent = if index == 1 {
-                    "content.json"
-                } else {
-                    &stamp.declaration.authority_chain[index - 2]
-                };
-                if epix_content::verify::governing_content_path(path, &context).as_deref()
-                    != Some(parent)
-                {
-                    return Err(authority_error("Delegation parent changed"));
-                }
-            }
-            epix_content::verify_content_file(path, &value, bytes.len() as i64, &context)
-                .map_err(authority_error)?;
-            if stamp.accepted.get(path) != Some(&value) {
-                return Err(changed("Stored manifest differs from accepted authority"));
-            }
-            hashes.push((path.into(), hex::encode(Sha256::digest(&bytes))));
-            live.insert(path.into(), value);
-        }
+        let hashes = verify_live_authority(stamp, cancel, &xid_map)?;
         if !stamp.raw_hashes.is_empty() && stamp.raw_hashes != hashes {
             return Err(changed("Raw authority bytes changed since consent"));
         }
@@ -686,6 +710,64 @@ fn validate_ledger(ledger: &Ledger, profile: &str, engine: AddonEngine) -> Resul
     }
     Ok(())
 }
+fn reconcile_pending_install(
+    managed: &mut Vec<AddonOwnership>,
+    candidate: &AddonCandidate,
+    inventory: &AddonInventory,
+) -> Option<AddonPhase> {
+    let actual = inventory
+        .addons
+        .iter()
+        .find(|a| a.addon_id == candidate.addon_id);
+    if actual.is_some_and(|a| {
+        a.version == candidate.version
+            && a.archive_sha256.as_deref() == Some(candidate.archive_sha256.as_str())
+    }) {
+        managed.retain(|a| a.addon_id != candidate.addon_id);
+        managed.push(candidate.into());
+        return Some(AddonPhase::Installed);
+    }
+    let old = managed.iter().find(|a| a.addon_id == candidate.addon_id);
+    let unchanged = match (actual, old) {
+        (None, None) => true,
+        (Some(actual), Some(old)) => {
+            actual.version == old.version
+                && actual.archive_sha256.as_deref() == Some(old.archive_sha256.as_str())
+        }
+        _ => false,
+    };
+    unchanged.then_some(AddonPhase::Cancelled)
+}
+fn reconcile_pending_uninstall(
+    managed: &mut Vec<AddonOwnership>,
+    id: &str,
+    inventory: &AddonInventory,
+) -> Option<AddonPhase> {
+    let Some(actual) = inventory.addons.iter().find(|a| a.addon_id == id) else {
+        managed.retain(|a| a.addon_id != id);
+        return Some(AddonPhase::Uninstalled);
+    };
+    let unchanged = managed
+        .iter()
+        .find(|o| o.addon_id == id)
+        .is_some_and(|owner| {
+            actual.version == owner.version
+                && actual.archive_sha256.as_deref() == Some(owner.archive_sha256.as_str())
+        });
+    unchanged.then_some(AddonPhase::Cancelled)
+}
+fn reconcile_pending(ledger: &mut Ledger, inventory: &AddonInventory) -> Option<AddonPhase> {
+    // An unfinished engine operation is not evidence for a terminal receipt.
+    if inventory.has_pending_installs {
+        return None;
+    }
+    let pending = ledger.pending.as_ref()?;
+    if let Some(candidate) = &pending.candidate {
+        return reconcile_pending_install(&mut ledger.managed, candidate, inventory);
+    }
+    let id = ledger.uninstall_id.as_deref()?;
+    reconcile_pending_uninstall(&mut ledger.managed, id, inventory)
+}
 impl AppState {
     pub async fn addon_open_session(
         &self,
@@ -827,62 +909,7 @@ impl AppState {
         }
         p.reconciled = false;
         let mut ledger = p.ledger.clone();
-        let mut result_phase = None;
-        if let Some(pending) = &ledger.pending {
-            if let Some(candidate) = &pending.candidate {
-                let actual = inventory
-                    .addons
-                    .iter()
-                    .find(|a| a.addon_id == candidate.addon_id);
-                if actual.is_some_and(|a| {
-                    a.version == candidate.version
-                        && a.archive_sha256.as_deref() == Some(candidate.archive_sha256.as_str())
-                }) && !inventory.has_pending_installs
-                {
-                    ledger.managed.retain(|a| a.addon_id != candidate.addon_id);
-                    ledger.managed.push(candidate.into());
-                    result_phase = Some(AddonPhase::Installed);
-                } else if !inventory.has_pending_installs {
-                    let old = ledger
-                        .managed
-                        .iter()
-                        .find(|a| a.addon_id == candidate.addon_id);
-                    let unchanged = match (actual, old) {
-                        (None, None) => true,
-                        (Some(actual), Some(old)) => {
-                            actual.version == old.version
-                                && actual.archive_sha256.as_deref()
-                                    == Some(old.archive_sha256.as_str())
-                        }
-                        _ => false,
-                    };
-                    if unchanged {
-                        result_phase = Some(AddonPhase::Cancelled);
-                    }
-                }
-            } else if let Some(id) = &ledger.uninstall_id {
-                if !inventory.has_pending_installs {
-                    let actual = inventory.addons.iter().find(|a| &a.addon_id == id);
-                    if actual.is_none() {
-                        ledger.managed.retain(|a| &a.addon_id != id);
-                        result_phase = Some(AddonPhase::Uninstalled);
-                    } else if ledger
-                        .managed
-                        .iter()
-                        .find(|o| &o.addon_id == id)
-                        .is_some_and(|owner| {
-                            actual.is_some_and(|a| {
-                                a.version == owner.version
-                                    && a.archive_sha256.as_deref()
-                                        == Some(owner.archive_sha256.as_str())
-                            })
-                        })
-                    {
-                        result_phase = Some(AddonPhase::Cancelled);
-                    }
-                }
-            }
-        }
+        let result_phase = reconcile_pending(&mut ledger, &inventory);
         if let Some(phase) = result_phase {
             let mut completed = ledger.pending.as_ref().unwrap().clone();
             completed.phase = phase;
@@ -1359,6 +1386,13 @@ impl AppState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::{
+        EdxBatch, EdxBatchProgress, EdxFetcher, EdxPushError, EdxPushProgress, EdxSignedProgress,
+        EdxWant, OnDemandResolver, ResolvedHost, UpdatePayload, XiteEntry,
+    };
+    use epix_core::PeerAddr;
+    use epix_xite::XiteStorage;
+    use serde_json::json;
     use std::io::{Cursor, Write};
     struct Fixture {
         root: tempfile::TempDir,

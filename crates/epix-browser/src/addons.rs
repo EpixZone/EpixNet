@@ -1,6 +1,7 @@
 //! Native launch boundary for the fixed packaged Firefox extension adapter.
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 const MODULES: &[(&str, &[u8])] = &[
@@ -182,11 +183,7 @@ fn directory(path: &Path, required: bool) -> Result<(), String> {
     Ok(())
 }
 
-pub fn preflight(firefox: &Path, profile: &Path, profile_id: &str) -> Result<(), String> {
-    directory(profile, true)?;
-    directory(&profile.join("epix-addons"), true)?;
-    directory(&profile.join("extensions"), false)?;
-    directory(&profile.join("extensions/staged"), false)?;
+fn check_firefox_resources(firefox: &Path) -> Result<(), String> {
     let root = resources(firefox)?;
     for (relative, expected) in MODULES {
         if read_regular(&root.join(relative), expected.len() as u64)? != *expected {
@@ -219,6 +216,53 @@ pub fn preflight(firefox: &Path, profile: &Path, profile_id: &str) -> Result<(),
             "The managed extension profile requires the supported Firefox ESR bundle.".into(),
         );
     }
+    Ok(())
+}
+
+fn pending_archive_approval<'a>(
+    mirror: &'a Value,
+    native_approved: Option<&Value>,
+    approved: &mut HashMap<&'a str, Vec<&'a str>>,
+) -> Result<Option<(&'a str, &'a str)>, String> {
+    let Some(pending) = mirror.get("pending").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    if !matches!(
+        pending.get("phase").and_then(Value::as_str),
+        Some("HandedOff" | "Staged" | "NeedsReconciliation" | "Installed")
+    ) {
+        return Ok(None);
+    }
+    let Some(candidate) = pending.get("candidate").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let id = text(candidate, "addon_id")?;
+    let hash = text(candidate, "archive_sha256")?;
+    if !addon_id(id) || !digest(hash) {
+        return Err("Invalid approved extension receipt.".into());
+    }
+    approved.entry(id).or_default();
+    if native_approved == Some(candidate) {
+        approved.get_mut(id).unwrap().push(hash);
+    }
+    if native_approved == Some(candidate)
+        && matches!(
+            pending.get("phase").and_then(Value::as_str),
+            Some("HandedOff" | "Staged" | "NeedsReconciliation")
+        )
+    {
+        Ok(Some((id, hash)))
+    } else {
+        Ok(None)
+    }
+}
+
+pub fn preflight(firefox: &Path, profile: &Path, profile_id: &str) -> Result<(), String> {
+    directory(profile, true)?;
+    directory(&profile.join("epix-addons"), true)?;
+    directory(&profile.join("extensions"), false)?;
+    directory(&profile.join("extensions/staged"), false)?;
+    check_firefox_resources(firefox)?;
     let mirror: Value = serde_json::from_slice(&read_regular(
         &profile.join("epix-addons/mirror.json"),
         2 * 1024 * 1024,
@@ -236,8 +280,7 @@ pub fn preflight(firefox: &Path, profile: &Path, profile_id: &str) -> Result<(),
         .filter(|owners| owners.len() <= 256)
         .ok_or("Invalid managed extension list.")?;
     let native_approved = approved_candidate(profile, &mirror, profile_id)?;
-    let mut staged_approval = None;
-    let mut approved = std::collections::HashMap::<&str, Vec<&str>>::new();
+    let mut approved = HashMap::<&str, Vec<&str>>::new();
     for owner in owners {
         let id = text(owner, "addon_id")?;
         let hash = text(owner, "archive_sha256")?;
@@ -246,32 +289,7 @@ pub fn preflight(firefox: &Path, profile: &Path, profile_id: &str) -> Result<(),
         }
         approved.insert(id, vec![hash]);
     }
-    if let Some(pending) = mirror.get("pending").filter(|value| !value.is_null()) {
-        if matches!(
-            pending.get("phase").and_then(Value::as_str),
-            Some("HandedOff" | "Staged" | "NeedsReconciliation" | "Installed")
-        ) {
-            if let Some(candidate) = pending.get("candidate").filter(|value| !value.is_null()) {
-                let id = text(candidate, "addon_id")?;
-                let hash = text(candidate, "archive_sha256")?;
-                if !addon_id(id) || !digest(hash) {
-                    return Err("Invalid approved extension receipt.".into());
-                }
-                approved.entry(id).or_default();
-                if native_approved == Some(candidate) {
-                    approved.get_mut(id).unwrap().push(hash);
-                }
-                if native_approved == Some(candidate)
-                    && matches!(
-                        pending.get("phase").and_then(Value::as_str),
-                        Some("HandedOff" | "Staged" | "NeedsReconciliation")
-                    )
-                {
-                    staged_approval = Some((id, hash));
-                }
-            }
-        }
-    }
+    let staged_approval = pending_archive_approval(&mirror, native_approved, &mut approved)?;
     // Firefox can promote staged updates before public install listeners run.
     // Only exact durable approved archives may cross that startup boundary.
     for (id, hashes) in approved {

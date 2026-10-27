@@ -449,8 +449,7 @@ impl EpixNode {
     ) -> Result<StagedAddon, AddonFailure> {
         let node = self.addon_node()?;
         self.rt
-            .block_on(node.addon_stage(&session_id, &operation_id, &archive_sha256))
-            .map_err(AddonFailure::from)?
+            .block_on(node.addon_stage(&session_id, &operation_id, &archive_sha256))?
             .try_into()
     }
     pub fn addon_report(

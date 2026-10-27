@@ -372,22 +372,7 @@ fn prepare_with_hook(
     }
     if effective == plan.target {
         // A crash after config commit must not undo a completed move.
-        if plan.operation == Operation::CopyNew {
-            let snapshot = plan
-                .snapshot
-                .as_ref()
-                .ok_or_else(|| invalid("Missing committed move record"))?;
-            if snapshot.parts.len() != PARTS.len() {
-                return Err(invalid("Incomplete committed move record"));
-            }
-            for (name, identity) in &snapshot.parts {
-                if target.directory.child(name.as_ref(), false)?.identity()? != *identity {
-                    return Err(invalid(
-                        "Committed data directory does not match its move record",
-                    ));
-                }
-            }
-        }
+        validate_committed_move(&target.directory, &plan)?;
         control.assert_bound()?;
         target.directory.assert_bound()?;
         finish(&control, &target.directory, &plan)?;
@@ -406,48 +391,13 @@ fn prepare_with_hook(
             ));
         }
     } else {
-        require_empty_parts(&target.directory)?;
-        let name = random_name(".epixnet-relocation-")?;
-        let stage = target.directory.create_child(name.as_ref())?;
-        plan.snapshot = Some(Snapshot {
-            name,
-            identity: stage.identity()?,
-            parts: Vec::new(),
-        });
-        save_plan(&control, &plan)?;
-        checkpoint("stage-created")?;
-        for part in PARTS {
-            let output = stage.create_child(part.as_ref())?;
-            if let Some(input) = source.directory.optional_child(part.as_ref())? {
-                copy_tree(&input, &output)?;
-            }
-            output.sync()?;
-            checkpoint(part)?;
-        }
-        if !has_identity(&stage)? {
-            return Err(invalid("The source identity disappeared during the move"));
-        }
-        let parts = PARTS
-            .iter()
-            .map(|name| {
-                Ok((
-                    name.to_string(),
-                    stage.child(name.as_ref(), false)?.identity()?,
-                ))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        plan.snapshot.as_mut().unwrap().parts = parts;
-        stage.sync()?;
-        save_plan(&control, &plan)?;
-        checkpoint("snapshot-ready")?;
-        for part in PARTS {
-            stage.move_new(part.as_ref(), &target.directory, part.as_ref())?;
-            checkpoint(if part == "private" {
-                "promoted-private"
-            } else {
-                "promoted-data"
-            })?;
-        }
+        copy_new_parts(
+            &control,
+            &source.directory,
+            &target.directory,
+            &mut plan,
+            &mut checkpoint,
+        )?;
     }
     checkpoint("before-config")?;
     source.directory.assert_bound()?;
@@ -474,6 +424,78 @@ fn prepare_with_hook(
     finish(&control, &target.directory, &plan)?;
     target.directory.assert_bound()?;
     Ok(target)
+}
+
+fn validate_committed_move(target: &Directory, plan: &Plan) -> io::Result<()> {
+    if plan.operation == Operation::CopyNew {
+        let snapshot = plan
+            .snapshot
+            .as_ref()
+            .ok_or_else(|| invalid("Missing committed move record"))?;
+        if snapshot.parts.len() != PARTS.len() {
+            return Err(invalid("Incomplete committed move record"));
+        }
+        for (name, identity) in &snapshot.parts {
+            if target.child(name.as_ref(), false)?.identity()? != *identity {
+                return Err(invalid(
+                    "Committed data directory does not match its move record",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn copy_new_parts(
+    control: &Directory,
+    source: &Directory,
+    target: &Directory,
+    plan: &mut Plan,
+    checkpoint: &mut impl FnMut(&str) -> io::Result<()>,
+) -> io::Result<()> {
+    require_empty_parts(target)?;
+    let name = random_name(".epixnet-relocation-")?;
+    let stage = target.create_child(name.as_ref())?;
+    plan.snapshot = Some(Snapshot {
+        name,
+        identity: stage.identity()?,
+        parts: Vec::new(),
+    });
+    save_plan(control, plan)?;
+    checkpoint("stage-created")?;
+    for part in PARTS {
+        let output = stage.create_child(part.as_ref())?;
+        if let Some(input) = source.optional_child(part.as_ref())? {
+            copy_tree(&input, &output)?;
+        }
+        output.sync()?;
+        checkpoint(part)?;
+    }
+    if !has_identity(&stage)? {
+        return Err(invalid("The source identity disappeared during the move"));
+    }
+    let parts = PARTS
+        .iter()
+        .map(|name| {
+            Ok((
+                name.to_string(),
+                stage.child(name.as_ref(), false)?.identity()?,
+            ))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    plan.snapshot.as_mut().unwrap().parts = parts;
+    stage.sync()?;
+    save_plan(control, plan)?;
+    checkpoint("snapshot-ready")?;
+    for part in PARTS {
+        stage.move_new(part.as_ref(), target, part.as_ref())?;
+        checkpoint(if part == "private" {
+            "promoted-private"
+        } else {
+            "promoted-data"
+        })?;
+    }
+    Ok(())
 }
 
 fn finish(control: &Directory, target: &Directory, plan: &Plan) -> io::Result<()> {

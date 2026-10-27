@@ -1,10 +1,14 @@
-use super::*;
-use serde::de::{self, MapAccess, SeqAccess, Visitor};
+use super::{check_cancel, fail, AddonError, AddonErrorCode, Result, MAX_ARCHIVE_BYTES};
+use serde::{
+    de::{self, MapAccess, SeqAccess, Visitor},
+    Deserialize,
+};
 use serde_json::Value;
 use std::{
     collections::HashSet,
     fmt,
     io::{Cursor, Read},
+    sync::atomic::AtomicBool,
 };
 
 pub(crate) struct Package {
@@ -89,7 +93,7 @@ pub(crate) fn unique_json(bytes: &[u8]) -> Result<Value> {
 
 /// No normalization of ambiguous URL bytes: package identity is one exact path.
 pub(crate) fn parse_source(source: &str) -> Result<(String, String)> {
-    if source.len() > 4096 || source.chars().any(|c| c.is_control()) {
+    if source.len() > 4096 || source.chars().any(char::is_control) {
         return fail(AddonErrorCode::UnsupportedSource, "Invalid xite URL");
     }
     let rest = source
@@ -143,9 +147,14 @@ fn extent(start: usize, len: usize, max: usize) -> Result<usize> {
     })
 }
 
-/// Check metadata allocation bounds and central/local agreement before zip opens
-/// any entry. ZIP64, split/prefixed archives and overlapping data are excluded.
-fn preflight(bytes: &[u8]) -> Result<usize> {
+struct ZipDirectory {
+    count: usize,
+    size: usize,
+    offset: usize,
+    end: usize,
+}
+
+fn zip_directory(bytes: &[u8]) -> Result<ZipDirectory> {
     if bytes.len() < 22 || bytes.len() as u64 > MAX_ARCHIVE_BYTES {
         return fail(AddonErrorCode::LimitExceeded, "Archive size limit");
     }
@@ -172,6 +181,114 @@ fn preflight(bytes: &[u8]) -> Result<usize> {
             "Unsupported ZIP directory layout",
         );
     }
+    Ok(ZipDirectory {
+        count,
+        size,
+        offset,
+        end,
+    })
+}
+
+struct ZipEntry<'a> {
+    flags: u16,
+    method: u16,
+    crc: u32,
+    compressed: usize,
+    unpacked: u64,
+    name: &'a str,
+}
+
+fn local_span(
+    bytes: &[u8],
+    local: usize,
+    offset: usize,
+    entry: ZipEntry<'_>,
+) -> Result<(usize, usize)> {
+    let ZipEntry {
+        flags,
+        method,
+        crc,
+        compressed,
+        unpacked,
+        name,
+    } = entry;
+    let n = name.len();
+    if bytes.get(local..local + 4) != Some(b"PK\x03\x04")
+        || u16at(bytes, local + 6)? != flags
+        || u16at(bytes, local + 8)? != method
+    {
+        return fail(AddonErrorCode::InvalidPackage, "ZIP local header mismatch");
+    }
+    let ln = u16at(bytes, local + 26)? as usize;
+    let le = u16at(bytes, local + 28)? as usize;
+    if ln != n || le > 4096 {
+        return fail(
+            AddonErrorCode::InvalidPackage,
+            "ZIP local name/extra mismatch",
+        );
+    }
+    let name_start = extent(local, 30, offset)?;
+    let local_name_end = extent(name_start, ln, offset)?;
+    if bytes.get(name_start..local_name_end) != Some(name.as_bytes()) {
+        return fail(AddonErrorCode::InvalidPackage, "ZIP local name mismatch");
+    }
+    let data = extent(local_name_end, le, offset)?;
+    let mut stop = extent(data, compressed, offset)?;
+    if flags & 8 == 0 {
+        if u32at(bytes, local + 14)? != crc
+            || u32at(bytes, local + 18)? as usize != compressed
+            || u32at(bytes, local + 22)? as u64 != unpacked
+        {
+            return fail(
+                AddonErrorCode::InvalidPackage,
+                "ZIP local size/CRC mismatch",
+            );
+        }
+    } else {
+        if bytes.get(stop..stop + 4) == Some(b"PK\x07\x08") {
+            stop += 4;
+        }
+        if u32at(bytes, stop)? != crc
+            || u32at(bytes, stop + 4)? as usize != compressed
+            || u32at(bytes, stop + 8)? as u64 != unpacked
+        {
+            return fail(AddonErrorCode::InvalidPackage, "ZIP descriptor mismatch");
+        }
+        stop = extent(stop, 12, offset)?;
+    }
+    Ok((local, stop))
+}
+
+fn check_spans(mut spans: Vec<(usize, usize)>, offset: usize) -> Result<()> {
+    spans.sort_unstable();
+    let mut previous = 0;
+    for (start, end) in spans {
+        if start != previous {
+            return fail(
+                AddonErrorCode::InvalidPackage,
+                "ZIP overlap, prefix or unexplained gap",
+            );
+        }
+        previous = end;
+    }
+    if previous != offset {
+        return fail(
+            AddonErrorCode::InvalidPackage,
+            "Unexpected data before ZIP directory",
+        );
+    }
+    Ok(())
+}
+
+/// Check metadata allocation bounds and central/local agreement before zip opens
+/// any entry. ZIP64, split/prefixed archives and overlapping data are excluded.
+fn preflight(bytes: &[u8]) -> Result<usize> {
+    let ZipDirectory {
+        count,
+        size,
+        offset,
+        end,
+    } = zip_directory(bytes)?;
     let mut pos = offset;
     let mut spans = Vec::with_capacity(count);
     let mut names = HashSet::new();
@@ -212,7 +329,7 @@ fn preflight(bytes: &[u8]) -> Result<usize> {
         let plain = name.strip_suffix('/').unwrap_or(name);
         if !epix_content::verify::is_valid_relative_path(plain)
             || plain.contains(['\\', ':'])
-            || plain.chars().any(|c| c.is_control())
+            || plain.chars().any(char::is_control)
         {
             return fail(AddonErrorCode::InvalidPackage, "Unsafe ZIP path");
         }
@@ -239,50 +356,15 @@ fn preflight(bytes: &[u8]) -> Result<usize> {
             }
         }
         let local = u32at(bytes, pos + 42)? as usize;
-        if bytes.get(local..local + 4) != Some(b"PK\x03\x04")
-            || u16at(bytes, local + 6)? != flags
-            || u16at(bytes, local + 8)? != method
-        {
-            return fail(AddonErrorCode::InvalidPackage, "ZIP local header mismatch");
-        }
-        let ln = u16at(bytes, local + 26)? as usize;
-        let le = u16at(bytes, local + 28)? as usize;
-        if ln != n || le > 4096 {
-            return fail(
-                AddonErrorCode::InvalidPackage,
-                "ZIP local name/extra mismatch",
-            );
-        }
-        let name_start = extent(local, 30, offset)?;
-        let local_name_end = extent(name_start, ln, offset)?;
-        if bytes.get(name_start..local_name_end) != Some(name.as_bytes()) {
-            return fail(AddonErrorCode::InvalidPackage, "ZIP local name mismatch");
-        }
-        let data = extent(local_name_end, le, offset)?;
-        let mut stop = extent(data, compressed, offset)?;
-        if flags & 8 == 0 {
-            if u32at(bytes, local + 14)? != crc
-                || u32at(bytes, local + 18)? as usize != compressed
-                || u32at(bytes, local + 22)? as u64 != unpacked
-            {
-                return fail(
-                    AddonErrorCode::InvalidPackage,
-                    "ZIP local size/CRC mismatch",
-                );
-            }
-        } else {
-            if bytes.get(stop..stop + 4) == Some(b"PK\x07\x08") {
-                stop += 4;
-            }
-            if u32at(bytes, stop)? != crc
-                || u32at(bytes, stop + 4)? as usize != compressed
-                || u32at(bytes, stop + 8)? as u64 != unpacked
-            {
-                return fail(AddonErrorCode::InvalidPackage, "ZIP descriptor mismatch");
-            }
-            stop = extent(stop, 12, offset)?;
-        }
-        spans.push((local, stop));
+        let entry = ZipEntry {
+            flags,
+            method,
+            crc,
+            compressed,
+            unpacked,
+            name,
+        };
+        spans.push(local_span(bytes, local, offset, entry)?);
         pos = extent(extra_end, comment, offset + size)?;
     }
     if pos != end {
@@ -291,30 +373,14 @@ fn preflight(bytes: &[u8]) -> Result<usize> {
             "ZIP directory size mismatch",
         );
     }
-    spans.sort_unstable();
-    let mut previous = 0;
-    for (start, end) in spans {
-        if start != previous {
-            return fail(
-                AddonErrorCode::InvalidPackage,
-                "ZIP overlap, prefix or unexplained gap",
-            );
-        }
-        previous = end;
-    }
-    if previous != offset {
-        return fail(
-            AddonErrorCode::InvalidPackage,
-            "Unexpected data before ZIP directory",
-        );
-    }
+    check_spans(spans, offset)?;
     Ok(count)
 }
 fn text(value: &Value, key: &str, max: usize) -> Result<String> {
     value
         .get(key)
         .and_then(Value::as_str)
-        .filter(|s| !s.is_empty() && s.len() <= max && !s.chars().any(|c| c.is_control()))
+        .filter(|s| !s.is_empty() && s.len() <= max && !s.chars().any(char::is_control))
         .map(str::to_owned)
         .ok_or_else(|| {
             AddonError::new(
@@ -335,7 +401,7 @@ fn permissions(value: &Value, key: &str) -> Result<Vec<String>> {
     for permission in list {
         let p = permission
             .as_str()
-            .filter(|p| !p.is_empty() && p.len() <= 2048 && !p.chars().any(|c| c.is_control()))
+            .filter(|p| !p.is_empty() && p.len() <= 2048 && !p.chars().any(char::is_control))
             .ok_or_else(|| AddonError::new(AddonErrorCode::InvalidPackage, "Invalid permission"))?;
         if matches!(
             p,

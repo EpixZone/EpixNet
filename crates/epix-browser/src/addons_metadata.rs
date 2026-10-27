@@ -522,6 +522,115 @@ fn interrupted_uninstall(
     Ok(Some((id.into(), owner.versions[0].version.clone())))
 }
 
+fn check_database(
+    profile: &Path,
+    base: &Path,
+    expected: &HashMap<String, Expected>,
+    installed: &HashMap<String, String>,
+    removed: Option<&(String, String)>,
+) -> Result<(), String> {
+    let Some(bytes) = read_optional(&profile.join("extensions.json"), METADATA_LIMIT as u64)?
+    else {
+        return Ok(());
+    };
+    let db = json(&bytes)?;
+    if db.get("schemaVersion").and_then(Value::as_u64) != Some(DB_SCHEMA) {
+        return Err(invalid("unknown extensions database schema"));
+    }
+    let addons = db
+        .get("addons")
+        .and_then(Value::as_array)
+        .ok_or_else(|| invalid("invalid extensions database"))?;
+    let mut seen = HashSet::new();
+    for addon in addons {
+        let id = field(addon, "id")?;
+        if !expected.contains_key(id) {
+            continue;
+        }
+        if !seen.insert(id) {
+            return Err(invalid("duplicate managed database identity"));
+        }
+        let version = installed
+            .get(id)
+            .or_else(|| {
+                removed
+                    .filter(|(removed_id, _)| removed_id == id)
+                    .map(|(_, version)| version)
+            })
+            .ok_or_else(|| invalid("database references missing or unapproved managed archive"))?;
+        ordinary(addon, id, version, &base.join(format!("{id}.xpi")), 0)?;
+    }
+    Ok(())
+}
+
+fn check_startup_cache(
+    profile: &Path,
+    base: &Path,
+    expected: &HashMap<String, Expected>,
+    installed: &HashMap<String, String>,
+    staged: &HashMap<String, String>,
+    removed: Option<&(String, String)>,
+) -> Result<(), String> {
+    let Some(bytes) = read_optional(
+        &profile.join("addonStartup.json.lz4"),
+        METADATA_LIMIT as u64,
+    )?
+    else {
+        return Ok(());
+    };
+    let data = startup_json(&bytes)?;
+    let locations = data
+        .as_object()
+        .filter(|v| v.len() <= 32)
+        .ok_or_else(|| invalid("invalid startup locations"))?;
+    let mut seen_installed = HashSet::new();
+    let mut seen_staged = HashSet::new();
+    for (location, state) in locations {
+        for (section, seen, versions, kind) in [
+            ("addons", &mut seen_installed, installed, 1),
+            ("staged", &mut seen_staged, staged, 2),
+        ] {
+            let Some(entries) = state.get(section) else {
+                continue;
+            };
+            let entries = entries
+                .as_object()
+                .ok_or_else(|| invalid("invalid startup addon table"))?;
+            for (id, addon) in entries {
+                if !expected.contains_key(id) {
+                    continue;
+                }
+                if location != "app-profile"
+                    || field(state, "path")?
+                        != base
+                            .to_str()
+                            .ok_or_else(|| invalid("non-UTF8 profile path"))?
+                    || !seen.insert(id)
+                {
+                    return Err(invalid("duplicate or redirected startup location"));
+                }
+                let version = versions
+                    .get(id)
+                    .or_else(|| {
+                        removed
+                            .filter(|(removed_id, _)| kind == 1 && removed_id == id)
+                            .map(|(_, version)| version)
+                    })
+                    .ok_or_else(|| {
+                        invalid("startup references missing or unapproved managed archive")
+                    })?;
+                let path = if kind == 1 {
+                    base.join(format!("{id}.xpi"))
+                } else {
+                    base.join("staged").join(format!("{id}.xpi"))
+                };
+                ordinary(addon, id, version, &path, kind)?;
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `approved_candidate` is supplied only after the launcher validates the
 /// profile's native Allow marker against this exact pending operation.
 pub(super) fn check(
@@ -551,94 +660,15 @@ pub(super) fn check(
         }
     }
     let removed = interrupted_uninstall(profile, mirror, &expected, &installed)?;
-    if let Some(bytes) = read_optional(&profile.join("extensions.json"), METADATA_LIMIT as u64)? {
-        let db = json(&bytes)?;
-        if db.get("schemaVersion").and_then(Value::as_u64) != Some(DB_SCHEMA) {
-            return Err(invalid("unknown extensions database schema"));
-        }
-        let addons = db
-            .get("addons")
-            .and_then(Value::as_array)
-            .ok_or_else(|| invalid("invalid extensions database"))?;
-        let mut seen = HashSet::new();
-        for addon in addons {
-            let id = field(addon, "id")?;
-            if !expected.contains_key(id) {
-                continue;
-            }
-            if !seen.insert(id) {
-                return Err(invalid("duplicate managed database identity"));
-            }
-            let version = installed
-                .get(id)
-                .or_else(|| {
-                    removed
-                        .as_ref()
-                        .filter(|(removed_id, _)| removed_id == id)
-                        .map(|(_, version)| version)
-                })
-                .ok_or_else(|| {
-                    invalid("database references missing or unapproved managed archive")
-                })?;
-            ordinary(addon, id, version, &base.join(format!("{id}.xpi")), 0)?;
-        }
-    }
-    if let Some(bytes) = read_optional(
-        &profile.join("addonStartup.json.lz4"),
-        METADATA_LIMIT as u64,
-    )? {
-        let data = startup_json(&bytes)?;
-        let locations = data
-            .as_object()
-            .filter(|v| v.len() <= 32)
-            .ok_or_else(|| invalid("invalid startup locations"))?;
-        let mut seen_installed = HashSet::new();
-        let mut seen_staged = HashSet::new();
-        for (location, state) in locations {
-            for (section, seen, versions, kind) in [
-                ("addons", &mut seen_installed, &installed, 1),
-                ("staged", &mut seen_staged, &staged, 2),
-            ] {
-                let Some(entries) = state.get(section) else {
-                    continue;
-                };
-                let entries = entries
-                    .as_object()
-                    .ok_or_else(|| invalid("invalid startup addon table"))?;
-                for (id, addon) in entries {
-                    if !expected.contains_key(id) {
-                        continue;
-                    }
-                    if location != "app-profile"
-                        || field(state, "path")?
-                            != base
-                                .to_str()
-                                .ok_or_else(|| invalid("non-UTF8 profile path"))?
-                        || !seen.insert(id)
-                    {
-                        return Err(invalid("duplicate or redirected startup location"));
-                    }
-                    let version = versions
-                        .get(id)
-                        .or_else(|| {
-                            removed
-                                .as_ref()
-                                .filter(|(removed_id, _)| kind == 1 && removed_id == id)
-                                .map(|(_, version)| version)
-                        })
-                        .ok_or_else(|| {
-                            invalid("startup references missing or unapproved managed archive")
-                        })?;
-                    let path = if kind == 1 {
-                        base.join(format!("{id}.xpi"))
-                    } else {
-                        base.join("staged").join(format!("{id}.xpi"))
-                    };
-                    ordinary(addon, id, version, &path, kind)?;
-                }
-            }
-        }
-    }
+    check_database(profile, &base, &expected, &installed, removed.as_ref())?;
+    check_startup_cache(
+        profile,
+        &base,
+        &expected,
+        &installed,
+        &staged,
+        removed.as_ref(),
+    )?;
     Ok(())
 }
 

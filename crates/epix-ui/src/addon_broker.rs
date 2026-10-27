@@ -3,7 +3,15 @@
 //! The launcher registers the real profile before Firefox starts. Requests can
 //! choose neither profile paths nor sessions. This protocol is separate from
 //! the wallet native-messaging host and is never exposed through EpixFrame.
-use crate::{addons::*, data_relocation::ProtectedDirectory, AppState};
+use crate::{
+    addons::{
+        now_ms, random_id, valid_id, AddonAction, AddonEngine, AddonEngineOutcome, AddonError,
+        AddonErrorCode, AddonInventory, AddonOwnership, AddonPhase, AddonPrepareRequest,
+        AddonSession, AddonSnapshot,
+    },
+    data_relocation::ProtectedDirectory,
+    AppState,
+};
 use axum::{
     body::Bytes,
     extract::{ConnectInfo, State},
@@ -784,6 +792,7 @@ pub(crate) async fn serve(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::addons::{AddonCandidate, AddonInstalled};
 
     #[tokio::test]
     async fn cancellation_interrupts_handoff_waiting_for_signed_authority() {
