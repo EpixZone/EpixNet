@@ -1,115 +1,53 @@
 name: Build
-
-# On-demand test builds - no tag, no signing, no Release. Trigger from the
-# Actions tab -> "Build" -> "Run workflow", optionally picking one platform to
-# build faster. The artifacts (unsigned) are attached to the run for download.
-# For a real signed release, push a `v*` tag (that's release.yml).
-
+# QA branch only: official Windows updater and exact reader modules.
 on:
   workflow_dispatch:
-    inputs:
-      platform:
-        description: Platform to build
-        type: choice
-        default: all
-        options: [all, macos, linux, windows]
-
 permissions:
   contents: read
-
 jobs:
-  macos:
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'macos' }}
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install protoc (mesh transport build dep)
-        run: |
-          # The macOS runner pre-taps aws/tap, which newer Homebrew treats as
-          # untrusted and warns about on every brew command. We don't use it, so
-          # untap it to keep the log clean (protobuf is from homebrew/core).
-          brew untap aws/tap 2>/dev/null || true
-          brew install protobuf
-      - name: Fetch Firefox ESR to bundle
-        run: packaging/fetch-firefox-esr.sh osx
-      - name: Build (ad-hoc signed, unnotarized)
-        env:
-          EPIX_MAKE_DMG: "1"
-          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/Firefox.app
-        run: packaging/macos/build-app.sh
-      - uses: actions/upload-artifact@v7
-        with:
-          name: epix-macos-unsigned
-          path: dist/Epix-*.dmg
-
-  linux:
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'linux' }}
-    runs-on: ubuntu-22.04
+  windows-official-updater:
+    name: Windows signed MAR and addon guard
+    runs-on: windows-2025
+    timeout-minutes: 25
+    defaults:
+      run:
+        shell: pwsh
     env:
-      EPIX_RELEASE_BUILD: "1"
+      PYTHONDONTWRITEBYTECODE: '1'
+      CARGO_BUILD_JOBS: '2'
     steps:
-      - uses: actions/checkout@v7.0.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 0
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge; GTK/AppIndicator for the system tray)
-        run: sudo bash packaging/linux/install-build-deps.sh
-      - name: Fetch Firefox ESR to bundle
-        run: packaging/fetch-firefox-esr.sh linux
-      - name: Build Linux desktop installers
-        env:
-          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
-        run: packaging/linux/build-linux.sh
-      - name: Validate Linux packaging
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.99.1
+      - name: Record runner and exact fixture provenance
         run: |
-          python3 packaging/test-firefox-download.py
-          python3 packaging/linux/test-packaging.py
-          shellcheck packaging/linux/*.sh packaging/linux/AppRun packaging/fetch-firefox-esr.sh
-          desktop-file-validate packaging/linux/epix.desktop
-          sudo apt-get install -y ./dist/*.deb
-          EPIX_DATA_DIR="$(mktemp -d)" epix-browser --quit
-          /opt/epixnet/firefox/firefox --headless --version
-          xvfb-run -a python3 packaging/linux/smoke-desktop.py /usr/bin/epix-browser --check-wallet
-          APPIMAGE_EXTRACT_AND_RUN=1 xvfb-run -a python3 packaging/linux/smoke-desktop.py dist/*.AppImage --check-wallet
-      - uses: actions/upload-artifact@v7
-        with:
-          name: epix-linux
-          path: |
-            dist/epix-linux-*.tar.gz
-            dist/*.deb
-            dist/*.rpm
-            dist/*.AppImage
-            dist/enable-epixnet-sandbox.sh
-            dist/SHA256SUMS
-
-  linux-package-tests:
-    needs: linux
-    uses: ./.github/workflows/linux-package-tests.yml
-
-  windows:
-    if: ${{ inputs.platform == 'all' || inputs.platform == 'windows' }}
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v7.0.1
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-pc-windows-msvc
-      - name: Install protoc (mesh transport build dep)
-        run: choco install protoc -y --no-progress
-      - name: Install NSIS
-        run: choco install nsis -y --no-progress
-      - name: Fetch Firefox ESR to bundle
-        shell: bash
-        run: packaging/fetch-firefox-esr.sh win64
-      - name: Build installer (unsigned)
-        shell: bash
-        env:
-          EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
+          New-Item -ItemType Directory -Force evidence | Out-Null
+          @{ fixture_revision=(git rev-parse HEAD).Trim(); os=(Get-CimInstance Win32_OperatingSystem | Select-Object Caption,Version,BuildNumber); image=$env:ImageVersion; rustc=@(rustc -Vv); python=@(python --version) } | ConvertTo-Json -Depth 5 | Set-Content evidence/runner.json -Encoding utf8
+      - name: Build bounded exact production metadata reader
+        timeout-minutes: 7
         run: |
-          export PATH="/c/Program Files (x86)/NSIS:$PATH"
-          packaging/windows/build-windows.sh
-      - uses: actions/upload-artifact@v7
+          python packaging/windows/issue-646-build-reader.py --output evidence
+          if ($LASTEXITCODE -ne 0) { throw 'reader compilation failed' }
+      - name: Apply signed official MAR and inspect updated owned profile
+        timeout-minutes: 12
+        run: |
+          python packaging/windows/issue-646-updater.py --output evidence --metadata-reader evidence/metadata-reader.exe
+          if ($LASTEXITCODE -ne 0) { throw 'updater or native cache acceptance failed' }
+      - name: Remove only owned intermediates
+        if: always()
+        timeout-minutes: 3
+        run: |
+          $roots = @(Get-ChildItem -LiteralPath $env:RUNNER_TEMP -Directory | Where-Object { $_.Name -like 'epix646-update-*' -or $_.Name -eq 'epix646-metadata-reader' })
+          foreach($root in $roots) { Remove-Item -LiteralPath $root.FullName -Recurse -Force }
+          @{ roots=@($roots.FullName); all_removed=@($roots | Where-Object {Test-Path -LiteralPath $_.FullName}).Count -eq 0; utc=[DateTime]::UtcNow.ToString('o') } | ConvertTo-Json -Depth 4 | Set-Content evidence/workflow-cleanup.json -Encoding utf8
+      - name: Retain bounded QA evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
         with:
-          name: epix-windows-unsigned
-          path: dist/Epix-Setup-*.exe
+          name: issue-646-windows-updater-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
+          retention-days: 7

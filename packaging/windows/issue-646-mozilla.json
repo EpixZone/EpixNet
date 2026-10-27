@@ -1,0 +1,20 @@
+{
+  "153.3.0esr": {
+    "metadata_url": "https://archive.mozilla.org/pub/firefox/releases/153.3.0esr/SHA256SUMS",
+    "metadata_sha256": "7c88a884ae4f5940fb04a5421b87ccbad7164ba6c68e356ec4bb19f82f23b08b",
+    "entries": [
+      "7ea68c853338fb42d4d68872152d58340ce766a03706f675bcce535c1501f8a6  update/win64/en-US/firefox-153.3.0esr.complete.mar",
+      "be79723a8fb9f976c7434a5f7dfee0a868a04a7148bf169fb3dab1fef932ad59  win64/en-US/Firefox Setup 153.3.0esr.exe",
+      "49bd01c8875065a7e2147205355b087e185e4211591fc1daeb1d65124759cd4f  win64/en-US/Firefox Setup 153.3.0esr.msi"
+    ]
+  },
+  "153.4.0esr": {
+    "metadata_url": "https://archive.mozilla.org/pub/firefox/releases/153.4.0esr/SHA256SUMS",
+    "metadata_sha256": "d7802bda1cd7c6a350b0adbeb4773723e18dc153a03987fc07266547699648fb",
+    "entries": [
+      "6294b68c9ff3309c12bc914d7ea5e88784f9f05a6a44065f11288fbbca19f222  update/win64/en-US/firefox-153.4.0esr.complete.mar",
+      "3f69fe432de892a9da2ef6ae4f4c568747823c32c6fba9f742f4d6e062bc722d  win64/en-US/Firefox Setup 153.4.0esr.exe",
+      "7b0efa0b4f4b88ee05b284dda7745308e4d55de7ff1136bfb053d1b23a289eda  win64/en-US/Firefox Setup 153.4.0esr.msi"
+    ]
+  }
+}

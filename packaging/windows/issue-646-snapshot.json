@@ -1,0 +1,19 @@
+{
+  "scope": "QA-only production resource and exact module snapshot for official Windows MAR preservation plus actual Windows engine metadata-reader acceptance. No full EpixNet build or release publication.",
+  "production_base": "c715c2958c2a0ef52f980b7e359b1575354d830e",
+  "native_source_provenance": "work/issue-646-reference/desktop-native-qa/run-05/provenance.json",
+  "status_at_snapshot": "Real desktop native first Add, same-permission update Cancel and Allow passed; restart/uninstall acceptance continuing independently.",
+  "files": {
+    "crates/epix-browser/src/addons.rs": "d245171699f019f5a9d39c4393e0bc62988bd084bd99c7f093b110cea6c9d55f",
+    "crates/epix-browser/src/addons_metadata.rs": "493f32e161df775ed6ce21fa993c7a46abafb60493fdeb9527269d3d4ff8131d",
+    "packaging/firefox-addons/chrome.manifest": "f05bbffbaa1f07cb5901f8f0bc82f234c7c91518480107f9e4045a765c627ae3",
+    "packaging/firefox-addons/manager.sys.mjs": "7d75e3557351551368f6053d30bfc6b52f322ec2b4a4ca5ed4021f11eb28258c",
+    "packaging/firefox-addons/policy.sys.mjs": "dafa36488ca8ab861135309922131060e06a02c533da1a671c24bcdefee16760",
+    "packaging/firefox-addons/manager.xhtml": "988ed76e7fbbef169aed59d331c563c7ddec3a31452ab61ccf6bd107a8b663f3",
+    "packaging/firefox-addons/manager.css": "1d3ede4f205e8e173858895b26ea1e0f61065192450ab5e6b96a86b00c3d2f51",
+    "packaging/firefox-addons/compatibility.json": "72f26a99069bd7ad628f1237ae4f991b5cc3d36f7c4a581b2065ff87eb33d878",
+    "packaging/firefox-addons/epix-addons.cfg": "a28058c5d1c25edf596e5dea634b824ad0dcdc485e08053ac2b62c51595776a4",
+    "packaging/firefox-addons/epix-addons.js": "0f935b9e080f82ce1f174d5fd63155428d46aae7015b18a2199bc89bd84d923d",
+    "packaging/firefox-addons/install.py": "f24204da947dbccbc840fe3df9881df4152ac42d017e93d2fdfda65011c8f054"
+  }
+}

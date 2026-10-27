@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<html xmlns="http://www.w3.org/1999/xhtml">
+<head><meta charset="UTF-8"/><title>EpixNet Extensions</title><link rel="stylesheet" href="manager.css"/></head>
+<body>
+<header><h1>Extensions from xites</h1><p>Install Mozilla-signed Firefox extensions published on a verified xite. Each install and update needs your confirmation.</p></header>
+<p id="status" role="status">Connecting to the local node…</p>
+<form id="source-form"><label for="source">Xite package URL</label><div class="row"><input id="source" type="url" required="required" placeholder="https://publisher.epix/extension.xpi"/><button id="review" type="submit">Review package</button></div></form>
+<section id="candidate" hidden="hidden"><h2 id="candidate-name"></h2><dl id="details"></dl><p id="permissions"></p><p>Firefox will show its own permissions prompt. Adding an extension gives it the access shown in that prompt.</p><div class="row"><button id="approve" type="button">Continue to Firefox confirmation</button><button id="cancel" type="button">Cancel</button></div></section>
+<section><h2>Managed extensions</h2><p>Updates are checked manually against the original xite publisher and package path.</p><div id="managed"></div><button id="refresh" type="button">Refresh status</button></section>
+</body></html>
