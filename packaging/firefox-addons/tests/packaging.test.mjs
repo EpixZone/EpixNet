@@ -15,6 +15,8 @@ test('fixed local anchors are staged for Linux/Windows and macOS without changin
   assert.equal(readFileSync(join(dir,'precomplete'),'utf8'),original);
   for(const name of ['epix-addons.cfg','defaults/pref/epix-addons.js','distribution/epix-addon-installer/manager.sys.mjs','distribution/epix-addon-installer/policy.sys.mjs','distribution/epix-addon-installer/manager.xhtml'])assert.ok(existsSync(join(dir,name)),name);
   assert.equal(readFileSync(join(dir,'epix-addons.cfg'),'utf8'),readFileSync(join(root,'epix-addons.cfg'),'utf8'));
+  assert.deepEqual(readFileSync(join(dir,'distribution/epix-addon-installer/theme.sys.mjs')),readFileSync(join(root,'theme.sys.mjs')));
+  assert.deepEqual(readFileSync(join(dir,'distribution/epix-addon-installer/theme/manifest.json')),readFileSync(join(root,'../../shells/epix-theme/manifest.json')));
  }}finally{rmSync(temporary,{recursive:true,force:true})}
 });
 test('packaging refuses a precomplete that would remove the custom guard during Mozilla update',()=>{

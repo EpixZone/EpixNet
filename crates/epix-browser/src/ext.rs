@@ -31,11 +31,6 @@ pub const LEGACY_EXT_ID: &str = "browser-ext@epix.zone";
 /// The starter chrome theme, embedded at build time.
 static THEME: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/browser-theme");
 
-/// The Epix chrome theme add-on (a WebExtension theme carrying a light and a
-/// dark colour set), embedded at build time. Unlike the wallet it is in-repo
-/// source, so it refreshes whenever the launcher binary is rebuilt.
-static THEME_ADDON: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/../../shells/epix-theme");
-
 /// Epix-branded replacements for the wallet's toolbar icon. The wallet draws its
 /// toolbar button on a canvas from `assets/toolbar-{16,48}.png` and overlays a
 /// status dot; substituting these bytes at XPI-pack time rebrands the icon (a
@@ -54,9 +49,6 @@ const WALLET_PACK_VERSION: u32 = 13;
 
 /// The extension id (must match the wallet `manifest.json`'s Firefox gecko id).
 pub const EXT_ID: &str = "wallet@epix.zone";
-/// The theme add-on id (must match `shells/epix-theme/manifest.json`'s gecko
-/// id). Firefox is told to activate it via the `extensions.activeThemeID` pref.
-pub const THEME_EXT_ID: &str = "theme@epix.zone";
 /// The native-messaging host name (must match the wallet's native bridge).
 pub const NMH_NAME: &str = "zone.epix.nmh";
 
@@ -156,81 +148,6 @@ pub fn ensure_epix_spacer(profile: &Path) {
     let _ = std::fs::write(&prefs, out);
 }
 
-/// Make the Epix theme the active theme the first time it is available, then
-/// never touch it again so the user can switch themes and have it stick.
-///
-/// Firefox installs a *sideloaded* theme as disabled, and the
-/// `extensions.activeThemeID` pref alone will not switch to it, so we flip the
-/// state directly in the add-on database (`extensions.json`) and drop Firefox's
-/// fast-start theme cache so it rebuilds from our edit. A marker file guards the
-/// one-shot. Best-effort: any unexpected shape is left alone (the browser just
-/// keeps Firefox's default theme, which still follows light/dark).
-///
-/// On a fresh profile Firefox has not written `extensions.json` yet, and on the
-/// launch that first ships the theme it is not in the DB yet; in both cases we
-/// do nothing and no marker is written, so the next launch tries again. Must run
-/// before Firefox launches (it rewrites `extensions.json`/`prefs.js`).
-pub fn activate_theme_once(profile: &Path) {
-    let marker = profile.join(".epix-theme-activated");
-    if marker.exists() {
-        return;
-    }
-    let db_path = profile.join("extensions.json");
-    let Ok(raw) = std::fs::read_to_string(&db_path) else { return };
-    let Ok(mut db) = serde_json::from_str::<serde_json::Value>(&raw) else { return };
-    let Some(addons) = db.get_mut("addons").and_then(|a| a.as_array_mut()) else { return };
-
-    // Wait until Firefox has actually registered our theme before deciding.
-    if !addons.iter().any(|a| a["id"] == THEME_EXT_ID) {
-        return;
-    }
-    let ours_active = addons
-        .iter()
-        .any(|a| a["id"] == THEME_EXT_ID && a["active"] == true);
-    let default_active = addons
-        .iter()
-        .any(|a| a["id"] == "default-theme@mozilla.org" && a["active"] == true);
-    // Already ours, or the user has switched to some non-default theme: in
-    // either case stop trying (mark done) and respect what is there.
-    if ours_active || !default_active {
-        let _ = std::fs::write(&marker, b"");
-        return;
-    }
-
-    // Installed but inactive while still on the default theme: activate ours.
-    for a in addons.iter_mut() {
-        if a["type"] != "theme" {
-            continue;
-        }
-        let is_ours = a["id"] == THEME_EXT_ID;
-        a["active"] = is_ours.into();
-        a["userDisabled"] = (!is_ours).into();
-    }
-    if std::fs::write(&db_path, db.to_string()).is_err() {
-        return;
-    }
-    // Force Firefox to recompute the active theme (and its startup cache).
-    let _ = std::fs::remove_file(profile.join("addonStartup.json.lz4"));
-    set_prefs_js_string(profile, "extensions.activeThemeID", THEME_EXT_ID);
-    let _ = std::fs::write(&marker, b"");
-}
-
-/// Set (or replace) a quoted string pref in prefs.js. Firefox is not running
-/// when this is called (same contract as the other prefs.js surgery here).
-fn set_prefs_js_string(profile: &Path, key: &str, value: &str) {
-    let path = profile.join("prefs.js");
-    let Ok(s) = std::fs::read_to_string(&path) else { return };
-    let line = format!("user_pref(\"{key}\", \"{value}\");");
-    let needle = format!("user_pref(\"{key}\",");
-    let out = if let Some(pos) = s.find(&needle) {
-        let end = s[pos..].find('\n').map(|e| pos + e).unwrap_or(s.len());
-        format!("{}{}{}", &s[..pos], line, &s[end..])
-    } else {
-        format!("{}\n{}\n", s.trim_end_matches('\n'), line)
-    };
-    let _ = std::fs::write(&path, out);
-}
-
 /// Byte offset just past `\"<area>\":[` inside prefs.js's
 /// `browser.uiCustomization.state` line, or `None` when either is absent.
 fn find_area(s: &str, area: &str) -> Option<usize> {
@@ -264,16 +181,6 @@ pub fn install_extension(profile: &Path) -> Result<(), String> {
     // `default_icon` to only 48px so the icon Firefox shows BEFORE the script
     // runs is a crisp downscale too, not a fuzzy 16px upscale.
     install_addon_xpi(profile, &EXT, EXT_ID, extra, &[("epix-urlbar.js", EPIX_URLBAR_JS)])
-}
-
-/// Install the Epix chrome theme add-on as an XPI. It is enabled by the same
-/// unsigned-sideload prefs as the wallet, and activated (made the current theme
-/// instead of Firefox's built-in default) by the `extensions.activeThemeID`
-/// pref the profile writer sets. Colours - including light/dark - live in the
-/// add-on, so the chrome CSS no longer needs to (and no longer does) hardcode
-/// them, which is what lets other Firefox themes apply.
-pub fn install_theme_addon(profile: &Path) -> Result<(), String> {
-    install_addon_xpi(profile, &THEME_ADDON, THEME_EXT_ID, 0, &[])
 }
 
 /// Zip an embedded add-on dir into `<profile>/extensions/<id>.xpi`, stamping its
@@ -636,7 +543,7 @@ fn write_dir_to_zip(
         // Stamp only the root manifest so the add-on version tracks the build;
         // swap the wallet's toolbar icons for the Epix-branded ones; and patch
         // its JS (single 48px render size, plus the connecting spin). All are
-        // no-ops for the theme add-on, which has none of these entries.
+        // applied only to the bundled wallet; the theme is an application resource.
         let stamped;
         let patched;
         let bytes: &[u8] = match entry.as_str() {
@@ -1017,118 +924,6 @@ mod tests {
         assert!(!is_prior_default_userchrome(&old_default_v0().replace("#0b0e14", "#000000")));
     }
 
-    // Build a minimal extensions.json like Firefox writes, with the given
-    // active theme id and our theme present but (by default) disabled.
-    fn write_ext_db(profile: &Path, active_theme: &str, include_ours: bool, ours_active: bool) {
-        let mut addons = vec![serde_json::json!({
-            "id": "default-theme@mozilla.org", "type": "theme",
-            "active": active_theme == "default-theme@mozilla.org",
-            "userDisabled": active_theme != "default-theme@mozilla.org",
-        })];
-        if include_ours {
-            addons.push(serde_json::json!({
-                "id": THEME_EXT_ID, "type": "theme",
-                "active": ours_active, "userDisabled": !ours_active,
-            }));
-        }
-        if active_theme != "default-theme@mozilla.org" && active_theme != THEME_EXT_ID {
-            addons.push(serde_json::json!({
-                "id": active_theme, "type": "theme", "active": true, "userDisabled": false,
-            }));
-        }
-        let db = serde_json::json!({ "schemaVersion": 36, "addons": addons });
-        std::fs::write(profile.join("extensions.json"), db.to_string()).unwrap();
-    }
-
-    fn theme_states(profile: &Path) -> Vec<(String, bool, bool)> {
-        let raw = std::fs::read_to_string(profile.join("extensions.json")).unwrap();
-        let db: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        db["addons"].as_array().unwrap().iter()
-            .filter(|a| a["type"] == "theme")
-            .map(|a| (a["id"].as_str().unwrap().to_string(), a["active"] == true, a["userDisabled"] == true))
-            .collect()
-    }
-
-    // On the default theme with ours installed-but-disabled: activate ours,
-    // disable the default, drop the startup cache, and write the marker.
-    #[test]
-    fn activate_theme_switches_from_default_once() {
-        let p = TmpProfile::new();
-        std::fs::write(p.0.join("addonStartup.json.lz4"), b"cache").unwrap();
-        std::fs::write(p.0.join("prefs.js"), "user_pref(\"x\", 1);\n").unwrap();
-        write_ext_db(&p.0, "default-theme@mozilla.org", true, false);
-        activate_theme_once(&p.0);
-        let st = theme_states(&p.0);
-        assert!(st.iter().any(|(id, active, dis)| id == THEME_EXT_ID && *active && !*dis));
-        assert!(st.iter().any(|(id, active, _)| id == "default-theme@mozilla.org" && !*active));
-        assert!(!p.0.join("addonStartup.json.lz4").exists(), "startup cache should be dropped");
-        assert!(p.0.join(".epix-theme-activated").exists(), "marker should be written");
-        assert!(std::fs::read_to_string(p.0.join("prefs.js")).unwrap().contains(THEME_EXT_ID));
-    }
-
-    // A user who picked a different theme is respected (we don't reactivate),
-    // and we mark done so we never fight them.
-    #[test]
-    fn activate_theme_respects_user_choice() {
-        let p = TmpProfile::new();
-        write_ext_db(&p.0, "firefox-compact-dark@mozilla.org", true, false);
-        activate_theme_once(&p.0);
-        let st = theme_states(&p.0);
-        assert!(st.iter().any(|(id, active, _)| id == "firefox-compact-dark@mozilla.org" && *active));
-        assert!(st.iter().any(|(id, active, _)| id == THEME_EXT_ID && !*active), "ours stays inactive");
-        assert!(p.0.join(".epix-theme-activated").exists());
-    }
-
-    // Before Firefox has registered our theme, do nothing and leave no marker,
-    // so a later launch retries.
-    #[test]
-    fn activate_theme_waits_until_theme_registered() {
-        let p = TmpProfile::new();
-        write_ext_db(&p.0, "default-theme@mozilla.org", false, false);
-        activate_theme_once(&p.0);
-        assert!(!p.0.join(".epix-theme-activated").exists(), "must retry next launch");
-        // No extensions.json at all (truly fresh profile): also a no-op, no marker.
-        let p2 = TmpProfile::new();
-        std::fs::create_dir_all(&p2.0).unwrap();
-        activate_theme_once(&p2.0);
-        assert!(!p2.0.join(".epix-theme-activated").exists());
-    }
-
-    // Once the marker exists we never touch the DB again (idempotent / hands-off).
-    #[test]
-    fn activate_theme_is_one_shot() {
-        let p = TmpProfile::new();
-        write_ext_db(&p.0, "default-theme@mozilla.org", true, false);
-        std::fs::write(p.0.join(".epix-theme-activated"), b"").unwrap();
-        activate_theme_once(&p.0);
-        let st = theme_states(&p.0);
-        assert!(st.iter().any(|(id, active, _)| id == THEME_EXT_ID && !*active), "should stay untouched");
-    }
-
-    // The theme add-on is written as a valid XPI whose manifest still parses as
-    // JSON after version stamping, carries the expected gecko id, and defines
-    // both a light (`theme`) and a dark (`dark_theme`) colour set.
-    #[test]
-    fn theme_addon_xpi_is_a_valid_theme() {
-        let p = TmpProfile::new();
-        install_theme_addon(&p.0).unwrap();
-        let xpi = p.0.join("extensions").join(format!("{THEME_EXT_ID}.xpi"));
-        let f = std::fs::File::open(&xpi).unwrap();
-        let mut zip = zip::ZipArchive::new(f).unwrap();
-        let mut s = String::new();
-        {
-            use std::io::Read;
-            zip.by_name("manifest.json").unwrap().read_to_string(&mut s).unwrap();
-        }
-        let m: serde_json::Value = serde_json::from_str(&s).unwrap();
-        assert_eq!(m["applications"]["gecko"]["id"], THEME_EXT_ID);
-        // Version was stamped from "1.0.0" to a 4-part build version.
-        let v = m["version"].as_str().unwrap();
-        assert_eq!(v.split('.').count(), 4, "version should be stamped: {v}");
-        assert!(m["theme"]["colors"].is_object());
-        assert!(m["dark_theme"]["colors"].is_object());
-    }
-
     /// Whether the patched icon-size list still sits immediately before the
     /// wallet's status-colour map, i.e. we rewrote the right `[16,48]`.
     ///
@@ -1208,11 +1003,6 @@ mod tests {
         assert_eq!(m["browser_action"]["default_icon"]["48"], "assets/toolbar-48.png");
         assert!(m["browser_action"]["default_icon"]["16"].is_null());
         assert_eq!(m["browser_action"]["default_popup"], "popup.html", "other keys preserved");
-        // A manifest without a browser_action (the theme) just gets its version stamped.
-        let theme = br#"{"version":"1.0.0","theme":{"colors":{}}}"#;
-        let t: serde_json::Value = serde_json::from_slice(&transform_manifest(theme, 7)).unwrap();
-        assert_eq!(t["version"], "1.0.0.7");
-        assert!(t["theme"]["colors"].is_object());
     }
 
     #[test]
@@ -1244,27 +1034,27 @@ mod tests {
         let cache = p.0.join("addonStartup.json.lz4");
         // The certificate warmup has already cached a profile with no wallet.
         std::fs::write(&cache, b"cached before sideload").unwrap();
-        install_theme_addon(&p.0).unwrap();
+        install_extension(&p.0).unwrap();
         assert!(!cache.exists(), "Firefox must register the newly installed add-on");
     }
 
     #[test]
     fn changed_addon_invalidates_startup_cache() {
         let p = TmpProfile::new();
-        install_theme_addon(&p.0).unwrap();
+        install_extension(&p.0).unwrap();
         let cache = p.0.join("addonStartup.json.lz4");
         std::fs::write(&cache, b"cached previous add-on version").unwrap();
-        install_addon_xpi(&p.0, &THEME_ADDON, THEME_EXT_ID, 1, &[]).unwrap();
+        install_addon_xpi(&p.0, &EXT, EXT_ID, 1, &[]).unwrap();
         assert!(!cache.exists(), "Firefox must register the updated add-on");
     }
 
     #[test]
     fn unchanged_addon_preserves_startup_cache() {
         let p = TmpProfile::new();
-        install_theme_addon(&p.0).unwrap();
+        install_extension(&p.0).unwrap();
         let cache = p.0.join("addonStartup.json.lz4");
         std::fs::write(&cache, b"current add-on cache").unwrap();
-        install_theme_addon(&p.0).unwrap();
+        install_extension(&p.0).unwrap();
         assert_eq!(std::fs::read(&cache).unwrap(), b"current add-on cache");
     }
 

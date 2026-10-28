@@ -26,6 +26,14 @@ const MODULES: &[(&str, &[u8])] = &[
         include_bytes!("../../../packaging/firefox-addons/policy.sys.mjs"),
     ),
     (
+        "distribution/epix-addon-installer/theme.sys.mjs",
+        include_bytes!("../../../packaging/firefox-addons/theme.sys.mjs"),
+    ),
+    (
+        "distribution/epix-addon-installer/theme/manifest.json",
+        include_bytes!("../../../shells/epix-theme/manifest.json"),
+    ),
+    (
         "distribution/epix-addon-installer/manager.xhtml",
         include_bytes!("../../../packaging/firefox-addons/manager.xhtml"),
     ),
@@ -363,6 +371,27 @@ mod tests {
         std::fs::remove_file(root.join("distribution/epix-addon-installer/manager.sys.mjs"))
             .unwrap();
         assert!(preflight(&firefox, &profile, &id).is_err());
+    }
+    #[test]
+    fn packaged_theme_resources_must_match_the_launcher() {
+        for name in ["theme.sys.mjs", "theme/manifest.json"] {
+            let (_temp, firefox, profile) = fixture();
+            let id = "a".repeat(64);
+            let path = resources(&firefox)
+                .unwrap()
+                .join("distribution/epix-addon-installer")
+                .join(name);
+            assert!(preflight(&firefox, &profile, &id).is_ok());
+            let original = std::fs::read(&path).unwrap();
+            let mut changed = original.clone();
+            changed[0] ^= 1;
+            std::fs::write(&path, changed).unwrap();
+            assert!(preflight(&firefox, &profile, &id).is_err());
+            std::fs::write(&path, original).unwrap();
+            assert!(preflight(&firefox, &profile, &id).is_ok());
+            std::fs::remove_file(path).unwrap();
+            assert!(preflight(&firefox, &profile, &id).is_err());
+        }
     }
     #[test]
     fn startup_only_accepts_exact_owned_and_approved_staged_bytes() {
