@@ -1334,12 +1334,15 @@ fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
              <div class='title'><h3>Everything</h3>\
                <div class='description'>Keys, node settings, zites, and your onion &amp; I2P addresses in one archive.</div></div>\
              <label class='value value-right checkbox'>\
-               <input type='checkbox' id='comp-all' checked/>\
+               <input type='checkbox' id='comp-all'/>\
                <div class='checkbox-skin'></div></label>\
            </div>"
     ));
     for comp in COMPONENTS {
-        body.push_str(&component_checkbox_row(comp, true));
+        // Zites are off by default: a full-content archive of every served
+        // xite runs to gigabytes and is rarely what an operator meant when
+        // they only wanted keys and settings backed up.
+        body.push_str(&component_checkbox_row(comp, *comp != "zites"));
     }
     body.push_str(&format!(
         "</div>\

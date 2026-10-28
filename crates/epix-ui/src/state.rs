@@ -31460,6 +31460,14 @@ impl AppState {
 
         let mut pending = queue.iter().peekable();
         let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        // Dropping the round (abort, or the pass ending) must cancel the
+        // spawned fetches the way dropping their futures used to.
+        struct AbortOnDrop(tokio::task::JoinHandle<Result<bool, String>>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
         let mut in_flight = FuturesUnordered::new();
         // Files currently in the network phase: the REAL pool occupancy,
         // reported as `workers`. A file leaves on its fetched signal or, if
@@ -31497,8 +31505,27 @@ impl AppState {
                 let hook: EdxFetchedHook = Arc::new(move || {
                     let _ = tx.send(idx);
                 });
+                // Each fetch runs as its own task. `in_flight` is only polled
+                // from the select below, while this loop also awaits the xites
+                // lock (mark_optional_file, push_xite_info, set_worker_stats).
+                // A fetch future parked inside `in_flight` that is next in the
+                // lock's FIFO queue gets the read permit handed to it on
+                // release, is never polled again, and this task's own write
+                // then waits on it forever: every reader in the node queues
+                // behind that writer and the lock watchdog aborts the process.
+                // A spawned task is polled regardless of what this loop awaits.
+                let address_owned = address.to_string();
+                let path_owned = path.clone();
+                let fetch = AbortOnDrop(tokio::spawn(async move {
+                    state.file_need_pooled(&address_owned, &path_owned, hook).await
+                }));
                 in_flight.push(async move {
-                    (idx, state.file_need_pooled(address, path, hook).await)
+                    let mut fetch = fetch;
+                    let result = match (&mut fetch.0).await {
+                        Ok(result) => result,
+                        Err(e) => Err(format!("optional fetch task failed: {e}")),
+                    };
+                    (idx, result)
                 });
                 self.set_worker_stats(
                     address,
