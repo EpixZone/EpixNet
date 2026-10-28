@@ -420,16 +420,22 @@ pub fn list_backups(data_root: &Path) -> Vec<BackupInfo> {
 pub fn read_manifest(path: &Path) -> Result<Manifest, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|_| "Not a valid backup archive".to_string())?;
+        .map_err(|e| format!("Not a valid backup archive: {e}"))?;
     let entry = zip
         .by_name("manifest.json")
-        .map_err(|_| "Not an EpixNet backup (no manifest.json)".to_string())?;
+        .map_err(|e| match e {
+            zip::result::ZipError::FileNotFound =>
+                "Not an EpixNet backup (no manifest.json)".to_string(),
+            zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED) =>
+                "The backup manifest is encrypted. EpixNet backups require an unencrypted manifest.json".to_string(),
+            e => format!("Could not read backup manifest: {e}"),
+        })?;
     let mut bytes = Vec::new();
     // The manifest is small; cap the read so a hostile archive can't balloon.
     entry
         .take(1024 * 1024)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Could not read backup manifest: {e}"))?;
     let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|_| "Unreadable backup manifest".to_string())?;
     if manifest.app != "epixnet" {
@@ -1601,6 +1607,89 @@ mod tests {
 
     fn all_components() -> Vec<String> {
         COMPONENTS.iter().map(ToString::to_string).collect()
+    }
+
+    fn write_manifest_fixture(path: &Path, name: &str, encrypted: bool) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let mut options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        if encrypted {
+            options = options.with_aes_encryption(zip::AesMode::Aes256, "fixture-password");
+        }
+        zip.start_file(name, options).unwrap();
+        zip.write_all(br#"{"format_version":1,"app":"epixnet","app_version":"0.5.24","created":"2026-10-27T00:00:00Z","encrypted":false,"components":{}}"#).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn manifest_reader_requires_a_root_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.zip");
+        write_manifest_fixture(&path, "backup/manifest.json", false);
+
+        assert_eq!(read_manifest(&path).err().unwrap(), "Not an EpixNet backup (no manifest.json)");
+    }
+
+    #[test]
+    fn manifest_reader_identifies_an_encrypted_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.zip");
+        write_manifest_fixture(&path, "manifest.json", true);
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("manifest is encrypted"), "unexpected error: {err}");
+        assert!(!err.contains("no manifest.json"));
+    }
+
+    #[test]
+    fn manifest_reader_reports_unsupported_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsupported.zip");
+        write_manifest_fixture(&path, "manifest.json", false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Zstandard is not enabled for backups. Change both header methods
+        // without changing the entry name or its offsets.
+        bytes[8..10].copy_from_slice(&93u16.to_le_bytes());
+        let central = bytes.windows(4).position(|part| part == b"PK\x01\x02").unwrap();
+        bytes[central + 10..central + 12].copy_from_slice(&93u16.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("Could not read backup manifest"), "unexpected error: {err}");
+        assert!(err.contains("compression method not supported: 93"), "unexpected error: {err}");
+        assert!(!err.contains("no manifest.json"));
+    }
+
+    #[test]
+    fn manifest_reader_reports_a_damaged_local_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged-header.zip");
+        write_manifest_fixture(&path, "manifest.json", false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] = b'X';
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("Could not read backup manifest"), "unexpected error: {err}");
+        assert!(err.contains("Invalid local file header"), "unexpected error: {err}");
+        assert!(!err.contains("no manifest.json"));
+    }
+
+    #[test]
+    fn manifest_reader_identifies_a_checksum_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged-data.zip");
+        write_manifest_fixture(&path, "manifest.json", false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+        bytes[30 + name_len + extra_len] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("Could not read backup manifest"), "unexpected error: {err}");
+        assert!(err.contains("checksum"), "unexpected error: {err}");
     }
 
     #[test]
