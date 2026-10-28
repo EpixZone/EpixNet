@@ -58,7 +58,7 @@ fn component_label(key: &str) -> &'static str {
     match key {
         "keys" => "Keys & identity",
         "config" => "Node settings",
-        "zites" => "Zites & xite data",
+        "zites" => "Xites & xite data",
         "transport" => "Onion & I2P address keys",
         _ => "Unknown",
     }
@@ -68,7 +68,7 @@ fn component_description(key: &str) -> &'static str {
     match key {
         "keys" => "Your master seed and per-xite private keys (private/users.json). This is what recovers your identity.",
         "config" => "The node configuration (private/config.json).",
-        "zites" => "All zite content and the served-xites list, so this node serves the same xites again.",
+        "zites" => "All xite content and the served-xites list, so this node serves the same xites again.",
         "transport" => "The Tor onion-service and I2P destination private keys. Restoring them on \
                         another computer keeps your .onion and .b32.i2p addresses, so the node \
                         continues hosting under the same addresses after a move.",
@@ -198,7 +198,7 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
 }
 
 /// The xite addresses under `data/` (only valid `epix1…` bech32 dirs count -
-/// anything else there is not zite content we can safely restore).
+/// anything else there is not xite content we can safely restore).
 fn zite_addresses(data_root: &Path) -> Vec<String> {
     let mut addrs: Vec<String> = std::fs::read_dir(data_root.join("data"))
         .map(|rd| {
@@ -1092,7 +1092,7 @@ pub(crate) async fn backup_upload(
     }
 }
 
-/// Stream the multipart "file" field to `part_path`. A zites backup can be
+/// Stream the multipart "file" field to `part_path`. A xites backup can be
 /// huge, so chunks go straight to disk.
 async fn receive_upload(
     multipart: &mut axum::extract::Multipart,
@@ -1274,7 +1274,7 @@ fn render_backup_page(
     crate::page_shell(
         "Backup & Restore",
         "Backup &amp; Restore",
-        "Back up your keys, settings, and zites - and restore them here or on another device.",
+        "Back up your keys, settings, and xites - and restore them here or on another device.",
         &body,
         homepage,
         theme,
@@ -1332,14 +1332,15 @@ fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
          <div class='config'>\
            <div class='plugin'>\
              <div class='title'><h3>Everything</h3>\
-               <div class='description'>Keys, node settings, zites, and your onion &amp; I2P addresses in one archive.</div></div>\
+               <div class='description'>Keys, node settings, xites, and your onion &amp; I2P addresses in one archive.</div></div>\
              <label class='value value-right checkbox'>\
                <input type='checkbox' id='comp-all'/>\
                <div class='checkbox-skin'></div></label>\
            </div>"
     ));
     for comp in COMPONENTS {
-        // Zites are off by default: a full-content archive of every served
+        // Xites are off by default (the component keeps its legacy "zites" key
+        // so older backups still restore): a full-content archive of every served
         // xite runs to gigabytes and is rarely what an operator meant when
         // they only wanted keys and settings backed up.
         body.push_str(&component_checkbox_row(comp, *comp != "zites"));
@@ -1499,7 +1500,7 @@ fn render_restore_page(
     for comp in COMPONENTS {
         let Some(entry) = manifest.components.get(*comp) else { continue };
         let extra = if *comp == "zites" && !entry.xites.is_empty() {
-            format!(" This backup holds {} zite(s).", entry.xites.len())
+            format!(" This backup holds {} xite(s).", entry.xites.len())
         } else {
             String::new()
         };
@@ -1579,7 +1580,7 @@ fn render_restarting_page(theme: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A scratch data root with an identity, config, and one zite.
+    /// A scratch data root with an identity, config, and one xite.
     fn scratch_root() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1909,7 +1910,7 @@ mod tests {
             std::fs::read(root.join("private/users.json")).unwrap(),
             b"{\"seed\":\"secret\"}"
         );
-        // The zite dir was replaced wholesale: stale file gone, backup files in.
+        // The xite dir was replaced wholesale: stale file gone, backup files in.
         assert!(!root.join("data").join(&addr).join("stale.txt").exists());
         assert!(root.join("data").join(&addr).join("sub/index.html").is_file());
         // Staging dir cleaned up.
