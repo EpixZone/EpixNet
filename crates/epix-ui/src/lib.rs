@@ -175,7 +175,7 @@ impl UiServer {
             .route("/StatsJson", get(serve_stats_json))
             // The Backup & Restore wizard. Mutations are POSTed (passwords and
             // destructive actions never ride a URL); the upload route gets its
-            // own generous body limit (a zites backup can be gigabytes - the
+            // own generous body limit (a xites backup can be gigabytes - the
             // global default is 2 MB) and streams to disk.
             .route(
                 "/Backup",
@@ -1654,7 +1654,7 @@ fn plugin_description(name: &str) -> &'static str {
         "Stats" => "Network stats charts and the peer world map on the dashboard.",
         "UiPluginManager" => "This plugin manager page.",
         "UiConfig" => "The node configuration page.",
-        "UiBackup" => "The Backup & Restore wizard for keys, settings, and zites.",
+        "UiBackup" => "The Backup & Restore wizard for keys, settings, and xites.",
         "Cors" => "Cross-xite file access via a Cors:<address> permission grant.",
         "PeerDb" => "Remembers known peers across restarts.",
         "Notification" => "Per-xite notification subscriptions, muting, and counts.",
@@ -1669,7 +1669,7 @@ fn plugin_description(name: &str) -> &'static str {
         "MergerSite" => "Aggregates merged xites into one database.",
         "OptionalManager" => "Manages optional (on-demand) files and the size limit.",
         "Newsfeed" => "Cross-xite news feed from followed xites.",
-        "CryptMessage" => "ECIES encrypt/decrypt, AES, and ECDSA sign/verify for zites.",
+        "CryptMessage" => "ECIES encrypt/decrypt, AES, and ECDSA sign/verify for xites.",
         "Chart" => "Collects the time-series data behind the Stats charts.",
         "Bigfile" => "Piecewise download of large files with piecefield exchange.",
         "UiPassword" => "Password-protects the whole UI with a login gate.",

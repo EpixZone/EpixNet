@@ -37,7 +37,7 @@ const BACKUPS_DIR: &str = "backups";
 const PENDING_DIR: &str = "restore-pending";
 
 /// The component keys, in display order.
-const COMPONENTS: &[&str] = &["keys", "config", "zites", "transport"];
+const COMPONENTS: &[&str] = &["keys", "config", "xites", "transport"];
 
 /// The onion service's permanent identity key in the Arti keystore (the
 /// `.onion` address derives from it). "epix" is the nickname the runtime
@@ -58,7 +58,7 @@ fn component_label(key: &str) -> &'static str {
     match key {
         "keys" => "Keys & identity",
         "config" => "Node settings",
-        "zites" => "Zites & xite data",
+        "xites" => "Xites & xite data",
         "transport" => "Onion & I2P address keys",
         _ => "Unknown",
     }
@@ -68,7 +68,7 @@ fn component_description(key: &str) -> &'static str {
     match key {
         "keys" => "Your master seed and per-xite private keys (private/users.json). This is what recovers your identity.",
         "config" => "The node configuration (private/config.json).",
-        "zites" => "All zite content and the served-xites list, so this node serves the same xites again.",
+        "xites" => "All xite content and the served-xites list, so this node serves the same xites again.",
         "transport" => "The Tor onion-service and I2P destination private keys. Restoring them on \
                         another computer keeps your .onion and .b32.i2p addresses, so the node \
                         continues hosting under the same addresses after a move.",
@@ -95,7 +95,7 @@ pub struct Manifest {
 pub struct ComponentEntry {
     /// Data-root-relative file paths with `/` separators.
     pub files: Vec<String>,
-    /// For `zites`: the xite addresses whose `data/<address>/` trees are included.
+    /// For `xites`: the xite addresses whose `data/<address>/` trees are included.
     // Written as `xites`; the legacy `sites` key is still accepted on read, so
     // archives made by older nodes keep restoring.
     #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "sites")]
@@ -177,14 +177,14 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
         "config" => {
             push_if_exists("private/config.json");
         }
-        "zites" => {
+        "xites" => {
             push_if_exists("private/xites.json");
             // Legacy registry name: still archived when present, so a backup
             // taken before the first start on a new build is complete.
             push_if_exists("private/sites.json");
             push_if_exists("private/permissions.json");
             push_if_exists("private/filters.json");
-            for addr in zite_addresses(data_root) {
+            for addr in xite_addresses(data_root) {
                 collect_files(&data_root.join("data").join(&addr), &format!("data/{addr}"), &mut out);
             }
         }
@@ -198,8 +198,8 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
 }
 
 /// The xite addresses under `data/` (only valid `epix1…` bech32 dirs count -
-/// anything else there is not zite content we can safely restore).
-fn zite_addresses(data_root: &Path) -> Vec<String> {
+/// anything else there is not xite content we can safely restore).
+fn xite_addresses(data_root: &Path) -> Vec<String> {
     let mut addrs: Vec<String> = std::fs::read_dir(data_root.join("data"))
         .map(|rd| {
             rd.filter_map(Result::ok)
@@ -319,7 +319,7 @@ pub fn create_backup(
                 .map(|(_, rel)| rel.clone())
                 .filter(|rel| !rel.starts_with("data/"))
                 .collect(),
-            xites: if *comp == "zites" { zite_addresses(data_root) } else { Vec::new() },
+            xites: if *comp == "xites" { xite_addresses(data_root) } else { Vec::new() },
         };
         manifest.components.insert(comp.to_string(), entry);
         all_files.extend(files);
@@ -529,8 +529,8 @@ fn restore_whitelist(manifest: &Manifest, selected: &[String]) -> (Vec<String>, 
         .filter_map(|c| manifest.components.get(c))
         .flat_map(|e| e.files.iter().cloned())
         .collect();
-    let xites = if selected.iter().any(|c| c == "zites") {
-        manifest.components.get("zites").map(|e| e.xites.clone()).unwrap_or_default()
+    let xites = if selected.iter().any(|c| c == "xites") {
+        manifest.components.get("xites").map(|e| e.xites.clone()).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -1092,7 +1092,7 @@ pub(crate) async fn backup_upload(
     }
 }
 
-/// Stream the multipart "file" field to `part_path`. A zites backup can be
+/// Stream the multipart "file" field to `part_path`. A xites backup can be
 /// huge, so chunks go straight to disk.
 async fn receive_upload(
     multipart: &mut axum::extract::Multipart,
@@ -1274,7 +1274,7 @@ fn render_backup_page(
     crate::page_shell(
         "Backup & Restore",
         "Backup &amp; Restore",
-        "Back up your keys, settings, and zites - and restore them here or on another device.",
+        "Back up your keys, settings, and xites - and restore them here or on another device.",
         &body,
         homepage,
         theme,
@@ -1332,14 +1332,17 @@ fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
          <div class='config'>\
            <div class='plugin'>\
              <div class='title'><h3>Everything</h3>\
-               <div class='description'>Keys, node settings, zites, and your onion &amp; I2P addresses in one archive.</div></div>\
+               <div class='description'>Keys, node settings, xites, and your onion &amp; I2P addresses in one archive.</div></div>\
              <label class='value value-right checkbox'>\
-               <input type='checkbox' id='comp-all' checked/>\
+               <input type='checkbox' id='comp-all'/>\
                <div class='checkbox-skin'></div></label>\
            </div>"
     ));
     for comp in COMPONENTS {
-        body.push_str(&component_checkbox_row(comp, true));
+        // Xites are off by default: a full-content archive of every served
+        // xite runs to gigabytes and is rarely what an operator meant when
+        // they only wanted keys and settings backed up.
+        body.push_str(&component_checkbox_row(comp, *comp != "xites"));
     }
     body.push_str(&format!(
         "</div>\
@@ -1495,8 +1498,8 @@ fn render_restore_page(
     ));
     for comp in COMPONENTS {
         let Some(entry) = manifest.components.get(*comp) else { continue };
-        let extra = if *comp == "zites" && !entry.xites.is_empty() {
-            format!(" This backup holds {} zite(s).", entry.xites.len())
+        let extra = if *comp == "xites" && !entry.xites.is_empty() {
+            format!(" This backup holds {} xite(s).", entry.xites.len())
         } else {
             String::new()
         };
@@ -1576,7 +1579,7 @@ fn render_restarting_page(theme: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A scratch data root with an identity, config, and one zite.
+    /// A scratch data root with an identity, config, and one xite.
     fn scratch_root() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1706,7 +1709,7 @@ mod tests {
         assert_eq!(m.format_version, SUPPORTED_BACKUP_FORMAT);
         assert!(!m.encrypted);
         assert_eq!(m.components.len(), 3);
-        assert_eq!(m.components["zites"].xites.len(), 1);
+        assert_eq!(m.components["xites"].xites.len(), 1);
 
         // No caches, no backups dir, forward slashes only.
         let f = std::fs::File::open(root.join("backups").join(&name)).unwrap();
@@ -1839,7 +1842,7 @@ mod tests {
     fn malicious_entries_never_staged() {
         let dir = scratch_root();
         let root = dir.path();
-        let addr = zite_addresses(root).remove(0);
+        let addr = xite_addresses(root).remove(0);
         let path = root.join("backups/evil.zip");
         let f = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(f);
@@ -1850,7 +1853,7 @@ mod tests {
                 "{{\"format_version\":1,\"app\":\"epixnet\",\"app_version\":\"0.9\",\
                  \"created\":\"2026-01-01T00:00:00Z\",\"encrypted\":false,\"components\":{{\
                  \"keys\":{{\"files\":[\"private/users.json\"]}},\
-                 \"zites\":{{\"files\":[],\"sites\":[\"{addr}\"]}}}}}}"
+                 \"xites\":{{\"files\":[],\"xites\":[\"{addr}\"]}}}}}}"
             )
             .as_bytes(),
         )
@@ -1889,7 +1892,7 @@ mod tests {
     fn stage_and_apply_roundtrip() {
         let dir = scratch_root();
         let root = dir.path();
-        let addr = zite_addresses(root).remove(0);
+        let addr = xite_addresses(root).remove(0);
         let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
         let path = root.join("backups").join(&name);
 
@@ -1906,7 +1909,7 @@ mod tests {
             std::fs::read(root.join("private/users.json")).unwrap(),
             b"{\"seed\":\"secret\"}"
         );
-        // The zite dir was replaced wholesale: stale file gone, backup files in.
+        // The xite dir was replaced wholesale: stale file gone, backup files in.
         assert!(!root.join("data").join(&addr).join("stale.txt").exists());
         assert!(root.join("data").join(&addr).join("sub/index.html").is_file());
         // Staging dir cleaned up.
