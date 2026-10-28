@@ -1558,7 +1558,11 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         val prefix = "$NODE_BASE/"
         if (!url.startsWith(prefix)) return url
         val rest = url.removePrefix(prefix).trimEnd('/')
-        rest.substringBefore('/').takeIf { it.isNotEmpty() }?.let { currentDisplay = it }
+        val xite = rest.substringBefore('/').substringBefore('?').substringBefore('#')
+        // Node pages must retain their origin: submitting "Backup" would open
+        // Backup.epix, and a restore query would become a search or web URL.
+        if (!xite.endsWith(".epix", ignoreCase = true) && !XITE_ADDRESS.matches(xite.lowercase())) return url
+        currentDisplay = xite
         return rest
     }
 
