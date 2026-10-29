@@ -2,6 +2,7 @@
 //! settings + stats), the local user identity, and node metadata.
 
 mod xite_export;
+mod merger_index;
 pub(crate) mod addon_install;
 
 use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
@@ -1051,32 +1052,6 @@ struct DbQueryReceipt {
     filter_epoch: u64,
     generation: u64,
     merger: bool,
-}
-
-#[derive(Clone)]
-struct MergerDbSourceSnapshot {
-    canonical: String,
-    storage: XiteStorage,
-    merged_type: String,
-    accepted_values: Vec<(String, Value)>,
-    verified_epoch: u64,
-    source_epoch: u64,
-}
-
-struct MergerDbTargetSnapshot {
-    key: String,
-    canonical: String,
-    storage: XiteStorage,
-    schema: DbSchema,
-    accepted_types: Vec<String>,
-    verified_epoch: u64,
-    source_epoch: u64,
-    populate_sources: bool,
-}
-
-struct PreparedMergerDb {
-    target: MergerDbTargetSnapshot,
-    db: Option<Database>,
 }
 
 struct StoreXiteCandidate {
@@ -4237,6 +4212,10 @@ pub struct AppState {
     db_merger_epoch: AtomicU64,
     db_generation_counter: AtomicU64,
     db_filter_epoch: AtomicU64,
+    merger_index_refresh: tokio::sync::Mutex<()>,
+    merger_temporary_root: std::sync::Mutex<Option<Arc<tempfile::TempDir>>>,
+    merger_indexes: std::sync::Mutex<HashMap<String, merger_index::CachedIndex>>,
+    merger_index_counters: std::sync::Mutex<merger_index::IndexCounters>,
     /// EDX verified-streaming fetcher, installed by the node when EDX is
     /// enabled. When absent, downloads use the legacy sha512/piecemap path.
     edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
@@ -5657,6 +5636,10 @@ impl AppState {
             db_merger_epoch: AtomicU64::new(0),
             db_generation_counter: AtomicU64::new(1),
             db_filter_epoch: AtomicU64::new(0),
+            merger_index_refresh: tokio::sync::Mutex::new(()),
+            merger_temporary_root: std::sync::Mutex::new(None),
+            merger_indexes: std::sync::Mutex::new(HashMap::new()),
+            merger_index_counters: std::sync::Mutex::new(merger_index::IndexCounters::default()),
             edx_fetcher: RwLock::new(None),
             pool_rules: RwLock::new(HashMap::new()),
             pool_shard_locks: std::sync::Mutex::new(HashMap::new()),
@@ -7173,7 +7156,7 @@ impl AppState {
                 .as_ref()
                 .map(|snapshot| snapshot.values.as_slice()),
         ) {
-            Some((db, schema)) => (Some(db), Some(schema)),
+            Some((db, schema)) => (if schema.version == 3 { None } else { Some(db) }, Some(schema)),
             None => (None, None),
         };
         // Restore any peers persisted by the PeerDb plugin, keyed by the signed
@@ -7997,6 +7980,7 @@ impl AppState {
         if registry_readable {
             self.persist_xites().await;
         }
+        self.rebuild_merger_dbs().await;
         restored
     }
 
@@ -14181,7 +14165,7 @@ impl AppState {
         if xite.db_verified_epoch != verified_epoch
             || xite.db_source_epoch != source_epoch
             || xite.db_filter_epoch != filter_epoch
-            || merger && xite.db_merger_epoch != self.db_merger_epoch()
+            || merger && (xite.db_merger_epoch != self.db_merger_epoch() || self.boot_restore_pending())
         {
             return None;
         }
@@ -14261,7 +14245,13 @@ impl AppState {
                 }
             };
             if exists {
-                self.rebuild_xite_db(address).await;
+                let merger = self.xites.read().await.get(address)
+                    .and_then(|xite| xite.db_schema.as_ref()).is_some_and(|schema| schema.version == 3);
+                if merger {
+                    self.rebuild_merger_dbs().await;
+                } else {
+                    self.rebuild_xite_db(address).await;
+                }
                 return self.current_receipt_for(address).await;
             }
             if declared == Some(false) || std::time::Instant::now() >= deadline {
@@ -14323,12 +14313,12 @@ impl AppState {
         &self,
         address: &str,
         result: Result<Vec<Value>, String>,
-        retry_until: std::time::Instant,
+        retry_until: tokio::time::Instant,
     ) -> Option<Result<Vec<Value>, String>> {
         match result {
             Ok(rows) => Some(Ok(rows)),
             Err(error)
-                if std::time::Instant::now() < retry_until
+                if tokio::time::Instant::now() < retry_until
                     && Self::is_transient_db_error(&error) =>
             {
                 // A missing table/column heals only while a clone or rebuild
@@ -14363,25 +14353,12 @@ impl AppState {
         }
     }
 
-    /// The retry budget ran out while the database kept changing: serve the
-    /// last consistent read if one landed (a slightly-stale snapshot beats
-    /// an error that kills the page - apps iterate the rows they expect),
-    /// else give up.
+    /// A successful SQL read is usable only when its receipt still matches.
+    /// Exhausting retries must not expose rows from a retired authority.
     async fn db_query_budget_exhausted(
         &self,
         address: &str,
-        last_ok: Option<Vec<Value>>,
     ) -> Result<Vec<Value>, String> {
-        if let Some(rows) = last_ok {
-            self.log(
-                "INFO",
-                format!(
-                    "dbQuery for {address}: database kept changing past the budget, serving the last consistent read"
-                ),
-            )
-            .await;
-            return Ok(rows);
-        }
         self.log(
             "INFO",
             format!("dbQuery gave up for {address}: authority changed past the deadline"),
@@ -14401,7 +14378,7 @@ impl AppState {
         if receipt.is_none() {
             receipt = self.lazy_build_db_receipt(address).await;
         }
-        let mut receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
+        let receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
         #[cfg(test)]
         let pause = self.db_query_after_receipt_pause
             .lock()
@@ -14412,6 +14389,18 @@ impl AppState {
             started.notify_one();
             let _permit = release.acquire().await;
         }
+        let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        self.db_query_with_receipt(address, query, params, receipt, retry_until).await
+    }
+
+    async fn db_query_with_receipt(
+        &self,
+        address: &str,
+        query: &str,
+        params: &Value,
+        mut receipt: DbQueryReceipt,
+        retry_until: tokio::time::Instant,
+    ) -> Result<Vec<Value>, String> {
         // `query` is page-supplied (the `dbQuery` WS command passes it verbatim),
         // so run it read-only: the authorizer refuses writes, DDL, and ATTACH.
         // dbQuery is not admin- or owner-gated, so on the public gateway this is
@@ -14424,14 +14413,12 @@ impl AppState {
         // bumps the generation, so a booting page's first query almost always
         // crossed a bump, and apps iterate the expected rows and died on the
         // error object (the frozen loading overlay).
-        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut last_ok: Option<Vec<Value>> = None;
         loop {
             let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
             let after = self
                 .recheck_db_query_receipt(address, &receipt.canonical)
                 .await;
-            let within_budget = std::time::Instant::now() < retry_until;
+            let within_budget = tokio::time::Instant::now() < retry_until;
             match after {
                 Some(after) if Self::same_db_query_receipt(&receipt, &after) => {
                     if let Some(done) = self
@@ -14442,13 +14429,8 @@ impl AppState {
                     }
                 }
                 Some(after) if within_budget => {
-                    // Keep the freshest successful read: if the database
-                    // never sits still inside the budget, a consistent
-                    // slightly-stale snapshot beats an error that kills the
-                    // page (apps iterate the rows they expect).
-                    if let Ok(rows) = result {
-                        last_ok = Some(rows);
-                    }
+                    // The old result may include revoked or newly filtered
+                    // rows. Retry using the new receipt without retaining it.
                     receipt = after;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
@@ -14461,7 +14443,7 @@ impl AppState {
                         receipt = fresh;
                     }
                 }
-                _ => return self.db_query_budget_exhausted(address, last_ok).await,
+                _ => return self.db_query_budget_exhausted(address).await,
             }
         }
     }
@@ -19234,248 +19216,6 @@ impl AppState {
         Ok(Value::Object(ret))
     }
 
-    /// Fill every merger xite's version-3 database from its merged xites: for
-    /// each merger, populate its db from each served xite whose `merged_type`
-    /// the merger accepts, tagging rows with the merged xite's address. Call
-    /// after the merged xites are served (or when they change).
-    pub async fn rebuild_merger_dbs(&self) {
-        loop {
-            let filter_epoch = self.db_filter_epoch();
-            let merger_epoch = self.db_merger_epoch();
-            let muted = self.muted_authors().await;
-            if self.db_filter_epoch() != filter_epoch
-                || self.db_merger_epoch() != merger_epoch
-            {
-                continue;
-            }
-            let registry = {
-                let xites = self.xites.read().await;
-                xites
-                    .iter()
-                    .map(|(key, xite)| {
-                        (
-                            key.clone(),
-                            canonical_address(xite.content.as_ref(), key),
-                            xite.storage.clone(),
-                            xite.content.clone(),
-                            xite.db_schema.clone(),
-                            xite
-                                .settings
-                                .permissions
-                                .iter()
-                                .filter_map(|permission| {
-                                    permission.strip_prefix("Merger:").map(String::from)
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let mut sources_by_canonical:
-                std::collections::BTreeMap<String, MergerDbSourceSnapshot> =
-                std::collections::BTreeMap::new();
-            let mut targets = Vec::new();
-            let mut snapshot_changed = false;
-            for (key, canonical, storage, content, current_schema, accepted_types) in registry {
-                let before = self.verified_index_epoch(&canonical);
-                let source_before = self.db_source_epoch(&canonical);
-                let authority = self
-                    .accepted_db_authority_for_root_locked(&canonical, content.as_ref())
-                    .ok();
-                let accepted_snapshot = match &authority {
-                    Some(authority) => Self::db_snapshot_from_authority(
-                        &canonical,
-                        &storage,
-                        authority,
-                    )
-                    .await
-                    .ok(),
-                    None => None,
-                };
-                if self.verified_index_epoch(&canonical) != before
-                    || self.db_source_epoch(&canonical) != source_before
-                {
-                    snapshot_changed = true;
-                    break;
-                }
-                let root = authority.as_ref().and_then(|authority| {
-                    authority
-                        .manifests
-                        .iter()
-                        .find(|manifest| manifest.inner_path == "content.json")
-                        .map(|manifest| &manifest.content)
-                });
-                if let Some(merged_type) = root
-                    .and_then(|content| content.get("merged_type"))
-                    .and_then(Value::as_str)
-                {
-                    if let Some(accepted_snapshot) = &accepted_snapshot {
-                        let source = MergerDbSourceSnapshot {
-                            canonical: canonical.clone(),
-                            storage: storage.clone(),
-                            merged_type: merged_type.to_string(),
-                            accepted_values: accepted_snapshot.values.clone(),
-                            verified_epoch: before,
-                            source_epoch: source_before,
-                        };
-                        match sources_by_canonical.get(&canonical) {
-                            Some(existing)
-                                if existing.storage.root() != source.storage.root() =>
-                            {
-                                snapshot_changed = true;
-                                break;
-                            }
-                            Some(_) => {}
-                            None => {
-                                sources_by_canonical.insert(canonical.clone(), source);
-                            }
-                        }
-                    }
-                }
-                if current_schema.as_ref().is_some_and(|schema| schema.version == 3) {
-                    let accepted_schema = accepted_snapshot.as_ref().and_then(|snapshot| {
-                        build_xite_db(
-                            &storage,
-                            &[],
-                            &snapshot.paths,
-                            Some(&snapshot.values),
-                        )
-                        .map(|(_, schema)| schema)
-                        .filter(|schema| schema.version == 3)
-                    });
-                    // A target whose current accepted inputs cannot be rebuilt
-                    // must not retain an old aggregate. Reuse only its already
-                    // installed schema to prepare a fresh empty handle. This is
-                    // fail closed and lets a later successful rebuild refill it.
-                    let populate_sources = accepted_schema.is_some();
-                    if let Some(schema) = accepted_schema.or(current_schema) {
-                        targets.push(MergerDbTargetSnapshot {
-                            key,
-                            canonical,
-                            storage,
-                            schema,
-                            accepted_types,
-                            verified_epoch: before,
-                            source_epoch: source_before,
-                            populate_sources,
-                        });
-                    }
-                }
-            }
-            if snapshot_changed {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            let sources = sources_by_canonical.into_values().collect::<Vec<_>>();
-            let mut prepared = Vec::with_capacity(targets.len());
-            for target in targets {
-                let db = Database::open_in_memory().ok().and_then(|db| {
-                    db.apply_schema(&target.schema).ok()?;
-                    if target.populate_sources {
-                        sources
-                            .iter()
-                            .filter(|source| target.accepted_types.contains(&source.merged_type))
-                            .try_for_each(|source| {
-                                db.populate_xite_values_filtered(
-                                    &target.schema,
-                                    &source.canonical,
-                                    &source.accepted_values,
-                                    &muted,
-                                )
-                                .map(|_| ())
-                            })
-                            .ok()?;
-                    }
-                    Some(db)
-                });
-                prepared.push(PreparedMergerDb { target, db });
-            }
-            #[cfg(test)]
-            let pause = {
-                self.merger_db_before_install_pause
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            };
-            #[cfg(test)]
-            if let Some((started, release)) = pause {
-                started.notify_one();
-                let _permit = release.acquire().await;
-            }
-            let mut canonicals = sources
-                .iter()
-                .map(|source| source.canonical.clone())
-                .chain(prepared.iter().map(|build| build.target.canonical.clone()))
-                .collect::<Vec<_>>();
-            canonicals.sort();
-            canonicals.dedup();
-            let mut tree_guards = Vec::with_capacity(canonicals.len());
-            let mut contended = false;
-            for canonical in &canonicals {
-                match self.tree_mutation_lock(canonical).try_lock_owned() {
-                    Ok(guard) => tree_guards.push(guard),
-                    Err(_) => {
-                        contended = true;
-                        break;
-                    }
-                }
-            }
-            if contended {
-                drop(tree_guards);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            let mut xites = self.xites.write().await;
-            let sources_current = self.db_filter_epoch() == filter_epoch
-                && self.db_merger_epoch() == merger_epoch
-                && sources.iter().all(|source| {
-                    self.verified_index_epoch(&source.canonical) == source.verified_epoch
-                    && self.db_source_epoch(&source.canonical) == source.source_epoch
-                    && xites.values().any(|xite| {
-                        xite.storage.root() == source.storage.root()
-                            && canonical_address(xite.content.as_ref(), &source.canonical)
-                                == source.canonical
-                    })
-                });
-            let targets_current = prepared.iter().all(|build| {
-                let target = &build.target;
-                self.verified_index_epoch(&target.canonical) == target.verified_epoch
-                    && self.db_source_epoch(&target.canonical) == target.source_epoch
-                    && xites.get(&target.key).is_some_and(|xite| {
-                        xite.storage.root() == target.storage.root()
-                            && canonical_address(xite.content.as_ref(), &target.key)
-                                == target.canonical
-                            && xite
-                                .settings
-                                .permissions
-                                .iter()
-                                .filter_map(|permission| {
-                                    permission.strip_prefix("Merger:").map(String::from)
-                                })
-                                .collect::<Vec<_>>()
-                                == target.accepted_types
-                    })
-            });
-            if !sources_current || !targets_current {
-                drop(xites);
-                drop(tree_guards);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            for build in prepared {
-                let Some(xite) = xites.get_mut(&build.target.key) else { continue };
-                xite.db = build.db;
-                xite.db_schema = Some(build.target.schema);
-                xite.db_verified_epoch = build.target.verified_epoch;
-                xite.db_source_epoch = build.target.source_epoch;
-                xite.db_merger_epoch = merger_epoch;
-                xite.db_generation = self.next_db_generation();
-                xite.db_filter_epoch = filter_epoch;
-            }
-            return;
-        }
-    }
-
     /// The merged xite + inner path for a `merged-<type>/<address>/<path>` path,
     /// if it is one (else `None`).
     pub fn split_merged_path(inner_path: &str) -> Option<(String, String)> {
@@ -20763,16 +20503,14 @@ impl AppState {
             manifest_permit.destination(&storage, inner_path);
         let path = destination.path(&destination_inner).map_err(|e| e.to_string())?;
         let now = now_secs().max(0) as u64;
-        let db_source_epochs = self.db_source_epochs.clone();
+        let state = self.owned_state();
         // Blocking: a cross-device materialize copies the whole file.
         tokio::task::spawn_blocking(move || {
             let _manifest_permit = manifest_permit;
             let result = store.materialize(id, &path, now);
             if result.is_ok() && !staged {
                 store.claim_manifest(id)?;
-                let mut epochs = db_source_epochs.lock().unwrap();
-                let epoch = epochs.entry(canonical).or_default();
-                *epoch = epoch.saturating_add(1);
+                state.bump_db_source_epoch(&canonical);
             }
             result
         })
@@ -21616,16 +21354,25 @@ impl AppState {
         let accepted_authority = self
             .accepted_db_authority_for_root_locked(&canonical, content.as_ref())
             .ok();
+        let governing_file = inner_path.ends_with("content.json") || inner_path == "dbschema.json";
         let accepted_snapshot = match &accepted_authority {
-            Some(authority) => Self::db_snapshot_from_authority(
-                &canonical,
-                &storage,
-                authority,
+            Some(authority) => Self::db_snapshot_from_authority_selected(
+                &canonical, &storage, authority, None,
+                if governing_file { None } else { Some(inner_path) },
             )
             .await
             .ok(),
             None => None,
         };
+        if accepted_authority.is_some() && accepted_snapshot.is_none() {
+            // A failed accepted-input check also invalidates any cached merger
+            // projection. It must not keep a formerly accepted row current.
+            self.bump_db_source_epoch(&canonical);
+            drop(tree);
+            drop(_activation);
+            self.rebuild_merger_dbs().await;
+            return;
+        }
         let accepted_paths = accepted_snapshot
             .as_ref()
             .map(|snapshot| snapshot.paths.clone())
@@ -21639,12 +21386,12 @@ impl AppState {
         // must reach rebuild_xite_db and the event tail (bump_modified,
         // file_done, pool-rule/RLN-roster refresh) even on a xite with no
         // accepted authority yet - those read the already-adopted content.
-        let governing_file =
-            inner_path.ends_with("content.json") || inner_path == "dbschema.json";
         if !governing_file && !accepted_paths.iter().any(|path| path == inner_path) {
             return;
         }
+        let previous_merger_epoch = self.db_merger_epoch();
         let source_epoch = self.bump_db_source_epoch(&canonical);
+        let merger_epoch = self.db_merger_epoch();
         let accepted_root = accepted_authority.as_ref().and_then(|authority| {
             authority
                 .manifests
@@ -21721,6 +21468,19 @@ impl AppState {
             current.db_generation = self.next_db_generation();
             current.db_filter_epoch = filter_epoch;
         }
+        let delta = if merged && !governing_changed {
+            accepted_authority.as_ref().zip(accepted_snapshot.as_ref()).and_then(|(authority, snapshot)| {
+                let (_, value) = snapshot.values.iter().find(|(path, _)| path == inner_path)?;
+                Some(merger_index::VerifiedInputDelta {
+                    canonical: canonical.clone(), storage: storage.clone(), content: content.clone(),
+                    verified_epoch: self.verified_index_epoch(&canonical), source_epoch,
+                    previous_merger_epoch, merger_epoch, filter_epoch,
+                    path: inner_path.to_string(), value: value.clone(),
+                    authority: Self::merger_authority_digest(authority).ok()?,
+                    merged_type: accepted_root.as_ref()?.get("merged_type")?.as_str()?.to_string(),
+                })
+            })
+        } else { None };
         drop(tree);
         drop(_activation);
         // A failed rebuild (an unverified or unowned local xite has no db
@@ -21729,8 +21489,12 @@ impl AppState {
         // already-ADOPTED content and are independent of the database.
         // Only the merger propagation depends on a fresh db.
         let db_rebuilt = !governing_changed || self.rebuild_xite_db(address).await;
-        if db_rebuilt && merged {
-            self.rebuild_merger_dbs().await;
+        if db_rebuilt && merged && !governing_changed {
+            let incremental = match delta {
+                Some(delta) => self.update_merger_input(delta).await,
+                None => false,
+            };
+            if !incremental { self.rebuild_merger_dbs().await; }
         }
         let _activation = self.xite_activation_gate.clone().read_owned().await;
         let event_tree = self.tree_mutation_lock(&canonical).lock_owned().await;
@@ -22602,17 +22366,32 @@ impl AppState {
         authority: &VerifiedDbAuthority,
         staged: Option<&ManifestTransaction>,
     ) -> Result<AcceptedDbSnapshot, String> {
+        Self::db_snapshot_from_authority_selected(canonical, storage, authority, staged, None).await
+    }
+
+    async fn db_snapshot_from_authority_selected(
+        canonical: &str,
+        storage: &XiteStorage,
+        authority: &VerifiedDbAuthority,
+        staged: Option<&ManifestTransaction>,
+        selected: Option<&str>,
+    ) -> Result<AcceptedDbSnapshot, String> {
         let manifests = &authority.manifests;
         let paths = Self::db_paths_from_manifests(manifests)?;
         let mut values = std::collections::BTreeMap::new();
         for manifest in manifests {
-            values.insert(manifest.inner_path.clone(), manifest.content.clone());
+            if selected.is_none_or(|path| path == manifest.inner_path) {
+                values.insert(manifest.inner_path.clone(), manifest.content.clone());
+            }
         }
         let contents = manifests
             .iter()
             .map(|manifest| (manifest.inner_path.clone(), manifest.content.clone()))
             .collect::<HashMap<_, _>>();
-        let inputs = Self::collect_db_inputs(authority)?;
+        let mut inputs = Self::collect_db_inputs(authority)?;
+        if let Some(selected) = selected {
+            inputs.retain(|path, _| path == selected);
+        }
         let names = Self::merge_input_xid_names(&inputs, &contents)?;
         #[cfg(test)]
         {
@@ -22626,33 +22405,32 @@ impl AppState {
         }
         let xid_map = Self::resolve_xid_names_checked(names).await?;
         let now = epix_core::now_ms();
-        for (full, input) in inputs {
-            let staged_source = Self::staged_db_input_source(staged, &full);
-            if staged_source.is_none() && !storage.exists(&full) {
-                continue;
+        let staged_sources = inputs.keys().filter_map(|full| {
+            Self::staged_db_input_source(staged, full).map(|source| (full.clone(), source))
+        }).collect::<HashMap<_, _>>();
+        let canonical = canonical.to_string();
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            for (full, input) in inputs {
+                let staged_source = staged_sources.get(&full);
+                if staged_source.is_none() && !storage.exists(&full) {
+                    continue;
+                }
+                let (read_storage, read_path) = match staged_source {
+                    Some((stage, inner)) => (stage, inner.as_str()),
+                    None => (&storage, full.as_str()),
+                };
+                let source = DbInputSource { storage: read_storage, path: read_path, full: &full };
+                let value = match input {
+                    AcceptedDbInput::Merged(declaration) => Self::merged_db_value(
+                        &canonical, &declaration, &contents, &xid_map, &source, now,
+                    )?,
+                    AcceptedDbInput::Immutable(entry) => Self::immutable_db_value(&entry, &source)?,
+                };
+                values.insert(full, value);
             }
-            let (read_storage, read_path) = match &staged_source {
-                Some((stage, inner)) => (stage, inner.as_str()),
-                None => (storage, full.as_str()),
-            };
-            let source = DbInputSource { storage: read_storage, path: read_path, full: &full };
-            let value = match input {
-                AcceptedDbInput::Merged(declaration) => Self::merged_db_value(
-                    canonical,
-                    &declaration,
-                    &contents,
-                    &xid_map,
-                    &source,
-                    now,
-                )?,
-                AcceptedDbInput::Immutable(entry) => Self::immutable_db_value(&entry, &source)?,
-            };
-            values.insert(full, value);
-        }
-        Ok(AcceptedDbSnapshot {
-            paths,
-            values: values.into_iter().collect(),
-        })
+            Ok(AcceptedDbSnapshot { paths, values: values.into_iter().collect() })
+        }).await.map_err(|error| format!("database input worker failed: {error}"))?
     }
 
     /// Every declared .json data file the snapshot reads, keyed by inner
@@ -30942,8 +30720,8 @@ impl AppState {
     /// - Retry passes notify only on completion (with the xite re-checked to
     ///   still exist - a deleted xite's empty missing-list must not toast
     ///   "Downloaded"); the toggle's own pass already reported any failure.
-    /// Warm every served xite's in-memory database in the background. Xite
-    /// dbs live only in RAM (see the startup note on `rebuild_merger_dbs`),
+    /// Warm ordinary in-memory xite databases in the background. Persistent
+    /// merger databases are reconciled separately after the complete restore,
     /// so after a restart the dashboard's first feedQuery used to trigger
     /// every rebuild lazily - racing the 10s per-feed deadline and the
     /// post-boot update churn, which left the feed empty until a later
@@ -30958,7 +30736,8 @@ impl AppState {
                 let xites = state.xites.read().await;
                 xites
                     .iter()
-                    .filter(|(_, xite)| xite.storage.exists("dbschema.json"))
+                    .filter(|(_, xite)| xite.storage.exists("dbschema.json")
+                        && !xite.db_schema.as_ref().is_some_and(|schema| schema.version == 3))
                     .filter_map(|(key, xite)| {
                         seen.insert(canonical_address(xite.content.as_ref(), key))
                             .then(|| key.clone())
@@ -32449,6 +32228,7 @@ impl AppState {
             )
             .await
         else {
+            self.bump_db_source_epoch(&canonical);
             self.log(
                 "DEBUG",
                 format!(
@@ -32460,7 +32240,9 @@ impl AppState {
             return false;
         };
         let epoch = self.verified_index_epoch(&canonical);
-        let source_epoch = self.db_source_epoch(&canonical);
+        // Explicit rebuilds re-read accepted inputs, even when a caller wrote
+        // them without an ingest notification. Retire the merger reuse receipt.
+        let source_epoch = self.bump_db_source_epoch(&canonical);
         let built = build_xite_db(
             &storage,
             &muted,
@@ -32495,7 +32277,7 @@ impl AppState {
             }
             match built {
                 Some((db, schema)) => {
-                    current.db = Some(db);
+                    current.db = if schema.version == 3 { None } else { Some(db) };
                     current.db_schema = Some(schema);
                 }
                 None => {
@@ -32517,6 +32299,9 @@ impl AppState {
         // caller that doesn't follow up itself - the dbRebuild/dbReload ws
         // command, db_query's lazy build, a mute change - leaves the merger
         // xite with no data until the next restart.
+        if is_merger && !self.reset_merger_index(address).await {
+            return false;
+        }
         if is_merger || is_merged_source {
             self.rebuild_merger_dbs().await;
         }
@@ -34727,6 +34512,9 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+
+    include!("state/merger_index_tests.rs");
+    include!("state/merger_cache_tests.rs");
 
     /// Mint an identity address, link it as `name` offline (the chain stand-in
     /// lists it as active) and return its address. The first link becomes the
@@ -46897,7 +46685,17 @@ mod tests {
                 epix_content::dumps_content(&source_v2).as_bytes(),
             )
             .unwrap();
-        state.update_content(&source, Some(source_v2)).await;
+        let source_epoch = state.db_source_epoch(&source);
+        let update = {
+            let state = state.clone();
+            let source = source.clone();
+            tokio::spawn(async move { state.update_content(&source, Some(source_v2)).await })
+        };
+        db_test_step("source root changed before merger install", async {
+            while state.db_source_epoch(&source) == source_epoch {
+                tokio::task::yield_now().await;
+            }
+        }).await;
         state
             .refresh_verified_object_paths(&source, &source, &source_storage)
             .await
@@ -46910,6 +46708,7 @@ mod tests {
         assert!(!rebuild.is_finished(), "rebuild abandoned a contended authority tree");
         drop(source_tree);
         db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
+        db_test_step("source root update completed", update).await.unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)
@@ -47032,6 +46831,78 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn db_query_budget_expiry_never_returns_retired_rows() {
+        for retirement in ["unavailable", "authority", "filter", "membership"] {
+            let (_dir, state, merger) = merger_with_one_post().await;
+            let receipt = state.current_receipt_for(&merger).await.unwrap();
+            // First retire a handle while a replacement remains available.
+            // Its successful SQL result must not become a fallback answer.
+            state.xites.write().await.get_mut(&merger).unwrap().db_generation =
+                state.next_db_generation();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let query = state.db_query_with_receipt(
+                &merger,
+                "SELECT title FROM post",
+                &Value::Null,
+                receipt,
+                deadline,
+            );
+            tokio::pin!(query);
+            assert!(
+                futures_util::poll!(&mut query).is_pending(),
+                "changed receipt must enter its retry wait"
+            );
+
+            // Retire the replacement during that wait, then exhaust the
+            // budget before its next read. This covers persistent refresh,
+            // authority revocation, local filtering, and merger permission.
+            match retirement {
+                "unavailable" => {
+                    state.xites.write().await.get_mut(&merger).unwrap().db = None;
+                }
+                "authority" => {
+                    state.bump_verified_index_epoch(&merger);
+                }
+                "filter" => {
+                    state.bump_db_filter_epoch();
+                }
+                "membership" => {
+                    state.remove_permission(&merger, "Merger:EpixPost").await;
+                }
+                _ => unreachable!(),
+            }
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+            let result = query.await;
+            assert_eq!(
+                result.unwrap_err(),
+                "database authority changed while query ran",
+                "retired rows escaped after {retirement}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn db_query_retries_an_ordinary_receipt_change() {
+        let (_dir, state, merger) = merger_with_one_post().await;
+        let receipt = state.current_receipt_for(&merger).await.unwrap();
+        state.xites.write().await.get_mut(&merger).unwrap().db_generation =
+            state.next_db_generation();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let rows = state
+            .db_query_with_receipt(
+                &merger,
+                "SELECT title FROM post",
+                &Value::Null,
+                receipt,
+                deadline,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "hello");
+    }
+
     #[tokio::test]
     async fn db_query_discards_a_detached_pre_revocation_handle() {
         let (_dir, state, merger) = merger_with_one_post().await;
@@ -47142,16 +47013,24 @@ mod tests {
         };
         db_test_step("database pause reached", started.notified()).await;
 
-        state
-            .delete_file(&source, "data/u/data.json", None)
-            .await
-            .unwrap();
+        let source_epoch = state.db_source_epoch(&source);
+        let delete = {
+            let state = state.clone();
+            let source = source.clone();
+            tokio::spawn(async move { state.delete_file(&source, "data/u/data.json", None).await })
+        };
+        db_test_step("source deletion changed its epoch before install", async {
+            while state.db_source_epoch(&source) == source_epoch {
+                tokio::task::yield_now().await;
+            }
+        }).await;
         state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         release.add_permits(1);
         db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
+        db_test_step("source deletion completed", delete).await.unwrap().unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)

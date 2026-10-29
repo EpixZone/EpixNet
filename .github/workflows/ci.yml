@@ -143,7 +143,9 @@ jobs:
       # binds loopback only. The 310s idle-reaper test in epix-runtime is
       # #[ignore]d and stays skipped.
       - name: Test EDX runtime, UI and wire crates
-        run: cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
+        run: |
+          cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
+          cargo test -p epix-ui --example merger_index_benchmark --locked
       # Security-critical channel suites must execute, not merely compile under
       # `build --all-targets`. These cover finality-backed identity resolution,
       # durable ratchet/outbox behavior, pairwise and group engines, and RLN.

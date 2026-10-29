@@ -3,19 +3,69 @@
 //! A pooled [`Database`] (rusqlite + r2d2), per-xite schemas applied from a
 //! xite's `dbschema.json` ([`schema`]), and the global [`ContentDb`].
 
+mod cache;
 pub mod content_db;
+pub mod derived;
 pub mod populate;
 pub mod schema;
 
 pub use content_db::ContentDb;
+pub use derived::{DeltaMetrics, DerivedIndex, SourceEntry, SourceVersion};
 pub use schema::{DbSchema, MapSettings, TableSchema, ToTable};
 
 use epix_core::{Error, Result};
 use r2d2::Pool;
 use r2d2_sqlite::SqliteConnectionManager;
 use serde_json::Value;
+use std::sync::Arc;
 
-pub type PooledConn = r2d2::PooledConnection<SqliteConnectionManager>;
+pub type PooledConn = r2d2::PooledConnection<ConnectionManager>;
+
+/// Opaque pooled connection which keeps a private-cache lease until SQLite has
+/// closed the underlying connection. Dereferences to `rusqlite::Connection`.
+#[derive(Debug)]
+pub struct ManagedConnection {
+    connection: rusqlite::Connection,
+    _lease: Option<Arc<cache::CacheLease>>,
+}
+
+impl std::ops::Deref for ManagedConnection {
+    type Target = rusqlite::Connection;
+    fn deref(&self) -> &Self::Target {
+        &self.connection
+    }
+}
+
+impl std::ops::DerefMut for ManagedConnection {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.connection
+    }
+}
+
+/// Pool manager retaining a private-cache lease during connection creation and
+/// background pool checks, as well as in every connection it creates.
+#[derive(Debug)]
+pub struct ConnectionManager {
+    inner: SqliteConnectionManager,
+    lease: Option<Arc<cache::CacheLease>>,
+}
+
+impl r2d2::ManageConnection for ConnectionManager {
+    type Connection = ManagedConnection;
+    type Error = rusqlite::Error;
+    fn connect(&self) -> std::result::Result<Self::Connection, Self::Error> {
+        Ok(ManagedConnection {
+            connection: self.inner.connect()?,
+            _lease: self.lease.clone(),
+        })
+    }
+    fn is_valid(&self, conn: &mut Self::Connection) -> std::result::Result<(), Self::Error> {
+        self.inner.is_valid(&mut conn.connection)
+    }
+    fn has_broken(&self, conn: &mut Self::Connection) -> bool {
+        self.inner.has_broken(&mut conn.connection)
+    }
+}
 
 /// An atomic operation that also composes with a caller's transaction. The
 /// savepoint rolls back on errors and unwinding without ending an outer transaction.
@@ -49,23 +99,32 @@ pub(crate) fn atomic<T>(
 /// A connection pool over a single SQLite database.
 #[derive(Clone)]
 pub struct Database {
-    pool: Pool<SqliteConnectionManager>,
+    pool: Pool<ConnectionManager>,
+    lease: Option<Arc<cache::CacheLease>>,
 }
 
 impl Database {
     /// Open (creating if needed) a file-backed database.
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let mgr = SqliteConnectionManager::file(path.as_ref());
-        Self::from_manager(mgr, 8)
+        Self::from_manager(mgr, 8, None)
     }
 
     /// A private in-memory database (pool size 1 so the single connection - and
     /// thus the data - is shared across all `conn()` calls). For tests.
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_manager(SqliteConnectionManager::memory(), 1)
+        Self::from_manager(SqliteConnectionManager::memory(), 1, None)
     }
 
-    fn from_manager(mgr: SqliteConnectionManager, max_size: u32) -> Result<Self> {
+    pub(crate) fn open_derived(lease: Arc<cache::CacheLease>) -> Result<Self> {
+        Self::from_manager(SqliteConnectionManager::file(lease.path()), 8, Some(lease))
+    }
+
+    fn from_manager(
+        mgr: SqliteConnectionManager,
+        max_size: u32,
+        lease: Option<Arc<cache::CacheLease>>,
+    ) -> Result<Self> {
         // WAL + foreign keys on every checked-out connection. A busy_timeout is
         // essential: with multiple pooled connections (and background indexers
         // writing concurrently with the WS command path) SQLite serializes
@@ -77,11 +136,22 @@ impl Database {
                 "PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON; PRAGMA busy_timeout=5000;",
             )
         });
+        let mgr = ConnectionManager {
+            inner: mgr,
+            lease: lease.clone(),
+        };
         let pool = Pool::builder()
             .max_size(max_size)
             .build(mgr)
             .map_err(|e| Error::Db(e.to_string()))?;
-        Ok(Self { pool })
+        Ok(Self { pool, lease })
+    }
+
+    pub(crate) fn retire_derived(&self) -> Result<()> {
+        self.lease
+            .as_ref()
+            .ok_or_else(|| Error::Db("database is not a private derived cache".into()))?
+            .retire()
     }
 
     /// Check out a pooled connection.
@@ -301,12 +371,19 @@ impl Database {
 fn read_only_authorizer(ctx: rusqlite::hooks::AuthContext<'_>) -> rusqlite::hooks::Authorization {
     use rusqlite::hooks::{AuthAction, Authorization};
     match ctx.action {
+        AuthAction::Read { table_name, .. } if internal_identifier(table_name) => {
+            Authorization::Deny
+        }
         AuthAction::Select
         | AuthAction::Read { .. }
         | AuthAction::Function { .. }
         | AuthAction::Recursive => Authorization::Allow,
         _ => Authorization::Deny,
     }
+}
+
+pub(crate) fn internal_identifier(name: &str) -> bool {
+    name.to_ascii_lowercase().starts_with("__epix_")
 }
 
 /// Clears the authorizer on drop, so a pooled connection never carries the

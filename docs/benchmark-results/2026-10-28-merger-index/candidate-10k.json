@@ -1,0 +1,314 @@
+{
+  "benchmark": "epix-signed-merger-index",
+  "build_profile": "release-assertions-disabled",
+  "environment": {
+    "architecture": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) CPU E5-1620 0 @ 3.60GHz",
+    "logical_cpus": 8,
+    "memory_total": "MemTotal:       31738632 kB",
+    "os": "linux"
+  },
+  "executable_blake3": "42507ca4144fb5d3d576a8eba298766b93f1707f5b17e7ac2b3d54734dc6ae96",
+  "fixture": {
+    "full_trove_release_fixture": false,
+    "generation_ms": null,
+    "hubs": 1,
+    "items": 10000,
+    "media_bytes": 0,
+    "owner_signed_hubs": true,
+    "records_per_segment": 1024,
+    "signed_record_verification": true
+  },
+  "format": 1,
+  "git_commit_at_run": "d6d669d75bcaf08b63f07498d95d61e7f641e134",
+  "git_dirty_at_run": false,
+  "initial": {
+    "cache_state": "fresh process; operating-system filesystem cache was not cleared",
+    "disk": {
+      "data_bytes": 3716902,
+      "derived_index_v1_bytes": 10333408,
+      "private_bytes": 27206897,
+      "total_bytes": 30924140
+    },
+    "distinct_hub_author_item_ids": 10000,
+    "elapsed_ms": 6635.410507,
+    "explicit_reconcile_index_work": {
+      "cache_recoveries": 0,
+      "changed_sources": 0,
+      "explicit_resets": 0,
+      "reconciliations": 1,
+      "replayed_bytes": 0,
+      "replayed_sources": 0,
+      "reused_hubs": 1,
+      "skipped_sources": 0,
+      "verified_input_files": 0
+    },
+    "explicit_reconcile_ms": 0.604451,
+    "index_stats_after_ready": {
+      "cache_recoveries": 0,
+      "changed_sources": 10,
+      "explicit_resets": 0,
+      "reconciliations": 4,
+      "replayed_bytes": 3712486,
+      "replayed_sources": 10,
+      "reused_hubs": 2,
+      "skipped_sources": 1,
+      "verified_input_files": 11
+    },
+    "index_stats_after_registration": {
+      "cache_recoveries": 0,
+      "changed_sources": 10,
+      "explicit_resets": 0,
+      "reconciliations": 3,
+      "replayed_bytes": 3712486,
+      "replayed_sources": 10,
+      "reused_hubs": 1,
+      "skipped_sources": 1,
+      "verified_input_files": 11
+    },
+    "index_stats_final": {
+      "cache_recoveries": 0,
+      "changed_sources": 17,
+      "explicit_resets": 0,
+      "reconciliations": 4,
+      "replayed_bytes": 6355385,
+      "replayed_sources": 17,
+      "reused_hubs": 2,
+      "skipped_sources": 2,
+      "verified_input_files": 19
+    },
+    "live_rows": 10000,
+    "phase": "initial",
+    "process_memory": {
+      "peak_rss_bytes": 57888768,
+      "rss_bytes": 54562816,
+      "source": "Linux /proc/self/status"
+    },
+    "queries": {
+      "deep_page_query_plan": [
+        {
+          "detail": "SEARCH item USING INDEX item_ordinal (ordinal>?)",
+          "id": 5,
+          "notused": 202,
+          "parent": 0
+        }
+      ],
+      "latencies": {
+        "deep_keyset_page": {
+          "max_ms": 0.076937,
+          "min_ms": 0.049526,
+          "p50_ms": 0.050539,
+          "p95_ms": 0.06452200000000001,
+          "p99_ms": 0.072294,
+          "samples": 100
+        },
+        "first_page": {
+          "max_ms": 0.130855,
+          "min_ms": 0.062184,
+          "p50_ms": 0.06333000000000001,
+          "p95_ms": 0.07217799999999999,
+          "p99_ms": 0.087477,
+          "samples": 100
+        },
+        "indexed_lookup": {
+          "max_ms": 0.046124,
+          "min_ms": 0.026361,
+          "p50_ms": 0.0269,
+          "p95_ms": 0.033556,
+          "p99_ms": 0.0347,
+          "samples": 100
+        },
+        "indexed_type_filter": {
+          "max_ms": 0.097114,
+          "min_ms": 0.069521,
+          "p50_ms": 0.07492599999999999,
+          "p95_ms": 0.089977,
+          "p99_ms": 0.094455,
+          "samples": 100
+        }
+      }
+    },
+    "ready_with_correct_count_ms": 4568.223415,
+    "registration_ms": 4567.4888630000005,
+    "updates": {
+      "same_segment_withdrawal_and_reinstatement": true,
+      "signed_segment_index_work": [
+        {
+          "cache_recoveries": 0,
+          "changed_sources": 1,
+          "explicit_resets": 0,
+          "reconciliations": 0,
+          "replayed_bytes": 376523,
+          "replayed_sources": 1,
+          "reused_hubs": 0,
+          "skipped_sources": 0,
+          "verified_input_files": 1
+        },
+        {
+          "cache_recoveries": 0,
+          "changed_sources": 1,
+          "explicit_resets": 0,
+          "reconciliations": 0,
+          "replayed_bytes": 376870,
+          "replayed_sources": 1,
+          "reused_hubs": 0,
+          "skipped_sources": 0,
+          "verified_input_files": 1
+        },
+        {
+          "cache_recoveries": 0,
+          "changed_sources": 1,
+          "explicit_resets": 0,
+          "reconciliations": 0,
+          "replayed_bytes": 377217,
+          "replayed_sources": 1,
+          "reused_hubs": 0,
+          "skipped_sources": 0,
+          "verified_input_files": 1
+        },
+        {
+          "cache_recoveries": 0,
+          "changed_sources": 1,
+          "explicit_resets": 0,
+          "reconciliations": 0,
+          "replayed_bytes": 377564,
+          "replayed_sources": 1,
+          "reused_hubs": 0,
+          "skipped_sources": 0,
+          "verified_input_files": 1
+        },
+        {
+          "cache_recoveries": 0,
+          "changed_sources": 1,
+          "explicit_resets": 0,
+          "reconciliations": 0,
+          "replayed_bytes": 377911,
+          "replayed_sources": 1,
+          "reused_hubs": 0,
+          "skipped_sources": 0,
+          "verified_input_files": 1
+        }
+      ],
+      "signed_segment_ingest": {
+        "max_ms": 249.470208,
+        "min_ms": 191.071924,
+        "p50_ms": 211.559702,
+        "p95_ms": 249.470208,
+        "p99_ms": 249.470208,
+        "samples": 5
+      },
+      "unauthorized_author_rejected": true
+    }
+  },
+  "label": "candidate-d6d669d-release",
+  "restart": {
+    "cache_state": "fresh process; operating-system filesystem cache was not cleared",
+    "disk": {
+      "data_bytes": 3716902,
+      "derived_index_v1_bytes": 5558272,
+      "private_bytes": 22410913,
+      "total_bytes": 26132786
+    },
+    "distinct_hub_author_item_ids": 10000,
+    "elapsed_ms": 2852.547967,
+    "explicit_reconcile_index_work": {
+      "cache_recoveries": 0,
+      "changed_sources": 0,
+      "explicit_resets": 0,
+      "reconciliations": 1,
+      "replayed_bytes": 0,
+      "replayed_sources": 0,
+      "reused_hubs": 1,
+      "skipped_sources": 0,
+      "verified_input_files": 0
+    },
+    "explicit_reconcile_ms": 0.5486179999999999,
+    "index_stats_after_ready": {
+      "cache_recoveries": 0,
+      "changed_sources": 0,
+      "explicit_resets": 0,
+      "reconciliations": 2,
+      "replayed_bytes": 0,
+      "replayed_sources": 0,
+      "reused_hubs": 1,
+      "skipped_sources": 11,
+      "verified_input_files": 11
+    },
+    "index_stats_after_registration": {
+      "cache_recoveries": 0,
+      "changed_sources": 0,
+      "explicit_resets": 0,
+      "reconciliations": 1,
+      "replayed_bytes": 0,
+      "replayed_sources": 0,
+      "reused_hubs": 0,
+      "skipped_sources": 11,
+      "verified_input_files": 11
+    },
+    "index_stats_final": {
+      "cache_recoveries": 0,
+      "changed_sources": 0,
+      "explicit_resets": 0,
+      "reconciliations": 2,
+      "replayed_bytes": 0,
+      "replayed_sources": 0,
+      "reused_hubs": 1,
+      "skipped_sources": 11,
+      "verified_input_files": 11
+    },
+    "live_rows": 10000,
+    "phase": "restart",
+    "process_memory": {
+      "peak_rss_bytes": 47169536,
+      "rss_bytes": 46563328,
+      "source": "Linux /proc/self/status"
+    },
+    "queries": {
+      "deep_page_query_plan": [
+        {
+          "detail": "SEARCH item USING INDEX item_ordinal (ordinal>?)",
+          "id": 5,
+          "notused": 202,
+          "parent": 0
+        }
+      ],
+      "latencies": {
+        "deep_keyset_page": {
+          "max_ms": 0.075703,
+          "min_ms": 0.049437,
+          "p50_ms": 0.049971,
+          "p95_ms": 0.066997,
+          "p99_ms": 0.074255,
+          "samples": 100
+        },
+        "first_page": {
+          "max_ms": 0.100331,
+          "min_ms": 0.053788,
+          "p50_ms": 0.054688999999999995,
+          "p95_ms": 0.076493,
+          "p99_ms": 0.08074,
+          "samples": 100
+        },
+        "indexed_lookup": {
+          "max_ms": 0.041337,
+          "min_ms": 0.026911,
+          "p50_ms": 0.027683,
+          "p95_ms": 0.038451,
+          "p99_ms": 0.039946,
+          "samples": 100
+        },
+        "indexed_type_filter": {
+          "max_ms": 0.144728,
+          "min_ms": 0.07539699999999999,
+          "p50_ms": 0.081825,
+          "p95_ms": 0.111486,
+          "p99_ms": 0.125818,
+          "samples": 100
+        }
+      }
+    },
+    "ready_with_correct_count_ms": 2776.776,
+    "registration_ms": 2776.0318,
+    "updates": null
+  }
+}
