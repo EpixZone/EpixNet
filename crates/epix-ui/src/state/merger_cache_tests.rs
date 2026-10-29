@@ -444,12 +444,15 @@ async fn merger_pending_refresh_survives_install_lock_contention() {
     )
     .await;
     let verified = state.merger_index_stats()["verified_input_files"].clone();
-    let reused = state.merger_index_stats()["reused_hubs"].as_u64().unwrap();
+    let generation = state.xites.read().await.get(&merger).unwrap().db_generation;
     let tree = state.tree_mutation_lock(&merger).lock_owned().await;
     state.merger_db_before_install_pause.lock().unwrap().take();
     release.add_permits(1);
-    db_test_step("contended install reused its completed source", async {
-        while state.merger_index_stats()["reused_hubs"].as_u64().unwrap() == reused {
+    // A retry withdraws handles before visiting registry entries. Waiting for
+    // hub reuse while holding this tree would depend on HashMap order: the
+    // refresh may visit the frontend and block on our lock before its source.
+    db_test_step("contended install began another preparation", async {
+        while state.xites.read().await.get(&merger).unwrap().db_generation == generation {
             tokio::task::yield_now().await;
         }
     })
