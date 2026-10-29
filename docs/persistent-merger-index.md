@@ -56,9 +56,12 @@ by clearing the ledger and rows transactionally, then reconciling. Lazy queries
 request reconciliation without resetting the whole index.
 
 Removing a frontend or changing its schema retires unused cache generations.
-Unpublished preparations are also retired if reconciliation fails or is
-superseded. SQLite connections, database handles, and workers retain a shared
-file lease; deletion waits until the final lease closes. Normal shutdown preserves
+Prepared work stays private across freshness retries for the same schema and
+context, reusing completed hubs whose authority and filter receipts still match.
+Unpublished preparations are retired on terminal reconciliation failure or when
+their schema/context generation is abandoned. SQLite connections, database
+handles, and workers retain a shared file lease; deletion waits until the final
+lease closes. Normal shutdown preserves
 published caches. A verified reopen of the same schema/context can cancel pending
 retirement. Durable retirement markers allow a later startup to retry cleanup.
 None of these operations deletes signed source files or optional media.

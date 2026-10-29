@@ -32,6 +32,23 @@ async fn restore_merger_fixture(
     merger: &str,
     entries: &[(String, XiteEntry)],
 ) -> Arc<AppState> {
+    let state = prepare_merger_restore(root, merger, entries).await;
+    state.rebuild_merger_dbs().await;
+    assert_eq!(
+        state
+            .db_query(merger, "SELECT title FROM post", &Value::Null)
+            .await
+            .unwrap(),
+        vec![json!({"title":"hello"})]
+    );
+    state
+}
+
+async fn prepare_merger_restore(
+    root: &Path,
+    merger: &str,
+    entries: &[(String, XiteEntry)],
+) -> Arc<AppState> {
     let state = AppState::with_data_dir("persistent-index-test", root);
     state.set_boot_restore_pending(true);
     // Force the frontend to arrive first, before its sources. Partial restore
@@ -61,14 +78,6 @@ async fn restore_merger_fixture(
     assert_eq!(state.merger_index_stats()["replayed_sources"], 0);
     assert!(state.current_receipt_for(merger).await.is_none());
     state.set_boot_restore_pending(false);
-    state.rebuild_merger_dbs().await;
-    assert_eq!(
-        state
-            .db_query(merger, "SELECT title FROM post", &Value::Null)
-            .await
-            .unwrap(),
-        vec![json!({"title":"hello"})]
-    );
     state
 }
 
@@ -353,4 +362,191 @@ async fn merger_failed_unpublished_generation_is_removed_without_retiring_publis
         published[0].is_file(),
         "published cache was retired by a provisional guard"
     );
+}
+
+#[tokio::test]
+async fn merger_pending_refresh_reuses_completed_hubs_after_epoch_retry() {
+    for restarting in [false, true] {
+        let (dir, original, merger, persisted_root, entries) = persistent_merger_fixture().await;
+        drop(original);
+        let root = if restarting {
+            persisted_root
+        } else {
+            dir.path().join("initial-refresh-retry")
+        };
+        let state = prepare_merger_restore(&root, &merger, &entries).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *state.merger_db_before_install_pause.lock().unwrap() =
+            Some((started.clone(), release.clone()));
+        let refresh = {
+            let state = state.clone();
+            tokio::spawn(async move { state.rebuild_merger_dbs().await })
+        };
+        db_test_step(
+            "pending generation reached installation",
+            started.notified(),
+        )
+        .await;
+        let expected_replays = if restarting { 0 } else { 1 };
+        assert_eq!(
+            state.merger_index_stats()["replayed_sources"],
+            expected_replays
+        );
+        let verified = state.merger_index_stats()["verified_input_files"].clone();
+        assert!(state.current_receipt_for(&merger).await.is_none());
+
+        // Only the target generation changes. The accepted source hub remains
+        // identical and must survive the retry without another scan or replay.
+        state.bump_db_source_epoch(&merger);
+        state.merger_db_before_install_pause.lock().unwrap().take();
+        release.add_permits(1);
+        db_test_step("pending generation retried successfully", refresh)
+            .await
+            .unwrap();
+        assert_eq!(
+            state
+                .db_query(&merger, "SELECT title FROM post", &Value::Null)
+                .await
+                .unwrap(),
+            vec![json!({ "title": "hello" })]
+        );
+        assert_eq!(
+            state.merger_index_stats()["replayed_sources"],
+            expected_replays,
+            "freshness retry discarded a completed projection (restart={restarting})"
+        );
+        assert_eq!(
+            state.merger_index_stats()["verified_input_files"],
+            verified,
+            "freshness retry rescanned an unchanged hub (restart={restarting})"
+        );
+    }
+}
+
+#[tokio::test]
+async fn merger_pending_refresh_survives_install_lock_contention() {
+    let (dir, original, merger, _persisted_root, entries) = persistent_merger_fixture().await;
+    drop(original);
+    let state =
+        prepare_merger_restore(&dir.path().join("contended-refresh"), &merger, &entries).await;
+    let started = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    *state.merger_db_before_install_pause.lock().unwrap() =
+        Some((started.clone(), release.clone()));
+    let refresh = {
+        let state = state.clone();
+        tokio::spawn(async move { state.rebuild_merger_dbs().await })
+    };
+    db_test_step(
+        "pending generation reached installation",
+        started.notified(),
+    )
+    .await;
+    let verified = state.merger_index_stats()["verified_input_files"].clone();
+    let reused = state.merger_index_stats()["reused_hubs"].as_u64().unwrap();
+    let tree = state.tree_mutation_lock(&merger).lock_owned().await;
+    state.merger_db_before_install_pause.lock().unwrap().take();
+    release.add_permits(1);
+    db_test_step("contended install reused its completed source", async {
+        while state.merger_index_stats()["reused_hubs"].as_u64().unwrap() == reused {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(state.current_receipt_for(&merger).await.is_none());
+    drop(tree);
+    db_test_step("contended pending generation installed", refresh)
+        .await
+        .unwrap();
+    assert_eq!(state.merger_index_stats()["replayed_sources"], 1);
+    assert_eq!(state.merger_index_stats()["verified_input_files"], verified);
+    assert_eq!(
+        state
+            .db_query(&merger, "SELECT title FROM post", &Value::Null)
+            .await
+            .unwrap(),
+        vec![json!({ "title": "hello" })]
+    );
+}
+
+#[tokio::test]
+async fn merger_pending_refresh_revalidates_changed_sources_and_filters() {
+    for change in ["source", "filter"] {
+        let (dir, original, merger, _persisted_root, entries) = persistent_merger_fixture().await;
+        drop(original);
+        let source = entries
+            .iter()
+            .find(|(key, _)| key != &merger)
+            .unwrap()
+            .0
+            .clone();
+        let state =
+            prepare_merger_restore(&dir.path().join("changed-refresh"), &merger, &entries).await;
+        let started = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        *state.merger_db_before_install_pause.lock().unwrap() =
+            Some((started.clone(), release.clone()));
+        let refresh = {
+            let state = state.clone();
+            tokio::spawn(async move { state.rebuild_merger_dbs().await })
+        };
+        db_test_step(
+            "pending generation reached installation",
+            started.notified(),
+        )
+        .await;
+        let verified = state.merger_index_stats()["verified_input_files"]
+            .as_u64()
+            .unwrap();
+        let delete = if change == "source" {
+            let epoch = state.db_source_epoch(&source);
+            let task = {
+                let state = state.clone();
+                let source = source.clone();
+                tokio::spawn(
+                    async move { state.delete_file(&source, "data/u/data.json", None).await },
+                )
+            };
+            db_test_step("source changed before pending installation", async {
+                while state.db_source_epoch(&source) == epoch {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await;
+            Some(task)
+        } else {
+            // Apply the filter mutation without its separate rebuild/reset so
+            // this test exercises pending receipt invalidation itself.
+            state.filters.write().await["mutes"][source.as_str()] = json!({ "reason": "test" });
+            state.bump_db_filter_epoch();
+            None
+        };
+        state.merger_db_before_install_pause.lock().unwrap().take();
+        release.add_permits(1);
+        db_test_step("changed pending generation reconciled", refresh)
+            .await
+            .unwrap();
+        if let Some(delete) = delete {
+            db_test_step("source deletion completed", delete)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            state
+                .db_query(&merger, "SELECT title FROM post", &Value::Null)
+                .await
+                .unwrap()
+                .is_empty(),
+            "pending reuse bypassed a changed {change}"
+        );
+        assert!(
+            state.merger_index_stats()["verified_input_files"]
+                .as_u64()
+                .unwrap()
+                > verified,
+            "pending reuse skipped verification after a changed {change}"
+        );
+    }
 }

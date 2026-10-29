@@ -96,6 +96,7 @@ impl AppState {
         counters.replayed_bytes += delta.replayed_bytes;
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn open_merger_index(
         &self,
         key: &str,
@@ -104,10 +105,11 @@ impl AppState {
         schema: &DbSchema,
         types: &[String],
         filter_epoch: u64,
+        pending: &BTreeMap<String, CachedIndex>,
     ) -> Result<CachedIndex, String> {
         let context = digest(&(canonical, storage.root(), types))?;
         let fingerprint = digest(&(&context, schema))?;
-        let cached = {
+        let cached = pending.get(&fingerprint).cloned().or_else(|| {
             let caches = self.merger_indexes.lock().unwrap();
             caches
                 .get(key)
@@ -118,7 +120,7 @@ impl AppState {
                         .find(|cache| cache.fingerprint == fingerprint)
                 })
                 .cloned()
-        };
+        });
         if let Some(mut cached) = cached {
             if cached.filter_epoch != filter_epoch {
                 cached.sources.clear();
@@ -221,6 +223,10 @@ impl AppState {
         }
         let _writer = self.merger_index_refresh.lock().await;
         self.merger_index_counters.lock().unwrap().reconciliations += 1;
+        // A freshness retry must not retire an existing disk cache or discard
+        // completed hub work. Keep preparations private until final installation;
+        // terminal exit retires any generations that never become published.
+        let mut pending = BTreeMap::new();
         loop {
             if self.boot_restore_pending() {
                 return;
@@ -336,7 +342,15 @@ impl AppState {
                     .unwrap_or_else(|| current_schema.clone());
                 let cache = if accepted_schema.is_some() {
                     match self
-                        .open_merger_index(key, canonical, storage, &schema, types, filter_epoch)
+                        .open_merger_index(
+                            key,
+                            canonical,
+                            storage,
+                            &schema,
+                            types,
+                            filter_epoch,
+                            &pending,
+                        )
                         .await
                     {
                         Ok(cache) => Some(cache),
@@ -349,6 +363,9 @@ impl AppState {
                 } else {
                     None
                 };
+                if let Some(cache) = &cache {
+                    pending.insert(cache.fingerprint.clone(), cache.clone());
+                }
                 // Failed authority must not expose any persisted rows. Keep a
                 // fresh empty handle only for the existing fail-closed contract.
                 let db = if accepted_schema.is_none() {
@@ -480,6 +497,12 @@ impl AppState {
             if failed {
                 return;
             }
+            pending.extend(
+                targets
+                    .iter()
+                    .filter_map(|target| target.cache.as_ref())
+                    .map(|cache| (cache.fingerprint.clone(), cache.clone())),
+            );
             if retry {
                 tokio::task::yield_now().await;
                 continue;
@@ -528,6 +551,12 @@ impl AppState {
             if failed {
                 return;
             }
+            pending.extend(
+                targets
+                    .iter()
+                    .filter_map(|target| target.cache.as_ref())
+                    .map(|cache| (cache.fingerprint.clone(), cache.clone())),
+            );
             #[cfg(test)]
             let pause = self.merger_db_before_install_pause.lock().unwrap().clone();
             #[cfg(test)]
