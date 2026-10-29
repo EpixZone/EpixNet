@@ -4750,10 +4750,9 @@ async fn serve(
             .await;
     }
 
-    // Xite dbs are in-memory, so merger databases (Git Epix, Epix Post) are
-    // empty on every boot until filled from their merged xites - do it now
-    // that all restored xites are registered, or merger pages show nothing
-    // until some merger action happens to trigger a rebuild.
+    // Reconcile persistent merger indexes after restoration and default-xite
+    // registration. Unchanged projections are reused after source validation;
+    // ordinary xite databases are still warmed separately below.
     report(BootStage::RebuildingDatabases);
     state.rebuild_merger_dbs().await;
     // Per-xite dbs are just as boot-empty: warm them in the background so

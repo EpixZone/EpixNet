@@ -169,8 +169,20 @@ pub fn update_json(
     xite: &str,
 ) -> Result<bool> {
     crate::atomic(conn, || {
-        update_json_inner(conn, schema, rel_path, data, xite)
+        update_json_inner(conn, schema, rel_path, data, xite, false)
     })
+}
+
+/// The derived index installs replacement guards on this connection. Keep the
+/// current logical target aligned with each table route, including aliases.
+pub(crate) fn update_json_scoped(
+    conn: &Connection,
+    schema: &DbSchema,
+    rel_path: &str,
+    data: &Value,
+    xite: &str,
+) -> Result<bool> {
+    update_json_inner(conn, schema, rel_path, data, xite, true)
 }
 
 fn update_json_inner(
@@ -179,6 +191,7 @@ fn update_json_inner(
     rel_path: &str,
     data: &Value,
     xite: &str,
+    scoped: bool,
 ) -> Result<bool> {
     let mut matched = false;
     for (pattern, map) in &schema.maps {
@@ -187,7 +200,7 @@ fn update_json_inner(
             continue;
         }
         matched = true;
-        populate_map(conn, schema, rel_path, data, xite, map)?;
+        populate_map(conn, schema, rel_path, data, xite, map, scoped)?;
     }
     Ok(matched)
 }
@@ -199,6 +212,7 @@ fn populate_map(
     data: &Value,
     xite: &str,
     map: &MapSettings,
+    scoped: bool,
 ) -> Result<()> {
     let jid = json_id(conn, schema, rel_path, xite)?;
     for key in &map.to_keyvalue {
@@ -227,6 +241,13 @@ fn populate_map(
     // The sibling json row is created even for maps with no table entries.
     let table_jid = map_json_id(conn, schema, rel_path, xite, map.file_name.as_deref(), jid)?;
     let table_data = folded_table_data(data, map.fold_crdt.as_deref());
+    if scoped {
+        conn.execute(
+            "UPDATE temp.__epix_write_target SET json_id = ?1",
+            [table_jid],
+        )
+        .map_err(db_err)?;
+    }
     for entry in &map.to_table {
         replace_mapped_rows(conn, schema, entry, &table_data, table_jid)?;
     }

@@ -160,6 +160,9 @@ fn apply_inner(conn: &Connection, schema: &DbSchema) -> Result<()> {
     // Validate every table name up front (used in interpolated DDL below).
     for name in schema.tables.keys() {
         safe_identifier(name)?;
+        if crate::internal_identifier(name) {
+            return Err(Error::Db("reserved internal schema table".into()));
+        }
     }
     for table in schema.tables.values() {
         for (name, _) in &table.cols {
@@ -168,6 +171,14 @@ fn apply_inner(conn: &Connection, schema: &DbSchema) -> Result<()> {
     }
     for name in schema.json_table_cols() {
         safe_identifier(&name)?;
+    }
+    for map in schema.maps.values() {
+        for entry in &map.to_table {
+            safe_identifier(entry.table())?;
+            if crate::internal_identifier(entry.table()) {
+                return Err(Error::Db("reserved internal schema table".into()));
+            }
+        }
     }
 
     // The keyvalue meta-table must exist before we can read the stored version.
@@ -249,7 +260,10 @@ fn execute_schema_ddl(conn: &Connection, sql: &str, table: &str, create_table: b
             AuthAction::CreateTable { table_name } => {
                 create_table && (table_name == table || table_name == "sqlite_sequence")
             }
-            AuthAction::CreateIndex { table_name, .. } => table_name == table,
+            AuthAction::CreateIndex {
+                table_name,
+                index_name,
+            } => table_name == table && !crate::internal_identifier(index_name),
             AuthAction::Insert { table_name } | AuthAction::Update { table_name, .. } => {
                 table_name == "sqlite_master"
             }
