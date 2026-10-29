@@ -1,0 +1,17 @@
+{
+  "fixture_items": 1000000,
+  "hubs": 100,
+  "segments": 1000,
+  "initial_max_live_items_per_segment": 1024,
+  "final_stored_record_versions": 1000007,
+  "final_max_stored_versions_per_segment": 1031,
+  "final_max_segment_bytes": 384709,
+  "declared_segment_max_bytes": 1048576,
+  "media_bytes": 0,
+  "generation": {
+    "format": 1,
+    "generation_ms": 210248.861282,
+    "items": 1000000,
+    "prepared": true
+  }
+}

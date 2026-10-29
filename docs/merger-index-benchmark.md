@@ -11,7 +11,10 @@ verification.
 
 The default is 10,000 live items. Use 100,000, 1,000,000, or 10,000,000 to increase
 the workload. Smaller sizes are accepted for smoke tests. There are at most
-10,000 items per hub and 1,024 records per segment, with a 1 MiB segment cap.
+10,000 initial live items per hub and 1,024 initial live items per segment, with
+a declared 1 MiB segment cap. The update probe retains signed revisions in its
+segment, so its stored-version count exceeds 1,024. This does not enforce the
+proposed Trove envelope of 1,024 stored versions per segment.
 Every segment keeps its own source identity. Local item IDs intentionally overlap
 between hubs. Synthetic keys and source bytes are deterministic across equivalent
 runs. These public test identities must never receive funds or be used for real
@@ -36,6 +39,9 @@ program exits unsuccessfully on incorrect row counts, source-identity collisions
 incorrect pagination, rejected legitimate updates, accepted unauthorized authors,
 or lost state after restart. Do not interpret a partially written report as a
 successful run.
+
+The ordinary Rust CI job runs the small example tests with `--locked`. The 1M and
+10M runs remain explicit scheduled or manual workloads.
 
 Generation is timed separately. The coordinator then starts a fresh child process
 for initial node registration and indexing. A second fresh process restores the
@@ -136,3 +142,7 @@ transfer load, cancellation or user-facing p95 latency. It does not certify a
 1M or 10M release target by itself. Cold filesystem-cache runs, power-loss
 recovery, sustained concurrent updates and transfer contention need separate
 measurements. Keep these distinctions alongside any published benchmark numbers.
+
+See the [recorded foundation results](benchmark-results/2026-10-28-merger-index/README.md)
+for the release-profile 10k baseline comparison and 1M candidate run, including
+raw reports and their exact implementation revisions.
