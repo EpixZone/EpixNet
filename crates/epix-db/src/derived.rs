@@ -441,34 +441,14 @@ impl DerivedIndex {
                 return Err(invalid("derived source compare-and-swap conflict"));
             }
             if let Some((version, serialized, _)) = &replacement {
-                if current
-                    .as_ref()
-                    .is_some_and(|current| current.digest == version.digest)
-                {
-                    let prior: String = tx
-                        .query_row(
-                            "SELECT value FROM __epix_sources WHERE hub=?1 AND path=?2",
-                            params![hub, path],
-                            |row| row.get(0),
-                        )
-                        .map_err(db_err)?;
-                    if current.as_ref() == Some(*version) && prior != *serialized {
-                        return Err(invalid(
-                            "derived source version reused for different accepted data",
-                        ));
+                match reuse_projection(&tx, hub, path, current.as_ref(), version, serialized)? {
+                    ProjectionReuse::Unchanged => {
+                        return Ok(DeltaMetrics {
+                            skipped_sources: 1,
+                            ..Default::default()
+                        });
                     }
-                    if prior == *serialized {
-                        if current.as_ref() == Some(*version) {
-                            return Ok(DeltaMetrics {
-                                skipped_sources: 1,
-                                ..Default::default()
-                            });
-                        }
-                        tx.execute(
-                            "UPDATE __epix_sources SET authority=?3 WHERE hub=?1 AND path=?2",
-                            params![hub, path, version.authority],
-                        )
-                        .map_err(db_err)?;
+                    ProjectionReuse::AuthorityUpdated => {
                         tx.commit().map_err(db_err)?;
                         return Ok(DeltaMetrics {
                             changed_sources: 1,
@@ -476,6 +456,7 @@ impl DerivedIndex {
                             ..Default::default()
                         });
                     }
+                    ProjectionReuse::Reproject => {}
                 }
             }
             let before = tx.total_changes();
@@ -518,22 +499,7 @@ impl DerivedIndex {
                 metrics.replayed_sources += 1;
                 metrics.replayed_bytes += serialized.len() as u64;
             }
-            // Keep stable json_ids for live aliases. Remove only targets no
-            // retained source references after the component has been replayed.
-            for target in &targets {
-                let retained: bool = tx.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM __epix_source_targets WHERE hub=?1 AND target_path=?2)",
-                    params![hub, target], |row| row.get(0),
-                ).map_err(db_err)?;
-                if !retained {
-                    let (directory, file_name) = target.rsplit_once('/').unwrap_or(("", target));
-                    tx.execute(
-                        "DELETE FROM json WHERE site=?1 AND directory=?2 AND file_name=?3",
-                        params![hub, directory, file_name],
-                    )
-                    .map_err(db_err)?;
-                }
-            }
+            prune_unreferenced_targets(&tx, hub, &targets)?;
             metrics.sql_changes = tx.total_changes() - before;
             tx.commit().map_err(db_err)?;
             Ok(metrics)
@@ -582,6 +548,75 @@ impl DerivedIndex {
         }
         Ok(())
     }
+}
+
+enum ProjectionReuse {
+    Unchanged,
+    AuthorityUpdated,
+    Reproject,
+}
+
+/// Reuse rows only when both the input digest and accepted data are unchanged.
+/// The caller retains transaction ownership, including the authority commit.
+fn reuse_projection(
+    conn: &Connection,
+    hub: &str,
+    path: &str,
+    current: Option<&SourceVersion>,
+    version: &SourceVersion,
+    serialized: &str,
+) -> Result<ProjectionReuse> {
+    let Some(current) = current.filter(|current| current.digest == version.digest) else {
+        return Ok(ProjectionReuse::Reproject);
+    };
+    let prior: String = conn
+        .query_row(
+            "SELECT value FROM __epix_sources WHERE hub=?1 AND path=?2",
+            params![hub, path],
+            |row| row.get(0),
+        )
+        .map_err(db_err)?;
+    if current == version && prior != serialized {
+        return Err(invalid(
+            "derived source version reused for different accepted data",
+        ));
+    }
+    if prior != serialized {
+        return Ok(ProjectionReuse::Reproject);
+    }
+    if current == version {
+        return Ok(ProjectionReuse::Unchanged);
+    }
+    conn.execute(
+        "UPDATE __epix_sources SET authority=?3 WHERE hub=?1 AND path=?2",
+        params![hub, path, version.authority],
+    )
+    .map_err(db_err)?;
+    Ok(ProjectionReuse::AuthorityUpdated)
+}
+
+/// Keep stable json_ids for live aliases. Remove only targets no retained
+/// source references after the component has been replayed.
+fn prune_unreferenced_targets(
+    conn: &Connection,
+    hub: &str,
+    targets: &BTreeSet<String>,
+) -> Result<()> {
+    for target in targets {
+        let retained: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM __epix_source_targets WHERE hub=?1 AND target_path=?2)",
+            params![hub, target], |row| row.get(0),
+        ).map_err(db_err)?;
+        if !retained {
+            let (directory, file_name) = target.rsplit_once('/').unwrap_or(("", target));
+            conn.execute(
+                "DELETE FROM json WHERE site=?1 AND directory=?2 AND file_name=?3",
+                params![hub, directory, file_name],
+            )
+            .map_err(db_err)?;
+        }
+    }
+    Ok(())
 }
 
 fn source_version(conn: &Connection, hub: &str, path: &str) -> Result<Option<SourceVersion>> {

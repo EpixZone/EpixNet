@@ -1,9 +1,16 @@
 //! Persistent derived merger databases. The source tree remains authoritative.
 //! A cache is never exposed until reconciliation and receipt validation finish.
 
-use super::*;
+use super::{canonical_address, AppState, ManagedXite, VerifiedDbAuthority};
 use epix_db::derived::{DeltaMetrics, DerivedIndex, SourceVersion};
-use std::collections::{BTreeMap, BTreeSet};
+use epix_db::{Database, DbSchema};
+use epix_xite::XiteStorage;
+use serde_json::Value;
+use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use tokio::sync::OwnedMutexGuard;
 
 #[derive(Clone, PartialEq, Eq)]
 struct SourceReceipt {
@@ -62,6 +69,57 @@ struct Target {
     source_epoch: u64,
     cache: Option<CachedIndex>,
     db: Option<Database>,
+}
+
+struct RegistryEntry {
+    key: String,
+    canonical: String,
+    storage: XiteStorage,
+    content: Option<Value>,
+    schema: Option<DbSchema>,
+    types: Vec<String>,
+}
+
+impl RegistryEntry {
+    fn is_merger(&self) -> bool {
+        self.schema
+            .as_ref()
+            .is_some_and(|schema| schema.version == 3)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RefreshEpochs {
+    filter: u64,
+    merger: u64,
+}
+
+struct SourceReconciliation {
+    observed: BTreeMap<String, SourceReceipt>,
+    retry: bool,
+}
+
+enum HubReconciliation {
+    Skipped,
+    Accepted(SourceReceipt),
+    Retry,
+}
+
+fn merger_types(xite: &ManagedXite) -> Vec<String> {
+    xite.settings
+        .permissions
+        .iter()
+        .filter_map(|permission| permission.strip_prefix("Merger:").map(String::from))
+        .collect()
+}
+
+fn retain_prepared_indexes(pending: &mut BTreeMap<String, CachedIndex>, targets: &[Target]) {
+    pending.extend(
+        targets
+            .iter()
+            .filter_map(|target| target.cache.as_ref())
+            .map(|cache| (cache.fingerprint.clone(), cache.clone())),
+    );
 }
 
 fn digest(value: &impl serde::Serialize) -> Result<String, String> {
@@ -231,433 +289,513 @@ impl AppState {
             if self.boot_restore_pending() {
                 return;
             }
-            let filter_epoch = self.db_filter_epoch();
-            let merger_epoch = self.db_merger_epoch();
-            let muted = self.muted_authors().await;
-            let registry = {
-                let xites = self.xites.read().await;
-                xites
-                    .iter()
-                    .map(|(key, xite)| {
-                        (
-                            key.clone(),
-                            canonical_address(xite.content.as_ref(), key),
-                            xite.storage.clone(),
-                            xite.content.clone(),
-                            xite.db_schema.clone(),
-                            xite.settings
-                                .permissions
-                                .iter()
-                                .filter_map(|permission| {
-                                    permission.strip_prefix("Merger:").map(String::from)
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
+            let epochs = RefreshEpochs {
+                filter: self.db_filter_epoch(),
+                merger: self.db_merger_epoch(),
             };
-            // Registering many source hubs before a frontend must not repeatedly
+            let muted = self.muted_authors().await;
+            let registry = self.merger_registry().await;
+            // Registering source hubs before a frontend must not repeatedly
             // materialize every source when there is no database to populate.
-            if !registry
-                .iter()
-                .any(|entry| entry.4.as_ref().is_some_and(|schema| schema.version == 3))
-            {
-                let retired = {
-                    let mut caches = self.merger_indexes.lock().unwrap();
-                    let retired = caches
-                        .values()
-                        .map(|cache| cache.index.clone())
-                        .collect::<Vec<_>>();
-                    caches.clear();
-                    retired
-                };
-                self.retire_merger_indexes(retired).await;
+            if !registry.iter().any(RegistryEntry::is_merger) {
+                self.retire_all_merger_indexes().await;
                 return;
             }
-            if self.db_filter_epoch() != filter_epoch || self.db_merger_epoch() != merger_epoch {
+            if !self.merger_epochs_current(epochs) {
                 continue;
             }
-            // Withdraw handles before touching a persistent projection. Old
-            // detached reads fail their receipt recheck, including on errors.
-            {
-                let mut xites = self.xites.write().await;
-                for (key, _, _, _, schema, _) in &registry {
-                    if schema.as_ref().is_some_and(|schema| schema.version == 3) {
-                        if let Some(xite) = xites.get_mut(key) {
-                            xite.db = None;
-                            xite.db_generation = self.next_db_generation();
-                        }
-                    }
-                }
-            }
-            let mut roots = BTreeMap::new();
-            for (_, canonical, storage, _, _, _) in &registry {
-                if roots
-                    .insert(canonical, storage.root())
-                    .is_some_and(|root| root != storage.root())
-                {
-                    self.log(
-                        "WARN",
-                        format!("merger index: conflicting storage roots for {canonical}"),
-                    )
-                    .await;
-                    return;
-                }
-            }
-            let mut targets = Vec::new();
-            for (key, canonical, storage, content, current_schema, types) in &registry {
-                let Some(current_schema) =
-                    current_schema.as_ref().filter(|schema| schema.version == 3)
-                else {
-                    continue;
-                };
-                let before = self.verified_index_epoch(canonical);
-                let source_before = self.db_source_epoch(canonical);
-                let accepted_schema =
-                    match self.accepted_db_authority_for_root_locked(canonical, content.as_ref()) {
-                        Ok(authority) => Self::db_snapshot_from_authority_selected(
-                            canonical,
-                            storage,
-                            &authority,
-                            None,
-                            Some("dbschema.json"),
-                        )
-                        .await
-                        .ok()
-                        .and_then(|snapshot| {
-                            snapshot
-                                .values
-                                .into_iter()
-                                .find(|(path, _)| path == "dbschema.json")
-                        })
-                        .and_then(|(_, value)| serde_json::from_value::<DbSchema>(value).ok())
-                        .filter(|schema| {
-                            schema.version == 3
-                                && epix_content::verify::is_valid_relative_path(&schema.db_file)
-                        }),
-                        Err(_) => None,
-                    };
-                let schema = accepted_schema
-                    .clone()
-                    .unwrap_or_else(|| current_schema.clone());
-                let cache = if accepted_schema.is_some() {
-                    match self
-                        .open_merger_index(
-                            key,
-                            canonical,
-                            storage,
-                            &schema,
-                            types,
-                            filter_epoch,
-                            &pending,
-                        )
-                        .await
-                    {
-                        Ok(cache) => Some(cache),
-                        Err(error) => {
-                            self.log("WARN", format!("merger index {key}: {error}"))
-                                .await;
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                if let Some(cache) = &cache {
-                    pending.insert(cache.fingerprint.clone(), cache.clone());
-                }
-                // Failed authority must not expose any persisted rows. Keep a
-                // fresh empty handle only for the existing fail-closed contract.
-                let db = if accepted_schema.is_none() {
-                    Database::open_in_memory().ok().and_then(|db| {
-                        db.apply_schema(&schema).ok()?;
-                        Some(db)
-                    })
-                } else {
-                    cache.as_ref().map(|cache| cache.index.database())
-                };
-                targets.push(Target {
-                    key: key.clone(),
-                    canonical: canonical.clone(),
-                    storage: storage.clone(),
-                    schema,
-                    types: types.clone(),
-                    verified_epoch: before,
-                    source_epoch: source_before,
-                    cache,
-                    db,
-                });
-            }
-            let mut observed = BTreeMap::new();
-            let mut retry = false;
-            let mut failed = false;
-            for (_, canonical, storage, content, _, _) in &registry {
-                if observed.contains_key(canonical) {
-                    continue;
-                }
-                let _tree = self.tree_mutation_lock(canonical).lock_owned().await;
-                let authority =
-                    match self.accepted_db_authority_for_root_locked(canonical, content.as_ref()) {
-                        Ok(authority) => authority,
-                        Err(_) => continue,
-                    };
-                let Some(merged_type) = authority
-                    .manifests
-                    .iter()
-                    .find(|manifest| manifest.inner_path == "content.json")
-                    .and_then(|manifest| manifest.content.get("merged_type"))
-                    .and_then(Value::as_str)
-                else {
-                    continue;
-                };
-                let receipt = SourceReceipt {
-                    storage_root: storage.root().to_path_buf(),
-                    verified_epoch: self.verified_index_epoch(canonical),
-                    source_epoch: self.db_source_epoch(canonical),
-                    merged_type: merged_type.to_string(),
-                };
-                let needing = targets
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(index, target)| {
-                        let cache = target.cache.as_ref()?;
-                        (target.types.iter().any(|kind| kind == merged_type)
-                            && cache.sources.get(canonical) != Some(&receipt))
-                        .then_some(index)
-                    })
-                    .collect::<Vec<_>>();
-                if needing.is_empty() {
-                    observed.insert(canonical.clone(), receipt);
-                    self.merger_index_counters.lock().unwrap().reused_hubs += 1;
-                    continue;
-                }
-                if self.db_merger_epoch() != merger_epoch || self.db_filter_epoch() != filter_epoch
-                {
-                    retry = true;
-                    break;
-                }
-                let snapshot =
-                    match Self::db_snapshot_from_authority(canonical, storage, &authority).await {
-                        Ok(snapshot) => snapshot,
-                        Err(error) => {
-                            self.log(
-                                "WARN",
-                                format!("merger source {canonical} unavailable: {error}"),
-                            )
-                            .await;
-                            continue;
-                        }
-                    };
-                self.merger_index_counters
-                    .lock()
-                    .unwrap()
-                    .verified_input_files += snapshot.values.len() as u64;
-                let authority_hash = match authority_digest(&authority) {
-                    Ok(hash) => hash,
-                    Err(_) => {
-                        failed = true;
-                        break;
-                    }
-                };
-                let indices = needing
-                    .iter()
-                    .map(|index| targets[*index].cache.as_ref().unwrap().index.clone())
-                    .collect::<Vec<_>>();
-                let hub = canonical.clone();
-                let excluded = muted.clone();
-                let result = tokio::task::spawn_blocking(move || {
-                    reconcile_hub(&indices, &hub, snapshot.values, &authority_hash, &excluded)
-                })
-                .await
-                .map_err(|error| error.to_string())
-                .and_then(|result| result);
-                match result {
-                    Ok(metrics) => {
-                        for metric in metrics {
-                            self.count_index_delta(&metric);
-                        }
-                    }
-                    Err(error) => {
-                        self.log("WARN", format!("merger source {canonical}: {error}"))
-                            .await;
-                        failed = true;
-                        break;
-                    }
-                }
-                for index in needing {
-                    targets[index]
-                        .cache
-                        .as_mut()
-                        .unwrap()
-                        .sources
-                        .insert(canonical.clone(), receipt.clone());
-                }
-                observed.insert(canonical.clone(), receipt);
-            }
-            if failed {
+            self.withdraw_merger_handles(&registry).await;
+            if !self.merger_roots_consistent(&registry).await {
                 return;
             }
-            pending.extend(
-                targets
-                    .iter()
-                    .filter_map(|target| target.cache.as_ref())
-                    .map(|cache| (cache.fingerprint.clone(), cache.clone())),
-            );
-            if retry {
+            let mut targets = self
+                .prepare_merger_targets(&registry, epochs, &mut pending)
+                .await;
+            let Ok(reconciliation) = self
+                .reconcile_merger_sources(&registry, &mut targets, epochs, &muted)
+                .await
+            else {
+                return;
+            };
+            retain_prepared_indexes(&mut pending, &targets);
+            if reconciliation.retry {
                 tokio::task::yield_now().await;
                 continue;
             }
-            for target in &mut targets {
-                let Some(cache) = &mut target.cache else {
-                    continue;
-                };
-                let keep = observed
-                    .iter()
-                    .filter(|(_, receipt)| target.types.contains(&receipt.merged_type))
-                    .map(|(hub, _)| hub.clone())
-                    .collect::<BTreeSet<_>>();
-                cache.sources.retain(|hub, _| keep.contains(hub));
-                let index = cache.index.clone();
-                let result =
-                    tokio::task::spawn_blocking(move || -> Result<Vec<DeltaMetrics>, String> {
-                        let mut metrics = Vec::new();
-                        for source in index.sources_all().map_err(|error| error.to_string())? {
-                            if !keep.contains(&source.hub) {
-                                metrics.push(
-                                    index
-                                        .remove_source(&source.hub, &source.path, &source.version)
-                                        .map_err(|error| error.to_string())?,
-                                );
-                            }
-                        }
-                        Ok(metrics)
-                    })
-                    .await
-                    .map_err(|error| error.to_string())
-                    .and_then(|result| result);
-                match result {
-                    Ok(metrics) => {
-                        for metric in metrics {
-                            self.count_index_delta(&metric);
-                        }
-                    }
-                    Err(error) => {
-                        self.log("WARN", format!("merger prune {}: {error}", target.key))
-                            .await;
-                        failed = true;
-                    }
-                }
-            }
-            if failed {
+            let observed = reconciliation.observed;
+            if !self.prune_merger_targets(&mut targets, &observed).await {
                 return;
             }
-            pending.extend(
-                targets
-                    .iter()
-                    .filter_map(|target| target.cache.as_ref())
-                    .map(|cache| (cache.fingerprint.clone(), cache.clone())),
-            );
+            retain_prepared_indexes(&mut pending, &targets);
             #[cfg(test)]
-            let pause = self.merger_db_before_install_pause.lock().unwrap().clone();
-            #[cfg(test)]
-            if let Some((started, release)) = pause {
-                started.notify_one();
-                let _permit = release.acquire().await;
-            }
-            let mut canonicals = observed
+            self.pause_merger_install().await;
+
+            let canonicals = observed
                 .keys()
                 .cloned()
                 .chain(targets.iter().map(|target| target.canonical.clone()))
-                .collect::<Vec<_>>();
-            canonicals.sort();
-            canonicals.dedup();
-            let mut guards = Vec::new();
-            for canonical in &canonicals {
-                match self.tree_mutation_lock(canonical).try_lock_owned() {
-                    Ok(guard) => guards.push(guard),
-                    Err(_) => {
-                        retry = true;
-                        break;
-                    }
-                }
-            }
-            if retry {
-                drop(guards);
+                .collect();
+            let Some(guards) = self.try_merger_tree_guards(canonicals) else {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
-            }
+            };
             let mut xites = self.xites.write().await;
-            let current = self.db_merger_epoch() == merger_epoch
-                && self.db_filter_epoch() == filter_epoch
-                && observed.iter().all(|(canonical, receipt)| {
-                    self.verified_index_epoch(canonical) == receipt.verified_epoch
-                        && self.db_source_epoch(canonical) == receipt.source_epoch
-                        && xites.values().any(|xite| {
-                            xite.storage.root() == receipt.storage_root
-                                && canonical_address(xite.content.as_ref(), canonical) == *canonical
-                        })
-                })
-                && targets.iter().all(|target| {
-                    self.verified_index_epoch(&target.canonical) == target.verified_epoch
-                        && self.db_source_epoch(&target.canonical) == target.source_epoch
-                        && xites.get(&target.key).is_some_and(|xite| {
-                            xite.storage.root() == target.storage.root()
-                                && canonical_address(xite.content.as_ref(), &target.key)
-                                    == target.canonical
-                                && xite
-                                    .settings
-                                    .permissions
-                                    .iter()
-                                    .filter_map(|p| p.strip_prefix("Merger:").map(String::from))
-                                    .collect::<Vec<_>>()
-                                    == target.types
-                        })
-                });
-            if !current {
+            if !self.merger_refresh_current(epochs, &observed, &targets, &xites) {
                 drop(xites);
                 drop(guards);
                 tokio::task::yield_now().await;
                 continue;
             }
-            let retired = {
-                let keep = targets
-                    .iter()
-                    .filter_map(|target| {
-                        target.cache.as_ref().map(|cache| cache.fingerprint.clone())
-                    })
-                    .collect::<BTreeSet<_>>();
-                let mut caches = self.merger_indexes.lock().unwrap();
-                let retired = caches
-                    .values()
-                    .filter(|cache| !keep.contains(&cache.fingerprint))
-                    .map(|cache| cache.index.clone())
-                    .collect::<Vec<_>>();
-                caches.retain(|key, _| targets.iter().any(|target| &target.key == key));
-                for target in targets {
-                    let Some(xite) = xites.get_mut(&target.key) else {
-                        continue;
-                    };
-                    xite.db = target.db;
-                    xite.db_schema = Some(target.schema);
-                    xite.db_verified_epoch = target.verified_epoch;
-                    xite.db_source_epoch = target.source_epoch;
-                    xite.db_merger_epoch = merger_epoch;
-                    xite.db_generation = self.next_db_generation();
-                    xite.db_filter_epoch = filter_epoch;
-                    if let Some(cache) = target.cache {
-                        cache.publication.published.store(true, Ordering::Release);
-                        caches.insert(target.key, cache);
-                    } else {
-                        caches.remove(&target.key);
-                    }
-                }
-                retired
-            };
+            // The tree guards and registry write lock cover both receipt
+            // validation and publication. Retire old generations after release.
+            let retired = self.install_merger_targets(targets, epochs, &mut xites);
             drop(xites);
             drop(guards);
             self.retire_merger_indexes(retired).await;
             return;
         }
+    }
+
+    async fn merger_registry(&self) -> Vec<RegistryEntry> {
+        let xites = self.xites.read().await;
+        xites
+            .iter()
+            .map(|(key, xite)| RegistryEntry {
+                key: key.clone(),
+                canonical: canonical_address(xite.content.as_ref(), key),
+                storage: xite.storage.clone(),
+                content: xite.content.clone(),
+                schema: xite.db_schema.clone(),
+                types: merger_types(xite),
+            })
+            .collect()
+    }
+
+    async fn retire_all_merger_indexes(&self) {
+        let retired = {
+            let mut caches = self.merger_indexes.lock().unwrap();
+            let retired = caches.values().map(|cache| cache.index.clone()).collect();
+            caches.clear();
+            retired
+        };
+        self.retire_merger_indexes(retired).await;
+    }
+
+    fn merger_epochs_current(&self, epochs: RefreshEpochs) -> bool {
+        self.db_filter_epoch() == epochs.filter && self.db_merger_epoch() == epochs.merger
+    }
+
+    async fn withdraw_merger_handles(&self, registry: &[RegistryEntry]) {
+        // Withdraw handles before touching a persistent projection. Detached
+        // reads fail their receipt recheck, including on errors.
+        let mut xites = self.xites.write().await;
+        for entry in registry.iter().filter(|entry| entry.is_merger()) {
+            if let Some(xite) = xites.get_mut(&entry.key) {
+                xite.db = None;
+                xite.db_generation = self.next_db_generation();
+            }
+        }
+    }
+
+    async fn merger_roots_consistent(&self, registry: &[RegistryEntry]) -> bool {
+        let mut roots = BTreeMap::new();
+        for entry in registry {
+            if roots
+                .insert(&entry.canonical, entry.storage.root())
+                .is_some_and(|root| root != entry.storage.root())
+            {
+                self.log(
+                    "WARN",
+                    format!(
+                        "merger index: conflicting storage roots for {}",
+                        entry.canonical
+                    ),
+                )
+                .await;
+                return false;
+            }
+        }
+        true
+    }
+
+    async fn accepted_merger_schema(&self, entry: &RegistryEntry) -> Option<DbSchema> {
+        let authority = self
+            .accepted_db_authority_for_root_locked(&entry.canonical, entry.content.as_ref())
+            .ok()?;
+        Self::db_snapshot_from_authority_selected(
+            &entry.canonical,
+            &entry.storage,
+            &authority,
+            None,
+            Some("dbschema.json"),
+        )
+        .await
+        .ok()?
+        .values
+        .into_iter()
+        .find(|(path, _)| path == "dbschema.json")
+        .and_then(|(_, value)| serde_json::from_value::<DbSchema>(value).ok())
+        .filter(|schema| {
+            schema.version == 3 && epix_content::verify::is_valid_relative_path(&schema.db_file)
+        })
+    }
+
+    async fn prepare_merger_targets(
+        &self,
+        registry: &[RegistryEntry],
+        epochs: RefreshEpochs,
+        pending: &mut BTreeMap<String, CachedIndex>,
+    ) -> Vec<Target> {
+        let mut targets = Vec::new();
+        for entry in registry {
+            let Some(schema) = entry.schema.as_ref().filter(|schema| schema.version == 3) else {
+                continue;
+            };
+            targets.push(
+                self.prepare_merger_target(entry, schema, epochs, pending)
+                    .await,
+            );
+        }
+        targets
+    }
+
+    async fn prepare_merger_target(
+        &self,
+        entry: &RegistryEntry,
+        current_schema: &DbSchema,
+        epochs: RefreshEpochs,
+        pending: &mut BTreeMap<String, CachedIndex>,
+    ) -> Target {
+        let verified_epoch = self.verified_index_epoch(&entry.canonical);
+        let source_epoch = self.db_source_epoch(&entry.canonical);
+        let accepted_schema = self.accepted_merger_schema(entry).await;
+        let schema = accepted_schema
+            .clone()
+            .unwrap_or_else(|| current_schema.clone());
+        let cache = if accepted_schema.is_some() {
+            match self
+                .open_merger_index(
+                    &entry.key,
+                    &entry.canonical,
+                    &entry.storage,
+                    &schema,
+                    &entry.types,
+                    epochs.filter,
+                    pending,
+                )
+                .await
+            {
+                Ok(cache) => Some(cache),
+                Err(error) => {
+                    self.log("WARN", format!("merger index {}: {error}", entry.key))
+                        .await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if let Some(cache) = &cache {
+            pending.insert(cache.fingerprint.clone(), cache.clone());
+        }
+        // Failed authority must not expose any persisted rows. Keep a fresh
+        // empty handle only for the existing fail-closed contract.
+        let db = if accepted_schema.is_none() {
+            Database::open_in_memory().ok().and_then(|db| {
+                db.apply_schema(&schema).ok()?;
+                Some(db)
+            })
+        } else {
+            cache.as_ref().map(|cache| cache.index.database())
+        };
+        Target {
+            key: entry.key.clone(),
+            canonical: entry.canonical.clone(),
+            storage: entry.storage.clone(),
+            schema,
+            types: entry.types.clone(),
+            verified_epoch,
+            source_epoch,
+            cache,
+            db,
+        }
+    }
+
+    async fn reconcile_merger_sources(
+        &self,
+        registry: &[RegistryEntry],
+        targets: &mut [Target],
+        epochs: RefreshEpochs,
+        muted: &[String],
+    ) -> Result<SourceReconciliation, ()> {
+        let mut result = SourceReconciliation {
+            observed: BTreeMap::new(),
+            retry: false,
+        };
+        for entry in registry {
+            if result.observed.contains_key(&entry.canonical) {
+                continue;
+            }
+            match self
+                .reconcile_merger_source(entry, targets, epochs, muted)
+                .await?
+            {
+                HubReconciliation::Skipped => {}
+                HubReconciliation::Accepted(receipt) => {
+                    result.observed.insert(entry.canonical.clone(), receipt);
+                }
+                HubReconciliation::Retry => {
+                    result.retry = true;
+                    break;
+                }
+            }
+        }
+        Ok(result)
+    }
+
+    async fn reconcile_merger_source(
+        &self,
+        entry: &RegistryEntry,
+        targets: &mut [Target],
+        epochs: RefreshEpochs,
+        muted: &[String],
+    ) -> Result<HubReconciliation, ()> {
+        // Hold this source tree from authority selection through SQL completion
+        // and receipt recording, including when the outer request is cancelled.
+        let _tree = self.tree_mutation_lock(&entry.canonical).lock_owned().await;
+        let Ok(authority) =
+            self.accepted_db_authority_for_root_locked(&entry.canonical, entry.content.as_ref())
+        else {
+            return Ok(HubReconciliation::Skipped);
+        };
+        let Some(merged_type) = authority
+            .manifests
+            .iter()
+            .find(|manifest| manifest.inner_path == "content.json")
+            .and_then(|manifest| manifest.content.get("merged_type"))
+            .and_then(Value::as_str)
+        else {
+            return Ok(HubReconciliation::Skipped);
+        };
+        let receipt = SourceReceipt {
+            storage_root: entry.storage.root().to_path_buf(),
+            verified_epoch: self.verified_index_epoch(&entry.canonical),
+            source_epoch: self.db_source_epoch(&entry.canonical),
+            merged_type: merged_type.to_string(),
+        };
+        let needing = targets
+            .iter()
+            .enumerate()
+            .filter_map(|(index, target)| {
+                let cache = target.cache.as_ref()?;
+                (target.types.iter().any(|kind| kind == merged_type)
+                    && cache.sources.get(&entry.canonical) != Some(&receipt))
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        if needing.is_empty() {
+            self.merger_index_counters.lock().unwrap().reused_hubs += 1;
+            return Ok(HubReconciliation::Accepted(receipt));
+        }
+        if !self.merger_epochs_current(epochs) {
+            return Ok(HubReconciliation::Retry);
+        }
+        let snapshot =
+            match Self::db_snapshot_from_authority(&entry.canonical, &entry.storage, &authority)
+                .await
+            {
+                Ok(snapshot) => snapshot,
+                Err(error) => {
+                    self.log(
+                        "WARN",
+                        format!("merger source {} unavailable: {error}", entry.canonical),
+                    )
+                    .await;
+                    return Ok(HubReconciliation::Skipped);
+                }
+            };
+        self.merger_index_counters
+            .lock()
+            .unwrap()
+            .verified_input_files += snapshot.values.len() as u64;
+        let authority_hash = authority_digest(&authority).map_err(|_| ())?;
+        let indices = needing
+            .iter()
+            .map(|index| targets[*index].cache.as_ref().unwrap().index.clone())
+            .collect::<Vec<_>>();
+        let hub = entry.canonical.clone();
+        let excluded = muted.to_vec();
+        let result = tokio::task::spawn_blocking(move || {
+            reconcile_hub(&indices, &hub, snapshot.values, &authority_hash, &excluded)
+        })
+        .await
+        .map_err(|error| error.to_string())
+        .and_then(|result| result);
+        if !self
+            .record_merger_result(result, &format!("merger source {}", entry.canonical))
+            .await
+        {
+            return Err(());
+        }
+        for index in needing {
+            targets[index]
+                .cache
+                .as_mut()
+                .unwrap()
+                .sources
+                .insert(entry.canonical.clone(), receipt.clone());
+        }
+        Ok(HubReconciliation::Accepted(receipt))
+    }
+
+    async fn record_merger_result(
+        &self,
+        result: Result<Vec<DeltaMetrics>, String>,
+        context: &str,
+    ) -> bool {
+        match result {
+            Ok(metrics) => {
+                for metric in metrics {
+                    self.count_index_delta(&metric);
+                }
+                true
+            }
+            Err(error) => {
+                self.log("WARN", format!("{context}: {error}")).await;
+                false
+            }
+        }
+    }
+
+    async fn prune_merger_targets(
+        &self,
+        targets: &mut [Target],
+        observed: &BTreeMap<String, SourceReceipt>,
+    ) -> bool {
+        let mut succeeded = true;
+        for target in targets {
+            let Some(cache) = &mut target.cache else {
+                continue;
+            };
+            let keep = observed
+                .iter()
+                .filter(|(_, receipt)| target.types.contains(&receipt.merged_type))
+                .map(|(hub, _)| hub.clone())
+                .collect::<BTreeSet<_>>();
+            cache.sources.retain(|hub, _| keep.contains(hub));
+            let index = cache.index.clone();
+            let result = tokio::task::spawn_blocking(move || prune_index_hubs(&index, &keep))
+                .await
+                .map_err(|error| error.to_string())
+                .and_then(|result| result);
+            if !self
+                .record_merger_result(result, &format!("merger prune {}", target.key))
+                .await
+            {
+                succeeded = false;
+            }
+        }
+        succeeded
+    }
+
+    #[cfg(test)]
+    async fn pause_merger_install(&self) {
+        let pause = self.merger_db_before_install_pause.lock().unwrap().clone();
+        if let Some((started, release)) = pause {
+            started.notify_one();
+            let _permit = release.acquire().await;
+        }
+    }
+
+    fn try_merger_tree_guards(
+        &self,
+        mut canonicals: Vec<String>,
+    ) -> Option<Vec<OwnedMutexGuard<()>>> {
+        canonicals.sort();
+        canonicals.dedup();
+        let mut guards = Vec::new();
+        for canonical in canonicals {
+            guards.push(self.tree_mutation_lock(&canonical).try_lock_owned().ok()?);
+        }
+        Some(guards)
+    }
+
+    fn merger_refresh_current(
+        &self,
+        epochs: RefreshEpochs,
+        observed: &BTreeMap<String, SourceReceipt>,
+        targets: &[Target],
+        xites: &HashMap<String, ManagedXite>,
+    ) -> bool {
+        self.merger_epochs_current(epochs)
+            && observed
+                .iter()
+                .all(|(canonical, receipt)| self.merger_source_current(canonical, receipt, xites))
+            && targets
+                .iter()
+                .all(|target| self.merger_target_current(target, xites))
+    }
+
+    fn merger_source_current(
+        &self,
+        canonical: &str,
+        receipt: &SourceReceipt,
+        xites: &HashMap<String, ManagedXite>,
+    ) -> bool {
+        self.verified_index_epoch(canonical) == receipt.verified_epoch
+            && self.db_source_epoch(canonical) == receipt.source_epoch
+            && xites.values().any(|xite| {
+                xite.storage.root() == receipt.storage_root
+                    && canonical_address(xite.content.as_ref(), canonical) == canonical
+            })
+    }
+
+    fn merger_target_current(&self, target: &Target, xites: &HashMap<String, ManagedXite>) -> bool {
+        self.verified_index_epoch(&target.canonical) == target.verified_epoch
+            && self.db_source_epoch(&target.canonical) == target.source_epoch
+            && xites.get(&target.key).is_some_and(|xite| {
+                xite.storage.root() == target.storage.root()
+                    && canonical_address(xite.content.as_ref(), &target.key) == target.canonical
+                    && merger_types(xite) == target.types
+            })
+    }
+
+    fn install_merger_targets(
+        &self,
+        targets: Vec<Target>,
+        epochs: RefreshEpochs,
+        xites: &mut HashMap<String, ManagedXite>,
+    ) -> Vec<DerivedIndex> {
+        let keep = targets
+            .iter()
+            .filter_map(|target| target.cache.as_ref().map(|cache| cache.fingerprint.clone()))
+            .collect::<BTreeSet<_>>();
+        let mut caches = self.merger_indexes.lock().unwrap();
+        let retired = caches
+            .values()
+            .filter(|cache| !keep.contains(&cache.fingerprint))
+            .map(|cache| cache.index.clone())
+            .collect();
+        caches.retain(|key, _| targets.iter().any(|target| &target.key == key));
+        for target in targets {
+            let Some(xite) = xites.get_mut(&target.key) else {
+                continue;
+            };
+            xite.db = target.db;
+            xite.db_schema = Some(target.schema);
+            xite.db_verified_epoch = target.verified_epoch;
+            xite.db_source_epoch = target.source_epoch;
+            xite.db_merger_epoch = epochs.merger;
+            xite.db_generation = self.next_db_generation();
+            xite.db_filter_epoch = epochs.filter;
+            if let Some(cache) = target.cache {
+                cache.publication.published.store(true, Ordering::Release);
+                caches.insert(target.key, cache);
+            } else {
+                caches.remove(&target.key);
+            }
+        }
+        retired
     }
 
     async fn retire_merger_indexes(&self, retired: Vec<DerivedIndex>) {
@@ -675,6 +813,23 @@ impl AppState {
             }
         }
     }
+}
+
+fn prune_index_hubs(
+    index: &DerivedIndex,
+    keep: &BTreeSet<String>,
+) -> Result<Vec<DeltaMetrics>, String> {
+    let mut metrics = Vec::new();
+    for source in index.sources_all().map_err(|error| error.to_string())? {
+        if !keep.contains(&source.hub) {
+            metrics.push(
+                index
+                    .remove_source(&source.hub, &source.path, &source.version)
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+    }
+    Ok(metrics)
 }
 
 fn reconcile_hub(
@@ -738,6 +893,58 @@ pub(super) struct VerifiedInputDelta {
     pub merged_type: String,
 }
 
+struct IncrementalTarget {
+    key: String,
+    canonical: String,
+    storage_root: PathBuf,
+    source_epoch: u64,
+    verified_epoch: u64,
+    interested: bool,
+    cache: CachedIndex,
+    generation: u64,
+}
+
+impl IncrementalTarget {
+    fn prepare(
+        key: &str,
+        xite: &ManagedXite,
+        cache: &CachedIndex,
+        delta: &VerifiedInputDelta,
+    ) -> Option<Self> {
+        if xite.db.is_none()
+            || xite.db_merger_epoch != delta.previous_merger_epoch
+            || xite.db_filter_epoch != delta.filter_epoch
+        {
+            return None;
+        }
+        let interested = xite
+            .settings
+            .permissions
+            .iter()
+            .any(|permission| permission == &format!("Merger:{}", delta.merged_type));
+        if interested
+            && !cache.sources.get(&delta.canonical).is_some_and(|receipt| {
+                receipt.verified_epoch == delta.verified_epoch
+                    && receipt.storage_root == delta.storage.root()
+                    && receipt.source_epoch.saturating_add(1) == delta.source_epoch
+                    && receipt.merged_type == delta.merged_type
+            })
+        {
+            return None;
+        }
+        Some(Self {
+            key: key.to_string(),
+            canonical: canonical_address(xite.content.as_ref(), key),
+            storage_root: xite.storage.root().to_path_buf(),
+            source_epoch: xite.db_source_epoch,
+            verified_epoch: xite.db_verified_epoch,
+            interested,
+            cache: cache.clone(),
+            generation: 0,
+        })
+    }
+}
+
 impl AppState {
     /// The fast path applies one verified input only when every installed
     /// projection covered the immediately preceding global source generation.
@@ -774,74 +981,16 @@ impl AppState {
             // ever inserting a muted hub through the single-file path.
             return false;
         }
-        let mut targets = Vec::new();
-        {
-            let mut xites = self.xites.write().await;
-            if !xites.values().any(|xite| {
-                xite.storage.root() == delta.storage.root()
-                    && canonical_address(xite.content.as_ref(), &delta.canonical) == delta.canonical
-                    && xite.content == delta.content
-            }) {
-                return false;
-            }
-            let caches = self.merger_indexes.lock().unwrap();
-            for (key, xite) in xites.iter() {
-                if !xite
-                    .db_schema
-                    .as_ref()
-                    .is_some_and(|schema| schema.version == 3)
-                {
-                    continue;
-                }
-                let Some(cache) = caches.get(key) else {
-                    return false;
-                };
-                if xite.db.is_none()
-                    || xite.db_merger_epoch != delta.previous_merger_epoch
-                    || xite.db_filter_epoch != delta.filter_epoch
-                {
-                    return false;
-                }
-                let interested = xite
-                    .settings
-                    .permissions
-                    .iter()
-                    .any(|permission| permission == &format!("Merger:{}", delta.merged_type));
-                if interested
-                    && !cache.sources.get(&delta.canonical).is_some_and(|receipt| {
-                        receipt.verified_epoch == delta.verified_epoch
-                            && receipt.storage_root == delta.storage.root()
-                            && receipt.source_epoch.saturating_add(1) == delta.source_epoch
-                            && receipt.merged_type == delta.merged_type
-                    })
-                {
-                    return false;
-                }
-                targets.push((
-                    key.clone(),
-                    canonical_address(xite.content.as_ref(), key),
-                    xite.storage.root().to_path_buf(),
-                    xite.db_source_epoch,
-                    xite.db_verified_epoch,
-                    interested,
-                    cache.clone(),
-                    0,
-                ));
-            }
-            for (key, _, _, _, _, _, _, generation) in &mut targets {
-                let xite = xites.get_mut(key).unwrap();
-                xite.db = None;
-                xite.db_generation = self.next_db_generation();
-                *generation = xite.db_generation;
-            }
-        }
+        let Some(targets) = self.prepare_incremental_targets(&delta).await else {
+            return false;
+        };
         if targets.is_empty() {
             return true;
         }
         let indices = targets
             .iter()
-            .filter(|target| target.5)
-            .map(|target| target.6.index.clone())
+            .filter(|target| target.interested)
+            .map(|target| target.cache.index.clone())
             .collect::<Vec<_>>();
         let hub = delta.canonical.clone();
         let path = delta.path.clone();
@@ -874,53 +1023,33 @@ impl AppState {
         .await
         .map_err(|error| error.to_string())
         .and_then(|result| result);
-        match result {
-            Ok(metrics) => {
-                for metric in metrics {
-                    self.count_index_delta(&metric);
-                }
-            }
-            Err(error) => {
-                self.log("WARN", format!("merger incremental update: {error}"))
-                    .await;
-                return false;
-            }
+        if !self
+            .record_merger_result(result, "merger incremental update")
+            .await
+        {
+            return false;
         }
-        let mut other_trees = targets
+        let other_trees = targets
             .iter()
-            .map(|target| target.1.clone())
+            .map(|target| target.canonical.clone())
             .filter(|canonical| canonical != &delta.canonical)
-            .collect::<Vec<_>>();
-        other_trees.sort();
-        other_trees.dedup();
-        let mut guards = Vec::new();
-        for canonical in other_trees {
-            match self.tree_mutation_lock(&canonical).try_lock_owned() {
-                Ok(guard) => guards.push(guard),
-                Err(_) => return false,
-            }
-        }
+            .collect();
+        let Some(_guards) = self.try_merger_tree_guards(other_trees) else {
+            return false;
+        };
         let mut xites = self.xites.write().await;
         if self.db_merger_epoch() != delta.merger_epoch
             || self.db_filter_epoch() != delta.filter_epoch
-            || targets.iter().any(
-                |(key, canonical, storage, source, verified, _, _, generation)| {
-                    self.db_source_epoch(canonical) != *source
-                        || self.verified_index_epoch(canonical) != *verified
-                        || !xites.get(key).is_some_and(|xite| {
-                            xite.storage.root() == storage
-                                && canonical_address(xite.content.as_ref(), key) == *canonical
-                                && xite.db_generation == *generation
-                        })
-                },
-            )
+            || targets
+                .iter()
+                .any(|target| !self.incremental_target_current(target, &xites))
         {
             return false;
         }
         let mut caches = self.merger_indexes.lock().unwrap();
-        for (key, _, _, _, _, interested, mut cache, _) in targets {
-            if interested {
-                cache.sources.insert(
+        for mut target in targets {
+            if target.interested {
+                target.cache.sources.insert(
                     delta.canonical.clone(),
                     SourceReceipt {
                         storage_root: delta.storage.root().to_path_buf(),
@@ -930,13 +1059,67 @@ impl AppState {
                     },
                 );
             }
-            let xite = xites.get_mut(&key).unwrap();
-            xite.db = Some(cache.index.database());
+            let xite = xites.get_mut(&target.key).unwrap();
+            xite.db = Some(target.cache.index.database());
             xite.db_merger_epoch = delta.merger_epoch;
             xite.db_generation = self.next_db_generation();
-            caches.insert(key, cache);
+            caches.insert(target.key, target.cache);
         }
         true
+    }
+
+    async fn prepare_incremental_targets(
+        &self,
+        delta: &VerifiedInputDelta,
+    ) -> Option<Vec<IncrementalTarget>> {
+        let mut xites = self.xites.write().await;
+        if !xites.values().any(|xite| {
+            xite.storage.root() == delta.storage.root()
+                && canonical_address(xite.content.as_ref(), &delta.canonical) == delta.canonical
+                && xite.content == delta.content
+        }) {
+            return None;
+        }
+        let caches = self.merger_indexes.lock().unwrap();
+        let mut targets = Vec::new();
+        for (key, xite) in xites.iter() {
+            if !xite
+                .db_schema
+                .as_ref()
+                .is_some_and(|schema| schema.version == 3)
+            {
+                continue;
+            }
+            targets.push(IncrementalTarget::prepare(
+                key,
+                xite,
+                caches.get(key)?,
+                delta,
+            )?);
+        }
+        // Preflight every target before withdrawing any handle. Preserve each
+        // withdrawal generation for the final check under the same registry lock.
+        for target in &mut targets {
+            let xite = xites.get_mut(&target.key).unwrap();
+            xite.db = None;
+            xite.db_generation = self.next_db_generation();
+            target.generation = xite.db_generation;
+        }
+        Some(targets)
+    }
+
+    fn incremental_target_current(
+        &self,
+        target: &IncrementalTarget,
+        xites: &HashMap<String, ManagedXite>,
+    ) -> bool {
+        self.db_source_epoch(&target.canonical) == target.source_epoch
+            && self.verified_index_epoch(&target.canonical) == target.verified_epoch
+            && xites.get(&target.key).is_some_and(|xite| {
+                xite.storage.root() == target.storage_root
+                    && canonical_address(xite.content.as_ref(), &target.key) == target.canonical
+                    && xite.db_generation == target.generation
+            })
     }
 
     pub(super) fn merger_authority_digest(
