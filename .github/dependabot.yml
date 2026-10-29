@@ -4,22 +4,45 @@ updates:
     directory: "/"
     schedule:
       interval: weekly
-    open-pull-requests-limit: 10
+    open-pull-requests-limit: 2
+    # Type-only ignores apply to routine updates, not security fixes.
+    # Cargo's current 0.x filtering can also suppress later major upgrades;
+    # review pre-1.0 upgrades manually when planning dependency migrations.
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
     groups:
       # Arti shares runtime types and safelog traits across these dependencies.
-      # Include major updates too: pre-1.0 minor bumps can be incompatible.
       arti:
+        applies-to: version-updates
         patterns:
           - "arti-client"
           - "tor-*"
           - "safelog"
-      # Batch low-risk patch/minor bumps into one PR to cut noise.
-      patch-and-minor:
-        update-types:
-          - minor
-          - patch
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
 
   - package-ecosystem: github-actions
     directory: "/"
     schedule:
       interval: weekly
+    open-pull-requests-limit: 1
+    ignore:
+      - dependency-name: "*"
+        update-types:
+          - version-update:semver-minor
+          - version-update:semver-patch
+    groups:
+      # SHA-only actions may lack a SemVer; keep their updates in this one group.
+      actions:
+        applies-to: version-updates
+        patterns:
+          - "*"
+      security:
+        applies-to: security-updates
+        patterns:
+          - "*"
