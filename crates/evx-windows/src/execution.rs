@@ -1,11 +1,14 @@
 //! Windows transport for real EVX compiler and Pulley worker roles.
 //! This trusted embedding API does not grant consent or enable node admission.
-use super::{
-    descriptor, fail, job, ok, sid_text, token, token_info, validate_token, wide,
-    worker_environment, Attributes, Handle, Stage, TERMINATED,
-};
+use super::{Stage, FIXTURE_LIMITS};
 use evx_api::frames::{self, FromCompiler, FromWorker, ToCompiler, ToWorker, WorkerResult};
 use evx_api::{Limits, MAX_ARTIFACT_FRAME, MAX_FRAME};
+pub use evx_windows_native::ProcessUsage as NativeUsage;
+use evx_windows_native::{
+    available, create_job, fail, launch_suspended, ok, pipe_pair, process_dead, process_usage,
+    read_available, resume, terminate_job, validate_token, verify_launched, wide,
+    worker_environment, Handle, JobLimits, LaunchSpec, Launched, TERMINATED,
+};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::os::windows::io::FromRawHandle;
@@ -20,46 +23,21 @@ use std::{
     ptr::{null, null_mut},
     time::{Duration, Instant},
 };
-use windows_sys::Win32::System::ProcessStatus::{GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS};
 use windows_sys::Win32::{
-    Foundation::{
-        GetLastError, ERROR_BROKEN_PIPE, ERROR_PIPE_CONNECTED, FILETIME, GENERIC_READ,
-        GENERIC_WRITE, HANDLE, WAIT_OBJECT_0, WAIT_TIMEOUT,
-    },
-    Security::{TokenUser, SECURITY_ATTRIBUTES, SECURITY_CAPABILITIES, TOKEN_USER},
+    Foundation::GENERIC_READ,
     Storage::FileSystem::{
-        CreateFileW, GetFileAttributesW, GetFileInformationByHandle, ReadFile, WriteFile,
+        CreateFileW, GetFileAttributesW, GetFileInformationByHandle, WriteFile,
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_FIRST_PIPE_INSTANCE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
-        INVALID_FILE_ATTRIBUTES, OPEN_EXISTING, PIPE_ACCESS_INBOUND, PIPE_ACCESS_OUTBOUND,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, INVALID_FILE_ATTRIBUTES, OPEN_EXISTING,
     },
     System::{
         JobObjects::{
-            IsProcessInJob, JobObjectBasicAccountingInformation, JobObjectExtendedLimitInformation,
-            QueryInformationJobObject, SetInformationJobObject, TerminateJobObject,
-            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JOBOBJECT_EXTENDED_LIMIT_INFORMATION,
-            JOB_OBJECT_LIMIT_ACTIVE_PROCESS, JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION,
-            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_JOB_TIME,
-            JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE, JOB_OBJECT_LIMIT_PROCESS_MEMORY,
-            JOB_OBJECT_LIMIT_PROCESS_TIME,
+            JobObjectExtendedLimitInformation, QueryInformationJobObject,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_ACTIVE_PROCESS,
+            JOB_OBJECT_LIMIT_JOB_MEMORY, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOB_OBJECT_LIMIT_PROCESS_MEMORY, JOB_OBJECT_LIMIT_PROCESS_TIME,
         },
-        Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, PeekNamedPipe, PIPE_NOWAIT, PIPE_READMODE_BYTE,
-            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE,
-        },
-        Threading::{
-            CreateProcessW, GetCurrentProcess, GetExitCodeProcess, GetProcessTimes, ResumeThread,
-            WaitForSingleObject, DETACHED_PROCESS, CREATE_SUSPENDED, CREATE_UNICODE_ENVIRONMENT,
-            EXTENDED_STARTUPINFO_PRESENT, PROCESS_INFORMATION,
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-            PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            PROC_THREAD_ATTRIBUTE_JOB_LIST, PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES,
-            STARTF_USESTDHANDLES, STARTUPINFOEXW,
-        },
-        WindowsProgramming::{
-            PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT,
-            PROCESS_CREATION_CHILD_PROCESS_RESTRICTED,
-        },
+        Threading::GetCurrentProcess,
     },
 };
 #[path = "../../evx-worker/src/ipc.rs"]
@@ -116,15 +94,14 @@ impl TrustedWorker {
         })?;
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { zeroed() };
         unsafe {
-            ok(GetFileInformationByHandle(handle.0, &mut info))?;
+            ok(GetFileInformationByHandle(handle.raw(), &mut info))?;
         }
         if info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT) != 0
             || info.nNumberOfLinks != 1
         {
             return Err(fail("worker must be a non-linked regular file"));
         }
-        let file = unsafe { std::fs::File::from_raw_handle(handle.0) };
-        std::mem::forget(handle);
+        let file = unsafe { std::fs::File::from_raw_handle(handle.into_raw()) };
         if file.metadata()?.len() > 512 * 1024 * 1024 {
             return Err(fail("worker exceeds installation limit"));
         }
@@ -141,14 +118,6 @@ impl TrustedWorker {
             sha256: expected_sha256.into(),
         })
     }
-}
-/// Native evidence. Job commitment and resident working set remain distinct.
-#[derive(Clone, Debug)]
-pub struct NativeUsage {
-    pub cpu_seconds: f64,
-    pub peak_resident_bytes: u64,
-    pub peak_committed_bytes: u64,
-    pub exit_code: u32,
 }
 /// Only unchanged output of this host's confined compiler can construct this.
 pub struct CompiledModule {
@@ -368,62 +337,8 @@ impl evx_runtime::HostCalls for StdioBroker {
     }
 }
 
-fn pipe_pair(host_writes: bool, number: u32, suffix: &str) -> io::Result<(Handle, Handle)> {
-    let parent = token(unsafe { GetCurrentProcess() })?;
-    let owner = token_info(&parent, TokenUser)?;
-    let sid = sid_text(unsafe { (*owner.as_ptr().cast::<TOKEN_USER>()).User.Sid })?;
-    let sd = descriptor(&format!("D:P(A;;FA;;;SY)(A;;FA;;;{sid})"))?;
-    let attrs = SECURITY_ATTRIBUTES {
-        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-        lpSecurityDescriptor: sd.0,
-        bInheritHandle: 0,
-    };
-    let name = wide(format!("\\\\.\\pipe\\LOCAL\\EpixEVX-{suffix}-{number}"))?;
-    let access = if host_writes {
-        PIPE_ACCESS_OUTBOUND
-    } else {
-        PIPE_ACCESS_INBOUND
-    };
-    let server = Handle::checked(unsafe {
-        CreateNamedPipeW(
-            name.as_ptr(),
-            access | FILE_FLAG_FIRST_PIPE_INSTANCE,
-            PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_NOWAIT | PIPE_REJECT_REMOTE_CLIENTS,
-            1,
-            65536,
-            65536,
-            0,
-            &attrs,
-        )
-    })?;
-    let inherited = SECURITY_ATTRIBUTES {
-        bInheritHandle: 1,
-        ..attrs
-    };
-    let client = Handle::checked(unsafe {
-        CreateFileW(
-            name.as_ptr(),
-            if host_writes {
-                GENERIC_READ
-            } else {
-                GENERIC_WRITE
-            },
-            0,
-            &inherited,
-            OPEN_EXISTING,
-            0,
-            null_mut(),
-        )
-    })?;
-    if unsafe { ConnectNamedPipe(server.0, null_mut()) } == 0
-        && unsafe { GetLastError() } != ERROR_PIPE_CONNECTED
-    {
-        return Err(io::Error::last_os_error());
-    }
-    Ok((server, client))
-}
 struct Native {
-    process: Handle,
+    launched: Launched,
     job: Handle,
 }
 // Windows process/job handles support concurrent queries and termination. The
@@ -432,73 +347,28 @@ unsafe impl Send for Native {}
 unsafe impl Sync for Native {}
 impl Native {
     fn usage(&self) -> io::Result<NativeUsage> {
-        let mut created: FILETIME = unsafe { zeroed() };
-        let mut exited = created;
-        let mut user = created;
-        let mut kernel = created;
-        unsafe {
-            ok(GetProcessTimes(
-                self.process.0,
-                &mut created,
-                &mut exited,
-                &mut kernel,
-                &mut user,
-            ))?;
-        }
-        let ticks =
-            |time: FILETIME| (u64::from(time.dwHighDateTime) << 32) | u64::from(time.dwLowDateTime);
-        let mut memory: PROCESS_MEMORY_COUNTERS = unsafe { zeroed() };
-        memory.cb = size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
-        unsafe {
-            ok(GetProcessMemoryInfo(
-                self.process.0,
-                &mut memory,
-                size_of::<PROCESS_MEMORY_COUNTERS>() as u32,
-            ))?;
-        }
-        let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-        unsafe {
-            ok(QueryInformationJobObject(
-                self.job.0,
-                JobObjectExtendedLimitInformation,
-                (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-                null_mut(),
-            ))?;
-        }
-        let mut code = 0;
-        unsafe {
-            ok(GetExitCodeProcess(self.process.0, &mut code))?;
-        }
-        Ok(NativeUsage {
-            cpu_seconds: (ticks(user) + ticks(kernel)) as f64 / 10_000_000.0,
-            peak_resident_bytes: memory.PeakWorkingSetSize as u64,
-            peak_committed_bytes: limits.PeakJobMemoryUsed as u64,
-            exit_code: code,
-        })
+        process_usage(self.launched.process.raw(), self.job.raw())
     }
     fn dead(&self) -> io::Result<bool> {
-        match unsafe { WaitForSingleObject(self.process.0, 0) } {
-            WAIT_TIMEOUT => Ok(false),
-            WAIT_OBJECT_0 => {
-                let mut accounting: JOBOBJECT_BASIC_ACCOUNTING_INFORMATION = unsafe { zeroed() };
-                unsafe {
-                    ok(QueryInformationJobObject(
-                        self.job.0,
-                        JobObjectBasicAccountingInformation,
-                        (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
-                        size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
-                        null_mut(),
-                    ))?;
-                }
-                Ok(accounting.ActiveProcesses == 0)
-            }
-            _ => Err(fail("native process wait unavailable")),
-        }
+        process_dead(self.launched.process.raw(), self.job.raw())
     }
     fn terminate(&self) -> io::Result<()> {
-        unsafe { ok(TerminateJobObject(self.job.0, TERMINATED)) }
+        terminate_job(self.job.raw(), TERMINATED)
     }
+}
+/// Per-invocation job limits from the EVX policy. The fixture's hard CPU rate
+/// cap stays in force for the execution transport.
+fn invocation_limits(limits: &Limits) -> io::Result<JobLimits> {
+    let user_100ns = (limits.process_cpu_seconds * 10_000_000.0).ceil() as i64;
+    let memory = usize::try_from(limits.process_rss_bytes)
+        .map_err(|_| fail("unsupported process memory cap"))?;
+    Ok(JobLimits {
+        process_memory: memory,
+        job_memory: memory,
+        per_process_user_100ns: user_100ns,
+        per_job_user_100ns: user_100ns,
+        cpu_rate_hard_cap_percent_x100: FIXTURE_LIMITS.cpu_rate_hard_cap_percent_x100,
+    })
 }
 struct Invocation {
     native: Arc<Native>,
@@ -544,95 +414,25 @@ impl Invocation {
         let (input, child_input) = pipe_pair(true, 0, &suffix)?;
         let (output, child_output) = pipe_pair(false, 1, &suffix)?;
         let (error, child_error) = pipe_pair(false, 2, &suffix)?;
-        let job = job()?;
-        let mut native_limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-        native_limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-            | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-            | JOB_OBJECT_LIMIT_JOB_MEMORY
-            | JOB_OBJECT_LIMIT_PROCESS_TIME
-            | JOB_OBJECT_LIMIT_JOB_TIME
-            | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-        native_limits.BasicLimitInformation.ActiveProcessLimit = 1;
-        native_limits.BasicLimitInformation.PerProcessUserTimeLimit =
-            (limits.process_cpu_seconds * 10_000_000.0).ceil() as i64;
-        native_limits.BasicLimitInformation.PerJobUserTimeLimit =
-            native_limits.BasicLimitInformation.PerProcessUserTimeLimit;
-        native_limits.ProcessMemoryLimit = usize::try_from(limits.process_rss_bytes)
-            .map_err(|_| fail("unsupported process memory cap"))?;
-        native_limits.JobMemoryLimit = native_limits.ProcessMemoryLimit;
-        unsafe {
-            ok(SetInformationJobObject(
-                job.0,
-                JobObjectExtendedLimitInformation,
-                (&native_limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-            ))?;
-        }
-        let mut security = SECURITY_CAPABILITIES {
-            AppContainerSid: profile.sid,
-            Capabilities: null_mut(),
-            CapabilityCount: 0,
-            Reserved: 0,
-        };
-        let mut lpac = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-        let mut restricted = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
-        let mut jobs = [job.0];
-        let mut handles = [child_input.0, child_output.0, child_error.0];
-        let mut attributes = Attributes::new(5)?;
-        attributes.set(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &mut security)?;
-        attributes.set(
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-            &mut lpac,
-        )?;
-        attributes.set(PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &mut restricted)?;
-        attributes.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &mut jobs)?;
-        attributes.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &mut handles)?;
-        let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
-        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = child_input.0;
-        startup.StartupInfo.hStdOutput = child_output.0;
-        startup.StartupInfo.hStdError = child_error.0;
-        startup.lpAttributeList = attributes.raw();
-        let exe = wide(&stage.executable)?;
-        let cwd = wide(&stage.root)?;
-        let mut command = wide(format!("\"{}\" {role}", stage.executable.display()))?;
-        let mut environment = worker_environment()?;
+        let job = create_job(&invocation_limits(limits)?)?;
         // Pipe-only transport must not initialize a console in the LPAC.
-        let mut info: PROCESS_INFORMATION = unsafe { zeroed() };
-        unsafe {
-            ok(CreateProcessW(
-                exe.as_ptr(),
-                command.as_mut_ptr(),
-                null(),
-                null(),
-                1,
-                EXTENDED_STARTUPINFO_PRESENT
-                    | CREATE_SUSPENDED
-                    | DETACHED_PROCESS
-                    | CREATE_UNICODE_ENVIRONMENT,
-                environment.as_mut_ptr().cast(),
-                cwd.as_ptr(),
-                &startup.StartupInfo,
-                &mut info,
-            ))?;
-        }
+        let mut spec = LaunchSpec {
+            executable: &stage.executable,
+            command_line: format!("\"{}\" {role}", stage.executable.display()),
+            current_directory: &stage.root,
+            environment: worker_environment()?,
+            container_sid: profile.sid(),
+            job: &job,
+            inherited_handles: vec![child_input.raw(), child_output.raw(), child_error.raw()],
+            stdin: child_input.raw(),
+            stdout: child_output.raw(),
+            stderr: child_error.raw(),
+        };
+        let launched = launch_suspended(&mut spec)?;
         stage.active = true;
-        let native = Arc::new(Native {
-            process: Handle::checked(info.hProcess)?,
-            job,
-        });
-        let thread = Handle::checked(info.hThread)?;
+        let native = Arc::new(Native { launched, job });
         drop((child_input, child_output, child_error));
-        validate_token(native.process.0, Some(profile.sid))?;
-        let mut member = 0;
-        unsafe {
-            ok(IsProcessInJob(native.process.0, native.job.0, &mut member))?;
-        }
-        if member != 1 {
-            return Err(fail("worker outside required job"));
-        }
+        verify_launched(&native.launched, &native.job, profile.sid())?;
         let started = Instant::now();
         let stop = Arc::new(AtomicBool::new(false));
         let failed = Arc::new(AtomicBool::new(false));
@@ -675,8 +475,7 @@ impl Invocation {
             monitor: Some(monitor),
             output_count: 0,
         };
-        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            let error = io::Error::last_os_error();
+        if let Err(error) = resume(&invocation.native.launched) {
             invocation.finish(true, cancel)?;
             return Err(error);
         }
@@ -690,11 +489,11 @@ impl Invocation {
         }
         let mut bytes = [0u8; 4096];
         loop {
-            let count = available(self.error.0)?;
+            let count = available(self.error.raw())?;
             if count == 0 {
                 break;
             }
-            let count = read_available(self.error.0, &mut bytes[..(count as usize).min(4096)])?;
+            let count = read_available(self.error.raw(), &mut bytes[..(count as usize).min(4096)])?;
             self.account_output(count)?;
         }
         Ok(())
@@ -718,7 +517,7 @@ impl Invocation {
             let mut count = 0;
             unsafe {
                 ok(WriteFile(
-                    self.input.0,
+                    self.input.raw(),
                     bytes.as_ptr(),
                     bytes.len().min(4096) as u32,
                     &mut count,
@@ -736,7 +535,7 @@ impl Invocation {
         let mut offset = 0;
         while offset < bytes.len() {
             self.check(cancel)?;
-            let available = available(self.output.0)? as usize;
+            let available = available(self.output.raw())? as usize;
             if available == 0 {
                 if self.native.dead()? {
                     return Err(fail("truncated worker output"));
@@ -745,7 +544,7 @@ impl Invocation {
                 continue;
             }
             let end = bytes.len().min(offset + available);
-            let count = read_available(self.output.0, &mut bytes[offset..end])?;
+            let count = read_available(self.output.raw(), &mut bytes[offset..end])?;
             self.account_output(count)?;
             offset += count;
         }
@@ -774,7 +573,7 @@ impl Invocation {
             }
             // Terminal protocol is final. Trailing output cannot hide in pipes.
             self.check(cancel).ok();
-            if available(self.output.0)? != 0 {
+            if available(self.output.raw())? != 0 {
                 self.native.terminate()?;
                 return Err(fail("unexpected trailing output"));
             }
@@ -791,7 +590,7 @@ impl Invocation {
         {
             return Err(fail("terminal native resource limit"));
         }
-        if available(self.output.0)? != 0 {
+        if available(self.output.raw())? != 0 {
             return Err(fail("unexpected trailing output"));
         }
         self.check(cancel)?;
@@ -821,30 +620,4 @@ impl Drop for Invocation {
         // Release the no-delete identity handle before Stage attempts cleanup.
         self._executable.take();
     }
-}
-fn available(pipe: HANDLE) -> io::Result<u32> {
-    let mut bytes = 0;
-    if unsafe { PeekNamedPipe(pipe, null_mut(), 0, null_mut(), &mut bytes, null_mut()) } == 0 {
-        if unsafe { GetLastError() } == ERROR_BROKEN_PIPE {
-            return Ok(0);
-        }
-        return Err(io::Error::last_os_error());
-    }
-    Ok(bytes)
-}
-fn read_available(pipe: HANDLE, bytes: &mut [u8]) -> io::Result<usize> {
-    let mut count = 0;
-    unsafe {
-        ok(ReadFile(
-            pipe,
-            bytes.as_mut_ptr(),
-            bytes.len() as u32,
-            &mut count,
-            null_mut(),
-        ))?;
-    }
-    if count == 0 {
-        return Err(fail("worker pipe closed"));
-    }
-    Ok(count as usize)
 }

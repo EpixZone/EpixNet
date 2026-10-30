@@ -1,284 +1,75 @@
 use crate::denial::{denied, descendant_denied, winsock_startup_denied};
+use evx_windows_native::{
+    create_job, current_user_sid_text, fail, inherited_object, launch_suspended, ok, protect,
+    resume, terminate_job, validate_token, verify_launched, wide, worker_environment, Handle,
+    JobLimits, LaunchSpec, Profile, TERMINATED,
+};
 use std::{
-    ffi::OsStr,
     io,
     mem::{size_of, zeroed},
     net::{TcpListener, TcpStream},
-    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
     ptr::{null, null_mut},
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
     Foundation::*,
-    Security::{Authorization::*, Cryptography::*, *},
+    Security::{Cryptography::*, SECURITY_ATTRIBUTES},
     Storage::FileSystem::*,
-    System::{JobObjects::*, Memory::*, Pipes::*, Threading::*, WindowsProgramming::*},
+    System::{JobObjects::*, Memory::*, Pipes::*, Threading::*},
 };
 
 const MEMORY: usize = 64 * 1024 * 1024;
 const CPU_100NS: i64 = 5_000_000;
-const TERMINATED: u32 = 0x45565801;
 const FRAME: [u8; 8] = *b"EVX042\r\n";
+/// The fixed fixture job: 64 MiB, 500 ms of user time and half a processor.
+pub(crate) const FIXTURE_LIMITS: JobLimits = JobLimits {
+    process_memory: MEMORY,
+    job_memory: MEMORY,
+    per_process_user_100ns: CPU_100NS,
+    per_job_user_100ns: CPU_100NS,
+    cpu_rate_hard_cap_percent_x100: Some(5000),
+};
 
-fn fail(message: &str) -> io::Error {
-    io::Error::other(message)
-}
-fn ok(value: i32) -> io::Result<()> {
-    if value == 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-fn wide(value: impl AsRef<OsStr>) -> io::Result<Vec<u16>> {
-    let mut result: Vec<_> = value.as_ref().encode_wide().collect();
-    if result.contains(&0) {
-        return Err(fail("NUL in trusted fixture path"));
-    }
-    result.push(0);
-    Ok(result)
-}
-// Resolve profile storage from the current user's registered known folder,
-// without trusting or inheriting caller-controlled environment variables.
-fn local_app_data() -> io::Result<Vec<u16>> {
-    use windows_sys::Win32::UI::Shell::FOLDERID_LocalAppData;
-    type KnownFolderPath = unsafe extern "system" fn(
-        *const windows_sys::core::GUID,
-        u32,
-        HANDLE,
-        *mut *mut u16,
-    ) -> i32;
-    type FreePath = unsafe extern "system" fn(*const std::ffi::c_void);
-    // Resolve host-only shell/COM entry points on demand. Static imports would
-    // also initialize these DLLs in the confined child before its entrypoint.
-    let shell = SystemLibrary::open("shell32.dll")?;
-    let com = SystemLibrary::open("ole32.dll")?;
-    // SAFETY: fixed system DLL exports and their documented Win32 signatures;
-    // both libraries remain loaded through the call and allocation release.
-    let known_folder: KnownFolderPath =
-        unsafe { std::mem::transmute(shell.symbol(c"SHGetKnownFolderPath")?) };
-    let free_path: FreePath = unsafe { std::mem::transmute(com.symbol(c"CoTaskMemFree")?) };
-    let mut path = null_mut();
-    let status = unsafe { known_folder(&FOLDERID_LocalAppData, 0, null_mut(), &mut path) };
-    let result = if status < 0 || path.is_null() {
-        Err(fail(&format!(
-            "local app data lookup failed: 0x{:08x}",
-            status as u32
-        )))
-    } else {
-        let mut len = 0;
-        unsafe {
-            while len < 32768 && *path.add(len) != 0 {
-                len += 1;
-            }
-            if len == 0 || len == 32768 {
-                Err(fail("invalid local app data path"))
-            } else {
-                Ok(std::slice::from_raw_parts(path, len).to_vec())
-            }
-        }
-    };
-    // The API requires freeing this allocation even on a failed lookup.
-    unsafe { free_path(path.cast()) };
-    result
-}
-
-struct SystemLibrary(HMODULE);
-impl SystemLibrary {
-    fn open(name: &str) -> io::Result<Self> {
-        use windows_sys::Win32::System::LibraryLoader::{
-            LoadLibraryExW, LOAD_LIBRARY_SEARCH_SYSTEM32,
-        };
-        let name = wide(name)?;
-        let module =
-            unsafe { LoadLibraryExW(name.as_ptr(), null_mut(), LOAD_LIBRARY_SEARCH_SYSTEM32) };
-        if module.is_null() {
-            return Err(io::Error::last_os_error());
-        }
-        Ok(Self(module))
-    }
-    fn symbol(&self, name: &std::ffi::CStr) -> io::Result<unsafe extern "system" fn() -> isize> {
-        unsafe {
-            windows_sys::Win32::System::LibraryLoader::GetProcAddress(self.0, name.as_ptr().cast())
-        }
-        .ok_or_else(io::Error::last_os_error)
-    }
-}
-impl Drop for SystemLibrary {
-    fn drop(&mut self) {
-        unsafe { FreeLibrary(self.0) };
-    }
-}
-
-// AppContainer startup resolves and redirects LOCALAPPDATA for its profile.
-// SystemRoot is also required for Windows activation contexts. Supply only
-// these OS-derived values, in the case-insensitive environment sort order.
-fn worker_environment() -> io::Result<Vec<u16>> {
-    let mut windows = vec![0u16; 32768];
-    let size = unsafe {
-        windows_sys::Win32::System::SystemInformation::GetWindowsDirectoryW(
-            windows.as_mut_ptr(),
-            windows.len() as u32,
+fn random_id() -> io::Result<String> {
+    let mut random = [0u8; 16];
+    if unsafe {
+        BCryptGenRandom(
+            null_mut(),
+            random.as_mut_ptr(),
+            random.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
         )
-    } as usize;
-    if size == 0 {
-        return Err(io::Error::last_os_error());
+    } < 0
+    {
+        return Err(fail("fixture randomness unavailable"));
     }
-    if size >= windows.len() {
-        return Err(fail("Windows directory exceeds environment limit"));
-    }
-    let mut environment: Vec<u16> = "LOCALAPPDATA=".encode_utf16().collect();
-    environment.extend(local_app_data()?);
-    environment.push(0);
-    environment.extend("SystemRoot=".encode_utf16());
-    environment.extend_from_slice(&windows[..size]);
-    environment.extend([0, 0]);
-    Ok(environment)
+    Ok(random.iter().map(|b| format!("{b:02x}")).collect())
 }
 
-struct Handle(HANDLE);
-impl Handle {
-    fn checked(raw: HANDLE) -> io::Result<Self> {
-        if raw.is_null() || raw == INVALID_HANDLE_VALUE {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(Self(raw))
-        }
-    }
-}
-impl Drop for Handle {
-    fn drop(&mut self) {
-        unsafe {
-            CloseHandle(self.0);
-        }
-    }
-}
-struct Local(*mut std::ffi::c_void);
-impl Drop for Local {
-    fn drop(&mut self) {
-        unsafe {
-            LocalFree(self.0);
-        }
+fn inheritable() -> SECURITY_ATTRIBUTES {
+    SECURITY_ATTRIBUTES {
+        nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
+        lpSecurityDescriptor: null_mut(),
+        bInheritHandle: 1,
     }
 }
 
-fn token(process: HANDLE) -> io::Result<Handle> {
-    let mut raw = null_mut();
+/// An anonymous pipe whose write end is inheritable and whose read end is not.
+fn reply_pipe() -> io::Result<(Handle, Handle)> {
+    let mut read = null_mut();
+    let mut write = null_mut();
     unsafe {
-        ok(OpenProcessToken(
-            process,
-            TOKEN_QUERY | TOKEN_DUPLICATE,
-            &mut raw,
-        ))?;
+        ok(CreatePipe(&mut read, &mut write, &inheritable(), 4096))?;
     }
-    Handle::checked(raw)
-}
-fn token_info(token: &Handle, class: TOKEN_INFORMATION_CLASS) -> io::Result<Vec<usize>> {
-    let mut bytes = 0;
+    let reader = Handle::checked(read)?;
+    let writer = Handle::checked(write)?;
     unsafe {
-        GetTokenInformation(token.0, class, null_mut(), 0, &mut bytes);
+        ok(SetHandleInformation(reader.raw(), HANDLE_FLAG_INHERIT, 0))?;
     }
-    if bytes == 0 || bytes > 65536 {
-        return Err(fail("invalid token metadata size"));
-    }
-    let mut buffer = vec![0usize; (bytes as usize).div_ceil(size_of::<usize>())];
-    unsafe {
-        ok(GetTokenInformation(
-            token.0,
-            class,
-            buffer.as_mut_ptr().cast(),
-            bytes,
-            &mut bytes,
-        ))?;
-    }
-    Ok(buffer)
-}
-fn sid_text(sid: PSID) -> io::Result<String> {
-    let mut raw = null_mut();
-    unsafe {
-        ok(ConvertSidToStringSidW(sid, &mut raw))?;
-    }
-    let allocated = Local(raw.cast());
-    let mut len = 0;
-    unsafe {
-        while len < 256 && *raw.add(len) != 0 {
-            len += 1;
-        }
-        if len == 256 {
-            return Err(fail("oversized SID text"));
-        }
-        let text = String::from_utf16(std::slice::from_raw_parts(raw, len))
-            .map_err(|_| fail("invalid SID text"))?;
-        drop(allocated);
-        Ok(text)
-    }
-}
-fn descriptor(sddl: &str) -> io::Result<Local> {
-    let text = wide(sddl)?;
-    let mut raw = null_mut();
-    unsafe {
-        ok(ConvertStringSecurityDescriptorToSecurityDescriptorW(
-            text.as_ptr(),
-            1,
-            &mut raw,
-            null_mut(),
-        ))?;
-    }
-    Ok(Local(raw))
-}
-fn protect(path: &Path, sddl: &str) -> io::Result<()> {
-    let sd = descriptor(sddl)?;
-    let mut dacl = null_mut();
-    let mut present = 0;
-    let mut defaulted = 0;
-    unsafe {
-        ok(GetSecurityDescriptorDacl(
-            sd.0,
-            &mut present,
-            &mut dacl,
-            &mut defaulted,
-        ))?;
-    }
-    if present == 0 || dacl.is_null() {
-        return Err(fail("missing fixture ACL"));
-    }
-    let path = wide(path)?;
-    let status = unsafe {
-        SetNamedSecurityInfoW(
-            path.as_ptr(),
-            SE_FILE_OBJECT,
-            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
-            null_mut(),
-            null_mut(),
-            dacl,
-            null(),
-        )
-    };
-    if status == 0 {
-        Ok(())
-    } else {
-        Err(io::Error::from_raw_os_error(status as i32))
-    }
+    Ok((reader, writer))
 }
 
-struct Profile {
-    name: Vec<u16>,
-    sid: PSID,
-    retained: bool,
-    delete: unsafe extern "system" fn(*const u16) -> i32,
-    _library: SystemLibrary,
-}
-impl Drop for Profile {
-    fn drop(&mut self) {
-        unsafe {
-            if !self.retained {
-                (self.delete)(self.name.as_ptr());
-            }
-            FreeSid(self.sid);
-        }
-    }
-}
 struct Stage {
     root: PathBuf,
     directory: Option<tempfile::TempDir>,
@@ -297,66 +88,14 @@ impl Stage {
         Self::with_image(|target| std::fs::write(target, bytes))
     }
     fn with_image(write_executable: impl FnOnce(&Path) -> io::Result<()>) -> io::Result<Self> {
-        let mut random = [0u8; 16];
-        if unsafe {
-            BCryptGenRandom(
-                null_mut(),
-                random.as_mut_ptr(),
-                random.len() as u32,
-                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
-            )
-        } < 0
-        {
-            return Err(fail("fixture randomness unavailable"));
+        let profile = Profile::create(&format!("Epix.EvxFixture.{}", random_id()?))?;
+        if !profile.created() {
+            return Err(fail(
+                "fresh AppContainer profile failed: name already exists",
+            ));
         }
-        let id: String = random.iter().map(|b| format!("{b:02x}")).collect();
-        let name = wide(format!("Epix.EvxFixture.{id}"))?;
-        type CreateProfile = unsafe extern "system" fn(
-            *const u16,
-            *const u16,
-            *const u16,
-            *const SID_AND_ATTRIBUTES,
-            u32,
-            *mut PSID,
-        ) -> i32;
-        type DeleteProfile = unsafe extern "system" fn(*const u16) -> i32;
-        // Profile management belongs to the host. Loading userenv.dll in the
-        // LPAC child can fail during DLL initialization before Rust runs.
-        let library = SystemLibrary::open("userenv.dll")?;
-        // SAFETY: fixed exports from the system DLL with their Win32 ABI;
-        // Profile retains the library until its deletion callback is finished.
-        let create: CreateProfile =
-            unsafe { std::mem::transmute(library.symbol(c"CreateAppContainerProfile")?) };
-        let delete: DeleteProfile =
-            unsafe { std::mem::transmute(library.symbol(c"DeleteAppContainerProfile")?) };
-        let mut sid = null_mut();
-        let status = unsafe {
-            create(
-                name.as_ptr(),
-                name.as_ptr(),
-                name.as_ptr(),
-                null(),
-                0,
-                &mut sid,
-            )
-        };
-        if status < 0 {
-            return Err(fail(&format!(
-                "fresh AppContainer profile failed: 0x{:08x}",
-                status as u32
-            )));
-        }
-        let profile = Profile {
-            name,
-            sid,
-            retained: false,
-            delete,
-            _library: library,
-        };
-        let parent = token(unsafe { GetCurrentProcess() })?;
-        let user = token_info(&parent, TokenUser)?;
-        let owner = sid_text(unsafe { (*user.as_ptr().cast::<TOKEN_USER>()).User.Sid })?;
-        let package = sid_text(profile.sid)?;
+        let owner = current_user_sid_text()?;
+        let package = profile.sid_text()?;
         let private = format!("D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;{owner})");
         let readable = format!("{private}(A;OICI;GRGX;;;{package})");
         let directory = tempfile::Builder::new().prefix("evx-windows-").tempdir()?;
@@ -385,148 +124,58 @@ impl Stage {
             .profile
             .as_ref()
             .ok_or_else(|| fail("missing profile"))?;
-        let job = job()?;
-        let inherit = SECURITY_ATTRIBUTES {
-            nLength: size_of::<SECURITY_ATTRIBUTES>() as u32,
-            lpSecurityDescriptor: null_mut(),
-            bInheritHandle: 1,
-        };
-        let mut read = null_mut();
-        let mut write = null_mut();
-        unsafe {
-            ok(CreatePipe(&mut read, &mut write, &inherit, 4096))?;
-        }
-        let reader = Handle::checked(read)?;
-        let writer = Handle::checked(write)?;
-        unsafe {
-            ok(SetHandleInformation(reader.0, HANDLE_FLAG_INHERIT, 0))?;
-        }
+        let job = create_job(&FIXTURE_LIMITS)?;
+        let (reader, writer) = reply_pipe()?;
         // Deliberately inheritable, but excluded from the explicit handle list.
-        let excluded = Handle::checked(unsafe { CreateEventW(&inherit, 1, 0, null()) })?;
-        let mut security = SECURITY_CAPABILITIES {
-            AppContainerSid: profile.sid,
-            Capabilities: null_mut(),
-            CapabilityCount: 0,
-            Reserved: 0,
-        };
-        let mut lpac = PROCESS_CREATION_ALL_APPLICATION_PACKAGES_OPT_OUT;
-        let mut restricted = PROCESS_CREATION_CHILD_PROCESS_RESTRICTED;
-        let mut jobs = [job.0];
-        let mut handles = [writer.0];
-        // Backing values outlive Attributes: UpdateProcThreadAttribute retains pointers.
-        let mut attrs = Attributes::new(5)?;
-        attrs.set(PROC_THREAD_ATTRIBUTE_SECURITY_CAPABILITIES, &mut security)?;
-        attrs.set(
-            PROC_THREAD_ATTRIBUTE_ALL_APPLICATION_PACKAGES_POLICY,
-            &mut lpac,
-        )?;
-        attrs.set(PROC_THREAD_ATTRIBUTE_CHILD_PROCESS_POLICY, &mut restricted)?;
-        attrs.set(PROC_THREAD_ATTRIBUTE_JOB_LIST, &mut jobs)?;
-        attrs.set(PROC_THREAD_ATTRIBUTE_HANDLE_LIST, &mut handles)?;
-        let mut startup: STARTUPINFOEXW = unsafe { zeroed() };
-        startup.StartupInfo.cb = size_of::<STARTUPINFOEXW>() as u32;
-        // The same explicitly inherited private pipe also captures bounded
-        // startup diagnostics; no host console handles are inherited.
-        startup.StartupInfo.dwFlags = STARTF_USESTDHANDLES;
-        startup.StartupInfo.hStdInput = INVALID_HANDLE_VALUE;
-        startup.StartupInfo.hStdOutput = writer.0;
-        startup.StartupInfo.hStdError = writer.0;
-        startup.lpAttributeList = attrs.raw();
-        let exe = wide(&self.executable)?;
+        let excluded = Handle::checked(unsafe { CreateEventW(&inheritable(), 1, 0, null()) })?;
         // Only our fixed enum and decimal handles/loopback port enter argv. The
         // executable is also supplied separately, never searched through PATH.
-        let mut command = wide(format!(
-            "\"{}\" --evx-fixed-child {} {} {}",
-            self.executable.display(),
-            mode as u32,
-            writer.0 as usize,
-            port
-        ))?;
-        let cwd = wide(&self.root)?;
-        // No parent environment is inherited.
-        let mut environment = worker_environment()?;
-        let mut process: PROCESS_INFORMATION = unsafe { zeroed() };
-        // These pipe-only workers need no console infrastructure inside the
-        // zero-capability LPAC and its single-process job.
-        unsafe {
-            ok(CreateProcessW(
-                exe.as_ptr(),
-                command.as_mut_ptr(),
-                null(),
-                null(),
-                1,
-                EXTENDED_STARTUPINFO_PRESENT
-                    | CREATE_SUSPENDED
-                    | DETACHED_PROCESS
-                    | CREATE_UNICODE_ENVIRONMENT,
-                environment.as_mut_ptr().cast(),
-                cwd.as_ptr(),
-                &startup.StartupInfo,
-                &mut process,
-            ))
+        // The same explicitly inherited private pipe also captures bounded
+        // startup diagnostics; no host console handles are inherited, and no
+        // parent environment is inherited.
+        let mut spec = LaunchSpec {
+            executable: &self.executable,
+            command_line: format!(
+                "\"{}\" --evx-fixed-child {} {} {}",
+                self.executable.display(),
+                mode as u32,
+                writer.raw() as usize,
+                port
+            ),
+            current_directory: &self.root,
+            environment: worker_environment()?,
+            container_sid: profile.sid(),
+            job: &job,
+            inherited_handles: vec![writer.raw()],
+            stdin: INVALID_HANDLE_VALUE,
+            stdout: writer.raw(),
+            stderr: writer.raw(),
+        };
+        let launched = launch_suspended(&mut spec)
             .map_err(|error| fail(&format!("CreateProcessW LPAC fixture: {error}")))?;
-        }
         self.active = true;
-        let process_handle = Handle::checked(process.hProcess)?;
-        let thread = Handle::checked(process.hThread)?;
         // An error from here leaves the stage quarantined; closing the job kills
         // the process but is not treated as confirmation that it has died.
-        validate_token(process_handle.0, Some(profile.sid))?;
-        let mut in_job = 0;
-        unsafe {
-            ok(IsProcessInJob(process_handle.0, job.0, &mut in_job))?;
-        }
-        if in_job == 0 {
-            return Err(fail("child not atomically placed in job"));
-        }
+        verify_launched(&launched, &job, profile.sid())?;
         // Inspect the suspended child's handle table from the host. Calling
         // SetEvent on an excluded value inside LPAC triggers strict-handle
         // termination, preventing the remaining denial probes from running.
-        if !inherited_object(process_handle.0, &writer)? {
+        if !inherited_object(launched.process.raw(), &writer)? {
             return Err(fail("explicit reply handle was not inherited"));
         }
-        if inherited_object(process_handle.0, &excluded)? {
+        if inherited_object(launched.process.raw(), &excluded)? {
             return Err(fail("excluded event was inherited"));
         }
         drop(writer);
-        if unsafe { ResumeThread(thread.0) } == u32::MAX {
-            return Err(io::Error::last_os_error());
-        }
+        resume(&launched)?;
         Ok(Child {
-            process: process_handle,
+            process: launched.process,
             job: Some(job),
             reader,
             excluded,
             started: Instant::now(),
         })
     }
-}
-
-fn inherited_object(process: HANDLE, original: &Handle) -> io::Result<bool> {
-    let mut duplicate = null_mut();
-    let copied = unsafe {
-        DuplicateHandle(
-            process,
-            original.0,
-            GetCurrentProcess(),
-            &mut duplicate,
-            0,
-            0,
-            DUPLICATE_SAME_ACCESS,
-        )
-    };
-    if copied == 0 {
-        let error = io::Error::last_os_error();
-        return if error.raw_os_error() == Some(ERROR_INVALID_HANDLE as i32) {
-            Ok(false)
-        } else {
-            Err(error)
-        };
-    }
-    let duplicate = Handle::checked(duplicate)?;
-    // Inheritance preserves handle values. A recycled number referring to a
-    // different child-local object is not evidence that our object leaked.
-    Ok(unsafe { CompareObjectHandles(original.0, duplicate.0) } != 0)
 }
 
 impl Drop for Stage {
@@ -536,7 +185,7 @@ impl Drop for Stage {
             // Do not delete/reassign a profile after an unconfirmed child lifetime.
             if let Some(profile) = self.profile.as_mut() {
                 // Retain the OS profile but release the local SID allocation.
-                profile.retained = true;
+                profile.retain();
             }
             if let Some(directory) = self.directory.take() {
                 let _ = directory.keep();
@@ -551,167 +200,6 @@ impl Drop for Stage {
             }
         }
     }
-}
-
-struct Attributes {
-    storage: Vec<usize>,
-}
-impl Attributes {
-    fn new(count: u32) -> io::Result<Self> {
-        let mut bytes = 0;
-        unsafe {
-            InitializeProcThreadAttributeList(null_mut(), count, 0, &mut bytes);
-        }
-        if bytes == 0 || bytes > 65536 {
-            return Err(fail("invalid startup attribute size"));
-        }
-        let mut storage = vec![0usize; bytes.div_ceil(size_of::<usize>())];
-        unsafe {
-            ok(InitializeProcThreadAttributeList(
-                storage.as_mut_ptr().cast(),
-                count,
-                0,
-                &mut bytes,
-            ))?;
-        }
-        // DeleteProcThreadAttributeList requires successful initialization.
-        Ok(Self { storage })
-    }
-    fn raw(&mut self) -> LPPROC_THREAD_ATTRIBUTE_LIST {
-        self.storage.as_mut_ptr().cast()
-    }
-    fn set<T>(&mut self, key: u32, value: &mut T) -> io::Result<()> {
-        unsafe {
-            ok(UpdateProcThreadAttribute(
-                self.raw(),
-                0,
-                key as usize,
-                std::ptr::from_mut(value).cast(),
-                size_of::<T>(),
-                null_mut(),
-                null(),
-            ))
-        }
-    }
-}
-impl Drop for Attributes {
-    fn drop(&mut self) {
-        unsafe {
-            DeleteProcThreadAttributeList(self.raw());
-        }
-    }
-}
-
-fn job() -> io::Result<Handle> {
-    let job = Handle::checked(unsafe { CreateJobObjectW(null(), null()) })?;
-    let mut limits: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
-    limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        | JOB_OBJECT_LIMIT_ACTIVE_PROCESS
-        | JOB_OBJECT_LIMIT_PROCESS_MEMORY
-        | JOB_OBJECT_LIMIT_JOB_MEMORY
-        | JOB_OBJECT_LIMIT_PROCESS_TIME
-        | JOB_OBJECT_LIMIT_JOB_TIME
-        | JOB_OBJECT_LIMIT_DIE_ON_UNHANDLED_EXCEPTION;
-    limits.BasicLimitInformation.ActiveProcessLimit = 1;
-    limits.BasicLimitInformation.PerProcessUserTimeLimit = CPU_100NS;
-    limits.BasicLimitInformation.PerJobUserTimeLimit = CPU_100NS;
-    limits.ProcessMemoryLimit = MEMORY;
-    limits.JobMemoryLimit = MEMORY;
-    unsafe {
-        ok(SetInformationJobObject(
-            job.0,
-            JobObjectExtendedLimitInformation,
-            (&limits as *const JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
-            size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
-        ))?;
-    }
-    let mut cpu: JOBOBJECT_CPU_RATE_CONTROL_INFORMATION = unsafe { zeroed() };
-    cpu.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
-    cpu.Anonymous.CpuRate = 5000;
-    unsafe {
-        ok(SetInformationJobObject(
-            job.0,
-            JobObjectCpuRateControlInformation,
-            (&cpu as *const JOBOBJECT_CPU_RATE_CONTROL_INFORMATION).cast(),
-            size_of::<JOBOBJECT_CPU_RATE_CONTROL_INFORMATION>() as u32,
-        ))?;
-    }
-    Ok(job)
-}
-fn grants_read(token: &Handle, package: &str) -> io::Result<bool> {
-    // Satisfy the ordinary user check with Everyone; the second grant tests
-    // the AppContainer package restriction independently of host file ACLs.
-    let sd = descriptor(&format!("O:SYG:SYD:(A;;0x1;;;WD)(A;;0x1;;;{package})"))?;
-    let mapping = GENERIC_MAPPING {
-        GenericRead: 1,
-        GenericWrite: 1,
-        GenericExecute: 1,
-        GenericAll: 1,
-    };
-    let mut privileges: PRIVILEGE_SET = unsafe { zeroed() };
-    let mut bytes = size_of::<PRIVILEGE_SET>() as u32;
-    let mut granted = 0;
-    let mut allowed = 0;
-    unsafe {
-        ok(AccessCheck(
-            sd.0,
-            token.0,
-            1,
-            &mapping,
-            &mut privileges,
-            &mut bytes,
-            &mut granted,
-            &mut allowed,
-        ))?;
-    }
-    Ok(allowed != 0 && granted & 1 != 0)
-}
-
-fn validate_lpac(token: &Handle, package: PSID) -> io::Result<()> {
-    let mut raw = null_mut();
-    unsafe {
-        ok(DuplicateToken(token.0, SecurityIdentification, &mut raw))?;
-    }
-    let impersonation = Handle::checked(raw)?;
-    // Class 46 (TokenIsLessPrivilegedAppContainer) is not queryable through
-    // GetTokenInformation on current Windows. Check LPAC's defining access
-    // restriction: its own package grant works, ALL_APPLICATION_PACKAGES does
-    // not. The positive control prevents an unrelated denial from passing.
-    if !grants_read(&impersonation, &sid_text(package)?)? {
-        return Err(fail(
-            "AppContainer token failed its own package access check",
-        ));
-    }
-    if grants_read(&impersonation, "S-1-15-2-1")? {
-        return Err(fail(
-            "child token accepts ALL_APPLICATION_PACKAGES; LPAC required",
-        ));
-    }
-    Ok(())
-}
-
-fn validate_token(process: HANDLE, expected: Option<PSID>) -> io::Result<()> {
-    let token = token(process)?;
-    let buffer = token_info(&token, TokenIsAppContainer)?;
-    if unsafe { *buffer.as_ptr().cast::<u32>() } == 0 {
-        return Err(fail("child token is not an AppContainer"));
-    }
-    let caps = token_info(&token, TokenCapabilities)?;
-    if unsafe { (*caps.as_ptr().cast::<TOKEN_GROUPS>()).GroupCount } != 0 {
-        return Err(fail("unexpected AppContainer capabilities"));
-    }
-    let sid = token_info(&token, TokenAppContainerSid)?;
-    let actual =
-        unsafe { (*sid.as_ptr().cast::<TOKEN_APPCONTAINER_INFORMATION>()).TokenAppContainer };
-    if actual.is_null() {
-        return Err(fail("missing AppContainer identity"));
-    }
-    if let Some(expected) = expected {
-        if unsafe { EqualSid(actual, expected) } == 0 {
-            return Err(fail("wrong AppContainer identity"));
-        }
-    }
-    validate_lpac(&token, actual)
 }
 
 struct Child {
@@ -730,13 +218,13 @@ struct Outcome {
 impl Child {
     fn confirm_ready(&self, wall: Duration) -> io::Result<()> {
         loop {
-            if unsafe { WaitForSingleObject(self.process.0, 0) } != WAIT_TIMEOUT {
+            if unsafe { WaitForSingleObject(self.process.raw(), 0) } != WAIT_TIMEOUT {
                 return Err(fail("sleep fixture exited before job-close probe"));
             }
             let mut bytes = 0;
             unsafe {
                 ok(PeekNamedPipe(
-                    self.reader.0,
+                    self.reader.raw(),
                     null_mut(),
                     0,
                     null_mut(),
@@ -746,7 +234,7 @@ impl Child {
             }
             if bytes != 0 {
                 verify_fixture_reply(&self.reader, 0)?;
-                if unsafe { WaitForSingleObject(self.process.0, 0) } != WAIT_TIMEOUT {
+                if unsafe { WaitForSingleObject(self.process.raw(), 0) } != WAIT_TIMEOUT {
                     return Err(fail("sleep fixture died before closing the job"));
                 }
                 return Ok(());
@@ -773,7 +261,7 @@ impl Child {
         }
         let deadline;
         loop {
-            match unsafe { WaitForSingleObject(self.process.0, 10) } {
+            match unsafe { WaitForSingleObject(self.process.raw(), 10) } {
                 WAIT_OBJECT_0 => {
                     deadline = self.started.elapsed() >= wall;
                     break;
@@ -784,11 +272,9 @@ impl Child {
             if self.started.elapsed() >= wall {
                 deadline = true;
                 if let Some(job) = &self.job {
-                    unsafe {
-                        ok(TerminateJobObject(job.0, TERMINATED))?;
-                    }
+                    terminate_job(job.raw(), TERMINATED)?;
                 }
-                if unsafe { WaitForSingleObject(self.process.0, 3000) } != WAIT_OBJECT_0 {
+                if unsafe { WaitForSingleObject(self.process.raw(), 3000) } != WAIT_OBJECT_0 {
                     return Err(fail("termination unconfirmed; fixture retained"));
                 }
                 break;
@@ -802,7 +288,7 @@ impl Child {
             loop {
                 unsafe {
                     ok(QueryInformationJobObject(
-                        job.0,
+                        job.raw(),
                         JobObjectBasicAccountingInformation,
                         (&mut accounting as *mut JOBOBJECT_BASIC_ACCOUNTING_INFORMATION).cast(),
                         size_of::<JOBOBJECT_BASIC_ACCOUNTING_INFORMATION>() as u32,
@@ -819,7 +305,7 @@ impl Child {
             }
             unsafe {
                 ok(QueryInformationJobObject(
-                    job.0,
+                    job.raw(),
                     JobObjectExtendedLimitInformation,
                     (&mut limits as *mut JOBOBJECT_EXTENDED_LIMIT_INFORMATION).cast(),
                     size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
@@ -829,12 +315,12 @@ impl Child {
         }
         let mut code = 0;
         unsafe {
-            ok(GetExitCodeProcess(self.process.0, &mut code))?;
+            ok(GetExitCodeProcess(self.process.raw(), &mut code))?;
         }
         // Only native wait and empty-job evidence clear quarantine, even if later
         // reply checks fail. Exit code alone, including STILL_ACTIVE, never clears it.
         stage.active = false;
-        if unsafe { WaitForSingleObject(self.excluded.0, 0) } != WAIT_TIMEOUT {
+        if unsafe { WaitForSingleObject(self.excluded.raw(), 0) } != WAIT_TIMEOUT {
             return Err(fail("excluded event was inherited or signaled"));
         }
         if expect_reply {
@@ -852,7 +338,7 @@ fn verify_fixture_reply(reader: &Handle, code: u32) -> io::Result<()> {
     let mut bytes = 0;
     unsafe {
         ok(PeekNamedPipe(
-            reader.0,
+            reader.raw(),
             null_mut(),
             0,
             null_mut(),
@@ -870,7 +356,7 @@ fn verify_fixture_reply(reader: &Handle, code: u32) -> io::Result<()> {
     let mut read = 0;
     unsafe {
         ok(ReadFile(
-            reader.0,
+            reader.raw(),
             reply.as_mut_ptr(),
             bytes,
             &mut read,
