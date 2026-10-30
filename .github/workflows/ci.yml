@@ -34,9 +34,23 @@ jobs:
           export KOTLINC="$(command -v kotlinc)"
           "$KOTLINC" -version
           export COROUTINES_JAR="$RUNNER_TEMP/kotlinx-coroutines-core-jvm-1.9.0.jar"
-          curl --fail --location --silent --show-error --retry 3 --connect-timeout 10 --max-time 120 \
-            https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.9.0/kotlinx-coroutines-core-jvm-1.9.0.jar \
-            --output "$COROUTINES_JAR"
+          # Maven Central rate-limits the shared runner addresses (HTTP 429), which
+          # failed an otherwise green run. The checksum below makes any source
+          # safe, so wait between attempts and fall back to the Google mirror.
+          # --retry-max-time bounds the window: a 429 with a long Retry-After
+          # must fail over to the mirror, not sleep past the job timeout.
+          ARTIFACT="org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.9.0/kotlinx-coroutines-core-jvm-1.9.0.jar"
+          download_coroutines() {
+            local url
+            for url in "https://repo.maven.apache.org/maven2/$ARTIFACT" "https://maven-central.storage-download.googleapis.com/maven2/$ARTIFACT"; do
+              if curl --fail --location --no-progress-meter --retry 4 --retry-delay 10 --retry-max-time 120 --connect-timeout 10 --max-time 120 "$url" --output "$COROUTINES_JAR"; then
+                return 0
+              fi
+              echo "Download failed from $url" >&2
+            done
+            return 1
+          }
+          download_coroutines
           echo "ad89c2892235e670f222d819cb3d81188143cb19a05b59df9889ae4269f5c70a  $COROUTINES_JAR" | sha256sum --check
           python3 shells/android/tests/run-node-host-regressions.py
           python3 shells/android/tests/run-browser-host-regressions.py
