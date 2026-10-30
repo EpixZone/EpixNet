@@ -52,6 +52,15 @@ class AcceptanceTests(unittest.TestCase):
             self.assertFalse(record["completed"])
             self.assertIsNone(record["checks"][0]["exit_code"])
 
+    def test_a_stalled_or_failed_version_probe_is_recorded_not_fatal(self):
+        stalled = acceptance.tool_version([sys.executable, "-c", "import time; time.sleep(5)"], timeout=0.5)
+        self.assertTrue(stalled.startswith("unavailable: TimeoutExpired"), stalled)
+        failed = acceptance.tool_version([sys.executable, "-c", "raise SystemExit(3)"])
+        self.assertTrue(failed.startswith("unavailable: CalledProcessError"), failed)
+        missing = acceptance.tool_version(["evx-no-such-tool-for-this-test"])
+        self.assertTrue(missing.startswith("unavailable: FileNotFoundError"), missing)
+        self.assertEqual(acceptance.tool_version([sys.executable, "-c", "print('v1')"]), "v1")
+
     def test_windows_core_profile_does_not_claim_native_worker_acceptance(self):
         all_args = [arg for _, command in acceptance.commands("windows-core") for arg in command]
         self.assertNotIn("evx-worker", all_args)
