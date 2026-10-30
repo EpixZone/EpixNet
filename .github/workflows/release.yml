@@ -34,7 +34,12 @@ permissions:
 
 jobs:
   macos:
-    runs-on: macos-14
+    # GitHub retires macos-14 on 2026-11-02. macos-latest moves to newer
+    # Xcode releases over time, so the deployment target is pinned to the
+    # minimum the app's Info.plist declares and checked after the build.
+    runs-on: macos-latest
+    env:
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
       - uses: actions/checkout@v7.0.1
 
@@ -87,6 +92,17 @@ jobs:
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
         run: packaging/macos/build-app.sh
+
+      - name: Check the built binaries still run on macOS 11
+        run: |
+          for bin in target/release/epix-browser target/release/epix-nmh; do
+            minos=$(otool -l "$bin" | awk '/LC_BUILD_VERSION/ {found=1} found && $1 == "minos" {print $2; exit}')
+            echo "$bin: minos $minos"
+            if [ "$minos" != "11.0" ]; then
+              echo "::error::$bin requires macOS $minos but Info.plist declares 11.0"
+              exit 1
+            fi
+          done
 
       - uses: actions/upload-artifact@v7
         with:
