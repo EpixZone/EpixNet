@@ -146,7 +146,11 @@ fn uncertain_write_requires_explicit_reconciliation_before_different_content() {
     for after_replace in [false, true] {
         let f = Fixture::new();
         assert_eq!(f.run(&write_wat("score.txt", "old")).status, Status::Ok);
-        let mut limits = f.broker.limits();
+        // The short host-call budget is for the helper the fault makes
+        // block; the plain runs after it get the ordinary one back, so a
+        // slow runner cannot turn a reconciled write into a second fault.
+        let ordinary = f.broker.limits();
+        let mut limits = ordinary.clone();
         limits.host_call_seconds = 0.25;
         f.broker.set_limits(limits).unwrap();
         let result = f.run_with(
@@ -161,6 +165,7 @@ fn uncertain_write_requires_explicit_reconciliation_before_different_content() {
             },
         );
         assert_eq!(result.status, Status::EffectUnknown, "{result:?}");
+        f.broker.set_limits(ordinary).unwrap();
         let read = f.run(&read_wat("score.txt"));
         assert_eq!(
             read_bytes(&read.responses[0]),
@@ -246,7 +251,9 @@ fn failed_provenance_persistence_prevents_the_native_commit() {
 #[test]
 fn first_write_interrupted_before_replace_can_reconcile_absence() {
     let f = Fixture::new();
-    let mut limits = f.broker.limits();
+    // Short budget for the blocked helper only (see above).
+    let ordinary = f.broker.limits();
+    let mut limits = ordinary.clone();
     limits.host_call_seconds = 0.2;
     f.broker.set_limits(limits).unwrap();
     let interrupted = f.run_with(
@@ -257,6 +264,7 @@ fn first_write_interrupted_before_replace_can_reconcile_absence() {
         },
     );
     assert_eq!(interrupted.status, Status::EffectUnknown, "{interrupted:?}");
+    f.broker.set_limits(ordinary).unwrap();
     assert!(!f.workspace.join("state/score.txt").exists());
     assert_eq!(
         evx_supervisor::reconcile_workspace(&f.config, &f.broker).unwrap(),

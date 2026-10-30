@@ -100,6 +100,9 @@ fn blocked_native_helper_is_killed_and_next_operation_recovers() {
     assert_eq!(files.len(), 1, "{result:?}");
     assert!(terminated_by_host(files[0].exit_code.unwrap()), "{result:?}");
     assert_clean_children(&f, &result);
+    // The recovery write is a plain run; give it the suite's ordinary
+    // budget rather than the one that was sized for the blocked helper.
+    f.broker.set_limits(lifecycle_limits()).unwrap();
     let recovery = f.run(&write_wat("recovered.txt", "ready"));
     assert_eq!(recovery.status, Status::Ok, "{recovery:?}");
     assert!(recovery.responses[0].is_ok());
