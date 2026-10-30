@@ -61,9 +61,12 @@ the fixture and both fixture executables, a build of `evx-worker.exe` and
 `packaging/windows/verify-evx-worker.py` on a single-link copy of it (AMD64
 image, no `userenv`, `shell32` or `ole32` import, refuses to run outside an
 AppContainer), the product dependency gates
-(`scripts/check-evx-platforms.py`) and the offline packaging test. CI runs
-it as `Windows native EVX (windows-2025)` in
-`.github/workflows/evx-platforms.yml`. The fixture workflow
+(`scripts/check-evx-platforms.py`) and the offline packaging test. The
+native suites run two tests at a time: every spawning test starts two or
+three AppContainer processes, and on the four-vCPU hosted runner the
+default parallelism turned the suites' fixed deadlines into a measurement
+of the runner. CI runs the profile as `Windows native EVX (windows-2025)`
+in `.github/workflows/evx-platforms.yml`. The fixture workflow
 `.github/workflows/evx-windows-fixture.yml` additionally inspects the
 fixture images with `dumpbin`.
 
