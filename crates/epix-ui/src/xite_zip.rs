@@ -186,6 +186,9 @@ fn merged_records(container: &Value) -> Result<&Vec<Value>, String> {
 /// Pin the configured root endpoint. Its trusted ancestry may contain symlinks,
 /// but the root itself and every untrusted descendant must be direct objects.
 struct Root {
+    // Held open on every platform to pin the root; read only where
+    // descriptor-relative opens exist.
+    #[cfg_attr(not(unix), allow(dead_code))]
     directory: File,
     path: PathBuf,
 }

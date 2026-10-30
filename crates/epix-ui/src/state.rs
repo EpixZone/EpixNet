@@ -34181,7 +34181,8 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
 }
 
 /// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
-/// current directory). Uses `statvfs` on unix.
+/// current directory). Uses `statvfs` on unix and `GetDiskFreeSpaceExW` on
+/// Windows; elsewhere it is unknown (0), which disables percentage caps.
 fn free_space(path: Option<&std::path::Path>) -> i64 {
     #[cfg(unix)]
     {
@@ -34197,7 +34198,25 @@ fn free_space(path: Option<&std::path::Path>) -> i64 {
         }
         0
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let dir = path.and_then(std::path::Path::parent).unwrap_or_else(|| std::path::Path::new("."));
+        let Ok(dir) = std::path::absolute(dir) else { return 0 };
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut available: u64 = 0;
+        // SAFETY: the function writes the caller-available byte count into
+        // `available`; the two totals are optional and left null.
+        let ok = unsafe {
+            GetDiskFreeSpaceExW(wide.as_ptr(), &mut available, std::ptr::null_mut(), std::ptr::null_mut())
+        };
+        if ok != 0 {
+            return i64::try_from(available).unwrap_or(i64::MAX);
+        }
+        0
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = path;
         0

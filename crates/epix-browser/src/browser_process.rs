@@ -74,6 +74,9 @@ pub fn browser_command(
     browser_command_for(platform, firefox, profile, window_size)
 }
 
+// Only the Linux launch sizes the window; elsewhere the size is accepted and
+// ignored, so the Windows and macOS builds stay warning-free.
+#[cfg_attr(not(any(all(unix, not(target_os = "macos")), test)), allow(unused_variables))]
 fn browser_command_for(
     platform: Platform,
     firefox: &Path,

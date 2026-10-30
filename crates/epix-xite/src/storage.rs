@@ -433,8 +433,7 @@ fn write_atomic_durable_beneath(root: &Path, inner_path: &str, bytes: &[u8]) -> 
     use std::io::{Read, Write};
     use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
     use windows_sys::Win32::Storage::FileSystem::{
-        DELETE, FILE_ATTRIBUTE_REPARSE_POINT,
-        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
+        DELETE, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT, FILE_GENERIC_WRITE,
         FILE_SHARE_DELETE, FILE_SHARE_READ,
     };
 
