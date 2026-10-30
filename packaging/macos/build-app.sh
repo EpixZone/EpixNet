@@ -159,6 +159,7 @@ if [ -n "$BUNDLED_FF" ]; then
   }
 }
 POLICIES
+  python3 "$REPO_ROOT/packaging/firefox-addons/install.py" "$BUNDLED_FF/Contents/Resources"
 fi
 
 cat > "$APP/Contents/Info.plist" <<PLIST

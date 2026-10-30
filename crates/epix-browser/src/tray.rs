@@ -98,6 +98,7 @@ pub(crate) struct Session {
     child: Option<Child>,
     firefox: PathBuf,
     profile: PathBuf,
+    addon_credentials: epix_ui::addon_broker::AddonLaunchCredentials,
     start_url: String,
     scheme: String,
     badge_shown: Option<bool>,
@@ -140,6 +141,7 @@ impl Session {
             child: ctx.child,
             firefox: ctx.ready.firefox,
             profile: ctx.ready.profile,
+            addon_credentials: ctx.ready.addon_credentials,
             start_url: ctx.ready.start_url,
             scheme: ctx.ready.scheme,
             // Force the first draw so an existing unread badge appears.
@@ -167,7 +169,7 @@ impl Session {
             match request {
                 crate::ipc::Request::Open(arg) => {
                     let url = target_url(&self.scheme, &arg);
-                    reopen_browser(&mut self.child, &self.firefox, &self.profile, &url);
+                    reopen_browser(&mut self.child, &self.firefox, &self.profile, &url, &self.addon_credentials, &self.handles.open_item);
                 }
                 // `epix-browser --quit` (the installer, a script): the same
                 // exit as the tray's Quit item, browser first.
@@ -187,6 +189,7 @@ impl Session {
                 &self.firefox,
                 &self.profile,
                 &self.start_url,
+                &self.addon_credentials,
             ) {
                 return true;
             }
@@ -307,6 +310,7 @@ fn on_menu_event(
     firefox: &Path,
     profile: &Path,
     start_url: &str,
+    credentials: &epix_ui::addon_broker::AddonLaunchCredentials,
 ) -> bool {
     if ev.id == handles.quit {
         // Take the managed browser down with the node - without the node every
@@ -315,7 +319,7 @@ fn on_menu_event(
         return true;
     }
     if ev.id == handles.open {
-        reopen_browser(child, firefox, profile, start_url);
+        reopen_browser(child, firefox, profile, start_url, credentials, &handles.open_item);
     } else if ev.id == handles.autostart {
         // Toggle "open at login", then reflect the real state back onto the
         // checkbox (a failed write leaves it where it was).
@@ -345,6 +349,7 @@ struct Handles {
     conns: MenuItem,
     transfer: MenuItem,
     open: muda::MenuId,
+    open_item: MenuItem,
     /// The "Open at Login" checkbox: its id (for click matching) and the item
     /// itself (to read/reflect the checked state).
     autostart: muda::MenuId,
@@ -432,6 +437,7 @@ fn build(ctx: &TrayContext) -> Result<Built, String> {
 
     let handles = Handles {
         open: open.id().clone(),
+        open_item: open,
         autostart: autostart_item.id().clone(),
         github: github.id().clone(),
         issues: issues.id().clone(),
@@ -526,9 +532,18 @@ fn target_url(scheme: &str, arg: &str) -> String {
 /// Reopen the browser from the tray. Starts a fresh managed instance when there
 /// is no window (background mode, or the previous one was closed); if one is
 /// still running, asks Firefox (remote) to raise it - best-effort.
-fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url: &str) {
+fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url: &str, credentials: &epix_ui::addon_broker::AddonLaunchCredentials, open_item: &MenuItem) {
+    if let Err(error) = crate::addons::preflight(firefox, profile, credentials.profile_id()) {
+        eprintln!("Could not reopen Epix Browser: {error}");
+        open_item.set_text(format!("Browser blocked: {error}"));
+        return;
+    }
+    open_item.set_text("Open EpixNet");
     let spawn_fresh = |child: &mut Option<Child>| {
-        let mut cmd = crate::browser_process::browser_command(firefox, profile);
+        // Query again on the tray thread: Gamescope's resolution can change while closed.
+        let window_size = crate::browser_process::gamescope_window_size();
+        let mut cmd = crate::browser_process::browser_command(firefox, profile, window_size);
+        credentials.configure_command(&mut cmd);
         if let Ok(c) = cmd.arg(url).spawn() {
             *child = Some(c);
         }
@@ -540,7 +555,9 @@ fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url
             Ok(Some(_)) => spawn_fresh(child),
             // Still running: best-effort remote open to raise it.
             Ok(None) => {
-                let _ = Command::new(firefox).arg("--profile").arg(profile).arg(url).spawn();
+                let mut command = Command::new(firefox);
+                credentials.configure_command(&mut command);
+                let _ = command.arg("--profile").arg(profile).arg(url).spawn();
             }
             Err(_) => {}
         },

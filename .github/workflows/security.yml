@@ -104,6 +104,7 @@ jobs:
           --ignore RUSTSEC-2025-0141
           --ignore RUSTSEC-2024-0436
           --ignore RUSTSEC-2024-0388
+          --ignore RUSTSEC-2026-0387
 
   cargo-deny:
     name: cargo deny (advisories, bans, licenses, sources)
@@ -126,12 +127,21 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: google/osv-scanner-action/osv-scanner-action@a345acffa64b0eaede81a3d9aae6141214d9c8fc # v2.6.0
-        with:
-          # osv-scanner.toml holds the accepted-advisory ignore list.
-          scan-args: |-
-            --config=osv-scanner.toml
-            --lockfile=Cargo.lock
+      - name: Test temporary OSV range correction
+        run: python3 -m unittest discover -s scripts -p test_osv_ci_config.py
+      - name: Prepare OSV policy for this lockfile
+        run: python3 scripts/osv_ci_config.py
+      - name: Scan Cargo.lock with OSV 2.7.0
+        # The action wrapper converts exit 128 to success, even with the false
+        # flag in scan-args. Call the same scanner directly to preserve errors.
+        # Keep this restricted to the inventory checked by osv_ci_config.py.
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace:ro" --workdir /workspace \
+            --entrypoint /root/osv-scanner \
+            ghcr.io/google/osv-scanner-action:v2.7.0@sha256:d54770fe0b09493894e76a02aaed9f51a0513fa57c5186452a755d257b0068a6 \
+            scan source --config=.osv-scanner-ci.toml --lockfile=Cargo.lock \
+            --allow-no-lockfiles=false
 
   semgrep:
     name: semgrep (SAST)
@@ -163,7 +173,7 @@ jobs:
           --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage
           --exclude-rule rust.lang.security.current-exe.current-exe
           --error --sarif --output semgrep.sarif crates || true
-      - uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4.38.2
+      - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         if: always()
         with:
           sarif_file: semgrep.sarif

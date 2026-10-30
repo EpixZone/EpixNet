@@ -1,15 +1,15 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/rln", "vendor/ark-relations", "vendor/rdrand"]
+exclude = ["vendor/rln", "vendor/ark-relations", "vendor/rdrand", "vendor/emissary-util", "vendor/askama_derive", "vendor/saturating-time"]
 members = ["crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/epix-ui", "crates/epix-server", "crates/epix-chain", "crates/epix-dht", "crates/epix-dht-net", "crates/epix-reticulum", "crates/epix-propagation", "crates/epix-runtime", "crates/epix-user", "crates/epix-peer", "crates/epix-plugin", "crates/epix-plugins", "crates/epix-tor", "crates/epix-i2p", "crates/epix-node", "crates/iptproxy-sys", "crates/epix-ffi", "crates/epix-browser", "crates/epix-browser-net", "crates/epix-nmh", "crates/epix-build", "crates/epix-bt", "crates/xid-spike", "crates/epix-blob", "crates/epix-fs", "crates/epix-selfenc", "crates/epix-edx", "crates/epix-feed", "crates/epix-search", "crates/epix-envelope", "crates/epix-channel", "crates/epix-pairwise-engine", "crates/epix-group-engine", "crates/epix-rln", "crates/evx-api", "crates/evx-runtime", "crates/evx-worker", "crates/evx-supervisor", "crates/evx-state", "crates/evx-activation", "crates/evx-host", "crates/evx-workspace", "crates/evx-declaration", "crates/epix-evx", "crates/evx-windows", "crates/evx-android"]
 
-# saturating-time 0.4.0 hangs forever on Windows: its platform-limit search
+# saturating-time 0.5.0 hangs forever on Windows: its platform-limit search
 # assumes 1ns clock granularity, but Windows SystemTime is a 100ns FILETIME, so
 # the loop never terminates. That made arti (tor-netdoc, tor-cert) hang on every
-# Tor bootstrap on Windows. Point at our fork until the fix is released upstream.
-# Fork: https://github.com/EpixZone/saturating-time  Upstream: https://codeberg.org/cve/saturating-time
+# Tor bootstrap on Windows. Port the existing 0.4.1 fork fix to the 0.5 version
+# required by Arti 0.47. See vendor/saturating-time/EPIXNET_PATCH.md.
 [patch.crates-io]
-saturating-time = { git = "https://github.com/EpixZone/saturating-time", rev = "afd652ed569053f878c30f6b0ef44528cd900d46" }
+saturating-time = { path = "vendor/saturating-time" }
 # Vendored rln (zerokit) with the sled-backed tree + C FFI gated off by default.
 # Upstream rln pulls sled with the `compression` feature, which links native
 # zstd and conflicts with arti's async-compression zstd (`links = "zstd"` may
@@ -24,3 +24,11 @@ ark-relations = { path = "vendor/ark-relations" }
 # register that native translation cannot emulate. Keep the other entropy
 # sources unchanged. See vendor/rdrand/EPIXNET_PATCH.md.
 rdrand = { path = "vendor/rdrand" }
+# Backport Askama's upstream replacement of the unmaintained basic-toml parser.
+# See vendor/askama_derive/EPIXNET_PATCH.md.
+askama_derive = { path = "vendor/askama_derive" }
+
+[patch."https://github.com/eepnet/emissary"]
+# Keep the reviewed router revision while upgrading the reseeder to patched ZIP.
+# See vendor/emissary-util/EPIXNET_PATCH.md.
+emissary-util = { path = "vendor/emissary-util" }

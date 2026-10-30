@@ -1224,7 +1224,7 @@ impl WsCommand for ConfigSet {
             _ => (None, Value::Null),
         };
         let key = key.ok_or("configSet: key required")?;
-        // data_dir persists to epixnet.conf (and copies the data over), not
+        // data_dir queues an offline move for the next start, not
         // config.json - config.json lives inside the directory it would name.
         if key == "data_dir" {
             let dir = value.as_str().unwrap_or_default();
@@ -1561,7 +1561,7 @@ impl WsCommand for WrapperNonce {
         "serverGetWrapperNonce"
     }
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
-        Ok(json!({ "wrapper_nonce": s.state.wrapper_nonce() }))
+        Ok(json!({ "wrapper_nonce": s.state.issue_wrapper_nonce() }))
     }
 }
 
@@ -3712,7 +3712,7 @@ impl WsCommand for MergerXiteDelete {
             return Err("Not a merger xite".into());
         }
         for target in arg_addresses(p) {
-            s.state.remove_xite(&require_address(&target)?).await;
+            s.state.try_remove_xite(&require_address(&target)?).await?;
         }
         s.state.rebuild_merger_dbs().await;
         Ok(Value::from("ok"))
@@ -3846,7 +3846,7 @@ impl WsCommand for XiteDelete {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = target_address(s, p)?;
-        if s.state.remove_xite(&address).await {
+        if s.state.try_remove_xite(&address).await? {
             Ok(Value::from("ok"))
         } else {
             Err(format!("Unknown xite: {address}"))
@@ -4682,6 +4682,27 @@ mod tests {
     use super::*;
     use crate::state::XiteEntry;
     use epix_xite::XiteStorage;
+
+    #[tokio::test]
+    async fn wrapper_nonce_command_issues_fresh_one_time_tokens() {
+        let state = AppState::new("test");
+        // Only the wrapper chrome (a wrapper socket with an elevated id) may
+        // ask for recovery nonces; a page-level socket is refused.
+        let session = WsSession::new_wrapper(state.clone(), Some(crate::state::DASHBOARD_XITE_ADDRESS.into()));
+        let commands = CommandRegistry::with_defaults();
+        let mut issued = Vec::new();
+        for _ in 0..2 {
+            let response = commands.dispatch(&session, "serverGetWrapperNonce", &json!([]), WRAPPER_ID_BASE)
+                .await.unwrap();
+            assert_eq!(response.as_object().unwrap().len(), 1, "preserve the object response contract");
+            let nonce = response["wrapper_nonce"].as_str().unwrap();
+            assert!(!nonce.is_empty() && nonce.bytes().all(|c| c.is_ascii_alphanumeric()));
+            assert!(state.consume_wrapper_nonce(nonce), "the recovered inner request must accept the token");
+            assert!(!state.consume_wrapper_nonce(nonce), "tokens must be single use");
+            issued.push(nonce.to_owned());
+        }
+        assert_ne!(issued[0], issued[1]);
+    }
 
     #[tokio::test]
     async fn clone_retry_command_targets_only_the_requested_xite() {

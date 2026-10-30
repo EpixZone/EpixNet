@@ -618,6 +618,114 @@ if (window.getComputedStyle(document.body).transform) {
 });
 
 
+/* Wrapper controls use their own coordinates. Compensate the xite's initial
+   viewport scale, while leaving subsequent user pinch zoom intact. */
+(function () {
+  function WrapperChrome() {
+    this.element = document.getElementById("wrapper-controls");
+    this.baseline = this.metrics().scale;
+    this.scale = this.baseline;
+    this.viewport = this.viewportContent();
+    this.physicalWidth = 0;
+    this.frame = null;
+    this.pendingViewport = 0;
+    this.update = this.update.bind(this);
+    this.schedule = this.schedule.bind(this);
+    window.addEventListener("resize", this.schedule);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", this.schedule);
+      window.visualViewport.addEventListener("scroll", this.schedule);
+    }
+    this.update();
+  }
+
+  WrapperChrome.prototype.viewportContent = function () {
+    var tags = document.querySelectorAll('meta[name="viewport"]');
+    return tags.length ? tags[tags.length - 1].content : "";
+  };
+
+  WrapperChrome.prototype.metrics = function () {
+    var viewport = window.visualViewport;
+    return {
+      scale: viewport && viewport.scale > 0 ? viewport.scale : 1,
+      width: viewport ? viewport.width : document.documentElement.clientWidth,
+      height: viewport ? viewport.height : document.documentElement.clientHeight,
+      left: viewport ? viewport.pageLeft : window.pageXOffset,
+      top: viewport ? viewport.pageTop : window.pageYOffset
+    };
+  };
+
+  WrapperChrome.prototype.beforeViewportChange = function (content) {
+    var before = this.metrics(), generation = ++this.pendingViewport, self = this;
+    this.viewport = content;
+    // Layout responds asynchronously to meta changes. Ordinary resize/scroll
+    // events must never adopt the user's current pinch as the author baseline.
+    requestAnimationFrame(function () {
+      requestAnimationFrame(function () {
+        if (generation !== self.pendingViewport) return;
+        var after = self.metrics();
+        // Desktop browsers can ignore viewport directives altogether. Keep the
+        // existing baseline when an edit has no observable viewport effect.
+        if (Math.abs(after.scale - before.scale) > 0.001) {
+          self.baseline = after.scale;
+        }
+        self.pendingViewport = 0;
+        self.physicalWidth = after.width * after.scale;
+        self.update();
+      });
+    });
+  };
+
+  WrapperChrome.prototype.schedule = function () {
+    if (this.frame !== null) return;
+    this.frame = requestAnimationFrame(this.update);
+  };
+
+  WrapperChrome.prototype.update = function () {
+    this.frame = null;
+    var viewport = this.metrics(), physicalWidth = viewport.width * viewport.scale;
+    // A numeric width with no initial scale fits the page again on rotation.
+    // Follow the browser's actual scale change, including its clamps. Desktop
+    // browsers that ignore the directive keep their scale. Keyboard height
+    // changes and pinch/pan do not change the physical viewport width.
+    if (!this.pendingViewport && this.physicalWidth > 0 && Math.abs(physicalWidth - this.physicalWidth) > 1 &&
+        /(?:^|[,;\s])width\s*=\s*\d/i.test(this.viewport) &&
+        !/(?:^|[,;\s])initial-scale\s*=/i.test(this.viewport)) {
+      this.baseline *= viewport.scale / this.scale;
+    }
+    this.scale = viewport.scale;
+    this.physicalWidth = physicalWidth;
+    this.width = viewport.width * this.baseline;
+    this.height = viewport.height * this.baseline;
+    this.left = viewport.left;
+    this.top = viewport.top;
+    var offsetLeft = this.left - window.pageXOffset, offsetTop = this.top - window.pageYOffset;
+    var signature = [this.width, this.height, this.left, this.top, offsetLeft, offsetTop, this.baseline].join(",");
+    if (signature === this.signature) return;
+    this.signature = signature;
+    var style = this.element.style;
+    style.width = this.width + "px";
+    style.height = this.height + "px";
+    style.transform = "translate(" + offsetLeft + "px," + offsetTop + "px) scale(" + (1 / this.baseline) + ")";
+    style.setProperty("--controls-width", this.width + "px");
+    style.setProperty("--controls-height", this.height + "px");
+    this.element.classList.toggle("controls-narrow", this.width <= 640);
+    this.element.classList.toggle("controls-compact-menu", this.width <= 800);
+    window.dispatchEvent(new Event("epixchromechange"));
+  };
+
+  WrapperChrome.prototype.point = function (pageX, pageY) {
+    return {left: (pageX - this.left) * this.baseline, top: (pageY - this.top) * this.baseline};
+  };
+
+  WrapperChrome.prototype.position = function (element) {
+    var bounds = element.getBoundingClientRect();
+    return this.point(bounds.left + window.pageXOffset, bounds.top + window.pageYOffset);
+  };
+
+  window.WrapperChrome = WrapperChrome;
+})();
+
 /* ---- Fixbutton.coffee ---- */
 
 
@@ -1467,6 +1575,7 @@ if (window.getComputedStyle(document.body).transform) {
       this.siteSign = bind(this.siteSign, this);
       this.onWrapperLoad = bind(this.onWrapperLoad, this);
       this.onPageLoad = bind(this.onPageLoad, this);
+      this.updateXiteLinks = bind(this.updateXiteLinks, this);
       this.onCloseWebsocket = bind(this.onCloseWebsocket, this);
       this.onOpenWebsocket = bind(this.onOpenWebsocket, this);
       this.handleMessage = bind(this.handleMessage, this);
@@ -1489,6 +1598,7 @@ if (window.getComputedStyle(document.body).transform) {
           return _this.ws.cmd("siteSetSettingsValue", ["modified_files_notification", true]);
         };
       })(this);
+      this.chrome = new WrapperChrome();
       this.fixbutton = new Fixbutton();
       window.addEventListener("message", this.onMessageInner, false);
       this.inner = document.getElementById("inner-iframe").contentWindow;
@@ -1510,15 +1620,25 @@ if (window.getComputedStyle(document.body).transform) {
       this.inner_loaded = false;
       this.inner_ready = false;
       this.wrapperWsInited = false;
+      // Per inner document, see newInnerDocument.
+      this.inner_generation = 0;
+      this.inner_load_state = null;
+      this.inner_probe_id = 0;
+      this.inner_probe_counter = 0;
+      this.iframe_reload_request = null;
+      this.iframe_recovery_pending = false;
       this.xite_error = null;
       this.address = null;
       this.opener_tested = false;
       this.announcer_line = null;
       this.web_notifications = {};
       this.is_title_changed = false;
+      this.is_viewport_changed = false;
       this.allowed_event_constructors = [window.MouseEvent, window.KeyboardEvent, window.PointerEvent];
       window.onload = this.onPageLoad;
       document.getElementById("inner-iframe").addEventListener("load", this.onPageLoad);
+      document.getElementById("inner-iframe").addEventListener("load", this.updateXiteLinks);
+      this.updateXiteLinks();
       window.onhashchange = (function (_this) {
         return function (e) {
           var src;
@@ -1568,6 +1688,12 @@ if (window.getComputedStyle(document.body).transform) {
       if (cmd === "response") {
         if (this.ws.waiting_cb[message.to] != null) {
           return this.ws.waiting_cb[message.to](message.result);
+        } else if (typeof message.to === "number" && message.to >= 1000000) {
+          // An answer to one of this chrome's own commands (ids from 1000000
+          // up) whose callback was released, such as a recovery nonce request
+          // a newer document superseded. It can carry chrome secrets and is
+          // nobody's business: never the page's.
+          return this.log("Dropping orphaned chrome response", message.to);
         } else {
           return this.sendInner(message);
         }
@@ -1660,6 +1786,9 @@ if (window.getComputedStyle(document.body).transform) {
         this.log("Message nonce error:", message.wrapper_nonce, '!=', window.wrapper_nonce);
         return;
       }
+      if (message.cmd === "innerReady" && e.source !== this.inner) {
+        return;
+      }
       return this.handleMessage(message);
     };
 
@@ -1686,13 +1815,7 @@ if (window.getComputedStyle(document.body).transform) {
       var cmd, query, ref;
       cmd = message.cmd;
       if (cmd === "innerReady") {
-        this.inner_ready = true;
-        if (this.ws.ws.readyState === 1 && !this.wrapperWsInited) {
-          this.sendInner({
-            "cmd": "wrapperOpenedWebsocket"
-          });
-          return this.wrapperWsInited = true;
-        }
+        return this.innerIsReady(true);
       } else if (cmd === "innerLoaded" || cmd === "wrapperInnerLoaded") {
         if (window.location.hash) {
           $("#inner-iframe")[0].src += window.location.hash;
@@ -1769,6 +1892,10 @@ if (window.getComputedStyle(document.body).transform) {
           "result": {"error": cmd + " is not available to a page"}
         });
       } else if (cmd === "response") {
+        if (this.inner_probe_id && message.to === this.inner_probe_id && message.result === "pong") {
+          // The document answered this chrome's own probe (see probeInner).
+          return this.innerIsReady(false);
+        }
         // Answers to the node's confirm/prompt dialogs come from this chrome
         // over its own socket, never from the page.
         return this.log("Ignoring inner response message");
@@ -2640,10 +2767,19 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.actionSetViewport = function (message) {
       this.log("actionSetViewport", message);
-      if ($("#viewport").length > 0) {
-        return $("#viewport").attr("content", this.toHtmlSafe(message.params));
-      } else {
-        return $('<meta name="viewport" id="viewport">').attr("content", this.toHtmlSafe(message.params)).appendTo("head");
+      this.is_viewport_changed = true;
+      return this.setViewport(String(this.toHtmlSafe(message.params)));
+    };
+
+    Wrapper.prototype.setViewport = function (viewport) {
+      var element = $("#viewport");
+      if (!element.length) {
+        if (this.chrome) this.chrome.beforeViewportChange(viewport);
+        return $('<meta name="viewport" id="viewport">').attr("content", viewport).appendTo("head");
+      } else if (element.attr("content") !== viewport) {
+        // Repeated download progress must not reset the user's zoom.
+        if (this.chrome) this.chrome.beforeViewportChange(viewport);
+        return element.attr("content", viewport);
       }
     };
 
@@ -2743,12 +2879,7 @@ if (window.getComputedStyle(document.body).transform) {
           "channels": ["siteChanged", "serverChanged"]
         });
       }
-      if (!this.wrapperWsInited && this.inner_ready) {
-        this.sendInner({
-          "cmd": "wrapperOpenedWebsocket"
-        });
-        this.wrapperWsInited = true;
-      }
+      this.announceWebsocket();
       if (window.show_loadingscreen) {
         this.ws.cmd("serverInfo", [], (function (_this) {
           return function (server_info) {
@@ -2785,6 +2916,8 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.onCloseWebsocket = function (e) {
       this.wrapperWsInited = false;
+      this.clearIframeReload();
+      this.iframe_recovery_pending = false;
       return setTimeout(((function (_this) {
         return function () {
           // The delay keeps a blip from flashing a banner, but a throttled
@@ -2923,6 +3056,240 @@ if (window.getComputedStyle(document.body).transform) {
       }, 12000);
     };
 
+    // Legacy path-form xite links already redirect when followed. Give native
+    // hover, copy and open-in-new-tab actions that same destination beforehand.
+    // The server still validates navigation and enforces origin permissions.
+    Wrapper.prototype.canonicalXiteLink = function (href, base, documentUrl, target) {
+      function xiteOrigin(reference) {
+        var dotted = /\.epix$/i.test(reference);
+        var label = dotted ? reference.slice(0, -5) : reference;
+        var folded = label.toLowerCase();
+        var charset = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
+        if (/^epix1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{38}$/i.test(label) &&
+            (label === folded || label === label.toUpperCase())) {
+          // Classic Bech32, HRP "epix", exactly 20 bytes. Validate before
+          // folding case, so mixed-case address typos never become origins.
+          var values = [3, 3, 3, 3, 0, 5, 16, 9, 24];
+          for (var i = 5; i < folded.length; i++) values.push(charset.indexOf(folded[i]));
+          var checksum = 1;
+          var generators = [0x3b6a57b2, 0x26508e6d, 0x1ea119fa, 0x3d4233dd, 0x2a1462b3];
+          for (var value of values) {
+            var high = checksum >>> 25;
+            checksum = ((checksum & 0x1ffffff) << 5) ^ value;
+            for (var bit = 0; bit < 5; bit++) {
+              if ((high >>> bit) & 1) checksum ^= generators[bit];
+            }
+          }
+          if (checksum === 1) return folded + ".epix";
+        }
+        // Address-shaped labels are never xID names, including bad checksums.
+        if (/^epix1[qpzry9x8gf2tvdw0s3jn54khce6mua7l]{20,}$/.test(folded)) return null;
+        if (dotted && /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/.test(folded)) return folded + ".epix";
+        return null;
+      }
+      if (typeof href !== "string" || !href || href !== href.trim() ||
+          /^[?#]/.test(href) || /^(?:[a-z][a-z0-9+.-]*:|\/\/)/i.test(href) ||
+          /[\x00-\x1f\x7f\\]/.test(href)) return null;
+      try {
+        var doc = new URL(documentUrl);
+        var url = new URL(href, base);
+        if ((doc.protocol !== "https:" && doc.protocol !== "http:") ||
+            url.origin !== doc.origin || url.username || url.password ||
+            url.searchParams.has("wrapper_nonce")) return null;
+        var path = url.pathname.slice(1);
+        var first = path.split("/")[0];
+        var origin = xiteOrigin(first);
+        // href retains empty query/fragment delimiters as well as encoded bytes.
+        var suffix = url.href.slice(url.origin.length + url.pathname.length);
+        if (xiteOrigin(doc.hostname)) {
+          if (!origin) return null;
+          return doc.protocol + "//" + origin + "/" + path.slice(first.length + 1) + suffix;
+        }
+        // Invalid proxy hosts must not fall through to the node's path mode.
+        if (/\.epix$/i.test(doc.hostname) ||
+            (/^epix1/i.test(doc.hostname) && doc.hostname.length > 20 && doc.hostname.indexOf(".") < 0)) return null;
+        var source = xiteOrigin(doc.pathname.split("/")[1]);
+        if (!source || origin !== source) return null;
+        path = path.slice(first.length + 1);
+        first = path.split("/")[0];
+        origin = xiteOrigin(first);
+        if (!origin) return null;
+        var rest = path.slice(first.length + 1);
+        // An iframe HTML file stays in its current wrapper. Only a root or
+        // directory, or an HTML document opened outside the iframe, redirects.
+        var topLevel = /^(?:_top|_parent|_blank)$/i.test(target || "");
+        if (rest && !rest.endsWith("/") && !(topLevel && /\.html?$/.test(rest))) return null;
+        return doc.origin + "/" + origin + "/" + rest + suffix;
+      } catch (_) {
+        return null;
+      }
+    };
+
+    Wrapper.prototype.updateXiteLinks = function () {
+      var doc = null;
+      try {
+        var candidate = document.getElementById("inner-iframe").contentDocument;
+        if (candidate && candidate.location.origin === window.location.origin &&
+            /^(?:https?:)$/.test(candidate.location.protocol)) doc = candidate;
+      } catch (_) {} // A navigated cross-origin frame is outside this wrapper.
+      if (this.xite_link_document === doc) return;
+      if (this.xite_link_observer) this.xite_link_observer.disconnect();
+      if (this.xite_link_cleanup) this.xite_link_cleanup();
+      this.xite_link_document = doc;
+      this.xite_link_observer = null;
+      this.xite_link_cleanup = null;
+      if (!doc) return;
+      var wrapper = this;
+      var rewritten = new WeakMap();
+      function normalize(anchor) {
+        if (!anchor.matches || !anchor.matches("a[href],area[href]")) return;
+        var current = anchor.getAttribute("href");
+        var previous = rewritten.get(anchor);
+        var raw = previous && current === previous.canonical ? previous.raw : current;
+        var canonical = null;
+        if (!anchor.hasAttribute("download") && !anchor.closest("[contenteditable]")) {
+          var baseTarget = doc.querySelector("base[target]");
+          var target = anchor.hasAttribute("target") ? anchor.getAttribute("target") :
+            (baseTarget ? baseTarget.getAttribute("target") : "");
+          canonical = wrapper.canonicalXiteLink(raw, anchor.baseURI, doc.location.href, target);
+        }
+        if (canonical && canonical !== raw) {
+          rewritten.set(anchor, { raw: raw, canonical: canonical });
+          if (current !== canonical) anchor.setAttribute("href", canonical);
+        } else {
+          rewritten.delete(anchor);
+          if (current !== raw) anchor.setAttribute("href", raw);
+        }
+      }
+      function scan(node) {
+        normalize(node);
+        if (node.querySelectorAll) node.querySelectorAll("a[href],area[href]").forEach(normalize);
+      }
+      function hasBase(node) {
+        return node.nodeType === 1 &&
+          (node.localName === "base" || !!node.querySelector("base"));
+      }
+      scan(doc);
+      var lastBase = doc.baseURI;
+      var lastLocation = doc.location.href;
+      function revalidate(event) {
+        // History navigation can change relative URL resolution without any
+        // DOM mutation. Refresh before the browser previews or follows a link.
+        if (doc.baseURI !== lastBase || doc.location.href !== lastLocation) {
+          lastBase = doc.baseURI;
+          lastLocation = doc.location.href;
+          scan(doc);
+        } else if (event.type !== "pointermove") {
+          var node = event.target;
+          if (node && !node.closest) node = node.parentElement;
+          var anchor = node && node.closest && node.closest("a[href],area[href]");
+          if (anchor) normalize(anchor);
+        }
+      }
+      var interactions = ["pointerover", "pointermove", "focusin", "click", "auxclick", "contextmenu", "dragstart"];
+      interactions.forEach(function (type) { doc.addEventListener(type, revalidate, true); });
+      this.xite_link_cleanup = function () {
+        interactions.forEach(function (type) { doc.removeEventListener(type, revalidate, true); });
+      };
+      this.xite_link_observer = new window.MutationObserver(function (changes) {
+        // A changed base affects every relative link. Otherwise inspect only
+        // changed links and subtrees, including editors entering/leaving edit mode.
+        var baseChanged = changes.some(function (change) {
+          return change.target.localName === "base" ||
+            (change.type === "childList" &&
+              (Array.from(change.addedNodes).some(hasBase) || Array.from(change.removedNodes).some(hasBase)));
+        });
+        if (baseChanged) return scan(doc);
+        changes.forEach(function (change) {
+          if (change.type === "attributes") {
+            if (change.attributeName === "contenteditable") scan(change.target);
+            else normalize(change.target);
+          } else {
+            change.addedNodes.forEach(scan);
+          }
+        });
+      });
+      this.xite_link_observer.observe(doc, {
+        subtree: true, childList: true, attributes: true,
+        attributeFilter: ["href", "target", "download", "contenteditable"]
+      });
+    };
+
+    // The inner frame is an opaque origin (in host mode, another origin), so
+    // the chrome can neither read its document nor tell one document from
+    // the next by identity, and the frame's `load` event is no help: a
+    // missing subresource can hold a document's load event back for minutes
+    // while the user reloads, and Chromium fires it for the chrome's own
+    // fragment-only src writes on the same document. What identifies a
+    // document is its own word: the frame library introduces a document
+    // once, at construction (`innerReady`). Readiness, the socket
+    // announcement, the placeholder state and the probe belong to one
+    // document and start over here, so a replacement (an in-frame reload
+    // keeps the WindowProxy and may keep the URL) is told the socket is
+    // open and inherits nothing the old one reported. A pending nonce
+    // recovery was the old document's: released, so its late reply cannot
+    // navigate the new one.
+    Wrapper.prototype.newInnerDocument = function () {
+      this.inner_generation = (this.inner_generation || 0) + 1;
+      this.inner_ready = false;
+      this.wrapperWsInited = false;
+      this.inner_probe_id = 0;
+      this.inner_load_state = null;
+      this.inner_loaded = false;
+      if (this.iframe_reload_request) {
+        this.clearIframeReload();
+        this.iframe_recovery_pending = false;
+      }
+    };
+
+    // What a document's word means. `introduced` is an innerReady: from a
+    // document that already introduced itself it can only be a replacement,
+    // whether or not the old document's load event ever arrived. A `pong`
+    // answers this chrome's own probe and never starts a document: it only
+    // confirms the current one.
+    Wrapper.prototype.innerIsReady = function (introduced) {
+      if (introduced) {
+        if (this.inner_ready) {
+          this.newInnerDocument();
+        } else if (this.iframe_reload_request) {
+          // The real document arrived on its own (the placeholder's refresh)
+          // while a recovery reload was still waiting for its nonce: that
+          // reload was for the placeholder this document replaced.
+          this.clearIframeReload();
+          this.iframe_recovery_pending = false;
+        }
+      }
+      this.inner_ready = true;
+      this.inner_probe_id = 0;
+      // The node's waiting placeholder never speaks the frame protocol: a
+      // document that does is the xite, whatever the last one reported.
+      this.inner_load_state = null;
+      return this.announceWebsocket();
+    };
+
+    // Ask a document that has not spoken whether its frame library is up.
+    // The first document can start before this chrome listens (script_init
+    // navigates the frame before all.js runs), so its innerReady can be
+    // missed; every later document starts after the chrome listens and
+    // needs no probe. The library answers a ping with `pong` on the chrome's
+    // own message id, which only the latest probe accepts. `wrapperReady`
+    // would make it repeat innerReady, and a repeated innerReady cannot be
+    // told from a new document introducing itself.
+    Wrapper.prototype.probeInner = function () {
+      this.inner_probe_counter = (this.inner_probe_counter || 0) - 1;
+      this.inner_probe_id = this.inner_probe_counter;
+      return this.sendInner({ "cmd": "ping", "id": this.inner_probe_id });
+    };
+
+    Wrapper.prototype.announceWebsocket = function () {
+      if (this.inner_ready && this.ws.ws && this.ws.ws.readyState === 1 && !this.wrapperWsInited) {
+        // Marked before posting: a page that answers the announcement with
+        // another innerReady is not announced to twice.
+        this.wrapperWsInited = true;
+        return this.sendInner({ "cmd": "wrapperOpenedWebsocket" });
+      }
+    };
+
     Wrapper.prototype.loadingDocumentReady = function () {
       // The inner frame is an opaque origin (the sandbox has no
       // allow-same-origin), so its document cannot be read from here. A frame
@@ -2940,6 +3307,12 @@ if (window.getComputedStyle(document.body).transform) {
       // The node's waiting placeholder reports "waiting" from inside the
       // frame. It is not the xite: keep the loading screen up and, once the
       // clone is complete, load the real document in its place (once).
+      // The placeholder never introduces itself: a document that did is the
+      // xite, and its "waiting" would only make this chrome reload the frame
+      // (and ask the node for a nonce) on a page's say-so.
+      if (this.inner_ready) {
+        return;
+      }
       this.inner_load_state = state === "waiting" ? "waiting" : null;
       if (!this.inner_load_state) {
         return;
@@ -2955,7 +3328,17 @@ if (window.getComputedStyle(document.body).transform) {
     Wrapper.prototype.onPageLoad = function (e) {
       var ref;
       this.log("onPageLoad");
+      // Bound to the inner frame's `load` and to this window's own `load`.
+      // A load starts no document (see newInnerDocument): a new document
+      // introduces itself, and one that could not is probed below.
       this.inner_loaded = this.loadingDocumentReady();
+      // A recovery reload made for the waiting placeholder outlives the
+      // placeholder's own load event, which follows its announcement within
+      // milliseconds. Any other load while a reload awaits its nonce means
+      // the frame moved on: the reply must not navigate it back.
+      if (this.iframe_reload_request && this.inner_load_state !== "waiting") {
+        this.clearIframeReload();
+      }
       this.iframe_recovery_pending = false;
       if (window.resolving_host) {
         return; // the iframe is blank; there is no xite to ask about yet
@@ -2972,9 +3355,7 @@ if (window.getComputedStyle(document.body).transform) {
         this.loading.hideScreen();
       }
       if (!this.inner_ready) {
-        this.sendInner({
-          "cmd": "wrapperReady"
-        });
+        this.probeInner();
       }
       if (this.ws.ws.readyState === 1 && !this.xite_info) {
         return this.reloadXiteInfo();
@@ -3170,6 +3551,13 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.setXiteInfo = function (xite_info) {
       var ref, ref1, ref2, ref3;
+      // On a first network visit, the manifest arrives after the wrapper was
+      // rendered. Apply its hint without replacing an explicit xite choice.
+      var viewport = xite_info.content && xite_info.content.viewport;
+      if (xite_info.address === (this.address || window.address) &&
+          !this.is_viewport_changed && typeof viewport === "string" && viewport.trim()) {
+        this.setViewport(viewport);
+      }
       // Clone progress carries only settings.size, not an authoritative
       // permissions/identity snapshot. Preserve fields from the latest full
       // snapshot so progress cannot erase a grant or switch local storage to
@@ -3491,22 +3879,71 @@ if (window.getComputedStyle(document.body).transform) {
       return false;
     };
 
+    Wrapper.prototype.clearIframeReload = function () {
+      var request = this.iframe_reload_request;
+      this.iframe_reload_request = null;
+      // The transport keeps callbacks; release only this request's captured document.
+      if (request && this.ws.waiting_cb[request.id] === request.callback) {
+        delete this.ws.waiting_cb[request.id];
+      }
+    };
+
     Wrapper.prototype.reloadIframe = function () {
-      var src;
-      // A new document is coming: forget what the old one reported.
-      this.inner_load_state = null;
-      this.inner_loaded = false;
-      src = $("iframe").attr("src");
-      return this.ws.cmd("serverGetWrapperNonce", [], (function (_this) {
-        return function (wrapper_nonce) {
-          src = src.replace(/wrapper_nonce=[A-Za-z0-9]+/, "wrapper_nonce=" + wrapper_nonce);
+      this.clearIframeReload();
+      this.iframe_recovery_pending = false;
+      // The reconnect snapshot retries waiting pages. Do not queue a nonce on a lost socket.
+      if (!this.ws.ws || this.ws.ws.readyState !== 1) return;
+      var frame = document.getElementById("inner-iframe");
+      var src = frame && frame.getAttribute("src");
+      if (!frame || typeof src !== "string") {
+        this.iframe_recovery_pending = false;
+        return;
+      }
+      // The frame's document cannot be read: the request is bound to the
+      // frame element, its src and the document generation it was made for.
+      var request = { generation: this.inner_generation || 0, src: src, id: this.ws.next_message_id };
+      this.ws.next_message_id += 1;
+      this.iframe_reload_request = request;
+      this.iframe_recovery_pending = true;
+      request.callback = (function (_this) {
+        return function (result) {
+          if (_this.iframe_reload_request !== request) return;
+          _this.clearIframeReload();
+          if (document.getElementById("inner-iframe") !== frame ||
+              frame.getAttribute("src") !== request.src || (_this.inner_generation || 0) !== request.generation) {
+            _this.iframe_recovery_pending = false;
+            return;
+          }
+          var nonce = typeof result === "string" ? result : result && result.wrapper_nonce;
+          if ((result && result.error) || typeof nonce !== "string" || !nonce || /[^A-Za-z0-9]/.test(nonce)) {
+            _this.iframe_recovery_pending = false;
+            _this.log("Invalid wrapper nonce response");
+            return;
+          }
+          // Replace only the nonce field; legacy routes can depend on exact query bytes.
+          var hashAt = src.indexOf("#");
+          var hash = hashAt < 0 ? "" : src.slice(hashAt);
+          src = hashAt < 0 ? src : src.slice(0, hashAt);
+          var queryAt = src.indexOf("?");
+          var query = queryAt < 0 ? "" : src.slice(queryAt + 1);
+          src = queryAt < 0 ? src : src.slice(0, queryAt);
+          var replaced = false;
+          query = query.replace(/(^|&)wrapper_nonce(?:=[^&]*)?(?=&|$)/g, function (_, separator) {
+            replaced = true;
+            return separator + "wrapper_nonce=" + nonce;
+          });
+          if (!replaced) query += (query && !/&$/.test(query) ? "&" : "") + "wrapper_nonce=" + nonce;
+          src += "?" + query + hash;
+          _this.log("Reloading iframe using url", src);
           // Nonce-secured xites sign their inner messages with the nonce in
           // their URL; the new document carries the new one.
-          window.wrapper_nonce = wrapper_nonce;
-          _this.log("Reloading iframe using url", src);
-          return $("iframe").attr("src", src);
+          window.wrapper_nonce = nonce;
+          // A new document is coming: forget what the old one reported.
+          _this.newInnerDocument();
+          return frame.setAttribute("src", src);
         };
-      })(this));
+      })(this);
+      return this.ws.send({ "cmd": "serverGetWrapperNonce", "params": [], "id": request.id }, request.callback);
     };
 
     Wrapper.prototype.log = function () {

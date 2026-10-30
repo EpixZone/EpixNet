@@ -9,6 +9,7 @@ epix-core = { path = "../epix-core" }
 epix-content = { path = "../epix-content" }
 epix-xite = { path = "../epix-xite" }
 epix-blob = { path = "../epix-blob" }
+epix-selfenc = { path = "../epix-selfenc" }
 # Deterministic feed organization (segments, checkpoints, index-by-target,
 # reaction counts, rollups). The node derives these read-only from the signed
 # OR-set records it already stores; see src/feed.rs.
@@ -59,8 +60,9 @@ maxminddb = { version = "0.32", features = ["mmap"] }
 flate2 = "1"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream"] }
 tar = "0.4.46"
-zip = { version = "8.6.0", default-features = false, features = ["deflate", "aes-crypto"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate", "aes-crypto"] }
 getrandom = { version = "0.4" }
+tempfile = "3"
 sha3 = { version = "0.12", optional = true }
 # default-features off: postcard's default heapless support drags the
 # unmaintained atomic-polyfill (RUSTSEC-2023-0089); we only need std.
@@ -71,6 +73,7 @@ rustix = { version = "1.1", features = ["fs"] }
 
 [target.'cfg(windows)'.dependencies]
 epix-fs = { path = "../epix-fs" }
+windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem", "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_System_Threading", "Win32_System_SystemServices"] }
 
 [features]
 # Test support: an offline chain stand-in and an identity helper that lets
@@ -96,11 +99,11 @@ bittorrent = ["dep:epix-bt"]
 bridges = []
 
 [dev-dependencies]
+rusqlite = { version = "0.37", features = ["bundled"] }
 epix-reticulum = { path = "../epix-reticulum" }
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }
 tokio = { version = "1", features = ["full", "test-util"] }
 tokio-tungstenite = "0.30"
 futures-util = "0.3"
-tempfile = "3"
 reqwest = { version = "0.12", default-features = false }

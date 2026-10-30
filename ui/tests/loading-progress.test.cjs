@@ -49,9 +49,9 @@ function fixture() {
     RateLimit(delay, fn) { fn(); },
   });
   const loading = source.slice(source.indexOf('/* ---- Loading.coffee ---- */'), source.indexOf('/* ---- Notifications.coffee ---- */'));
-  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'loadingDocumentReady', 'setInnerLoadState', 'onMessageInner', 'handleMessage', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
+  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'newInnerDocument', 'innerIsReady', 'probeInner', 'announceWebsocket', 'clearIframeReload', 'loadingDocumentReady', 'setInnerLoadState', 'onMessageInner', 'handleMessage', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
   const wrapper = Object.assign(Object.create(context.Wrapper.prototype), {
-    xite_info: null, inner, inner_loaded: false, inner_ready: true,
+    xite_info: null, inner, inner_loaded: false, inner_ready: false,
     event_xite_info: { resolve() {} }, noteContentSync() {}, log() {}, reloadXiteInfo() {},
     sendInner() {}, updateProgress() {}, pollNotificationCount() {}, setAnnouncerInfo() {}, ws: { connected: true, ws: { readyState: 1 }, cmd() {} },
   });

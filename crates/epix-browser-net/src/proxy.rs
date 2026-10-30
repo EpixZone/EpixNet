@@ -200,18 +200,32 @@ async fn https_upgrade_target(sock: &tokio::net::TcpStream) -> Option<String> {
     }
     // Proxy plain-http requests are absolute-form: `GET http://talk.epix/p?q ...`.
     let rest = parts.next()?.strip_prefix("http://")?;
-    let (authority, path) = match rest.find('/') {
+    let (authority, path) = match rest.find(['/', '?']) {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
     };
     let host = authority.split(':').next().unwrap_or(authority);
-    if host.starts_with("epix1") && host.len() > 20 && !host.contains('.') {
-        return Some(format!("https://{host}.epix{path}"));
+    let origin = canonical_xite_host(host)?;
+    let slash = if path.starts_with('?') { "/" } else { "" };
+    Some(format!("https://{origin}{slash}{path}"))
+}
+
+/// A redirect must validate address labels before folding host case: browsers
+/// lowercase origins, which would otherwise repair an invalid mixed-case
+/// Bech32 address. Certificate namespace policy remains independent of this.
+fn canonical_xite_host(host: &str) -> Option<String> {
+    if !crate::ca::is_epix_host(host) {
+        return None;
     }
-    if host.ends_with(".epix") && host.len() > 5 {
-        return Some(format!("https://{host}{path}"));
+    let (label, dotted) = match host.rsplit_once('.') {
+        Some((label, suffix)) if suffix.eq_ignore_ascii_case("epix") => (label, true),
+        _ => (host, false),
+    };
+    match epix_core::classify_label(label) {
+        epix_core::LabelClass::Address => Some(format!("{}.epix", label.to_ascii_lowercase())),
+        epix_core::LabelClass::Name if dotted => Some(host.to_ascii_lowercase()),
+        _ => None,
     }
-    None
 }
 
 /// Read bytes until the end of the HTTP request head (`\r\n\r\n`), returning
@@ -281,22 +295,13 @@ fn canonical_xite_location(req: &Request) -> Option<String> {
         .ok()?
         .split(':')
         .next()?;
-    if !crate::ca::is_epix_host(host) {
-        return None;
-    }
+    canonical_xite_host(host)?;
     if is_opaque_subresource(req) {
         return None;
     }
     let path = req.uri().path().trim_start_matches('/');
     let (target, rest) = path.split_once('/').unwrap_or((path, ""));
-    if !crate::ca::is_epix_host(target) {
-        return None;
-    }
-    let origin = if target.ends_with(".epix") {
-        target.to_string()
-    } else {
-        format!("{target}.epix")
-    };
+    let origin = canonical_xite_host(target)?;
     let query = req
         .uri()
         .query()
@@ -325,6 +330,126 @@ fn is_opaque_subresource(req: &Request) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn http_upgrades_fold_only_valid_xite_hosts() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = Arc::new(LocalCa::load_or_create(dir.path()).unwrap());
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let app = axum::Router::new().fallback(|| async { "unmodified request" });
+        let secure = Arc::new(AtomicBool::new(true));
+        let server = tokio::spawn(serve(listener, app, ca, secure.clone()));
+        let dash = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let upper = dash.to_ascii_uppercase();
+        let mixed = format!("E{}", &dash[1..]);
+        let typo = format!("{}q", &dash[..dash.len() - 1]);
+        let path = "/Docs/Mixed%23%252F.HTML?Token=AbC%2fZ&Path=Keep%2FCase";
+        let mut cases = vec![
+            ("GET", format!("http://TaLk.EpIx:80{path}"),
+                Some(format!("https://talk.epix{path}"))),
+            ("HEAD", "http://EPiX1Shop.EPIX?Token=AbC%2FZ".into(),
+                Some("https://epix1shop.epix/?Token=AbC%2FZ".into())),
+            ("GET", format!("http://{upper}{path}"),
+                Some(format!("https://{dash}.epix{path}"))),
+            ("GET", format!("http://{upper}.EpIx{path}"),
+                Some(format!("https://{dash}.epix{path}"))),
+            ("GET", format!("http://{dash}.EPIX{path}"),
+                Some(format!("https://{dash}.epix{path}"))),
+            ("GET", "http://Unresolved.EPIX".into(),
+                Some("https://unresolved.epix/".into())),
+            ("GET", format!("http://example.com{path}"), None),
+            ("POST", format!("http://TaLk.EPIX{path}"), None),
+        ];
+        for invalid in [mixed, typo, "-Bad.EPIX".into(), "Bad_.EPIX".into()] {
+            cases.push(("GET", format!("http://{invalid}{path}"), None));
+            if !invalid.contains('.') {
+                cases.push(("GET", format!("http://{invalid}.EPIX{path}"), None));
+            }
+        }
+        let result = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            for (method, target, expected) in cases {
+                let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+                let host = target.strip_prefix("http://").unwrap().split(['/', '?']).next().unwrap();
+                socket.write_all(format!(
+                    "{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+                ).as_bytes()).await.unwrap();
+                let mut response = Vec::new();
+                socket.read_to_end(&mut response).await.unwrap();
+                let response = String::from_utf8(response).unwrap();
+                if let Some(location) = expected {
+                    assert!(response.starts_with("HTTP/1.1 307"), "{target}: {response}");
+                    assert!(response.contains(&format!("\r\nLocation: {location}\r\n")),
+                        "{target}: {response}");
+                } else {
+                    assert!(response.starts_with("HTTP/1.1 200"), "{target}: {response}");
+                    assert!(response.contains("unmodified request"), "{target}: {response}");
+                }
+            }
+            // A profile that has not trusted the CA must still serve plain HTTP.
+            secure.store(false, Ordering::Relaxed);
+            let mut socket = tokio::net::TcpStream::connect(address).await.unwrap();
+            socket.write_all(
+                b"GET http://TaLk.EPIX/ HTTP/1.1\r\nHost: TaLk.EPIX\r\nConnection: close\r\n\r\n"
+            ).await.unwrap();
+            let mut response = Vec::new();
+            socket.read_to_end(&mut response).await.unwrap();
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        }).await;
+        server.abort();
+        result.expect("HTTP upgrade regression timed out");
+    }
+
+    #[test]
+    fn canonical_redirects_preserve_paths_and_validate_original_address_case() {
+        let request = |host: &str, path: &str| {
+            Request::builder()
+                .uri(path)
+                .header("host", host)
+                .body(axum::body::Body::empty())
+                .unwrap()
+        };
+        let dash = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
+        let upper = dash.to_ascii_uppercase();
+        let rest = "/Docs/Mixed%23%252F.HTML?Token=AbC%2fZ&Path=Keep%2FCase";
+        for (target, origin) in [
+            ("TaLk.EpIx".into(), "talk.epix".into()),
+            ("EPiX1Shop.EPIX".into(), "epix1shop.epix".into()),
+            ("Unresolved.EPIX".into(), "unresolved.epix".into()),
+            (upper.clone(), format!("{dash}.epix")),
+            (format!("{upper}.EpIx"), format!("{dash}.epix")),
+            (format!("{dash}.EPIX"), format!("{dash}.epix")),
+        ] {
+            assert_eq!(
+                canonical_xite_location(&request("DashBoard.EPIX:443", &format!("/{target}{rest}"))),
+                Some(format!("//{origin}{rest}")),
+                "{target}"
+            );
+        }
+        for invalid in [
+            format!("E{}", &dash[1..]),
+            format!("{}q", &dash[..dash.len() - 1]),
+        ] {
+            for target in [invalid.clone(), format!("{invalid}.EPIX")] {
+                assert_eq!(
+                    canonical_xite_location(&request("dashboard.epix", &format!("/{target}{rest}"))),
+                    None,
+                    "{target} must not become a valid origin by lowercasing"
+                );
+                assert_eq!(
+                    canonical_xite_location(&request(&target, "/TaLk.EPIX/")),
+                    None,
+                    "an invalid source host must not initiate a canonical redirect"
+                );
+            }
+        }
+        for target in ["-Bad.EPIX", "Bad_.EPIX", "Talk.Example", "epix1shop"] {
+            assert_eq!(
+                canonical_xite_location(&request("dashboard.epix", &format!("/{target}{rest}"))),
+                None
+            );
+        }
+    }
 
     #[tokio::test]
     async fn tls_proxy_serves_only_private_origins_with_its_own_anchor() {

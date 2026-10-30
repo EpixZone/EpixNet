@@ -1,0 +1,184 @@
+{
+  "benchmark": "epix-signed-merger-index",
+  "build_profile": "release-assertions-disabled",
+  "environment": {
+    "architecture": "x86_64",
+    "cpu_model": "Intel(R) Xeon(R) CPU E5-1620 0 @ 3.60GHz",
+    "logical_cpus": 8,
+    "memory_total": "MemTotal:       31738632 kB",
+    "os": "linux"
+  },
+  "executable_blake3": "40eeccbf8c48ce7410f4b3cc5480ea451c2897755fe5cc747a07bc2a71ebd898",
+  "fixture": {
+    "full_trove_release_fixture": false,
+    "generation_ms": null,
+    "hubs": 1,
+    "items": 10000,
+    "media_bytes": 0,
+    "owner_signed_hubs": true,
+    "records_per_segment": 1024,
+    "signed_record_verification": true
+  },
+  "format": 1,
+  "git_commit_at_run": "5d71d9f67e9122fe19936e754f253d7c3acb35db",
+  "git_dirty_at_run": true,
+  "initial": {
+    "cache_state": "fresh process; operating-system filesystem cache was not cleared",
+    "disk": {
+      "data_bytes": 3716902,
+      "derived_index_v1_bytes": 0,
+      "private_bytes": 16873489,
+      "total_bytes": 20590732
+    },
+    "distinct_hub_author_item_ids": 10000,
+    "elapsed_ms": 30647.699119999997,
+    "explicit_reconcile_index_work": null,
+    "explicit_reconcile_ms": 1502.883841,
+    "index_stats_after_ready": null,
+    "index_stats_after_registration": null,
+    "index_stats_final": null,
+    "live_rows": 10000,
+    "phase": "initial",
+    "process_memory": {
+      "peak_rss_bytes": 161857536,
+      "rss_bytes": 131182592,
+      "source": "Linux /proc/self/status"
+    },
+    "queries": {
+      "deep_page_query_plan": [
+        {
+          "detail": "SEARCH item USING INDEX item_ordinal (ordinal>?)",
+          "id": 5,
+          "notused": 202,
+          "parent": 0
+        }
+      ],
+      "latencies": {
+        "deep_keyset_page": {
+          "max_ms": 0.059864999999999995,
+          "min_ms": 0.045815,
+          "p50_ms": 0.046293,
+          "p95_ms": 0.051501,
+          "p99_ms": 0.058560999999999995,
+          "samples": 100
+        },
+        "first_page": {
+          "max_ms": 0.117002,
+          "min_ms": 0.051601,
+          "p50_ms": 0.052286,
+          "p95_ms": 0.058691,
+          "p99_ms": 0.061108,
+          "samples": 100
+        },
+        "indexed_lookup": {
+          "max_ms": 0.030202999999999997,
+          "min_ms": 0.021471,
+          "p50_ms": 0.021867,
+          "p95_ms": 0.023579,
+          "p99_ms": 0.028864,
+          "samples": 100
+        },
+        "indexed_type_filter": {
+          "max_ms": 0.07794899999999999,
+          "min_ms": 0.06565499999999999,
+          "p50_ms": 0.066883,
+          "p95_ms": 0.073449,
+          "p99_ms": 0.077618,
+          "samples": 100
+        }
+      }
+    },
+    "ready_with_correct_count_ms": 7742.577669,
+    "registration_ms": 6239.586088,
+    "updates": {
+      "same_segment_withdrawal_and_reinstatement": true,
+      "signed_segment_index_work": [
+        null,
+        null,
+        null,
+        null,
+        null
+      ],
+      "signed_segment_ingest": {
+        "max_ms": 2929.485258,
+        "min_ms": 2778.772977,
+        "p50_ms": 2792.8785989999997,
+        "p95_ms": 2929.485258,
+        "p99_ms": 2929.485258,
+        "samples": 5
+      },
+      "unauthorized_author_rejected": true
+    }
+  },
+  "label": "baseline-5d71d9f-release",
+  "restart": {
+    "cache_state": "fresh process; operating-system filesystem cache was not cleared",
+    "disk": {
+      "data_bytes": 3716902,
+      "derived_index_v1_bytes": 0,
+      "private_bytes": 16852641,
+      "total_bytes": 20572165
+    },
+    "distinct_hub_author_item_ids": 10000,
+    "elapsed_ms": 5849.1006099999995,
+    "explicit_reconcile_index_work": null,
+    "explicit_reconcile_ms": 1605.766031,
+    "index_stats_after_ready": null,
+    "index_stats_after_registration": null,
+    "index_stats_final": null,
+    "live_rows": 10000,
+    "phase": "restart",
+    "process_memory": {
+      "peak_rss_bytes": 125259776,
+      "rss_bytes": 99917824,
+      "source": "Linux /proc/self/status"
+    },
+    "queries": {
+      "deep_page_query_plan": [
+        {
+          "detail": "SEARCH item USING INDEX item_ordinal (ordinal>?)",
+          "id": 5,
+          "notused": 202,
+          "parent": 0
+        }
+      ],
+      "latencies": {
+        "deep_keyset_page": {
+          "max_ms": 0.06571199999999999,
+          "min_ms": 0.047404,
+          "p50_ms": 0.04805,
+          "p95_ms": 0.061573,
+          "p99_ms": 0.063273,
+          "samples": 100
+        },
+        "first_page": {
+          "max_ms": 0.10988,
+          "min_ms": 0.053096,
+          "p50_ms": 0.054101,
+          "p95_ms": 0.066655,
+          "p99_ms": 0.07166700000000001,
+          "samples": 100
+        },
+        "indexed_lookup": {
+          "max_ms": 0.035574999999999996,
+          "min_ms": 0.023047,
+          "p50_ms": 0.023856,
+          "p95_ms": 0.031803,
+          "p99_ms": 0.033936,
+          "samples": 100
+        },
+        "indexed_type_filter": {
+          "max_ms": 0.106621,
+          "min_ms": 0.06759699999999999,
+          "p50_ms": 0.069693,
+          "p95_ms": 0.084415,
+          "p99_ms": 0.091647,
+          "samples": 100
+        }
+      }
+    },
+    "ready_with_correct_count_ms": 5777.178049,
+    "registration_ms": 4171.304397,
+    "updates": null
+  }
+}

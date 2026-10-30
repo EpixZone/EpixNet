@@ -15,6 +15,8 @@
 #![cfg_attr(windows, windows_subsystem = "windows")]
 
 mod autostart;
+mod addons;
+mod addons_metadata;
 use epix_browser_net::ca;
 mod eepsite;
 mod browser_process;
@@ -70,6 +72,7 @@ pub struct Ready {
     pub display: String,
     pub firefox: PathBuf,
     pub profile: PathBuf,
+    pub addon_credentials: epix_ui::addon_broker::AddonLaunchCredentials,
     pub start_url: String,
     /// The scheme the managed browser uses (`https` with a trusted CA, else
     /// `http`); used to build URLs for reopen requests from later launches.
@@ -153,14 +156,22 @@ fn main() {
     };
 
     let handle = rt.handle().clone();
-    let outcome = startup::run(&rt, !background, move |progress| async move {
-        let (ready, child) = boot(&raw_arg, background, progress).await?;
-        Ok(tray::TrayContext {
-            ready,
-            child,
-            rt: handle,
-            open_rx,
-        })
+    let outcome = startup::run(&rt, !background, move |progress| {
+        // This closure runs on main before its future is spawned or polled.
+        let window_size = if background {
+            None
+        } else {
+            browser_process::gamescope_window_size()
+        };
+        async move {
+            let (ready, child) = boot(&raw_arg, background, progress, window_size).await?;
+            Ok(tray::TrayContext {
+                ready,
+                child,
+                rt: handle,
+                open_rx,
+            })
+        }
     });
     match outcome {
         Ok(startup::Outcome::Finished) => {}
@@ -236,20 +247,26 @@ async fn boot(
     raw_arg: &str,
     background: bool,
     progress: startup::Progress,
+    window_size: Option<browser_process::BrowserWindowSize>,
 ) -> Result<(Ready, Option<std::process::Child>), String> {
     let target = epix_node::parse_target(raw_arg);
     progress.report(startup::Stage::Preparing);
 
-    let data_root = epix_node::data_root();
-    tokio::fs::create_dir_all(&data_root)
-        .await
-        .map_err(|e| format!("Cannot create the data folder: {e}"))?;
+    // Finish queued moves before CA/profile files or node databases open.
+    let data_lease = tokio::task::spawn_blocking(epix_node::prepare_data_root)
+        .await.map_err(|e| format!("Cannot prepare the data folder: {e}"))??;
+    let data_root = data_lease.root().to_path_buf();
 
     let firefox = find_firefox().ok_or_else(|| {
         "The Epix Browser engine was not found. Reinstall EpixNet.".to_string()
     })?;
     #[cfg(target_os = "linux")]
     linux_sandbox::prepare(&firefox, background, &progress)?;
+
+    #[cfg(all(unix, not(target_os = "macos")))]
+    if let Err(error) = autostart::refresh_enabled() {
+        eprintln!("Could not refresh Open at Login: {error}");
+    }
 
     // The local CA for secure `https://*.epix` origins.
     let ca = Arc::new(
@@ -273,13 +290,14 @@ async fn boot(
         version: env!("EPIX_VERSION").to_string(),
         rev: env!("EPIX_GIT_REV").to_string(),
     };
-    let (server, running) = epix_node::boot_with_progress(opts, |stage| {
+    let (server, running) = epix_node::boot_with_data_lease(opts, data_lease, |stage| {
         progress.report(stage.into());
     })
     .await
     .map_err(|e| format!("Could not start the local node: {e}"))?;
     let display = running.display.clone();
     let ui_addr = running.ui_addr;
+    let addon_broker = server.addon_broker();
 
     // The proxy serves the same router (with the transparent-proxy host rewrite)
     // over TLS + plain http. Build it before the plain server consumes `server`.
@@ -341,9 +359,9 @@ async fn boot(
     // Write the managed profile (CA injected so https://*.epix is trusted), then
     // install the theme + wallet extension into it.
     progress.report(startup::Stage::Profile);
-    let (profile, secure) = setup_profile(
-        &data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &firefox, &ca,
-    )?;
+    let (profile, secure, addon_credentials) = setup_profile(
+        &data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &firefox, &ca, &addon_broker, ui_addr,
+    ).await?;
     ensure_search_policy(&firefox);
     progress.report(startup::Stage::Wallet);
     install_addons(&profile, &firefox, ext_capable);
@@ -366,7 +384,7 @@ async fn boot(
     let launch_url = handoff
         .as_ref()
         .map_or(start_url.as_str(), |handoff| handoff.url());
-    let mut child = launch_browser(background, &firefox, &profile, launch_url)?;
+    let mut child = launch_browser(background, &firefox, &profile, launch_url, window_size, &addon_credentials)?;
     if let Some(handoff) = &mut handoff {
         wait_for_browser_window(handoff, &mut child, Duration::from_secs(60)).await?;
     }
@@ -380,9 +398,10 @@ async fn boot(
 
     // A Config-page restart relaunches this executable in background mode:
     // the node comes back up without popping a second browser window, and the
-    // already-open window reconnects on its own.
+    // already-open window reconnects on its own unless a data move changes the
+    // browser profile. That restart page asks the user to reopen from the tray.
     if let Some(exe) = epix_ui::self_exe() {
-        running.state.set_restart_argv(vec![exe, "--background".to_string()]);
+        running.state.set_managed_browser_restart_argv(vec![exe, "--background".to_string()]);
     }
 
     // I2P on/off comes from the node config (the boot above defaults it to
@@ -399,6 +418,7 @@ async fn boot(
         display,
         firefox,
         profile,
+        addon_credentials,
         start_url,
         scheme: scheme.to_string(),
         version: env!("EPIX_VERSION").to_string(),
@@ -499,7 +519,7 @@ fn spawn_eepsite_proxy(state: Arc<epix_ui::AppState>, book_path: PathBuf) {
 /// falls back to http (re-writing the profile without secure origins). A failure
 /// to write the profile at all is fatal.
 #[allow(clippy::too_many_arguments)]
-fn setup_profile(
+async fn setup_profile(
     data_root: &Path,
     proxy_addr: SocketAddr,
     socks_addr: SocketAddr,
@@ -508,15 +528,19 @@ fn setup_profile(
     ext_capable: bool,
     firefox: &Path,
     ca: &LocalCa,
-) -> Result<(PathBuf, bool), String> {
+    addon_broker: &epix_ui::addon_broker::AddonBroker,
+    ui_addr: SocketAddr,
+) -> Result<(PathBuf, bool, epix_ui::addon_broker::AddonLaunchCredentials), String> {
     let profile = data_root.join("firefox-profile");
     if let Err(e) =
         write_profile(&profile, proxy_addr, socks_addr, display, true, tor_clearnet, ext_capable)
     {
         return Err(format!("Could not prepare the browser profile: {e}"));
     }
+    let credentials = addon_broker.register_profile(&profile, ui_addr).await?;
+    addons::preflight(firefox, &profile, credentials.profile_id())?;
     let secure = match install_ca(&profile, firefox, ca) {
-        Ok(()) => ensure_ca_imported(&profile, firefox, ca),
+        Ok(()) => ensure_ca_imported(&profile, firefox, ca, &credentials),
         Err(e) => {
             eprintln!("· note: could not install the local CA ({e}); falling back to http");
             false
@@ -526,7 +550,7 @@ fn setup_profile(
         let _ =
             write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
     }
-    Ok((profile, secure))
+    Ok((profile, secure, credentials))
 }
 
 /// Whether the profile's NSS DB (`cert9.db`) holds this exact CA cert. NSS
@@ -559,7 +583,7 @@ fn profile_trusts_ca(profile: &Path, ca: &LocalCa) -> bool {
 /// child means waiting for the real browser. The first warm-up run absorbs the add-on
 /// churn; the import lands in it or in the (churn-free) run after it. Falls
 /// back to http only if the CA never shows up.
-fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
+fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa, credentials: &epix_ui::addon_broker::AddonLaunchCredentials) -> bool {
     if profile_trusts_ca(profile, ca) {
         return true;
     }
@@ -569,7 +593,13 @@ fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa) -> bool {
     // (e.g. as a symlink) by another local user.
     let shot = profile.join("ca-warmup.png");
     for _ in 0..3 {
-        let child = ca_warmup_command(profile, firefox, &shot)
+        if let Err(error) = addons::preflight(firefox, profile, credentials.profile_id()) {
+            eprintln!("· extension-manager preflight failed: {error}");
+            return false;
+        }
+        let mut command = ca_warmup_command(profile, firefox, &shot);
+        credentials.configure_command(&mut command);
+        let child = command
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
@@ -643,14 +673,7 @@ fn install_addons(profile: &Path, firefox: &Path, ext_capable: bool) {
     if let Err(e) = ext::install_extension(profile) {
         eprintln!("· note: could not install the wallet extension: {e}");
     }
-    // The Epix theme add-on (light + dark chrome colours).
-    if let Err(e) = ext::install_theme_addon(profile) {
-        eprintln!("· note: could not install the theme add-on: {e}");
-    }
-    // Make the Epix theme the active one the first time it is available (Firefox
-    // installs a sideloaded theme disabled). Runs before Firefox launches and
-    // only acts once, so switching themes later sticks.
-    ext::activate_theme_once(profile);
+    // Firefox registers the packaged Epix theme through its built-in add-on API.
     // Profiles that installed the wallet before the manifest pinned it to the
     // toolbar: move it out of the puzzle-piece menu.
     ext::ensure_wallet_pinned(profile);
@@ -671,13 +694,17 @@ fn launch_browser(
     firefox: &Path,
     profile: &Path,
     start_url: &str,
+    window_size: Option<browser_process::BrowserWindowSize>,
+    credentials: &epix_ui::addon_broker::AddonLaunchCredentials,
 ) -> Result<Option<std::process::Child>, String> {
     if background {
         println!("· background mode: node + tray up, no browser window");
         return Ok(None);
     }
+    addons::preflight(firefox, profile, credentials.profile_id())?;
     println!("· launching Epix Browser at {start_url}");
-    let mut cmd = browser_process::browser_command(firefox, profile);
+    let mut cmd = browser_process::browser_command(firefox, profile, window_size);
+    credentials.configure_command(&mut cmd);
     match cmd.arg(start_url).spawn() {
         Ok(mut child) => {
             // `--no-remote --new-instance` on a profile another Firefox already
@@ -1200,7 +1227,7 @@ fn write_profile(
          }}\n"
     );
     std::fs::write(&pac_path, pac)?;
-    let pac_url = file_url(&pac_path);
+    let pac_url = file_url(&pac_path)?;
 
     // failover_direct=false: when a proxy connection hiccups, necko's default
     // is to silently retry DIRECT - for a `.epix` host that means a clearnet
@@ -1242,10 +1269,8 @@ fn write_profile(
     // Load and auto-enable the bundled (unsigned) extension from the profile.
     // Only on editions that allow it; harmless prefs otherwise.
     let ext_prefs = if ext_capable {
-        // Note: the Epix theme is *not* forced here via extensions.activeThemeID.
-        // A sideloaded theme installs disabled and that pref alone won't switch
-        // to it; ext::activate_theme_once handles activation in the add-on DB,
-        // once, so a user who later picks another theme keeps it.
+        // The packaged static theme uses Firefox's built-in lifecycle. This
+        // legacy unsigned-extension setting is still needed by the wallet.
         "user_pref(\"xpinstall.signatures.required\", false);\n\
          user_pref(\"extensions.autoDisableScopes\", 0);\n\
          user_pref(\"extensions.enabledScopes\", 5);\n\
@@ -1302,21 +1327,24 @@ user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
     Ok(())
 }
 
-/// A `file://` URL Firefox will load for a local path. On Unix a path already
-/// starts with `/`, so `file://` + `/x` is the well-formed `file:///x`. On
-/// Windows the path is `C:\dir\f`, which must become `file:///C:/dir/f`
-/// (forward slashes, the extra slash before the drive) - the naive
-/// `file://C:\dir\f` is not a valid URL and Firefox silently ignores the PAC,
-/// so `.epix` routing and clearnet-through-Tor both break. Spaces (common under
-/// `C:\Users\First Last\`) are percent-encoded.
-fn file_url(path: &Path) -> String {
-    let p = path.display().to_string().replace('\\', "/").replace(' ', "%20");
-    if p.starts_with('/') {
-        format!("file://{p}")
-    } else {
-        format!("file:///{p}")
-    }
+/// Encode the complete native path, including Windows canonical drive and UNC
+/// prefixes. URL delimiters in filenames must not become a query or fragment.
+fn file_url(path: &Path) -> std::io::Result<String> {
+    url::Url::from_file_path(path)
+        .map(String::from)
+        .map_err(|()| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "cannot represent PAC path as an absolute file URL: {}",
+                    path.display()
+                ),
+            )
+        })
 }
+
+#[cfg(test)]
+mod file_url_tests;
 
 /// Poll `addr` until a TCP connection succeeds or `timeout` elapses.
 async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
@@ -1357,7 +1385,7 @@ mod startup_tests {
         let profile = tempfile::tempdir().unwrap();
         std::fs::write(profile.path().join("user.js"),
             "user_pref(\"browser.aboutwelcome.enabled\", false);\nuser_pref(\"browser.shell.checkDefaultBrowser\", false);\n").unwrap();
-        let mut child = Some(browser_process::browser_command(&firefox, profile.path())
+        let mut child = Some(browser_process::browser_command(&firefox, profile.path(), None)
             .arg("about:blank").spawn().unwrap());
         let result = wait_for_native_browser_window(&mut child, Duration::from_secs(20)).await;
         let visible = !browser_process::visible_windows(child.as_mut().unwrap()).is_empty();

@@ -165,7 +165,7 @@ fn strip_scheme(arg: &str) -> &str {
 /// Normalize a launch argument into a resolver target: strip the scheme
 /// (`epix://`, `https://`, ...) and any path/query so `epix://talk.epix/topic/1`
 /// becomes `talk.epix` (the host is the xite; the path is opened inside the
-/// wrapper afterwards). A raw address or bare name passes through unchanged.
+/// wrapper afterwards). Only the host's ASCII case is normalized.
 pub fn parse_target(arg: &str) -> String {
     let s = strip_scheme(arg);
     // Host is everything up to the first `/`, `?`, or `#`.
@@ -174,7 +174,18 @@ pub fn parse_target(arg: &str) -> String {
     if host.is_empty() {
         arg.to_string()
     } else {
+        normalize_resolve_target(host)
+    }
+}
+
+/// Validate the original address spelling before folding case. Lowercasing
+/// mixed-case Bech32 first would repair an invalid address into a valid one.
+fn normalize_resolve_target(host: &str) -> String {
+    let (label, _) = host.rsplit_once('.').unwrap_or((host, "epix"));
+    if epix_core::classify_label(label) == epix_core::LabelClass::AddressShaped {
         host.to_string()
+    } else {
+        host.to_ascii_lowercase()
     }
 }
 
@@ -228,6 +239,8 @@ fn select_launch_from(
     lookup: impl Fn(&str) -> Option<CachedResolution>,
     on_disk: impl Fn(&str) -> bool,
 ) -> Result<LaunchSelection, String> {
+    let target = normalize_resolve_target(target);
+    let target = target.as_str();
     let (name, tld) = target.rsplit_once('.').unwrap_or((target, "epix"));
     match epix_core::classify_label(name) {
         epix_core::LabelClass::Address => {
@@ -390,18 +403,20 @@ async fn try_resolve_on_chain_bound(
     // forged address and is refused outright - otherwise an attacker could
     // register the typo-space around a real address as names and phish.
     match epix_core::classify_label(name) {
-        epix_core::LabelClass::Address => return Ok((name.to_string(), None)),
+        epix_core::LabelClass::Address => return Ok((name.to_ascii_lowercase(), None)),
         epix_core::LabelClass::AddressShaped => {
             return Err(ResolveError::MistypedAddress(address_shaped_target_error(name, tld)));
         }
         epix_core::LabelClass::Name => {}
     }
+    let name = name.to_ascii_lowercase();
+    let tld = tld.to_ascii_lowercase();
     // The shared resolver follows the configured endpoint list and rotates
     // to the next endpoint when one fails; a throwaway single-endpoint
     // resolver here made api.epix.zone alone a single point of failure.
     let resolver = epix_chain::shared_resolver();
     let (domain, binding) = resolver
-        .resolve_fresh_bound(name, tld)
+        .resolve_fresh_bound(&name, &tld)
         .await
         .map_err(ResolveError::Chain)?;
     let address = domain.xite_address().ok_or_else(|| {
@@ -456,7 +471,10 @@ tor_bootstrap=info";
 /// `EPIX_LOG` (or `RUST_LOG`), else [`DEFAULT_LOG_FILTER`]. `try_init` never
 /// panics if a host shell (or a second `boot`) already installed a subscriber.
 fn init_logging() {
-    use tracing_subscriber::{fmt, EnvFilter};
+    use tracing_subscriber::filter::FilterExt as _;
+    use tracing_subscriber::layer::SubscriberExt as _;
+    use tracing_subscriber::util::SubscriberInitExt as _;
+    use tracing_subscriber::{fmt, EnvFilter, Layer as _};
     let filter = std::env::var("EPIX_LOG")
         .or_else(|_| std::env::var("RUST_LOG"))
         .ok()
@@ -464,7 +482,68 @@ fn init_logging() {
         .and_then(|s| EnvFilter::try_new(&s).ok())
         .unwrap_or_else(|| EnvFilter::new(DEFAULT_LOG_FILTER));
     // No ANSI: this stream is usually a file, and colour escapes only litter it.
-    let _ = fmt().with_env_filter(filter).with_ansi(false).try_init();
+    let _ = tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_ansi(false)
+                .with_filter(filter.and(RepeatedWarningThrottle)),
+        )
+        .try_init();
+}
+
+/// A per-layer filter that tames the one third-party warning known to repeat
+/// on a timer for as long as its condition lasts: emissary's "cannot publish
+/// lease set, no inbound tunnels", once a second. Every occurrence is handed
+/// to [`epix_runtime::i2p_health`], which keeps the streak the I2P status
+/// loop turns into a single operator-facing warning; only the first of a
+/// streak and a periodic heartbeat reach the output. Everything else passes
+/// untouched, so the env filter alone decides what is logged.
+struct RepeatedWarningThrottle;
+
+impl<S: tracing::Subscriber> tracing_subscriber::layer::Filter<S> for RepeatedWarningThrottle {
+    fn enabled(
+        &self,
+        _meta: &tracing::Metadata<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        true
+    }
+
+    fn event_enabled(
+        &self,
+        event: &tracing::Event<'_>,
+        _cx: &tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        let target = event.metadata().target();
+        if target != epix_runtime::i2p_health::LEASE_SET_BLOCKED_TARGET {
+            return true;
+        }
+        let mut message = EventMessage::default();
+        event.record(&mut message);
+        if !epix_runtime::i2p_health::is_lease_set_blocked_event(target, &message.0) {
+            return true;
+        }
+        epix_runtime::i2p_health::note_lease_set_blocked()
+    }
+}
+
+/// Captures an event's `message` field as text (the format string, already
+/// rendered) so a filter can match on it; other fields are ignored.
+#[derive(Default)]
+struct EventMessage(String);
+
+impl tracing::field::Visit for EventMessage {
+    fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+
+    fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+        if field.name() == "message" {
+            self.0 = value.to_string();
+        }
+    }
 }
 
 /// Local startup work reported by [`boot_with_progress`]. Network bootstrap
@@ -499,9 +578,46 @@ pub async fn boot_with_progress(
     opts: NodeOptions,
     report: impl Fn(BootStage) + Send + Sync,
 ) -> Result<(UiServer, RunningNode), String> {
-    init_logging();
     report(BootStage::PreparingData);
-    std::fs::create_dir_all(&opts.data_root).map_err(|e| format!("create data root: {e}"))?;
+    let lease = epix_ui::data_relocation::DataRootLease::acquire(&opts.data_root)
+        .map_err(|e| format!("Cannot open data directory {}: {e}", opts.data_root.display()))?;
+    boot_with_data_lease(opts, Arc::new(lease), report).await
+}
+
+/// Prepare the desktop-selected root before a shell opens CA/profile data.
+/// An embedding app or explicit environment root never applies desktop moves.
+pub fn prepare_data_root() -> Result<Arc<epix_ui::data_relocation::DataRootLease>, String> {
+    // Desktop shutdown has a bounded wait for blocking work. Keep ownership
+    // until process exit even if the last async AppState drops before a writer.
+    static PROCESS_LEASES: std::sync::Mutex<Vec<Arc<epix_ui::data_relocation::DataRootLease>>> =
+        std::sync::Mutex::new(Vec::new());
+    let prepared = if let Some(root) = std::env::var_os("EPIX_DATA_DIR").filter(|v| !v.is_empty()) {
+        epix_ui::data_relocation::DataRootLease::acquire(std::path::Path::new(&root))
+    } else {
+        epix_ui::data_relocation::prepare_startup(
+            &epix_ui::paths::default_conf_path(),
+            &epix_ui::paths::default_data_root(),
+        )
+    };
+    let lease = Arc::new(prepared.map_err(|e| format!("Cannot prepare the data directory: {e}"))?);
+    PROCESS_LEASES.lock().unwrap().push(lease.clone());
+    Ok(lease)
+}
+
+/// Boot using a root already prepared by the desktop shell. Ownership spans
+/// migration, shell setup, node startup and the lifetime of all state writers.
+pub async fn boot_with_data_lease(
+    mut opts: NodeOptions,
+    lease: Arc<epix_ui::data_relocation::DataRootLease>,
+    report: impl Fn(BootStage) + Send + Sync,
+) -> Result<(UiServer, RunningNode), String> {
+    init_logging();
+    let selected = opts.data_root.canonicalize()
+        .map_err(|e| format!("Cannot resolve the data directory: {e}"))?;
+    if selected != lease.root() {
+        return Err("The prepared data directory does not match the requested node root".to_string());
+    }
+    opts.data_root = lease.root().to_path_buf();
     // A restore staged by the Backup & Restore wizard applies now, before
     // anything reads the data dir (users.json, sites.json, config).
     epix_ui::backup::apply_pending_restore(&opts.data_root);
@@ -536,7 +652,7 @@ pub async fn boot_with_progress(
     let (launch, startup_network_policy) =
         prepare_startup_launch_with(&opts, arm_startup_network_policy)?;
 
-    serve(opts, launch, xid_finality, startup_network_policy, &report).await
+    serve(opts, lease, launch, xid_finality, startup_network_policy, &report).await
 }
 
 
@@ -912,6 +1028,19 @@ fn publish_nmh_endpoint(
 /// server binary and the FFI background thread.
 pub async fn run(opts: NodeOptions) -> Result<(), String> {
     let (server, running) = boot(opts).await?;
+    serve_standalone(server, running).await
+}
+
+/// Run a desktop server with the ownership retained by `prepare_data_root`.
+pub async fn run_with_data_lease(
+    opts: NodeOptions,
+    lease: Arc<epix_ui::data_relocation::DataRootLease>,
+) -> Result<(), String> {
+    let (server, running) = boot_with_data_lease(opts, lease, |_| {}).await?;
+    serve_standalone(server, running).await
+}
+
+async fn serve_standalone(server: UiServer, running: RunningNode) -> Result<(), String> {
     // A standalone binary can relaunch itself for the Config page's restart.
     // Shells that call `boot` directly register their own argv (the desktop
     // browser) or none at all (the mobile apps, where the node is a library
@@ -3019,6 +3148,11 @@ impl epix_ui::OnDemandResolver for OnDemand {
         {
             return Ok(());
         }
+        // Preserve the complete local-entry fast path, including old serving
+        // keys. Only an actual resolve uses the normalized host spelling.
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
+        let key = self.state.canonical_key(host).await;
         if self.network_disabled {
             self.state.set_clone_status(&key, "paused", Some("offline_policy"), None);
             self.state
@@ -3042,7 +3176,7 @@ impl epix_ui::OnDemandResolver for OnDemand {
         let Resolved { address, verified } = resolved?;
         // The homepage's name just resolved: record what it points to, and
         // whether the chain said so, for serverInfo and the verifier.
-        if self.state.homepage().await.as_deref() == Some(host) {
+        if self.state.homepage().await.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(host)) {
             self.state.set_launch_status(host, Some(&address), verified).await;
         }
         // Coalesce concurrent clones on the RESOLVED address: the first does
@@ -3098,7 +3232,8 @@ impl epix_ui::OnDemandResolver for OnDemand {
     }
 
     fn is_resolving(&self, host: &str) -> bool {
-        self.resolving.lock().map(|hosts| hosts.contains(host)).unwrap_or(true)
+        let host = normalize_resolve_target(host);
+        self.resolving.lock().map(|hosts| hosts.contains(&host)).unwrap_or(true)
     }
 
     async fn cancel(&self, address: &str) {
@@ -3127,6 +3262,8 @@ impl epix_ui::OnDemandResolver for OnDemand {
         if self.network_disabled {
             return None;
         }
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let name = host.strip_suffix(".epix")?;
         if name.is_empty()
             || name.len() > 63
@@ -3228,6 +3365,8 @@ impl OnDemand {
     /// names use their verified mapping (fresh or stale), and an unverified
     /// (superseded) mapping only when the xite is already registered.
     async fn resolve_host_cached_only(&self, host: &str) -> Option<Resolved> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         match epix_core::classify_label(name) {
             epix_core::LabelClass::Address => {
@@ -3250,6 +3389,8 @@ impl OnDemand {
     /// the saved mapping when the chain does not answer. A successful chain
     /// lookup is written back to the cache. Never clones.
     async fn resolve_host(&self, host: &str) -> Result<Resolved, ResolveError> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let (name, tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         // Every label classifies against the address space, including dotless
         // inputs. Short `epix1…` branding names remain names; checksum-valid
@@ -3533,15 +3674,18 @@ impl OnDemand {
 
     /// Claim the resolve slot for `host`, or `None` if another caller holds it.
     fn claim_resolve_slot(&self, host: &str) -> Option<ResolveSlot> {
+        let host = normalize_resolve_target(host);
         let mut set = self.resolving.lock().ok()?;
-        if !set.insert(host.to_string()) {
+        if !set.insert(host.clone()) {
             return None;
         }
-        Some(ResolveSlot { set: self.resolving.clone(), host: host.to_string() })
+        Some(ResolveSlot { set: self.resolving.clone(), host })
     }
 
     /// Wait for the resolve (and clone) another caller is running for `host`.
     async fn wait_for_resolve(&self, host: &str) -> Result<(), String> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         for _ in 0..600 {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
             let key = self.state.canonical_key(host).await;
@@ -3563,6 +3707,8 @@ impl OnDemand {
     /// answer with no proof behind it. Gives up after [`RESOLVE_BUDGET`]; the
     /// published status stays, and a Retry or a network change starts over.
     async fn resolve_with_status(&self, host: &str) -> Result<Resolved, String> {
+        let normalized = normalize_resolve_target(host);
+        let host = normalized.as_str();
         let (name, _tld) = host.rsplit_once('.').unwrap_or((host, "epix"));
         let is_name = epix_core::classify_label(name) == epix_core::LabelClass::Name;
         let needs_chain = is_name && needs_chain_resolve(&self.data_root, host);
@@ -4117,6 +4263,8 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
         // the app should not wait 15 minutes for names to resolve. Once
         // trusted, settle into the regular cadence.
         let mut fast_retry_secs = 5u64;
+        // One WARN per clock-skew failure streak (see log_xid_lightclient_outcome).
+        let mut warned_clock_skew = false;
         loop {
             let mut cfg = xid_lightclient_config(&state, &data_root).await;
             let mut rpc_candidates = rpc_candidates_for(&cfg, preferred.as_deref());
@@ -4134,7 +4282,7 @@ fn spawn_xid_lightclient(state: std::sync::Arc<AppState>, data_root: std::path::
             // Only that transition retries - not every tick, or an hourly
             // UpToDate would re-index the whole deferred set forever.
             let anchored_now = before.is_none() && epix_chain::pinned_validators().is_some();
-            log_xid_lightclient_outcome(&state, before, outcome).await;
+            log_xid_lightclient_outcome(&state, before, outcome, &mut warned_clock_skew).await;
             if anchored_now {
                 on_trust_anchored(&state).await;
             }
@@ -4302,10 +4450,6 @@ fn pinned_set_changed(old: &epix_chain::PinnedSet, new: &epix_chain::PinnedSet) 
         })
 }
 
-/// Log one light-client advance outcome at the right level: set changes at
-/// INFO, routine advances at DEBUG, an unextendable anchor at WARN, transient
-/// errors (RPC hiccup, Tor not up yet) at DEBUG — the active pin is untouched
-/// in every non-advanced case and the next tick retries.
 /// One light-client advance cycle, rotating across the candidate RPCs on
 /// failure. The URL that answers moves to the front, so the next cycle starts
 /// on the endpoint that actually works - the pin must keep advancing inside
@@ -4335,11 +4479,26 @@ async fn advance_with_rpc_rotation(
     outcome
 }
 
+/// Log one light-client advance outcome at the right level: set changes at
+/// INFO, routine advances at DEBUG, an unextendable anchor at WARN, transient
+/// errors (RPC hiccup, Tor not up yet) at DEBUG — the active pin is untouched
+/// in every non-advanced case and the next tick retries.
+///
+/// One transient-looking error is not transient: a header rejected as "from
+/// the future" means this machine's clock is behind the chain by more than
+/// the verifier's drift allowance, and no retry can succeed until the clock
+/// is fixed. That one is raised to WARN with the fix spelled out, once per
+/// failure streak (`warned_clock_skew`), so a default INFO log shows the
+/// cause instead of only the downstream "trust not established" symptoms.
 async fn log_xid_lightclient_outcome(
     state: &AppState,
     before: Option<epix_chain::PinnedSet>,
     outcome: Result<epix_chain::Advance, String>,
+    warned_clock_skew: &mut bool,
 ) {
+    if outcome.is_ok() {
+        *warned_clock_skew = false;
+    }
     match outcome {
         Ok(epix_chain::Advance::Advanced { height, validators }) => {
             let set_changed = match (&before, epix_chain::pinned_validators()) {
@@ -4371,6 +4530,13 @@ async fn log_xid_lightclient_outcome(
                 .await;
         }
         Err(e) => {
+            if let Some(hint) = light_client_clock_skew_hint(&e) {
+                if !*warned_clock_skew {
+                    *warned_clock_skew = true;
+                    state.log("WARN", hint).await;
+                    return;
+                }
+            }
             state
                 .log("DEBUG", format!("xID finality: light client: {e}"))
                 .await;
@@ -4378,16 +4544,37 @@ async fn log_xid_lightclient_outcome(
     }
 }
 
+/// The operator-facing explanation when a light-client error is really a
+/// local clock problem. The CometBFT verifier rejects a header whose time is
+/// more than `max_clock_drift` ahead of the local clock as "from the future";
+/// on a live chain that only happens when THIS machine's clock is behind (a
+/// classic after sleep/hibernate, and on WSL2). Everything downstream then
+/// fails closed with "trust not established", which points nowhere near the
+/// cause, so name the cause and the fix.
+fn light_client_clock_skew_hint(error: &str) -> Option<String> {
+    if !error.contains("header from the future") {
+        return None;
+    }
+    Some(format!(
+        "xID finality: the light client rejected the chain head because this machine's clock \
+         is behind the chain by more than the allowed drift ({error}). xID names cannot \
+         resolve until the system clock is corrected: re-sync it with NTP (for example \
+         `sudo chronyc makestep`, or on WSL2 restart WSL); the light client retries on its \
+         own once the clock is right"
+    ))
+}
+
 /// Wire up the [`AppState`], plugins, background runtime, and UI server for a
 /// launch target. Returns the server future + handle.
 async fn serve(
     opts: NodeOptions,
+    lease: Arc<epix_ui::data_relocation::DataRootLease>,
     launch: LaunchTarget,
     xid_finality: XidFinalityBoot,
     startup_network_policy: StartupNetworkPolicy,
     report: &(dyn Fn(BootStage) + Send + Sync),
 ) -> Result<(UiServer, RunningNode), String> {
-    let state = AppState::with_data_dir(&opts.version, &opts.data_root);
+    let state = AppState::with_data_dir_leased(&opts.version, lease);
     // Set BEFORE any xite is restored: a node that is offline by policy will
     // never anchor chain trust, so a withheld xID verdict there is terminal
     // rather than something to retry. Deciding this later (the chain route is
@@ -4478,7 +4665,7 @@ async fn serve(
     // programmatically by an embedding shell). The choice persists as
     // `data_dir` in the default location's epixnet.conf, Python-style.
     let env_pinned = std::env::var("EPIX_DATA_DIR").map(|v| !v.is_empty()).unwrap_or(false);
-    if !env_pinned && opts.data_root == epix_ui::paths::data_root() {
+    if !env_pinned && epix_ui::paths::data_root().canonicalize().ok().as_ref() == Some(&opts.data_root) {
         state.set_data_dir_conf(epix_ui::paths::default_data_root().join("epixnet.conf"));
     }
 
@@ -4563,10 +4750,9 @@ async fn serve(
             .await;
     }
 
-    // Xite dbs are in-memory, so merger databases (Git Epix, Epix Post) are
-    // empty on every boot until filled from their merged xites - do it now
-    // that all restored xites are registered, or merger pages show nothing
-    // until some merger action happens to trigger a rebuild.
+    // Reconcile persistent merger indexes after restoration and default-xite
+    // registration. Unchanged projections are reused after source validation;
+    // ordinary xite databases are still warmed separately below.
     report(BootStage::RebuildingDatabases);
     state.rebuild_merger_dbs().await;
     // Per-xite dbs are just as boot-empty: warm them in the background so
@@ -5025,16 +5211,22 @@ struct CachedResolution {
 /// an attacker could have planted, so they resolve fresh, once.
 fn cached_resolution(data_root: &std::path::Path, full: &str) -> Option<CachedResolution> {
     let cache = read_resolve_cache(data_root);
+    let canonical = normalize_resolve_target(full);
+    // Prefer current lowercase keys, but keep caches written by older builds
+    // usable without rewriting their finality bindings or timestamps.
+    let entry = cache.get(&canonical).or_else(|| {
+        cache.iter().find(|(key, _)| key.eq_ignore_ascii_case(&canonical)).map(|(_, value)| value)
+    })?;
     let finality_required =
         epix_chain::verify_finality_enabled() && cache_target_requires_finality(full);
-    parse_cached_resolution(cache.get(full)?, finality_required, |height, digest| {
+    parse_cached_resolution(entry, finality_required, |height, digest| {
         epix_chain::finality_checkpoint_matches(height, digest)
     })
 }
 
 fn cache_target_requires_finality(full: &str) -> bool {
     let (label, tld) = full.rsplit_once('.').unwrap_or((full, "epix"));
-    !(tld == "epix" && epix_core::classify_label(label) == epix_core::LabelClass::Address)
+    !(tld.eq_ignore_ascii_case("epix") && epix_core::classify_label(label) == epix_core::LabelClass::Address)
 }
 
 fn parse_cached_resolution(
@@ -5285,6 +5477,7 @@ fn write_resolve_cache_bound_checked(
         &std::path::Path,
     ) -> std::io::Result<bool>,
 ) -> std::io::Result<ResolveCacheWriteOutcome> {
+    let full = normalize_resolve_target(full);
     let path = resolve_cache_path(data_root);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -5304,14 +5497,14 @@ fn write_resolve_cache_bound_checked(
     let mut cache = read_resolve_cache_for_update(&path)?;
 
     // A delayed writer must never downgrade a newer binding already published
-    // for the same name, even if its caller supplies a faulty current-binding
-    // predicate.
+    // for the same name in any casing, even if its caller supplies a faulty
+    // current-binding predicate.
     if let Some((height, _)) = binding {
         let existing_height = cache
-            .get(full)
-            .and_then(serde_json::Value::as_object)
-            .and_then(|entry| entry.get("finality_height"))
-            .and_then(serde_json::Value::as_u64);
+            .iter()
+            .filter(|(key, _)| key.eq_ignore_ascii_case(&full))
+            .filter_map(|(_, entry)| entry.get("finality_height").and_then(serde_json::Value::as_u64))
+            .max();
         if existing_height.is_some_and(|existing| existing > *height) {
             return Ok(ResolveCacheWriteOutcome::Superseded);
         }
@@ -5325,7 +5518,7 @@ fn write_resolve_cache_bound_checked(
         entry["finality_height"] = serde_json::json!(height);
         entry["finality_digest"] = serde_json::json!(digest);
     }
-    cache.insert(full.to_string(), entry);
+    cache.insert(full, entry);
     let bytes = serde_json::to_vec_pretty(&cache).map_err(|error| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -5575,6 +5768,76 @@ mod navigation_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn clock_skew_hint_names_the_clock_for_a_future_header() {
+        let error = "light client: header 6212615 REJECTED: header from the future: \
+                     header_time=2026-10-24T20:48:25Z now=2026-10-24T20:47:39Z \
+                     max_clock_drift=30s (leaving current pin untouched)";
+        let hint = light_client_clock_skew_hint(error).expect("future header is clock skew");
+        assert!(hint.contains("clock"), "{hint}");
+        assert!(hint.contains("NTP"), "{hint}");
+        assert!(
+            hint.contains("header 6212615"),
+            "keeps the verifier detail: {hint}"
+        );
+    }
+
+    #[test]
+    fn clock_skew_hint_leaves_other_light_client_errors_alone() {
+        for error in [
+            "light client: rpc request failed: Tor-always mode: chain RPC blocked until Tor is ready",
+            "network bootstrap: only 1/4 sources reachable (need 2)",
+            "light client: header 5 REJECTED: insufficient signers overlap (leaving current pin untouched)",
+        ] {
+            assert!(light_client_clock_skew_hint(error).is_none(), "{error}");
+        }
+    }
+
+    /// A layer that counts the events the throttle lets through to it.
+    struct CountEvents(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CountEvents {
+        fn on_event(
+            &self,
+            _event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        }
+    }
+
+    #[test]
+    fn repeated_warning_throttle_drops_only_emissarys_lease_set_repeats() {
+        use tracing_subscriber::layer::SubscriberExt as _;
+        use tracing_subscriber::Layer as _;
+        let seen = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let subscriber = tracing_subscriber::registry()
+            .with(CountEvents(seen.clone()).with_filter(RepeatedWarningThrottle));
+        tracing::subscriber::with_default(subscriber, || {
+            // The per-second repeat: the first of the streak passes, the
+            // next ones (same second, same streak) are swallowed.
+            for _ in 0..5 {
+                tracing::warn!(
+                    target: "emissary::destination::lease-set",
+                    local = %"oLt8E42s",
+                    "cannot publish lease set, no inbound tunnels",
+                );
+            }
+            // Other warnings from that target, and from anywhere else, pass.
+            tracing::warn!(
+                target: "emissary::destination::lease-set",
+                "non-existent inbound tunnel about to expire",
+            );
+            tracing::warn!(target: "emissary::tunnel::pool", "tunnel build failed");
+            tracing::info!("unrelated");
+        });
+        assert_eq!(seen.load(std::sync::atomic::Ordering::Acquire), 1 + 3);
+        assert!(
+            epix_runtime::i2p_health::inbound_tunnels_missing().is_some(),
+            "the streak was recorded for the I2P status loop"
+        );
+    }
+
     #[tokio::test]
     async fn boot_progress_reports_data_failure_without_prepared() {
         let dir = tempfile::tempdir().unwrap();
@@ -5585,9 +5848,54 @@ mod tests {
             stages.lock().unwrap().push(stage);
         })
         .await;
-        assert!(matches!(result, Err(error) if error.contains("create data root")));
+        assert!(matches!(result, Err(error) if error.contains("Cannot open data directory")));
         assert_eq!(*stages.lock().unwrap(), vec![BootStage::PreparingData]);
         assert_eq!(tokio::fs::read(&root).await.unwrap(), b"existing file");
+    }
+
+    #[test]
+    fn desktop_data_ownership_outlives_returned_state_handles() {
+        const WORKER: &str = "EPIX_DESKTOP_LEASE_WORKER";
+        if std::env::var_os(WORKER).is_some() {
+            let lease = prepare_data_root().unwrap();
+            let root = lease.root().to_path_buf();
+            drop(lease);
+            assert!(epix_ui::data_relocation::DataRootLease::acquire(&root).is_err(),
+                "bounded runtime shutdown must not release desktop ownership early");
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "tests::desktop_data_ownership_outlives_returned_state_handles"])
+            .env(WORKER, "1")
+            .env("EPIX_DATA_DIR", root.path())
+            .status().unwrap();
+        assert!(status.success());
+        assert!(epix_ui::data_relocation::DataRootLease::acquire(root.path()).is_ok(),
+            "process exit releases ownership");
+    }
+
+    #[tokio::test]
+    async fn boot_refuses_a_busy_data_root_before_opening_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let lease = epix_ui::data_relocation::DataRootLease::acquire(dir.path()).unwrap();
+        let result = boot(NodeOptions::new(dir.path(), "dashboard.epix")).await;
+        assert!(result.is_err());
+        assert!(!dir.path().join("private/users.json").exists());
+        assert!(!dir.path().join("xid_lc_state.json").exists());
+        drop(lease);
+    }
+
+    #[tokio::test]
+    async fn boot_rejects_a_prepared_lease_for_another_root() {
+        let held = tempfile::tempdir().unwrap();
+        let requested = tempfile::tempdir().unwrap();
+        let lease = epix_ui::data_relocation::DataRootLease::acquire(held.path()).unwrap();
+        let result = boot_with_data_lease(
+            NodeOptions::new(requested.path(), "dashboard.epix"), Arc::new(lease), |_| {},
+        ).await;
+        assert!(matches!(result, Err(error) if error.contains("does not match")));
+        assert!(!requested.path().join("private").exists());
     }
 
     #[test]
@@ -5667,6 +5975,8 @@ mod tests {
         );
         assert!(running.state.offline_by_policy());
         assert_eq!(running.address, DASHBOARD_XITE_ADDRESS);
+        assert!(epix_ui::data_relocation::DataRootLease::acquire(dir.path()).is_err(),
+            "node state must retain exclusive ownership after boot returns");
         drop(server);
     }
 
@@ -6124,6 +6434,163 @@ mod tests {
         assert_eq!(parse_inner_path("epix://talk.epix"), "");
         assert_eq!(parse_inner_path("talk.epix/a"), "/a");
         assert_eq!(parse_inner_path("https://talk.epix/?Topic:123_mud.epix"), "/?Topic:123_mud.epix");
+    }
+
+    #[test]
+    fn domain_case_launch_normalizes_only_valid_targets_and_keeps_inner_url() {
+        let suffix = "/Docs/Mixed%23Name.html?Token=AbC%2FZ#KeepCase";
+        let url = format!("https://TaLk.EPIX{suffix}");
+        assert_eq!(parse_target(&url), "talk.epix");
+        assert_eq!(parse_inner_path(&url), suffix);
+        for target in ["TaLk.EPIX", "TALK", "Epix1Shop.EpIx"] {
+            let expected = if target.contains('.') {
+                target.to_ascii_lowercase()
+            } else {
+                format!("{}.epix", target.to_ascii_lowercase())
+            };
+            assert!(matches!(
+                select_launch_from(target, |key| {
+                    assert_eq!(key, expected);
+                    None
+                }, |_| false).unwrap(),
+                LaunchSelection::Deferred { display } if display == expected
+            ));
+        }
+        let uppercase = DASHBOARD_XITE_ADDRESS.to_ascii_uppercase();
+        for target in [uppercase.clone(), format!("{uppercase}.EpIx")] {
+            assert!(matches!(
+                select_launch_from(&parse_target(&target), |_| panic!("address must not use cache"), |_| false).unwrap(),
+                LaunchSelection::Resolved { address, verified: true, .. }
+                    if address == DASHBOARD_XITE_ADDRESS
+            ));
+        }
+        let mixed = format!("E{}", &DASHBOARD_XITE_ADDRESS[1..]);
+        let typo = format!("{}q", &DASHBOARD_XITE_ADDRESS[..DASHBOARD_XITE_ADDRESS.len() - 1]);
+        for label in [mixed, typo.to_ascii_uppercase()] {
+            for target in [label.clone(), format!("{label}.EPIX")] {
+                assert_eq!(parse_target(&target), target, "invalid spelling must not be repaired");
+                assert!(select_launch_from(&target, |_| panic!("invalid address must not use cache"), |_| false).is_err());
+                assert!(cache_target_requires_finality(&target));
+            }
+        }
+    }
+
+    #[test]
+    fn domain_case_cache_reads_legacy_keys_and_prefers_canonical_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let other = "epix1talk58lw26c0cyrtuu8axptne2p6zf33s7xxwu";
+        let cache = serde_json::json!({
+            "TaLk.EPIX": { "address": other, "resolved_at": now_secs() },
+            "LEGACY.EPIX": DASHBOARD_XITE_ADDRESS,
+        });
+        std::fs::write(resolve_cache_path(root), serde_json::to_vec(&cache).unwrap()).unwrap();
+        for name in ["talk.epix", "Talk.EPIX", "TALK.EPIX"] {
+            assert_eq!(validated_cached_resolution(root, name).unwrap().address, other);
+            assert!(!needs_chain_resolve(root, name));
+        }
+        let legacy = validated_cached_resolution(root, "Legacy.epix").unwrap();
+        assert_eq!(legacy.address, DASHBOARD_XITE_ADDRESS);
+        assert!(legacy.verified);
+        assert!(!legacy.fresh, "a legacy string keeps its expired-cache semantics");
+
+        write_resolve_cache(root, "TALK.EPIX", DASHBOARD_XITE_ADDRESS);
+        let saved = read_resolve_cache(root);
+        assert_eq!(saved["talk.epix"]["address"], DASHBOARD_XITE_ADDRESS);
+        assert!(saved.contains_key("TaLk.EPIX"), "reading must not rewrite old entries");
+        for name in ["talk.epix", "TaLk.EPIX", "TALK.EPIX"] {
+            assert_eq!(validated_cached_resolution(root, name).unwrap().address, DASHBOARD_XITE_ADDRESS);
+        }
+    }
+
+    #[test]
+    fn domain_case_cache_writer_cannot_downgrade_a_legacy_binding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = resolve_cache_path(dir.path());
+        let initial = serde_json::to_vec(&serde_json::json!({
+            "TaLk.EPIX": {
+                "address": DASHBOARD_XITE_ADDRESS, "resolved_at": now_secs(),
+                "finality_height": 42, "finality_digest": "42".repeat(32),
+            }
+        })).unwrap();
+        std::fs::write(&path, &initial).unwrap();
+        let stale = (41, "41".repeat(32));
+        let outcome = write_resolve_cache_bound_checked(
+            dir.path(), "TALK.EPIX", "older", Some(&stale), true,
+            |_, _, _, _| panic!("a stale spelling must fail before publication"),
+        ).unwrap();
+        assert_eq!(outcome, ResolveCacheWriteOutcome::Superseded);
+        assert_eq!(std::fs::read(&path).unwrap(), initial);
+
+        let current = (43, "43".repeat(32));
+        let outcome = write_resolve_cache_bound_checked(
+            dir.path(), "TALK.EPIX", DASHBOARD_XITE_ADDRESS, Some(&current), true,
+            |height, digest, temporary, destination| {
+                assert_eq!((height, digest), (43, current.1.as_str()));
+                publish_resolve_cache_temp(temporary, destination)?;
+                Ok(true)
+            },
+        ).unwrap();
+        assert_eq!(outcome, ResolveCacheWriteOutcome::Published);
+        let saved = read_resolve_cache(dir.path());
+        assert_eq!(saved["talk.epix"]["finality_height"], 43);
+        assert_eq!(saved["TaLk.EPIX"]["finality_height"], 42);
+    }
+
+    #[tokio::test]
+    async fn domain_case_on_demand_shares_slots_and_rejects_invalid_addresses() {
+        use epix_ui::OnDemandResolver as _;
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir("test", dir.path());
+        let resolver = OnDemand {
+            state: state.clone(), data_root: dir.path().to_path_buf(), trackers: vec![],
+            network_disabled: false, me: std::sync::Weak::new(),
+            in_flight: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            in_flight_token: std::sync::atomic::AtomicU64::new(0),
+            tor_expected: std::sync::atomic::AtomicBool::new(false),
+            tor_always: std::sync::atomic::AtomicBool::new(false),
+            resolving: Arc::new(std::sync::Mutex::new(std::collections::HashSet::new())),
+            verifier_wake: tokio::sync::Notify::new(),
+        };
+        let slot = resolver.claim_resolve_slot("Talk.EPIX").unwrap();
+        assert!(resolver.is_resolving("tAlK.ePiX"));
+        assert!(resolver.claim_resolve_slot("talk.epix").is_none());
+        drop(slot);
+        assert!(!resolver.is_resolving("TALK.EPIX"));
+        assert!(resolver.claim_resolve_slot("TALK.EPIX").is_some());
+
+        write_resolve_cache(dir.path(), "talk.epix", DASHBOARD_XITE_ADDRESS);
+        let expected = Resolved { address: DASHBOARD_XITE_ADDRESS.into(), verified: true };
+        for name in ["Talk.EPIX", "TALK.epix", "tAlK.ePiX"] {
+            assert_eq!(resolver.resolve_host_cached_only(name).await, Some(expected.clone()));
+            assert_eq!(resolver.resolve_host(name).await.unwrap(), expected);
+            assert_eq!(resolver.resolve_with_status(name).await.unwrap(), expected);
+            let status = state.resolve_status("talk.epix").await.unwrap();
+            assert_eq!(status.state, "resolved");
+            assert_eq!(status.address.as_deref(), Some(DASHBOARD_XITE_ADDRESS));
+        }
+        let uppercase = DASHBOARD_XITE_ADDRESS.to_ascii_uppercase();
+        assert_eq!(resolver.resolve_host(&format!("{uppercase}.EPIX")).await.unwrap(), expected);
+        assert_eq!(resolver.resolve_host_cached_only(&uppercase).await, Some(expected));
+        let mixed = format!("E{}", &DASHBOARD_XITE_ADDRESS[1..]);
+        let typo = format!("{}q", &DASHBOARD_XITE_ADDRESS[..DASHBOARD_XITE_ADDRESS.len() - 1]);
+        for label in [mixed, typo.to_ascii_uppercase()] {
+            let host = format!("{label}.EPIX");
+            write_resolve_cache(dir.path(), &host, DASHBOARD_XITE_ADDRESS);
+            write_resolve_cache(dir.path(), &host.to_ascii_lowercase(), DASHBOARD_XITE_ADDRESS);
+            assert!(!needs_chain_resolve(dir.path(), &host));
+            assert_eq!(resolver.resolve_host_cached_only(&host).await, None);
+            assert!(matches!(resolver.resolve_host(&host).await, Err(ResolveError::MistypedAddress(_))));
+            assert!(matches!(try_resolve_on_chain_bound(&label, "EPIX").await, Err(ResolveError::MistypedAddress(_))));
+        }
+        // Old registered keys still use their exact spelling for the local
+        // owned-xite shortcut; they are not necessarily domain names.
+        let legacy = "LegacyLocalKey";
+        state.add_xite(legacy, XiteEntry {
+            storage: XiteStorage::new(dir.path().join("legacy")), content: None,
+        }).await;
+        state.set_owned(legacy, true).await;
+        resolver.ensure(legacy).await.unwrap();
     }
 
     #[test]

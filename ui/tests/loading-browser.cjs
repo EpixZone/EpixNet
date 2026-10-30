@@ -13,6 +13,19 @@ const { chromium } = require(tools
   ? path.join(tools, "playwright")
   : "playwright");
 const repo = path.resolve(__dirname, "../..");
+
+// Playwright's waitForFunction evaluates its predicate with eval, which the
+// production wrapper's Content-Security-Policy forbids. Poll with evaluate,
+// which passes the function itself, so the fixture runs under the real CSP.
+async function waitFor(page, predicate, arg, options = {}) {
+  const deadline = Date.now() + (options.timeout ?? 30000);
+  const interval = typeof options.polling === "number" ? options.polling : 100;
+  for (;;) {
+    if (await page.evaluate(predicate, arg)) return;
+    if (Date.now() > deadline) throw new Error("waitFor: condition not met within the timeout");
+    await page.waitForTimeout(interval);
+  }
+}
 const out =
   process.env.EPIX_BROWSER_TEST_OUTPUT ||
   path.join(require("node:os").tmpdir(), "epix-discovery-browser-results");
@@ -194,7 +207,7 @@ wss.on("connection", (ws) => {
     await page.goto(`http://127.0.0.1:${server.address().port}/${address}/`, {
       waitUntil: "domcontentloaded",
     });
-    await page.waitForFunction(() => document.readyState === "complete", null, { polling: 250 });
+    await waitFor(page, () => document.readyState === "complete", null, { polling: 250 });
     await page.waitForTimeout(400);
     async function shot(stage) {
       await page.screenshot({
@@ -231,7 +244,7 @@ wss.on("connection", (ws) => {
     results.countdownAdvanced =
       firstCountdown !== (await countdown.innerText());
     results.retryButtons = await page.locator(".button-retry").count();
-    await page.waitForFunction(() => document.querySelector(".loading-attempt")?.textContent === "Attempt 3");
+    await waitFor(page, () => document.querySelector(".loading-attempt")?.textContent === "Attempt 3");
     clearTimeout(automaticRetry);
     results.automaticAttempt = await page.locator(".loading-attempt").innerText();
     results.automaticFeedback = await page.locator(".loading-retry-note").innerText();

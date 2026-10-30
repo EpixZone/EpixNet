@@ -133,8 +133,11 @@ class EvxPackagingTests(unittest.TestCase):
         package.mkdir(parents=True)
         shutil.copy2(HERE / "build-linux.sh", package / "build-linux.sh")
         shutil.copy2(HERE / "epix.desktop", package / "epix.desktop")
-        # Isolate staging from compiler, browser downloads and package tools.
+        # Isolate staging from compiler, browser downloads, extension
+        # installation and package tools.
         (package / "package-linux.py").write_text("pass\n")
+        (repo / "packaging/firefox-addons").mkdir(parents=True)
+        (repo / "packaging/firefox-addons/install.py").write_text("pass\n")
         (repo / "LICENSE").write_text("fixture license")
         for size in (48, 64, 128, 256, 512):
             icon = package / f"icons/epix-{size}.png"

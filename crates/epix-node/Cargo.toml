@@ -35,7 +35,8 @@ async-trait = "0.1"
 # they are dropped, which is why a stalled Tor bootstrap left "no logging
 # whatsoever" in the field.
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-fslock-guard = "0.8"
+tracing = "0.1"
+fslock-guard = "0.9"
 
 [target.'cfg(any(target_os = "macos", target_os = "linux"))'.dependencies]
 # The EVX service includes a Unix process supervisor and descriptor-based

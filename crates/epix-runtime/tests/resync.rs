@@ -197,3 +197,124 @@ async fn runtime_resyncs_a_published_update() {
         "a pass with nothing newer closes without claiming an update"
     );
 }
+
+// Issue #565: a complete local snapshot must be checked promptly on startup,
+// even without a recent propagation hint or a short periodic interval.
+#[tokio::test]
+async fn startup_resyncs_before_the_periodic_tick_without_a_publish_hint() {
+    prompt_resync("startup").await;
+}
+
+#[tokio::test]
+async fn new_peer_resyncs_after_startup_without_waiting_for_the_periodic_tick() {
+    prompt_resync("new-peer").await;
+}
+
+#[tokio::test]
+async fn foreground_resyncs_a_completed_xite_on_the_same_network() {
+    prompt_resync("foreground").await;
+}
+
+async fn prompt_resync(trigger: &str) {
+    let private_key = "11b913374fe145476b2798a4f6b88753c6228d8ea950f905723bcdbb343df0e7";
+    let address = epix_crypt::privatekey_to_address(private_key).unwrap();
+    let source_data = tempfile::tempdir().unwrap();
+    let source_store = tempfile::tempdir().unwrap();
+    let source_storage = XiteStorage::new(source_data.path());
+    let post = b"already published before the client starts";
+    source_storage.write("post.txt", post).unwrap();
+    let new_bytes = signed_content(
+        private_key, &address, 200.0,
+        json!({"post.txt": {
+            "size": post.len(),
+            "sha512": XiteStorage::hash_bytes(post),
+            "b3": ObjId::of(post).to_string(),
+        }}),
+    );
+    let old_bytes = signed_content(private_key, &address, 100.0, json!({}));
+    source_storage.write("content.json", if trigger == "foreground" { &old_bytes } else { &new_bytes }).unwrap();
+    let source = AppState::new("source");
+    let store = Arc::new(Store::open(source_store.path()).unwrap());
+    source.set_edx_store(store.clone()).await.unwrap();
+    source.add_xite(&address, XiteEntry {
+        storage: source_storage.clone(),
+        content: None,
+    }).await;
+    assert!(source.load_content_from_disk(&address).await);
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let peer = PeerAddr::Ip(listener.local_addr().unwrap());
+    let server = PeerServer::new(edx_hook(
+        source.clone(), store, epix_crypt::new_seed(), None,
+        epix_runtime::edx::ControlHandles::detached(), false, None,
+    ));
+    let server_task = tokio::spawn(server.serve(listener));
+
+    let destination_data = tempfile::tempdir().unwrap();
+    let destination_storage = XiteStorage::new(destination_data.path().join("data").join(&address));
+    destination_storage.write("content.json", &old_bytes).unwrap();
+    let destination = AppState::with_data_dir("destination", destination_data.path());
+    destination.add_xite(&address, XiteEntry {
+        storage: destination_storage.clone(),
+        content: Some(serde_json::from_slice(&old_bytes).unwrap()),
+    }).await;
+    destination.set_transport(Arc::new(TcpTransport)).await;
+    if trigger != "new-peer" {
+        destination.add_peers(&address, [peer.clone()]).await;
+    }
+    let mut events = destination.subscribe_events();
+    let mut runtime = NodeRuntime::with_config(destination.clone(), vec![], RuntimeConfig {
+        announce_interval: Duration::from_secs(3600),
+        resync_interval: Duration::from_secs(3600),
+        propagation_interval: Duration::from_secs(3600),
+        chart_interval: Duration::from_secs(3600),
+        connection_interval: Duration::from_secs(3600),
+        fileserver_port: None,
+        offline: false,
+        #[cfg(feature = "tor")]
+        tor_mode: epix_runtime::TorMode::Disable,
+        ..Default::default()
+    });
+    runtime.start().await;
+    if trigger == "foreground" {
+        let first_pass = timeout(Duration::from_secs(10), async {
+            while let Ok(event) = events.recv().await {
+                let message: Value = serde_json::from_str(&event.payload).unwrap();
+                if message["params"]["event"][0] == "updated"
+                    && message["params"]["update_applied"] == json!(false) { return true; }
+            }
+            false
+        }).await;
+        if !matches!(first_pass, Ok(true)) {
+            runtime.shutdown().await;
+            server_task.abort();
+            let _ = server_task.await;
+            panic!("foreground fixture must complete its initial no-change pass");
+        }
+        source_storage.write("content.json", &new_bytes).unwrap();
+        source.add_xite(&address, XiteEntry {
+            storage: source_storage.clone(),
+            content: Some(serde_json::from_slice(&new_bytes).unwrap()),
+        }).await;
+        source.edx_register_xite(&address).await.unwrap();
+        destination.network_changed().await;
+    } else if trigger == "new-peer" {
+        // Startup has no peers and must leave the signed local copy alone.
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(destination_storage.read("content.json").unwrap(), old_bytes);
+        destination.add_peers(&address, [peer]).await;
+    }
+    let updated = timeout(Duration::from_secs(10), async {
+        loop {
+            if destination.xite_info(&address).await["content_updated"] == json!(200.0)
+                && destination_storage.read("post.txt").ok().as_deref() == Some(post.as_slice())
+            {
+                break;
+            }
+            sleep(Duration::from_millis(25)).await;
+        }
+    }).await;
+    runtime.shutdown().await;
+    server_task.abort();
+    let _ = server_task.await;
+    assert!(updated.is_ok(), "{trigger} must apply the verified root and file before the hourly tick");
+}

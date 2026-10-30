@@ -88,6 +88,46 @@ the clone completes. A frame still on `about:blank` is never counted as the
 loaded xite. `ui/tests/loading-browser.cjs` exercises this flow in a real
 browser against the production wrapper.
 
+## Documents in the opaque frame
+
+The chrome cannot read the frame's document, so it cannot tell one document
+from the next by identity, and the frame's `load` event does not count
+documents either: a missing subresource holds a document's load event back
+for minutes while the user may reload, and Chromium fires it for the chrome's
+own fragment-only src writes on the same cross-origin document. What
+identifies a document is its own word. Readiness (`innerReady`), the
+`wrapperOpenedWebsocket` announcement and the placeholder state belong to one
+document and start over for the next (`Wrapper.prototype.newInnerDocument`
+in `ui/media/all.js`):
+
+- the frame library sends `innerReady` once, at construction, so an
+  `innerReady` from a document that already introduced itself is its
+  replacement (an in-frame reload keeps the WindowProxy and the URL);
+- only the first document can have spoken before the chrome listened
+  (`script_init` navigates the frame before `all.js` runs), so a document
+  that has not spoken is probed at every load with a `ping`, which the
+  library answers with `pong` on the chrome's own message id. That reply
+  never looks like a new document, unlike the repeated `innerReady` that
+  `wrapperReady` provokes: a page whose library starts at `load` can have its
+  load event reach the chrome before its own `innerReady` does;
+- a page without a frame library is invisible: it inherits the previous
+  document's state (an announcement addressed to nobody costs nothing) and
+  the next document that has a library introduces itself;
+- the chrome's own reload (`reloadIframe`) starts a new document when it
+  navigates the frame, so a late nonce reply cannot act on the next one; a
+  real document that arrives by itself while that reload awaits its nonce
+  releases it;
+- the placeholder's `innerLoadState` is accepted only from a document that
+  has not introduced itself, and the answer to one of the chrome's own
+  commands (ids from 1000000 up) whose callback was released is dropped,
+  never forwarded to the page. A page can neither make the chrome reload the
+  frame on its say-so nor read the fresh wrapper nonce such a reload asks
+  the node for.
+
+`ui/tests/wrapper-startup.test.cjs` covers the event orders synthetically and
+`ui/tests/wrapper-startup-browser.cjs` drives them through Chromium with the
+production wrapper.
+
 ## What a xite author must know
 
 - Use the wrapper storage commands, not `localStorage`; guard any direct use

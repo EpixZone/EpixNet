@@ -25,7 +25,10 @@ pub fn address_hash(address: &str) -> [u8; 32] {
     h.finalize().into()
 }
 
-pub use tracker::{AnnounceParams, AnnounceSender, OnionSigner, discover_via_epix_tracker};
+pub use tracker::{
+    discover_via_epix_tracker, discover_via_epix_tracker_attempt, AnnounceParams, AnnounceSender,
+    OnionSigner,
+};
 pub use tracker_pc::{AnnounceReply, AnnounceReq, AnnounceResp, PeerBuckets};
 
 /// One announcer, whichever protocol it speaks. The announce set mixes both

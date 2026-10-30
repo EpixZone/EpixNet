@@ -89,20 +89,15 @@ async fn main() {
         .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false);
 
-    // Persistent per-OS data directory with a single-instance lock. If already
-    // running, hand off to the existing instance's browser tab and exit.
-    let root = platform::data_root();
-    std::fs::create_dir_all(&root).expect("create data root");
-    let _lock = match platform::acquire_lock(&root) {
-        Ok(lock) => lock,
-        Err(()) => {
-            eprintln!("Epix is already running (lock held in {}).", root.display());
-            if !headless {
-                epix_node::open_in_browser(&format!("http://{}/{target}/", ui_bind()));
-            }
-            return;
+    // Apply a queued move before opening the log or any persistent node data.
+    let data_lease = match epix_node::prepare_data_root() {
+        Ok(lease) => lease,
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(1);
         }
     };
+    let root = data_lease.root().to_path_buf();
 
     // EPIX_TOR is an explicit override; empty defers to the Config page's
     // persisted choice (the node resolves it at boot, default enable).
@@ -124,7 +119,7 @@ async fn main() {
     };
 
     println!("· Epix node starting (data: {})", root.display());
-    if let Err(e) = epix_node::run(opts).await {
+    if let Err(e) = epix_node::run_with_data_lease(opts, data_lease).await {
         eprintln!("Epix node failed: {e}");
         std::process::exit(1);
     }

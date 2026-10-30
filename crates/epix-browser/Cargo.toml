@@ -21,17 +21,20 @@ hyper-util = { version = "0.1", features = ["server", "server-auto", "tokio", "s
 tower = { version = "0.5", features = ["util"] }
 axum = "0.8"
 serde_json = "1"
+serde = "1"
+sha2 = "0.11"
+url = "2.5"
 uuid = { version = "1", features = ["v4"] }
 # The bundled WebExtension is embedded and written out as an XPI into the
 # managed profile at launch.
 include_dir = "0.7"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 # Desktop system tray (macOS menu bar / Windows notification area / Linux
 # StatusNotifier-AppIndicator). Keeps the node's stats visible while it runs in
 # the background after the browser window closes. `tao` owns the main-thread
 # event loop the tray needs; `image` decodes the embedded PNG icon. All
 # best-effort - the launcher falls back to no-tray when the host can't show one.
-tray-icon = "0.25"
+tray-icon = "0.26"
 tao = "0.37"
 image = { version = "0.25", default-features = false, features = ["png"] }
 
@@ -52,6 +55,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_Graphics_Gdi",
     "Win32_System_SystemServices",
 ] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 # Native startup-panel widgets share Tao's existing platform UI stack.
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -81,7 +87,7 @@ reqwest = { version = "0.12", default-features = false, features = ["blocking", 
 # Verify the downloaded wallet archive against shells/wallet-ext.sha256
 # before extracting it into the packaged extension.
 sha2 = "0.11"
-zip = { version = "8", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 
 # Windows: embed packaging/windows/app.ico in the exe (Explorer, taskbar).
 [target.'cfg(windows)'.build-dependencies]

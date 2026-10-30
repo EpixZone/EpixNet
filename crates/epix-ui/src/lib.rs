@@ -6,6 +6,8 @@
 //! `/EpixNet-Internal/Websocket?wrapper_key=…`. Commands are dispatched through
 //! the [`CommandRegistry`], which the plugin system extends.
 
+pub mod addons;
+pub mod addon_broker;
 pub mod backup;
 #[cfg(feature = "benchmark")]
 pub mod benchmark;
@@ -13,10 +15,14 @@ pub mod chart;
 pub mod command;
 pub mod config_schema;
 pub mod conn_pool;
+pub mod data_relocation;
+mod deletion_reserve;
 pub mod feed;
 /// The inert `/list/<xite>/?evx=1` EVX inspection panel.
 mod evx_view;
 mod file_revert;
+mod xite_zip;
+mod xite_zip_http;
 pub mod geoip;
 pub mod local_feed;
 mod nmh_auth;
@@ -83,8 +89,10 @@ pub struct MediaBundle {
 #[derive(Clone)]
 struct Ctx {
     state: Arc<AppState>,
+    addon_broker: addon_broker::AddonBroker,
     registry: Arc<CommandRegistry>,
     media: Arc<MediaBundle>,
+    zip_exports: Arc<tokio::sync::Semaphore>,
     /// The BitTorrent streaming engine backing `/bt/stream`. Present only in a
     /// `bittorrent` build; the iOS binary has neither the field nor the route.
     #[cfg(feature = "bittorrent")]
@@ -127,9 +135,11 @@ impl UiServer {
         };
         Self {
             ctx: Ctx {
+                addon_broker: addon_broker::AddonBroker::new(state.clone()),
                 state,
                 registry: Arc::new(registry),
                 media: Arc::new(media),
+                zip_exports: Arc::new(tokio::sync::Semaphore::new(1)),
                 #[cfg(feature = "bittorrent")]
                 bt,
             },
@@ -145,11 +155,19 @@ impl UiServer {
         self
     }
 
+    /// Native launcher handle. Registration happens before any browser starts.
+    pub fn addon_broker(&self) -> addon_broker::AddonBroker {
+        self.ctx.addon_broker.clone()
+    }
+
     pub fn router(&self) -> Router {
         let router = Router::new()
             .route("/", get(health))
             .route("/EpixNet-Internal/Status", get(serve_status))
+            .route("/EpixNet-Internal/Zip", get(xite_zip_http::download))
             .route(NMH_RESOLVE_PATH, axum::routing::post(serve_nmh_resolve))
+            .route(addon_broker::PATH, axum::routing::post(addon_broker::serve)
+                .layer(axum::extract::DefaultBodyLimit::max(addon_broker::MAX_REQUEST_BYTES)))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
             .route(BIGFILE_UPLOAD_PATH, axum::routing::post(bigfile_upload))
             .route("/uimedia/{*path}", get(serve_uimedia))
@@ -159,7 +177,7 @@ impl UiServer {
             .route("/StatsJson", get(serve_stats_json))
             // The Backup & Restore wizard. Mutations are POSTed (passwords and
             // destructive actions never ride a URL); the upload route gets its
-            // own generous body limit (a zites backup can be gigabytes - the
+            // own generous body limit (a xites backup can be gigabytes - the
             // global default is 2 MB) and streams to disk.
             .route(
                 "/Backup",
@@ -803,7 +821,7 @@ fn url_is_same_host(url: &str, host: &str) -> bool {
         .split('/')
         .next()
         .unwrap_or("");
-    strip_port(url_host) == strip_port(host)
+    strip_port(url_host).eq_ignore_ascii_case(strip_port(host))
 }
 
 /// The xite a referer URL points at: the nested path segment if it is itself a
@@ -876,6 +894,7 @@ fn is_global_path(path: &str) -> bool {
 /// or a bare bech32 `epix1…` address Firefox routed to us - rather than the
 /// loopback UI bind.
 fn is_proxy_host(host: &str) -> bool {
+    let host = host.to_ascii_lowercase();
     (host.ends_with(".epix") && !host.is_empty())
         || (host.starts_with("epix1") && host.len() > 20 && !host.contains('.'))
 }
@@ -898,6 +917,8 @@ const CONTENT_HOST_MARKER: &str = "x-epix-content-host";
 /// `talk.content.epix` -> `talk.epix`: the xite host a content host serves
 /// for, or `None` when `host` is not a content host.
 fn content_host_xite(host: &str) -> Option<String> {
+    // Host names are matched without regard to case, like xite names.
+    let host = host.to_ascii_lowercase();
     let suffix = format!(".{CONTENT_HOST_LABEL}.epix");
     let label = host.strip_suffix(suffix.as_str())?;
     (!label.is_empty() && !label.contains('.')).then(|| format!("{label}.epix"))
@@ -905,13 +926,15 @@ fn content_host_xite(host: &str) -> Option<String> {
 
 /// `talk.epix` (or a bare `epix1…` address) -> `talk.content.epix`.
 fn content_host_for(xite_host: &str) -> String {
-    let label = xite_host.strip_suffix(".epix").unwrap_or(xite_host);
+    let xite_host = xite_host.to_ascii_lowercase();
+    let label = xite_host.strip_suffix(".epix").unwrap_or(&xite_host);
     format!("{label}.{CONTENT_HOST_LABEL}.epix")
 }
 
 /// True if a path segment plausibly references a xite we could fetch on
 /// demand: a `.epix` name (xID) or a bech32 `epix1…` address.
 fn plausible_xite_ref(s: &str) -> bool {
+    let s = s.to_ascii_lowercase();
     s.ends_with(".epix") || (s.starts_with("epix1") && s.len() > 20)
 }
 
@@ -920,7 +943,10 @@ fn plausible_xite_ref(s: &str) -> bool {
 /// bypass filters), so a bare address is always presented as this dotted alias
 /// in URLs; checksum-validated, so a look-alike xID name never collapses.
 fn address_alias(host: &str) -> Option<&str> {
-    let label = host.strip_suffix(".epix")?;
+    let (label, suffix) = host.rsplit_once('.')?;
+    if !suffix.eq_ignore_ascii_case("epix") {
+        return None;
+    }
     (!label.contains('.') && epix_core::classify_label(label) == epix_core::LabelClass::Address)
         .then_some(label)
 }
@@ -930,8 +956,8 @@ fn address_alias(host: &str) -> Option<&str> {
 /// name (or an already-dotted alias) passes through unchanged. Public so the
 /// desktop browser applies the same rule to its homepage / start URL.
 pub fn aliased_origin(xite_ref: &str) -> String {
-    if xite_ref.starts_with("epix1") && !xite_ref.contains('.') {
-        format!("{xite_ref}.epix")
+    if epix_core::classify_label(xite_ref) == epix_core::LabelClass::Address {
+        format!("{}.epix", xite_ref.to_ascii_lowercase())
     } else {
         xite_ref.to_string()
     }
@@ -940,13 +966,13 @@ pub fn aliased_origin(xite_ref: &str) -> String {
 /// An untrusted path segment may become an origin only when it names a
 /// supported xite. Decoded URL delimiters must never enter the authority.
 fn cross_xite_origin(xite_ref: &str) -> Option<String> {
+    if epix_core::classify_label(xite_ref) == epix_core::LabelClass::Address {
+        return Some(aliased_origin(xite_ref));
+    }
+    if address_alias(xite_ref).is_some() {
+        return Some(xite_ref.to_ascii_lowercase());
+    }
     let normalized = xite_ref.to_ascii_lowercase();
-    if epix_core::classify_label(&normalized) == epix_core::LabelClass::Address {
-        return Some(aliased_origin(&normalized));
-    }
-    if address_alias(&normalized).is_some() {
-        return Some(normalized);
-    }
     state::xite_domain_name(&normalized).filter(|name| name == &normalized)
 }
 
@@ -991,7 +1017,7 @@ pub fn rewrite_proxy_host(mut req: axum::extract::Request) -> axum::extract::Req
     // this host's path; the wrapper redirects such a document to the xite's
     // own origin.
     let first_seg = path.trim_start_matches('/').split('/').next().unwrap_or("");
-    if (first_seg.starts_with("epix1") && first_seg.len() > 20) || first_seg.ends_with(".epix") {
+    if plausible_xite_ref(first_seg) {
         return req;
     }
     // A content host (`talk.content.epix`) serves its xite's files: route it
@@ -1450,7 +1476,7 @@ async fn render_wrapper(
         let query = raw_query.as_deref().filter(|q| !q.is_empty()).map(|q| format!("?{q}")).unwrap_or_default();
         return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
     }
-    let proxy_mode = host == requested;
+    let proxy_mode = host.eq_ignore_ascii_case(&requested);
     // In host mode the xite page gets an origin of its own, distinct from this
     // wrapper's: the iframe loads from the content host, and because that is
     // a real origin the page may keep `allow-same-origin`. In path mode (the
@@ -1463,6 +1489,8 @@ async fn render_wrapper(
     // once here and key everything below (state lookups, wrapper identity,
     // the WS session) by the address.
     let mut address = ctx.state.canonical_key(&requested).await;
+    let address_form = epix_core::classify_label(&requested) == epix_core::LabelClass::Address
+        || address_alias(&requested).is_some();
     let mut loading = false;
     // Set when the name has no address yet: the wrapper is served in
     // resolving mode (no xite identity, no inner document, polls
@@ -1522,7 +1550,7 @@ async fn render_wrapper(
         // network, the name registry, Tor - stop waiting and serve the
         // resolving screen instead: it explains the wait, shows progress, and
         // reloads itself the moment the name lands.
-        if !requested.starts_with("epix1") {
+        if !address_form {
             for _ in 0..20 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let key = ctx.state.canonical_key(&requested).await;
@@ -1551,8 +1579,10 @@ async fn render_wrapper(
                     // was refused by policy, not "not found" on the chain, and
                     // retrying can never fix a bad checksum.
                     if matches!(
-                        requested.strip_suffix(".epix").map(epix_core::classify_label),
-                        Some(epix_core::LabelClass::AddressShaped)
+                        epix_core::classify_label(requested.rsplit_once('.')
+                            .filter(|(_, suffix)| suffix.eq_ignore_ascii_case("epix"))
+                            .map_or(requested.as_str(), |(label, _)| label)),
+                        epix_core::LabelClass::AddressShaped
                     ) {
                         return (
                             StatusCode::NOT_FOUND,
@@ -1599,8 +1629,6 @@ async fn render_wrapper(
     // Reverse lookup is independent of address discovery, including before
     // content.json arrives. Only a verified name-to-this-address binding may
     // change the visible origin; saved display metadata is not proof.
-    let address_form = epix_core::classify_label(&requested) == epix_core::LabelClass::Address
-        || address_alias(&requested).is_some();
     if address_form {
         ctx.state.request_xite_domain(&address).await;
         if let Some(domain) = ctx.state.verified_xite_domain(&address).await {
@@ -1671,6 +1699,8 @@ async fn render_wrapper(
     let resolving = !resolving_host.is_empty();
     let wrapper_identity = if resolving { String::new() } else { address.clone() };
     let file_url = if resolving { "about:blank".to_string() } else { file_url };
+    // A blank frame loads from no content host.
+    let site_file_server = if resolving { String::new() } else { site_file_server };
     let is_homepage = node_home == requested || node_home == address;
 
     // The xite's secret wrapper/AJAX keys (EpixNet's `site.settings`): the
@@ -1834,7 +1864,7 @@ fn plugin_description(name: &str) -> &'static str {
         "Stats" => "Network stats charts and the peer world map on the dashboard.",
         "UiPluginManager" => "This plugin manager page.",
         "UiConfig" => "The node configuration page.",
-        "UiBackup" => "The Backup & Restore wizard for keys, settings, and zites.",
+        "UiBackup" => "The Backup & Restore wizard for keys, settings, and xites.",
         "Cors" => "Cross-xite file access via a Cors:<address> permission grant.",
         "PeerDb" => "Remembers known peers across restarts.",
         "Notification" => "Per-xite notification subscriptions, muting, and counts.",
@@ -1849,7 +1879,7 @@ fn plugin_description(name: &str) -> &'static str {
         "MergerSite" => "Aggregates merged xites into one database.",
         "OptionalManager" => "Manages optional (on-demand) files and the size limit.",
         "Newsfeed" => "Cross-xite news feed from followed xites.",
-        "CryptMessage" => "ECIES encrypt/decrypt, AES, and ECDSA sign/verify for zites.",
+        "CryptMessage" => "ECIES encrypt/decrypt, AES, and ECDSA sign/verify for xites.",
         "Chart" => "Collects the time-series data behind the Stats charts.",
         "Bigfile" => "Piecewise download of large files with piecefield exchange.",
         "UiPassword" => "Password-protects the whole UI with a login gate.",
@@ -2018,13 +2048,14 @@ async fn run_config_action(ctx: &Ctx, action: &str) -> Response {
             Redirect::to("/Config?cleared=1").into_response()
         }
         // The restart bar's button: stop the node and relaunch once the
-        // process is gone. The page returned keeps polling and comes back to
-        // /Config when the node answers again.
+        // process is gone. A data move selects a different browser profile;
+        // that path explains how to reopen instead of polling with the old CA.
         "restart" => {
+            let data_move = ctx.state.restart_pending_keys().await.iter().any(|key| key == "data_dir");
             ctx.state.push_notification("info", "Restarting...", 5000);
             ctx.state.shutdown(true).await;
             let theme = ctx.state.theme_class().await;
-            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme))
+            ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], render_restarting_page(&theme, data_move, ctx.state.restart_uses_managed_browser_profile()))
                 .into_response()
         }
         _ => Redirect::to("/Config").into_response(),
@@ -2085,7 +2116,7 @@ async fn save_config_values(
     Redirect::to(&to).into_response()
 }
 
-/// `data_dir` is special: it persists to epixnet.conf and copies the data to
+/// `data_dir` is special: it queues a move that copies the data to
 /// the new location, so its outcome is reported back on the page. `None` when
 /// it was not submitted or did not change.
 async fn apply_data_dir(
@@ -2093,7 +2124,7 @@ async fn apply_data_dir(
     params: &std::collections::HashMap<String, String>,
 ) -> Option<(bool, String)> {
     let dir = params.get("data_dir")?;
-    if dir.trim() == ctx.state.data_dir_value() {
+    if dir.trim() == ctx.state.data_dir_config_value() {
         return None;
     }
     Some(match ctx.state.set_data_dir(dir).await {
@@ -2140,10 +2171,10 @@ async fn serve_config_page(
     }
     let mut values = Vec::new();
     for (section, key, label, default, kind) in crate::state::CONFIG_SCHEMA {
-        // data_dir isn't in config.json: its value is the live data root and
+        // data_dir isn't in config.json: show the pending destination if any, and
         // its default the per-OS conventional location.
         let (val, default) = if *key == "data_dir" {
-            (ctx.state.data_dir_value(), ctx.state.data_dir_default())
+            (ctx.state.data_dir_config_value(), ctx.state.data_dir_default())
         } else {
             let val = ctx
                 .state
@@ -2185,11 +2216,17 @@ async fn serve_config_page(
         .into_response()
 }
 
-/// The page shown after the restart button: the node is going down, so the
-/// page itself polls until /Config answers again and then returns there. The
-/// meta refresh is the no-JS fallback (its first hits may error while the
-/// node is down; the JS poll swallows those).
-fn render_restarting_page(theme: &str) -> String {
+/// A managed browser needs a fresh profile after a data move. Other restarts
+/// poll until /Config answers again, with a meta refresh as the no-JS fallback.
+fn render_restarting_page(theme: &str, data_move: bool, managed_browser: bool) -> String {
+    if data_move && managed_browser {
+        return page_shell("Restarting", "Moving node data", "",
+            "<p class='sub'>EpixNet is restarting and moving its node data. \
+             When the EpixNet tray is ready, close this browser window and open Epix Browser from the tray. \
+             This window uses the previous folder's browser profile.</p>\
+             <p class='sub'>Browser profiles and wallet extension storage remain in their original folder. \
+             The original node data is also kept as a backup.</p>", "", theme);
+    }
     let body = "<meta http-equiv='refresh' content='6;url=/Config'>\
         <p class='sub'>EpixNet is restarting. This page returns to the settings when the node is back - \
         if it does not, reload it manually.</p>\
@@ -2398,6 +2435,9 @@ fn render_config_page(
         } else {
             let note = if coming_soon {
                 "<span class='default'> - coming soon (not yet supported)</span>"
+            } else if *key == "data_dir" {
+                "<br>Copies node identities, settings and downloaded xites to a new folder. \
+                 Browser profiles and wallet extension storage remain in their original folder."
             } else {
                 ""
             };
@@ -4159,7 +4199,9 @@ async fn ui_password_gate(
         return next.run(request).await;
     }
     let path = request.uri().path();
-    if path == "/Login" || path.ends_with("favicon.ico") {
+    // The native addon endpoint has independent per-run authentication. It
+    // never inherits page cookies or grants access to other UI routes.
+    if path == "/Login" || path.ends_with("favicon.ico") || path == addon_broker::PATH {
         return next.run(request).await;
     }
     let cookie = request
@@ -4321,6 +4363,24 @@ fn percent_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+#[cfg(test)]
+mod data_move_page_tests {
+    #[test]
+    fn relocated_browser_gets_reopen_instructions_without_polling_the_old_profile() {
+        let page = super::render_restarting_page("theme-light", true, true);
+        assert!(page.contains("close this browser window"));
+        assert!(page.contains("open Epix Browser from the tray"));
+        assert!(page.contains("wallet extension storage remain in their original folder"));
+        assert!(!page.contains("http-equiv='refresh'"));
+        assert!(!page.contains("fetch('/Config'"));
+        for (data_move, managed_browser) in [(true, false), (false, true), (false, false)] {
+            let ordinary = super::render_restarting_page("theme-light", data_move, managed_browser);
+            assert!(ordinary.contains("fetch('/Config'"));
+            assert!(!ordinary.contains("open Epix Browser from the tray"));
+        }
+    }
 }
 
 // ---- Benchmark: /Benchmark diagnostics page --------------------------------

@@ -17,7 +17,7 @@ permissions: {}
 
 jobs:
   android-wallet-staging:
-    name: Android wallet staging regressions
+    name: Android shell regressions
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
@@ -29,6 +29,28 @@ jobs:
           distribution: temurin
           java-version: '21'
       - run: python3 shells/android/tests/run-wallet-staging-regressions.py
+      - name: Test Android startup and controls
+        run: |
+          export KOTLINC="$(command -v kotlinc)"
+          "$KOTLINC" -version
+          export COROUTINES_JAR="$RUNNER_TEMP/kotlinx-coroutines-core-jvm-1.9.0.jar"
+          curl --fail --location --silent --show-error --retry 3 --connect-timeout 10 --max-time 120 \
+            https://repo.maven.apache.org/maven2/org/jetbrains/kotlinx/kotlinx-coroutines-core-jvm/1.9.0/kotlinx-coroutines-core-jvm-1.9.0.jar \
+            --output "$COROUTINES_JAR"
+          echo "ad89c2892235e670f222d819cb3d81188143cb19a05b59df9889ae4269f5c70a  $COROUTINES_JAR" | sha256sum --check
+          python3 shells/android/tests/run-node-host-regressions.py
+          python3 shells/android/tests/run-browser-host-regressions.py
+          python3 shells/android/tests/run-addon-policy-regressions.py
+          python3 shells/android/tests/run-browser-settings-regressions.py
+          python3 shells/android/tests/run-pending-operations-regressions.py
+          python3 shells/android/tests/run-guarded-session-regressions.py
+          python3 shells/android/tests/run-picked-file-regressions.py
+          python3 shells/android/tests/run-file-response-regressions.py
+          python3 shells/android/tests/run-activity-lifecycle-regressions.py
+          python3 shells/android/tests/run-startup-regressions.py
+          python3 shells/android/tests/run-toolbar-regressions.py
+          python3 shells/android/tests/run-fullscreen-regressions.py
+          python3 shells/android/tests/run-window-insets-regressions.py
 
   linux-packaging:
     name: Linux packaging (${{ matrix.os }})
@@ -42,6 +64,9 @@ jobs:
         os: [ubuntu-22.04, ubuntu-24.04]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
       - name: Install packaging test dependencies
         run: |
           sudo apt-get update
@@ -50,6 +75,7 @@ jobs:
         run: |
           python3 packaging/test-firefox-download.py -v
           python3 packaging/linux/test-packaging.py -v
+          python3 packaging/linux/test-autostart.py -v
           python3 packaging/linux/test-evx-package.py -v
 
   build-test:
@@ -68,27 +94,19 @@ jobs:
       RUSTFLAGS: "-D warnings"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Test bounded apt mirror fallback
+        run: python3 scripts/test_ci_install_apt_deps.py -v
       - name: Install Linux build deps (protoc + libudev for the Ledger HID bridge; GTK/AppIndicator for the system tray)
-        # `timeout` per apt call + retry: a stalled Azure apt mirror otherwise
-        # hangs the step for the full 6h job timeout (observed on this branch).
-        env:
-          DEBIAN_FRONTEND: noninteractive
+        # Bound stalled downloads and leave Azure after the first failure.
         run: |
-          for i in 1 2 3; do
-            if sudo timeout 300 apt-get update && \
-               sudo timeout 300 apt-get install -y --no-install-recommends \
-                 protobuf-compiler libudev-dev pkg-config libgtk-3-dev \
-                 libayatana-appindicator3-dev libxdo-dev; then
-              exit 0
-            fi
-            echo "::warning::apt attempt $i failed or timed out; retrying in 15s"
-            sleep 15
-          done
-          echo "::error::apt-get failed after 3 attempts"; exit 1
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+            python3 scripts/ci_install_apt_deps.py \
+              protobuf-compiler libudev-dev pkg-config libgtk-3-dev \
+              libayatana-appindicator3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       - name: Assert native host delegates xID resolution to the node
         run: |
           if grep -q '^epix-chain[[:space:]]*=' crates/epix-nmh/Cargo.toml || \
@@ -108,6 +126,7 @@ jobs:
           python3 scripts/test_android_native.py
           python3 scripts/test_mobile_wallet.py
           node --test crates/epix-browser/tests/pac-routing.test.cjs
+          node --test packaging/firefox-addons/tests/*.test.mjs
           node --test ui/tests/*.test.cjs
       # Run the deterministic crypto vectors (sslcrypto + Python interop), so a
       # change that compiles but breaks byte-compatibility is caught too.
@@ -126,7 +145,9 @@ jobs:
       # binds loopback only. The 310s idle-reaper test in epix-runtime is
       # #[ignore]d and stays skipped.
       - name: Test EDX runtime, UI and wire crates
-        run: cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
+        run: |
+          cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
+          cargo test -p epix-ui --example merger_index_benchmark --locked
       # Security-critical channel suites must execute, not merely compile under
       # `build --all-targets`. These cover finality-backed identity resolution,
       # durable ratchet/outbox behavior, pairwise and group engines, and RLN.
@@ -142,6 +163,61 @@ jobs:
       - name: Verify a privileged parent cannot lend capabilities to an EVX worker
         run: sudo python3 packaging/linux/verify-evx-worker.py target/debug/evx-worker --require-privileged-parent
 
+  windows-time-regressions:
+    name: Windows filesystem and time regressions
+    runs-on: windows-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      # This excluded vendored crate has a standalone dependency graph. Avoid
+      # building or caching the full workspace to exercise Windows clock limits.
+      - name: Test Windows clock limits and coarse-clock progress
+        env:
+          CARGO_TARGET_DIR: ${{ runner.temp }}/saturating-time-tests
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+        run: cargo test --manifest-path vendor/saturating-time/Cargo.toml
+      - name: Test Windows data moves and canonical PAC paths
+        env:
+          CARGO_BUILD_JOBS: "2"
+          CARGO_PROFILE_DEV_DEBUG: "0"
+          CARGO_PROFILE_TEST_DEBUG: "0"
+          CARGO_INCREMENTAL: "0"
+          EPIX_TEST_FETCH_DEPS: "1"
+        run: |
+          python scripts/test_data_relocation.py
+          node --test crates/epix-browser/tests/pac-routing.test.cjs
+
+  apple-filesystem-regressions:
+    name: Apple filesystem regressions
+    runs-on: macos-14
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings"
+      EPIX_TEST_FETCH_DEPS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - name: Test native directory ownership, recovery and PAC paths
+        run: |
+          python3 scripts/test_data_relocation.py
+          node --test crates/epix-browser/tests/pac-routing.test.cjs
+
   mobile-profiles:
     name: Mobile feature profiles
     runs-on: ubuntu-latest
@@ -154,22 +230,13 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install Linux build deps (protoc)
-        env:
-          DEBIAN_FRONTEND: noninteractive
         run: |
-          for i in 1 2 3; do
-            if sudo timeout 300 apt-get update && \
-               sudo timeout 300 apt-get install -y --no-install-recommends protobuf-compiler pkg-config; then
-              exit 0
-            fi
-            echo "::warning::apt attempt $i failed or timed out; retrying in 15s"
-            sleep 15
-          done
-          echo "::error::apt-get failed after 3 attempts"; exit 1
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+            python3 scripts/ci_install_apt_deps.py protobuf-compiler pkg-config
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
         with:
           toolchain: stable
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
       # The actual iOS/Android target builds need the Apple SDK / Android NDK on
       # a matching runner (release pipeline). Here we validate the FEATURE
       # PROFILES resolve and compile on the host - a dependency leaking into the

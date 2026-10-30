@@ -69,6 +69,7 @@ cat > "$STAGE/firefox/distribution/policies.json" <<'POLICIES'
   }
 }
 POLICIES
+python3 "$REPO_ROOT/packaging/firefox-addons/install.py" "$STAGE/firefox"
 
 # Hicolor icons for the .desktop entry, prebuilt from the assets repo
 # (images/icons/generated/linux) and checked in under packaging/linux/icons.

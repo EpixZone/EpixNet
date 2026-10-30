@@ -1,7 +1,11 @@
 //! Shared server state: the xites this node serves (with their runtime
 //! settings + stats), the local user identity, and node metadata.
 
-use epix_core::{Address, PeerAddr};
+mod xite_export;
+mod merger_index;
+pub(crate) mod addon_install;
+
+use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{DialableNets, Peer, PeerCounts, Peers};
 use epix_transport::Transport;
@@ -269,6 +273,18 @@ impl UpdatePayload {
 /// crate stays free of the transport/swarm dependency, like the resolvers.
 #[async_trait::async_trait]
 pub trait EdxFetcher: Send + Sync {
+    /// Fetch one previously authorized flat addon object, never a mutable path.
+    /// Implementations must cap size at addons::MAX_ARCHIVE_BYTES and return
+    /// only bytes matching both fields. Dropping this future cancels its owned
+    /// requests; it must not detach a downloader or materialize a xite file.
+    async fn fetch_addon_object(
+        &self,
+        _address: &str,
+        _object: EdxObjectRef,
+    ) -> Result<Vec<u8>, String> {
+        Err("Bounded addon download is unavailable".into())
+    }
+
     /// Fetch `inner_path` of `address` from EDX peers, verify it against its
     /// `b3` root, and write it into the xite's storage. `Ok(true)` when the
     /// file is present afterward; `Err` when the EDX fetch could not complete
@@ -430,6 +446,17 @@ pub trait EdxFetcher: Send + Sync {
     /// opaque here - `epix-discovery` owns both encode and decode.
     async fn announce(&self, peer: PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String>;
 
+    /// Preserve whether an announce was deferred locally without a new dial.
+    /// Existing fetchers report real failures unless they explicitly carry
+    /// that distinction from their connection pool.
+    async fn announce_attempt(
+        &self,
+        peer: PeerAddr,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, AttemptError<String>> {
+        self.announce(peer, payload).await.map_err(AttemptError::Failed)
+    }
+
     /// Store-and-forward hints after the `after` cursor over EDX
     /// (`Req::UpdatesSince`): `(xite, modified)` pairs plus the peer's current
     /// head, which the caller keeps as its next cursor.
@@ -469,6 +496,14 @@ struct EdxAnnounceSender {
 impl epix_discovery::AnnounceSender for EdxAnnounceSender {
     async fn send(&self, tracker: &PeerAddr, payload: Vec<u8>) -> Result<Vec<u8>, String> {
         self.fetcher.announce(tracker.clone(), payload).await
+    }
+
+    async fn send_attempt(
+        &self,
+        tracker: &PeerAddr,
+        payload: Vec<u8>,
+    ) -> Result<Vec<u8>, AttemptError<String>> {
+        self.fetcher.announce_attempt(tracker.clone(), payload).await
     }
 }
 
@@ -621,6 +656,17 @@ static BIGFILE_AFTER_MANIFEST_COMMIT_PAUSE: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 #[cfg(test)]
+type RootSignPreparationPause = (
+    std::sync::mpsc::Sender<()>,
+    Arc<tokio::sync::Notify>,
+    Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+);
+#[cfg(test)]
+static ROOT_SIGN_PREPARATION_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<PathBuf, RootSignPreparationPause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+#[cfg(test)]
 static ROOT_SIGN_BEFORE_CACHE_PAUSE: std::sync::LazyLock<
     std::sync::Mutex<
         Option<(
@@ -631,7 +677,17 @@ static ROOT_SIGN_BEFORE_CACHE_PAUSE: std::sync::LazyLock<
     >,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 #[cfg(test)]
+static ROOT_COMMIT_PREFLIGHT_PAUSES: std::sync::LazyLock<
+    std::sync::Mutex<
+        HashMap<PathBuf, (Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+    >,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+#[cfg(test)]
 type DbTestPause = std::sync::Mutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
+>;
+#[cfg(test)]
+type StoreTestPause = std::sync::Mutex<
     Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Semaphore>)>,
 >;
 #[cfg(test)]
@@ -996,32 +1052,6 @@ struct DbQueryReceipt {
     filter_epoch: u64,
     generation: u64,
     merger: bool,
-}
-
-#[derive(Clone)]
-struct MergerDbSourceSnapshot {
-    canonical: String,
-    storage: XiteStorage,
-    merged_type: String,
-    accepted_values: Vec<(String, Value)>,
-    verified_epoch: u64,
-    source_epoch: u64,
-}
-
-struct MergerDbTargetSnapshot {
-    key: String,
-    canonical: String,
-    storage: XiteStorage,
-    schema: DbSchema,
-    accepted_types: Vec<String>,
-    verified_epoch: u64,
-    source_epoch: u64,
-    populate_sources: bool,
-}
-
-struct PreparedMergerDb {
-    target: MergerDbTargetSnapshot,
-    db: Option<Database>,
 }
 
 struct StoreXiteCandidate {
@@ -4089,6 +4119,7 @@ const XID_RETRY_BACKOFF_MAX_SECS: u64 = 30 * 60;
 pub type EvxGrantSummarySource = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
 
 pub struct AppState {
+    addon_profiles: std::sync::Mutex<crate::addons::Profiles>,
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
     self_weak: std::sync::OnceLock<std::sync::Weak<AppState>>,
@@ -4107,6 +4138,7 @@ pub struct AppState {
     /// stale ordinary writer cannot resurrect a deleted canonical.
     metadata_persistence_lock: tokio::sync::Mutex<()>,
     removal_retries: std::sync::Mutex<std::collections::HashSet<String>>,
+    deletion_reserve: Option<crate::deletion_reserve::DeletionReserve>,
     /// Derived feed artifacts per `address -> feed name -> artifacts`. A pure,
     /// recomputable read cache over the xite's signed OR-set records (see
     /// [`crate::feed`]); never persisted, rebuilt on demand and on merge.
@@ -4184,6 +4216,10 @@ pub struct AppState {
     db_merger_epoch: AtomicU64,
     db_generation_counter: AtomicU64,
     db_filter_epoch: AtomicU64,
+    merger_index_refresh: tokio::sync::Mutex<()>,
+    merger_temporary_root: std::sync::Mutex<Option<Arc<tempfile::TempDir>>>,
+    merger_indexes: std::sync::Mutex<HashMap<String, merger_index::CachedIndex>>,
+    merger_index_counters: std::sync::Mutex<merger_index::IndexCounters>,
     /// EDX verified-streaming fetcher, installed by the node when EDX is
     /// enabled. When absent, downloads use the legacy sha512/piecemap path.
     edx_fetcher: RwLock<Option<Arc<dyn EdxFetcher>>>,
@@ -4292,10 +4328,9 @@ pub struct AppState {
     /// key "pending restart" when its saved value has drifted from this. None
     /// until snapshotted (test/in-memory nodes never are, so nothing pends).
     boot_config: std::sync::Mutex<Option<HashMap<String, String>>>,
-    /// The argv a requested restart relaunches with. Set by the embedding
-    /// shell - the desktop browser relaunches itself with `--background` so no
-    /// second window pops. None relaunches the current exe with its own args.
-    restart_argv: std::sync::Mutex<Option<Vec<String>>>,
+    /// The command and browser-profile behavior registered by the embedding
+    /// shell. Without a command, a restart request shuts down without relaunch.
+    restart_command: std::sync::Mutex<Option<RestartCommand>>,
     /// Names of loaded plugins/features, reported in `serverInfo` (the dashboard
     /// menu shows plugin-gated items like Stats from this).
     plugins: RwLock<Vec<String>>,
@@ -4409,6 +4444,8 @@ pub struct AppState {
     /// chains that expected rows (EpixTalk's loading overlay, stuck forever).
     db_rebuilds_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
     // A fixture's synchronization hooks must not pause another AppState.
+    #[cfg(test)]
+    store_before_exposure_pause: StoreTestPause,
     #[cfg(test)]
     merger_db_before_install_pause: DbTestPause,
     #[cfg(test)]
@@ -4575,6 +4612,8 @@ pub struct AppState {
     /// node's data root is user-relocatable (a desktop node not pinned by
     /// `EPIX_DATA_DIR`). `set_data_dir` persists the choice there.
     data_dir_conf: std::sync::Mutex<Option<PathBuf>>,
+    /// Held while any runtime task can write this data root.
+    data_root_lease: std::sync::OnceLock<Arc<crate::data_relocation::DataRootLease>>,
     /// Trackers contributed at runtime (the Beacon plugin's live list),
     /// folded into every announce alongside the configured ones. Replaced
     /// wholesale on each refresh - not persisted, the plugin's book is.
@@ -4592,6 +4631,10 @@ pub struct AppState {
     /// Fired when the runtime-contributed tracker set changes, so the announce
     /// loop can run early instead of waiting out its period.
     trackers_changed: Arc<tokio::sync::Notify>,
+    /// Coalesced update requests belong to a registration, so deletion and
+    /// re-add cannot turn an old wake into work for the replacement xite.
+    xite_update_requests: std::sync::Mutex<HashMap<String, u64>>,
+    update_requests_changed: Arc<tokio::sync::Notify>,
     /// Fired when the Tor bridges setting (`tor_use_bridges`) changes, so the
     /// Tor loop can re-bootstrap through (or away from) Snowflake without a
     /// node restart.
@@ -5471,6 +5514,11 @@ pub fn self_exe() -> Option<String> {
     exe.is_file().then(|| exe.display().to_string())
 }
 
+struct RestartCommand {
+    argv: Vec<String>,
+    managed_browser_profile: bool,
+}
+
 /// Launch a detached helper that waits for this process to die, then starts
 /// the node again with `argv`. The wait matters: the single-instance guard
 /// and the bound ports are only free once the old process is gone. Only ever
@@ -5588,7 +5636,11 @@ impl AppState {
     /// added to `AppState` is initialized once instead of in two places that
     /// have to be kept in step.
     fn build(version: impl Into<String>, persist: Persistence) -> Arc<Self> {
+        let deletion_reserve = persist.xites_path.as_ref()
+            .and_then(|path| path.parent())
+            .map(|directory| crate::deletion_reserve::DeletionReserve::new(directory.to_path_buf()));
         let state = Arc::new(Self {
+            addon_profiles: std::sync::Mutex::new(crate::addons::Profiles::default()),
             self_weak: std::sync::OnceLock::new(),
             version: version.into(),
             rev: RwLock::new("0".to_string()),
@@ -5597,6 +5649,7 @@ impl AppState {
             xite_registry_lock: tokio::sync::Mutex::new(()),
             metadata_persistence_lock: tokio::sync::Mutex::new(()),
             removal_retries: std::sync::Mutex::new(std::collections::HashSet::new()),
+            deletion_reserve,
             feed_cache: RwLock::new(HashMap::new()),
             feed_cache_epochs: RwLock::new(HashMap::new()),
             feed_object_owners: std::sync::Mutex::new(HashMap::new()),
@@ -5627,6 +5680,10 @@ impl AppState {
             db_merger_epoch: AtomicU64::new(0),
             db_generation_counter: AtomicU64::new(1),
             db_filter_epoch: AtomicU64::new(0),
+            merger_index_refresh: tokio::sync::Mutex::new(()),
+            merger_temporary_root: std::sync::Mutex::new(None),
+            merger_indexes: std::sync::Mutex::new(HashMap::new()),
+            merger_index_counters: std::sync::Mutex::new(merger_index::IndexCounters::default()),
             edx_fetcher: RwLock::new(None),
             pool_rules: RwLock::new(HashMap::new()),
             pool_shard_locks: std::sync::Mutex::new(HashMap::new()),
@@ -5653,7 +5710,7 @@ impl AppState {
             config: RwLock::new(persist.config),
             config_path: persist.config_path,
             boot_config: std::sync::Mutex::new(None),
-            restart_argv: std::sync::Mutex::new(None),
+            restart_command: std::sync::Mutex::new(None),
             plugins: RwLock::new(Vec::new()),
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
@@ -5684,6 +5741,8 @@ impl AppState {
             pending_updates: std::sync::Mutex::new(HashMap::new()),
             pending_child_relays: std::sync::Mutex::new(HashMap::new()),
             db_rebuilds_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            #[cfg(test)]
+            store_before_exposure_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
             merger_db_before_install_pause: std::sync::Mutex::new(None),
             #[cfg(test)]
@@ -5727,10 +5786,13 @@ impl AppState {
             data_root: persist.data_root,
             xites_path: persist.xites_path,
             data_dir_conf: std::sync::Mutex::new(None),
+            data_root_lease: std::sync::OnceLock::new(),
             extra_trackers: RwLock::new(Vec::new()),
             gossip_trackers: RwLock::new(Vec::new()),
             bootstrap_trackers: RwLock::new(Vec::new()),
             trackers_changed: Arc::new(tokio::sync::Notify::new()),
+            xite_update_requests: std::sync::Mutex::new(HashMap::new()),
+            update_requests_changed: Arc::new(tokio::sync::Notify::new()),
             tor_config_changed: Arc::new(tokio::sync::Notify::new()),
             plugin_changes: tokio::sync::watch::channel(()).0,
             #[cfg(feature = "multiuser")]
@@ -5739,6 +5801,7 @@ impl AppState {
             multi_users_path: persist.multi_users_path,
         });
         let _ = state.self_weak.set(Arc::downgrade(&state));
+        state.replenish_deletion_reserve();
         state
     }
 
@@ -5754,6 +5817,19 @@ impl AppState {
     /// live in `<root>/private/` and each xite's files in `<root>/data/<addr>/`.
     /// Upgrading from the Python client to this node therefore needs no
     /// migration - the identity, certs, and downloaded xites are read in place.
+    pub fn with_data_dir_leased(
+        version: impl Into<String>,
+        lease: Arc<crate::data_relocation::DataRootLease>,
+    ) -> Arc<Self> {
+        let state = Self::with_data_dir(version, lease.root());
+        // The local lease is held throughout construction, before any database
+        // opens. Keep it until the last runtime task releases AppState.
+        assert!(state.data_root_lease.set(lease).is_ok());
+        state
+    }
+
+    /// Construct disk-backed state when the caller already owns its lifecycle.
+    /// Production node and offline CLI entry points use `with_data_dir_leased`.
     pub fn with_data_dir(version: impl Into<String>, data_root: impl Into<PathBuf>) -> Arc<Self> {
         let data_root = data_root.into();
         let dir = data_root.join("private");
@@ -6193,6 +6269,65 @@ impl AppState {
         self.trackers_changed.clone()
     }
 
+    /// Wake the runtime's bounded update coordinator.
+    pub fn update_requests_changed(&self) -> Arc<tokio::sync::Notify> {
+        self.update_requests_changed.clone()
+    }
+
+    /// Request an early update for a registered, serving xite. Propagation
+    /// hints use signed addresses, while the registry may use an alias.
+    pub async fn request_xite_update(&self, address: &str) {
+        let requested = {
+            let xites = self.xites.read().await;
+            let mut pending = self.xite_update_requests.lock().unwrap();
+            let mut requested = false;
+            for (key, xite) in xites.iter() {
+                if xite.settings.serving && (key == address
+                    || canonical_address(xite.content.as_ref(), key) == address)
+                {
+                    pending.insert(key.clone(), xite.membership_generation);
+                    requested = true;
+                }
+            }
+            requested
+        };
+        if requested {
+            self.update_requests_changed.notify_one();
+        }
+    }
+
+    /// Startup, foreground, and transport readiness refresh all serving xites.
+    pub async fn request_all_xite_updates(&self) {
+        let requested = {
+            let xites = self.xites.read().await;
+            let mut pending = self.xite_update_requests.lock().unwrap();
+            for (key, xite) in xites.iter().filter(|(_, xite)| xite.settings.serving) {
+                pending.insert(key.clone(), xite.membership_generation);
+            }
+            !pending.is_empty()
+        };
+        if requested {
+            self.update_requests_changed.notify_one();
+        }
+    }
+
+    /// Drain requests atomically. Wakes arriving during a pass remain queued.
+    pub fn take_xite_update_requests(&self) -> HashMap<String, u64> {
+        std::mem::take(&mut *self.xite_update_requests.lock().unwrap())
+    }
+
+    /// Recheck before dispatch and each update stage, including user content.
+    pub async fn xite_update_is_current(&self, address: &str, generation: u64) -> bool {
+        self.xites.read().await.get(address).is_some_and(|xite| {
+            xite.settings.serving && xite.membership_generation == generation
+        })
+    }
+
+    /// Runtime startup can precede installation of the node's EDX fetcher.
+    pub async fn edx_fetcher_ready(&self) -> bool {
+        self.edx_fetcher.read().await.is_some()
+    }
+
     /// The Tor loop awaits this to re-bootstrap when the bridges setting changes.
     pub fn tor_config_changed(&self) -> Arc<tokio::sync::Notify> {
         self.tor_config_changed.clone()
@@ -6510,7 +6645,7 @@ impl AppState {
                 continue;
             }
             let (value, default) = if *key == "data_dir" {
-                (json!(self.data_dir_value()), json!(self.data_dir_default()))
+                (json!(self.data_dir_config_value()), json!(self.data_dir_default()))
             } else {
                 (self.config_get(key).await.unwrap_or_else(|| json!(default)), json!(default),
                 )
@@ -6561,12 +6696,13 @@ impl AppState {
                 }
             }
         }
-        // data_dir applies from epixnet.conf on the next start: pending when
-        // the staged root (or the default, when the entry was removed) is not
-        // the one this run opened.
+        // The effective config remains unchanged until an offline move has
+        // completed. A queued request must still show the restart control.
         let conf = self.data_dir_conf.lock().unwrap().clone();
         if let (Some(conf), Some(root)) = (conf, &self.data_root) {
-            let staged = crate::paths::read_conf_data_dir(&conf)
+            let staged = crate::data_relocation::pending_target(&conf)
+                .ok().flatten()
+                .or_else(|| crate::paths::read_conf_data_dir(&conf))
                 .unwrap_or_else(crate::paths::default_data_root);
             if crate::paths::resolve_data_directory(&staged).ok()
                 != crate::paths::resolve_data_directory(root).ok()
@@ -6582,13 +6718,27 @@ impl AppState {
     /// `--background`); without it a restart request is a plain shutdown and
     /// the Config page words its restart bar accordingly.
     pub fn set_restart_argv(&self, argv: Vec<String>) {
-        *self.restart_argv.lock().unwrap() = Some(argv);
+        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+            argv, managed_browser_profile: false,
+        });
+    }
+
+    /// Register a shell whose browser profile changes with the data root.
+    pub fn set_managed_browser_restart_argv(&self, argv: Vec<String>) {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+            argv, managed_browser_profile: true,
+        });
+    }
+
+    pub fn restart_uses_managed_browser_profile(&self) -> bool {
+        self.restart_command.lock().unwrap().as_ref()
+            .is_some_and(|command| command.managed_browser_profile)
     }
 
     /// Whether a restart can actually relaunch the node (a shell registered
     /// a relaunch argv).
     pub fn can_restart(&self) -> bool {
-        self.restart_argv.lock().unwrap().is_some()
+        self.restart_command.lock().unwrap().is_some()
     }
 
     /// Stop the node process; with `restart` a detached helper waits for this
@@ -6603,7 +6753,9 @@ impl AppState {
         .await;
         self.persist_peers().await;
         self.persist_xites().await;
-        let argv = if restart { self.restart_argv.lock().unwrap().clone() } else { None };
+        let argv = if restart {
+            self.restart_command.lock().unwrap().as_ref().map(|command| command.argv.clone())
+        } else { None };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
             if let Some(argv) = argv {
@@ -6627,6 +6779,14 @@ impl AppState {
         self.data_root.as_ref().map(|p| p.display().to_string()).unwrap_or_default()
     }
 
+    /// Saved destination shown in Config while a move waits for restart.
+    pub fn data_dir_config_value(&self) -> String {
+        let conf = self.data_dir_conf.lock().unwrap().clone();
+        conf.and_then(|conf| crate::data_relocation::pending_target(&conf).ok().flatten())
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| self.data_dir_value())
+    }
+
     /// The staged Epix Wallet web app (`<data_root>/wallet-ui`), if present.
     /// The mobile shells copy their bundled wallet build here so the UI
     /// server can serve it as a plain web app - their WebViews cannot run
@@ -6642,12 +6802,9 @@ impl AppState {
         crate::paths::default_data_root().display().to_string()
     }
 
-    /// Change where EpixNet stores its data. Copies `private/` and `data/`
-    /// to the new location (unless it already holds an identity), then records
-    /// the choice as `data_dir` in `epixnet.conf` - the same key the Python
-    /// client uses. The old directory is left in place as a backup; the node
-    /// switches to the new one on the next start. An empty path resets to the
-    /// per-OS default. Returns the message to show the user.
+    /// Queue a data move for the next start, before databases and writers open.
+    /// The current root and effective config stay unchanged until the copy has
+    /// completed. The old private/data directories remain as a backup.
     pub async fn set_data_dir(&self, new_dir: &str) -> Result<String, String> {
         let conf = self
             .data_dir_conf
@@ -6657,8 +6814,6 @@ impl AppState {
             .ok_or("The data directory is fixed for this node (set via EPIX_DATA_DIR or the embedding app)")?;
         let current = self.data_root.as_ref().ok_or("This node keeps no data on disk")?
             .canonicalize().map_err(|e| format!("Could not resolve the current data directory: {e}"))?;
-
-        // Resolve the input: empty resets to the default; "~" expands.
         let mut input = new_dir.trim().to_string();
         if let Some(rest) = input.strip_prefix("~/") {
             if let Ok(home) = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")) {
@@ -6667,50 +6822,15 @@ impl AppState {
         }
         let default = crate::paths::resolve_data_directory(&crate::paths::default_data_root())
             .map_err(|e| format!("Could not resolve the default data directory: {e}"))?;
-        let target = if input.is_empty() { default.clone() } else { PathBuf::from(&input) };
-        let target = crate::paths::resolve_data_directory(&target)
-            .map_err(|e| format!("Invalid data directory: {e}"))?;
-        if target == current {
-            // Nothing to copy, but the conf must still match (e.g. resetting a
-            // stale data_dir line while already running on the default root).
-            crate::paths::write_conf_data_dir(&conf, (target != default).then_some(target.as_path()),
-            )
-                .map_err(|e| format!("Could not save {}: {e}", conf.display()))?;
-            return Ok(format!("Data directory is already {}", target.display()));
-        }
-        if target.starts_with(&current) || current.starts_with(&target) {
-            return Err("The new data directory can't be inside the current one (or contain it)".to_string(),
-            );
-        }
-
-        validate_data_destination(&target)?;
-
-        // Copy the node's data over unless the target already holds an
-        // identity of its own (then switching must not overwrite it).
-        if !target.join("private/users.json").exists() && current.join("private").exists() {
-            let (from, to) = (current.clone(), target.clone());
-            tokio::task::spawn_blocking(move || {
-                for sub in ["private", "data"] {
-                    let src = from.join(sub);
-                    if src.exists() {
-                        copy_dir_all(&src, &to.join(sub))?;
-                    }
-                }
-                Ok::<(), std::io::Error>(())
-            })
-            .await
-            .map_err(|e| format!("copy task failed: {e}"))?
-            .map_err(|e| format!("Could not copy the data to {}: {e}", target.display()))?;
-        }
-
-        crate::paths::write_conf_data_dir(&conf, (target != default).then_some(target.as_path()))
-            .map_err(|e| format!("Could not save {}: {e}", conf.display()))?;
-        self.log("INFO", format!("Data directory set to {} (was {})", target.display(), current.display()),
-        ).await;
-        Ok(format!(
-            "Data directory set to {}. Restart EpixNet to start using it; the old directory is kept as a backup.",
-            target.display()
-        ))
+        let target = if input.is_empty() { default.clone() } else { PathBuf::from(input) };
+        let message = tokio::task::spawn_blocking(move || {
+            crate::data_relocation::queue_request(&conf, &current, &target, &default)
+        })
+        .await
+        .map_err(|e| format!("Could not queue the data directory change: {e}"))?
+        .map_err(|e| format!("Could not queue the data directory change: {e}"))?;
+        self.log("INFO", &message).await;
+        Ok(message)
     }
 
     /// Set a node config value (`configSet`), persisted to `data_dir/config.json`.
@@ -7092,7 +7212,7 @@ impl AppState {
                 .as_ref()
                 .map(|snapshot| snapshot.values.as_slice()),
         ) {
-            Some((db, schema)) => (Some(db), Some(schema)),
+            Some((db, schema)) => (if schema.version == 3 { None } else { Some(db) }, Some(schema)),
             None => (None, None),
         };
         // Restore any peers persisted by the PeerDb plugin, keyed by the signed
@@ -7456,6 +7576,13 @@ impl AppState {
     /// The cache entry beats the display alias whenever it exists, so the
     /// wrapper, the node and the background verifier agree on one address.
     pub async fn resolve_name_verified(&self, name: &str) -> Option<(String, bool)> {
+        // Addresses and address-shaped typos are never registry names, even
+        // when an old cache contains a same-string registration.
+        let label = name.rsplit_once('.').map_or(name, |(label, _)| label);
+        if epix_core::classify_label(label) != epix_core::LabelClass::Name {
+            return None;
+        }
+        let name = name.to_ascii_lowercase();
         let finality_required = epix_chain::verify_finality_enabled();
         // Entries are `{"address": …, "resolved_at": …, "finality_height": …,
         // "finality_digest": …}`, an older unbound object, or a legacy string.
@@ -7464,13 +7591,15 @@ impl AppState {
                 .await
                 .ok()
                 .and_then(|b| serde_json::from_slice::<serde_json::Map<String, Value>>(&b).ok())
-                .and_then(|cache| cache.get(name).cloned()),
+                .and_then(|cache| cache.get(&name)
+                    .or_else(|| cache.iter().find(|(key, _)| key.eq_ignore_ascii_case(&name)).map(|(_, entry)| entry))
+                    .cloned()),
             None => None,
         };
         let xites = self.xites.read().await;
         let served = xites
             .iter()
-            .find(|(_, x)| x.display.as_deref() == Some(name))
+            .find(|(_, x)| x.display.as_deref().is_some_and(|display| display.eq_ignore_ascii_case(&name)))
             .map(|(address, _)| address.as_str());
         select_name_mapping(
             finality_required,
@@ -7550,6 +7679,9 @@ impl AppState {
     /// input unchanged if the name is unknown (lookups then miss cleanly).
     pub async fn canonical_key(&self, address_or_name: &str) -> String {
         if !address_or_name.contains('.') {
+            if epix_core::classify_label(address_or_name) == epix_core::LabelClass::Address {
+                return address_or_name.to_ascii_lowercase();
+            }
             return address_or_name.to_string();
         }
         // `<bech32>.epix` is the dotted ALIAS for a bare address: browsers
@@ -7560,10 +7692,12 @@ impl AppState {
         // checksum) is a mistyped or forged address: passed through unchanged,
         // and every resolve path refuses it, so a typo-squatted name can never
         // serve in an address's place.
-        if let Some(label) = address_or_name.strip_suffix(".epix") {
+        if let Some((label, _)) = address_or_name.rsplit_once('.')
+            .filter(|(_, suffix)| suffix.eq_ignore_ascii_case("epix"))
+        {
             if !label.contains('.') {
                 match epix_core::classify_label(label) {
-                    epix_core::LabelClass::Address => return label.to_string(),
+                    epix_core::LabelClass::Address => return label.to_ascii_lowercase(),
                     epix_core::LabelClass::AddressShaped => return address_or_name.to_string(),
                     epix_core::LabelClass::Name => {}
                 }
@@ -7802,9 +7936,32 @@ impl AppState {
     ) -> Result<(), String> {
         let Some(path) = self.xite_removals_path() else { return Ok(());
         };
-        let bytes = serde_json::to_vec_pretty(intents)
-            .map_err(|error| format!("could not encode removal intents: {error}"))?;
-        Self::write_durable_private_file(&path, &bytes)
+        if intents.len() > MAX_XITE_REMOVAL_INTENTS {
+            return Err("removal-intent entry limit exceeded".to_string());
+        }
+        let bytes = crate::deletion_reserve::encode_bounded(intents, MAX_XITE_REMOVAL_INTENT_BYTES as usize)?;
+        if let Some(reserve) = &self.deletion_reserve {
+            reserve.write_journal("xite-removals.json", &bytes)
+                .map_err(|error| format!("could not durably replace {}: {error}", path.display()))?;
+        } else {
+            Self::write_durable_private_file(&path, &bytes)?;
+        }
+        if intents.is_empty() {
+            self.replenish_deletion_reserve();
+        }
+        Ok(())
+    }
+
+    fn replenish_deletion_reserve(&self) {
+        let Some(reserve) = &self.deletion_reserve else { return };
+        // Startup may be recovering a removal. Its journal and Store cleanup
+        // need free space first; a corrupt journal also fails closed here.
+        if !self.read_xite_removal_intents().is_ok_and(|intents| intents.is_empty()) {
+            return;
+        }
+        if let Err(error) = reserve.ensure() {
+            eprintln!("[WARN] Deletion reserve is unavailable: {error}. Deletion may require free device storage.");
+        }
     }
 
     fn xite_registry_bytes(
@@ -7893,6 +8050,7 @@ impl AppState {
         if registry_readable {
             self.persist_xites().await;
         }
+        self.rebuild_merger_dbs().await;
         restored
     }
 
@@ -8029,9 +8187,9 @@ impl AppState {
         }
     }
 
-    /// One boot-time removal: user data, persisted metadata, then the tree -
-    /// each failure leaves the intent journaled and moves on. True = fully
-    /// removed.
+    /// Remove a Store-safe tree before rewriting metadata so its bytes can
+    /// provide recovery space. The durable intent remains until every phase
+    /// succeeds and continues to exclude the canonical throughout recovery.
     async fn finish_one_boot_xite_removal(
         &self,
         canonical: &str,
@@ -8041,22 +8199,6 @@ impl AppState {
             self.log(
                 "ERROR",
                 format!("Refusing invalid xite-removal address {canonical}"),
-            )
-            .await;
-            return false;
-        }
-        if let Err(error) = self.delete_user_xite_data(&intent.keys).await {
-            self.log(
-                "WARN",
-                format!("Pending user cleanup for removed xite {canonical}: {error}"),
-            )
-            .await;
-            return false;
-        }
-        if let Err(error) = self.delete_xite_persisted_metadata(canonical, &intent.keys).await {
-            self.log(
-                "WARN",
-                format!("Pending metadata cleanup for removed xite {canonical}: {error}"),
             )
             .await;
             return false;
@@ -8082,13 +8224,31 @@ impl AppState {
                 self.log("WARN", format!("Pending xite removal: {error}")).await;
             }
         }
-        removed
+        if !removed {
+            return false;
+        }
+        if let Err(error) = self.delete_user_xite_data(&intent.keys).await {
+            self.log(
+                "WARN",
+                format!("Pending user cleanup for removed xite {canonical}: {error}"),
+            )
+            .await;
+            return false;
+        }
+        if let Err(error) = self.delete_xite_persisted_metadata(canonical, &intent.keys).await {
+            self.log(
+                "WARN",
+                format!("Pending metadata cleanup for removed xite {canonical}: {error}"),
+            )
+            .await;
+            return false;
+        }
+        true
     }
 
-    /// Finish removal intents whose tree may still be the canonical backing
-    /// for Store extern objects. Called only under the activation write gate,
-    /// after incoming Store reconciliation has internalized every extern not
-    /// authorized by the current accepted index.
+    /// Finish removal intents whose tree may still back Store objects. The
+    /// activation write gate is held, and the accepted indexes describe the
+    /// remaining verified memberships before ownership is reconciled here.
     async fn finish_store_xite_removals(
         &self,
         store: Arc<epix_blob::store::Store>,
@@ -8118,9 +8278,9 @@ impl AppState {
             return Ok(());
         }
 
-        // Make exclusion durable before any retained root is removed. All
-        // other registry writers take the same mutex, so no stale snapshot can
-        // resurrect one of these canonicals after this point.
+        // Compact the registry while holding its writer lock. The durable
+        // receipts already exclude these canonicals, so a full filesystem
+        // may defer this replacement until safe target bytes are reclaimed.
         let excluded = pending
             .iter()
             .map(|(canonical, _)| canonical.clone())
@@ -8129,7 +8289,7 @@ impl AppState {
             let xites = self.xites.read().await;
             Self::xite_registry_bytes(&xites, &excluded)?
         };
-        self.write_xite_registry_bytes(&registry)?;
+        let registry_persisted = self.write_xite_registry_bytes(&registry).is_ok();
 
         let mut completed = Vec::new();
         let mut failures = Vec::new();
@@ -8145,6 +8305,13 @@ impl AppState {
             }
             let mut current = intent.clone();
             if current.store_cleanup_required {
+                let warnings = self.release_xite_removal_ownership(
+                    &canonical, &current, &store,
+                ).await;
+                if !warnings.is_empty() {
+                    failures.extend(warnings);
+                    continue;
+                }
                 let entries = store.extern_entries().map_err(|error| {
                     format!("could not inspect pending Store cleanup: {error}")
                 })?;
@@ -8208,6 +8375,16 @@ impl AppState {
                     continue;
                 }
             }
+            let mut roots_removed = true;
+            for root in &roots {
+                if let Err(error) = remove_xite_directory_durable(root) {
+                    roots_removed = false;
+                    failures.push(error);
+                }
+            }
+            if !roots_removed {
+                continue;
+            }
             if let Err(error) = self.delete_user_xite_data(&current.keys).await {
                 failures.push(format!("could not persist user cleanup for {canonical}: {error}"));
                 continue;
@@ -8221,20 +8398,19 @@ impl AppState {
                 ));
                 continue;
             }
-            let mut roots_removed = true;
-            for root in &roots {
-                if let Err(error) = remove_xite_directory_durable(root) {
-                    roots_removed = false;
-                    failures.push(error);
-                }
-            }
-            if !roots_removed {
-                continue;
-            }
             completed.push(canonical);
         }
-        for canonical in completed {
-            intents.remove(&canonical);
+        let registry_persisted = registry_persisted || match self.write_xite_registry_bytes(&registry) {
+            Ok(()) => true,
+            Err(error) => {
+                failures.push(format!("could not persist registry cleanup: {error}"));
+                false
+            }
+        };
+        if registry_persisted {
+            for canonical in completed {
+                intents.remove(&canonical);
+            }
         }
         self.write_xite_removal_intents(&intents)?;
         if failures.is_empty() {
@@ -8454,6 +8630,7 @@ impl AppState {
         // dashboard row live, like EpixNet's peers_added.
         if grew {
             self.wake_clone_retry(address);
+            self.request_xite_update(address).await;
             self.push_xite_info(address).await;
         }
     }
@@ -9261,7 +9438,7 @@ impl AppState {
         }
     }
 
-    /// Announce a xite to each tracker in turn, recording per-tracker stats and
+    /// Announce a xite to trackers concurrently, recording per-tracker stats and
     /// folding the peers found into the xite's registry. Returns all peers.
     pub async fn announce_to_trackers(
         &self,
@@ -9337,11 +9514,11 @@ impl AppState {
                 let started = std::time::Instant::now();
                 let result = tokio::time::timeout(
                     std::time::Duration::from_secs(75),
-                    epix_xite::announce(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert,
+                    epix_xite::announce_attempt(sender.as_ref(), &key, std::slice::from_ref(&tracker), &advert,
                     ),
                 )
                 .await
-                .unwrap_or_else(|_| Err("announce timed out".into()));
+                .unwrap_or_else(|_| Err(AttemptError::Failed("announce timed out".into())));
                 (tracker, result, started.elapsed())
             });
         }
@@ -9351,12 +9528,12 @@ impl AppState {
         if seeded {
             self.push_announcer_info(&key).await;
         }
-        let all = self.absorb_announce_results(set, &key).await;
+        let registration = membership.map(|generation| (address, generation));
+        let all = self.absorb_announce_results(set, &key, registration).await;
         let _activation = self.xite_activation_gate.clone().read_owned().await;
         if membership.is_some() && self.xite_membership_generation(address).await != membership {
             return Vec::new();
         }
-        self.add_peers(address, all.clone()).await;
         let skip_note = if skipped > 0 { format!(" ({skipped} backed off)") } else { String::new() };
         self.log("INFO", format!("Announced {address}: {} peers{skip_note}", all.len()),
         ).await;
@@ -9373,19 +9550,36 @@ impl AppState {
         &self,
         mut set: tokio::task::JoinSet<(
             epix_xite::Tracker,
-            Result<Vec<PeerAddr>, String>,
+            Result<Vec<PeerAddr>, AttemptError<String>>,
             std::time::Duration,
         )>,
         xite_key: &str,
+        registration: Option<(&str, u64)>,
     ) -> Vec<PeerAddr> {
         let mut all: Vec<PeerAddr> = Vec::new();
         while let Some(res) = set.join_next().await {
             let Ok((tracker, result, latency)) = res else { continue;
             };
+            let result = match result {
+                Err(AttemptError::Deferred(reason)) => {
+                    self.mark_tracker_deferred(&tracker, reason).await;
+                    continue;
+                }
+                Err(AttemptError::Failed(error)) => Err(error),
+                Ok(peers) => Ok(peers),
+            };
             self.record_tracker(&tracker, &result, latency).await;
             self.record_tracker_backoff(&tracker, xite_key, result.is_ok()).await;
             match result {
                 Ok(peers) => {
+                    // Use a healthy tracker's answer immediately. A stalled
+                    // tracker must not hold these peers until its timeout.
+                    if let Some((address, generation)) = registration {
+                        let _activation = self.xite_activation_gate.clone().read_owned().await;
+                        if self.xite_membership_generation(address).await == Some(generation) {
+                            self.add_peers(address, peers.iter().cloned()).await;
+                        }
+                    }
                     // AnnounceShare: remember a tracker that answered - even
                     // with zero peers; small peer-trackers usually know nobody
                     // for a given xite - so it is reused (and shared) across
@@ -9427,6 +9621,7 @@ impl AppState {
             json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": now })
         });
         let obj = entry.as_object_mut().expect("tracker stat object");
+        obj.remove("deferred_reason");
         let bump = |o: &mut serde_json::Map<String, Value>, k: &str, by: i64| {
             let v = o.get(k).and_then(|v| v.as_i64()).unwrap_or(0) + by;
             o.insert(k.to_string(), json!(v));
@@ -9490,23 +9685,48 @@ impl AppState {
     /// whether a new entry was created.
     async fn mark_tracker_announcing(&self, tracker: &epix_xite::Tracker) -> bool {
         let key = tracker_stat_key(tracker);
-        let now = now_secs();
         let mut stats = self.tracker_stats.write().await;
         if let Some(entry) = stats.get_mut(&key) {
-            // A gated entry whose overlay came back up is being tried now.
-            let gated = entry.get("status").and_then(|s| s.as_str()) == Some("gated");
-            if gated {
+            // A previously skipped tracker is eligible for another attempt.
+            let skipped = matches!(entry.get("status").and_then(|s| s.as_str()), Some("gated" | "deferred"));
+            if skipped {
                 if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("status".into(), json!("announcing"));
+                    let status = if obj.get("num_request").and_then(Value::as_u64).unwrap_or(0) == 0 {
+                        "announcing"
+                    } else if obj.get("num_error").and_then(Value::as_u64).unwrap_or(0) > 0 {
+                        "error"
+                    } else {
+                        "announced"
+                    };
+                    obj.insert("status".into(), json!(status));
                 }
             }
-            return gated;
+            return skipped;
         }
         stats.insert(
             key,
-            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": now }),
+            json!({ "status": "announcing", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": 0 }),
         );
         true
+    }
+
+    /// A pool failure may have come from another xite or a non-tracker call.
+    /// Do not leave its first tracker placeholder announcing forever, but
+    /// never let a late follower overwrite a real outcome or a gated status.
+    async fn mark_tracker_deferred(&self, tracker: &epix_xite::Tracker, reason: DeferredAttempt) {
+        let key = tracker_stat_key(tracker);
+        let mut stats = self.tracker_stats.write().await;
+        let entry = stats.entry(key).or_insert_with(|| {
+            json!({ "status": "deferred", "num_request": 0, "num_success": 0, "num_error": 0, "num_added": 0, "time_request": 0, "time_success": 0, "time_first_request": 0 })
+        });
+        if entry.get("num_request").and_then(Value::as_u64) == Some(0)
+            && matches!(entry.get("status").and_then(Value::as_str), Some("announcing" | "deferred"))
+        {
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert("status".into(), json!("deferred"));
+                obj.insert("deferred_reason".into(), json!(reason.to_string()));
+            }
+        }
     }
 
     /// Mark a tracker skipped because its overlay is down (Tor off for an
@@ -9543,7 +9763,7 @@ impl AppState {
     }
 
     /// Per-tracker announce stats for the dashboard. `announcerStats`.
-    /// Overlay-gated entries (skipped, never tried - Tor/I2P down) are
+    /// Overlay-gated or locally deferred entries (skipped, never tried) are
     /// excluded: the shipped dashboard counts every entry in its ratio
     /// denominator and only "announced" in the numerator, so including
     /// them turns a healthy 4/4 pill into a 4/9 warning over trackers
@@ -9554,13 +9774,13 @@ impl AppState {
                 .read()
                 .await
                 .iter()
-                .filter(|(_, v)| v.get("status").and_then(|s| s.as_str()) != Some("gated"))
+                .filter(|(_, v)| !matches!(v.get("status").and_then(Value::as_str), Some("gated" | "deferred")))
                 .map(|(k, v)| (k.clone(), v.clone()))
                 .collect(),
         )
     }
 
-    /// [`Self::announcer_stats`] including overlay-gated entries, so the
+    /// [`Self::announcer_stats`] including overlay-gated and deferred entries, so the
     /// dashboard's health drawer can list every tracker the node plans to
     /// try once its overlay comes up. Served only to a caller that asks
     /// (`announcerStats {planned: true}`): the shipped dashboard counts
@@ -9887,6 +10107,7 @@ impl AppState {
             // announce loop so onion trackers gated during boot get tried
             // seconds after Tor comes up, not at the next periodic pass.
             self.trackers_changed.notify_one();
+            self.request_all_xite_updates().await;
         }
     }
 
@@ -10252,13 +10473,15 @@ impl AppState {
         };
 
         // A single non-address top-level dir wraps the real content.
-        let tops: std::collections::HashSet<String> = (0..zip.len())
-            .filter_map(|i| {
-                let name = zip.by_index(i).ok()?.name().to_string();
-                Some(name.split('/').next()?.to_string())
-            })
-            .filter(|t| !t.is_empty())
-            .collect();
+        // Decode every name before extracting anything, propagating any
+        // filename errors from the archive reader.
+        let mut tops = std::collections::HashSet::new();
+        for name in zip.file_names() {
+            let name = name.map_err(|e| format!("Invalid bundle file name: {e}"))?;
+            if let Some(top) = name.split('/').next().filter(|top| !top.is_empty()) {
+                tops.insert(top.to_string());
+            }
+        }
         let prefix = match tops.len() {
             1 => {
                 let top = tops.iter().next().unwrap();
@@ -10273,7 +10496,7 @@ impl AppState {
             if entry.is_dir() {
                 continue;
             }
-            let name = entry.name().to_string();
+            let name = entry.name().map_err(|e| format!("Invalid bundle file name: {e}"))?.into_owned();
             let Some(rel) = name.strip_prefix(&prefix) else { continue;
             };
             let Some((address, inner)) = rel.split_once('/') else { continue;
@@ -10898,7 +11121,7 @@ impl AppState {
         let xites = self.xites.read().await;
         xites
             .iter()
-            .find(|(_, x)| x.display.as_deref() == Some(name))
+            .find(|(_, x)| x.display.as_deref().is_some_and(|display| display.eq_ignore_ascii_case(name)))
             .map(|(address, _)| address.clone())
     }
 
@@ -10912,7 +11135,7 @@ impl AppState {
         detail: Option<String>,
     ) {
         let mut statuses = self.resolve_status.write().await;
-        let entry = statuses.entry(host.to_string()).or_insert_with(|| ResolveStatus {
+        let entry = statuses.entry(host.to_ascii_lowercase()).or_insert_with(|| ResolveStatus {
             last_observed: None,
             state: String::new(),
             reason: None,
@@ -10935,7 +11158,7 @@ impl AppState {
     pub async fn resolve_status_resolved(&self, host: &str, address: &str, verified: bool) {
         self.resolve_status_set(host, "resolved", None, None).await;
         let mut statuses = self.resolve_status.write().await;
-        if let Some(entry) = statuses.get_mut(host) {
+        if let Some(entry) = statuses.get_mut(&host.to_ascii_lowercase()) {
             entry.address = Some(address.to_string());
             entry.verified = verified;
         }
@@ -10943,13 +11166,13 @@ impl AppState {
 
     /// One more resolve attempt for `host` (drives "attempt N" on screen).
     pub async fn resolve_status_attempt(&self, host: &str) {
-        if let Some(entry) = self.resolve_status.write().await.get_mut(host) {
+        if let Some(entry) = self.resolve_status.write().await.get_mut(&host.to_ascii_lowercase()) {
             entry.attempts += 1;
         }
     }
 
     pub async fn resolve_status(&self, host: &str) -> Option<ResolveStatus> {
-        self.resolve_status.read().await.get(host).cloned()
+        self.resolve_status.read().await.get(&host.to_ascii_lowercase()).cloned()
     }
 
     /// Hosts whose resolution is parked on something outside the node's
@@ -10990,7 +11213,7 @@ impl AppState {
     pub async fn resolve_status_json(&self, host: &str) -> Value {
         let status = {
             let mut statuses = self.resolve_status.write().await;
-            statuses.get_mut(host).map(|status| {
+            statuses.get_mut(&host.to_ascii_lowercase()).map(|status| {
                 status.last_observed = Some(std::time::Instant::now());
                 status.clone()
             })
@@ -11023,6 +11246,7 @@ impl AppState {
     pub async fn network_changed(self: &Arc<Self>) {
         epix_chain::wake_light_client();
         self.trackers_changed.notify_one();
+        self.request_all_xite_updates().await;
         if let Some(hook) = self.on_demand.read().await.clone() {
             hook.network_changed();
         }
@@ -11353,6 +11577,7 @@ impl AppState {
         let merged_source = content.get("merged_type").and_then(Value::as_str).is_some();
         let digest = epix_blob::ObjId::of(bytes);
         if transaction.lease.canonical != canonical
+            || transaction.lease.storage_root != storage.root()
             || transaction.lease.governing != "content.json"
             || transaction.lease.modified != modified
             || transaction.lease.digest != digest
@@ -11425,7 +11650,6 @@ impl AppState {
                 return false;
             }
         };
-        let accepted_db_paths = &accepted_db_snapshot.paths;
         let previous_archive_contents = self
             .verified_manifest_contents
             .read()
@@ -11438,24 +11662,96 @@ impl AppState {
             .iter()
             .map(|manifest| (manifest.inner_path.clone(), manifest.content.clone()))
             .collect::<HashMap<_, _>>();
-        let (archive_targets, archive_prune_dirs) = match Self::accepted_archive_plan(
-            storage,
-            "content.json",
-            &content,
-            &previous_archive_contents,
-            &protected_archive_contents,
-        ) {
-            Ok(plan) => plan,
+        let database_rows = {
+            let xites = self.xites.read().await;
+            xites
+                .iter()
+                .filter(|(key, xite)| {
+                    xite.storage.root() == storage.root()
+                        && (keys.contains(key)
+                            || canonical_address(xite.content.as_ref(), key) == canonical)
+                })
+                .map(|(key, xite)| {
+                    (
+                        key.clone(),
+                        xite.membership_generation,
+                        canonical_address(xite.content.as_ref(), key),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        #[cfg(test)]
+        {
+            let pause = ROOT_COMMIT_PREFLIGHT_PAUSES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(storage.root())
+                .cloned();
+            if let Some((entered, release)) = pause {
+                entered.notify_one();
+                let _ = release.acquire().await;
+            }
+        }
+        // Full-file verification and private database construction must not
+        // exclude readers of unrelated xites or occupy an async worker. The
+        // worker owns the tree guard and transaction authority until it stops,
+        // even if the task awaiting it is cancelled.
+        let worker_transaction = ManifestTransaction { lease: transaction.lease.clone() };
+        let worker_content = content.clone();
+        let worker_bytes = bytes.to_vec();
+        let prepared = tokio::task::spawn_blocking(move || {
+            let result = (|| -> Result<_, String> {
+                let prepared = commit_xite
+                    .prepare_root_archive_update(&worker_bytes, size_limit)
+                    .map_err(|error| format!("preparing content.json failed: {error}"))?;
+                commit_xite.content = Some(worker_content.clone());
+                if !Self::files_needed_for_transaction(&commit_xite, &worker_transaction).is_empty() {
+                    return Err("root candidate lost a required file before commit".into());
+                }
+                let (archive_targets, archive_prune_dirs) = Self::accepted_archive_plan(
+                    &commit_xite.storage,
+                    "content.json",
+                    &worker_content,
+                    &previous_archive_contents,
+                    &protected_archive_contents,
+                )?;
+                let databases = database_rows
+                    .into_iter()
+                    .map(|(key, generation, canonical)| {
+                        // Keep a separate private pool for each served alias,
+                        // matching the previous per-row construction.
+                        let built = build_xite_db(
+                            &commit_xite.storage,
+                            &muted,
+                            &accepted_db_snapshot.paths,
+                            Some(&accepted_db_snapshot.values),
+                        );
+                        (key, (generation, canonical, built))
+                    })
+                    .collect::<HashMap<_, _>>();
+                Ok((commit_xite, prepared, archive_targets, archive_prune_dirs, databases))
+            })();
+            (tree, result)
+        })
+        .await;
+        let (tree, prepared) = match prepared {
+            Ok(prepared) => prepared,
             Err(error) => {
-                drop(tree);
-                self.log(
-                    "ERROR",
-                    format!("Could not build accepted archive plan for {canonical}: {error}"),
-                )
-                .await;
+                self.log("ERROR", format!("Root preflight worker failed for {canonical}: {error}"))
+                    .await;
                 return false;
             }
         };
+        let (mut commit_xite, prepared, archive_targets, archive_prune_dirs, mut databases) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    drop(tree);
+                    self.log("ERROR", format!("Root preflight failed for {canonical}: {error}"))
+                        .await;
+                    return false;
+                }
+            };
         // Every await that can cancel the caller is complete before the first
         // governing-manifest write. From here through the disk commit, index
         // swap, pending-version update, and in-memory root adoption is one
@@ -11475,14 +11771,24 @@ impl AppState {
                 if self.pending_root_blocks(canonical, modified, digest) {
                     return Err(format!("root candidate was superseded: {canonical}@{modified}"));
                 }
-                let prepared = commit_xite
-                    .prepare_root_archive_update(bytes, size_limit)
-                    .map_err(|error| {
-                        format!("preparing content.json for {canonical} failed: {error}")
-                    })?;
-                commit_xite.content = Some(content.clone());
-                if !Self::files_needed_for_transaction(&commit_xite, transaction).is_empty() {
-                    return Err("root candidate lost a required file before commit".into());
+                let matching_rows = xites
+                    .iter()
+                    .filter(|(key, xite)| {
+                        xite.storage.root() == storage.root()
+                            && (keys.contains(key)
+                                || canonical_address(xite.content.as_ref(), key) == canonical)
+                    })
+                    .count();
+                if matching_rows != databases.len()
+                    || databases.iter().any(|(key, (generation, bound_canonical, _))| {
+                        xites.get(key).is_none_or(|xite| {
+                            xite.storage.root() != storage.root()
+                                || xite.membership_generation != *generation
+                                || canonical_address(xite.content.as_ref(), key) != *bound_canonical
+                        })
+                    })
+                {
+                    return Err("root candidate membership changed during preflight".into());
                 }
                 if transaction.lease.stages_files() {
                     let governing_path = storage
@@ -11577,12 +11883,8 @@ impl AppState {
                     author_optout = true;
                 }
                 xite.content = Some(content.clone());
-                let (db, schema) = match build_xite_db(
-                    &xite.storage,
-                    &muted,
-                    accepted_db_paths,
-                    Some(&accepted_db_snapshot.values),
-                ) {
+                let (_, _, built) = databases.remove(key).expect("preflight membership checked");
+                let (db, schema) = match built {
                     Some((db, schema)) => (Some(db), Some(schema)),
                     None => (None, None),
                 };
@@ -13258,8 +13560,19 @@ impl AppState {
     /// verify it and download the changed files (updating live worker stats).
     /// Returns true if an update was applied. This is the node's re-sync step.
     pub async fn resync_xite(self: &Arc<Self>, address: &str) -> Result<bool, String> {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return Ok(false);
+        };
+        self.resync_xite_for_registration(address, generation).await
+    }
+
+    /// An automatic request must still belong to the registration that queued
+    /// it when a peer's answer is ready to enter the manifest transaction.
+    pub async fn resync_xite_for_registration(
+        self: &Arc<Self>, address: &str, generation: u64,
+    ) -> Result<bool, String> {
         // A paused xite (sitePause) is not re-synced until resumed.
-        if !self.is_serving(address).await {
+        if !self.xite_update_is_current(address, generation).await {
             return Ok(false);
         }
         // Nudge the optional retry loop: a resync may have brought a new
@@ -13341,7 +13654,7 @@ impl AppState {
                 continue;
             }
             return self
-                .resync_apply_newer(address, &canonical, &view.storage, bytes, peers.clone())
+                .resync_apply_newer(address, generation, &canonical, &view.storage, bytes, peers.clone())
                 .await;
         }
         if !answered {
@@ -13436,6 +13749,7 @@ impl AppState {
     async fn resync_apply_newer(
         self: &Arc<Self>,
         address: &str,
+        generation: u64,
         canonical: &str,
         storage: &XiteStorage,
         bytes: Vec<u8>,
@@ -13452,6 +13766,11 @@ impl AppState {
         let update_guard = self
             .acquire_manifest_guard(canonical, "content.json")
             .await?;
+        // The peer request can outlive removal and re-add at the same path.
+        // The activation guard now excludes replacement through the commit.
+        if !self.xite_update_is_current(address, generation).await {
+            return Ok(false);
+        }
         // The candidate was selected before waiting for the transaction. Read
         // the authoritative version again after acquiring it and discard a
         // candidate that another path made stale while this resync waited.
@@ -13777,7 +14096,9 @@ impl AppState {
     /// during the probe's flight stays claimed by whoever holds it).
     pub async fn note_probe_outcome(&self, addr: &PeerAddr, ok: bool) {
         let now = now_secs();
-        for x in self.xites.write().await.values_mut() {
+        let mut revived = Vec::new();
+        let mut xites = self.xites.write().await;
+        for (address, x) in xites.iter_mut() {
             let Some(p) = x.peers.get_mut(addr) else { continue;
             };
             if p.connection_errors == 0 {
@@ -13785,9 +14106,16 @@ impl AppState {
             }
             if ok {
                 p.note_probe_ok(now);
+                if x.settings.serving {
+                    revived.push(address.clone());
+                }
             } else if !p.connected {
                 p.note_probe_fail(now);
             }
+        }
+        drop(xites);
+        for address in revived {
+            self.request_xite_update(&address).await;
         }
     }
 
@@ -13907,7 +14235,7 @@ impl AppState {
         if xite.db_verified_epoch != verified_epoch
             || xite.db_source_epoch != source_epoch
             || xite.db_filter_epoch != filter_epoch
-            || merger && xite.db_merger_epoch != self.db_merger_epoch()
+            || merger && (xite.db_merger_epoch != self.db_merger_epoch() || self.boot_restore_pending())
         {
             return None;
         }
@@ -13987,7 +14315,13 @@ impl AppState {
                 }
             };
             if exists {
-                self.rebuild_xite_db(address).await;
+                let merger = self.xites.read().await.get(address)
+                    .and_then(|xite| xite.db_schema.as_ref()).is_some_and(|schema| schema.version == 3);
+                if merger {
+                    self.rebuild_merger_dbs().await;
+                } else {
+                    self.rebuild_xite_db(address).await;
+                }
                 return self.current_receipt_for(address).await;
             }
             if declared == Some(false) || std::time::Instant::now() >= deadline {
@@ -14049,12 +14383,12 @@ impl AppState {
         &self,
         address: &str,
         result: Result<Vec<Value>, String>,
-        retry_until: std::time::Instant,
+        retry_until: tokio::time::Instant,
     ) -> Option<Result<Vec<Value>, String>> {
         match result {
             Ok(rows) => Some(Ok(rows)),
             Err(error)
-                if std::time::Instant::now() < retry_until
+                if tokio::time::Instant::now() < retry_until
                     && Self::is_transient_db_error(&error) =>
             {
                 // A missing table/column heals only while a clone or rebuild
@@ -14089,25 +14423,12 @@ impl AppState {
         }
     }
 
-    /// The retry budget ran out while the database kept changing: serve the
-    /// last consistent read if one landed (a slightly-stale snapshot beats
-    /// an error that kills the page - apps iterate the rows they expect),
-    /// else give up.
+    /// A successful SQL read is usable only when its receipt still matches.
+    /// Exhausting retries must not expose rows from a retired authority.
     async fn db_query_budget_exhausted(
         &self,
         address: &str,
-        last_ok: Option<Vec<Value>>,
     ) -> Result<Vec<Value>, String> {
-        if let Some(rows) = last_ok {
-            self.log(
-                "INFO",
-                format!(
-                    "dbQuery for {address}: database kept changing past the budget, serving the last consistent read"
-                ),
-            )
-            .await;
-            return Ok(rows);
-        }
         self.log(
             "INFO",
             format!("dbQuery gave up for {address}: authority changed past the deadline"),
@@ -14127,7 +14448,7 @@ impl AppState {
         if receipt.is_none() {
             receipt = self.lazy_build_db_receipt(address).await;
         }
-        let mut receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
+        let receipt = receipt.ok_or_else(|| "xite has no current database".to_string())?;
         #[cfg(test)]
         let pause = self.db_query_after_receipt_pause
             .lock()
@@ -14138,6 +14459,18 @@ impl AppState {
             started.notify_one();
             let _permit = release.acquire().await;
         }
+        let retry_until = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        self.db_query_with_receipt(address, query, params, receipt, retry_until).await
+    }
+
+    async fn db_query_with_receipt(
+        &self,
+        address: &str,
+        query: &str,
+        params: &Value,
+        mut receipt: DbQueryReceipt,
+        retry_until: tokio::time::Instant,
+    ) -> Result<Vec<Value>, String> {
         // `query` is page-supplied (the `dbQuery` WS command passes it verbatim),
         // so run it read-only: the authorizer refuses writes, DDL, and ATTACH.
         // dbQuery is not admin- or owner-gated, so on the public gateway this is
@@ -14150,14 +14483,12 @@ impl AppState {
         // bumps the generation, so a booting page's first query almost always
         // crossed a bump, and apps iterate the expected rows and died on the
         // error object (the frozen loading overlay).
-        let retry_until = std::time::Instant::now() + std::time::Duration::from_secs(60);
-        let mut last_ok: Option<Vec<Value>> = None;
         loop {
             let result = receipt.db.query_untrusted(query, params).map_err(|e| e.to_string());
             let after = self
                 .recheck_db_query_receipt(address, &receipt.canonical)
                 .await;
-            let within_budget = std::time::Instant::now() < retry_until;
+            let within_budget = tokio::time::Instant::now() < retry_until;
             match after {
                 Some(after) if Self::same_db_query_receipt(&receipt, &after) => {
                     if let Some(done) = self
@@ -14168,13 +14499,8 @@ impl AppState {
                     }
                 }
                 Some(after) if within_budget => {
-                    // Keep the freshest successful read: if the database
-                    // never sits still inside the budget, a consistent
-                    // slightly-stale snapshot beats an error that kills the
-                    // page (apps iterate the rows they expect).
-                    if let Ok(rows) = result {
-                        last_ok = Some(rows);
-                    }
+                    // The old result may include revoked or newly filtered
+                    // rows. Retry using the new receipt without retaining it.
                     receipt = after;
                     tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 }
@@ -14187,7 +14513,7 @@ impl AppState {
                         receipt = fresh;
                     }
                 }
-                _ => return self.db_query_budget_exhausted(address, last_ok).await,
+                _ => return self.db_query_budget_exhausted(address).await,
             }
         }
     }
@@ -19006,248 +19332,6 @@ impl AppState {
         Ok(Value::Object(ret))
     }
 
-    /// Fill every merger xite's version-3 database from its merged xites: for
-    /// each merger, populate its db from each served xite whose `merged_type`
-    /// the merger accepts, tagging rows with the merged xite's address. Call
-    /// after the merged xites are served (or when they change).
-    pub async fn rebuild_merger_dbs(&self) {
-        loop {
-            let filter_epoch = self.db_filter_epoch();
-            let merger_epoch = self.db_merger_epoch();
-            let muted = self.muted_authors().await;
-            if self.db_filter_epoch() != filter_epoch
-                || self.db_merger_epoch() != merger_epoch
-            {
-                continue;
-            }
-            let registry = {
-                let xites = self.xites.read().await;
-                xites
-                    .iter()
-                    .map(|(key, xite)| {
-                        (
-                            key.clone(),
-                            canonical_address(xite.content.as_ref(), key),
-                            xite.storage.clone(),
-                            xite.content.clone(),
-                            xite.db_schema.clone(),
-                            xite
-                                .settings
-                                .permissions
-                                .iter()
-                                .filter_map(|permission| {
-                                    permission.strip_prefix("Merger:").map(String::from)
-                                })
-                                .collect::<Vec<_>>(),
-                        )
-                    })
-                    .collect::<Vec<_>>()
-            };
-            let mut sources_by_canonical:
-                std::collections::BTreeMap<String, MergerDbSourceSnapshot> =
-                std::collections::BTreeMap::new();
-            let mut targets = Vec::new();
-            let mut snapshot_changed = false;
-            for (key, canonical, storage, content, current_schema, accepted_types) in registry {
-                let before = self.verified_index_epoch(&canonical);
-                let source_before = self.db_source_epoch(&canonical);
-                let authority = self
-                    .accepted_db_authority_for_root_locked(&canonical, content.as_ref())
-                    .ok();
-                let accepted_snapshot = match &authority {
-                    Some(authority) => Self::db_snapshot_from_authority(
-                        &canonical,
-                        &storage,
-                        authority,
-                    )
-                    .await
-                    .ok(),
-                    None => None,
-                };
-                if self.verified_index_epoch(&canonical) != before
-                    || self.db_source_epoch(&canonical) != source_before
-                {
-                    snapshot_changed = true;
-                    break;
-                }
-                let root = authority.as_ref().and_then(|authority| {
-                    authority
-                        .manifests
-                        .iter()
-                        .find(|manifest| manifest.inner_path == "content.json")
-                        .map(|manifest| &manifest.content)
-                });
-                if let Some(merged_type) = root
-                    .and_then(|content| content.get("merged_type"))
-                    .and_then(Value::as_str)
-                {
-                    if let Some(accepted_snapshot) = &accepted_snapshot {
-                        let source = MergerDbSourceSnapshot {
-                            canonical: canonical.clone(),
-                            storage: storage.clone(),
-                            merged_type: merged_type.to_string(),
-                            accepted_values: accepted_snapshot.values.clone(),
-                            verified_epoch: before,
-                            source_epoch: source_before,
-                        };
-                        match sources_by_canonical.get(&canonical) {
-                            Some(existing)
-                                if existing.storage.root() != source.storage.root() =>
-                            {
-                                snapshot_changed = true;
-                                break;
-                            }
-                            Some(_) => {}
-                            None => {
-                                sources_by_canonical.insert(canonical.clone(), source);
-                            }
-                        }
-                    }
-                }
-                if current_schema.as_ref().is_some_and(|schema| schema.version == 3) {
-                    let accepted_schema = accepted_snapshot.as_ref().and_then(|snapshot| {
-                        build_xite_db(
-                            &storage,
-                            &[],
-                            &snapshot.paths,
-                            Some(&snapshot.values),
-                        )
-                        .map(|(_, schema)| schema)
-                        .filter(|schema| schema.version == 3)
-                    });
-                    // A target whose current accepted inputs cannot be rebuilt
-                    // must not retain an old aggregate. Reuse only its already
-                    // installed schema to prepare a fresh empty handle. This is
-                    // fail closed and lets a later successful rebuild refill it.
-                    let populate_sources = accepted_schema.is_some();
-                    if let Some(schema) = accepted_schema.or(current_schema) {
-                        targets.push(MergerDbTargetSnapshot {
-                            key,
-                            canonical,
-                            storage,
-                            schema,
-                            accepted_types,
-                            verified_epoch: before,
-                            source_epoch: source_before,
-                            populate_sources,
-                        });
-                    }
-                }
-            }
-            if snapshot_changed {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            let sources = sources_by_canonical.into_values().collect::<Vec<_>>();
-            let mut prepared = Vec::with_capacity(targets.len());
-            for target in targets {
-                let db = Database::open_in_memory().ok().and_then(|db| {
-                    db.apply_schema(&target.schema).ok()?;
-                    if target.populate_sources {
-                        sources
-                            .iter()
-                            .filter(|source| target.accepted_types.contains(&source.merged_type))
-                            .try_for_each(|source| {
-                                db.populate_xite_values_filtered(
-                                    &target.schema,
-                                    &source.canonical,
-                                    &source.accepted_values,
-                                    &muted,
-                                )
-                                .map(|_| ())
-                            })
-                            .ok()?;
-                    }
-                    Some(db)
-                });
-                prepared.push(PreparedMergerDb { target, db });
-            }
-            #[cfg(test)]
-            let pause = {
-                self.merger_db_before_install_pause
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner)
-                    .clone()
-            };
-            #[cfg(test)]
-            if let Some((started, release)) = pause {
-                started.notify_one();
-                let _permit = release.acquire().await;
-            }
-            let mut canonicals = sources
-                .iter()
-                .map(|source| source.canonical.clone())
-                .chain(prepared.iter().map(|build| build.target.canonical.clone()))
-                .collect::<Vec<_>>();
-            canonicals.sort();
-            canonicals.dedup();
-            let mut tree_guards = Vec::with_capacity(canonicals.len());
-            let mut contended = false;
-            for canonical in &canonicals {
-                match self.tree_mutation_lock(canonical).try_lock_owned() {
-                    Ok(guard) => tree_guards.push(guard),
-                    Err(_) => {
-                        contended = true;
-                        break;
-                    }
-                }
-            }
-            if contended {
-                drop(tree_guards);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            let mut xites = self.xites.write().await;
-            let sources_current = self.db_filter_epoch() == filter_epoch
-                && self.db_merger_epoch() == merger_epoch
-                && sources.iter().all(|source| {
-                    self.verified_index_epoch(&source.canonical) == source.verified_epoch
-                    && self.db_source_epoch(&source.canonical) == source.source_epoch
-                    && xites.values().any(|xite| {
-                        xite.storage.root() == source.storage.root()
-                            && canonical_address(xite.content.as_ref(), &source.canonical)
-                                == source.canonical
-                    })
-                });
-            let targets_current = prepared.iter().all(|build| {
-                let target = &build.target;
-                self.verified_index_epoch(&target.canonical) == target.verified_epoch
-                    && self.db_source_epoch(&target.canonical) == target.source_epoch
-                    && xites.get(&target.key).is_some_and(|xite| {
-                        xite.storage.root() == target.storage.root()
-                            && canonical_address(xite.content.as_ref(), &target.key)
-                                == target.canonical
-                            && xite
-                                .settings
-                                .permissions
-                                .iter()
-                                .filter_map(|permission| {
-                                    permission.strip_prefix("Merger:").map(String::from)
-                                })
-                                .collect::<Vec<_>>()
-                                == target.accepted_types
-                    })
-            });
-            if !sources_current || !targets_current {
-                drop(xites);
-                drop(tree_guards);
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-                continue;
-            }
-            for build in prepared {
-                let Some(xite) = xites.get_mut(&build.target.key) else { continue };
-                xite.db = build.db;
-                xite.db_schema = Some(build.target.schema);
-                xite.db_verified_epoch = build.target.verified_epoch;
-                xite.db_source_epoch = build.target.source_epoch;
-                xite.db_merger_epoch = merger_epoch;
-                xite.db_generation = self.next_db_generation();
-                xite.db_filter_epoch = filter_epoch;
-            }
-            return;
-        }
-    }
-
     /// The merged xite + inner path for a `merged-<type>/<address>/<path>` path,
     /// if it is one (else `None`).
     pub fn split_merged_path(inner_path: &str) -> Option<(String, String)> {
@@ -19324,6 +19408,7 @@ impl AppState {
     pub async fn set_rns_transport(&self, transport: Arc<dyn Transport>) {
         *self.rns_transport.write().await = Some(transport);
         self.recompose_transport().await;
+        self.request_all_xite_updates().await;
     }
 
     /// Rebuild the composed transport from the base + the overlay layers.
@@ -19367,7 +19452,10 @@ impl AppState {
             // Same rule as set_tor_status: an I2P reachability move regates
             // i2p trackers, so the announce loop should run early.
             self.trackers_changed.notify_one();
-            if ready { self.wake_waiting_clone_retries(); }
+            if ready {
+                self.wake_waiting_clone_retries();
+                self.request_all_xite_updates().await;
+            }
         }
     }
 
@@ -19865,10 +19953,29 @@ impl AppState {
             tally.xites = tally.xites.saturating_add(1);
             verified.push((candidate.canonical.clone(), index));
         }
+        // Retained removal roots are deliberately absent from the serving
+        // registry. Their authenticated Extern rows may still be the only
+        // backing for another owner. Preserve them through reconciliation;
+        // removal will release obsolete owners before copying survivors.
+        let mut removal_roots = Vec::new();
+        for (canonical, intent) in self.read_xite_removal_intents()? {
+            if !intent.store_cleanup_required
+                || !self.removal_intent_matches_store(&intent, &store)
+                || self.has_any_alias(&canonical).await
+            {
+                continue;
+            }
+            let roots = self.validated_removal_roots(&canonical, &intent)?;
+            if self.removal_root_is_reused(&canonical, &roots).await {
+                return Err(format!("pending removal {canonical} shares a storage root with a served xite"));
+            }
+            removal_roots.extend(roots);
+        }
         let (registered, skipped) = Self::reconcile_and_register_verified_store(
             store.clone(),
             authorized,
             registrations,
+            removal_roots,
         )
         .await?;
         tally.registered = registered;
@@ -19891,18 +19998,17 @@ impl AppState {
                 ));
             }
         }
-        // A pending removal may still need this incoming Store to preserve
-        // the last valid Extern copy. Do that before changing the accepted
-        // indexes or releasing ownership in the Store that remains exposed
-        // when activation returns an error.
-        if let Err(error) = self.finish_store_xite_removals(store.clone()).await {
+        // Cleanup must use the freshly verified declarations for owner
+        // reconciliation and rehoming. The activation gate still excludes
+        // mutation, and no Store is exposed until every phase succeeds.
+        {
             let _ownership = self.manifest_ownership_lock.lock().unwrap();
-            let _ = self.transition_manifest_object_owners(
-                &store,
-                &std::collections::HashSet::new(),
-            );
-            return Err(error);
+            self.install_verified_store_indexes(verified);
         }
+        // Keep incoming ownership on failure. An earlier receipt may already
+        // have removed its root after preserving another xite's only bytes;
+        // clearing all claims here would destroy that surviving copy.
+        self.finish_store_xite_removals(store.clone()).await?;
         let mut previous_release_warnings = Vec::new();
         {
             let _ownership = self.manifest_ownership_lock.lock().unwrap();
@@ -19917,7 +20023,18 @@ impl AppState {
                     }
                 }
             }
-            self.install_verified_store_indexes(verified);
+        }
+        // Test cancellation at the exact boundary: reconciliation is done,
+        // but the owned activation writer must still prevent exposure.
+        #[cfg(test)]
+        let pause = self.store_before_exposure_pause
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        #[cfg(test)]
+        if let Some((entered, release)) = pause {
+            entered.notify_one();
+            let _permit = release.acquire().await;
         }
         *self.edx_store.write().await = Some(store);
         self.store_mutation_blocked.store(false, Ordering::Release);
@@ -19941,6 +20058,8 @@ impl AppState {
     /// Install the EDX verified-streaming fetcher (set by the node).
     pub async fn set_edx_fetcher(&self, fetcher: Arc<dyn EdxFetcher>) {
         *self.edx_fetcher.write().await = Some(fetcher);
+        self.request_all_xite_updates().await;
+        self.trackers_changed.notify_one();
     }
 
     /// Install the warm pool's link opener (set by the node).
@@ -20500,16 +20619,14 @@ impl AppState {
             manifest_permit.destination(&storage, inner_path);
         let path = destination.path(&destination_inner).map_err(|e| e.to_string())?;
         let now = now_secs().max(0) as u64;
-        let db_source_epochs = self.db_source_epochs.clone();
+        let state = self.owned_state();
         // Blocking: a cross-device materialize copies the whole file.
         tokio::task::spawn_blocking(move || {
             let _manifest_permit = manifest_permit;
             let result = store.materialize(id, &path, now);
             if result.is_ok() && !staged {
                 store.claim_manifest(id)?;
-                let mut epochs = db_source_epochs.lock().unwrap();
-                let epoch = epochs.entry(canonical).or_default();
-                *epoch = epoch.saturating_add(1);
+                state.bump_db_source_epoch(&canonical);
             }
             result
         })
@@ -20651,6 +20768,7 @@ impl AppState {
         store: Arc<epix_blob::store::Store>,
         authorized: std::collections::HashSet<(epix_blob::ObjId, PathBuf)>,
         registrations: Vec<(Address, XiteStorage, Vec<VerifiedManifestUnit>)>,
+        removal_roots: Vec<PathBuf>,
     ) -> Result<(usize, usize), String> {
         tokio::task::spawn_blocking(move || -> Result<(usize, usize), String> {
             let entries = store.extern_entries().map_err(|error| error.to_string())?;
@@ -20660,7 +20778,9 @@ impl AppState {
                     .map_err(|error| format!("could not reconcile extern {}: {error}", entry.id))?;
             }
             for entry in store.extern_entries().map_err(|error| error.to_string())? {
-                if !authorized.contains(&(entry.id, entry.path.clone())) {
+                if !authorized.contains(&(entry.id, entry.path.clone()))
+                    && !Self::removal_entry_is_under_roots(&entry.path, &removal_roots)
+                {
                     store
                         .retire_extern_mapping_at(entry.id, &entry.path)
                         .map_err(|error| {
@@ -21257,9 +21377,25 @@ impl AppState {
     /// Sync a xite's included / per-user content via the installed
     /// [`ContentSyncer`]; rebuilds the db when anything new arrived.
     pub async fn sync_user_content(&self, address: &str) -> u64 {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return 0;
+        };
+        self.sync_user_content_for_registration(address, generation).await
+    }
+
+    /// Keep the hook and its completion notifications attached to the caller's
+    /// registration. Already-admitted child writes retain their own signed
+    /// manifest authority; this boundary check does not cancel those writes.
+    pub async fn sync_user_content_for_registration(&self, address: &str, generation: u64) -> u64 {
         let hook = self.content_syncer.read().await.clone();
         let Some(hook) = hook else { return 0 };
+        if !self.xite_update_is_current(address, generation).await {
+            return 0;
+        }
         let (bytes, files) = hook.sync_user_content(address).await;
+        if !self.xite_update_is_current(address, generation).await {
+            return 0;
+        }
         if bytes > 0 {
             self.rebuild_xite_db(address).await;
             // A merged xite's fresh rows must reach its merger's db too (its
@@ -21334,16 +21470,25 @@ impl AppState {
         let accepted_authority = self
             .accepted_db_authority_for_root_locked(&canonical, content.as_ref())
             .ok();
+        let governing_file = inner_path.ends_with("content.json") || inner_path == "dbschema.json";
         let accepted_snapshot = match &accepted_authority {
-            Some(authority) => Self::db_snapshot_from_authority(
-                &canonical,
-                &storage,
-                authority,
+            Some(authority) => Self::db_snapshot_from_authority_selected(
+                &canonical, &storage, authority, None,
+                if governing_file { None } else { Some(inner_path) },
             )
             .await
             .ok(),
             None => None,
         };
+        if accepted_authority.is_some() && accepted_snapshot.is_none() {
+            // A failed accepted-input check also invalidates any cached merger
+            // projection. It must not keep a formerly accepted row current.
+            self.bump_db_source_epoch(&canonical);
+            drop(tree);
+            drop(_activation);
+            self.rebuild_merger_dbs().await;
+            return;
+        }
         let accepted_paths = accepted_snapshot
             .as_ref()
             .map(|snapshot| snapshot.paths.clone())
@@ -21357,12 +21502,12 @@ impl AppState {
         // must reach rebuild_xite_db and the event tail (bump_modified,
         // file_done, pool-rule/RLN-roster refresh) even on a xite with no
         // accepted authority yet - those read the already-adopted content.
-        let governing_file =
-            inner_path.ends_with("content.json") || inner_path == "dbschema.json";
         if !governing_file && !accepted_paths.iter().any(|path| path == inner_path) {
             return;
         }
+        let previous_merger_epoch = self.db_merger_epoch();
         let source_epoch = self.bump_db_source_epoch(&canonical);
+        let merger_epoch = self.db_merger_epoch();
         let accepted_root = accepted_authority.as_ref().and_then(|authority| {
             authority
                 .manifests
@@ -21439,6 +21584,19 @@ impl AppState {
             current.db_generation = self.next_db_generation();
             current.db_filter_epoch = filter_epoch;
         }
+        let delta = if merged && !governing_changed {
+            accepted_authority.as_ref().zip(accepted_snapshot.as_ref()).and_then(|(authority, snapshot)| {
+                let (_, value) = snapshot.values.iter().find(|(path, _)| path == inner_path)?;
+                Some(merger_index::VerifiedInputDelta {
+                    canonical: canonical.clone(), storage: storage.clone(), content: content.clone(),
+                    verified_epoch: self.verified_index_epoch(&canonical), source_epoch,
+                    previous_merger_epoch, merger_epoch, filter_epoch,
+                    path: inner_path.to_string(), value: value.clone(),
+                    authority: Self::merger_authority_digest(authority).ok()?,
+                    merged_type: accepted_root.as_ref()?.get("merged_type")?.as_str()?.to_string(),
+                })
+            })
+        } else { None };
         drop(tree);
         drop(_activation);
         // A failed rebuild (an unverified or unowned local xite has no db
@@ -21447,8 +21605,12 @@ impl AppState {
         // already-ADOPTED content and are independent of the database.
         // Only the merger propagation depends on a fresh db.
         let db_rebuilt = !governing_changed || self.rebuild_xite_db(address).await;
-        if db_rebuilt && merged {
-            self.rebuild_merger_dbs().await;
+        if db_rebuilt && merged && !governing_changed {
+            let incremental = match delta {
+                Some(delta) => self.update_merger_input(delta).await,
+                None => false,
+            };
+            if !incremental { self.rebuild_merger_dbs().await; }
         }
         let _activation = self.xite_activation_gate.clone().read_owned().await;
         let event_tree = self.tree_mutation_lock(&canonical).lock_owned().await;
@@ -22320,17 +22482,32 @@ impl AppState {
         authority: &VerifiedDbAuthority,
         staged: Option<&ManifestTransaction>,
     ) -> Result<AcceptedDbSnapshot, String> {
+        Self::db_snapshot_from_authority_selected(canonical, storage, authority, staged, None).await
+    }
+
+    async fn db_snapshot_from_authority_selected(
+        canonical: &str,
+        storage: &XiteStorage,
+        authority: &VerifiedDbAuthority,
+        staged: Option<&ManifestTransaction>,
+        selected: Option<&str>,
+    ) -> Result<AcceptedDbSnapshot, String> {
         let manifests = &authority.manifests;
         let paths = Self::db_paths_from_manifests(manifests)?;
         let mut values = std::collections::BTreeMap::new();
         for manifest in manifests {
-            values.insert(manifest.inner_path.clone(), manifest.content.clone());
+            if selected.is_none_or(|path| path == manifest.inner_path) {
+                values.insert(manifest.inner_path.clone(), manifest.content.clone());
+            }
         }
         let contents = manifests
             .iter()
             .map(|manifest| (manifest.inner_path.clone(), manifest.content.clone()))
             .collect::<HashMap<_, _>>();
-        let inputs = Self::collect_db_inputs(authority)?;
+        let mut inputs = Self::collect_db_inputs(authority)?;
+        if let Some(selected) = selected {
+            inputs.retain(|path, _| path == selected);
+        }
         let names = Self::merge_input_xid_names(&inputs, &contents)?;
         #[cfg(test)]
         {
@@ -22344,33 +22521,32 @@ impl AppState {
         }
         let xid_map = Self::resolve_xid_names_checked(names).await?;
         let now = epix_core::now_ms();
-        for (full, input) in inputs {
-            let staged_source = Self::staged_db_input_source(staged, &full);
-            if staged_source.is_none() && !storage.exists(&full) {
-                continue;
+        let staged_sources = inputs.keys().filter_map(|full| {
+            Self::staged_db_input_source(staged, full).map(|source| (full.clone(), source))
+        }).collect::<HashMap<_, _>>();
+        let canonical = canonical.to_string();
+        let storage = storage.clone();
+        tokio::task::spawn_blocking(move || {
+            for (full, input) in inputs {
+                let staged_source = staged_sources.get(&full);
+                if staged_source.is_none() && !storage.exists(&full) {
+                    continue;
+                }
+                let (read_storage, read_path) = match staged_source {
+                    Some((stage, inner)) => (stage, inner.as_str()),
+                    None => (&storage, full.as_str()),
+                };
+                let source = DbInputSource { storage: read_storage, path: read_path, full: &full };
+                let value = match input {
+                    AcceptedDbInput::Merged(declaration) => Self::merged_db_value(
+                        &canonical, &declaration, &contents, &xid_map, &source, now,
+                    )?,
+                    AcceptedDbInput::Immutable(entry) => Self::immutable_db_value(&entry, &source)?,
+                };
+                values.insert(full, value);
             }
-            let (read_storage, read_path) = match &staged_source {
-                Some((stage, inner)) => (stage, inner.as_str()),
-                None => (storage, full.as_str()),
-            };
-            let source = DbInputSource { storage: read_storage, path: read_path, full: &full };
-            let value = match input {
-                AcceptedDbInput::Merged(declaration) => Self::merged_db_value(
-                    canonical,
-                    &declaration,
-                    &contents,
-                    &xid_map,
-                    &source,
-                    now,
-                )?,
-                AcceptedDbInput::Immutable(entry) => Self::immutable_db_value(&entry, &source)?,
-            };
-            values.insert(full, value);
-        }
-        Ok(AcceptedDbSnapshot {
-            paths,
-            values: values.into_iter().collect(),
-        })
+            Ok(AcceptedDbSnapshot { paths, values: values.into_iter().collect() })
+        }).await.map_err(|error| format!("database input worker failed: {error}"))?
     }
 
     /// Every declared .json data file the snapshot reads, keyed by inner
@@ -25158,32 +25334,66 @@ impl AppState {
             }
             current.content.clone()
         };
-        let addr = Address::parse(canonical.clone()).map_err(|error| error.to_string())?;
-        let mut view = Xite::new(addr, storage.clone());
-        view.content = match storage.read("content.json") {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<Value>(&bytes)
-                    .map_err(|error| format!("could not parse content.json before signing: {error}"))?,
-            ),
-            Err(epix_core::Error::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound => managed_content,
-            Err(error) => {
-                return Err(format!("could not read content.json before signing: {error}"));
-            }
+        let worker_storage = storage.clone();
+        let worker_canonical = canonical.clone();
+        let version = self.version.clone();
+        let privatekey = privatekey.to_owned();
+        let manifest_guard = ManifestGuard {
+            _activation: Some(activation),
+            _manifest: Some(manifest),
         };
-        if let Some(map) = view.content.as_mut().and_then(Value::as_object_mut) {
-            map.insert("epixnet_version".into(), json!(self.version));
-        }
-        let previous_modified = view
-            .content
-            .as_ref()
-            .and_then(|content| content.get("modified"))
-            .and_then(Value::as_f64)
-            .unwrap_or(0.0);
-        let modified = (now_secs() as f64).max(previous_modified + 1.0);
-        let prepared = view
-            .prepare_sign_opts(privatekey, modified, opts)
-            .map_err(|error| error.to_string())?;
+        // Hashing and bundle preparation can take seconds. Keep their locks
+        // inside the blocking worker so even a dropped awaiter cannot release
+        // mutation authority before that worker has finished reading files.
+        let (prepared, manifest_guard, tree) = tokio::task::spawn_blocking(move || {
+            let storage = worker_storage;
+            let canonical = worker_canonical;
+            let result = (|| -> Result<epix_xite::PreparedRootSign, String> {
+                #[cfg(test)]
+                {
+                    let pause = ROOT_SIGN_PREPARATION_PAUSES.lock().unwrap()
+                        .get(storage.root()).cloned();
+                    if let Some((entered, ready, release)) = pause {
+                        let _ = entered.send(());
+                        ready.notify_one();
+                        let (lock, changed) = &*release;
+                        let mut released = lock.lock().unwrap();
+                        while !*released {
+                            released = changed.wait(released).unwrap();
+                        }
+                    }
+                }
+                let addr = Address::parse(canonical.clone()).map_err(|error| error.to_string())?;
+                let mut view = Xite::new(addr, storage.clone());
+                view.content = match storage.read("content.json") {
+                    Ok(bytes) => Some(
+                        serde_json::from_slice::<Value>(&bytes)
+                            .map_err(|error| format!("could not parse content.json before signing: {error}"))?,
+                    ),
+                    Err(epix_core::Error::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound => managed_content,
+                    Err(error) => {
+                        return Err(format!("could not read content.json before signing: {error}"));
+                    }
+                };
+                if let Some(map) = view.content.as_mut().and_then(Value::as_object_mut) {
+                    map.insert("epixnet_version".into(), json!(version));
+                }
+                let previous_modified = view
+                    .content
+                    .as_ref()
+                    .and_then(|content| content.get("modified"))
+                    .and_then(Value::as_f64)
+                    .unwrap_or(0.0);
+                let modified = (now_secs() as f64).max(previous_modified + 1.0);
+                view.prepare_sign_opts(&privatekey, modified, opts)
+                    .map_err(|error| error.to_string())
+            })();
+            (result, manifest_guard, tree)
+        })
+        .await
+        .map_err(|error| format!("Root signing preparation failed: {error}"))?;
+        let prepared = prepared?;
         let content = prepared.content().clone();
         let bytes = prepared.bytes().to_vec();
         let sign_cache = prepared.sign_cache().map(<[u8]>::to_vec);
@@ -25206,10 +25416,7 @@ impl AppState {
             &canonical,
             "content.json",
             &bytes,
-            ManifestGuard {
-                _activation: Some(activation),
-                _manifest: Some(manifest),
-            },
+            manifest_guard,
         )?;
         let keys = self.alias_keys(&canonical, address).await;
         // Ownership is derived from the already-proven private key, so make
@@ -26015,6 +26222,17 @@ impl AppState {
         &self,
         request: MergeFetchRequest<'_>,
     ) -> MergeFetchOutcome {
+        let Some(generation) = self.xite_membership_generation(request.address).await else {
+            return MergeFetchOutcome::default();
+        };
+        self.fetch_and_merge_records_for_registration(request, generation).await
+    }
+
+    async fn fetch_and_merge_records_for_registration(
+        &self,
+        request: MergeFetchRequest<'_>,
+        generation: u64,
+    ) -> MergeFetchOutcome {
         let MergeFetchRequest {
             address,
             inner_path,
@@ -26035,6 +26253,9 @@ impl AppState {
             let Some(e) = x.get(address) else {
                 return MergeFetchOutcome::default();
             };
+            if !e.settings.serving || e.membership_generation != generation {
+                return MergeFetchOutcome::default();
+            }
             (e.storage.clone(), canonical_address(e.content.as_ref(), address),
             )
         };
@@ -26104,7 +26325,9 @@ impl AppState {
         let current_matches = {
             let xites = self.xites.read().await;
             xites.get(address).is_some_and(|xite| {
-                canonical_address(xite.content.as_ref(), address) == canonical
+                xite.settings.serving
+                    && xite.membership_generation == generation
+                    && canonical_address(xite.content.as_ref(), address) == canonical
                     && xite.storage.root() == storage.root()
             })
         };
@@ -26207,7 +26430,18 @@ impl AppState {
     /// "no change" and never fetches them - only this unconditional per-record
     /// merge does. Idempotent (grow-only union), so an extra call is harmless.
     pub async fn resync_merge_files_for(self: &Arc<Self>, address: &str) {
-        if !self.is_serving(address).await {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return;
+        };
+        self.resync_merge_files_for_registration(address, generation).await;
+    }
+
+    /// Pull every merge file for one registration, retaining its identity
+    /// across discovery and each network wait before guarded file commits.
+    pub async fn resync_merge_files_for_registration(
+        self: &Arc<Self>, address: &str, generation: u64,
+    ) {
+        if !self.xite_update_is_current(address, generation).await {
             return;
         }
         // The pool is SHUFFLED every pass, and each file unions copies from
@@ -26235,8 +26469,11 @@ impl AppState {
         let mut manifests: Vec<_> = manifests.into_iter().collect();
         manifests.sort_by(|left, right| left.0.cmp(&right.0));
         for (content_path, content) in manifests {
+            if !self.xite_update_is_current(address, generation).await {
+                return;
+            }
             let (f, u) = self
-                .resync_merge_dir(address, &content_path, &content, &peers)
+                .resync_merge_dir_for_registration(address, generation, &content_path, &content, &peers)
                 .await;
             files += f;
             unserved += u;
@@ -26268,6 +26505,21 @@ impl AppState {
         content: &Value,
         peers: &[PeerAddr],
     ) -> (usize, usize) {
+        let Some(generation) = self.xite_membership_generation(address).await else {
+            return (0, 0);
+        };
+        self.resync_merge_dir_for_registration(address, generation, content_path, content, peers)
+            .await
+    }
+
+    async fn resync_merge_dir_for_registration(
+        &self,
+        address: &str,
+        generation: u64,
+        content_path: &str,
+        content: &Value,
+        peers: &[PeerAddr],
+    ) -> (usize, usize) {
         let merge_paths = epix_content::declared_merge_files(content);
         if merge_paths.is_empty() {
             return (0, 0);
@@ -26276,9 +26528,12 @@ impl AppState {
         let mut files = 0usize;
         let mut unserved = 0usize;
         for rel in merge_paths {
+            if !self.xite_update_is_current(address, generation).await {
+                break;
+            }
             let mpath = if dir.is_empty() { rel.clone() } else { format!("{dir}/{rel}") };
             let outcome = self
-                .fetch_and_merge_records(
+                .fetch_and_merge_records_for_registration(
                     MergeFetchRequest {
                         address,
                         inner_path: &mpath,
@@ -26288,7 +26543,7 @@ impl AppState {
                         sender_peers: peers,
                         union_from: MERGE_SWEEP_UNION,
                         transaction: None,
-                    })
+                    }, generation)
                 .await;
             files += 1;
             if outcome.served == 0 {
@@ -30581,8 +30836,8 @@ impl AppState {
     /// - Retry passes notify only on completion (with the xite re-checked to
     ///   still exist - a deleted xite's empty missing-list must not toast
     ///   "Downloaded"); the toggle's own pass already reported any failure.
-    /// Warm every served xite's in-memory database in the background. Xite
-    /// dbs live only in RAM (see the startup note on `rebuild_merger_dbs`),
+    /// Warm ordinary in-memory xite databases in the background. Persistent
+    /// merger databases are reconciled separately after the complete restore,
     /// so after a restart the dashboard's first feedQuery used to trigger
     /// every rebuild lazily - racing the 10s per-feed deadline and the
     /// post-boot update churn, which left the feed empty until a later
@@ -30597,7 +30852,8 @@ impl AppState {
                 let xites = state.xites.read().await;
                 xites
                     .iter()
-                    .filter(|(_, xite)| xite.storage.exists("dbschema.json"))
+                    .filter(|(_, xite)| xite.storage.exists("dbschema.json")
+                        && !xite.db_schema.as_ref().is_some_and(|schema| schema.version == 3))
                     .filter_map(|(key, xite)| {
                         seen.insert(canonical_address(xite.content.as_ref(), key))
                             .then(|| key.clone())
@@ -31099,6 +31355,14 @@ impl AppState {
 
         let mut pending = queue.iter().peekable();
         let (phase_tx, mut phase_rx) = tokio::sync::mpsc::unbounded_channel::<usize>();
+        // Dropping the round (abort, or the pass ending) must cancel the
+        // spawned fetches the way dropping their futures used to.
+        struct AbortOnDrop(tokio::task::JoinHandle<Result<bool, String>>);
+        impl Drop for AbortOnDrop {
+            fn drop(&mut self) {
+                self.0.abort();
+            }
+        }
         let mut in_flight = FuturesUnordered::new();
         // Files currently in the network phase: the REAL pool occupancy,
         // reported as `workers`. A file leaves on its fetched signal or, if
@@ -31136,8 +31400,27 @@ impl AppState {
                 let hook: EdxFetchedHook = Arc::new(move || {
                     let _ = tx.send(idx);
                 });
+                // Each fetch runs as its own task. `in_flight` is only polled
+                // from the select below, while this loop also awaits the xites
+                // lock (mark_optional_file, push_xite_info, set_worker_stats).
+                // A fetch future parked inside `in_flight` that is next in the
+                // lock's FIFO queue gets the read permit handed to it on
+                // release, is never polled again, and this task's own write
+                // then waits on it forever: every reader in the node queues
+                // behind that writer and the lock watchdog aborts the process.
+                // A spawned task is polled regardless of what this loop awaits.
+                let address_owned = address.to_string();
+                let path_owned = path.clone();
+                let fetch = AbortOnDrop(tokio::spawn(async move {
+                    state.file_need_pooled(&address_owned, &path_owned, hook).await
+                }));
                 in_flight.push(async move {
-                    (idx, state.file_need_pooled(address, path, hook).await)
+                    let mut fetch = fetch;
+                    let result = match (&mut fetch.0).await {
+                        Ok(result) => result,
+                        Err(e) => Err(format!("optional fetch task failed: {e}")),
+                    };
+                    (idx, result)
                 });
                 self.set_worker_stats(
                     address,
@@ -32061,6 +32344,7 @@ impl AppState {
             )
             .await
         else {
+            self.bump_db_source_epoch(&canonical);
             self.log(
                 "DEBUG",
                 format!(
@@ -32072,7 +32356,9 @@ impl AppState {
             return false;
         };
         let epoch = self.verified_index_epoch(&canonical);
-        let source_epoch = self.db_source_epoch(&canonical);
+        // Explicit rebuilds re-read accepted inputs, even when a caller wrote
+        // them without an ingest notification. Retire the merger reuse receipt.
+        let source_epoch = self.bump_db_source_epoch(&canonical);
         let built = build_xite_db(
             &storage,
             &muted,
@@ -32107,7 +32393,7 @@ impl AppState {
             }
             match built {
                 Some((db, schema)) => {
-                    current.db = Some(db);
+                    current.db = if schema.version == 3 { None } else { Some(db) };
                     current.db_schema = Some(schema);
                 }
                 None => {
@@ -32129,6 +32415,9 @@ impl AppState {
         // caller that doesn't follow up itself - the dbRebuild/dbReload ws
         // command, db_query's lazy build, a mute change - leaves the merger
         // xite with no data until the next restart.
+        if is_merger && !self.reset_merger_index(address).await {
+            return false;
+        }
         if is_merger || is_merged_source {
             self.rebuild_merger_dbs().await;
         }
@@ -32157,13 +32446,13 @@ impl AppState {
         Ok(ids)
     }
 
-    async fn settle_xite_removal_owners(
+    async fn release_xite_removal_ownership(
         &self,
         canonical: &str,
         intent: &XiteRemovalIntent,
-        store: Arc<epix_blob::store::Store>,
+        store: &epix_blob::store::Store,
     ) -> Vec<String> {
-        if !self.removal_intent_matches_store(intent, &store) {
+        if !self.removal_intent_matches_store(intent, store) {
             return vec![format!(
                 "pending removal {canonical} belongs to another Store"
             )];
@@ -32176,7 +32465,20 @@ impl AppState {
                 ));
             }
         }
-        warnings.extend(self.reconcile_manifest_object_owners(&store));
+        warnings.extend(self.reconcile_manifest_object_owners(store));
+        warnings
+    }
+
+    async fn settle_xite_removal_owners(
+        &self,
+        canonical: &str,
+        intent: &XiteRemovalIntent,
+        store: Arc<epix_blob::store::Store>,
+    ) -> Vec<String> {
+        let mut warnings = self.release_xite_removal_ownership(canonical, intent, &store).await;
+        if !self.removal_intent_matches_store(intent, &store) {
+            return warnings;
+        }
         let mut ids = match Self::removal_rehome_ids(intent) {
             Ok(ids) => ids,
             Err(error) => {
@@ -32260,6 +32562,19 @@ impl AppState {
                 return false;
             }
         }
+        let roots = match self.validated_removal_roots(canonical, &intent) {
+            Ok(roots) => roots,
+            Err(_) => return false,
+        };
+        if self.removal_root_is_reused(canonical, &roots).await {
+            return false;
+        }
+        if roots
+            .iter()
+            .any(|root| remove_xite_directory_durable(root).is_err())
+        {
+            return false;
+        }
         let excluded = std::collections::HashSet::from([canonical.to_string()]);
         let registry = {
             let xites = self.xites.read().await;
@@ -32274,19 +32589,6 @@ impl AppState {
                 .delete_xite_persisted_metadata(canonical, &intent.keys)
                 .await
                 .is_err()
-        {
-            return false;
-        }
-        let roots = match self.validated_removal_roots(canonical, &intent) {
-            Ok(roots) => roots,
-            Err(_) => return false,
-        };
-        if self.removal_root_is_reused(canonical, &roots).await {
-            return false;
-        }
-        if roots
-            .iter()
-            .any(|root| remove_xite_directory_durable(root).is_err())
         {
             return false;
         }
@@ -32356,8 +32658,24 @@ impl AppState {
     /// [`Self::activation_read_fresh`] can hold fresh mutations back.
     async fn acquire_activation_write(&self) -> tokio::sync::OwnedRwLockWriteGuard<()> {
         use std::sync::atomic::Ordering;
+        struct PendingWriter<'a> {
+            waiting: &'a std::sync::atomic::AtomicUsize,
+            landed: &'a tokio::sync::Notify,
+        }
+        impl Drop for PendingWriter<'_> {
+            fn drop(&mut self) {
+                self.waiting.fetch_sub(1, Ordering::SeqCst);
+                self.landed.notify_waiters();
+            }
+        }
         let _turn = self.activation_writer_turnstile.lock().await;
         self.activation_writers_waiting.fetch_add(1, Ordering::SeqCst);
+        // Cancellation while polling must release the fresh-mutation barrier
+        // and wake readers which already observed this pending writer.
+        let pending = PendingWriter {
+            waiting: &self.activation_writers_waiting,
+            landed: &self.activation_writer_landed,
+        };
         let mut delay = std::time::Duration::from_millis(5);
         let guard = loop {
             if let Ok(guard) = self.xite_activation_gate.clone().try_write_owned() {
@@ -32366,8 +32684,7 @@ impl AppState {
             tokio::time::sleep(delay).await;
             delay = delay.saturating_mul(2).min(std::time::Duration::from_millis(100));
         };
-        self.activation_writers_waiting.fetch_sub(1, Ordering::SeqCst);
-        self.activation_writer_landed.notify_waiters();
+        drop(pending);
         guard
     }
 
@@ -32391,6 +32708,13 @@ impl AppState {
     }
 
     pub async fn remove_xite(&self, address: &str) -> bool {
+        self.try_remove_xite(address).await.unwrap_or(false)
+    }
+
+    /// Accept a durable removal, preserving the cause when it cannot start.
+    /// `Ok(false)` means no membership or pending receipt exists. `Ok(true)`
+    /// retains the existing accepted-removal contract: cleanup may be pending.
+    pub async fn try_remove_xite(&self, address: &str) -> Result<bool, String> {
         let canonical = self.canonical_key(address).await;
         let address = canonical.as_str();
         // Removal takes visible time (locks, durable intent, directory
@@ -32414,11 +32738,11 @@ impl AppState {
                 Err(error) => {
                     self.log("ERROR", format!("Xite removal completion failed: {error}"))
                         .await;
-                    false
+                    Err(format!("Xite removal completion failed: {error}"))
                 }
             };
         self.end_xite_update(address);
-        if !removed {
+        if !matches!(&removed, Ok(true)) {
             // The row survives a failed removal: retire its pill quietly (the
             // caller's command reply carries the error) so it does not read
             // as deleting forever.
@@ -32427,7 +32751,7 @@ impl AppState {
         removed
     }
 
-    async fn remove_xite_owned(&self, address: &str) -> bool {
+    async fn remove_xite_owned(&self, address: &str) -> Result<bool, String> {
         // Stop the detached download before waiting for its activation and
         // manifest guards. No old task may recreate progress after cleanup.
         let canonical = self.canonical_key(address).await;
@@ -32481,19 +32805,17 @@ impl AppState {
         let Some((canonical, keys, cache_keys, roots)) = target else {
             let pending = self
                 .read_xite_removal_intents()
-                .ok()
-                .and_then(|intents| {
-                    intents.into_iter().find_map(|(canonical, intent)| {
-                        (canonical == address || intent.keys.iter().any(|key| key == address))
-                            .then_some(canonical)
-                    })
+                .map_err(|error| format!("Could not inspect pending xite removal: {error}"))?
+                .into_iter().find_map(|(canonical, intent)| {
+                    (canonical == address || intent.keys.iter().any(|key| key == address))
+                        .then_some(canonical)
                 });
             drop(registry);
             drop(_activation);
-            let Some(canonical) = pending else { return false };
+            let Some(canonical) = pending else { return Ok(false) };
             self.schedule_xite_removal_retry(&canonical);
             let _ = self.retry_pending_xite_removal_once(&canonical).await;
-            return true;
+            return Ok(true);
         };
         if self.removal_root_is_reused(&canonical, &roots).await {
             self.log(
@@ -32503,7 +32825,7 @@ impl AppState {
                 ),
             )
             .await;
-            return false;
+            return Err(format!("Refusing to remove {canonical}: its storage root is shared by another served xite"));
         }
         let _manifest = match self
             .acquire_manifest_mutex(&canonical, "content.json")
@@ -32513,7 +32835,7 @@ impl AppState {
             Err(error) => {
                 self.log("ERROR", format!("Could not lock {canonical} for deletion: {error}"))
                     .await;
-                return false;
+                return Err(format!("Could not lock {canonical} for deletion: {error}"));
             }
         };
         let tree = self.tree_mutation_lock(&canonical).lock_owned().await;
@@ -32539,7 +32861,7 @@ impl AppState {
                     drop(_manifest);
                     self.log("ERROR", format!("Could not start xite removal: {error}"))
                         .await;
-                    return false;
+                    return Err(format!("Could not start xite removal: {error}"));
                 }
             };
             let store_root = if let Some(store) = store.as_deref() {
@@ -32550,14 +32872,14 @@ impl AppState {
                         drop(_manifest);
                         self.log("ERROR", format!("Could not start xite removal: {error}"))
                             .await;
-                        return false;
+                        return Err(format!("Could not start xite removal: {error}"));
                     }
                 }
             } else if dormant_store {
                 let Some(data_root) = self.data_root.as_ref() else {
                     drop(tree);
                     drop(_manifest);
-                    return false;
+                    return Err("Could not bind dormant Store removal: no data root".to_string());
                 };
                 match tokio::fs::canonicalize(data_root.join("edx-store")).await {
                     Ok(root) => Some(root),
@@ -32569,7 +32891,7 @@ impl AppState {
                             format!("Could not bind dormant Store removal: {error}"),
                         )
                         .await;
-                        return false;
+                        return Err(format!("Could not bind dormant Store removal: {error}"));
                     }
                 }
             } else {
@@ -32589,7 +32911,7 @@ impl AppState {
                 drop(_manifest);
                 self.log("ERROR", format!("Could not start xite removal: {error}"))
                     .await;
-                return false;
+                return Err(format!("Could not start xite removal: {error}"));
             }
             intents.insert(canonical.clone(), intent);
             if let Err(error) = self.write_xite_removal_intents(&intents) {
@@ -32609,7 +32931,7 @@ impl AppState {
                     drop(_manifest);
                     self.log("ERROR", format!("Could not start xite removal: {error}"))
                         .await;
-                    return false;
+                    return Err(format!("Could not start xite removal: {error}"));
                 }
                 self.log(
                     "WARN",
@@ -32621,7 +32943,7 @@ impl AppState {
                 let Some(path) = self.xite_removals_path() else {
                     drop(tree);
                     drop(_manifest);
-                    return false;
+                    return Err("Could not confirm xite removal: journal path disappeared".to_string());
                 };
                 if sync_parent_directory(&path).is_err() {
                     // Do not hold the global activation writer through a
@@ -32636,7 +32958,7 @@ impl AppState {
                     drop(registry);
                     drop(_activation);
                     self.schedule_xite_removal_retry(&canonical);
-                    return true;
+                    return Ok(true);
                 }
             }
             intent_persisted = true;
@@ -32662,6 +32984,7 @@ impl AppState {
             self.clone_statuses.lock().unwrap().retain(|key, _| !remove.contains(key));
             self.clone_retry_wakes.lock().unwrap().retain(|key, _| !remove.contains(key));
             self.clone_retry_dirty.lock().unwrap().retain(|key| !remove.contains(key));
+            self.xite_update_requests.lock().unwrap().retain(|key, _| !remove.contains(key));
             self.clones_in_flight.lock().unwrap().retain(|key| !remove.contains(key));
         }
 
@@ -32684,7 +33007,39 @@ impl AppState {
             }
         }
 
-        // Preserve every exact Store object before the xite tree disappears.
+        // The intent now excludes this membership durably. Release its
+        // accepted declarations before preserving Extern rows: an object
+        // with no surviving owner can be retired without an object-sized
+        // copy. Independent references and shared declarations remain in
+        // Store's typed ownership ledger and are preserved below.
+        let mut removed_keys = Vec::new();
+        {
+            let mut xites = self.xites.write().await;
+            for key in &keys {
+                if let Some(xite) = xites.remove(key) {
+                    if let Some(display) = xite.display {
+                        removed_keys.push(display);
+                    }
+                    removed_keys.push(key.clone());
+                }
+            }
+        }
+        self.replace_verified_object_paths(&canonical, Vec::new());
+        self.replace_verified_manifest_chains(&canonical, HashMap::new());
+        self.replace_verified_manifest_contents(&canonical, &[]);
+        let mut ownership_warnings = if feed_cleanup_complete {
+            Vec::new()
+        } else {
+            vec![format!(
+                "could not release all feed ownership for removed xite {canonical}"
+            )]
+        };
+        ownership_warnings.extend(store
+            .as_deref()
+            .map(|store| self.reconcile_manifest_object_owners(store))
+            .unwrap_or_default());
+
+        // Preserve every surviving Store object before the tree disappears.
         // This walks Store's authenticated extern index, not raw child
         // manifests. A stale rejected child therefore cannot name and delete
         // an unrelated object, and bundles/shards follow their typed owner
@@ -32793,33 +33148,6 @@ impl AppState {
                 ));
             }
         }
-
-        let mut removed_keys = Vec::new();
-        {
-            let mut xites = self.xites.write().await;
-            for key in &keys {
-                if let Some(xite) = xites.remove(key) {
-                    if let Some(display) = xite.display {
-                        removed_keys.push(display);
-                    }
-                    removed_keys.push(key.clone());
-                }
-            }
-        }
-        self.replace_verified_object_paths(&canonical, Vec::new());
-        self.replace_verified_manifest_chains(&canonical, HashMap::new());
-        self.replace_verified_manifest_contents(&canonical, &[]);
-        let mut ownership_warnings = if feed_cleanup_complete {
-            Vec::new()
-        } else {
-            vec![format!(
-                "could not release all feed ownership for removed xite {canonical}"
-            )]
-        };
-        ownership_warnings.extend(store
-            .as_deref()
-            .map(|store| self.reconcile_manifest_object_owners(store))
-            .unwrap_or_default());
 
         let mut roots_removed = store_cleanup_complete;
         if store_cleanup_complete {
@@ -32937,7 +33265,7 @@ impl AppState {
         if intent_remaining {
             self.schedule_xite_removal_retry(&canonical);
         }
-        true
+        Ok(true)
     }
 
     /// Drop the per-xite user data (derived auth keys, cert binding, feed
@@ -33387,7 +33715,7 @@ impl AppState {
     /// `HTTP_HOST` to `allowed_ws_origins` when it serves the wrapper).
     pub fn allow_ws_origin(&self, host: &str) {
         if !host.is_empty() {
-            self.allowed_ws_origins.lock().unwrap().insert(host.to_string());
+            self.allowed_ws_origins.lock().unwrap().insert(host.to_ascii_lowercase());
         }
     }
 
@@ -33399,14 +33727,14 @@ impl AppState {
     /// Whether a WebSocket `Origin` host is allowed: same as the request host,
     /// loopback, or a previously-served wrapper host.
     pub fn is_ws_origin_allowed(&self, origin_host: &str, request_host: &str) -> bool {
-        if origin_host.is_empty() || origin_host == request_host {
+        if origin_host.is_empty() || origin_host.eq_ignore_ascii_case(request_host) {
             return true;
         }
         let host_only = origin_host.split(':').next().unwrap_or(origin_host);
         if host_only == "127.0.0.1" || host_only == "localhost" || host_only == "[::1]" {
             return true;
         }
-        self.allowed_ws_origins.lock().unwrap().contains(origin_host)
+        self.allowed_ws_origins.lock().unwrap().contains(&origin_host.to_ascii_lowercase())
     }
 
     /// Move a per-xite user identity (derived xite keys, cert binding, feed
@@ -33824,7 +34152,14 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
     use std::io::Read;
     if archive_path.ends_with(".zip") {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
-        let mut file = zip.by_name(within).ok()?;
+        // ZIP 9 indexes raw filename bytes; a decoded CP437 name therefore
+        // needs an index lookup instead of a UTF-8 by_name lookup.
+        let index = zip.index_for_name(within).or_else(|| {
+            zip.file_names().enumerate().find_map(|(index, name)| {
+                (name.ok()?.as_ref() == within).then_some(index)
+            })
+        })?;
+        let mut file = zip.by_index(index).ok()?;
         let mut out = Vec::new();
         file.read_to_end(&mut out).ok()?;
         Some(out)
@@ -33843,86 +34178,6 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
         }
         None
     }
-}
-
-/// An existing identity must be inside the selected root, not behind a link.
-fn validate_data_destination(target: &std::path::Path) -> Result<(), String> {
-    for (sub, directory) in [("private", true), ("data", true), ("private/users.json", false)] {
-        match std::fs::symlink_metadata(target.join(sub)) {
-            Ok(meta) => {
-                let kind = meta.file_type();
-                let valid = if directory { kind.is_dir() } else { kind.is_file() };
-                if !valid {
-                    return Err(format!("The destination {sub} must not be a link or special file"));
-                }
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(format!("Could not inspect destination {sub}: {e}")),
-        }
-    }
-    Ok(())
-}
-
-/// Recursively copy a directory (for `set_data_dir`'s move to a new root).
-/// Reject links and special files, and never overwrite destination files.
-/// A selected directory may already contain entries not written by the node.
-fn copy_dir_all(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-    if !std::fs::symlink_metadata(src)?.file_type().is_dir() {
-        return Err(Error::new(ErrorKind::InvalidInput, "Source must be a directory, not a link"));
-    }
-    match std::fs::symlink_metadata(dst) {
-        Ok(meta) if !meta.file_type().is_dir() => {
-            return Err(Error::new(ErrorKind::InvalidInput, "Destination must be a directory, not a link"));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::NotFound => std::fs::create_dir_all(dst)?,
-        Err(e) => return Err(e),
-    }
-    for entry in std::fs::read_dir(src)? {
-        let entry = entry?;
-        let to = dst.join(entry.file_name());
-        let file_type = entry.file_type()?;
-        if file_type.is_dir() {
-            copy_dir_all(&entry.path(), &to)?;
-        } else if file_type.is_file() {
-            copy_data_file(src, &entry.file_name(), &to)?;
-        } else {
-            return Err(Error::new(ErrorKind::InvalidInput, "Data directories cannot contain links or special files"));
-        }
-    }
-    Ok(())
-}
-
-/// Copy one regular file without following a source link or replacing a target.
-fn copy_data_file(src: &std::path::Path, name: &std::ffi::OsStr, to: &std::path::Path) -> std::io::Result<()> {
-    use std::io::{Error, ErrorKind};
-    #[cfg(unix)]
-    let mut input = {
-        use rustix::fs::{Mode, OFlags};
-        let fd = rustix::fs::open(src.join(name),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK, Mode::empty())?;
-        std::fs::File::from(fd)
-    };
-    #[cfg(windows)]
-    let mut input = epix_fs::open_regular_file_beneath(src, std::path::Path::new(name))?;
-    #[cfg(not(any(unix, windows)))]
-    let mut input = std::fs::File::open(src.join(name))?;
-    if !input.metadata()?.is_file() {
-        return Err(Error::new(ErrorKind::InvalidInput, "Source must be a regular file"));
-    }
-    let mut options = std::fs::OpenOptions::new();
-    options.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // Keep private keys owner-only throughout the copy.
-        options.mode(0o600);
-    }
-    let mut output = options.open(to)?;
-    std::io::copy(&mut input, &mut output)?;
-    output.set_permissions(input.metadata()?.permissions())?;
-    Ok(())
 }
 
 /// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
@@ -34442,6 +34697,9 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    include!("state/merger_index_tests.rs");
+    include!("state/merger_cache_tests.rs");
+
     /// Mint an identity address, link it as `name` offline (the chain stand-in
     /// lists it as active) and return its address. The first link becomes the
     /// node-wide default, so every xite without an override acts as it.
@@ -34870,6 +35128,243 @@ mod tests {
         assert_eq!(resp.peers[0].unpack(), vec![PeerAddr::Onion { host: onion, port: 26959 }]);
     }
 
+    async fn absorb_tracker_attempt(
+        state: &AppState,
+        tracker: &epix_xite::Tracker,
+        xite: &str,
+        result: Result<Vec<PeerAddr>, AttemptError<String>>,
+    ) {
+        let tracker = tracker.clone();
+        let mut set = tokio::task::JoinSet::new();
+        set.spawn(async move { (tracker, result, std::time::Duration::from_millis(10)) });
+        state.absorb_announce_results(set, xite, None).await;
+    }
+
+    #[tokio::test]
+    async fn first_deferred_tracker_stays_untried_until_a_real_result() {
+        for reason in [DeferredAttempt::NegativeDialCache, DeferredAttempt::FailedDialFollower] {
+            let state = AppState::new("tracker-deferred-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            let key = tracker_stat_key(&tracker);
+            assert!(state.mark_tracker_announcing(&tracker).await);
+            absorb_tracker_attempt(&state, &tracker, "follower", Err(AttemptError::Deferred(reason))).await;
+            let planned = state.announcer_stats_planned().await;
+            let entry = &planned[&key];
+            assert_eq!(entry["status"], "deferred");
+            assert_eq!(entry["deferred_reason"], reason.to_string());
+            for field in ["num_request", "num_success", "num_error", "time_request", "time_success", "time_first_request"] {
+                assert_eq!(entry[field], 0, "no real attempt: {field}");
+            }
+            assert!(entry.get("time_last_error").is_none());
+            assert!(entry.get("last_error").is_none());
+            assert!(state.announcer_stats().await.get(&key).is_none());
+            assert!(state.tracker_backoff.read().await.is_empty());
+
+            assert!(state.mark_tracker_announcing(&tracker).await);
+            assert_eq!(state.announcer_stats().await[&key]["status"], "announcing");
+            absorb_tracker_attempt(&state, &tracker, "follower", Ok(Vec::new())).await;
+            let stats = state.announcer_stats().await;
+            let entry = &stats[&key];
+            assert_eq!(entry["status"], "announced");
+            assert_eq!(entry["num_request"], 1);
+            assert_eq!(entry["num_success"], 1);
+            assert_eq!(entry["num_error"], 0);
+            assert!(entry["time_first_request"].as_i64().unwrap() > 0);
+            assert!(entry.get("deferred_reason").is_none());
+            assert!(state.tracker_backoff.read().await.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_followers_cannot_overwrite_another_xites_real_result() {
+        for follower_first in [false, true] {
+            for succeeded in [false, true] {
+                let state = AppState::new("tracker-ordering-test");
+                let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+                let key = tracker_stat_key(&tracker);
+                state.mark_tracker_announcing(&tracker).await;
+                let follower = || Err(AttemptError::Deferred(DeferredAttempt::FailedDialFollower));
+                if follower_first {
+                    absorb_tracker_attempt(&state, &tracker, "follower", follower()).await;
+                }
+                let result = if succeeded { Ok(Vec::new()) } else { Err(AttemptError::Failed("dial failed".into())) };
+                absorb_tracker_attempt(&state, &tracker, "leader", result).await;
+                let winner = state.announcer_stats().await[&key].clone();
+                if !follower_first {
+                    absorb_tracker_attempt(&state, &tracker, "follower", follower()).await;
+                }
+                assert_eq!(state.announcer_stats().await[&key], winner);
+                assert_eq!(winner["num_request"], 1);
+                assert_eq!(winner["status"], if succeeded { "announced" } else { "error" });
+                let backoff = state.tracker_backoff.read().await;
+                assert!(!backoff.contains_key(&(key.clone(), "follower".into())));
+                assert_eq!(backoff.contains_key(&(key, "leader".into())), !succeeded);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn late_deferred_tracker_does_not_override_overlay_gating() {
+        let state = AppState::new("tracker-gating-test");
+        let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+        let key = tracker_stat_key(&tracker);
+        state.mark_tracker_announcing(&tracker).await;
+        state.mark_tracker_gated(&tracker).await;
+        let gated = state.announcer_stats_planned().await[&key].clone();
+        absorb_tracker_attempt(&state, &tracker, "follower", Err(AttemptError::Deferred(DeferredAttempt::FailedDialFollower))).await;
+        assert_eq!(state.announcer_stats_planned().await[&key], gated);
+        assert!(state.announcer_stats().await.get(&key).is_none());
+    }
+
+    #[tokio::test]
+    async fn reactivated_tracker_keeps_its_last_verdict_when_retry_is_deferred() {
+        for succeeded in [false, true] {
+            let state = AppState::new("tracker-reactivation-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            let key = tracker_stat_key(&tracker);
+            let result = if succeeded { Ok(Vec::new()) } else { Err(AttemptError::Failed("dial failed".into())) };
+            absorb_tracker_attempt(&state, &tracker, "fixture", result).await;
+            let previous = state.announcer_stats().await[&key].clone();
+            state.mark_tracker_gated(&tracker).await;
+            assert!(state.announcer_stats().await.get(&key).is_none());
+            assert!(state.mark_tracker_announcing(&tracker).await);
+            assert_eq!(state.announcer_stats().await[&key], previous);
+            absorb_tracker_attempt(&state, &tracker, "fixture", Err(AttemptError::Deferred(DeferredAttempt::NegativeDialCache))).await;
+            assert_eq!(state.announcer_stats().await[&key], previous);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_tracker_does_not_trigger_shared_tracker_eviction() {
+        for reason in [DeferredAttempt::NegativeDialCache, DeferredAttempt::FailedDialFollower] {
+            let state = AppState::new("tracker-eviction-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            let key = tracker_stat_key(&tracker);
+            state.config_set("shared_trackers", json!([tracker.to_string()])).await;
+            state.tracker_stats.write().await.insert(key.clone(), json!({
+                "status": "error", "num_request": SHARED_TRACKER_ERROR_LIMIT,
+                "num_error": SHARED_TRACKER_ERROR_LIMIT, "num_success": 0,
+                "time_first_request": now_secs() - SHARED_TRACKER_DEAD_SECS - 1,
+                "time_success": 0, "last_error": "original failure"
+            }));
+            let before = state.announcer_stats().await[&key].clone();
+            absorb_tracker_attempt(&state, &tracker, "follower", Err(AttemptError::Deferred(reason))).await;
+            assert_eq!(state.announcer_stats().await[&key], before);
+            assert_eq!(state.config_get("shared_trackers").await, Some(json!([tracker.to_string()])));
+            assert!(state.tracker_backoff.read().await.is_empty());
+            // The fixture really is eligible for eviction on its next real failure.
+            absorb_tracker_attempt(&state, &tracker, "leader", Err(AttemptError::Failed("new failure".into()))).await;
+            assert_eq!(state.config_get("shared_trackers").await, Some(json!([])));
+        }
+    }
+
+    #[tokio::test]
+    async fn genuine_tracker_errors_with_cache_diagnostics_still_back_off() {
+        for reason in [DeferredAttempt::NegativeDialCache, DeferredAttempt::FailedDialFollower] {
+            let state = AppState::new("tracker-diagnostic-test");
+            let tracker = epix_xite::Tracker::parse("tcp://203.0.113.9:26552").unwrap();
+            for _ in 0..6 {
+                absorb_tracker_attempt(&state, &tracker, "fixture", Err(AttemptError::Failed(reason.to_string()))).await;
+            }
+            let stats = state.announcer_stats().await;
+            let entry = &stats[tracker_stat_key(&tracker)];
+            assert_eq!(entry["num_request"], 6);
+            assert_eq!(entry["num_error"], 6);
+            assert_eq!(entry["last_error"], reason.to_string());
+            assert!(state.tracker_backed_off(&tracker, "fixture").await);
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_dial_results_do_not_count_as_fresh_tracker_failures() {
+        // A cached refusal and a caller queued behind the same failed dial
+        // both report the original attempt; neither attempted another dial.
+        let mut observed = Vec::new();
+        for deferred in [
+            DeferredAttempt::NegativeDialCache,
+            DeferredAttempt::FailedDialFollower,
+        ] {
+            let state = AppState::new("tracker-cache-test");
+            let tracker = epix_xite::Tracker::Epix(PeerAddr::parse(
+                "shx5vqsw7usdaunyzr2qmes2fq37oumybpudrd4jjj4e4vk4uusa.b32.i2p:0",
+            ).unwrap());
+            let key = tracker_stat_key(&tracker);
+            let pair = (key.clone(), "fixture-xite".to_string());
+            let mut set = tokio::task::JoinSet::new();
+            let first_tracker = tracker.clone();
+            set.spawn(async move {
+                (first_tracker, Err(AttemptError::Failed("protocol: i2p connect fixture: transient failure".to_string())),
+                    std::time::Duration::from_millis(10))
+            });
+            state.absorb_announce_results(set, "fixture-xite", None).await;
+            let first_stats = state.tracker_stats.read().await[&key].clone();
+            let first_backoff = state.tracker_backoff.read().await[&pair];
+            for _ in 0..5 {
+                let mut set = tokio::task::JoinSet::new();
+                let tracker = tracker.clone();
+                set.spawn(async move {
+                    (tracker, Err(AttemptError::Deferred(deferred)), std::time::Duration::ZERO)
+                });
+                state.absorb_announce_results(set, "fixture-xite", None).await;
+            }
+            let backed_off = state.tracker_backed_off(&tracker, "fixture-xite").await;
+            let later_backoff = state.tracker_backoff.read().await[&pair];
+            let later_stats = state.tracker_stats.read().await[&key].clone();
+            eprintln!("issue585_tracker_report={}", json!({
+                "deferred": deferred.to_string(),
+                "backed_off": backed_off,
+                "first_backoff": first_backoff,
+                "later_backoff": later_backoff,
+                "first_stats": first_stats,
+                "later_stats": later_stats,
+            }));
+            observed.push((deferred, backed_off, first_backoff, later_backoff, first_stats, later_stats));
+        }
+        // Both suppression paths must preserve the same genuine outcome.
+        for (deferred, backed_off, first_backoff, later_backoff, first_stats, later_stats) in observed {
+            assert!(
+                !backed_off,
+                "one actual dial must not become six-minute backoff through {deferred}"
+            );
+            assert_eq!(later_backoff, first_backoff,
+                "suppression must not advance the failure streak or last-attempt stamp");
+            assert_eq!(later_stats, first_stats,
+                "keep the actual attempt count, latency, and original diagnostic");
+        }
+    }
+
+    #[tokio::test]
+    async fn independent_tracker_failures_keep_the_existing_backoff() {
+        let state = AppState::new("tracker-real-failures-test");
+        let tracker = epix_xite::Tracker::Epix(PeerAddr::parse("203.0.113.9:26552").unwrap());
+        let key = tracker_stat_key(&tracker);
+        let pair = (key.clone(), "fixture-xite".to_string());
+        for attempt in 0..6 {
+            let mut set = tokio::task::JoinSet::new();
+            let tracker = tracker.clone();
+            set.spawn(async move {
+                (tracker, Err(AttemptError::Failed(format!("protocol: independent transport attempt {attempt} failed"))),
+                    std::time::Duration::from_millis(10))
+            });
+            state.absorb_announce_results(set, "fixture-xite", None).await;
+        }
+        assert_eq!(state.tracker_stats.read().await[&key]["num_request"], 6);
+        assert_eq!(state.tracker_stats.read().await[&key]["num_error"], 6);
+        assert!(state.tracker_backed_off(&tracker, "fixture-xite").await);
+        assert!(!state.tracker_backed_off(&tracker, "another-xite").await);
+        state.tracker_backoff.write().await.get_mut(&pair).unwrap().1 = now_secs() - 300;
+        assert!(state.tracker_backed_off(&tracker, "fixture-xite").await);
+        state.tracker_backoff.write().await.get_mut(&pair).unwrap().1 = now_secs() - 360;
+        assert!(!state.tracker_backed_off(&tracker, "fixture-xite").await);
+        let mut set = tokio::task::JoinSet::new();
+        let recovered = tracker.clone();
+        set.spawn(async move { (recovered, Ok(Vec::new()), std::time::Duration::ZERO) });
+        state.absorb_announce_results(set, "fixture-xite", None).await;
+        assert!(!state.tracker_backoff.read().await.contains_key(&pair));
+        assert_eq!(state.tracker_stats.read().await[&key]["num_error"], 0);
+        assert_eq!(state.tracker_stats.read().await[&key]["num_success"], 1);
+    }
+
     #[tokio::test]
     async fn tracker_back_off_is_per_xite_and_resets_on_success() {
         let state = AppState::new("test");
@@ -35172,6 +35667,116 @@ mod tests {
                 assert!(error.to_string().contains(&format!("{name} lane {lane}")));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn update_requests_coalesce_aliases_and_ignore_paused_or_replaced_registrations() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("updates");
+        let address = DASHBOARD_XITE_ADDRESS;
+        let alias = "updates.epix";
+        let storage = XiteStorage::new(dir.path().join(address));
+        state.add_xite(alias, XiteEntry {
+            storage: storage.clone(), content: Some(json!({"address":address, "files":{}})),
+        }).await;
+        let generation = state.xite_membership_generation(alias).await.unwrap();
+        for requested in [alias, address, alias, "unregistered.epix"] {
+            state.request_xite_update(requested).await;
+        }
+        assert_eq!(state.take_xite_update_requests(), HashMap::from([(alias.to_string(), generation)]));
+        assert!(state.take_xite_update_requests().is_empty());
+        assert!(state.xite_update_is_current(alias, generation).await);
+
+        state.xites.write().await.get_mut(alias).unwrap().settings.serving = false;
+        state.request_xite_update(address).await;
+        state.request_all_xite_updates().await;
+        assert!(state.take_xite_update_requests().is_empty());
+        assert!(!state.xite_update_is_current(alias, generation).await);
+        state.xites.write().await.get_mut(alias).unwrap().settings.serving = true;
+        state.request_xite_update(alias).await;
+        assert!(state.remove_xite(alias).await);
+        assert!(state.take_xite_update_requests().is_empty(), "deletion removes pending wakes");
+        state.add_xite(alias, XiteEntry {
+            storage, content: Some(json!({"address":address, "files":{}})),
+        }).await;
+        assert!(!state.xite_update_is_current(alias, generation).await);
+        state.request_xite_update(address).await;
+        let replacement = state.take_xite_update_requests()[alias];
+        assert_ne!(replacement, generation);
+        assert!(state.xite_update_is_current(alias, replacement).await);
+    }
+
+    #[tokio::test]
+    async fn update_requests_follow_new_peers_foreground_and_overlay_readiness() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("updates");
+        let address = DASHBOARD_XITE_ADDRESS;
+        state.add_xite(address, XiteEntry {
+            storage: XiteStorage::new(dir.path()), content: Some(json!({"address":address, "files":{}})),
+        }).await;
+        let generation = state.xite_membership_generation(address).await.unwrap();
+        let expected = HashMap::from([(address.to_string(), generation)]);
+        let peer = PeerAddr::parse("198.18.0.7:26552").unwrap();
+        state.add_peers(address, [peer.clone()]).await;
+        assert_eq!(state.take_xite_update_requests(), expected);
+        state.add_peers(address, [peer.clone()]).await;
+        assert!(state.take_xite_update_requests().is_empty(), "duplicate PEX is not new evidence");
+
+        state.note_edx_dials(address, vec![(peer.clone(), false)]).await;
+        let backoff = state.xites.read().await[address].peers.get(&peer).unwrap().probe_after;
+        state.network_changed().await;
+        assert_eq!(state.take_xite_update_requests(), expected, "same-network foreground refreshes complete xites");
+        assert_eq!(state.xites.read().await[address].peers.get(&peer).unwrap().probe_after, backoff,
+            "foreground must not erase peer failure backoff");
+        state.note_probe_outcome(&peer, false).await;
+        assert!(state.take_xite_update_requests().is_empty());
+        state.note_probe_outcome(&peer, true).await;
+        assert_eq!(state.take_xite_update_requests(), expected, "real reachability revives updates");
+
+        state.set_i2p_status(json!({"phase":"Starting"})).await;
+        assert!(state.take_xite_update_requests().is_empty());
+        state.set_i2p_status(json!({"phase":"Ready"})).await;
+        assert_eq!(state.take_xite_update_requests(), expected);
+        state.set_i2p_status(json!({"phase":"Ready", "bytes":1234})).await;
+        assert!(state.take_xite_update_requests().is_empty(), "status counters do not queue another pass");
+        state.set_tor_status(true, "OK").await;
+        assert_eq!(state.take_xite_update_requests(), expected);
+        state.set_tor_status(true, "OK").await;
+        assert!(state.take_xite_update_requests().is_empty());
+        state.set_rns_transport(Arc::new(epix_transport::TcpTransport)).await;
+        assert_eq!(state.take_xite_update_requests(), expected,
+            "mesh readiness retries xites skipped before its transport existed");
+    }
+
+    #[tokio::test]
+    async fn late_tracker_results_do_not_attach_to_a_replacement_registration() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("updates");
+        let address = DASHBOARD_XITE_ADDRESS;
+        let storage = XiteStorage::new(dir.path().join(address));
+        state.add_xite(address, XiteEntry { storage: storage.clone(), content: None }).await;
+        let generation = state.xite_membership_generation(address).await.unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        let peer = PeerAddr::parse("198.18.0.7:26552").unwrap();
+        let mut results = tokio::task::JoinSet::new();
+        results.spawn({
+            let peer = peer.clone();
+            async move {
+                wait.await.unwrap();
+                (epix_xite::Tracker::parse("198.18.0.1:26552").unwrap(),
+                    Ok(vec![peer]), std::time::Duration::from_millis(10))
+            }
+        });
+        let draining = tokio::spawn({
+            let state = state.clone();
+            async move { state.absorb_announce_results(results, address, Some((address, generation))).await }
+        });
+        assert!(state.remove_xite(address).await);
+        state.add_xite(address, XiteEntry { storage, content: None }).await;
+        release.send(()).unwrap();
+        assert_eq!(draining.await.unwrap(), vec![peer]);
+        assert!(state.connectable_peers(address, 10).await.is_empty());
+        assert!(state.take_xite_update_requests().is_empty());
     }
 
     #[tokio::test]
@@ -37932,10 +38537,12 @@ mod tests {
         let resync_state = state.clone();
         let resync_addr = addr.clone();
         let resync_storage = storage.clone();
+        let generation = state.xite_membership_generation(&addr).await.unwrap();
         let mut resync = tokio::spawn(async move {
             resync_state
                 .resync_apply_newer(
                     &resync_addr,
+                    generation,
                     &resync_addr,
                     &resync_storage,
                     v2,
@@ -39497,30 +40104,38 @@ mod tests {
             )
             .unwrap(),
         );
-        let manifest_ownership = state.manifest_ownership_lock.lock().unwrap();
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        struct ReleaseStorePause(Arc<tokio::sync::Semaphore>);
+        impl Drop for ReleaseStorePause {
+            fn drop(&mut self) {
+                // A failed assertion must not strand detached installation.
+                self.0.close();
+            }
+        }
+        let _release_on_drop = ReleaseStorePause(release.clone());
+        *state.store_before_exposure_pause.lock().unwrap() =
+            Some((entered.clone(), release.clone()));
         let install_state = state.clone();
         let install_store = store.clone();
         let install = tokio::spawn(async move {
             install_state.set_edx_store(install_store).await
         });
-        tokio::time::timeout(std::time::Duration::from_secs(5), async {
-            loop {
-                if store.is_complete(id).unwrap_or(false) {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("Store reconciliation never reached cache installation");
+        tokio::time::timeout(std::time::Duration::from_secs(5), entered.notified())
+            .await
+            .expect("Store reconciliation never reached the exposure boundary");
+        assert!(store.is_complete(id).unwrap());
         install.abort();
-        let _ = install.await;
+        let cancelled = tokio::time::timeout(std::time::Duration::from_secs(1), install)
+            .await
+            .expect("Store installation caller did not cancel");
+        assert!(cancelled.unwrap_err().is_cancelled());
         assert!(state.edx_store.read().await.is_none());
         assert!(
             state.xite_activation_gate.clone().try_read_owned().is_err(),
             "caller cancellation released the Store activation writer"
         );
-        drop(manifest_ownership);
+        release.add_permits(1);
 
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
@@ -39892,6 +40507,80 @@ mod tests {
         assert_eq!(
             state.edx_object_path(&id),
             Some((address, "asset.bin".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_waiting_store_install_does_not_block_fresh_mutations() {
+        let directory = tempdir().unwrap();
+        let state = AppState::new("test");
+        let store = Arc::new(
+            epix_blob::store::Store::open(directory.path().join("store")).unwrap(),
+        );
+        // Hold installation before it acquires the writer and starts its
+        // detached completion, as an active signing transaction would.
+        let active_transaction = state.xite_activation_gate.clone().read_owned().await;
+        let install_state = state.clone();
+        let install = tokio::spawn(async move { install_state.set_edx_store(store).await });
+        let reached_pending = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            async {
+                while state
+                    .activation_writers_waiting
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                    == 0
+                {
+                    tokio::task::yield_now().await;
+                }
+            },
+        )
+        .await
+        .is_ok();
+        let install_was_waiting = !install.is_finished();
+
+        // Poll once to register this fresh reader on Notify before aborting.
+        // A new reader alone would test the decrement but miss a lost wakeup.
+        let waiting_reader = state.activation_read_fresh();
+        tokio::pin!(waiting_reader);
+        let reader_was_waiting = std::future::poll_fn(|cx| {
+            std::task::Poll::Ready(
+                std::future::Future::poll(waiting_reader.as_mut(), cx).is_pending(),
+            )
+        })
+        .await;
+        install.abort();
+        let install_was_cancelled = matches!(
+            install.await,
+            Err(error) if error.is_cancelled()
+        );
+        drop(active_transaction);
+
+        // Both bounds detect a stranded barrier after all legitimate blockers
+        // are gone. Join the aborted writer before checking either reader.
+        let waiting_reader_woke = reader_was_waiting
+            && tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                waiting_reader.as_mut(),
+            )
+            .await
+            .is_ok();
+        let fresh_reader_available = tokio::time::timeout(
+            std::time::Duration::from_millis(100),
+            state.activation_read_fresh(),
+        )
+        .await
+        .is_ok();
+        let waiters = state
+            .activation_writers_waiting
+            .load(std::sync::atomic::Ordering::SeqCst);
+        assert!(reached_pending, "Store installation never became a pending writer");
+        assert!(install_was_waiting && install_was_cancelled);
+        assert!(reader_was_waiting, "fresh mutation bypassed the pending writer");
+        assert!(
+            waiting_reader_woke && fresh_reader_available && waiters == 0,
+            "cancelled installation stranded the mutation barrier: \
+             waiting writers={waiters}, waiting reader woke={waiting_reader_woke}, \
+             fresh reader available={fresh_reader_available}",
         );
     }
 
@@ -40271,6 +40960,269 @@ mod tests {
             assert!(!fixture.storage_a.root().exists());
             assert_shared_extern_rehomed(&fixture);
         }
+    }
+
+    struct PendingRemovalBacking {
+        address: String,
+        storage: XiteStorage,
+        bytes: Vec<u8>,
+        id: epix_blob::ObjId,
+    }
+
+    struct PendingStoreRemovalFixture {
+        _dir: tempfile::TempDir,
+        state: Arc<AppState>,
+        store: Arc<epix_blob::store::Store>,
+        removed: Vec<PendingRemovalBacking>,
+        survivor: Option<String>,
+    }
+
+    async fn pending_store_removal_fixture(
+        count: usize,
+        shared_bundle: bool,
+        independent_reference: bool,
+    ) -> PendingStoreRemovalFixture {
+        let dir = tempdir().unwrap();
+        let state = AppState::with_data_dir("pending-store-removal-test", dir.path());
+        let mut removed = Vec::new();
+        for _ in 0..count {
+            let key = epix_crypt::new_seed();
+            let address = epix_crypt::privatekey_to_address(&key).unwrap();
+            let storage = XiteStorage::new(dir.path().join("data").join(&address));
+            let bytes = random_upload_bytes(200 * 1024);
+            let id = epix_blob::ObjId::of(&bytes);
+            storage.write("payload.bin", &bytes).unwrap();
+            let mut content = json!({
+                "address": address.clone(),
+                "modified": 1.0,
+                "edx": 1,
+                "files": { "payload.bin": {
+                    "size": bytes.len(),
+                    "sha512": XiteStorage::hash_bytes(&bytes),
+                    "b3": id.to_string(),
+                } },
+            });
+            epix_content::sign(&mut content, &key).unwrap();
+            storage.write("content.json", &serde_json::to_vec(&content).unwrap()).unwrap();
+            state.add_xite(&address, XiteEntry {
+                storage: storage.clone(),
+                content: Some(content),
+            }).await;
+            removed.push(PendingRemovalBacking { address, storage, bytes, id });
+        }
+        removed.sort_by(|left, right| left.address.cmp(&right.address));
+
+        let survivor = if shared_bundle {
+            let key = epix_crypt::new_seed();
+            let address = epix_crypt::privatekey_to_address(&key).unwrap();
+            let storage = XiteStorage::new(dir.path().join("data").join(&address));
+            let bundles = removed.iter().enumerate().map(|(seq, backing)| {
+                (backing.id.to_string(), json!({ "size": backing.bytes.len(), "seq": seq }))
+            }).collect::<serde_json::Map<String, Value>>();
+            let mut content = json!({
+                "address": address.clone(),
+                "modified": 1.0,
+                "edx": 1,
+                "files": {},
+                "bundles": bundles,
+            });
+            epix_content::sign(&mut content, &key).unwrap();
+            storage.write("content.json", &serde_json::to_vec(&content).unwrap()).unwrap();
+            state.add_xite(&address, XiteEntry {
+                storage,
+                content: Some(content),
+            }).await;
+            Some(address)
+        } else {
+            None
+        };
+
+        let store_path = dir.path().join("edx-store");
+        let store_config = || epix_blob::store::StoreConfig {
+            xite_root: Some(dir.path().join("data")),
+            ..Default::default()
+        };
+        let store = Arc::new(epix_blob::store::Store::open_with(&store_path, store_config()).unwrap());
+        // Establish durable typed manifest claims using the real activation path.
+        state.set_edx_store(store.clone()).await.unwrap();
+        for backing in &removed {
+            assert!(store.manifest_claimed(backing.id).unwrap());
+            assert_eq!(store.ref_delta(backing.id, 0).unwrap(), 1);
+            assert!(store.extern_entries().unwrap().iter().any(|entry| {
+                entry.id == backing.id && entry.path == backing.storage.path("payload.bin").unwrap()
+            }));
+            if independent_reference {
+                assert_eq!(store.ref_delta(backing.id, 1).unwrap(), 2);
+            }
+        }
+        state.persist_xites().await;
+        let store_root = AppState::store_receipt_root(&store).unwrap();
+        let intents = removed.iter().map(|backing| {
+            (backing.address.clone(), XiteRemovalIntent {
+                keys: vec![backing.address.clone()],
+                roots: vec![backing.storage.root().to_path_buf()],
+                store_root: Some(store_root.clone()),
+                store_cleanup_required: true,
+                owner_cleanup_required: true,
+                rehome_ids: Vec::new(),
+            })
+        }).collect::<std::collections::BTreeMap<_, _>>();
+        state.write_xite_removal_intents(&intents).unwrap();
+        // Crash point: intent durable, but old membership and tree still exist.
+        drop(state);
+        drop(store);
+        let store = Arc::new(epix_blob::store::Store::open_with(&store_path, store_config()).unwrap());
+        let restarted = AppState::with_data_dir("pending-store-removal-test", dir.path());
+        assert_eq!(restarted.restore_xites().await, usize::from(shared_bundle));
+        for backing in &removed {
+            assert!(!restarted.has_xite(&backing.address).await);
+            assert!(backing.storage.root().exists());
+            assert_eq!(store.read_bytes(backing.id, 2).unwrap(), backing.bytes);
+        }
+        PendingStoreRemovalFixture { _dir: dir, state: restarted, store, removed, survivor }
+    }
+
+    fn block_pending_removal_copy(
+        fixture: &PendingStoreRemovalFixture,
+        id: epix_blob::ObjId,
+    ) -> PathBuf {
+        let blocked = fixture.store.root().join("sparse").join(id.to_string());
+        std::fs::create_dir_all(&blocked).unwrap();
+        blocked
+    }
+
+    #[tokio::test]
+    async fn restart_removal_releases_a_sole_manifest_owner_without_copying() {
+        let fixture = pending_store_removal_fixture(1, false, false).await;
+        let backing = &fixture.removed[0];
+        let _blocked = block_pending_removal_copy(&fixture, backing.id);
+        fixture.state.set_edx_store(fixture.store.clone()).await.unwrap();
+        assert!(!backing.storage.root().exists());
+        assert!(!fixture.store.contains(backing.id).unwrap());
+        assert!(!fixture.store.manifest_claimed(backing.id).unwrap());
+        assert!(fixture.state.read_xite_removal_intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn failed_restart_preservation_keeps_independent_bytes_receipt_and_reference_for_retry() {
+        let fixture = pending_store_removal_fixture(1, false, true).await;
+        let backing = &fixture.removed[0];
+        let blocked = block_pending_removal_copy(&fixture, backing.id);
+        assert!(fixture.state.set_edx_store(fixture.store.clone()).await.is_err());
+        assert!(backing.storage.root().exists());
+        assert_eq!(backing.storage.read("payload.bin").unwrap(), backing.bytes);
+        assert_eq!(fixture.store.read_bytes(backing.id, 3).unwrap(), backing.bytes);
+        assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1);
+        assert!(!fixture.store.manifest_claimed(backing.id).unwrap());
+        assert!(fixture.state.read_xite_removal_intents().unwrap()[&backing.address].store_cleanup_required);
+        assert!(fixture.state.edx_store().await.is_none());
+
+        std::fs::remove_dir(&blocked).unwrap();
+        fixture.state.set_edx_store(fixture.store.clone()).await.unwrap();
+        assert!(!backing.storage.root().exists());
+        assert_eq!(fixture.store.read_bytes(backing.id, 4).unwrap(), backing.bytes);
+        assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1, "retry must not release the independent ref");
+        assert!(fixture.state.read_xite_removal_intents().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn later_removal_failure_keeps_a_completed_removals_shared_sparse_bytes() {
+        let fixture = pending_store_removal_fixture(2, true, false).await;
+        let first = &fixture.removed[0];
+        let second = &fixture.removed[1];
+        assert!(first.address < second.address);
+        let blocked = block_pending_removal_copy(&fixture, second.id);
+        assert!(fixture.state.set_edx_store(fixture.store.clone()).await.is_err());
+
+        assert!(!first.storage.root().exists(), "first receipt must complete before second fails");
+        assert!(second.storage.root().exists());
+        let intents = fixture.state.read_xite_removal_intents().unwrap();
+        assert!(!intents.contains_key(&first.address));
+        assert!(intents[&second.address].store_cleanup_required);
+        assert_eq!(fixture.store.read_bytes(first.id, 3).unwrap(), first.bytes,
+            "failed activation must not discard the completed removal's only remaining bytes");
+        assert_eq!(fixture.store.read_bytes(second.id, 3).unwrap(), second.bytes);
+        for backing in &fixture.removed {
+            assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1);
+            assert!(fixture.store.manifest_claimed(backing.id).unwrap());
+        }
+
+        std::fs::remove_dir(&blocked).unwrap();
+        fixture.state.set_edx_store(fixture.store.clone()).await.unwrap();
+        for backing in &fixture.removed {
+            assert!(!backing.storage.root().exists());
+            assert_eq!(fixture.store.read_bytes(backing.id, 4).unwrap(), backing.bytes);
+            assert_eq!(fixture.store.ref_delta(backing.id, 0).unwrap(), 1);
+            assert!(fixture.store.manifest_claimed(backing.id).unwrap());
+            let paths = fixture.state.edx_paths.read().unwrap();
+            assert!(paths.get(&backing.id).unwrap().iter().any(|candidate| {
+                Some(&candidate.canonical) == fixture.survivor.as_ref()
+                    && candidate.kind == ObjectDeclarationKind::Bundle
+            }));
+        }
+        assert!(fixture.store.extern_entries().unwrap().is_empty());
+        assert!(fixture.state.read_xite_removal_intents().unwrap().is_empty());
+    }
+
+
+    #[tokio::test]
+    async fn store_safe_removal_reclaims_payload_before_blocked_user_metadata_then_converges() {
+        // Exercise both startup replay and the already-running retry path.
+        for boot_replay in [true, false] {
+            let fixture = pending_store_removal_fixture(1, false, false).await;
+            let backing = &fixture.removed[0];
+            assert!(fixture.store.release_manifest_and_delete_unowned(backing.id).unwrap());
+            let mut intents = fixture.state.read_xite_removal_intents().unwrap();
+            let intent = intents.get_mut(&backing.address).unwrap();
+            intent.store_cleanup_required = false;
+            intent.owner_cleanup_required = false;
+            intent.rehome_ids.clear();
+            fixture.state.write_xite_removal_intents(&intents).unwrap();
+
+            // Load the original fixture identity before blocking its persistence.
+            let boot_state = boot_replay.then(|| AppState::with_data_dir(
+                "pending-store-removal-test", fixture._dir.path()));
+            let users = fixture._dir.path().join("private/users.json");
+            let original_users = std::fs::read(&users).unwrap();
+            std::fs::remove_file(&users).unwrap();
+            std::fs::create_dir(&users).unwrap();
+            let replay = if let Some(replay) = boot_state {
+                assert_eq!(replay.restore_xites().await, 0);
+                replay
+            } else {
+                assert!(!fixture.state.retry_pending_xite_removal_once(&backing.address).await);
+                fixture.state.clone()
+            };
+            assert!(!backing.storage.root().exists(),
+                "Store-safe payload must be reclaimed even while users.json cannot be replaced");
+            assert!(!replay.has_xite(&backing.address).await);
+            assert!(replay.read_xite_removal_intents().unwrap().contains_key(&backing.address),
+                "metadata failure must retain the durable exclusion receipt");
+
+            std::fs::remove_dir(&users).unwrap();
+            std::fs::write(&users, original_users).unwrap();
+            assert!(replay.retry_pending_xite_removal_once(&backing.address).await);
+            assert!(replay.read_xite_removal_intents().unwrap().is_empty());
+            assert!(!backing.storage.root().exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn remove_unshared_extern_does_not_need_a_payload_copy() {
+        let fixture = shared_extern_fixture(false, true).await;
+        assert!(fixture.state.remove_xite(&fixture.address_b).await);
+        assert!(fixture.store.manifest_owned_ids().unwrap().contains(&fixture.id));
+        assert!(fixture.store.extern_entries().unwrap().iter().any(|entry| {
+            entry.id == fixture.id && entry.path == fixture.storage_a.path("shared.bin").unwrap()
+        }));
+        // Copying into sparse storage must fail. With no remaining independent
+        // owner, deletion should release the row instead of trying that copy.
+        let blocked_copy = fixture.store.root().join("sparse").join(fixture.id.to_string());
+        std::fs::create_dir(&blocked_copy).unwrap();
+        assert!(fixture.state.remove_xite(&fixture.address_a).await);
+        assert!(!fixture.storage_a.root().exists(), "unshared deletion tried to copy its payload");
+        assert!(!fixture.store.contains(fixture.id).unwrap());
+        assert!(!fixture.store.manifest_owned_ids().unwrap().contains(&fixture.id));
     }
 
     #[tokio::test]
@@ -42805,6 +43757,35 @@ mod tests {
         assert!(state.no_new_xites().await);
     }
 
+    #[test]
+    fn removal_journal_write_limits_preserve_installed_receipts_and_reserve() {
+        let root = tempdir().unwrap();
+        let state = AppState::with_data_dir("test", root.path());
+        let path = state.xite_removals_path().unwrap();
+        state.write_xite_removal_intents(&Default::default()).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let reserve = root.path().join("private/deletion-reserve");
+        let reserve_size = std::fs::metadata(&reserve).unwrap().len();
+
+        let large = std::collections::BTreeMap::from([(
+            "large".to_string(),
+            XiteRemovalIntent {
+                keys: vec!["x".repeat(MAX_XITE_REMOVAL_INTENT_BYTES as usize)],
+                ..Default::default()
+            },
+        )]);
+        assert!(state.write_xite_removal_intents(&large).unwrap_err().contains("size limit"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::metadata(&reserve).unwrap().len(), reserve_size);
+
+        let many = (0..=MAX_XITE_REMOVAL_INTENTS)
+            .map(|index| (index.to_string(), XiteRemovalIntent::default()))
+            .collect();
+        assert!(state.write_xite_removal_intents(&many).unwrap_err().contains("entry limit"));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        assert_eq!(std::fs::metadata(&reserve).unwrap().len(), reserve_size);
+    }
+
     #[tokio::test]
     async fn favourite_and_delete_take_effect() {
         let content = json!({ "address": "1FavMe", "files": {} });
@@ -43183,6 +44164,189 @@ mod tests {
         assert_eq!(storage_b.read("content.json").unwrap(), root_b_bytes);
     }
 
+    struct RootCommitPreflightPause {
+        root: PathBuf,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    impl RootCommitPreflightPause {
+        fn new(storage: &XiteStorage) -> Self {
+            let pause = Self {
+                root: storage.root().to_path_buf(),
+                entered: Arc::new(tokio::sync::Notify::new()),
+                release: Arc::new(tokio::sync::Semaphore::new(0)),
+            };
+            ROOT_COMMIT_PREFLIGHT_PAUSES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(pause.root.clone(), (pause.entered.clone(), pause.release.clone()));
+            pause
+        }
+    }
+
+    impl Drop for RootCommitPreflightPause {
+        fn drop(&mut self) {
+            ROOT_COMMIT_PREFLIGHT_PAUSES
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(&self.root);
+            self.release.add_permits(1);
+        }
+    }
+
+    async fn add_root_preflight_test_xite(
+        state: &AppState,
+        root: PathBuf,
+        database: bool,
+    ) -> (String, String, XiteStorage) {
+        let key = epix_crypt::new_seed();
+        let address = epix_crypt::privatekey_to_address(&key).unwrap();
+        let storage = XiteStorage::new(root);
+        storage.write("asset.bin", b"initial").unwrap();
+        if database {
+            storage.write(
+                "dbschema.json",
+                br#"{"db_name":"Preflight","db_file":"preflight.db","version":2,
+                     "maps":{"data.json":{"to_table":[{"node":"post","table":"post"}]}},
+                     "tables":{"post":{"cols":[["title","TEXT"],["json_id","INTEGER"]]}}}"#,
+            ).unwrap();
+            storage.write("data.json", br#"{"post":[{"title":"before"}]}"#).unwrap();
+        }
+        let mut xite = Xite::new(Address::parse(address.clone()).unwrap(), storage.clone());
+        xite.sign_opts(&key, 1.0, epix_xite::SignOpts::default()).unwrap();
+        state.add_xite(
+            &address,
+            XiteEntry { storage: storage.clone(), content: xite.content },
+        ).await;
+        (address, key, storage)
+    }
+
+    #[tokio::test]
+    async fn root_preflight_keeps_neighbors_available_and_preserves_database_receipts() {
+        let directory = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (address, key, storage) =
+            add_root_preflight_test_xite(&state, directory.path().join("signing"), true).await;
+        let (neighbor, neighbor_key, neighbor_storage) =
+            add_root_preflight_test_xite(&state, directory.path().join("neighbor"), false).await;
+        let alias = "preflight.epix";
+        state.add_xite(
+            alias,
+            XiteEntry {
+                storage: storage.clone(),
+                content: Some(serde_json::from_slice(&storage.read("content.json").unwrap()).unwrap()),
+            },
+        ).await;
+        state.write_file(&address, "data.json", br#"{"post":[{"title":"after"}]}"#)
+            .await.unwrap();
+        let captured_filter_epoch = state.db_filter_epoch();
+        let pause = RootCommitPreflightPause::new(&storage);
+        let signing_state = state.clone();
+        let signing_address = address.clone();
+        let signing = tokio::spawn(async move {
+            signing_state.sign_xite(&signing_address, &key).await
+        });
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(5), pause.entered.notified(),
+        ).await.is_ok();
+        let neighbor_state = state.clone();
+        let neighbor_address = neighbor.clone();
+        let mut editing = tokio::spawn(async move {
+            let info = neighbor_state.xite_info(&neighbor_address).await;
+            neighbor_state.write_file(&neighbor_address, "neighbor.txt", b"edited").await?;
+            Ok::<_, String>(info)
+        });
+        let editing_while_paused = tokio::time::timeout(
+            std::time::Duration::from_secs(1), &mut editing,
+        ).await;
+        let neighbor_was_available = editing_while_paused.is_ok();
+        // Model a filter change after the snapshot. Adoption must keep the
+        // captured epoch so queries reject this DB until its lazy rebuild.
+        state.bump_db_filter_epoch();
+        drop(pause);
+        let signed = signing.await;
+        let edited = match editing_while_paused {
+            Ok(result) => result,
+            Err(_) => editing.await,
+        };
+        assert!(entered, "signing never reached root preflight");
+        assert!(neighbor_was_available, "preflight blocked the neighbor's registry access");
+        let info = edited.unwrap().unwrap();
+        assert_eq!(info["address"], neighbor);
+        assert_eq!(neighbor_storage.read("neighbor.txt").unwrap(), b"edited");
+        signed.unwrap().unwrap();
+        let (primary_db, alias_db) = {
+            let xites = state.xites.read().await;
+            let primary = &xites[&address];
+            let alias = &xites[alias];
+            for xite in [primary, alias] {
+                assert_eq!(xite.db_filter_epoch, captured_filter_epoch);
+                assert_eq!(xite.db_verified_epoch, state.verified_index_epoch(&address));
+                assert_eq!(xite.db_source_epoch, state.db_source_epoch(&address));
+            }
+            assert!(state.current_db_query_receipt(&address, primary).is_none());
+            (primary.db.clone().unwrap(), alias.db.clone().unwrap())
+        };
+        assert_eq!(primary_db.query("SELECT title FROM post", &[]).unwrap()[0]["title"], "after");
+        primary_db.execute("UPDATE post SET title = 'primary only'", &[]).unwrap();
+        assert_eq!(alias_db.query("SELECT title FROM post", &[]).unwrap()[0]["title"], "after");
+        // The public query path must rebuild a stale filtered receipt, not
+        // expose the private test edit from the invalidated database.
+        assert_eq!(state.db_query(&address, "SELECT title FROM post", &Value::Null)
+            .await.unwrap()[0]["title"], "after");
+        state.sign_xite(&neighbor, &neighbor_key).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_root_preflight_preserves_authority_and_allows_later_signing() {
+        let directory = tempdir().unwrap();
+        let state = AppState::new("test");
+        let (address, key, storage) =
+            add_root_preflight_test_xite(&state, directory.path().join("signing"), true).await;
+        let (neighbor, neighbor_key, _) =
+            add_root_preflight_test_xite(&state, directory.path().join("neighbor"), false).await;
+        let original_root = storage.read("content.json").unwrap();
+        let original_cache = storage.read(".sign-cache.json").unwrap();
+        let original_managed = state.xites.read().await[&address].content.clone();
+        let original_index_epoch = state.verified_index_epoch(&address);
+        let original_db_generation = state.xites.read().await[&address].db_generation;
+        let pause = RootCommitPreflightPause::new(&storage);
+        let signing_state = state.clone();
+        let signing_address = address.clone();
+        let signing_key = key.clone();
+        let signing = tokio::spawn(async move {
+            signing_state.sign_xite(&signing_address, &signing_key).await
+        });
+        let entered = tokio::time::timeout(
+            std::time::Duration::from_secs(5), pause.entered.notified(),
+        ).await.is_ok();
+        // Deliberate external corruption after the candidate was hashed.
+        // Equal length ensures the final content verification is exercised.
+        let corrupted = storage.write("asset.bin", b"changed");
+        drop(pause);
+        let signed = signing.await;
+        assert!(entered, "signing never reached root preflight");
+        corrupted.unwrap();
+        assert!(signed.unwrap().is_err(), "a changed required file was committed");
+        assert_eq!(storage.read("content.json").unwrap(), original_root);
+        assert_eq!(storage.read(".sign-cache.json").unwrap(), original_cache);
+        assert_eq!(state.verified_index_epoch(&address), original_index_epoch);
+        {
+            let xites = state.xites.read().await;
+            let current = &xites[&address];
+            assert_eq!(current.content, original_managed);
+            assert_eq!(current.db_generation, original_db_generation);
+            assert_eq!(current.db.as_ref().unwrap().query("SELECT title FROM post", &[])
+                .unwrap()[0]["title"], "before");
+        }
+        state.write_file(&neighbor, "neighbor.txt", b"after failure").await.unwrap();
+        state.sign_xite(&neighbor, &neighbor_key).await.unwrap();
+        state.write_file(&address, "asset.bin", b"initial").await.unwrap();
+        state.sign_xite(&address, &key).await.unwrap();
+        assert_eq!(state.xite_info(&address).await["settings"]["own"], true);
+    }
+
     #[tokio::test]
     async fn root_sign_preserves_a_malformed_authoritative_manifest() {
         let dir = tempdir().unwrap();
@@ -43214,6 +44378,50 @@ mod tests {
         let error = state.sign_xite(&address, &key).await.unwrap_err();
         assert!(error.contains("parse content.json"), "{error}");
         assert_eq!(storage.read("content.json").unwrap(), malformed);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn root_sign_preparation_keeps_the_async_worker_available() {
+        let fixture = shared_extern_fixture(false, true).await;
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (neighbor_tx, neighbor_rx) = std::sync::mpsc::channel();
+        let ready = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        ROOT_SIGN_PREPARATION_PAUSES.lock().unwrap().insert(
+            fixture.storage_a.root().to_path_buf(), (entered_tx, ready.clone(), release.clone()),
+        );
+        // A separate OS thread always releases the synchronous pause. An
+        // async timeout alone cannot rescue a monopolized current-thread runtime.
+        let supervisor = std::thread::spawn(move || {
+            let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(2)).is_ok();
+            let neighbor_during_preparation = entered
+                && neighbor_rx.recv_timeout(std::time::Duration::from_secs(1)).is_ok();
+            let (lock, changed) = &*release;
+            *lock.lock().unwrap() = true;
+            changed.notify_all();
+            (entered, neighbor_during_preparation)
+        });
+        let state = fixture.state.clone();
+        let address = fixture.address_a.clone();
+        let key = fixture.key_a.clone();
+        let signing = tokio::spawn(async move { state.sign_xite(&address, &key).await });
+        let state = fixture.state.clone();
+        let neighbor_address = fixture.address_b.clone();
+        let neighbor = tokio::spawn(async move {
+            ready.notified().await;
+            let info = state.xite_info(&neighbor_address).await;
+            let _ = neighbor_tx.send(());
+            info
+        });
+        let signed = tokio::time::timeout(std::time::Duration::from_secs(5), signing).await;
+        let info = tokio::time::timeout(std::time::Duration::from_secs(5), neighbor).await;
+        let (entered, neighbor_during_preparation) = supervisor.join().unwrap();
+        ROOT_SIGN_PREPARATION_PAUSES.lock().unwrap().remove(fixture.storage_a.root());
+        let signed = signed.expect("signing did not settle").unwrap().unwrap();
+        assert_eq!(fixture.storage_a.read("content.json").unwrap(), signed);
+        assert_eq!(info.expect("neighbor did not settle").unwrap()["address"], fixture.address_b);
+        assert!(entered && neighbor_during_preparation,
+            "synchronous root signing preparation monopolized the async worker");
     }
 
     #[tokio::test]
@@ -43994,6 +45202,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn filepack_reads_zip_filenames_with_cp437_fallback() {
+        use std::io::Write;
+
+        let mut writer = zip::ZipWriter::new(std::io::Cursor::new(Vec::new()));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        for (name, data) in [
+            ("dir/cafX.txt", &b"legacy CP437 bytes"[..]),
+            ("modern/café.txt", &b"UTF-8 bytes"[..]),
+            ("plain.txt", &b"ASCII bytes"[..]),
+        ] {
+            writer.start_file(name, options).unwrap();
+            writer.write_all(data).unwrap();
+        }
+        let mut archive = writer.finish().unwrap().into_inner();
+        // Replace the same-width ASCII placeholder in both ZIP headers. The
+        // UTF-8 flag remains clear, and 0x82 is CP437's encoding of é.
+        let offsets: Vec<_> = archive.windows(b"dir/cafX.txt".len())
+            .enumerate()
+            .filter_map(|(index, part)| (part == b"dir/cafX.txt").then_some(index))
+            .collect();
+        assert_eq!(offsets.len(), 2);
+        for offset in offsets {
+            archive[offset + b"dir/caf".len()] = 0x82;
+        }
+        let corrupt_offset = {
+            let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&archive)).unwrap();
+            assert!(zip.index_for_name("dir/café.txt").is_none());
+            let file = zip.by_index(0).unwrap();
+            assert_eq!(file.name_raw(), b"dir/caf\x82.txt");
+            assert_eq!(file.flags().as_u16() & 0x800, 0);
+            assert_eq!(file.name().unwrap(), "dir/café.txt");
+            file.data_start().unwrap() as usize
+        };
+
+        let directory = tempdir().unwrap();
+        let storage = XiteStorage::new(directory.path());
+        storage.write("pack.zip", &archive).unwrap();
+        let state = AppState::new("test");
+        state.add_xite("1Pack", XiteEntry { storage: storage.clone(), content: None }).await;
+        for (name, expected) in [
+            ("dir/café.txt", &b"legacy CP437 bytes"[..]),
+            ("modern/café.txt", &b"UTF-8 bytes"[..]),
+            ("plain.txt", &b"ASCII bytes"[..]),
+        ] {
+            let bytes = state.read_file("1Pack", &format!("pack.zip/{name}")).await;
+            assert_eq!(bytes.as_deref(), Some(expected), "{name}");
+        }
+        assert!(state.read_file("1Pack", "pack.zip/missing.txt").await.is_none());
+        assert!(state.read_file("1Pack", "../pack.zip/plain.txt").await.is_none());
+
+        state.set_plugin_enabled("FilePack", false).await;
+        assert!(state.read_file("1Pack", "pack.zip/dir/café.txt").await.is_none());
+        state.set_plugin_enabled("FilePack", true).await;
+        // The fallback still reads through ZipFile, preserving its CRC check.
+        archive[corrupt_offset] ^= 1;
+        storage.write("pack.zip", &archive).unwrap();
+        assert!(state.read_file("1Pack", "pack.zip/dir/café.txt").await.is_none());
+    }
+
+    #[tokio::test]
     async fn filepack_reads_from_tar_gz() {
         // Build a small .tar.gz containing dir/hello.txt.
         let mut gz = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
@@ -44526,7 +45795,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn set_data_dir_copies_data_and_persists_to_conf() {
+    async fn set_data_dir_queues_without_copying_live_data() {
         let old = tempdir().unwrap();
         let new = tempdir().unwrap();
         let conf_dir = tempdir().unwrap();
@@ -44534,6 +45803,7 @@ mod tests {
         let s = AppState::with_data_dir("test", old.path());
         // Not relocatable until the server marks the root as such.
         assert!(s.set_data_dir("/anywhere").await.is_err());
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
         s.set_data_dir_conf(&conf);
 
         // Relative and nested targets are refused.
@@ -44542,11 +45812,72 @@ mod tests {
 
         let target = new.path().join("EpixData");
         s.set_data_dir(target.to_str().unwrap()).await.unwrap();
-        // The identity was copied and the choice recorded Python-style.
-        assert!(target.join("private/users.json").exists());
-        assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(target.canonicalize().unwrap()));
+        // Live files remain untouched and effective config still names the source.
+        assert!(!target.join("private/users.json").exists());
+        assert_eq!(crate::paths::read_conf_data_dir(&conf), Some(old.path().to_path_buf()));
+        assert_eq!(crate::data_relocation::pending_target(&conf).unwrap(),
+            Some(crate::paths::resolve_data_directory(&target).unwrap()));
+        assert_eq!(s.data_dir_value(), old.path().display().to_string());
+        assert_eq!(s.data_dir_config_value(),
+            crate::paths::resolve_data_directory(&target).unwrap().display().to_string());
         // The old root stays in place as a backup.
         assert!(old.path().join("private/users.json").exists());
+    }
+
+    #[tokio::test]
+    async fn queued_move_waits_for_writers_and_copies_latest_saved_state() {
+        let old = tempdir().unwrap();
+        let new = tempdir().unwrap();
+        let conf_dir = tempdir().unwrap();
+        let conf = conf_dir.path().join("epixnet.conf");
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
+        let lease = crate::data_relocation::DataRootLease::acquire(old.path()).unwrap();
+        let state = AppState::with_data_dir_leased("test", Arc::new(lease));
+        state.set_data_dir_conf(&conf);
+        let target = new.path().join("moved");
+        state.set_data_dir(target.to_str().unwrap()).await.unwrap();
+        let default = crate::paths::default_data_root();
+        let busy = crate::data_relocation::prepare_startup(&conf, &default).unwrap_err();
+        assert_eq!(busy.kind(), std::io::ErrorKind::WouldBlock);
+        assert!(!target.join("private/users.json").exists());
+        // Edits after pressing Save must be present in the eventual snapshot.
+        state.set_global_settings(json!({"theme":"dark"})).await;
+        state.config_set("offline", json!(true)).await;
+        let latest_identity = std::fs::read(old.path().join("private/users.json")).unwrap();
+        let latest_config = std::fs::read(old.path().join("private/config.json")).unwrap();
+        drop(state);
+        let moved = crate::data_relocation::prepare_startup(&conf, &default).unwrap();
+        assert_eq!(moved.root(), target.canonicalize().unwrap());
+        assert_eq!(std::fs::read(target.join("private/users.json")).unwrap(), latest_identity);
+        assert_eq!(std::fs::read(target.join("private/config.json")).unwrap(), latest_config);
+        assert_eq!(std::fs::read(old.path().join("private/users.json")).unwrap(), latest_identity);
+    }
+
+    #[test]
+    fn managed_browser_restart_is_explicit_and_resets_for_standalone_registration() {
+        let state = AppState::new("test");
+        assert!(!state.restart_uses_managed_browser_profile());
+        state.set_managed_browser_restart_argv(vec!["epix-browser".into(), "--background".into()]);
+        assert!(state.restart_uses_managed_browser_profile());
+        state.set_restart_argv(vec!["epix-server".into()]);
+        assert!(!state.restart_uses_managed_browser_profile());
+    }
+
+    #[tokio::test]
+    async fn queued_data_move_can_be_cancelled_by_selecting_the_current_root() {
+        let old = tempdir().unwrap();
+        let target = tempdir().unwrap();
+        let conf_dir = tempdir().unwrap();
+        let conf = conf_dir.path().join("epixnet.conf");
+        let state = AppState::with_data_dir("test", old.path());
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
+        state.set_data_dir_conf(&conf);
+        state.set_data_dir(target.path().to_str().unwrap()).await.unwrap();
+        assert_eq!(state.restart_pending_keys().await, vec!["data_dir".to_string()]);
+        state.set_data_dir(old.path().to_str().unwrap()).await.unwrap();
+        assert!(crate::data_relocation::pending_target(&conf).unwrap().is_none());
+        assert!(state.restart_pending_keys().await.is_empty());
+        assert!(!target.path().join("private").exists());
     }
 
     #[cfg(unix)]
@@ -44557,6 +45888,8 @@ mod tests {
         let current = root.path().join("current");
         let state = AppState::with_data_dir("test", &current);
         let conf = root.path().join("epixnet.conf");
+        crate::paths::write_conf_data_dir(&conf, Some(&current)).unwrap();
+        let original_conf = std::fs::read(&conf).unwrap();
         state.set_data_dir_conf(&conf);
         state.snapshot_boot_config().await;
         let alias = root.path().join("alias");
@@ -44565,7 +45898,7 @@ mod tests {
         for target in [alias.join("nested"), root.path().join("../other"),
             root.path().join("new\nui_ip=0.0.0.0"), root.path().to_path_buf()] {
             assert!(state.set_data_dir(target.to_str().unwrap()).await.is_err(), "{target:?}");
-            assert!(!conf.exists(), "Rejected paths must not change configuration");
+            assert_eq!(std::fs::read(&conf).unwrap(), original_conf, "Rejected paths must not change configuration");
         }
         // An alias of the current root is a no-op, not a recursive copy or a
         // spurious restart requirement caused by /var vs /private/var on macOS.
@@ -44581,41 +45914,12 @@ mod tests {
         let conf_dir = tempdir().unwrap();
         let state = AppState::with_data_dir("test", old.path());
         let conf = conf_dir.path().join("epixnet.conf");
+        crate::paths::write_conf_data_dir(&conf, Some(old.path())).unwrap();
+        let original_conf = std::fs::read(&conf).unwrap();
         state.set_data_dir_conf(&conf);
         std::os::unix::fs::symlink(old.path().join("private"), new.path().join("private")).unwrap();
         assert!(state.set_data_dir(new.path().to_str().unwrap()).await.is_err());
-        assert!(!conf.exists());
-    }
-
-    #[test]
-    fn data_directory_copy_preserves_existing_files() {
-        let source = tempdir().unwrap();
-        let target = tempdir().unwrap();
-        std::fs::write(source.path().join("data"), b"new").unwrap();
-        std::fs::write(target.path().join("data"), b"existing").unwrap();
-        assert!(copy_dir_all(source.path(), target.path()).is_err());
-        assert_eq!(std::fs::read(target.path().join("data")).unwrap(), b"existing");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn data_directory_copy_rejects_source_and_destination_links() {
-        use std::os::unix::fs::symlink;
-        let source = tempdir().unwrap();
-        let target = tempdir().unwrap();
-        let outside = tempdir().unwrap();
-        let external_file = outside.path().join("secret");
-        std::fs::write(&external_file, b"external").unwrap();
-        symlink(&external_file, source.path().join("link")).unwrap();
-        assert!(copy_dir_all(source.path(), target.path()).is_err());
-        assert!(!target.path().join("link").exists());
-        std::fs::remove_file(source.path().join("link")).unwrap();
-
-        std::fs::create_dir(source.path().join("private")).unwrap();
-        std::fs::write(source.path().join("private/secret"), b"node").unwrap();
-        symlink(outside.path(), target.path().join("private")).unwrap();
-        assert!(copy_dir_all(source.path(), target.path()).is_err());
-        assert_eq!(std::fs::read(external_file).unwrap(), b"external");
+        assert_eq!(std::fs::read(&conf).unwrap(), original_conf);
     }
 
     #[tokio::test]
@@ -44716,7 +46020,7 @@ mod tests {
         s.snapshot_boot_config().await;
         assert!(s.restart_pending_keys().await.is_empty());
 
-        // Staging a move in epixnet.conf pends data_dir until the next start.
+        // A pending move pends data_dir without changing the effective config.
         let target = target.path().join("new-root");
         s.set_data_dir(target.to_str().unwrap()).await.unwrap();
         assert_eq!(s.restart_pending_keys().await, vec!["data_dir".to_string()]);
@@ -45628,7 +46932,17 @@ mod tests {
                 epix_content::dumps_content(&source_v2).as_bytes(),
             )
             .unwrap();
-        state.update_content(&source, Some(source_v2)).await;
+        let source_epoch = state.db_source_epoch(&source);
+        let update = {
+            let state = state.clone();
+            let source = source.clone();
+            tokio::spawn(async move { state.update_content(&source, Some(source_v2)).await })
+        };
+        db_test_step("source root changed before merger install", async {
+            while state.db_source_epoch(&source) == source_epoch {
+                tokio::task::yield_now().await;
+            }
+        }).await;
         state
             .refresh_verified_object_paths(&source, &source, &source_storage)
             .await
@@ -45641,6 +46955,7 @@ mod tests {
         assert!(!rebuild.is_finished(), "rebuild abandoned a contended authority tree");
         drop(source_tree);
         db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
+        db_test_step("source root update completed", update).await.unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)
@@ -45763,6 +47078,78 @@ mod tests {
         assert_eq!(rows.len(), 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn db_query_budget_expiry_never_returns_retired_rows() {
+        for retirement in ["unavailable", "authority", "filter", "membership"] {
+            let (_dir, state, merger) = merger_with_one_post().await;
+            let receipt = state.current_receipt_for(&merger).await.unwrap();
+            // First retire a handle while a replacement remains available.
+            // Its successful SQL result must not become a fallback answer.
+            state.xites.write().await.get_mut(&merger).unwrap().db_generation =
+                state.next_db_generation();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+            let query = state.db_query_with_receipt(
+                &merger,
+                "SELECT title FROM post",
+                &Value::Null,
+                receipt,
+                deadline,
+            );
+            tokio::pin!(query);
+            assert!(
+                futures_util::poll!(&mut query).is_pending(),
+                "changed receipt must enter its retry wait"
+            );
+
+            // Retire the replacement during that wait, then exhaust the
+            // budget before its next read. This covers persistent refresh,
+            // authority revocation, local filtering, and merger permission.
+            match retirement {
+                "unavailable" => {
+                    state.xites.write().await.get_mut(&merger).unwrap().db = None;
+                }
+                "authority" => {
+                    state.bump_verified_index_epoch(&merger);
+                }
+                "filter" => {
+                    state.bump_db_filter_epoch();
+                }
+                "membership" => {
+                    state.remove_permission(&merger, "Merger:EpixPost").await;
+                }
+                _ => unreachable!(),
+            }
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+            let result = query.await;
+            assert_eq!(
+                result.unwrap_err(),
+                "database authority changed while query ran",
+                "retired rows escaped after {retirement}"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn db_query_retries_an_ordinary_receipt_change() {
+        let (_dir, state, merger) = merger_with_one_post().await;
+        let receipt = state.current_receipt_for(&merger).await.unwrap();
+        state.xites.write().await.get_mut(&merger).unwrap().db_generation =
+            state.next_db_generation();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+        let rows = state
+            .db_query_with_receipt(
+                &merger,
+                "SELECT title FROM post",
+                &Value::Null,
+                receipt,
+                deadline,
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["title"], "hello");
+    }
+
     #[tokio::test]
     async fn db_query_discards_a_detached_pre_revocation_handle() {
         let (_dir, state, merger) = merger_with_one_post().await;
@@ -45873,16 +47260,24 @@ mod tests {
         };
         db_test_step("database pause reached", started.notified()).await;
 
-        state
-            .delete_file(&source, "data/u/data.json", None)
-            .await
-            .unwrap();
+        let source_epoch = state.db_source_epoch(&source);
+        let delete = {
+            let state = state.clone();
+            let source = source.clone();
+            tokio::spawn(async move { state.delete_file(&source, "data/u/data.json", None).await })
+        };
+        db_test_step("source deletion changed its epoch before install", async {
+            while state.db_source_epoch(&source) == source_epoch {
+                tokio::task::yield_now().await;
+            }
+        }).await;
         state.merger_db_before_install_pause
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .take();
         release.add_permits(1);
         db_test_step("paused merger rebuild completed", rebuild).await.unwrap();
+        db_test_step("source deletion completed", delete).await.unwrap().unwrap();
 
         let rows = state
             .db_query(&merger, "SELECT title FROM post", &Value::Null)

@@ -37,7 +37,7 @@ const BACKUPS_DIR: &str = "backups";
 const PENDING_DIR: &str = "restore-pending";
 
 /// The component keys, in display order.
-const COMPONENTS: &[&str] = &["keys", "config", "zites", "transport"];
+const COMPONENTS: &[&str] = &["keys", "config", "xites", "transport"];
 
 /// The onion service's permanent identity key in the Arti keystore (the
 /// `.onion` address derives from it). "epix" is the nickname the runtime
@@ -58,7 +58,7 @@ fn component_label(key: &str) -> &'static str {
     match key {
         "keys" => "Keys & identity",
         "config" => "Node settings",
-        "zites" => "Zites & xite data",
+        "xites" => "Xites & xite data",
         "transport" => "Onion & I2P address keys",
         _ => "Unknown",
     }
@@ -68,7 +68,7 @@ fn component_description(key: &str) -> &'static str {
     match key {
         "keys" => "Your master seed and per-xite private keys (private/users.json). This is what recovers your identity.",
         "config" => "The node configuration (private/config.json).",
-        "zites" => "All zite content and the served-xites list, so this node serves the same xites again.",
+        "xites" => "All xite content and the served-xites list, so this node serves the same xites again.",
         "transport" => "The Tor onion-service and I2P destination private keys. Restoring them on \
                         another computer keeps your .onion and .b32.i2p addresses, so the node \
                         continues hosting under the same addresses after a move.",
@@ -95,7 +95,7 @@ pub struct Manifest {
 pub struct ComponentEntry {
     /// Data-root-relative file paths with `/` separators.
     pub files: Vec<String>,
-    /// For `zites`: the xite addresses whose `data/<address>/` trees are included.
+    /// For `xites`: the xite addresses whose `data/<address>/` trees are included.
     // Written as `xites`; the legacy `sites` key is still accepted on read, so
     // archives made by older nodes keep restoring.
     #[serde(default, skip_serializing_if = "Vec::is_empty", alias = "sites")]
@@ -177,14 +177,14 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
         "config" => {
             push_if_exists("private/config.json");
         }
-        "zites" => {
+        "xites" => {
             push_if_exists("private/xites.json");
             // Legacy registry name: still archived when present, so a backup
             // taken before the first start on a new build is complete.
             push_if_exists("private/sites.json");
             push_if_exists("private/permissions.json");
             push_if_exists("private/filters.json");
-            for addr in zite_addresses(data_root) {
+            for addr in xite_addresses(data_root) {
                 collect_files(&data_root.join("data").join(&addr), &format!("data/{addr}"), &mut out);
             }
         }
@@ -198,8 +198,8 @@ fn component_files(data_root: &Path, component: &str) -> Vec<(PathBuf, String)> 
 }
 
 /// The xite addresses under `data/` (only valid `epix1…` bech32 dirs count -
-/// anything else there is not zite content we can safely restore).
-fn zite_addresses(data_root: &Path) -> Vec<String> {
+/// anything else there is not xite content we can safely restore).
+fn xite_addresses(data_root: &Path) -> Vec<String> {
     let mut addrs: Vec<String> = std::fs::read_dir(data_root.join("data"))
         .map(|rd| {
             rd.filter_map(Result::ok)
@@ -319,7 +319,7 @@ pub fn create_backup(
                 .map(|(_, rel)| rel.clone())
                 .filter(|rel| !rel.starts_with("data/"))
                 .collect(),
-            xites: if *comp == "zites" { zite_addresses(data_root) } else { Vec::new() },
+            xites: if *comp == "xites" { xite_addresses(data_root) } else { Vec::new() },
         };
         manifest.components.insert(comp.to_string(), entry);
         all_files.extend(files);
@@ -420,16 +420,22 @@ pub fn list_backups(data_root: &Path) -> Vec<BackupInfo> {
 pub fn read_manifest(path: &Path) -> Result<Manifest, String> {
     let file = std::fs::File::open(path).map_err(|e| e.to_string())?;
     let mut zip = zip::ZipArchive::new(std::io::BufReader::new(file))
-        .map_err(|_| "Not a valid backup archive".to_string())?;
+        .map_err(|e| format!("Not a valid backup archive: {e}"))?;
     let entry = zip
         .by_name("manifest.json")
-        .map_err(|_| "Not an EpixNet backup (no manifest.json)".to_string())?;
+        .map_err(|e| match e {
+            zip::result::ZipError::FileNotFound =>
+                "Not an EpixNet backup (no manifest.json)".to_string(),
+            zip::result::ZipError::UnsupportedArchive(zip::result::ZipError::PASSWORD_REQUIRED) =>
+                "The backup manifest is encrypted. EpixNet backups require an unencrypted manifest.json".to_string(),
+            e => format!("Could not read backup manifest: {e}"),
+        })?;
     let mut bytes = Vec::new();
     // The manifest is small; cap the read so a hostile archive can't balloon.
     entry
         .take(1024 * 1024)
         .read_to_end(&mut bytes)
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| format!("Could not read backup manifest: {e}"))?;
     let manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|_| "Unreadable backup manifest".to_string())?;
     if manifest.app != "epixnet" {
@@ -523,8 +529,8 @@ fn restore_whitelist(manifest: &Manifest, selected: &[String]) -> (Vec<String>, 
         .filter_map(|c| manifest.components.get(c))
         .flat_map(|e| e.files.iter().cloned())
         .collect();
-    let xites = if selected.iter().any(|c| c == "zites") {
-        manifest.components.get("zites").map(|e| e.xites.clone()).unwrap_or_default()
+    let xites = if selected.iter().any(|c| c == "xites") {
+        manifest.components.get("xites").map(|e| e.xites.clone()).unwrap_or_default()
     } else {
         Vec::new()
     };
@@ -547,13 +553,17 @@ fn stage_archive(
     let file = std::fs::File::open(backup_path).map_err(|e| e.to_string())?;
     let mut zip: BackupArchive = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|_| "Not a valid backup archive".to_string())?;
-    let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+    let names: Vec<String> = zip
+        .file_names()
+        .map(|name| name.map(|name| name.into_owned()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| format!("Invalid backup file name: {e}"))?;
     let mut staged_files = Vec::new();
-    for name in names {
+    for (index, name) in names.into_iter().enumerate() {
         if name == "manifest.json" || !entry_allowed(&name, allowed_files, allowed_xites) {
             continue;
         }
-        if stage_entry(&mut zip, &name, password, encrypted, pending)? {
+        if stage_entry(&mut zip, index, &name, password, encrypted, pending)? {
             staged_files.push(name);
         }
     }
@@ -580,14 +590,17 @@ fn stage_archive(
 /// the entry was skipped (a directory or symlink), not staged.
 fn stage_entry(
     zip: &mut BackupArchive,
+    index: usize,
     name: &str,
     password: Option<&str>,
     encrypted: bool,
     pending: &Path,
 ) -> Result<bool, String> {
+    // ZIP 9 indexes names by their original bytes. Keep the decoded name for
+    // path checks, but use its index so legacy CP437 names remain readable.
     let mut entry = match password {
-        Some(pwd) => zip.by_name_decrypt(name, pwd.as_bytes()),
-        None => zip.by_name(name),
+        Some(pwd) => zip.by_index_decrypt(index, pwd.as_bytes()),
+        None => zip.by_index(index),
     }
     .map_err(|e| match e {
         zip::result::ZipError::InvalidPassword => "Wrong password".to_string(),
@@ -1079,7 +1092,7 @@ pub(crate) async fn backup_upload(
     }
 }
 
-/// Stream the multipart "file" field to `part_path`. A zites backup can be
+/// Stream the multipart "file" field to `part_path`. A xites backup can be
 /// huge, so chunks go straight to disk.
 async fn receive_upload(
     multipart: &mut axum::extract::Multipart,
@@ -1261,7 +1274,7 @@ fn render_backup_page(
     crate::page_shell(
         "Backup & Restore",
         "Backup &amp; Restore",
-        "Back up your keys, settings, and zites - and restore them here or on another device.",
+        "Back up your keys, settings, and xites - and restore them here or on another device.",
         &body,
         homepage,
         theme,
@@ -1319,14 +1332,17 @@ fn render_create_tab(body: &mut String, backups: &[BackupInfo], csrf: &str) {
          <div class='config'>\
            <div class='plugin'>\
              <div class='title'><h3>Everything</h3>\
-               <div class='description'>Keys, node settings, zites, and your onion &amp; I2P addresses in one archive.</div></div>\
+               <div class='description'>Keys, node settings, xites, and your onion &amp; I2P addresses in one archive.</div></div>\
              <label class='value value-right checkbox'>\
-               <input type='checkbox' id='comp-all' checked/>\
+               <input type='checkbox' id='comp-all'/>\
                <div class='checkbox-skin'></div></label>\
            </div>"
     ));
     for comp in COMPONENTS {
-        body.push_str(&component_checkbox_row(comp, true));
+        // Xites are off by default: a full-content archive of every served
+        // xite runs to gigabytes and is rarely what an operator meant when
+        // they only wanted keys and settings backed up.
+        body.push_str(&component_checkbox_row(comp, *comp != "xites"));
     }
     body.push_str(&format!(
         "</div>\
@@ -1482,8 +1498,8 @@ fn render_restore_page(
     ));
     for comp in COMPONENTS {
         let Some(entry) = manifest.components.get(*comp) else { continue };
-        let extra = if *comp == "zites" && !entry.xites.is_empty() {
-            format!(" This backup holds {} zite(s).", entry.xites.len())
+        let extra = if *comp == "xites" && !entry.xites.is_empty() {
+            format!(" This backup holds {} xite(s).", entry.xites.len())
         } else {
             String::new()
         };
@@ -1563,7 +1579,7 @@ fn render_restarting_page(theme: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A scratch data root with an identity, config, and one zite.
+    /// A scratch data root with an identity, config, and one xite.
     fn scratch_root() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
@@ -1596,6 +1612,89 @@ mod tests {
         COMPONENTS.iter().map(ToString::to_string).collect()
     }
 
+    fn write_manifest_fixture(path: &Path, name: &str, encrypted: bool) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        let mut options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        if encrypted {
+            options = options.with_aes_encryption(zip::AesMode::Aes256, "fixture-password");
+        }
+        zip.start_file(name, options).unwrap();
+        zip.write_all(br#"{"format_version":1,"app":"epixnet","app_version":"0.5.24","created":"2026-10-27T00:00:00Z","encrypted":false,"components":{}}"#).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn manifest_reader_requires_a_root_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested.zip");
+        write_manifest_fixture(&path, "backup/manifest.json", false);
+
+        assert_eq!(read_manifest(&path).err().unwrap(), "Not an EpixNet backup (no manifest.json)");
+    }
+
+    #[test]
+    fn manifest_reader_identifies_an_encrypted_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("encrypted.zip");
+        write_manifest_fixture(&path, "manifest.json", true);
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("manifest is encrypted"), "unexpected error: {err}");
+        assert!(!err.contains("no manifest.json"));
+    }
+
+    #[test]
+    fn manifest_reader_reports_unsupported_compression() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("unsupported.zip");
+        write_manifest_fixture(&path, "manifest.json", false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        // Zstandard is not enabled for backups. Change both header methods
+        // without changing the entry name or its offsets.
+        bytes[8..10].copy_from_slice(&93u16.to_le_bytes());
+        let central = bytes.windows(4).position(|part| part == b"PK\x01\x02").unwrap();
+        bytes[central + 10..central + 12].copy_from_slice(&93u16.to_le_bytes());
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("Could not read backup manifest"), "unexpected error: {err}");
+        assert!(err.contains("compression method not supported: 93"), "unexpected error: {err}");
+        assert!(!err.contains("no manifest.json"));
+    }
+
+    #[test]
+    fn manifest_reader_reports_a_damaged_local_header() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged-header.zip");
+        write_manifest_fixture(&path, "manifest.json", false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes[0] = b'X';
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("Could not read backup manifest"), "unexpected error: {err}");
+        assert!(err.contains("Invalid local file header"), "unexpected error: {err}");
+        assert!(!err.contains("no manifest.json"));
+    }
+
+    #[test]
+    fn manifest_reader_identifies_a_checksum_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("damaged-data.zip");
+        write_manifest_fixture(&path, "manifest.json", false);
+        let mut bytes = std::fs::read(&path).unwrap();
+        let name_len = u16::from_le_bytes([bytes[26], bytes[27]]) as usize;
+        let extra_len = u16::from_le_bytes([bytes[28], bytes[29]]) as usize;
+        bytes[30 + name_len + extra_len] ^= 1;
+        std::fs::write(&path, bytes).unwrap();
+
+        let err = read_manifest(&path).err().unwrap();
+        assert!(err.contains("Could not read backup manifest"), "unexpected error: {err}");
+        assert!(err.contains("checksum"), "unexpected error: {err}");
+    }
+
     #[test]
     fn create_list_roundtrip_and_exclusions() {
         let dir = scratch_root();
@@ -1610,12 +1709,12 @@ mod tests {
         assert_eq!(m.format_version, SUPPORTED_BACKUP_FORMAT);
         assert!(!m.encrypted);
         assert_eq!(m.components.len(), 3);
-        assert_eq!(m.components["zites"].xites.len(), 1);
+        assert_eq!(m.components["xites"].xites.len(), 1);
 
         // No caches, no backups dir, forward slashes only.
         let f = std::fs::File::open(root.join("backups").join(&name)).unwrap();
         let mut zip = zip::ZipArchive::new(f).unwrap();
-        let names: Vec<String> = zip.file_names().map(str::to_string).collect();
+        let names: Vec<String> = zip.file_names().map(|name| name.unwrap().into_owned()).collect();
         assert!(names.iter().all(|n| !n.contains('\\')));
         assert!(names.iter().all(|n| !n.starts_with("backups/")));
         assert!(names.iter().all(|n| !n.starts_with("tor/")));
@@ -1623,7 +1722,7 @@ mod tests {
         assert!(names.iter().any(|n| n == "private/users.json"));
         assert!(names.iter().any(|n| n.starts_with("data/") && n.ends_with("sub/index.html")));
         // Manifest is entry 0 (readable first even when streaming).
-        assert_eq!(zip.by_index(0).unwrap().name(), "manifest.json");
+        assert_eq!(zip.by_index(0).unwrap().name().unwrap(), "manifest.json");
     }
 
     #[test]
@@ -1634,9 +1733,48 @@ mod tests {
             create_backup(root, &["keys".to_string()], None, "0.9", "epix-backup").unwrap();
         let f = std::fs::File::open(root.join("backups").join(&name)).unwrap();
         let zip = zip::ZipArchive::new(f).unwrap();
-        let names: Vec<&str> = zip.file_names().collect();
+        let names: Vec<String> = zip.file_names().map(|name| name.unwrap().into_owned()).collect();
         assert_eq!(names.len(), 2); // manifest + users.json
-        assert!(names.contains(&"private/users.json"));
+        assert!(names.iter().any(|name| name == "private/users.json"));
+    }
+
+    #[test]
+    fn restore_preserves_unicode_file_names() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let xite = std::fs::read_dir(root.join("data")).unwrap().next().unwrap().unwrap();
+        let path = xite.path().join("sub/café.txt");
+        std::fs::write(&path, b"unicode filename").unwrap();
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        stage_restore(root, &root.join("backups").join(name), &all_components(), None, "0.9").unwrap();
+        let staged = root.join(PENDING_DIR).join(path.strip_prefix(root).unwrap());
+        assert_eq!(std::fs::read(staged).unwrap(), b"unicode filename");
+    }
+
+    #[test]
+    fn restore_preserves_legacy_cp437_file_names() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let xite = std::fs::read_dir(root.join("data")).unwrap().next().unwrap().unwrap();
+        std::fs::write(xite.path().join("sub/caf_.txt"), b"legacy filename").unwrap();
+        let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
+        let path = root.join("backups").join(name);
+
+        // Replace the ASCII placeholder in both headers with CP437 e-acute.
+        // Both names have eight bytes, so offsets and lengths stay unchanged.
+        let mut bytes = std::fs::read(&path).unwrap();
+        let offsets: Vec<_> = bytes.windows(b"caf_.txt".len())
+            .enumerate().filter_map(|(i, part)| (part == b"caf_.txt").then_some(i))
+            .collect();
+        assert_eq!(offsets.len(), 2);
+        for offset in offsets {
+            bytes[offset + 3] = 0x82;
+        }
+        std::fs::write(&path, bytes).unwrap();
+
+        stage_restore(root, &path, &all_components(), None, "0.9").unwrap();
+        let staged = root.join(PENDING_DIR).join(xite.path().strip_prefix(root).unwrap()).join("sub/café.txt");
+        assert_eq!(std::fs::read(staged).unwrap(), b"legacy filename");
     }
 
     #[test]
@@ -1704,7 +1842,7 @@ mod tests {
     fn malicious_entries_never_staged() {
         let dir = scratch_root();
         let root = dir.path();
-        let addr = zite_addresses(root).remove(0);
+        let addr = xite_addresses(root).remove(0);
         let path = root.join("backups/evil.zip");
         let f = std::fs::File::create(&path).unwrap();
         let mut zip = zip::ZipWriter::new(f);
@@ -1715,7 +1853,7 @@ mod tests {
                 "{{\"format_version\":1,\"app\":\"epixnet\",\"app_version\":\"0.9\",\
                  \"created\":\"2026-01-01T00:00:00Z\",\"encrypted\":false,\"components\":{{\
                  \"keys\":{{\"files\":[\"private/users.json\"]}},\
-                 \"zites\":{{\"files\":[],\"sites\":[\"{addr}\"]}}}}}}"
+                 \"xites\":{{\"files\":[],\"xites\":[\"{addr}\"]}}}}}}"
             )
             .as_bytes(),
         )
@@ -1754,7 +1892,7 @@ mod tests {
     fn stage_and_apply_roundtrip() {
         let dir = scratch_root();
         let root = dir.path();
-        let addr = zite_addresses(root).remove(0);
+        let addr = xite_addresses(root).remove(0);
         let name = create_backup(root, &all_components(), None, "0.9", "epix-backup").unwrap();
         let path = root.join("backups").join(&name);
 
@@ -1771,7 +1909,7 @@ mod tests {
             std::fs::read(root.join("private/users.json")).unwrap(),
             b"{\"seed\":\"secret\"}"
         );
-        // The zite dir was replaced wholesale: stale file gone, backup files in.
+        // The xite dir was replaced wholesale: stale file gone, backup files in.
         assert!(!root.join("data").join(&addr).join("stale.txt").exists());
         assert!(root.join("data").join(&addr).join("sub/index.html").is_file());
         // Staging dir cleaned up.

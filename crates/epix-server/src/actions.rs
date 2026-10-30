@@ -90,14 +90,14 @@ async fn dispatch(
     match action {
         // --- authoring (offline, against the data dir) --------------------
         "siteCreate" => {
-            let state = open_state(data_root, version).await;
+            let state = open_state(version).await?;
             let (address, privatekey) = state.create_xite().await?;
             println!("----------------------------------------------------------------------");
             println!("Xite private key: {privatekey}");
             println!("          !!! ^ Save it now, required to modify the xite ^ !!!");
             println!("Xite address:     {address}");
             println!("----------------------------------------------------------------------");
-            println!("Xite created! You can find it in {}", data_root.join("data").join(&address).display());
+            println!("Xite created! You can find it in {}", state.data_root_path().unwrap().join("data").join(&address).display());
             Ok(())
         }
         "siteSign" => {
@@ -130,7 +130,7 @@ async fn dispatch(
                 println!("{inner_path} signed via the running node [live]");
                 return Ok(());
             }
-            let state = open_state(data_root, version).await;
+            let state = open_state(version).await?;
             if !state.has_any_alias(address).await {
                 return Err(format!("Xite not found: {address}"));
             }
@@ -175,7 +175,7 @@ async fn dispatch(
                 return Ok(());
             }
             // Offline path: no node running, so this command drives the publish.
-            let state = open_state(data_root, version).await;
+            let state = open_state(version).await?;
             if !state.has_any_alias(address).await {
                 return Err(format!("Xite not found: {address}"));
             }
@@ -213,7 +213,7 @@ async fn dispatch(
         }
         "siteVerify" => {
             let [address] = args else { return Err("usage: siteVerify <address>".into()) };
-            let state = open_state(data_root, version).await;
+            let state = open_state(version).await?;
             if !state.has_any_alias(address).await {
                 return Err(format!("Xite not found: {address}"));
             }
@@ -241,7 +241,7 @@ async fn dispatch(
         }
         "dbRebuild" => {
             let [address] = args else { return Err("usage: dbRebuild <address>".into()) };
-            let state = open_state(data_root, version).await;
+            let state = open_state(version).await?;
             let started = std::time::Instant::now();
             if state.rebuild_xite_db(address).await {
                 println!("Db rebuilt in {:.3}s", started.elapsed().as_secs_f64());
@@ -254,14 +254,14 @@ async fn dispatch(
             let [address, query] = args else {
                 return Err("usage: dbQuery <address> <sql>".into());
             };
-            let state = open_state(data_root, version).await;
+            let state = open_state(version).await?;
             let rows = state.db_query(address, query, &serde_json::Value::Null).await?;
             println!("{}", serde_json::to_string_pretty(&rows).map_err(|e| e.to_string())?);
             Ok(())
         }
         "importBundle" => {
             let [path] = args else { return Err("usage: importBundle <bundle.zip>".into()) };
-            let state = open_state(data_root, version).await;
+            let state = open_state(version).await?;
             let imported = state.import_bundle(std::path::Path::new(path)).await?;
             for address in &imported {
                 println!("Imported {address}");
@@ -301,7 +301,7 @@ async fn dispatch(
                     _ => println!("Downloading {address} [live] - watch the node log"),
                 },
                 None => {
-                    let state = open_state(data_root, version).await;
+                    let state = open_state(version).await?;
                     match action {
                         "siteList" => {
                             let xites = state.xite_addresses().await;
@@ -310,10 +310,12 @@ async fn dispatch(
                             }
                             println!("{} xite(s) [offline]", xites.len());
                         }
-                        "siteDelete" if !state.remove_xite(&address).await => {
-                            return Err(format!("Unknown xite: {address}"));
+                        "siteDelete" => {
+                            if !state.try_remove_xite(&address).await? {
+                                return Err(format!("Unknown xite: {address}"));
+                            }
+                            println!("Deleted {address} [offline]");
                         }
-                        "siteDelete" => println!("Deleted {address} [offline]"),
                         // No network stack offline: register it so the node
                         // clones it on the next start.
                         _ => {
@@ -347,7 +349,7 @@ async fn dispatch(
                     return Ok(());
                 }
                 Ok(None) => {
-                    let state = open_state(data_root, version).await;
+                    let state = open_state(version).await?;
                     if let Some(key) = state.xite_privatekey(address).await {
                         println!("{}", epix_crypt::sign(&message, &key).map_err(|e| e.to_string())?);
                         return Ok(());
@@ -528,10 +530,19 @@ async fn admin_call(
 }
 
 /// Open the node state offline: data dir + user + the served-xite registry.
-async fn open_state(data_root: &std::path::Path, version: &str) -> Arc<AppState> {
-    let state = AppState::with_data_dir(version, data_root);
+async fn open_state(version: &str) -> Result<Arc<AppState>, String> {
+    // The root captured for live admin dispatch can become stale if a move
+    // commits while this action waits. Resolve and lock the selected root now.
+    open_prepared_state(version, epix_node::prepare_data_root()?).await
+}
+
+async fn open_prepared_state(
+    version: &str,
+    lease: Arc<epix_ui::data_relocation::DataRootLease>,
+) -> Result<Arc<AppState>, String> {
+    let state = AppState::with_data_dir_leased(version, lease);
     state.restore_xites().await;
-    state
+    Ok(state)
 }
 
 /// Bring up an EDX link to a clearnet peer: dial, exchange the magic, run the
@@ -551,12 +562,18 @@ async fn connect(ip: &str, port: &str) -> Result<epix_edx::conn::Conn, String> {
 mod tests {
     use super::*;
 
+    async fn open_fixture_state(root: &std::path::Path) -> Result<Arc<AppState>, String> {
+        let lease = epix_ui::data_relocation::DataRootLease::acquire(root)
+            .map_err(|e| e.to_string())?;
+        open_prepared_state("test", Arc::new(lease)).await
+    }
+
     /// The offline authoring cycle: create, edit, sign with the saved key,
     /// verify clean, tamper, verify dirty.
     #[tokio::test]
     async fn create_sign_verify_cycle() {
         let root = tempfile::tempdir().unwrap();
-        let state = open_state(root.path(), "test").await;
+        let state = open_fixture_state(root.path()).await.unwrap();
         let (address, _privatekey) = state.create_xite().await.unwrap();
         assert!(state.has_xite(&address).await);
         assert!(state.xite_privatekey(&address).await.is_some(), "key saved for later signs");
@@ -572,8 +589,46 @@ mod tests {
 
         // A second state over the same data dir restores the xite (what a
         // fresh CLI invocation does).
-        let state2 = open_state(root.path(), "test").await;
+        assert!(open_fixture_state(root.path()).await.is_err(), "offline writers need exclusive ownership");
+        drop(state);
+        let state2 = open_fixture_state(root.path()).await.unwrap();
         assert!(state2.has_xite(&address).await, "registry persisted");
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn offline_action_reselects_root_after_a_completed_move() {
+        const WORKER: &str = "EPIX_CLI_RELOCATION_WORKER";
+        if let Some(base) = std::env::var_os(WORKER) {
+            tokio::runtime::Runtime::new().unwrap().block_on(async {
+                let captured = epix_ui::paths::default_data_root();
+                let conf = epix_ui::paths::default_conf_path();
+                let state = open_fixture_state(&captured).await.unwrap();
+                state.set_data_dir_conf(&conf);
+                let target = std::path::Path::new(&base).join("moved");
+                state.set_data_dir(target.to_str().unwrap()).await.unwrap();
+                drop(state);
+                let moved = epix_ui::data_relocation::prepare_startup(&conf, &captured).unwrap();
+                drop(moved);
+                let old_registry = std::fs::read(captured.join("private/xites.json")).ok();
+                let address = epix_ui::DASHBOARD_XITE_ADDRESS.to_string();
+                // Simulate an action paused after capturing the old admin root.
+                dispatch("siteDownload", &[address.clone()], &captured, "test").await.unwrap();
+                assert_eq!(std::fs::read(captured.join("private/xites.json")).ok(), old_registry);
+                let registry = std::fs::read_to_string(target.join("private/xites.json")).unwrap();
+                assert!(registry.contains(&address));
+            });
+            return;
+        }
+        let base = tempfile::tempdir().unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "actions::tests::offline_action_reselects_root_after_a_completed_move"])
+            .env(WORKER, base.path())
+            .env("XDG_DATA_HOME", base.path().join("app"))
+            .env("APPDATA", base.path().join("app"))
+            .env_remove("EPIX_DATA_DIR")
+            .status().unwrap();
+        assert!(status.success());
     }
 
     #[test]
