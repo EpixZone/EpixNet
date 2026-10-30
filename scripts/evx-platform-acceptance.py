@@ -94,9 +94,20 @@ def source_manifest(root):
     return {str(p.relative_to(root)): sha256(p) for p in sorted(files)}
 
 
-def tool_version(command):
-    return subprocess.run(command, cwd=ROOT, check=True, capture_output=True,
-                          text=True, timeout=30).stdout.strip()
+# A cold hosted Windows runner has taken over 30 seconds for the first
+# `cargo --version` (the image is scanned on first execution).
+TOOL_VERSION_TIMEOUT = 300
+
+
+def tool_version(command, timeout=TOOL_VERSION_TIMEOUT):
+    """The tool's version text for the manifest. A probe that fails or
+    stalls is recorded as unavailable instead of aborting the profile:
+    the checks themselves run the same tools and fail on a real fault."""
+    try:
+        return subprocess.run(command, cwd=ROOT, check=True, capture_output=True,
+                              text=True, timeout=timeout).stdout.strip()
+    except (OSError, subprocess.SubprocessError) as error:
+        return f"unavailable: {type(error).__name__}: {error}"
 
 
 # Per-check wall budgets in seconds; the default covers a warm cache. The
