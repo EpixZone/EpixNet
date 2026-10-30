@@ -33968,8 +33968,9 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
     use std::io::Read;
     if archive_path.ends_with(".zip") {
         let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).ok()?;
-        // ZIP 9 indexes raw filename bytes; a decoded CP437 name therefore
-        // needs an index lookup instead of a UTF-8 by_name lookup.
+        // ZIP 9.0 indexed raw filename bytes only, so a decoded CP437 name
+        // needed this decoded lookup; 9.1 matches decoded names itself. Keep
+        // the lookup so a CP437 name is found whichever the crate does.
         let index = zip.index_for_name(within).or_else(|| {
             zip.file_names().enumerate().find_map(|(index, name)| {
                 (name.ok()?.as_ref() == within).then_some(index)
@@ -44982,9 +44983,12 @@ mod tests {
         }
         let corrupt_offset = {
             let mut zip = zip::ZipArchive::new(std::io::Cursor::new(&archive)).unwrap();
-            assert!(zip.index_for_name("dir/café.txt").is_none());
+            // ZIP 9.0 indexed raw bytes only; 9.1 also matches decoded names.
+            // The reader below must find the file either way: the raw name is
+            // not UTF-8, so only CP437 decoding can match it.
             let file = zip.by_index(0).unwrap();
             assert_eq!(file.name_raw(), b"dir/caf\x82.txt");
+            assert!(std::str::from_utf8(file.name_raw()).is_err());
             assert_eq!(file.flags().as_u16() & 0x800, 0);
             assert_eq!(file.name().unwrap(), "dir/café.txt");
             file.data_start().unwrap() as usize
