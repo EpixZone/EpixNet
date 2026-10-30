@@ -436,10 +436,21 @@ pub fn read_manifest(path: &Path) -> Result<Manifest, String> {
         .take(1024 * 1024)
         .read_to_end(&mut bytes)
         .map_err(|e| format!("Could not read backup manifest: {e}"))?;
-    let manifest: Manifest =
+    let mut manifest: Manifest =
         serde_json::from_slice(&bytes).map_err(|_| "Unreadable backup manifest".to_string())?;
     if manifest.app != "epixnet" {
         return Err("Not an EpixNet backup".to_string());
+    }
+    // v0.5.24 and earlier used this component name in format 1 archives.
+    // Normalize only on read so current forms and newly written backups keep
+    // using `xites`, with the same file and address restrictions.
+    if let Some(legacy) = manifest.components.remove("zites") {
+        if manifest.components.contains_key("xites") {
+            return Err(
+                "Ambiguous backup manifest: contains both xites and legacy zites components".to_string(),
+            );
+        }
+        manifest.components.insert("xites".to_string(), legacy);
     }
     Ok(manifest)
 }
@@ -1610,6 +1621,207 @@ mod tests {
 
     fn all_components() -> Vec<String> {
         COMPONENTS.iter().map(ToString::to_string).collect()
+    }
+
+    /// v0.5.24 wrote the component as `zites`, with an unencrypted manifest
+    /// and AES-encrypted data. Older archives also used `sites` inside it.
+    fn write_legacy_backup(root: &Path, address_key: &str, ambiguous: bool) -> PathBuf {
+        let addr = xite_addresses(root).remove(0);
+        let mut manifest = serde_json::json!({
+            "format_version": 1,
+            "app": "epixnet",
+            "app_version": "0.5.24",
+            "created": "2026-10-27T00:00:00Z",
+            "encrypted": true,
+            "components": {
+                "keys": {"files": ["private/users.json"]},
+                "config": {"files": ["private/config.json"]},
+                "zites": {"files": ["private/sites.json"], (address_key): [addr]}
+            }
+        });
+        if ambiguous {
+            manifest["components"]["xites"] = manifest["components"]["zites"].clone();
+        }
+        let path = root.join("backups/legacy.zip");
+        let mut zip = zip::ZipWriter::new(std::fs::File::create(&path).unwrap());
+        let plain = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Deflated);
+        zip.start_file("manifest.json", plain).unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
+        let encrypted = plain.with_aes_encryption(zip::AesMode::Aes256, "legacy-password");
+        for name in [
+            "private/users.json".to_string(),
+            "private/config.json".to_string(),
+            "private/sites.json".to_string(),
+            format!("data/{addr}/content.json"),
+            format!("data/{addr}/sub/index.html"),
+        ] {
+            zip.start_file(&name, encrypted).unwrap();
+            zip.write_all(&std::fs::read(root.join(&name)).unwrap())
+                .unwrap();
+        }
+        // These entries must remain excluded when the old component is read.
+        for name in [
+            "../escape".to_string(),
+            "/absolute-escape".to_string(),
+            "private\\users.json".to_string(),
+            "private/other.json".to_string(),
+            "content.db".to_string(),
+            "tor/state".to_string(),
+            "backups/nested.zip".to_string(),
+            format!("data/{addr}/../../escape"),
+            "data/notanaddress/content.json".to_string(),
+        ] {
+            zip.start_file(name, encrypted).unwrap();
+            zip.write_all(b"excluded").unwrap();
+        }
+        zip.finish().unwrap();
+        path
+    }
+
+    #[test]
+    fn legacy_component_encrypted_restore_preserves_all_selected_data() {
+        for address_key in ["xites", "sites"] {
+            let dir = scratch_root();
+            let root = dir.path();
+            let addr = xite_addresses(root).remove(0);
+            let path = write_legacy_backup(root, address_key, false);
+            let expected: BTreeMap<_, _> = [
+                "private/users.json".to_string(),
+                "private/config.json".to_string(),
+                "private/sites.json".to_string(),
+                format!("data/{addr}/content.json"),
+                format!("data/{addr}/sub/index.html"),
+            ]
+            .into_iter()
+            .map(|name| {
+                let bytes = std::fs::read(root.join(&name)).unwrap();
+                std::fs::write(root.join(&name), b"changed").unwrap();
+                (name, bytes)
+            })
+            .collect();
+            std::fs::write(root.join("private/xites.json"), b"current registry").unwrap();
+            std::fs::write(root.join(format!("data/{addr}/stale.txt")), b"stale").unwrap();
+
+            let err = stage_restore(
+                root,
+                &path,
+                &all_components(),
+                Some("wrong-password"),
+                "0.5.25",
+            )
+            .unwrap_err();
+            assert!(
+                err.to_lowercase().contains("password"),
+                "unexpected error: {err}"
+            );
+            assert!(!root.join(PENDING_DIR).exists());
+            assert!(!list_backups(root)
+                .iter()
+                .any(|b| b.file_name.starts_with("pre-restore-")));
+
+            stage_restore(
+                root,
+                &path,
+                &all_components(),
+                Some("legacy-password"),
+                "0.5.25",
+            )
+            .unwrap();
+            for (name, bytes) in &expected {
+                assert_eq!(
+                    std::fs::read(root.join(PENDING_DIR).join(name)).unwrap(),
+                    *bytes,
+                    "{name}"
+                );
+            }
+            let plan: ApplyPlan = serde_json::from_slice(
+                &std::fs::read(root.join(PENDING_DIR).join("apply.json")).unwrap(),
+            )
+            .unwrap();
+            let staged: std::collections::BTreeSet<_> = plan.files.into_iter().collect();
+            assert_eq!(staged, expected.keys().cloned().collect());
+            assert_eq!(plan.replace_dirs, vec![format!("data/{addr}")]);
+
+            let manifest = read_manifest(&path).unwrap();
+            assert!(manifest.encrypted);
+            assert!(manifest.components.contains_key("xites"));
+            assert!(!manifest.components.contains_key("zites"));
+            let page = render_restore_page("legacy.zip", &manifest, None, "", "dark");
+            assert!(page.contains("name='comp_xites'"));
+            assert!(!page.contains("comp_zites"));
+
+            apply_pending_restore(root);
+            for (name, bytes) in &expected {
+                assert_eq!(std::fs::read(root.join(name)).unwrap(), *bytes, "{name}");
+            }
+            assert_eq!(
+                std::fs::read(root.join("private/xites.json")).unwrap(),
+                expected["private/sites.json"]
+            );
+            assert_eq!(std::fs::read(root.join("content.db")).unwrap(), b"db");
+            assert_eq!(std::fs::read(root.join("tor/state")).unwrap(), b"x");
+            assert!(!root.join(format!("data/{addr}/stale.txt")).exists());
+            assert!(!root.join(PENDING_DIR).exists());
+        }
+    }
+
+    #[test]
+    fn legacy_component_remains_excluded_from_a_keys_and_config_restore() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let path = write_legacy_backup(root, "xites", false);
+        let selected = vec!["keys".to_string(), "config".to_string()];
+        stage_restore(root, &path, &selected, Some("legacy-password"), "0.5.25").unwrap();
+        let pending = root.join(PENDING_DIR);
+        assert!(pending.join("private/users.json").is_file());
+        assert!(pending.join("private/config.json").is_file());
+        assert!(!pending.join("private/sites.json").exists());
+        assert!(!pending.join("data").exists());
+    }
+
+    #[test]
+    fn legacy_component_conflicting_with_current_component_is_rejected() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let path = write_legacy_backup(root, "xites", true);
+        let err = stage_restore(
+            root,
+            &path,
+            &all_components(),
+            Some("legacy-password"),
+            "0.5.25",
+        )
+        .unwrap_err();
+        assert!(
+            err.contains("both") && err.contains("xites") && err.contains("zites"),
+            "unexpected error: {err}"
+        );
+        assert!(!root.join(PENDING_DIR).exists());
+        assert_eq!(
+            std::fs::read(root.join("private/users.json")).unwrap(),
+            b"{\"seed\":\"secret\"}"
+        );
+    }
+
+    #[test]
+    fn current_backup_keeps_xites_output_and_content_opt_in() {
+        let dir = scratch_root();
+        let root = dir.path();
+        let name = create_backup(root, &all_components(), None, "0.5.25", "epix-backup").unwrap();
+        let file = std::fs::File::open(root.join("backups").join(name)).unwrap();
+        let mut zip = zip::ZipArchive::new(file).unwrap();
+        let raw: serde_json::Value =
+            serde_json::from_reader(zip.by_name("manifest.json").unwrap()).unwrap();
+        assert!(raw["components"].get("xites").is_some());
+        assert!(raw["components"].get("zites").is_none());
+
+        let mut page = String::new();
+        render_create_tab(&mut page, &[], "test-token");
+        assert!(page.contains("name='comp_xites' data-comp='xites' />"));
+        assert!(!page.contains("name='comp_xites' data-comp='xites' checked"));
+        assert!(!page.contains("comp_zites"));
     }
 
     fn write_manifest_fixture(path: &Path, name: &str, encrypted: bool) {
