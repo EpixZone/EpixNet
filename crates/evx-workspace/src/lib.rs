@@ -1,65 +1,59 @@
 //! Private workspace operations.
 //!
-//! Every operation starts from an already-open directory descriptor for the
-//! workspace root and walks one validated component at a time with
-//! `O_NOFOLLOW | O_DIRECTORY`. Files must be regular with a link count of one.
-//! Writes stage into a `.pending-<random>` sibling, `fsync`, then `rename`
-//! over the target after the caller authorizes the commit. Nothing here resolves
-//! a path string against the host filesystem. Symlinks and special files are
-//! refused. A link-count snapshot cannot prove origin under concurrent hard-link
-//! replacement: an opened alias can disappear before fstat. The trusted broker
-//! must verify read bytes against host-owned write provenance before releasing
-//! them to a guest. This crate alone is not that provenance boundary.
+//! Every operation starts from an already-open directory ([`Dir`]) for the
+//! workspace root and walks one validated component at a time without
+//! following links. Files must be regular with a link count of one. Writes
+//! stage into a `.pending-<random>` sibling, flush, then rename over the
+//! target after the caller authorizes the commit. Nothing here resolves a
+//! path string against the host filesystem. Links, reparse points and
+//! special files are refused. A link-count snapshot cannot prove origin
+//! under concurrent hard-link replacement: an opened alias can disappear
+//! before it is examined. The trusted broker must verify read bytes against
+//! host-owned write provenance before releasing them to a guest. This crate
+//! alone is not that provenance boundary.
 //!
-//! The same code runs in the trusted supervisor (for quota accounting) and in
-//! the OS-confined file helper (for the actual read or write), which is why
-//! this crate has no dependency on either.
+//! The same code runs in the trusted supervisor (for quota accounting) and
+//! in the OS-confined file helper (for the actual read or write), which is
+//! why this crate has no dependency on either. The platform seam is
+//! [`sys`]: `openat` and `flock` on Unix, handle-relative NT opens and an
+//! exclusive directory handle on Windows (`docs/evx-windows-backend.md`).
 
-// Unix descriptor APIs only. Elsewhere this crate is empty, so a workspace
-// build still succeeds; nothing there may depend on it (docs/evx-platforms.md).
-#![cfg(unix)]
-#![forbid(unsafe_code)]
+// Only the platform modules may use `unsafe`, for the raw OS calls.
+#![deny(unsafe_code)]
 
 use std::io::{Read, Write};
+use std::path::Path;
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
-use rustix::fs::{
-    fstat, fsync, mkdirat, openat, renameat, statat, unlinkat, AtFlags, FileType, Mode, OFlags,
-};
 
 use evx_api::{validate_relative_path, Denied, Response, MAX_ENTRIES, MAX_FILE};
+
+pub mod sys;
+pub use sys::{Dir, Entry, Identity, Kind, Lease, Privacy, Stat};
 
 const MAX_DEPTH: usize = 8;
 const STAGING_PREFIX: &str = ".pending-";
 
-/// Open a workspace root. Refuses symlinks and non-directories.
-pub fn open_root(path: &std::path::Path) -> Result<OwnedFd, Denied> {
-    openat(
-        rustix::fs::CWD,
-        path,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| Denied::new("workspace root unavailable"))
+/// Open a workspace root. Refuses links and non-directories.
+pub fn open_root(path: &Path) -> Result<Dir, Denied> {
+    Dir::open_root(path)
 }
 
 /// Bytes and entry count currently used, walking at most `MAX_DEPTH` levels
-/// and `MAX_ENTRIES` entries. Symlinks are counted as entries but never
+/// and `MAX_ENTRIES` entries. Links are counted as entries but never
 /// followed. Fails closed if the workspace is larger than the bounds.
-pub fn usage(root: BorrowedFd<'_>) -> Result<(u64, usize), Denied> {
+pub fn usage(root: &Dir) -> Result<(u64, usize), Denied> {
     let mut total = 0u64;
     let mut count = 0usize;
-    walk(root, 0, &mut |fd, name, kind, size| {
+    walk(root, 0, &mut |_, _, kind, size| {
         count += 1;
         if count > MAX_ENTRIES {
             return Err(Denied::new("workspace entry limit"));
         }
-        if kind == FileType::RegularFile {
+        if kind == Kind::Regular {
             total += size;
         }
-        let _ = (fd, name);
         Ok(())
     })?;
     Ok((total, count))
@@ -67,18 +61,17 @@ pub fn usage(root: BorrowedFd<'_>) -> Result<(u64, usize), Denied> {
 
 /// Remove abandoned staging files left by a helper that died before commit.
 /// Call only while holding the workspace lease.
-pub fn cleanup_staging(root: BorrowedFd<'_>) -> Result<(), Denied> {
+pub fn cleanup_staging(root: &Dir) -> Result<(), Denied> {
     let mut visited = 0usize;
-    walk(root, 0, &mut |fd, name, kind, _| {
+    walk(root, 0, &mut |dir, name, kind, _| {
         visited += 1;
         if visited > MAX_ENTRIES {
             return Err(Denied::new("workspace entry limit"));
         }
-        if kind == FileType::RegularFile && is_staging_name(name) {
-            let st = statat(fd, name, AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(|_| Denied::new("workspace stat"))?;
-            if st.st_nlink == 1 {
-                let _ = unlinkat(fd, name, AtFlags::empty());
+        if kind == Kind::Regular && is_staging_name(name) {
+            let stat = dir.stat(name)?.ok_or_else(|| Denied::new("workspace stat"))?;
+            if stat.links == 1 {
+                let _ = dir.unlink(name);
             }
         }
         Ok(())
@@ -93,97 +86,49 @@ fn is_staging_name(name: &str) -> bool {
             .all(|b| b.is_ascii_hexdigit())
 }
 
-type Visitor<'a> = dyn FnMut(BorrowedFd<'_>, &str, FileType, u64) -> Result<(), Denied> + 'a;
+type Visitor<'a> = dyn FnMut(&Dir, &str, Kind, u64) -> Result<(), Denied> + 'a;
 
-fn walk(
-    dir: BorrowedFd<'_>,
-    depth: usize,
-    visit: &mut Visitor<'_>,
-) -> Result<(), Denied> {
+fn walk(dir: &Dir, depth: usize, visit: &mut Visitor<'_>) -> Result<(), Denied> {
     if depth > MAX_DEPTH {
         return Err(Denied::new("directory depth limit"));
     }
-    // read_from reopens the directory so the listing never shares a file
-    // offset with the caller's descriptor.
-    let reader = rustix::fs::Dir::read_from(dir).map_err(|_| Denied::new("workspace listing"))?;
-    for entry in reader {
-        let entry = entry.map_err(|_| Denied::new("workspace listing"))?;
-        let name = entry
-            .file_name()
-            .to_str()
-            .map_err(|_| Denied::new("workspace name encoding"))?
-            .to_owned();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let st = statat(dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-            .map_err(|_| Denied::new("workspace stat"))?;
-        let kind = FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode);
-        visit(dir, &name, kind, st.st_size as u64)?;
-        if kind == FileType::Directory {
-            let child = openat(
-                dir,
-                name.as_str(),
-                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-                Mode::empty(),
-            )
-            .map_err(|_| Denied::new("workspace directory"))?;
-            walk(child.as_fd(), depth + 1, visit)?;
+    for entry in dir.entries()? {
+        visit(dir, &entry.name, entry.kind, entry.size)?;
+        if entry.kind == Kind::Directory {
+            let child = dir.open_dir(&entry.name)?;
+            walk(&child, depth + 1, visit)?;
         }
     }
     Ok(())
 }
 
-/// Open the parent directory of a validated relative path, optionally creating
-/// intermediate directories with mode 0700.
-fn parent_fd(root: BorrowedFd<'_>, parts: &[&str], create: bool) -> Result<OwnedFd, Denied> {
-    let mut fd = rustix::io::dup(root).map_err(|_| Denied::new("workspace descriptor"))?;
+/// Open the parent directory of a validated relative path, optionally
+/// creating intermediate directories.
+fn parent(root: &Dir, parts: &[&str], create: bool) -> Result<Dir, Denied> {
+    let mut dir = root.try_clone()?;
     for part in &parts[..parts.len() - 1] {
         if create {
-            match mkdirat(fd.as_fd(), *part, Mode::RWXU) {
-                Ok(()) => {}
-                Err(rustix::io::Errno::EXIST) => {}
-                Err(_) => return Err(Denied::new("workspace directory")),
-            }
+            dir.create_dir(part)?;
         }
-        let child = openat(
-            fd.as_fd(),
-            *part,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|_| Denied::new("workspace directory"))?;
-        fd = child;
+        dir = dir.open_dir(part)?;
     }
-    Ok(fd)
+    Ok(dir)
 }
 
 /// Read one bounded regular file.
-pub fn read(root: BorrowedFd<'_>, path: &str) -> Result<Response, Denied> {
+pub fn read(root: &Dir, path: &str) -> Result<Response, Denied> {
     let parts = validate_relative_path(path)?;
-    let parent = parent_fd(root, &parts, false)?;
-    let fd = openat(
-        parent.as_fd(),
-        *parts.last().expect("validated path has a component"),
-        OFlags::RDONLY | OFlags::NONBLOCK | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|error| {
-        if error == rustix::io::Errno::NOENT {
-            Denied::new("workspace file absent")
-        } else {
-            Denied::new("workspace operation denied")
-        }
-    })?;
-    let st = fstat(&fd).map_err(|_| Denied::new("workspace stat"))?;
-    let kind = FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode);
-    if kind != FileType::RegularFile || st.st_nlink != 1 {
+    let parent = parent(root, &parts, false)?;
+    let name = *parts.last().expect("validated path has a component");
+    let (mut file, stat) = parent
+        .open_read(name)?
+        .ok_or_else(|| Denied::new("workspace file absent"))?;
+    if stat.kind != Kind::Regular || stat.links != 1 {
         return Err(Denied::new("not an isolated regular file"));
     }
-    if st.st_size as u64 > MAX_FILE as u64 {
+    if stat.size > MAX_FILE as u64 {
         return Err(Denied::new("file read limit"));
     }
-    let mut file = std::fs::File::from(fd);
     let mut data = Vec::with_capacity(MAX_FILE + 1);
     std::io::Read::by_ref(&mut file)
         .take(MAX_FILE as u64 + 1)
@@ -201,7 +146,7 @@ pub fn read(root: BorrowedFd<'_>, path: &str) -> Result<Response, Denied> {
 
 /// A staged write awaiting commit authorization.
 pub struct StagedWrite {
-    parent: OwnedFd,
+    parent: Dir,
     temp: String,
     target: String,
     bytes: usize,
@@ -220,35 +165,29 @@ impl StagedWrite {
         after_replace: Option<&dyn Fn() -> Result<(), Denied>>,
     ) -> Result<Response, Denied> {
         let result = (|| {
-            renameat(
-                self.parent.as_fd(),
-                self.temp.as_str(),
-                self.parent.as_fd(),
-                self.target.as_str(),
-            )
-            .map_err(|_| Denied::new("workspace operation denied"))?;
+            self.parent.rename(&self.temp, &self.target)?;
             if let Some(hook) = after_replace {
                 hook()?;
             }
-            fsync(self.parent.as_fd()).map_err(|_| Denied::new("workspace operation denied"))?;
+            self.parent.sync()?;
             Ok(Response::Write {
                 ok: true,
                 bytes: self.bytes,
             })
         })();
-        let _ = unlinkat(self.parent.as_fd(), self.temp.as_str(), AtFlags::empty());
+        let _ = self.parent.unlink(&self.temp);
         result
     }
 
     /// Discard the staged bytes.
     pub fn abort(self) {
-        let _ = unlinkat(self.parent.as_fd(), self.temp.as_str(), AtFlags::empty());
+        let _ = self.parent.unlink(&self.temp);
     }
 }
 
 /// Validate quota, stage the bytes durably and return a handle for commit.
 pub fn stage_write(
-    root: BorrowedFd<'_>,
+    root: &Dir,
     path: &str,
     text: &str,
     storage_limit: u64,
@@ -266,37 +205,26 @@ pub fn stage_write(
     if count + parts.len() + 1 > MAX_ENTRIES {
         return Err(Denied::new("workspace entry limit"));
     }
-    let parent = parent_fd(root, &parts, true)?;
+    let parent = parent(root, &parts, true)?;
     let target = parts
         .last()
         .expect("validated path has a component")
         .to_string();
-    match statat(parent.as_fd(), target.as_str(), AtFlags::SYMLINK_NOFOLLOW) {
-        Ok(st) => {
-            let kind = FileType::from_raw_mode(st.st_mode as rustix::fs::RawMode);
-            if kind != FileType::RegularFile || st.st_nlink != 1 {
-                return Err(Denied::new("not an isolated regular file"));
-            }
+    if let Some(stat) = parent.stat(&target)? {
+        if stat.kind != Kind::Regular || stat.links != 1 {
+            return Err(Denied::new("not an isolated regular file"));
         }
-        Err(rustix::io::Errno::NOENT) => {}
-        Err(_) => return Err(Denied::new("workspace operation denied")),
     }
     let temp = format!("{STAGING_PREFIX}{}", random_hex());
-    let fd = openat(
-        parent.as_fd(),
-        temp.as_str(),
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|_| Denied::new("workspace operation denied"))?;
+    let mut file = parent.create_new(&temp)?;
     let staged = StagedWrite {
         parent,
         temp,
         target,
         bytes: data.len(),
     };
-    let mut file = std::fs::File::from(fd);
     if file.write_all(data).is_err() || file.sync_all().is_err() {
+        drop(file);
         staged.abort();
         return Err(Denied::new("workspace operation denied"));
     }
@@ -311,18 +239,55 @@ fn random_hex() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::symlink;
 
-    fn root() -> (tempfile::TempDir, OwnedFd) {
+    fn root() -> (tempfile::TempDir, Dir) {
         let dir = tempfile::tempdir().unwrap();
-        let fd = open_root(dir.path()).unwrap();
-        (dir, fd)
+        let root = open_root(dir.path()).unwrap();
+        (dir, root)
+    }
+
+    #[cfg(unix)]
+    fn symlink(target: &Path, link: &Path) {
+        std::os::unix::fs::symlink(target, link).unwrap();
+    }
+
+    /// A junction plays the symbolic link's part on Windows: it needs no
+    /// privilege and is a reparse point like a symbolic link.
+    #[cfg(windows)]
+    fn symlink(target: &Path, link: &Path) {
+        if target.is_dir() {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+        } else {
+            std::os::windows::fs::symlink_file(target, link).unwrap();
+        }
+    }
+
+    /// Whether this host can create file symbolic links (Developer Mode or
+    /// the privilege); directory junctions always work.
+    fn file_symlinks_available(dir: &Path) -> bool {
+        #[cfg(windows)]
+        {
+            std::fs::write(dir.join("probe-target"), b"x").unwrap();
+            std::os::windows::fs::symlink_file(dir.join("probe-target"), dir.join("probe-link"))
+                .is_ok()
+        }
+        #[cfg(unix)]
+        {
+            let _ = dir;
+            true
+        }
     }
 
     #[test]
     fn write_then_read_round_trip() {
         let (dir, fd) = root();
-        let staged = stage_write(fd.as_fd(), "state/presence.txt", "game fixture", 4096).unwrap();
+        let staged = stage_write(&fd, "state/presence.txt", "game fixture", 4096).unwrap();
         assert!(matches!(
             staged.commit(None).unwrap(),
             Response::Write {
@@ -330,7 +295,7 @@ mod tests {
                 bytes: 12
             }
         ));
-        let read = read(fd.as_fd(), "state/presence.txt").unwrap();
+        let read = read(&fd, "state/presence.txt").unwrap();
         match read {
             Response::Read {
                 data_b64, bytes, ..
@@ -341,52 +306,50 @@ mod tests {
             other => panic!("{other:?}"),
         }
         assert!(dir.path().join("state/presence.txt").exists());
-        assert_eq!(usage(fd.as_fd()).unwrap(), (12, 2));
+        assert_eq!(usage(&fd).unwrap(), (12, 2));
     }
 
     #[test]
     fn links_special_files_and_escapes_are_refused() {
         let (dir, fd) = root();
-        let outside = dir
-            .path()
-            .parent()
-            .unwrap()
-            .join(format!("evx-ws-outside-{}", random_hex()));
-        std::fs::write(&outside, "secret").unwrap();
-        symlink(&outside, dir.path().join("outside-link")).unwrap();
-        std::fs::hard_link(&outside, dir.path().join("hard-link")).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret = outside.path().join("secret");
+        std::fs::write(&secret, "secret").unwrap();
+        std::fs::hard_link(&secret, dir.path().join("hard-link")).unwrap();
         std::fs::create_dir(dir.path().join("real")).unwrap();
-        symlink(dir.path().join("real"), dir.path().join("dir-link")).unwrap();
+        symlink(&dir.path().join("real"), &dir.path().join("dir-link"));
         std::fs::write(dir.path().join("real/private.txt"), "x").unwrap();
-        assert!(read(fd.as_fd(), "outside-link").is_err());
-        assert!(read(fd.as_fd(), "hard-link").is_err());
-        assert!(read(fd.as_fd(), "dir-link/private.txt").is_err());
-        assert!(read(fd.as_fd(), "../outside").is_err());
-        assert!(stage_write(fd.as_fd(), "outside-link", "changed", 4096).is_err());
-        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "secret");
-        std::fs::remove_file(&outside).unwrap();
+        if file_symlinks_available(outside.path()) {
+            symlink(&secret, &dir.path().join("outside-link"));
+            assert!(read(&fd, "outside-link").is_err());
+            assert!(stage_write(&fd, "outside-link", "changed", 4096).is_err());
+        }
+        assert!(read(&fd, "hard-link").is_err());
+        assert!(read(&fd, "dir-link/private.txt").is_err());
+        assert!(read(&fd, "../outside").is_err());
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "secret");
     }
 
     #[test]
     fn quota_and_entry_limits_fail_before_mutation() {
         let (dir, fd) = root();
-        assert!(stage_write(fd.as_fd(), "big.txt", &"x".repeat(100), 50).is_err());
-        assert!(stage_write(fd.as_fd(), "a/b/c/d/e/f/g/h/i.txt", "x", 4096).is_err());
+        assert!(stage_write(&fd, "big.txt", &"x".repeat(100), 50).is_err());
+        assert!(stage_write(&fd, "a/b/c/d/e/f/g/h/i.txt", "x", 4096).is_err());
         let long = format!("must-not-create/{}", "x".repeat(300));
-        assert!(stage_write(fd.as_fd(), &long, "x", 4096).is_err());
+        assert!(stage_write(&fd, &long, "x", 4096).is_err());
         assert!(!dir.path().join("must-not-create").exists());
-        assert_eq!(usage(fd.as_fd()).unwrap(), (0, 0));
+        assert_eq!(usage(&fd).unwrap(), (0, 0));
     }
 
     #[test]
     fn staging_cleanup_only_removes_orphans() {
         let (dir, fd) = root();
-        let staged = stage_write(fd.as_fd(), "s.txt", "x", 4096).unwrap();
+        let staged = stage_write(&fd, "s.txt", "x", 4096).unwrap();
         let temp_name = staged.temp.clone();
         std::mem::forget(staged);
         assert!(dir.path().join(&temp_name).exists());
         std::fs::write(dir.path().join(".pending-not-hex"), "keep").unwrap();
-        cleanup_staging(fd.as_fd()).unwrap();
+        cleanup_staging(&fd).unwrap();
         assert!(!dir.path().join(&temp_name).exists());
         assert!(dir.path().join(".pending-not-hex").exists());
     }
@@ -396,13 +359,23 @@ mod tests {
         let (dir, fd) = root();
         let outside = tempfile::tempdir().unwrap();
         std::fs::write(outside.path().join("score.txt"), "outside secret").unwrap();
-        let staged = stage_write(fd.as_fd(), "round/score.txt", "updated", 4096).unwrap();
-        std::fs::rename(dir.path().join("round"), dir.path().join("retired")).unwrap();
-        symlink(outside.path(), dir.path().join("round")).unwrap();
+        let staged = stage_write(&fd, "round/score.txt", "updated", 4096).unwrap();
+        // On Unix the parent is renamed away and a link planted in its
+        // place; the commit still lands in the directory that was opened.
+        // On Windows the open directory handle refuses the rename itself,
+        // and the commit lands in the only `round` there is. Either way the
+        // outside file is untouched.
+        let renamed = std::fs::rename(dir.path().join("round"), dir.path().join("retired")).is_ok();
+        if renamed {
+            symlink(outside.path(), &dir.path().join("round"));
+        }
         staged.commit(None).unwrap();
         assert_eq!(std::fs::read(outside.path().join("score.txt")).unwrap(), b"outside secret");
-        assert_eq!(std::fs::read(dir.path().join("retired/score.txt")).unwrap(), b"updated");
-        assert!(read(fd.as_fd(), "round/score.txt").is_err());
+        let landed = if renamed { "retired/score.txt" } else { "round/score.txt" };
+        assert_eq!(std::fs::read(dir.path().join(landed)).unwrap(), b"updated");
+        if renamed {
+            assert!(read(&fd, "round/score.txt").is_err());
+        }
     }
 
     #[test]
@@ -412,16 +385,20 @@ mod tests {
             let outside = tempfile::tempdir().unwrap();
             let secret = outside.path().join("secret");
             std::fs::write(&secret, "outside secret").unwrap();
-            let staged = stage_write(fd.as_fd(), "score.txt", "updated", 4096).unwrap();
+            if !hard && !file_symlinks_available(outside.path()) {
+                continue;
+            }
+            let staged = stage_write(&fd, "score.txt", "updated", 4096).unwrap();
             let target = dir.path().join("score.txt");
-            if hard { std::fs::hard_link(&secret, &target).unwrap(); }
-            else { symlink(&secret, &target).unwrap(); }
+            if hard {
+                std::fs::hard_link(&secret, &target).unwrap();
+            } else {
+                symlink(&secret, &target);
+            }
             staged.commit(None).unwrap();
             assert_eq!(std::fs::read(&secret).unwrap(), b"outside secret");
             assert_eq!(std::fs::read(&target).unwrap(), b"updated");
             assert!(!target.is_symlink());
         }
     }
-
-
 }
