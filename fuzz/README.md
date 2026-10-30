@@ -31,7 +31,7 @@ CARGO_NET_OFFLINE=true cargo +nightly-2026-10-03 fuzz run lifecycle_metadata --f
 
 `cargo-fuzz 0.13.2` has no `run --locked` option. The locked fetch verifies the separate fuzz lockfile before an offline run. AddressSanitizer, debug assertions and overflow checks are enabled by cargo-fuzz by default. `CARGO_BUILD_JOBS=2` was used for the recorded builds. Fuzz time bounds exclude compilation time. For a smaller CI smoke run, also pass `-runs=10000`; that stops at the first reached run or time limit.
 
-This directory is a separate Cargo workspace. Its lockfile pins dependencies without altering the application's workspace configuration. Wasmtime is pinned by `evx-runtime` to `48.0.5`; the validator uses wasmparser `0.254.2`.
+This directory is a separate Cargo workspace. Its lockfile pins dependencies without altering the application's workspace configuration. Wasmtime is pinned by `evx-runtime` to `48.0.8`; the validator uses wasmparser `0.254.2`.
 The current lockfile aligns shared package versions, sources and checksums
 with the application lockfile. `python3 scripts/check-evx-fuzz-lock.py` checks
 that identity in CI; it does not claim identical feature selection. CI preserves
@@ -111,6 +111,8 @@ are ignored.
 
 [dependency-audit.json](results/dependency-audit.json) records the scoped cargo-audit `0.22.2` result against RustSec database commit `ef6173cbc5c50ec8166f9a5b28f07834144373ee`, updated 2026-10-03. The checked closure is the listed EVX crates and their dependencies on this macOS host.
 
-The initial Wasmtime `48.0.3` lock matched three published advisories: [RUSTSEC-2026-0325](https://rustsec.org/advisories/RUSTSEC-2026-0325.html), [RUSTSEC-2026-0326](https://rustsec.org/advisories/RUSTSEC-2026-0326.html) and [RUSTSEC-2026-0327](https://rustsec.org/advisories/RUSTSEC-2026-0327.html). Their affected GC, exception and component paths are disabled by EVX's profile. No exploit of those paths was demonstrated here. The application and fuzz lockfiles now use patched `48.0.5`; the repeated advisory scan reports no known vulnerability in this scoped closure.
+The initial Wasmtime `48.0.3` lock matched three published advisories: [RUSTSEC-2026-0325](https://rustsec.org/advisories/RUSTSEC-2026-0325.html), [RUSTSEC-2026-0326](https://rustsec.org/advisories/RUSTSEC-2026-0326.html) and [RUSTSEC-2026-0327](https://rustsec.org/advisories/RUSTSEC-2026-0327.html). Their affected GC, exception and component paths are disabled by EVX's profile. No exploit of those paths was demonstrated here. The application and fuzz lockfiles then moved to patched `48.0.5`; the 2026-10-04 scan against that database reported no known vulnerability in this scoped closure.
+
+On 2026-10-14 and 2026-10-19 RustSec published thirteen further Wasmtime 48 advisories (RUSTSEC-2026-0353 to RUSTSEC-2026-0359, RUSTSEC-2026-0361 to RUSTSEC-2026-0364, RUSTSEC-2026-0378 and RUSTSEC-2026-0379, the last a critical aarch64 `br_table` miscompile), all fixed in `48.0.7`. Both lockfiles now use `48.0.8`, itself a 2026-10-29 security release that also fixes GHSA-6fr9-xmw9-5352, GHSA-qw58-7h65-crq2 and GHSA-3982-jqvv-277m. The campaign results above were recorded on `48.0.5` and have not been rerun; the recorded cargo-audit result has not been repeated at `48.0.8`, and the CI cargo-audit, cargo-deny and osv-scanner jobs are the current evidence.
 
 Two maintenance warnings remain: `paste 1.0.15` through Tendermint/flex-error and `proc-macro-error 0.4.12` through bao-tree/genawaiter. The registry request for yanked-package status timed out, so that check remains unverified; the completed advisory scan used `--no-yanked`. Findings elsewhere in the full repository are outside this scoped report.

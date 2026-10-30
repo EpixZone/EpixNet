@@ -13,7 +13,7 @@ use crate::features;
 /// Identity of the engine an artifact is bound to. Change `CONFIG_REVISION`
 /// whenever [`engine_config`] changes in a way that affects compiled output.
 const CONFIG_REVISION: u32 = 2;
-const WASMTIME_VERSION: &str = "48.0.5";
+const WASMTIME_VERSION: &str = "48.0.8";
 
 /// Stable key for artifact caches and for the worker's refusal to load an
 /// artifact produced under a different engine or configuration.
@@ -96,4 +96,35 @@ pub fn engine_config() -> Config {
 /// Create an engine with [`engine_config`].
 pub fn new_engine() -> wasmtime::Result<Engine> {
     Engine::new(&engine_config())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The engine key names the Wasmtime release so artifacts compiled under
+    /// another release are refused; the constant must follow the locked crate.
+    #[test]
+    fn wasmtime_version_matches_lockfile() {
+        let lock = std::fs::read_to_string(
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../Cargo.lock"),
+        )
+        .expect("workspace Cargo.lock");
+        let mut lines = lock.lines();
+        let locked = loop {
+            match lines.next() {
+                Some(line) if line.trim() == r#"name = "wasmtime""# => {
+                    break lines
+                        .next()
+                        .and_then(|line| line.trim().strip_prefix(r#"version = ""#))
+                        .and_then(|rest| rest.strip_suffix('"'))
+                        .expect("wasmtime version follows its name");
+                }
+                Some(_) => continue,
+                None => panic!("wasmtime is not in Cargo.lock"),
+            }
+        };
+        assert_eq!(locked, WASMTIME_VERSION);
+        assert!(engine_key().contains(&format!("wasmtime-{WASMTIME_VERSION}/")));
+    }
 }

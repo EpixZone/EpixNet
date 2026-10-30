@@ -60,7 +60,14 @@ Wasmtime was updated from 48.0.3 to exactly pinned 48.0.5, including its compile
 artifact identity. RustSec flagged RUSTSEC-2026-0325, RUSTSEC-2026-0326 and
 RUSTSEC-2026-0327 in the old release. The affected exception, GC and component
 features are disabled in EVX, but the patched release removes reliance on that
-reachability argument. The final runtime fuzz campaign uses the production pin.
+reachability argument. The final runtime fuzz campaign used the then-production
+48.0.5 pin. The pin later moved to 48.0.8, including its compiled artifact
+identity, when RustSec published thirteen more Wasmtime 48 advisories in
+October 2026, among them the critical RUSTSEC-2026-0379 aarch64 `br_table`
+miscompile; 48.0.8 is itself a 2026-10-29 security release. It also refuses a
+`br_table` with more than 65520 targets at compile time on every backend; such
+a module fails closed in the confined compiler. The fuzz campaign results were
+not rerun.
 
 The execution marker deliberately errs on the side of reconciliation. A crash
 after marking admission but before process startup can pause a job that made
