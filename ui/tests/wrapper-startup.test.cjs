@@ -581,3 +581,15 @@ test("a page cannot harvest the nonce of a reload it provoked", () => {
   assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 1, "a ready page provokes nothing more");
   assert.equal(f.opens(), 1);
 });
+
+test("a repeated introduction keeps the document counted as loaded", () => {
+  // A legacy page with two frame instances introduces itself twice; the
+  // second counts as a replacement, which must not leave the loading
+  // overlay waiting for a load event that never comes.
+  const f = fixture(); f.ready(); f.load();
+  assert.equal(f.wrapper.inner_loaded, true);
+  f.ready();
+  assert.equal(f.wrapper.inner_generation, 1);
+  assert.equal(f.wrapper.inner_loaded, true);
+  assert.equal(f.opens(), 2);
+});

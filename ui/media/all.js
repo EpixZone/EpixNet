@@ -3251,6 +3251,9 @@ if (window.getComputedStyle(document.body).transform) {
       if (introduced) {
         if (this.inner_ready) {
           this.newInnerDocument();
+          // The document that speaks is up, whatever its load event does:
+          // a legacy page with two frame instances gets none after this.
+          this.inner_loaded = this.loadingDocumentReady();
         } else if (this.iframe_reload_request) {
           // The real document arrived on its own (the placeholder's refresh)
           // while a recovery reload was still waiting for its nonce: that
