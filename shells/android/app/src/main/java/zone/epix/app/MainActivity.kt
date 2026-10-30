@@ -965,6 +965,9 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     private fun setChromeHidden(hidden: Boolean) {
         if (chromeHidden == hidden) return
         chromeHidden = hidden
+        // Surface resize can expose Gecko's clear color beneath the fading
+        // controls. Match the chrome without changing the page's theme.
+        geckoView.session?.compositorController?.setClearColor(COLOR_CHROME_BG)
         val visibility = if (hidden) View.GONE else View.VISIBLE
         topBar.visibility = visibility
         bottomBar.visibility = visibility
