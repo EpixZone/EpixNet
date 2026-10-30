@@ -294,7 +294,8 @@ process and accounting backend.
 
 The new [Windows fixture](evx-windows.md) implements an LPAC/Job Object test
 launcher; its MSVC target typecheck and strict Clippy pass on the macOS host.
-Its six native Windows cases remain unrun locally. The
+Its six native Windows cases and the real-runtime fixture passed natively on
+2026-10-29 (see evx-windows.md). The
 [Android fixture](evx-android.md) compiles against official API 36 and passes
 32 portable protocol/lifecycle assertions, with no emulator or device result.
 Both are separate acceptance fixtures and are not node backends. New CI jobs

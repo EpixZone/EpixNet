@@ -87,7 +87,9 @@ fixtures below (the six isolation cases; the real compile/run, `evx.call`
 roundtrip, cancellation and fresh execution), the import inspection (no
 `userenv`, `shell32` or `ole32` import in `acceptance.exe` or
 `evx-windows-worker.exe`) and the `windows-core` profile (169 portable tests,
-11 Pulley tests, product exclusion). Product execution stays disabled.
+11 Pulley tests, product exclusion). Product execution stays disabled. The
+same checks were repeated later that day after the Wasmtime pin moved from
+48.0.5 to 48.0.8 for the October RustSec advisories, with the same results.
 `.github/workflows/evx-windows-fixture.yml` builds on Windows and requires:
 
 ```powershell
