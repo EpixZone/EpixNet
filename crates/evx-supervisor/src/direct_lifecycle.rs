@@ -3,6 +3,7 @@
 //! death. An owned terminal reap completes an invocation. A new kernel boot
 //! can clear process ownership without clearing uncertain effects.
 
+use std::ffi::OsStr;
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::io::{Read, Write};
@@ -124,7 +125,7 @@ impl DirectLifecycle {
         let path = canonical_path(path)?;
         let parent = Dir::open_root(path.parent().ok_or_else(denied)?)?;
         directory_identity(&parent)?;
-        let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(denied)?;
+        let name = path.file_name().and_then(OsStr::to_str).ok_or_else(denied)?;
         if !parent.create_private_dir(name).map_err(|_| denied())? {
             return Err(denied());
         }

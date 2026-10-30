@@ -6,6 +6,7 @@
 //! handle is the entry the directory names, and a directory flush after
 //! the write.
 
+use std::ffi::OsStr;
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -56,7 +57,7 @@ pub(crate) fn direct_lifecycle(root: &Path) -> (
 /// parent when absent.
 fn open_parent(root: &Path) -> Result<(Dir, &str), String> {
     let parent = root.parent().ok_or("state root has no parent")?;
-    let name = root.file_name().and_then(|name| name.to_str()).ok_or("state root has no name")?;
+    let name = root.file_name().and_then(OsStr::to_str).ok_or("state root has no name")?;
     std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
     // The parent is host-owned and trusted; resolve it (a `private` directory
     // may be a link to another volume) before the final open, which never

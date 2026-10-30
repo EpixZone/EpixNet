@@ -53,6 +53,9 @@ fn convert(stat: rustix::fs::Stat) -> Stat {
 }
 
 fn privacy_of(stat: rustix::fs::Stat) -> Privacy {
+    // `st_mode` is 32 bits on Linux and 16 on macOS; the widening is only
+    // a no-op on the former.
+    #[allow(clippy::useless_conversion)]
     let mode = u32::from(stat.st_mode) & 0o7777;
     Privacy {
         owned: stat.st_uid == rustix::process::geteuid().as_raw(),

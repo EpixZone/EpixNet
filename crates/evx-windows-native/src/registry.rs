@@ -62,9 +62,10 @@ pub fn registry_dword(key: HKEY, subkey: &str, value: &str) -> io::Result<u32> {
 /// including `REG_EXPAND_SZ`, is an error.
 pub fn registry_string(key: HKEY, subkey: &str, value: &str) -> io::Result<String> {
     let bytes = read_value(key, subkey, value, RRF_RT_REG_SZ | RRF_NOEXPAND)?;
-    let units: Vec<u16> = bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_ne_bytes([pair[0], pair[1]]))
+    let (pairs, _odd_tail) = bytes.as_chunks::<2>();
+    let units: Vec<u16> = pairs
+        .iter()
+        .map(|pair| u16::from_ne_bytes(*pair))
         .take_while(|unit| *unit != 0)
         .collect();
     String::from_utf16(&units).map_err(|_| fail("registry string is not UTF-16"))
