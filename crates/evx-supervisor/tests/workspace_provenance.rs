@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 //! Production broker regressions for bytes whose path does not prove origin.
 mod common;
 use common::*;
@@ -59,7 +59,6 @@ fn provenance_survives_broker_restart_and_rejects_changed_bytes_and_paths() {
 
 #[test]
 fn concurrent_link_replacement_never_releases_outside_bytes() {
-    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicBool, Ordering};
     let f = Fixture::new();
     let write = f.run(&write_wat("score.txt", "inside"));
@@ -74,11 +73,20 @@ fn concurrent_link_replacement_never_releases_outside_bytes() {
             let mut n = 0;
             while !stop.load(Ordering::Acquire) {
                 match n % 3 {
-                    0 => symlink(&f.outside, &next).unwrap(),
+                    // A file symbolic link may be unavailable on Windows;
+                    // a hard link to the outside file stands in then.
+                    0 if !plant_link(&f.outside, &next) => {
+                        std::fs::hard_link(&f.outside, &next).unwrap()
+                    }
+                    0 => {}
                     1 => std::fs::hard_link(&f.outside, &next).unwrap(),
                     _ => std::fs::write(&next, "inside").unwrap(),
                 }
-                std::fs::rename(&next, &target).unwrap();
+                // Windows refuses to replace a file a helper has open
+                // without delete sharing; a refused replacement is retried.
+                if std::fs::rename(&next, &target).is_err() {
+                    let _ = std::fs::remove_file(&next);
+                }
                 n += 1;
             }
         });
@@ -403,7 +411,7 @@ fn failed_commit_delivery_retains_reconciliation() {
 fn broker_refuses_a_symlink_workspace_root() {
     let f = Fixture::new();
     let alias = f.workspace.parent().unwrap().join("workspace-alias");
-    std::os::unix::fs::symlink(&f.workspace, &alias).unwrap();
+    assert!(plant_link(&f.workspace, &alias));
     assert!(
         evx_supervisor::Broker::new(&alias, f.broker.grant(), f.broker.limits()).is_err(),
         "a final-component symlink bypassed the root NOFOLLOW check"

@@ -1,12 +1,10 @@
 #![allow(clippy::field_reassign_with_default)]
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 //! Port of the proof-of-concept baseline suite (`run_tests.py`): containment,
 //! capability boundary, guest-memory boundary, malformed input, resource
 //! limits, revocation, quotas and native escape simulation.
 
 mod common;
-
-use std::os::unix::fs::symlink;
 
 use evx_api::{Capability, Limits, Response, Status};
 use evx_supervisor::{run_guest, RunOptions};
@@ -94,23 +92,41 @@ fn traversal_absolute_cross_xite_links_and_special_files_denied() {
     let write = f.run(&write_wat("state/presence.txt", "game fixture"));
     assert!(write.responses[0].is_ok(), "{write:?}");
     f.denied_call(&read_wat("state/presence.txt/..namedfork/rsrc"));
-    symlink(&f.outside, f.workspace.join("outside-link")).unwrap();
-    symlink(&f.other, f.workspace.join("dir-link")).unwrap();
-    f.denied_call(&read_wat("outside-link"));
+    // A file symbolic link needs a privilege on Windows; a directory
+    // junction never does and is refused the same way.
+    if plant_link(&f.outside, &f.workspace.join("outside-link")) {
+        f.denied_call(&read_wat("outside-link"));
+        f.denied_call(&write_wat("outside-link", "changed"));
+    }
+    assert!(plant_link(&f.other, &f.workspace.join("dir-link")));
     f.denied_call(&read_wat("dir-link/private.txt"));
-    f.denied_call(&write_wat("outside-link", "changed"));
     std::fs::hard_link(&f.outside, f.workspace.join("hard-link")).unwrap();
     f.denied_call(&read_wat("hard-link"));
     std::fs::remove_file(f.workspace.join("hard-link")).unwrap();
+    special_file_denied(&f);
+    assert_eq!(
+        std::fs::read_to_string(&f.outside).unwrap(),
+        "sacrificial-secret-not-a-real-key"
+    );
+}
+
+/// A FIFO on Unix; Windows has no special files a user can plant in a
+/// directory, so a junction stands in as the entry that is not a regular
+/// file (the reader classifies every reparse point as `Other`).
+#[cfg(unix)]
+fn special_file_denied(f: &Fixture) {
     let fifo = f.workspace.join("pipe-fixture");
     let c = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
     assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
     f.denied_call(&read_wat("pipe-fixture"));
     std::fs::remove_file(&fifo).unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&f.outside).unwrap(),
-        "sacrificial-secret-not-a-real-key"
-    );
+}
+
+#[cfg(windows)]
+fn special_file_denied(f: &Fixture) {
+    assert!(plant_link(&f.other, &f.workspace.join("junction-fixture")));
+    f.denied_call(&read_wat("junction-fixture"));
+    std::fs::remove_dir(f.workspace.join("junction-fixture")).unwrap();
 }
 
 #[test]
@@ -299,11 +315,15 @@ fn storage_quota_rejects_growth_and_preserves_data_after_reduction() {
     assert_eq!(f.broker.usage().unwrap().0, 768 + 512);
 }
 
+/// The worker's `probe` mode installs the Unix confinement itself. On
+/// Windows the host confines the child; `tests/windows_confinement.rs`
+/// proves the equivalent denials through the backend.
+#[cfg(unix)]
 #[test]
 fn native_escape_simulation_denies_files_network_and_children() {
     let f = Fixture::new();
     std::fs::write(f.workspace.join("native-fixture.txt"), "readable fixture").unwrap();
-    symlink(&f.outside, f.workspace.join("outside-link")).unwrap();
+    assert!(plant_link(&f.outside, &f.workspace.join("outside-link")));
     let destination = f.dir.path().join("outside-write.txt");
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();

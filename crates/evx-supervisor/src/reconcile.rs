@@ -8,7 +8,6 @@ use crate::process::{
 use crate::{Broker, Config};
 use evx_api::frames::{encode, FromHelper, ToHelper};
 use evx_api::{Capability, Denied, Limits, Request, Response};
-use rustix::fs::{flock, FlockOperation};
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -41,7 +40,8 @@ pub fn reconcile_workspace_cancellable(
         if inner.running {
             return Err(Denied::new("workspace busy"));
         }
-        flock(broker.root_fd(), FlockOperation::NonBlockingLockExclusive)
+        broker
+            .take_lease(&mut inner)
             .map_err(|_| Denied::new("workspace busy"))?;
         inner.running = true;
         (inner.grant.generation, inner.limits.clone())
@@ -72,9 +72,7 @@ pub fn reconcile_workspace_cancellable(
     })();
     let mut inner = broker.lock();
     inner.running = false;
-    if !inner.quarantined {
-        let _ = flock(broker.root_fd(), FlockOperation::Unlock);
-    }
+    Broker::release_lease(&mut inner);
     result
 }
 
@@ -107,7 +105,7 @@ fn read_one(
         broker.workspace(),
         Role::File,
         tx,
-        broker.helper_lease_fd(),
+        broker.helper_lease(),
     )?;
     let result = (|| {
         let xite = broker.grant().xite;

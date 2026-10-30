@@ -1,19 +1,17 @@
 //! Durable direct-child admission. This directory is host-private and never
-//! passed to a worker. A lease descriptor is concurrency control, not proof of
-//! process death. An owned terminal wait4 reap completes an invocation. A new
-//! kernel boot can clear process ownership without clearing uncertain effects.
+//! passed to a worker. A lease is concurrency control, not proof of process
+//! death. An owned terminal reap completes an invocation. A new kernel boot
+//! can clear process ownership without clearing uncertain effects.
 
 use std::collections::BTreeSet;
+use std::fs::File;
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use evx_api::Denied;
-use rustix::fd::OwnedFd;
-use rustix::fs::{
-    flock, fstat, fsync, mkdirat, openat, renameat, FileType, FlockOperation, Mode, OFlags,
-};
+use evx_workspace::sys::{file_privacy, file_stat, path_bytes, try_lock_file};
+use evx_workspace::{Dir, Identity, Kind, Privacy};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -76,8 +74,8 @@ pub struct DirectLifecycle {
     path: PathBuf,
     binding: Binding,
     // Pin namespace identities for the entire session, including between checks.
-    _root: OwnedFd,
-    _lock: OwnedFd,
+    _root: Dir,
+    _lock: File,
     session: u64,
     boot: BootSession,
     gate: Mutex<()>,
@@ -88,6 +86,12 @@ pub struct DirectLifecycle {
 pub struct DirectScope {
     context: Arc<DirectLifecycle>,
     xite: String,
+}
+
+/// Owner-only with the exact Unix mode where modes exist (`0700` for a
+/// directory, `0600` for a file).
+fn exactly_private(privacy: Privacy, mode: u32) -> bool {
+    privacy.owned && privacy.mode.map_or(!privacy.shared, |actual| actual == mode)
 }
 
 impl DirectLifecycle {
@@ -105,32 +109,34 @@ impl DirectLifecycle {
     /// is never replaced, and user workspaces/grants are not modified.
     pub fn prepare_legacy(path: &Path) -> Result<(), Denied> {
         let path = canonical_path(path)?;
-        let parent = evx_workspace::open_root(path.parent().ok_or_else(denied)?)?;
-        let info = fstat(&parent).map_err(|_| denied())?;
-        if info.st_uid != rustix::process::geteuid().as_raw() {
+        let parent = Dir::open_root(path.parent().ok_or_else(denied)?)?;
+        if !parent.privacy().map_err(|_| denied())?.owned {
             return Err(denied());
         }
         // Earlier state roots used the default directory mode. Tighten only
-        // this already-open host-owned directory, never a followed symlink.
-        rustix::fs::fchmod(&parent, Mode::RWXU).map_err(|_| denied())?;
-        fsync(&parent).map_err(|_| denied())?;
+        // this already-open host-owned directory, never a followed link.
+        parent.make_private().map_err(|_| denied())?;
+        parent.sync().map_err(|_| denied())?;
         Self::provision(&path, BootSession::current()?, true)
     }
 
     fn provision(path: &Path, boot: BootSession, reboot_required: bool) -> Result<(), Denied> {
         let path = canonical_path(path)?;
-        let parent = evx_workspace::open_root(path.parent().ok_or_else(denied)?)?;
+        let parent = Dir::open_root(path.parent().ok_or_else(denied)?)?;
         directory_identity(&parent)?;
-        mkdirat(&parent, path.file_name().ok_or_else(denied)?, Mode::RWXU).map_err(|_| denied())?;
-        let root = evx_workspace::open_root(&path)?;
+        let name = path.file_name().and_then(|name| name.to_str()).ok_or_else(denied)?;
+        if !parent.create_private_dir(name).map_err(|_| denied())? {
+            return Err(denied());
+        }
+        let root = Dir::open_root(&path)?;
         let identity = directory_identity(&root)?;
         create(&root, LOCK, &[])?;
         let lock = safe_open(&root, LOCK, true)?;
         let binding = Binding {
             version: 1,
-            path: hex::encode(Sha256::digest(path.as_os_str().as_bytes())),
-            root: identity,
-            lock: identity_of(&lock)?,
+            path: hex::encode(Sha256::digest(path_bytes(&path).map_err(|_| denied())?)),
+            root: identity.0,
+            lock: identity_of(&lock)?.0,
         };
         create(
             &root,
@@ -150,8 +156,8 @@ impl DirectLifecycle {
             })
             .map_err(|_| denied())?,
         )?;
-        fsync(&root).map_err(|_| denied())?;
-        fsync(&parent).map_err(|_| denied())?;
+        root.sync().map_err(|_| denied())?;
+        parent.sync().map_err(|_| denied())?;
         Ok(())
     }
 
@@ -164,12 +170,12 @@ impl DirectLifecycle {
 
     fn open_on_boot(path: &Path, boot: BootSession) -> Result<Arc<Self>, Denied> {
         let path = canonical_path(path)?;
-        let root = evx_workspace::open_root(&path)?;
+        let root = Dir::open_root(&path)?;
         let identity = directory_identity(&root)?;
         let binding: Binding = read(&root, BINDING)?;
         if binding.version != 1
-            || binding.root != identity
-            || binding.path != hex::encode(Sha256::digest(path.as_os_str().as_bytes()))
+            || binding.root != identity.0
+            || binding.path != hex::encode(Sha256::digest(path_bytes(&path).map_err(|_| denied())?))
         {
             return Err(denied());
         }
@@ -241,18 +247,18 @@ impl DirectLifecycle {
 
     fn with_journal<T>(
         &self,
-        action: impl FnOnce(&OwnedFd, &mut Journal) -> Result<T, Denied>,
+        action: impl FnOnce(&Dir, &mut Journal) -> Result<T, Denied>,
     ) -> Result<T, Denied> {
         let _gate = self.gate.lock().map_err(|_| quarantine())?;
-        let root = evx_workspace::open_root(&self.path)?;
-        if directory_identity(&root)? != self.binding.root
+        let root = Dir::open_root(&self.path)?;
+        if directory_identity(&root)?.0 != self.binding.root
             || read::<Binding>(&root, BINDING)? != self.binding
         {
             return Err(denied());
         }
         let lock = safe_open(&root, LOCK, true)?;
-        if identity_of(&lock)? != self.binding.lock
-            || fstat(&lock).map_err(|_| denied())?.st_size != 0
+        if identity_of(&lock)?.0 != self.binding.lock
+            || file_stat(&lock).map_err(|_| denied())?.size != 0
         {
             return Err(denied());
         }
@@ -261,32 +267,26 @@ impl DirectLifecycle {
         // lock window, but never interpret acquisition as proof of child death.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         loop {
-            match flock(&lock, FlockOperation::NonBlockingLockExclusive) {
-                Ok(()) => break,
-                Err(rustix::io::Errno::WOULDBLOCK) if std::time::Instant::now() < deadline => {
+            match try_lock_file(&lock) {
+                Ok(true) => break,
+                Ok(false) if std::time::Instant::now() < deadline => {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                Err(rustix::io::Errno::WOULDBLOCK) => {
-                    return Err(Denied::new("direct lifecycle busy"))
-                }
+                Ok(false) => return Err(Denied::new("direct lifecycle busy")),
                 Err(_) => return Err(denied()),
             }
         }
-        match openat(
-            &root,
-            PENDING,
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Err(rustix::io::Errno::NOENT) => {}
-            _ => return Err(denied()),
+        if root.stat(PENDING).map_err(|_| denied())?.is_some() {
+            return Err(denied());
         }
         let mut journal: Journal = read(&root, JOURNAL)?;
         validate_journal(&journal)?;
         // A visible replacement after a failed sync is not durable authority
         // until both the file and its containing directory are synced again.
-        fsync(safe_open(&root, JOURNAL, false)?).map_err(|_| denied())?;
-        fsync(&root).map_err(|_| denied())?;
+        safe_open(&root, JOURNAL, true)?
+            .sync_all()
+            .map_err(|_| denied())?;
+        root.sync().map_err(|_| denied())?;
         action(&root, &mut journal)
     }
 }
@@ -334,7 +334,7 @@ impl DirectScope {
 }
 
 /// Drop intentionally leaves the record active. Only the trusted process
-/// owner may call complete after wait4 returned this exact child PID.
+/// owner may call complete after the exact child was reaped.
 pub(crate) struct DirectInvocation {
     scope: DirectScope,
     role: Role,
@@ -412,50 +412,37 @@ fn canonical_path(path: &Path) -> Result<PathBuf, Denied> {
         .map_err(|_| denied())?
         .join(name))
 }
-#[allow(clippy::unnecessary_cast)]
-fn identity_of(fd: &OwnedFd) -> Result<[u64; 2], Denied> {
-    let info = fstat(fd).map_err(|_| denied())?;
-    Ok([info.st_dev as u64, info.st_ino as u64])
+fn identity_of(file: &File) -> Result<Identity, Denied> {
+    Ok(file_stat(file).map_err(|_| denied())?.identity)
 }
-fn directory_identity(fd: &OwnedFd) -> Result<[u64; 2], Denied> {
-    let info = fstat(fd).map_err(|_| denied())?;
-    if FileType::from_raw_mode(info.st_mode as rustix::fs::RawMode) != FileType::Directory
-        || info.st_uid != rustix::process::geteuid().as_raw()
-        || info.st_mode & 0o7777 != 0o700
+fn directory_identity(dir: &Dir) -> Result<Identity, Denied> {
+    let stat = dir.stat_self().map_err(|_| denied())?;
+    if stat.kind != Kind::Directory
+        || !exactly_private(dir.privacy().map_err(|_| denied())?, 0o700)
     {
         return Err(denied());
     }
-    identity_of(fd)
+    Ok(stat.identity)
 }
-fn safe_open(root: &OwnedFd, name: &str, writable: bool) -> Result<OwnedFd, Denied> {
-    let fd = openat(
-        root,
-        name,
-        (if writable {
-            OFlags::RDWR
-        } else {
-            OFlags::RDONLY
-        }) | OFlags::NOFOLLOW
-            | OFlags::NONBLOCK
-            | OFlags::CLOEXEC,
-        Mode::empty(),
-    )
-    .map_err(|_| denied())?;
-    let info = fstat(&fd).map_err(|_| denied())?;
-    if FileType::from_raw_mode(info.st_mode as rustix::fs::RawMode) != FileType::RegularFile
-        || info.st_uid != rustix::process::geteuid().as_raw()
-        || info.st_mode & 0o7777 != 0o600
-        || info.st_nlink != 1
-        || info.st_size < 0
-        || info.st_size as u64 > MAX_METADATA as u64
+fn safe_open(root: &Dir, name: &str, writable: bool) -> Result<File, Denied> {
+    let opened = if writable {
+        root.open_write(name)
+    } else {
+        root.open_read(name)
+    };
+    let (file, stat) = opened.map_err(|_| denied())?.ok_or_else(denied)?;
+    if stat.kind != Kind::Regular
+        || !exactly_private(file_privacy(&file).map_err(|_| denied())?, 0o600)
+        || stat.links != 1
+        || stat.size > MAX_METADATA as u64
     {
         return Err(denied());
     }
-    Ok(fd)
+    Ok(file)
 }
-fn read<T: serde::de::DeserializeOwned>(root: &OwnedFd, name: &str) -> Result<T, Denied> {
+fn read<T: serde::de::DeserializeOwned>(root: &Dir, name: &str) -> Result<T, Denied> {
     let mut bytes = Vec::new();
-    std::fs::File::from(safe_open(root, name, false)?)
+    safe_open(root, name, false)?
         .take(MAX_METADATA as u64 + 1)
         .read_to_end(&mut bytes)
         .map_err(|_| denied())?;
@@ -464,21 +451,14 @@ fn read<T: serde::de::DeserializeOwned>(root: &OwnedFd, name: &str) -> Result<T,
     }
     evx_api::strict::parse_typed(&bytes).map_err(|_| denied())
 }
-fn create(root: &OwnedFd, name: &str, bytes: &[u8]) -> Result<(), Denied> {
-    let fd = openat(
-        root,
-        name,
-        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-        Mode::RUSR | Mode::WUSR,
-    )
-    .map_err(|_| denied())?;
-    let mut file = std::fs::File::from(fd);
+fn create(root: &Dir, name: &str, bytes: &[u8]) -> Result<(), Denied> {
+    let mut file = root.create_new(name).map_err(|_| denied())?;
     file.write_all(bytes).map_err(|_| denied())?;
     file.sync_all().map_err(|_| denied())
 }
 #[cfg(test)]
 thread_local! { static FAIL_PERSIST: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
-fn persist(root: &OwnedFd, journal: &Journal) -> Result<(), Denied> {
+fn persist(root: &Dir, journal: &Journal) -> Result<(), Denied> {
     let bytes = serde_json::to_vec(journal).map_err(|_| denied())?;
     if bytes.len() > MAX_METADATA {
         return Err(denied());
@@ -495,7 +475,7 @@ fn persist(root: &OwnedFd, journal: &Journal) -> Result<(), Denied> {
     }) {
         return Err(denied());
     }
-    renameat(root, PENDING, root, JOURNAL).map_err(|_| denied())?;
+    root.rename(PENDING, JOURNAL).map_err(|_| denied())?;
     #[cfg(test)]
     if FAIL_PERSIST.with(|fail| {
         if fail.get() == 2 {
@@ -507,17 +487,27 @@ fn persist(root: &OwnedFd, journal: &Journal) -> Result<(), Denied> {
     }) {
         return Err(denied());
     }
-    fsync(root).map_err(|_| denied())
+    root.sync().map_err(|_| denied())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    /// A private parent directory: mode 0700 where modes exist.
+    fn private_parent() -> tempfile::TempDir {
+        let parent = tempfile::tempdir().unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        parent
+    }
 
     fn fixture() -> (tempfile::TempDir, PathBuf, Arc<DirectLifecycle>) {
-        let parent = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = private_parent();
         let path = parent.path().join("lifecycle");
         let context = DirectLifecycle::provision_fresh(&path).unwrap();
         (parent, path, context)
@@ -528,7 +518,7 @@ mod tests {
         let (_parent, path, context) = fixture();
         let root = evx_workspace::open_root(&path).unwrap();
         let lock = safe_open(&root, LOCK, true).unwrap();
-        flock(&lock, FlockOperation::NonBlockingLockExclusive).unwrap();
+        assert!(try_lock_file(&lock).unwrap());
         let release = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(50));
             drop(lock);
@@ -540,7 +530,7 @@ mod tests {
 
     #[test]
     fn provisioning_is_explicit_and_never_repairs_existing_state() {
-        let parent = tempfile::tempdir().unwrap();
+        let parent = private_parent();
         let path = parent.path().join("lifecycle");
         assert!(DirectLifecycle::open(&path).is_err());
         std::fs::create_dir(&path).unwrap();
@@ -603,26 +593,73 @@ mod tests {
         let (_parent, path, context) = fixture();
         std::fs::remove_file(path.join(LOCK)).unwrap();
         std::fs::write(path.join(LOCK), "").unwrap();
-        std::fs::set_permissions(path.join(LOCK), std::fs::Permissions::from_mode(0o600)).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(path.join(LOCK), std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+        }
         assert!(context.validate().is_err());
     }
 
     #[test]
-    fn metadata_links_modes_and_namespace_replacement_are_rejected() {
+    fn metadata_links_and_namespace_replacement_are_rejected() {
         let (parent, path, context) = fixture();
         std::fs::hard_link(path.join(JOURNAL), parent.path().join("linked")).unwrap();
         assert!(context.validate().is_err());
         std::fs::remove_file(parent.path().join("linked")).unwrap();
+        context.validate().unwrap();
+        let moved = parent.path().join("old");
+        #[cfg(unix)]
+        {
+            std::fs::rename(&path, &moved).unwrap();
+            std::os::unix::fs::symlink(&moved, &path).unwrap();
+            assert!(context.validate().is_err());
+            assert!(DirectLifecycle::open(&path).is_err());
+        }
+        #[cfg(windows)]
+        {
+            // The retained directory handle pins the namespace: the state
+            // directory cannot be renamed away while this session holds it.
+            assert!(std::fs::rename(&path, &moved).is_err());
+            context.validate().unwrap();
+            drop(context);
+            std::fs::rename(&path, &moved).unwrap();
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(&path)
+                .arg(&moved)
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{output:?}");
+            assert!(DirectLifecycle::open(&path).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_modes_are_rejected() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_parent, path, context) = fixture();
         std::fs::set_permissions(path.join(JOURNAL), std::fs::Permissions::from_mode(0o644))
             .unwrap();
         assert!(context.validate().is_err());
         std::fs::set_permissions(path.join(JOURNAL), std::fs::Permissions::from_mode(0o600))
             .unwrap();
-        let moved = parent.path().join("old");
-        std::fs::rename(&path, &moved).unwrap();
-        symlink(&moved, &path).unwrap();
+        context.validate().unwrap();
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn shared_acls_are_rejected() {
+        let (_parent, path, context) = fixture();
+        let output = std::process::Command::new("icacls")
+            .arg(path.join(JOURNAL))
+            .args(["/grant", "*S-1-1-0:(R)"])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
         assert!(context.validate().is_err());
-        assert!(DirectLifecycle::open(&path).is_err());
     }
 
     #[test]
@@ -682,8 +719,7 @@ mod tests {
 
     #[test]
     fn legacy_barrier_requires_a_different_boot_and_preserves_neighbor_data() {
-        let parent = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = private_parent();
         let marker = parent.path().join("game-data");
         std::fs::write(&marker, b"keep score").unwrap();
         let path = parent.path().join("lifecycle");
@@ -703,8 +739,7 @@ mod tests {
 
     #[test]
     fn a_new_kernel_boot_clears_process_uncertainty_but_not_external_effects() {
-        let parent = tempfile::tempdir().unwrap();
-        std::fs::set_permissions(parent.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        let parent = private_parent();
         let path = parent.path().join("lifecycle");
         let first = BootSession::fixture(1);
         DirectLifecycle::provision(&path, first.clone(), false).unwrap();

@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 //! Durable admission through the actual confined compiler, guest and helper.
 mod common;
 use common::*;
@@ -6,7 +6,19 @@ use evx_api::frames::HelperFault;
 use evx_api::{Response, Status};
 use evx_supervisor::direct_lifecycle::DirectLifecycle;
 use evx_supervisor::{reconcile_workspace, run_guest, RunOptions};
-use std::os::unix::fs::PermissionsExt;
+
+/// A host-private control directory: mode 0700 where modes exist; a
+/// temporary directory under the user's profile is already owner-only on
+/// Windows.
+fn private_control() -> tempfile::TempDir {
+    let control = tempfile::tempdir().unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(control.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    control
+}
 
 #[test]
 fn direct_journal_covers_compile_guest_helper_and_reconciliation() {
@@ -14,8 +26,7 @@ fn direct_journal_covers_compile_guest_helper_and_reconciliation() {
         return;
     }
     let mut fixture = Fixture::new();
-    let control = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(control.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let control = private_control();
     let path = control.path().join("lifecycle");
     let journal = DirectLifecycle::provision_fresh(&path).unwrap();
     fixture.config.direct_lifecycle = Some(journal.scope("game-a").unwrap());
@@ -81,8 +92,7 @@ fn direct_scope_cannot_be_substituted_for_another_broker_xite() {
         return;
     }
     let mut fixture = Fixture::new();
-    let control = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(control.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let control = private_control();
     let journal = DirectLifecycle::provision_fresh(&control.path().join("lifecycle")).unwrap();
     let artifact = compile_ok(&fixture.config, calc());
     fixture.config.direct_lifecycle = Some(journal.scope("game-b").unwrap());

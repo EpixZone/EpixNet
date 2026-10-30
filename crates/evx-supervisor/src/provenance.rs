@@ -6,17 +6,14 @@
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use evx_api::{Denied, Request, Response, MAX_ENTRIES, MAX_FILE};
-use rustix::fd::{BorrowedFd, OwnedFd};
-use rustix::fs::{
-    fstat, fsync, mkdirat, openat, renameat, unlinkat, AtFlags, FileType, Mode, OFlags,
-};
+use evx_workspace::sys::{file_privacy, path_bytes};
+use evx_workspace::{Dir, Kind};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -56,7 +53,7 @@ struct Record {
 }
 
 pub(crate) struct Provenance {
-    directory: OwnedFd,
+    directory: Dir,
     name: String,
     xite: String,
     root_path: String,
@@ -65,51 +62,41 @@ pub(crate) struct Provenance {
 }
 
 impl Provenance {
-    pub(crate) fn new(workspace: &Path, root: BorrowedFd<'_>, xite: &str) -> Result<Self, Denied> {
+    pub(crate) fn new(workspace: &Path, root: &Dir, xite: &str) -> Result<Self, Denied> {
         evx_api::validate_identifier(xite)?;
         let parent = workspace.parent().ok_or_else(denied)?;
         // Never grant a workspace whose own root contains its authority store.
         if parent.join(DIRECTORY).starts_with(workspace) {
             return Err(denied());
         }
-        let parent_fd = evx_workspace::open_root(parent)?;
-        match mkdirat(&parent_fd, DIRECTORY, Mode::RWXU) {
-            Ok(()) => fsync(&parent_fd).map_err(|_| denied())?,
-            Err(rustix::io::Errno::EXIST) => {}
-            Err(_) => return Err(denied()),
+        let parent = Dir::open_root(parent)?;
+        if parent
+            .create_private_dir(DIRECTORY)
+            .map_err(|_| denied())?
+        {
+            parent.sync().map_err(|_| denied())?;
         }
-        let directory = openat(
-            &parent_fd,
-            DIRECTORY,
-            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|_| denied())?;
-        let metadata = fstat(&directory).map_err(|_| denied())?;
-        if metadata.st_uid != rustix::process::geteuid().as_raw() || metadata.st_mode & 0o077 != 0 {
+        let directory = parent.open_dir(DIRECTORY).map_err(|_| denied())?;
+        let privacy = directory.privacy().map_err(|_| denied())?;
+        if !privacy.owned || privacy.shared {
             return Err(denied());
         }
-        let root_metadata = fstat(root).map_err(|_| denied())?;
-        let root_path = digest(workspace.as_os_str().as_bytes());
+        let root_identity = root.identity().map_err(|_| denied())?;
+        let root_path = digest(&path_bytes(workspace).map_err(|_| denied())?);
         Ok(Self {
             directory,
             name: format!("{root_path}.json"),
             xite: xite.into(),
             root_path,
-            root_device: root_metadata.st_dev as u64,
-            root_inode: root_metadata.st_ino as u64,
+            root_device: root_identity.0[0],
+            root_inode: root_identity.0[1],
         })
     }
 
     fn load(&self) -> Result<Record, Denied> {
-        let fd = match openat(
-            &self.directory,
-            self.name.as_str(),
-            OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => fd,
-            Err(rustix::io::Errno::NOENT) => {
+        let (mut file, stat) = match self.directory.open_read(&self.name) {
+            Ok(Some(opened)) => opened,
+            Ok(None) => {
                 return Ok(Record {
                     version: 1,
                     xite: self.xite.clone(),
@@ -121,18 +108,17 @@ impl Provenance {
             }
             Err(_) => return Err(denied()),
         };
-        let metadata = fstat(&fd).map_err(|_| denied())?;
-        if FileType::from_raw_mode(metadata.st_mode as rustix::fs::RawMode) != FileType::RegularFile
-            || metadata.st_nlink != 1
-            || metadata.st_size < 0
-            || metadata.st_size as u64 > MAX_REGISTRY as u64
-            || metadata.st_uid != rustix::process::geteuid().as_raw()
-            || metadata.st_mode & 0o077 != 0
+        let privacy = file_privacy(&file).map_err(|_| denied())?;
+        if stat.kind != Kind::Regular
+            || stat.links != 1
+            || stat.size > MAX_REGISTRY as u64
+            || !privacy.owned
+            || privacy.shared
         {
             return Err(denied());
         }
         let mut bytes = Vec::new();
-        std::fs::File::from(fd)
+        std::io::Read::by_ref(&mut file)
             .take(MAX_REGISTRY as u64 + 1)
             .read_to_end(&mut bytes)
             .map_err(|_| denied())?;
@@ -174,27 +160,17 @@ impl Provenance {
             std::process::id(),
             STAGING_ID.fetch_add(1, Ordering::Relaxed)
         );
-        let fd = openat(
-            &self.directory,
-            name.as_str(),
-            OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::RUSR | Mode::WUSR,
-        )
-        .map_err(|_| denied())?;
+        let mut file = self.directory.create_new(&name).map_err(|_| denied())?;
         let result = (|| {
-            let mut file = std::fs::File::from(fd);
             file.write_all(&data).map_err(|_| denied())?;
             file.sync_all().map_err(|_| denied())?;
-            renameat(
-                &self.directory,
-                name.as_str(),
-                &self.directory,
-                self.name.as_str(),
-            )
-            .map_err(|_| denied())?;
-            fsync(&self.directory).map_err(|_| denied())
+            drop(file);
+            self.directory
+                .rename(&name, &self.name)
+                .map_err(|_| denied())?;
+            self.directory.sync().map_err(|_| denied())
         })();
-        let _ = unlinkat(&self.directory, name.as_str(), AtFlags::empty());
+        let _ = self.directory.unlink(&name);
         result
     }
 
@@ -324,7 +300,6 @@ impl Provenance {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rustix::fd::AsFd;
 
     fn fixture() -> (tempfile::TempDir, Provenance) {
         let dir = tempfile::tempdir().unwrap();
@@ -332,7 +307,7 @@ mod tests {
         std::fs::create_dir(&workspace).unwrap();
         let workspace = std::fs::canonicalize(workspace).unwrap();
         let root = evx_workspace::open_root(&workspace).unwrap();
-        let authority = Provenance::new(&workspace, root.as_fd(), "game").unwrap();
+        let authority = Provenance::new(&workspace, &root, "game").unwrap();
         (dir, authority)
     }
 
@@ -435,19 +410,29 @@ mod tests {
     }
 
     #[test]
-    fn registry_binds_xite_root_inode_and_rejects_insecure_authority_paths() {
+    fn registry_binds_xite_and_root_identity() {
+        let (dir, authority) = fixture();
+        authority.prepare("score", "42").unwrap();
+        let workspace = std::fs::canonicalize(dir.path().join("game")).unwrap();
+        let root = evx_workspace::open_root(&workspace).unwrap();
+        let other = Provenance::new(&workspace, &root, "other").unwrap();
+        assert!(other.pending_paths().is_err());
+        drop(root);
+        std::fs::rename(&workspace, dir.path().join("old-game")).unwrap();
+        std::fs::create_dir(&workspace).unwrap();
+        let root = evx_workspace::open_root(&workspace).unwrap();
+        let replacement = Provenance::new(&workspace, &root, "game").unwrap();
+        assert!(replacement.pending_paths().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_rejects_a_linked_authority_directory() {
         use std::os::unix::fs::symlink;
         let (dir, authority) = fixture();
         authority.prepare("score", "42").unwrap();
         let workspace = std::fs::canonicalize(dir.path().join("game")).unwrap();
         let root = evx_workspace::open_root(&workspace).unwrap();
-        let other = Provenance::new(&workspace, root.as_fd(), "other").unwrap();
-        assert!(other.pending_paths().is_err());
-        std::fs::rename(&workspace, dir.path().join("old-game")).unwrap();
-        std::fs::create_dir(&workspace).unwrap();
-        let root = evx_workspace::open_root(&workspace).unwrap();
-        let replacement = Provenance::new(&workspace, root.as_fd(), "game").unwrap();
-        assert!(replacement.pending_paths().is_err());
         drop(authority);
         std::fs::rename(
             dir.path().join(DIRECTORY),
@@ -459,7 +444,30 @@ mod tests {
             dir.path().join(DIRECTORY),
         )
         .unwrap();
-        assert!(Provenance::new(&workspace, root.as_fd(), "game").is_err());
+        assert!(Provenance::new(&workspace, &root, "game").is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn registry_rejects_a_junctioned_authority_directory() {
+        let (dir, authority) = fixture();
+        authority.prepare("score", "42").unwrap();
+        let workspace = std::fs::canonicalize(dir.path().join("game")).unwrap();
+        let root = evx_workspace::open_root(&workspace).unwrap();
+        drop(authority);
+        std::fs::rename(
+            dir.path().join(DIRECTORY),
+            dir.path().join("saved-authority"),
+        )
+        .unwrap();
+        let output = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(dir.path().join(DIRECTORY))
+            .arg(dir.path().join("saved-authority"))
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert!(Provenance::new(&workspace, &root, "game").is_err());
     }
 
     #[test]

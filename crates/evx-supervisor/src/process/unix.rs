@@ -1,5 +1,5 @@
-//! Confined child processes: spawning, framed I/O, kernel observations and
-//! bounded termination.
+//! Unix children: fork and exec with sealed descriptors, confinement
+//! installed by the child itself, `wait4` as the only reaper.
 //!
 //! Every child has its own process group, starts with an empty
 //! environment and closed descriptors, and confines itself before reading
@@ -8,72 +8,21 @@
 //! Resource observations come from the kernel, never from the child.
 
 use std::fs::File;
-use std::io::{Read, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use evx_api::{Denied, MAX_ARTIFACT_FRAME, MAX_FRAME};
+use evx_api::{Denied, MAX_FRAME};
+use evx_workspace::sys::RawLease;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Role {
-    Guest,
-    File,
-    Compiler,
-}
-
-impl Role {
-    pub fn name(self) -> &'static str {
-        match self {
-            Role::Guest => "guest",
-            Role::File => "file",
-            Role::Compiler => "compiler",
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum Event {
-    /// One complete frame body from the child's stdout.
-    Frame(Role, u64, Vec<u8>),
-    /// A chunk of stderr.
-    Stderr(Role, u64, Vec<u8>),
-    /// A stream closed. `protocol_error` is set when it closed mid-frame or
-    /// after an oversized length prefix.
-    Closed(Role, u64, Stream, Option<&'static str>),
-}
-
-impl Event {
-    pub fn origin(&self) -> (Role, u64) {
-        match self {
-            Self::Frame(role, id, _) | Self::Stderr(role, id, _) | Self::Closed(role, id, _, _) => {
-                (*role, *id)
-            }
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Stream {
-    Stdout,
-    Stderr,
-}
-
-/// Child termination or durable cleanup was not confirmed. Quarantine its slot.
-#[derive(Debug, thiserror::Error)]
-#[error("child {pid} cleanup unconfirmed; quarantine its slot")]
-pub struct CleanupTimeout {
-    pub pid: i32,
-}
-
-#[derive(Debug, thiserror::Error)]
-#[error("process measurement unavailable")]
-pub struct ObservationUnavailable;
+use super::common::{
+    quarantine_child_admission, quarantine_error, read_frames, read_stderr, record_diagnostics,
+    CleanupTimeout, Event, Input, Role, CHILD_ADMISSION_STOPPED,
+};
 
 #[derive(Debug, Clone, Copy)]
 pub struct Sample {
@@ -91,10 +40,7 @@ pub struct Peer {
     ownership_lost: bool,
     #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
     apple: Option<crate::apple::ApplePeer>,
-    stdin: Option<File>,
-    pending_input: Vec<u8>,
-    input_offset: usize,
-    input_started: bool,
+    input: Input,
     pub exit_code: Option<i32>,
     // Physical reap evidence is separate from successful durable completion.
     observed_exit_code: Option<i32>,
@@ -112,11 +58,6 @@ pub struct Peer {
     pub commit_sent: bool,
     pub limits_generation: u64,
 }
-
-const STDERR_RETAINED: usize = 4096;
-pub(crate) const OUTPUT_QUOTA: usize = 256 * 1024;
-pub(crate) const MAX_FRAMES: u32 = 130;
-pub(crate) const EVENT_CAPACITY: usize = 8;
 
 /// Mark all ambient descriptors close-on-exec. This also covers descriptors
 /// a different host thread opened immediately before fork. The exec error
@@ -171,32 +112,6 @@ unsafe fn seal_descriptors(_keep_lease: bool) -> std::io::Result<()> {
 // Every spawn and every cleanup-uncertainty latch use the same lock. This
 // prevents another xite from consuming a released scheduler slot to launch
 // more processes after an old child could not be confirmed stopped.
-static CHILD_ADMISSION_STOPPED: Mutex<bool> = Mutex::new(false);
-
-fn quarantine_error() -> Denied {
-    Denied::Quarantined(
-        "child admission quarantined; confirm prior children stopped before restarting the host"
-            .into(),
-    )
-}
-
-pub fn child_admission_status() -> Result<(), Denied> {
-    let stopped = CHILD_ADMISSION_STOPPED
-        .lock()
-        .map_err(|_| quarantine_error())?;
-    if *stopped {
-        Err(quarantine_error())
-    } else {
-        Ok(())
-    }
-}
-
-/// Irreversible within this host process. No guest or operator API clears it.
-pub(crate) fn quarantine_child_admission() {
-    *CHILD_ADMISSION_STOPPED
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
-}
 
 impl Peer {
     /// Spawn `worker <mode>` with `cwd`, an empty environment, and optionally
@@ -208,7 +123,7 @@ impl Peer {
         cwd: &Path,
         role: Role,
         events: SyncSender<Event>,
-        lease_fd: Option<i32>,
+        lease_fd: Option<RawLease>,
     ) -> Result<Peer, Denied> {
         // Hold through spawn so quarantine and admission have one order.
         // No broker callbacks occur while holding this lock.
@@ -262,10 +177,7 @@ impl Peer {
                 direct_invocation: None,
                 ownership_lost: false,
                 apple: Some(spawned.peer),
-                stdin: Some(spawned.stdin),
-                pending_input: Vec::new(),
-                input_offset: 0,
-                input_started: false,
+                input: Input::new(Some(spawned.stdin)),
                 exit_code: None,
                 observed_exit_code: None,
                 readers: 2,
@@ -329,6 +241,12 @@ impl Peer {
             .stdin
             .take()
             .map(|input| File::from(std::os::fd::OwnedFd::from(input)));
+        let configured = stdin.as_ref().is_some_and(|input| {
+            let fd = input.as_raw_fd();
+            // SAFETY: owned pipe; nonblocking writes preserve watchdog progress.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0
+        });
         let stdout = child.stdout.take();
         let stderr = child.stderr.take();
         let mut peer = Peer {
@@ -341,10 +259,7 @@ impl Peer {
             ownership_lost: false,
             #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
             apple: None,
-            stdin,
-            pending_input: Vec::new(),
-            input_offset: 0,
-            input_started: false,
+            input: Input::new(stdin),
             exit_code: None,
             observed_exit_code: None,
             readers: 2,
@@ -359,12 +274,6 @@ impl Peer {
             limits_generation: 0,
         };
         drop(stopped);
-        let configured = peer.stdin.as_ref().is_some_and(|input| {
-            let fd = input.as_raw_fd();
-            // SAFETY: owned pipe; nonblocking writes preserve watchdog progress.
-            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-            flags >= 0 && unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } >= 0
-        });
         let (Some(stdout), Some(stderr)) = (stdout, stderr) else {
             peer.close(Duration::from_millis(50), Duration::from_secs(2))
                 .map_err(|_| quarantine_error())?;
@@ -382,57 +291,23 @@ impl Peer {
     }
 
     /// Queue one bounded frame, flushing only while the pipe is writable.
-    /// The event loop calls `flush_input` on every watchdog tick. A second
-    /// frame cannot overtake an incomplete frame or grow the input queue.
+    /// The event loop calls `flush_input` on every watchdog tick.
     pub fn send(&mut self, encoded: &[u8]) -> Result<(), Denied> {
-        self.send_bounded(encoded, MAX_FRAME)
+        self.input.send(encoded, MAX_FRAME)
     }
 
     /// Only a guest's first input may carry the larger serialized artifact.
     /// Compiler input, file helpers and subsequent broker replies stay small.
     pub(crate) fn send_artifact_init(&mut self, encoded: &[u8]) -> Result<(), Denied> {
-        if self.role != Role::Guest || self.input_started {
-            return Err(Denied::new("unexpected artifact initialization"));
-        }
-        self.send_bounded(encoded, MAX_ARTIFACT_FRAME)
-    }
-
-    fn send_bounded(&mut self, encoded: &[u8], limit: usize) -> Result<(), Denied> {
-        if encoded.len() > limit + 4 {
-            return Err(Denied::new("outgoing frame limit"));
-        }
-        self.flush_input()?;
-        if !self.pending_input.is_empty() {
-            return Err(Denied::new("worker input backpressure"));
-        }
-        self.input_started = true;
-        self.pending_input.extend_from_slice(encoded);
-        self.flush_input()
+        self.input.send_artifact_init(self.role, encoded)
     }
 
     pub fn flush_input(&mut self) -> Result<(), Denied> {
-        while self.input_offset < self.pending_input.len() {
-            let stdin = self
-                .stdin
-                .as_mut()
-                .ok_or_else(|| Denied::new("worker input closed"))?;
-            match stdin.write(&self.pending_input[self.input_offset..]) {
-                Ok(0) => return Err(Denied::new("worker input closed")),
-                Ok(n) => self.input_offset += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return Ok(()),
-                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-                Err(_) => return Err(Denied::new("worker input closed")),
-            }
-        }
-        self.pending_input.clear();
-        self.input_offset = 0;
-        Ok(())
+        self.input.flush()
     }
 
     pub fn record_stderr(&mut self, chunk: &[u8]) {
-        let room = STDERR_RETAINED.saturating_sub(self.diagnostics.len());
-        self.diagnostics
-            .extend_from_slice(&chunk[..chunk.len().min(room)]);
+        record_diagnostics(&mut self.diagnostics, chunk);
     }
 
     /// Kernel-owned usage for a live child.
@@ -557,7 +432,7 @@ impl Peer {
     /// Terminate then kill the child's process group and reap it within the
     /// cleanup budget. A `CleanupTimeout` is a quarantine signal.
     pub fn close(&mut self, grace: Duration, cleanup: Duration) -> Result<i32, CleanupTimeout> {
-        self.stdin.take();
+        self.input.close();
         if let Some(code) = self.poll() {
             return Ok(code);
         }
@@ -631,116 +506,6 @@ impl Drop for Peer {
         }
         // Child::try_wait cannot supply this journal's trusted wait4 evidence.
         // Cleanup above owns all reaping; uncertainty must remain durable.
-    }
-}
-
-fn read_frames(role: Role, id: u64, mut stdout: impl Read, tx: SyncSender<Event>) {
-    let frame_limit = if role == Role::Compiler {
-        MAX_ARTIFACT_FRAME
-    } else {
-        MAX_FRAME
-    };
-    let mut bytes = 0usize;
-    let mut frames = 0u32;
-    loop {
-        let mut len = [0u8; 4];
-        // Distinguish a clean boundary EOF from a truncated length prefix.
-        match stdout.read(&mut len[..1]) {
-            Ok(0) => {
-                let _ = tx.send(Event::Closed(role, id, Stream::Stdout, None));
-                return;
-            }
-            Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                let _ = tx.send(Event::Closed(
-                    role,
-                    id,
-                    Stream::Stdout,
-                    Some("worker output read failed"),
-                ));
-                return;
-            }
-        }
-        if stdout.read_exact(&mut len[1..]).is_err() {
-            let _ = tx.send(Event::Closed(
-                role,
-                id,
-                Stream::Stdout,
-                Some("truncated worker frame"),
-            ));
-            return;
-        }
-        let len = u32::from_be_bytes(len) as usize;
-        frames += 1;
-        if len == 0
-            || len > frame_limit
-            || frames > MAX_FRAMES
-            || len > OUTPUT_QUOTA.saturating_sub(bytes)
-        {
-            let _ = tx.send(Event::Closed(
-                role,
-                id,
-                Stream::Stdout,
-                Some("worker frame quota"),
-            ));
-            return;
-        }
-        bytes += len;
-        let mut body = vec![0u8; len];
-        if stdout.read_exact(&mut body).is_err() {
-            let _ = tx.send(Event::Closed(
-                role,
-                id,
-                Stream::Stdout,
-                Some("truncated worker frame"),
-            ));
-            return;
-        }
-        if tx.send(Event::Frame(role, id, body)).is_err() {
-            return;
-        }
-    }
-}
-
-fn read_stderr(role: Role, id: u64, mut stderr: impl Read, tx: SyncSender<Event>) {
-    let mut buffer = [0u8; 4096];
-    let mut bytes = 0usize;
-    loop {
-        match stderr.read(&mut buffer) {
-            Ok(0) => {
-                let _ = tx.send(Event::Closed(role, id, Stream::Stderr, None));
-                return;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(_) => {
-                let _ = tx.send(Event::Closed(
-                    role,
-                    id,
-                    Stream::Stderr,
-                    Some("worker diagnostics read failed"),
-                ));
-                return;
-            }
-            Ok(n) => {
-                bytes += n;
-                if bytes > OUTPUT_QUOTA {
-                    let _ = tx.send(Event::Closed(
-                        role,
-                        id,
-                        Stream::Stderr,
-                        Some("worker output quota"),
-                    ));
-                    return;
-                }
-                if tx
-                    .send(Event::Stderr(role, id, buffer[..n].to_vec()))
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        }
     }
 }
 
@@ -834,6 +599,7 @@ fn sample_process(_pid: i32) -> Result<Sample, SampleError> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::common::child_admission_status;
     use super::*;
 
     fn inert_peer(invocation: Option<crate::direct_lifecycle::DirectInvocation>) -> Peer {
@@ -847,10 +613,7 @@ mod tests {
             ownership_lost: false,
             #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
             apple: None,
-            stdin: None,
-            pending_input: Vec::new(),
-            input_offset: 0,
-            input_started: false,
+            input: Input::new(None::<File>),
             exit_code: None,
             observed_exit_code: None,
             readers: 0,
@@ -948,71 +711,5 @@ mod tests {
         assert!(child_admission_status().is_err());
         assert!(DirectLifecycle::open(&third).is_err());
         *CHILD_ADMISSION_STOPPED.lock().unwrap() = false;
-    }
-
-    #[test]
-    fn compiler_artifact_envelope_does_not_expand_guest_or_helper_output() {
-        let len = MAX_FRAME + 1;
-        let mut bytes = (len as u32).to_be_bytes().to_vec();
-        bytes.resize(len + 4, b' ');
-        for role in [Role::Guest, Role::File, Role::Compiler] {
-            let (tx, rx) = std::sync::mpsc::sync_channel(8);
-            read_frames(role, 0, std::io::Cursor::new(&bytes), tx);
-            let events: Vec<_> = rx.try_iter().collect();
-            assert_eq!(
-                matches!(events.first(), Some(Event::Frame(..))),
-                role == Role::Compiler
-            );
-        }
-        // The compiler's aggregate output budget remains 256 KiB. A second
-        // otherwise valid large frame is rejected before allocating its body.
-        let mut twice = bytes.clone();
-        twice.extend_from_slice(&bytes);
-        let (tx, rx) = std::sync::mpsc::sync_channel(8);
-        read_frames(Role::Compiler, 0, std::io::Cursor::new(twice), tx);
-        let events: Vec<_> = rx.try_iter().collect();
-        assert_eq!(
-            events
-                .iter()
-                .filter(|event| matches!(event, Event::Frame(..)))
-                .count(),
-            1
-        );
-        assert!(matches!(
-            events.last(),
-            Some(Event::Closed(_, _, _, Some("worker frame quota")))
-        ));
-    }
-
-    #[test]
-    fn compiler_artifact_prefix_above_cap_is_rejected_before_body() {
-        let bytes = ((MAX_ARTIFACT_FRAME + 1) as u32).to_be_bytes();
-        let (tx, rx) = std::sync::mpsc::sync_channel(8);
-        read_frames(Role::Compiler, 0, std::io::Cursor::new(bytes), tx);
-        assert!(matches!(
-            rx.recv().unwrap(),
-            Event::Closed(_, _, _, Some("worker frame quota"))
-        ));
-    }
-
-    #[test]
-    fn reader_bounds_flood_before_supervisor_dequeues_it() {
-        let mut bytes = Vec::new();
-        for _ in 0..1000 {
-            bytes.extend_from_slice(&2u32.to_be_bytes());
-            bytes.extend_from_slice(b"{}");
-        }
-        let (tx, rx) = std::sync::mpsc::sync_channel(1024);
-        read_frames(Role::Guest, 0, std::io::Cursor::new(bytes), tx);
-        let events: Vec<_> = rx.try_iter().collect();
-        assert!(
-            events.len() <= 131,
-            "queued {} events before applying quota",
-            events.len()
-        );
-        assert!(matches!(
-            events.last(),
-            Some(Event::Closed(_, _, _, Some(_)))
-        ));
     }
 }

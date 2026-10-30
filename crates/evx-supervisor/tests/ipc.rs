@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 //! Adversarial supervisor integration: a hostile peer (`examples/hostile_peer.rs`)
 //! that violates the frame protocol, forges measurements, floods output and
 //! leaks control characters. Port of `test_supervisor_ipc.py`.
@@ -253,6 +253,10 @@ fn compiler_kernel_resource_limits_apply_before_output() {
     }
 }
 
+/// Unix descriptors only: on Windows the explicit handle list of the
+/// launch is the mechanism, and `evx-windows` proves it with its excluded
+/// event fixture.
+#[cfg(unix)]
 #[test]
 fn ambient_non_cloexec_descriptor_is_not_inherited() {
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -273,6 +277,8 @@ fn ambient_non_cloexec_descriptor_is_not_inherited() {
     );
 }
 
+/// Process groups are a Unix notion; a Windows child cannot leave its job.
+#[cfg(unix)]
 #[test]
 fn cleanup_reaps_a_child_that_changed_its_process_group() {
     let f = Fixture::new();

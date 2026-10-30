@@ -68,7 +68,7 @@ impl AppleWorkspace {
     /// Lost or partially initialized controls are not reconstructed.
     pub fn open(assignment: AppleSlotAssignment) -> Result<Arc<Self>, Denied> {
         let (path, binding) = assignment.with_workspace(|registry, expected| {
-            let root = evx_workspace::open_root(registry)?;
+            let root = OwnedFd::from(evx_workspace::open_root(registry)?);
             match mkdirat(&root, "workspaces", Mode::RWXU) {
                 Ok(()) => fsync(&root).map_err(|_| denied())?,
                 Err(rustix::io::Errno::EXIST) => {}
@@ -163,7 +163,7 @@ impl AppleWorkspace {
             {
                 return Err(denied());
             }
-            let directory = evx_workspace::open_root(&self.path)?;
+            let directory = OwnedFd::from(evx_workspace::open_root(&self.path)?);
             if directory_identity(&directory)? != self.binding.root {
                 return Err(denied());
             }
@@ -639,7 +639,7 @@ mod tests {
             "host metadata must not be reported as guest storage"
         );
         assert!(
-            broker.helper_lease_fd().is_none(),
+            broker.helper_lease().is_none(),
             "host authority fd must never reach a service"
         );
         config.apple_xpc.as_mut().unwrap().file_service = "org.example.other.file".into();
