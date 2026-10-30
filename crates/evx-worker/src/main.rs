@@ -13,27 +13,31 @@
 //!
 //! All frames travel over stdin and stdout with a 4-byte length prefix;
 //! stderr carries bounded diagnostics only.
+//!
+//! On Unix the worker confines itself (Seatbelt, Landlock and seccomp). On
+//! Windows the host launches it already confined and the worker verifies
+//! that confinement before reading input (`docs/evx-windows-backend.md`).
 
-// The worker exists on Unix hosts only (docs/evx-platforms.md). Elsewhere the
-// binary is a stub, so a workspace build still succeeds.
 #[cfg(unix)]
 mod confine;
-#[cfg(unix)]
+#[cfg(windows)]
+mod confine_windows;
+#[cfg(any(unix, windows))]
 mod ipc;
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 mod modes;
 #[cfg(unix)]
 mod probe;
 
 use std::process::ExitCode;
 
-#[cfg(not(unix))]
+#[cfg(not(any(unix, windows)))]
 fn main() -> ExitCode {
-    eprintln!("evx-worker: EVX workers run only on Unix hosts");
+    eprintln!("evx-worker: EVX workers run only on Unix and Windows hosts");
     ExitCode::from(1)
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn main() -> ExitCode {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let outcome = match mode.as_str() {
@@ -50,6 +54,7 @@ fn main() -> ExitCode {
         "file" => modes::file(true),
         "file-read" => modes::file(false),
         // Harness-only containment probe; the supervisor never selects it.
+        #[cfg(unix)]
         "probe" => probe::probe(),
         _ => Err("usage: evx-worker run|compile|file|file-read|probe".to_string()),
     };

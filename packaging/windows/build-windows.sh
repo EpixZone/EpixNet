@@ -24,7 +24,7 @@ mkdir -p "$OUT_DIR"
 
 if [ "$PHASE" != "pack" ]; then
   if [ "${EPIX_SKIP_BUILD:-0}" != "1" ]; then
-    ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh \
+    ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh -p evx-worker \
         --target x86_64-pc-windows-msvc )
   fi
   BINDIR="$REPO_ROOT/target/x86_64-pc-windows-msvc/release"
@@ -32,6 +32,10 @@ if [ "$PHASE" != "pack" ]; then
   rm -rf "$STAGE"; mkdir -p "$STAGE/firefox"
   cp "$BINDIR/epix-browser.exe" "$STAGE/epix-browser.exe"
   cp "$BINDIR/epix-nmh.exe" "$STAGE/epix-nmh.exe"
+  # The EVX worker the node launches inside an AppContainer. It lives beside
+  # the launcher, which is where the node looks for it (docs/evx-windows.md).
+  cp "$BINDIR/evx-worker.exe" "$STAGE/evx-worker.exe"
+  python3 "$REPO_ROOT/packaging/windows/verify-evx-worker.py" "$STAGE/evx-worker.exe"
 
   # In-process Snowflake bridge library (loaded at runtime beside the exe),
   # fetched by iptproxy-sys's build.rs into the target dir. Best-effort: absent

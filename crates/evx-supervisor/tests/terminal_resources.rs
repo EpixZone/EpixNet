@@ -1,5 +1,7 @@
-#![cfg(target_os = "macos")]
-//! Native IPC accounting fixtures, not a proof of guest confinement.
+#![cfg(any(target_os = "macos", windows))]
+//! Native IPC accounting fixtures, not a proof of guest confinement. macOS
+//! and Windows both report a terminal peak the child cannot hide by
+//! releasing memory before it answers.
 
 mod common;
 use common::*;
@@ -34,6 +36,7 @@ fn a_known_terminal_memory_violation_cannot_report_success() {
         };
         let broker = Broker::new(&workspace, Grant::new("game", true).unwrap(), limits).unwrap();
         let result = run_guest(&config, &artifact, &broker, RunOptions::default());
+        forget_workspace_profiles(&workspace);
         assert!(
             result
                 .trusted_observations

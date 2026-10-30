@@ -31,5 +31,11 @@ pulley = ["wasmtime/pulley"]
 [target.'cfg(target_os = "ios")'.dependencies]
 wasmtime = { version = "=48.0.8", default-features = false, features = ["pulley"] }
 
+# Windows executes through the interpreter inside its AppContainer, as the
+# native fixture always has (docs/evx-windows-backend.md). Enabling it here
+# keeps the host's and the worker's engine keys equal in every build.
+[target.'cfg(windows)'.dependencies]
+wasmtime = { version = "=48.0.8", default-features = false, features = ["pulley"] }
+
 [dev-dependencies]
 wat = "1.254"

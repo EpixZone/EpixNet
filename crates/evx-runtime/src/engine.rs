@@ -28,7 +28,7 @@ pub fn engine_key() -> String {
 
 /// Compiled-artifact identity must distinguish native code and bytecode.
 pub fn backend_name() -> &'static str {
-    if cfg!(any(feature = "pulley", target_os = "ios")) {
+    if cfg!(any(feature = "pulley", target_os = "ios", windows)) {
         if cfg!(target_pointer_width = "64") {
             if cfg!(target_endian = "little") {
                 "pulley64"
@@ -52,7 +52,7 @@ pub fn engine_config() -> Config {
     // (GHSA-xx5w, April 2026). Pulley is selected separately for iOS builds.
     #[cfg(feature = "compiler")]
     c.strategy(Strategy::Cranelift);
-    if cfg!(any(feature = "pulley", target_os = "ios")) {
+    if cfg!(any(feature = "pulley", target_os = "ios", windows)) {
         c.target(backend_name()).expect("fixed Pulley target");
         c.signals_based_traps(false);
     }
@@ -72,7 +72,7 @@ pub fn engine_config() -> Config {
     // Static 4 GiB reservation with a guard region elides bounds checks and is
     // the configuration the 2023 x86_64 escape workaround relied on. Actual
     // growth is capped by the store limiter.
-    if cfg!(any(feature = "pulley", target_os = "ios")) {
+    if cfg!(any(feature = "pulley", target_os = "ios", windows)) {
         // Explicit bytecode bounds checks, no signal handlers or executable
         // mappings. Reserve only the largest supported guest memory ceiling.
         c.memory_reservation(256 << 20);

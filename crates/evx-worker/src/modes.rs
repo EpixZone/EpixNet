@@ -1,15 +1,23 @@
 //! The confined worker modes.
 
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 
 use evx_api::frames::{
     FromCompiler, FromHelper, FromWorker, HelperFault, ToCompiler, ToHelper, ToWorker,
 };
 use evx_api::{Request, Response};
 use evx_runtime::{HostCalls, HostError, RunOptions};
+use evx_workspace::Dir;
 
+#[cfg(unix)]
 use crate::confine::{self, Spec};
+#[cfg(windows)]
+use crate::confine_windows;
 use crate::ipc::{read_frame, read_worker_init, write_compiler_reply, write_frame};
+
+/// The file a read-only helper tries to create natively under the
+/// `ReadOnlyWriteProbe` test fault.
+const READ_ONLY_PROBE: &str = "read-only-native-probe.txt";
 
 /// Broker channel: each call is one frame out and one frame back.
 struct StdioBroker {
@@ -37,15 +45,28 @@ impl HostCalls for StdioBroker {
     }
 }
 
+/// Confinement for a mode without filesystem access.
+fn confine_pure(cpu_seconds: u64) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        confine::apply_rlimits(cpu_seconds, 64)?;
+        confine::apply(&Spec {
+            workspace: None,
+            writable: false,
+        })
+    }
+    #[cfg(windows)]
+    {
+        let _ = cpu_seconds;
+        confine_windows::verify()
+    }
+}
+
 /// Execute one precompiled artifact.
 pub fn run() -> Result<(), String> {
     // The supervisor enforces the current grant (at most 300 CPU seconds)
     // and can apply live changes. This non-raisable backstop covers its loss.
-    confine::apply_rlimits(301, 64)?;
-    confine::apply(&Spec {
-        workspace: None,
-        writable: false,
-    })?;
+    confine_pure(301)?;
     run_confined()
 }
 
@@ -98,11 +119,7 @@ fn run_confined() -> Result<(), String> {
 
 /// Validate and precompile one module.
 pub fn compile() -> Result<(), String> {
-    confine::apply_rlimits(10, 64)?;
-    confine::apply(&Spec {
-        workspace: None,
-        writable: false,
-    })?;
+    confine_pure(10)?;
     compile_confined()
 }
 
@@ -135,8 +152,10 @@ fn compile_confined() -> Result<(), String> {
     write_compiler_reply(&mut stdout.lock(), &reply)
 }
 
-/// Perform one workspace operation in the current directory, which the
-/// supervisor set to the workspace. Writes need a commit acknowledgement.
+/// Perform one workspace operation. On Unix the workspace is the current
+/// directory, which the supervisor set; on Windows it is the inherited
+/// lease handle. Writes need a commit acknowledgement.
+#[cfg(unix)]
 pub fn file(writable: bool) -> Result<(), String> {
     // The supervisor enforces the current grant (at most 300 CPU seconds)
     // and can apply live changes. This non-raisable backstop covers its loss.
@@ -146,7 +165,18 @@ pub fn file(writable: bool) -> Result<(), String> {
         workspace: Some(&workspace),
         writable,
     })?;
-    file_confined(workspace, writable, None)
+    let root = evx_workspace::open_root(&workspace).map_err(|e| e.to_string())?;
+    let probe = || std::fs::write(workspace.join(READ_ONLY_PROBE), b"fixture").is_ok();
+    file_confined(writable, &root, &probe)
+}
+
+/// Perform one workspace operation through the inherited lease handle.
+#[cfg(windows)]
+pub fn file(writable: bool) -> Result<(), String> {
+    confine_windows::verify()?;
+    let root = confine_windows::workspace(writable)?;
+    let probe = || root.create_new(READ_ONLY_PROBE).is_ok();
+    file_confined(writable, &root, &probe)
 }
 
 /// The trusted file service owns this private workspace and passes its lease.
@@ -178,14 +208,18 @@ pub fn apple_file(writable: bool) -> Result<(), String> {
     {
         return Err("Apple file workspace descriptor unavailable".into());
     }
-    let root = unsafe { rustix::fd::OwnedFd::from_raw_fd(3) };
-    file_confined(workspace, writable, Some(root))
+    let root = Dir::from(unsafe { rustix::fd::OwnedFd::from_raw_fd(3) });
+    let probe = || std::fs::write(workspace.join(READ_ONLY_PROBE), b"fixture").is_ok();
+    file_confined(writable, &root, &probe)
 }
 
+/// One helper invocation over an already open workspace root. `native_probe`
+/// attempts a native write for the `ReadOnlyWriteProbe` test fault and
+/// reports whether the OS allowed it.
 fn file_confined(
-    workspace: std::path::PathBuf,
     writable: bool,
-    root: Option<rustix::fd::OwnedFd>,
+    root: &Dir,
+    native_probe: &dyn Fn() -> bool,
 ) -> Result<(), String> {
     let stdin = io::stdin();
     let stdout = io::stdout();
@@ -202,8 +236,7 @@ fn file_confined(
     };
     limits.validate().map_err(|e| e.to_string())?;
     if fault == Some(HelperFault::ReadOnlyWriteProbe) {
-        let allowed =
-            std::fs::write(workspace.join("read-only-native-probe.txt"), b"fixture").is_ok();
+        let allowed = native_probe();
         return write_frame(
             &mut stdout.lock(),
             &FromHelper::FileResult {
@@ -215,11 +248,6 @@ fn file_confined(
             },
         );
     }
-    let root = match root {
-        Some(root) => root,
-        None => evx_workspace::open_root(&workspace).map_err(|e| e.to_string())?,
-    };
-    let root = rustix::fd::AsFd::as_fd(&root);
 
     if fault == Some(HelperFault::BlockBeforeOperation) {
         write_frame(&mut stdout.lock(), &FromHelper::FaultEntered)?;
@@ -276,7 +304,9 @@ fn file_confined(
 
 /// Real blocking native I/O with no writer, used only by test fault injection
 /// to prove the supervisor can terminate a stuck helper.
+#[cfg(unix)]
 fn block_forever() -> ! {
+    use std::io::Read;
     // Linux confinement permits pipe2 on both native architectures.
     #[cfg(target_os = "linux")]
     let (reader, _writer) =
@@ -287,6 +317,12 @@ fn block_forever() -> ! {
     let mut byte = [0u8; 1];
     let _ = file.read(&mut byte);
     std::process::exit(3);
+}
+
+/// A native wait that never completes, for the same fault injection.
+#[cfg(windows)]
+fn block_forever() -> ! {
+    confine_windows::block_forever()
 }
 
 #[allow(dead_code)]

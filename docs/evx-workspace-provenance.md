@@ -115,7 +115,17 @@ replacement, the unknown old bytes cannot be adopted by reconciliation. An
 operator can preserve the old file outside the workspace and reconcile its
 absence, or retry the exact authorized write. There is no guest enrollment API.
 A restored or replaced workspace root requires an explicit host migration;
-inode identity changes are not silently trusted.
+inode identity changes are not silently trusted. On Windows the identity is
+the volume serial number and file index, so moving the data directory to
+another volume has the same effect as a restored root on Unix.
+
+On Windows the registry directory is protected by a DACL naming only the
+owner and SYSTEM instead of mode 0700, link counts come from the file
+information the handle reports, and every open refuses reparse points, so a
+junction or symbolic link planted at the authority directory or inside the
+workspace is refused like a Unix symbolic link. NTFS directories are
+case-insensitive by default; two spellings of one name are treated as a
+divergence and denied, never aliased, as on APFS.
 
 This boundary assumes the host authority directory itself is trusted. An
 unconfined process with permission to rewrite that directory can change host

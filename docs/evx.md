@@ -17,11 +17,14 @@ The candidate evidence checklist and source handoff procedure are in
 A signed declaration is inspected inertly, granted through trusted wrapper
 consent or the operator socket, and run once or on a durable background
 schedule. macOS uses a confined child. Linux adds Landlock plus seccomp and
-refuses execution when required confinement is unavailable. Pulley is tested
-as an interpreter backend. A separate macOS Developer ID package can select
-the signed XPC backend; App Store and mobile product integration remain open.
-Windows and Android fixtures do not enable product execution. No mobile OS
-wake, publication or chain operations are added.
+refuses execution when required confinement is unavailable. Windows runs the
+same direct worker backend inside less-privileged AppContainers and Job
+Objects, through the Pulley interpreter; see
+[`evx-windows-backend.md`](evx-windows-backend.md). Pulley is also tested
+as an interpreter backend on the Unix hosts. A separate macOS Developer ID
+package can select the signed XPC backend; App Store and mobile product
+integration remain open. The Android fixture does not enable product
+execution. No mobile OS wake, publication or chain operations are added.
 An external independent security review remains a release gate.
 Compiler-free Pulley and mobile limits are described in
 [`evx-mobile.md`](evx-mobile.md). Workspace read provenance and explicit
@@ -33,7 +36,7 @@ recovery are described in [`evx-workspace-provenance.md`](evx-workspace-provenan
 | --- | --- | --- |
 | `evx-api` | Shared types: closed capability set, limits, grants, IPC frames, strict JSON decoding, path and identifier validation. No I/O. | Dependency leaf |
 | `evx-runtime` | Wasm feature profile, structural validator, Wasmtime engine configuration, precompilation, execution with fuel, epoch deadline and store limits. | Trusted code, hostile input |
-| `evx-workspace` | Descriptor-relative workspace file operations: link-refusing reads, staged writes with a commit step, quota accounting. | Trusted code, used inside the confined helper |
+| `evx-workspace` | Handle-relative workspace file operations: link-refusing reads, staged writes with a commit step, quota accounting, the cross-process lease. `openat` and `flock` on Unix, NT handle-relative opens and an exclusive directory handle on Windows. | Trusted code, used inside the confined helper |
 | `evx-worker` | The confined binary. Modes `run`, `compile`, `file`, `file-read` and a harness-only `probe`. Confines itself before reading any input. | Untrusted after a guest starts |
 | `evx-supervisor` | Broker, workspace lease, child processes, kernel resource observations, commit authorization, effect-outcome semantics. | Trusted |
 | `evx-activation` | Ed25519-signed activation envelopes, immutable closure capture, two-phase admission, shared-source record verification. | Trusted |
@@ -41,7 +44,8 @@ recovery are described in [`evx-workspace-provenance.md`](evx-workspace-provenan
 | `evx-host` | Binds activation to the supervisor; JSON-on-stdin CLI for harnesses. | Trusted |
 | `evx-declaration` | Strict parser and manifest binder for the signed `evx` section of a root `content.json`: programs, jobs, capability requests, limits; unsupported items disable only the affected work. | Dependency leaf, hostile input |
 | `epix-evx` | The node's EVX plugin: grant store and workspaces under `private/evx/`, the `evx*` WebSocket commands (inspect, status, request, grant, revoke, limits, run once) and the activation of a xite's declared program through `evx-host`. | Trusted |
-| `evx-windows` | Windows LPAC/Job Object worker and real Wasm compilation/execution adapter. Native acceptance and node/workspace integration remain pending. | Platform work in progress |
+| `evx-windows-native` | Win32 primitives with no EVX policy: AppContainer profiles, Job Objects, LPAC launch and token validation, named pipes, ACLs, process accounting. Empty on other targets. | Trusted |
+| `evx-windows` | The Windows native acceptance fixture: six LPAC/Job Object isolation cases and a real compile/run fixture, built on `evx-windows-native`. | Acceptance fixture |
 | `evx-android` | Pulley execution and JNI bridge for a separate Android isolated service. Native accounting, lifecycle acceptance and product integration remain pending. | Platform work in progress |
 
 Signed envelope verification also accepts a host-selected bounded reader through
@@ -184,16 +188,17 @@ on a desktop do not establish iOS device support.
   [`evx-platforms.md`](evx-platforms.md).
 - Pulley removes executable-code generation at execution time. Its compiler
   still needs containment, and iOS needs a device-tested host, interruption
-  handling and explicit memory policy. The Windows LPAC/Job Object worker and
-  Android isolated-service runtime adapter have no product admission path.
-  Native platform acceptance and runtime/broker integration remain required;
-  see [`evx-windows.md`](evx-windows.md) and [`evx-android.md`](evx-android.md).
-  The node includes EVX only on macOS and Linux with its `evx` feature enabled.
-  Unsupported targets omit execution and management commands. The
-  supervisor, worker, host and workspace crates themselves require Unix APIs;
-  the target gate excludes them from unsupported products, and on other
-  targets they compile as empty crates (their binaries as stubs) so a full
-  workspace build and test run still succeed there without providing any API.
+  handling and explicit memory policy. Windows executes through Pulley inside
+  AppContainers; see [`evx-windows.md`](evx-windows.md) and
+  [`evx-windows-backend.md`](evx-windows-backend.md). The Android
+  isolated-service runtime adapter has no product admission path; see
+  [`evx-android.md`](evx-android.md).
+  The node includes EVX on macOS, Linux and Windows with its `evx` feature
+  enabled. Mobile targets and the native messaging host omit execution and
+  management commands. The supervisor, worker, host and workspace crates
+  share one code base across the three desktop platforms; only the child
+  launch, measurement and termination mechanics and the workspace lease
+  differ per platform.
 - Linux positive containment passed on Debian 13 ARM64 with Landlock ABI 6.
   Broader supported-kernel, architecture and package coverage remains required;
   see [`evx-linux-acceptance.md`](evx-linux-acceptance.md).

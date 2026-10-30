@@ -6,7 +6,7 @@ on:
     # the advisory/license gates on every branch push, not first at merge time.
     branches: [main, edx, evx]
   pull_request:
-    branches: [main]
+    branches: [main, evx]
   schedule:
     # Weekly, so new advisories against pinned deps get caught even without a push.
     - cron: "0 6 * * 1"

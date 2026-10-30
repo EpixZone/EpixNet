@@ -146,7 +146,7 @@ claimed and the job reports `clock_rollback` until time passes the slot.
 - Status: `evxStatus` gains `jobs: [{job, program, schedule, enabled,
   paused_reason, next_due_unix, last_slot, last_occurrence, failures,
   runs_today, daily_limit}]` and `scheduler: {enabled, busy_workers,
-  next_wake_unix, host: "macos"|"linux"|"unsupported"}`; `evxInspect` lists the
+  next_wake_unix, host: "macos"|"linux"|"windows"|"unsupported"}`; `evxInspect` lists the
   declared jobs as before. Run records expose `occurrence` and `trigger`.
 - Commands (wrapper/operator only, gated like the other EVX mutators in
   `EVX_WRAPPER_COMMANDS`): `evxJobPause {xite, job}`, `evxJobResume {xite,

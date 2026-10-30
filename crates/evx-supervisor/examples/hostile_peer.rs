@@ -13,9 +13,9 @@
 //!
 //! Usage: `hostile_peer <mode> run` (the supervisor appends the mode name).
 
-// The supervisor exists on Unix hosts only; elsewhere this example is a stub,
-// so a workspace build still succeeds.
-#![cfg_attr(not(unix), allow(dead_code))]
+// The supervisor exists on Unix and Windows hosts; elsewhere this example is
+// a stub, so a workspace build still succeeds.
+#![cfg_attr(not(any(unix, windows)), allow(dead_code))]
 
 use std::io::{Read, Write};
 
@@ -37,6 +37,16 @@ fn result(extra: &str) {
 
 fn consume_init() {
     let mut stdin = std::io::stdin().lock();
+    // A Windows file helper first receives its workspace handle value.
+    if cfg!(windows)
+        && matches!(
+            std::env::args().next_back().as_deref(),
+            Some("file") | Some("file-read")
+        )
+    {
+        let mut preamble = [0u8; 8];
+        let _ = stdin.read_exact(&mut preamble);
+    }
     let mut len = [0u8; 4];
     if stdin.read_exact(&mut len).is_ok() {
         let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
@@ -62,13 +72,104 @@ fn transient_memory_peak() {
     }
 }
 
-#[cfg(not(unix))]
+/// The same fixture on Windows: touch 32 MiB, then release it. The peak
+/// working set keeps the high-water mark after the pages are gone.
+#[cfg(windows)]
+fn transient_memory_peak() {
+    let mut memory = vec![0u8; 32 * 1024 * 1024];
+    for offset in (0..memory.len()).step_by(4096) {
+        memory[offset] = 1;
+    }
+    std::hint::black_box(&memory);
+    drop(memory);
+}
+
+/// Close one of the standard handles so the next operation on it fails.
+#[cfg(unix)]
+fn close_standard(number: u32) {
+    unsafe {
+        libc::close(number as i32);
+    }
+}
+
+#[cfg(windows)]
+fn close_standard(number: u32) {
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let which = match number {
+        0 => STD_INPUT_HANDLE,
+        1 => STD_OUTPUT_HANDLE,
+        _ => STD_ERROR_HANDLE,
+    };
+    // SAFETY: closing a standard handle this process owns; nothing uses it
+    // afterwards except the deliberate failing write under test.
+    unsafe {
+        CloseHandle(GetStdHandle(which));
+    }
+}
+
+/// Only this sacrificial child changes its own process group. It exits on
+/// its own after two seconds even when cleanup is broken.
+#[cfg(unix)]
+fn change_group() {
+    let changed = unsafe { libc::setpgid(0, libc::getpgid(libc::getppid())) };
+    assert_eq!(changed, 0);
+    eprintln!("group changed");
+    std::thread::sleep(std::time::Duration::from_secs(2));
+}
+
+#[cfg(windows)]
+fn change_group() {
+    std::process::exit(2);
+}
+
+/// Whether the descriptor named on the command line is open in this process.
+#[cfg(unix)]
+fn inherited_descriptor() -> i32 {
+    let fd: i32 = std::env::args().nth(2).unwrap().parse().unwrap();
+    i32::from(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0)
+}
+
+#[cfg(windows)]
+fn inherited_descriptor() -> i32 {
+    std::process::exit(2);
+}
+
+/// 0 for an access denial, 1 for success, 2 for another error.
+fn outcome<T>(result: std::io::Result<T>) -> i32 {
+    match result {
+        Ok(_) => 1,
+        Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => 0,
+        Err(_) => 2,
+    }
+}
+
+/// Windows only: try to read the file named on the command line natively.
+fn read_native() -> i32 {
+    outcome(std::fs::read(std::env::args().nth(2).unwrap()))
+}
+
+/// Windows only: try to create a file inside the directory named on the
+/// command line natively.
+fn write_native() -> i32 {
+    let dir = std::path::PathBuf::from(std::env::args().nth(2).unwrap());
+    outcome(std::fs::write(dir.join("evx-hostile-probe.txt"), b"probe"))
+}
+
+/// Windows only: try to list the directory named on the command line.
+fn list_native() -> i32 {
+    outcome(std::fs::read_dir(std::env::args().nth(2).unwrap()))
+}
+
+#[cfg(not(any(unix, windows)))]
 fn main() {
-    eprintln!("hostile_peer runs only on Unix hosts");
+    eprintln!("hostile_peer runs only on Unix and Windows hosts");
     std::process::exit(1);
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, windows))]
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     if mode == "unread_init" {
@@ -98,7 +199,7 @@ fn main() {
             if std::env::args().next_back().as_deref() == Some("file") {
                 // Force the supervisor's Commit write to fail after it has
                 // durably recorded the authorized candidate.
-                unsafe { libc::close(0); }
+                close_standard(0);
                 frame(br#"{"type":"prepared"}"#);
             } else {
                 let request = evx_api::Request::WorkspaceWrite {
@@ -114,17 +215,16 @@ fn main() {
         "reconcile_close_before_exit" => {
             frame(br#"{"type":"file_result","response":{"ok":true,"data_b64":"Y2FuZGlkYXRl","bytes":9}}"#);
             // Model stream EOF before the kernel makes the process reapable.
-            unsafe { libc::close(1); libc::close(2); }
+            close_standard(1);
+            close_standard(2);
             std::thread::sleep(std::time::Duration::from_millis(100));
+            // Exit directly: returning from main after closing the standard
+            // handles faults in the runtime's exit path inside an LPAC job
+            // (0xC0000005), which would turn this clean-exit fixture into a
+            // crash fixture.
+            std::process::exit(0);
         }
-        "change_group" => {
-            // Only this sacrificial child changes its own group. It exits on
-            // its own after two seconds even when cleanup is broken.
-            let changed = unsafe { libc::setpgid(0, libc::getpgid(libc::getppid())) };
-            assert_eq!(changed, 0);
-            eprintln!("group changed");
-            std::thread::sleep(std::time::Duration::from_secs(2));
-        }
+        "change_group" => change_group(),
         "forged_cancellation" => frame(br#"{"type":"result","status":"error","error":"execution grant revoked"}"#),
         "forged_cancellation_field" => frame(br#"{"type":"result","status":"error","error":"fixture","host_cancellation":"authority_changed"}"#),
         "bad_json" => frame(br#"{"type":"#),
@@ -220,13 +320,20 @@ fn main() {
             result("");
         }
         "inherited_fd" => {
-            let fd: i32 = std::env::args().nth(2).unwrap().parse().unwrap();
-            let leaked = i32::from(unsafe { libc::fcntl(fd, libc::F_GETFD) } >= 0);
+            let leaked = inherited_descriptor();
             frame(format!(r#"{{"type":"result","status":"ok","value":{leaked}}}"#).as_bytes());
         }
         "environment" => {
             let leaked = i32::from(std::env::var_os("EVX_TEST_SECRET").is_some());
             frame(format!(r#"{{"type":"result","status":"ok","value":{leaked}}}"#).as_bytes());
+        }
+        "read_native" | "write_native" | "list_native" => {
+            let outcome = match mode.as_str() {
+                "read_native" => read_native(),
+                "write_native" => write_native(),
+                _ => list_native(),
+            };
+            frame(format!(r#"{{"type":"result","status":"ok","value":{outcome}}}"#).as_bytes());
         }
         "frame_flood" => {
             for _ in 0..200 {

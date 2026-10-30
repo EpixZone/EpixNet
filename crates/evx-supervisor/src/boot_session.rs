@@ -47,12 +47,17 @@ impl BootSession {
             }
             Self::parse(&bytes[..36])
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(target_os = "windows")]
+        {
+            windows::current()
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
         {
             Err(unavailable())
         }
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux", test))]
     fn parse(bytes: &[u8]) -> Result<Self, Denied> {
         if bytes.len() != 36 {
             return Err(unavailable());
@@ -90,6 +95,92 @@ impl BootSession {
     #[cfg(test)]
     pub(crate) fn fixture(value: u8) -> Self {
         Self([value; 16])
+    }
+}
+
+/// Windows has no documented boot UUID. The identity is a digest of the
+/// machine GUID and the kernel's boot counter, which it increments on every
+/// boot. Both are machine-wide registry values under `HKLM` that no caller,
+/// page or environment variable can influence, and neither depends on wall
+/// time.
+#[cfg(target_os = "windows")]
+mod windows {
+    use super::{unavailable, BootSession};
+    use evx_api::Denied;
+    use sha2::{Digest, Sha256};
+    use windows_sys::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RRF_RT_REG_SZ};
+
+    const MACHINE_KEY: &str = r"SOFTWARE\Microsoft\Cryptography";
+    const MACHINE_VALUE: &str = "MachineGuid";
+    const BOOT_KEY: &str =
+        r"SYSTEM\CurrentControlSet\Control\Session Manager\Memory Management\PrefetchParameters";
+    const BOOT_VALUE: &str = "BootId";
+
+    fn wide(text: &str) -> Vec<u16> {
+        text.encode_utf16().chain(std::iter::once(0)).collect()
+    }
+
+    fn machine_guid() -> Result<String, Denied> {
+        let key = wide(MACHINE_KEY);
+        let value = wide(MACHINE_VALUE);
+        let mut buffer = [0u16; 128];
+        let mut bytes = (buffer.len() * 2) as u32;
+        // SAFETY: NUL-terminated names and a bounded output buffer.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_SZ,
+                std::ptr::null_mut(),
+                buffer.as_mut_ptr().cast(),
+                &mut bytes,
+            )
+        };
+        if status != 0 || bytes < 2 {
+            return Err(unavailable());
+        }
+        let units = &buffer[..(bytes as usize / 2).saturating_sub(1)];
+        let text = String::from_utf16(units).map_err(|_| unavailable())?;
+        if text.len() != 36 {
+            return Err(unavailable());
+        }
+        Ok(text)
+    }
+
+    fn boot_counter() -> Result<u32, Denied> {
+        let key = wide(BOOT_KEY);
+        let value = wide(BOOT_VALUE);
+        let mut data = 0u32;
+        let mut bytes = 4u32;
+        // SAFETY: NUL-terminated names and a 4-byte output for a DWORD.
+        let status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                key.as_ptr(),
+                value.as_ptr(),
+                RRF_RT_REG_DWORD,
+                std::ptr::null_mut(),
+                (&mut data as *mut u32).cast(),
+                &mut bytes,
+            )
+        };
+        if status != 0 || bytes != 4 || data == 0 {
+            return Err(unavailable());
+        }
+        Ok(data)
+    }
+
+    pub(super) fn current() -> Result<BootSession, Denied> {
+        let mut hasher = Sha256::new();
+        hasher.update(machine_guid()?.as_bytes());
+        hasher.update(boot_counter()?.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut value = [0u8; 16];
+        value.copy_from_slice(&digest[..16]);
+        let session = BootSession(value);
+        session.validate()?;
+        Ok(session)
     }
 }
 

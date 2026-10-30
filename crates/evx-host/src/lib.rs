@@ -15,12 +15,8 @@
 //! Neither input selects a broker, workspace, runtime option or key, and a
 //! denied binding check leaves the previous version runnable.
 
-// Built on the Unix-only supervisor. Elsewhere this crate is empty, so a
-// workspace build still succeeds; nothing there may depend on it
-// (docs/evx-platforms.md).
-#![cfg(unix)]
-
 use std::collections::BTreeSet;
+#[cfg(unix)]
 use std::path::Path;
 
 use evx_activation::{
@@ -126,7 +122,10 @@ fn check_binding_to_grant(
     Ok(())
 }
 
-/// Verify, capture, compile, admit and run one signed activation.
+/// Verify, capture, compile, admit and run one signed activation. The
+/// envelope path captures the artifact tree through the Unix-only reader;
+/// the node uses the content path on every platform.
+#[cfg(unix)]
 pub fn run_activation(
     config: &Config,
     loader: &mut ActivationLoader,

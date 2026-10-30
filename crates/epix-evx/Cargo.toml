@@ -19,6 +19,9 @@ evx-activation = { path = "../evx-activation" }
 evx-state = { path = "../evx-state" }
 evx-host = { path = "../evx-host" }
 evx-supervisor = { path = "../evx-supervisor" }
+# The binding and checkpoint writes go through the same directory seam the
+# supervisor uses, so Windows and Unix apply one set of checks.
+evx-workspace = { path = "../evx-workspace" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 async-trait = "0.1"

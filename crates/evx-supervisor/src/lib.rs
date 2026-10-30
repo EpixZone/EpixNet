@@ -11,12 +11,12 @@
 //! the deadlines, and only then authorizes the commit. If anything fails after
 //! that authorization the result is `EffectUnknown`: the file may have changed
 //! and the caller must reconcile before retrying.
+//!
+//! The same logic runs on macOS, Linux and Windows. Only the child launch,
+//! measurement and termination mechanics and the workspace lease differ per
+//! platform (`process`, `evx_workspace::sys`, `docs/evx-windows-backend.md`).
 
-// Unix process and descriptor APIs only. Elsewhere this crate is empty, so a
-// workspace build still succeeds; nothing there may depend on it
-// (docs/evx-platforms.md).
-#![cfg(unix)]
-
+#[cfg(unix)]
 pub mod apple_slots;
 #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
 pub mod apple_workspace;
@@ -29,6 +29,12 @@ mod provenance;
 mod reconcile;
 pub use reconcile::{reconcile_workspace, reconcile_workspace_cancellable};
 pub mod supervisor;
+#[cfg(windows)]
+pub mod windows;
+#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+pub mod apple;
+#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
+pub mod apple_package;
 
 pub use broker::Broker;
 pub use compile::{
@@ -65,8 +71,13 @@ pub fn confinement_available() -> Result<(), evx_api::Denied> {
             Ok(())
         }
     }
+    #[cfg(windows)]
+    {
+        process::windows_confinement_available()
+    }
     #[cfg(not(any(
         target_os = "macos",
+        windows,
         all(
             target_os = "linux",
             any(target_arch = "x86_64", target_arch = "aarch64")
@@ -78,8 +89,3 @@ pub fn confinement_available() -> Result<(), evx_api::Denied> {
         ))
     }
 }
-#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
-pub mod apple;
-
-#[cfg(all(target_os = "macos", feature = "apple-xpc"))]
-pub mod apple_package;

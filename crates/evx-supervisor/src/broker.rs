@@ -5,9 +5,9 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
-use rustix::fd::{AsFd, BorrowedFd, OwnedFd};
-
 use evx_api::{Capability, Denied, Grant, Limits, Request, Response};
+use evx_workspace::sys::RawLease;
+use evx_workspace::{Dir, Lease};
 
 pub struct Inner {
     pub grant: Grant,
@@ -24,11 +24,14 @@ pub struct Inner {
     pub active_capabilities: Option<BTreeSet<Capability>>,
     pub calls: u32,
     pub responses: Vec<Response>,
+    /// The workspace lease while an invocation or a reconciliation runs. A
+    /// quarantined broker keeps it until the broker itself is dropped.
+    pub lease: Option<Lease>,
 }
 
 pub struct Broker {
     workspace: PathBuf,
-    root_fd: OwnedFd,
+    root: Dir,
     inner: Mutex<Inner>,
     pub(crate) provenance: crate::provenance::Provenance,
     #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
@@ -37,8 +40,9 @@ pub struct Broker {
 
 impl Broker {
     /// Open a workspace and bind a grant to it. The workspace must be a
-    /// host-created directory, never a symlink. Its parent is host-owned and
-    /// trusted; only that parent is resolved before the final NOFOLLOW open.
+    /// host-created directory, never a link. Its parent is host-owned and
+    /// trusted; only that parent is resolved before the final open, which
+    /// does not follow links.
     pub fn new(workspace: &Path, grant: Grant, limits: Limits) -> Result<Broker, Denied> {
         limits.validate()?;
         let name = workspace
@@ -51,15 +55,18 @@ impl Broker {
         let workspace = std::fs::canonicalize(parent)
             .map_err(|_| Denied::new("workspace unavailable"))?
             .join(name);
-        let root_fd = evx_workspace::open_root(&workspace)?;
-        let provenance =
-            crate::provenance::Provenance::new(&workspace, root_fd.as_fd(), &grant.xite)?;
+        let root = Dir::open_root(&workspace)?;
+        // The helper containers must reach the workspace before any lease
+        // is held (`crate::windows::containers`).
+        #[cfg(windows)]
+        crate::windows::prepare_workspace(&workspace)?;
+        let provenance = crate::provenance::Provenance::new(&workspace, &root, &grant.xite)?;
         Ok(Broker {
             #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
             apple_workspace: None,
             provenance,
             workspace,
-            root_fd,
+            root,
             inner: Mutex::new(Inner {
                 grant,
                 limits,
@@ -69,6 +76,7 @@ impl Broker {
                 active_capabilities: None,
                 calls: 0,
                 responses: Vec::new(),
+                lease: None,
             }),
         })
     }
@@ -115,20 +123,40 @@ impl Broker {
         Ok(())
     }
 
-    pub(crate) fn helper_lease_fd(&self) -> Option<std::os::fd::RawFd> {
+    /// The lease value a file helper inherits, while one is held. Apple
+    /// helpers receive their workspace from the file service instead. Call
+    /// without holding the broker lock.
+    pub(crate) fn helper_lease(&self) -> Option<RawLease> {
         #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
         if self.apple_workspace.is_some() {
             return None;
         }
-        Some(std::os::fd::AsRawFd::as_raw_fd(&self.root_fd))
+        self.lock().lease.as_ref().map(Lease::raw)
+    }
+
+    /// Take the workspace lease for the invocation the caller is admitting.
+    /// `inner` is the caller's lock on this broker.
+    pub(crate) fn take_lease(&self, inner: &mut Inner) -> Result<(), Denied> {
+        let lease = self.root.lease()?;
+        inner.lease = Some(lease);
+        Ok(())
+    }
+
+    /// Release the lease after an invocation, unless the workspace is
+    /// quarantined: then it stays held until the broker is dropped.
+    pub(crate) fn release_lease(inner: &mut Inner) {
+        if !inner.quarantined {
+            inner.lease.take();
+        }
     }
 
     pub fn workspace(&self) -> &Path {
         &self.workspace
     }
 
-    pub fn root_fd(&self) -> BorrowedFd<'_> {
-        self.root_fd.as_fd()
+    /// The open workspace root.
+    pub fn root(&self) -> &Dir {
+        &self.root
     }
 
     pub fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -182,7 +210,7 @@ impl Broker {
                 "Apple workspace usage requires the scoped file service",
             ));
         }
-        evx_workspace::usage(self.root_fd())
+        evx_workspace::usage(&self.root)
     }
 
     /// Validate one raw guest request against the locked state without any

@@ -61,6 +61,7 @@ Ship a self-contained install directory:
 Epix\
   epix-browser.exe        # the launcher (GUI subsystem - no console window)
   epix-nmh.exe            # native-messaging host
+  evx-worker.exe          # the EVX worker the node runs inside an AppContainer
   firefox\                # bundled Firefox ESR (extract the ESR installer)
     firefox.exe
     distribution\
@@ -84,8 +85,15 @@ The CA itself is written by the launcher to
 
 1. Build the binaries:
    ```
-   cargo build --release -p epix-browser -p epix-nmh
+   cargo build --release -p epix-browser -p epix-nmh -p evx-worker
    ```
+   `build-windows.sh` also runs `verify-evx-worker.py` on the staged worker:
+   it must be an AMD64 image with a single hard link that imports no host-only
+   DLL (`userenv`, `shell32`, `ole32`) and refuses to run outside an
+   AppContainer. The node pins the worker beside `epix-browser.exe`, hashes it
+   once at start and keeps it open; see `docs/evx-windows-backend.md`. For a
+   development run, copy (do not link) `evx-worker.exe` beside the launcher:
+   Cargo's own hard-linked target binary is refused.
 2. Get Firefox ESR (`packaging/fetch-firefox-esr.sh win64` downloads the
    installer; extract it with 7-Zip into `Epix\firefox\`).
 3. Package with an installer. NSIS (extends the existing `EpixNet/installer.nsi`)
@@ -109,9 +117,11 @@ The CA itself is written by the launcher to
 
 ## Signing
 
-Sign `epix-browser.exe` and `epix-nmh.exe` **before** the NSIS pack (so the
-copies inside the installer are signed - SmartScreen and Defender judge what
-runs after install, not just the download), then the installer itself. The
+Sign `epix-browser.exe`, `epix-nmh.exe` and `evx-worker.exe` **before** the
+NSIS pack (so the copies inside the installer are signed - SmartScreen and
+Defender judge what runs after install, not just the download), then the
+installer itself. The release workflow signs every top-level `*.exe` in the
+stage, which covers the worker. The
 release workflow does this with Azure Trusted Signing around the script's two
 phases:
 

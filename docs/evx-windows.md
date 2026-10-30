@@ -1,137 +1,149 @@
-# Windows native isolation fixture
+# Windows EVX
 
-Windows EVX execution is still disabled. `evx-windows` is a separate native
-acceptance primitive and a real compiler/worker transport. Its `WindowsExecutor`
-can compile arbitrary bounded EVX Wasm modules and execute their resulting
-Pulley artifacts through `evx-windows-worker`. It does not port the node's
-workspace broker, scheduler, consent or recovery integration. Nothing in the
-node selects it.
+Windows runs EVX through the same direct worker backend as macOS and Linux:
+the node's `epix-evx` service, its lifecycle journal, workspace broker,
+provenance and reconciliation are one code base on all three platforms. On
+Windows the confined children are less-privileged AppContainers inside Job
+Objects, launched and verified by `evx-supervisor` through the primitives in
+`evx-windows-native`, and the worker is `evx-worker.exe` beside
+`epix-browser.exe`. The design, the Win32 mechanisms chosen for each POSIX
+assumption and the facts measured while building it are in
+[evx-windows-backend.md](evx-windows-backend.md). This page records what runs
+on Windows, how to reproduce it, and what remains.
 
-The fixture stages a copy of its own executable in a new disposable directory
-and creates a fresh AppContainer identity. Its host API accepts no caller-selected
-program, command line, path or capability. The child modes are fixed game output,
-native denial checks, a bounded memory request, a CPU loop and sleep. No downloaded
-code, real user records, chain activity or external network request is used.
+`evx-windows` is the native acceptance fixture: six isolation cases and a
+real compile/run fixture on the same primitives the backend uses. It is not
+selected by the node.
 
-## Boundary implemented
+## What the node does on Windows
 
-The child is launched as a less-privileged AppContainer (LPAC), with zero
-capabilities and the All Application Packages opt-out. Protected ACLs grant the
-exact package identity read/execute access only to its staged fixture directory.
-A synthetic host-private game record has a separate owner/System ACL. There are
-no network, broad filesystem or registry grants.
-
-`PROC_THREAD_ATTRIBUTE_JOB_LIST` attaches the process to its job during
-`CreateProcessW`. There is no create-then-assign gap. The process initially stays
-suspended while the host verifies its AppContainer SID, LPAC access restrictions,
-empty capability list and job membership. The LPAC check uses an impersonation
-duplicate with `AccessCheck`: a grant to the exact package must succeed, while
-a grant to `ALL_APPLICATION_PACKAGES` must be denied. This avoids relying on
-the class-46 token query, which current Windows rejects from user mode.
-An unsupported or failed operation refuses
-execution. There is no unrestricted fallback.
-
-The job permits one process, disallows breakaway, uses kill-on-last-job-handle
-close, and sets 64 MiB process and aggregate committed-memory limits. Its CPU
-controls are a 500 ms user-time budget and a 50% scheduling-rate cap. The user-time
-budget does not claim to measure kernel time. A separate wall deadline covers
-sleep and stalled execution. Child creation is also disabled by the process
-creation policy. The only inherited handle is a private reply-pipe writer;
-a deliberately inheritable event is excluded and checked by the fixture.
-The parent environment and ordinary standard handles are not passed through.
-Workers start with `DETACHED_PROCESS` and communicate through their explicit
-pipes, without initializing console infrastructure inside the LPAC.
-The child environment contains only `SystemRoot` and `LOCALAPPDATA`, resolved
-through Windows APIs; AppContainer startup redirects its profile storage.
-
-Normal completion requires a signaled process handle followed by job accounting
-showing zero active processes. `TerminateJobObject` returning success, a reply,
-pipe closure or an exit-code query alone cannot establish death. A termination
-wait or accounting failure retains the disposable stage/profile and returns an
-error. The separate kill-on-close case retains an independent process handle to
-observe death; a readiness frame and an unsignaled process first prove the
-sleeping child is alive, then job closure must terminate it before the wall
-deadline. The job-close exit code can be zero and does not prove success.
-Its one-process restriction precludes descendants. This is not a
-persistent production lifecycle journal or an actual host-crash test.
-
-This primitive does not promise that native code has no filesystem namespace.
-LPAC uses Windows access checks, and OS resources may already grant LPAC access.
-Its dedicated profile can also have private OS-managed state. Before production,
-that storage needs quota, identity, provenance and reuse rules comparable to the
-existing EVX host protocols. Closing a job is not a substitute for those rules.
+- The worker is pinned at service start: `evx-worker.exe` beside the running
+  executable, on a local disk, with no reparse point in any path component,
+  a regular file with one link, hashed once and held open with
+  `FILE_SHARE_READ`. `EVX_WORKER` is not honoured on Windows; tests pin a
+  worker through `EvxPlugin::with_worker`.
+- The image is staged under the node's private tree, re-hashed, protected
+  with a DACL for the owner, SYSTEM and `ALL RESTRICTED APPLICATION PACKAGES`,
+  and held open. Every child executes the staged copy.
+- Each workspace gets three retained AppContainer profiles with deterministic
+  names (guest, file helper, file-read helper) and an inheritable DACL that
+  lets only the two helper profiles reach it; the compiler uses one fixed
+  profile. The guest cannot open the workspace natively; a native test proves
+  it.
+- The workspace lease is an exclusive handle on the workspace directory; a
+  file helper receives a duplicate, so the lease lives as long as either
+  holder. `KILL_ON_JOB_CLOSE` ends every child with its supervisor.
+- The lifecycle journal, provenance records, checkpoints and the backend
+  marker use handle-relative NT opens, volume serial plus file index as
+  identity, owner and DACL checks in place of modes, and POSIX-semantics
+  renames. The boot identity is a digest of the machine GUID and the kernel's
+  boot counter.
+- Execution is through the Pulley interpreter; `evx-runtime` enables it for
+  every Windows build so the host's and the worker's engine keys agree.
+- `evxStatus` reports `host: "windows"`. The operator socket does not exist
+  on Windows, so a node with `ui_restrict` set has no caller for the
+  wrapper-only commands; this is a pre-existing property of the Windows node.
 
 ## Reproducible checks
 
-The 2026-10-04 macOS review host has Rust's `x86_64-pc-windows-msvc` target but no
-Windows execution environment or SDK. Both commands passed without a Windows SDK
-or C build dependency:
-
-```sh
-cargo check -p evx-windows --all-targets --target x86_64-pc-windows-msvc --locked --offline
-cargo clippy -p evx-windows --all-targets --target x86_64-pc-windows-msvc --locked --offline -- -D warnings
-```
-
-Portable regression tests also pass. They verify that descendant creation
-accepts the explicit `ERROR_CHILD_PROCESS_BLOCKED` status (367), while file and
-network checks still require `PermissionDenied`, and unrelated launch failures
-cannot count as isolation. The former permission-only descendant check failed
-this regression before correction. Microsoft's [SDK error definition](https://github.com/microsoft/win32metadata/blob/main/generation/WinSDK/RecompiledIdlHeaders/shared/winerror.h)
-identifies 367 as a process-creation block; Rust's current Windows mapping does
-not classify it as `PermissionDenied`.
-
-That was portable test/type/lint evidence only. A native run on 2026-10-29
-(Windows 11 Pro 10.0.26300, rustc 1.97.0, this branch merged with `main` at
-418fef1) passed the strict Clippy check, the seven library tests, both release
-fixtures below (the six isolation cases; the real compile/run, `evx.call`
-roundtrip, cancellation and fresh execution), the import inspection (no
-`userenv`, `shell32` or `ole32` import in `acceptance.exe` or
-`evx-windows-worker.exe`) and the `windows-core` profile (169 portable tests,
-11 Pulley tests, product exclusion). Product execution stays disabled. The
-same checks were repeated later that day after the Wasmtime pin moved from
-48.0.5 to 48.0.8 for the October RustSec advisories, with the same results.
-`.github/workflows/evx-windows-fixture.yml` builds on Windows and requires:
+The native profile runs everything the backend depends on, inside real
+AppContainers, and retains the evidence:
 
 ```powershell
-cargo build -p evx-windows --example acceptance --release --locked
-& target/release/examples/acceptance.exe
+python scripts/evx-platform-acceptance.py windows --output <new directory>
 ```
 
-The six native cases cover a valid eight-byte game response; explicit access
-denials for the synthetic host record, package write, child creation and loopback
-connect/listen; rejection of an allocation above the memory cap after a small
-allocation succeeds; CPU termination before the wall fallback; confirmed wall
-termination; and confirmed death on job close. Non-permission errors do not count
-as access-denial evidence, except the specific child-policy status above for
-descendant creation. Before resume, the host duplicates the child's handle
-values and compares their underlying kernel objects: the explicit reply pipe
-must be inherited and the excluded event must not be. This handles recycled
-numbers without provoking LPAC's strict-handle termination inside the child.
-The host also verifies its event remains unsignaled after termination.
-When zero-capability LPAC blocks Winsock initialization itself, the network
-probe requires both `WSASYSCALLFAILURE` and an independent `PermissionDenied`
-reading the Winsock protocol catalog. The host first confirms that the same
-catalog and Winsock are usable outside the LPAC. A generic initialization error
-alone never counts as isolation; when initialization succeeds, connect/listen
-must each fail with `PermissionDenied` as usual.
-The workflow retains the output and fails on refused
-LPAC startup rather than treating an unavailable profile as a passing test.
+It runs, in order: the ten-crate native test suite (`evx-api`,
+`evx-declaration`, `evx-runtime`, `evx-workspace`, `evx-activation`,
+`evx-state`, `evx-worker`, `evx-supervisor`, `evx-host`, `epix-evx`), the
+`evx-windows-native` and `evx-windows` library tests, the release build of
+the fixture and both fixture executables, a build of `evx-worker.exe` and
+`packaging/windows/verify-evx-worker.py` on a single-link copy of it (AMD64
+image, no `userenv`, `shell32` or `ole32` import, refuses to run outside an
+AppContainer), the product dependency gates
+(`scripts/check-evx-platforms.py`) and the offline packaging test. CI runs
+it as `Windows native EVX (windows-2025)` in
+`.github/workflows/evx-platforms.yml`. The fixture workflow
+`.github/workflows/evx-windows-fixture.yml` additionally inspects the
+fixture images with `dumpbin`.
+
+A developer run (`cargo run -p epix-browser`) finds Cargo's hard-linked
+`target/debug/evx-worker.exe` beside the executable and refuses it with
+"image has more than one link": the pin requires a single-link file, as
+every installed copy is. Copy the worker beside the executable for a
+development node; the test suites and the acceptance profile do the same.
+
+The portable claim stays separate:
+
+```powershell
+python scripts/evx-platform-acceptance.py windows-core --output <new directory>
+```
+
+The supervisor's suites that run on Windows: `baseline`, `ipc` (with the
+hostile peer example ported; the process-group and inherited-descriptor
+cases stay Unix-only), `lifecycle` (including the orphaned-helper lease
+case in its Windows form), `direct_lifecycle`, `workspace_provenance`,
+`terminal_resources` and the new `windows_confinement` (guest denied the
+workspace and the outside file while the helper profiles are allowed, a
+connected pipe cannot be opened by name, the capability gate, the fixed
+termination code). The node's `service` and `backend_lifecycle` suites and
+the host's `content_activation` suite run on Windows; `activation_runner`
+stays Unix-only because the envelope reader is.
+
+## Native evidence
+
+A native run on 2026-10-30 (Windows 11 Pro 10.0.26300, rustc 1.97.0, Wasmtime
+48.0.8 through Pulley) passed the whole `windows` profile: 561 tests in the
+ten-crate native suite, among them `evx-supervisor` 40 library tests,
+`baseline` 11, `ipc` 15, `lifecycle` 18, `direct_lifecycle` 2,
+`workspace_provenance` 16, `terminal_resources` 3, `windows_confinement` 7;
+`evx-worker` 6; `evx-workspace` 12; `evx-host` 9 plus `content_activation`
+11; `epix-evx` 58 plus `service` 39 and `backend_lifecycle` 2 against the
+real confined worker; then `evx-windows-native` 22 and `evx-windows` 7, both
+release fixtures (the six isolation cases; real compile/run, `evx.call`
+roundtrip, cancellation and fresh execution), the worker verifier, the
+product dependency gates and the packaging test. Strict Clippy on every EVX
+crate and a locked all-targets workspace check passed alongside. The
+profile's retained manifest is the record of a complete run.
+
+The six fixture cases cover a valid eight-byte game response; explicit access
+denials for the synthetic host record, package write, child creation and
+loopback connect/listen; rejection of an allocation above the memory cap
+after a small allocation succeeds; CPU termination before the wall fallback;
+confirmed wall termination; and confirmed death on job close. Non-permission
+errors do not count as access-denial evidence, except the child-creation
+block status 367 for descendant creation. The fixture also inspects the
+suspended child's handle table: the explicit reply pipe must be inherited
+and a deliberately inheritable excluded event must not be.
 
 ## Remaining acceptance and integration
 
-A passing native fixture is necessary, not Windows product support. Production
-needs a trusted installed worker identity and immutable package, permanent
-per-xite container mapping, bounded broker IPC, Windows file/provenance operations,
-restart-safe lifecycle records, cancellation and accounting integration, Wasm
-engine compilation/execution acceptance, and node/scheduler selection. The
-existing macOS/Linux workspace semantics cannot be assumed to hold on NTFS.
-
-Native acceptance must also cover host death, interrupted startup, token and
-handle substitution, cross-container access, named-object access, DLL search and
-loading, profile storage quotas, and supported Windows versions and security
-policies. Fresh fixture profiles are not a product migration/reset mechanism.
-External security review remains a release gate. No AppContainer result proves
-an absence of all kernel or runtime vulnerabilities.
+- External independent security review remains a release gate, as on every
+  platform. No AppContainer result proves an absence of all kernel or
+  runtime vulnerabilities.
+- An actual cross-reboot acceptance run of the journal's reboot barrier on
+  Windows remains distinct from the simulated boot-transition tests.
+- Supported Windows versions and security policies: the gate requires
+  Windows 10 version 1703 or newer and a working AppContainer profile API
+  and fails closed otherwise; environments that disable AppContainers by
+  policy have not been exercised.
+- Any data directory move changes file identities and the recorded
+  canonical path, so the journal and provenance bindings refuse until the
+  explicit migration that does not exist yet, as on Unix. After a move the
+  node starts with EVX "execution disabled: direct lifecycle state
+  unavailable"; inspection and grants keep working.
+- A first run as administrator leaves the state directory owned by
+  Administrators; a later ordinary run then reports "EVX backend binding
+  unavailable or mismatched". The remedy is to take ownership of
+  `private/evx` or remove it. The installer never elevates.
+- Production profiles are never deleted automatically, matching the Unix
+  rule that a workspace is never reassigned after revocation; test fixtures
+  delete theirs. A cleanup tool for the profiles of deleted xites is open.
+- Cranelift JIT inside the AppContainer is a separately measured option;
+  Pulley is the shipped engine.
+- Actual release signing of `evx-worker.exe` happens in the release workflow
+  with the other top-level executables; a same-publisher signature check at
+  service start is a possible hardening on top of the hash pin.
 
 ## Primary API references
 
@@ -139,69 +151,6 @@ Microsoft documents [LPAC creation and the capability opt-out](https://learn.mic
 [creation-time job lists, handle lists and child restrictions](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute),
 [job limits](https://learn.microsoft.com/en-us/windows/win32/api/winnt/ns-winnt-jobobject_extended_limit_information),
 [job termination](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-terminatejobobject),
-and [job accounting queries](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject).
-These API contracts motivate the implementation; the pending native run must
-establish that the complete configured profile works on a supported host.
-
-## Real compiler and worker transport
-
-`TrustedWorker::open(path, expected_sha256)` accepts only a local disk path and
-rejects reparse components, hard-linked files and a wrong trusted hash. Its
-held source handle refuses write/delete sharing. The verified bytes are copied
-into a fresh LPAC stage, then independently pinned before launch, so staging
-does not reopen a replaceable source path. The expected hash is trusted installer
-input. No xite or request may choose it. The native fixture hashes its own local
-build; that is a test stand-in, not a production signed-package policy.
-
-`WindowsExecutor::compile` sends the common bounded compiler frame to a fresh
-LPAC compiler. It validates the artifact digest and engine key after native
-completion and returns an opaque `CompiledModule`; publishers cannot construct
-or deserialize that type. `run` sends it to a separate fresh LPAC worker and
-uses the existing `evx.call` protocol. It enforces request shape, call count,
-response limits and host-call elapsed time. The supplied callback is trusted
-embedding code and still needs grant/revocation checks before authorizing effects.
-No Windows filesystem callback is provided.
-
-Three private byte pipes carry stdin, stdout and stderr. Only their child ends
-are inherited; no parent environment is passed. Host ends use nonblocking mode,
-check deadlines/cancellation between bounded operations, cap framing before
-allocation and enforce a 256 KiB combined stdout/stderr budget. The worker
-checks its LPAC token and job restrictions before parsing input. The suspended
-startup is verified before resume, with creation-time job membership and child
-process creation disabled.
-
-An independent monitor enforces wall time, cancellation, total kernel-plus-user
-CPU from process times and resident working-set peaks. Job limits separately
-cap committed memory and user CPU time. `NativeUsage` names resident and
-committed memory separately. Reported guest fuel/memory never authorize native
-budgets. Success requires terminal protocol, no trailing output, a signaled
-process handle, zero active job processes, terminal resource checks and clean
-exit. An unconfirmed lifetime retains its stage/profile and stops further
-admission in that host process. There is no persistent restart journal in this
-adapter yet. The host callback must return; native cancellation still kills the
-worker while a trusted callback is blocked, but cannot interrupt arbitrary host
-callback code.
-
-Native CI now also builds and runs:
-
-```powershell
-cargo build -p evx-windows --bins --example execution_acceptance --release --locked
-& target/release/examples/execution_acceptance.exe
-```
-
-That fixture requires real compilation and return value 42, an `evx.call` game
-score roundtrip, cancellation with confirmed cleanup, and successful fresh
-execution afterward. It also rejects a wrong worker hash. It has not run on
-this macOS machine. Cross-target all-target checks and strict Clippy pass;
-they prove type/build compatibility only. The user must run the workflow or
-these commands on Windows and retain the actual native result before enabling
-any product target.
-
-The next Windows implementation work is durable host lifecycle admission,
-trusted installed-package selection, native filesystem/provenance effects,
-per-xite storage/identity/quota policy, and mapping the low-level result/error
-into node budgets, activation, consent and scheduling. Failed or unmeasured
-runs must reserve the full admitted budget instead of reporting zero usage.
-The native tests must also confirm the named-pipe behavior, LPAC loader access,
-job queries from the child, process exit accounting and cleanup on the supported
-Windows versions. Current product gates remain closed.
+[job accounting queries](https://learn.microsoft.com/en-us/windows/win32/api/jobapi2/nf-jobapi2-queryinformationjobobject),
+[handle-relative file creation](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/nf-ntifs-ntcreatefile)
+and [POSIX-semantics rename](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_rename_information).

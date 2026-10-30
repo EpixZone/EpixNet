@@ -3,7 +3,7 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use evx_api::{Capability, Grant, Limits, RunResult};
@@ -19,6 +19,20 @@ pub const TEST_WORKER: &str = "EVX_TEST_WORKER";
 /// The same hand-off for the hostile peer example.
 pub const TEST_HOSTILE_PEER: &str = "EVX_TEST_HOSTILE_PEER";
 
+/// The exit code of a child the supervisor terminated through its job on
+/// Windows (`evx_windows_native::TERMINATED`).
+const WINDOWS_TERMINATED: i32 = 0x45565801;
+
+/// The exit code of a child the supervisor terminated: a negative signal
+/// number on Unix, the fixed `TERMINATED` code on Windows.
+pub fn terminated_by_host(code: i32) -> bool {
+    if cfg!(windows) {
+        code == WINDOWS_TERMINATED
+    } else {
+        code < 0
+    }
+}
+
 /// Build and locate `evx-worker`. The target directory is derived from this
 /// test binary's own location, so `CARGO_TARGET_DIR`, `--release` and
 /// `--target` all resolve correctly, and the build is always requested so an
@@ -28,7 +42,7 @@ pub fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         handed_down(TEST_WORKER)
-            .unwrap_or_else(|| build_target("evx-worker", &["-p", "evx-worker"], ""))
+            .unwrap_or_else(|| pinned(build_target("evx-worker", &["-p", "evx-worker"], "")))
     })
     .clone()
 }
@@ -38,11 +52,11 @@ pub fn hostile_peer_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         handed_down(TEST_HOSTILE_PEER).unwrap_or_else(|| {
-            build_target(
+            pinned(build_target(
                 "hostile_peer",
                 &["-p", "evx-supervisor", "--example", "hostile_peer"],
                 "examples",
-            )
+            ))
         })
     })
     .clone()
@@ -50,9 +64,19 @@ pub fn hostile_peer_binary() -> PathBuf {
 
 fn handed_down(variable: &str) -> Option<PathBuf> {
     let path = std::env::var_os(variable)?;
-    Some(std::fs::canonicalize(&path).unwrap_or_else(|e| {
-        panic!("{variable} names {}: {e}", PathBuf::from(path).display())
-    }))
+    Some(
+        std::fs::canonicalize(&path)
+            .unwrap_or_else(|e| panic!("{variable} names {}: {e}", PathBuf::from(path).display())),
+    )
+}
+
+/// target/<profile>/deps/<test-binary> -> target/<profile>
+fn profile_dir() -> PathBuf {
+    let exe = std::env::current_exe().expect("test binary path");
+    exe.parent()
+        .and_then(Path::parent)
+        .expect("target profile directory")
+        .to_path_buf()
 }
 
 fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {
@@ -76,24 +100,88 @@ fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {
         .status()
         .unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
     assert!(status.success(), "building {name} failed");
-    // target/<profile>/deps/<test-binary> -> target/<profile>
-    let exe = std::env::current_exe().expect("test binary path");
-    let profile_dir = exe
-        .parent()
-        .and_then(std::path::Path::parent)
-        .expect("target profile directory")
-        .to_path_buf();
+    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
+    let profile_dir = profile_dir();
     let path = if subdir.is_empty() {
-        profile_dir.join(name)
+        profile_dir.join(file)
     } else {
-        profile_dir.join(subdir).join(name)
+        profile_dir.join(subdir).join(file)
     };
     std::fs::canonicalize(&path)
         .unwrap_or_else(|e| panic!("{name} not found at {}: {e}", path.display()))
 }
 
+/// The Windows backend pins a worker as a regular file with exactly one
+/// link, but Cargo's uplifted `target/<profile>/<name>.exe` is a hard link
+/// to the copy under `deps`. Tests therefore run a private copy under
+/// `target/<profile>/evx-test-images`, refreshed whenever the build output
+/// changes and kept while another test process still has it pinned.
+#[cfg(windows)]
+fn pinned(built: PathBuf) -> PathBuf {
+    let images = profile_dir().join("evx-test-images");
+    std::fs::create_dir_all(&images).expect("test image directory");
+    let name = built.file_name().expect("image name");
+    let bytes = std::fs::read(&built).expect("read built image");
+    let shared = images.join(name);
+    if std::fs::read(&shared).ok().as_deref() == Some(&bytes) {
+        return shared;
+    }
+    if std::fs::write(&shared, &bytes).is_ok() {
+        return shared;
+    }
+    // Another test process holds the previous image: use a private copy.
+    let private = images.join(std::process::id().to_string());
+    std::fs::create_dir_all(&private).expect("private image directory");
+    let path = private.join(name);
+    std::fs::write(&path, &bytes).expect("write private image");
+    path
+}
+
+#[cfg(not(windows))]
+fn pinned(built: PathBuf) -> PathBuf {
+    built
+}
+
 pub fn config() -> Config {
     Config::new(worker_binary())
+}
+
+/// Delete the AppContainer profiles a disposable test workspace created.
+/// Production profiles are retained forever; a test workspace is a fresh
+/// temporary directory every time, so without this each test would leak
+/// three permanent profiles and their package folders.
+pub fn forget_workspace_profiles(workspace: &Path) {
+    #[cfg(windows)]
+    if let Err(error) = evx_supervisor::windows::forget_workspace_profiles(workspace) {
+        eprintln!("profile cleanup for {}: {error}", workspace.display());
+    }
+    #[cfg(not(windows))]
+    let _ = workspace;
+}
+
+/// Plant a link named `link` to `target` as the platform allows: a symbolic
+/// link on Unix; on Windows a junction for a directory and, where Developer
+/// Mode or the privilege allows it, a file symbolic link. Returns whether a
+/// link now exists.
+pub fn plant_link(target: &Path, link: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link).is_ok()
+    }
+    #[cfg(windows)]
+    {
+        if target.is_dir() {
+            let output = std::process::Command::new("cmd")
+                .args(["/C", "mklink", "/J"])
+                .arg(link)
+                .arg(target)
+                .output()
+                .expect("mklink");
+            output.status.success()
+        } else {
+            std::os::windows::fs::symlink_file(target, link).is_ok()
+        }
+    }
 }
 
 pub fn calc() -> &'static str {
@@ -205,12 +293,18 @@ impl Fixture {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir(&other).unwrap();
         std::fs::write(other.join("private.txt"), "other-game-fixture").unwrap();
-        let broker = Broker::new(
-            &workspace,
-            Grant::new("game-a", true).unwrap(),
-            Limits::default(),
-        )
-        .unwrap();
+        #[allow(unused_mut)]
+        let mut limits = Limits::default();
+        // A file helper's host-call clock starts when its process is
+        // resumed, and a debug worker starting inside an AppContainer on a
+        // loaded, freshly imaged runner (Defender's first-run scan, parallel
+        // test launches) has taken over 800 ms before its commit. Tests of
+        // the deadline itself set their own budgets.
+        #[cfg(windows)]
+        {
+            limits.host_call_seconds = 1.5;
+        }
+        let broker = Broker::new(&workspace, Grant::new("game-a", true).unwrap(), limits).unwrap();
         Fixture {
             dir,
             workspace,
@@ -250,5 +344,11 @@ impl Fixture {
     pub fn set_capabilities(&self, caps: &[Capability]) {
         self.broker
             .with_grant(|g| g.capabilities = caps.iter().copied().collect());
+    }
+}
+
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        forget_workspace_profiles(&self.workspace);
     }
 }

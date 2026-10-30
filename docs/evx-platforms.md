@@ -289,39 +289,42 @@ capabilities removed. See [Linux acceptance evidence](evx-linux-acceptance.md).
 Nine Linux package tests also pass. Broader supported-kernel, x86_64 and full-application tests still need execution;
 cross-compilation does not establish enforcement. Missing Landlock, seccomp or observations must
 fail closed, with no unconfined fallback. Keep unavailable-platform refusal
-tests even after adding a supported profile. Windows needs its own confined
-process and accounting backend.
+tests even after adding a supported profile. Windows has its own confined
+process and accounting backend: the direct worker backend over
+AppContainers and Job Objects described in
+[evx-windows-backend.md](evx-windows-backend.md), with its native evidence
+in [evx-windows.md](evx-windows.md).
 
-The new [Windows fixture](evx-windows.md) implements an LPAC/Job Object test
-launcher; its MSVC target typecheck and strict Clippy pass on the macOS host.
-Its six native Windows cases and the real-runtime fixture passed natively on
-2026-10-29 (see evx-windows.md). The
-[Android fixture](evx-android.md) compiles against official API 36 and passes
-32 portable protocol/lifecycle assertions, with no emulator or device result.
-Both are separate acceptance fixtures and are not node backends. New CI jobs
-require native Windows execution and mobile SDK checks; creating those jobs
-does not establish their results.
+The [Windows fixture](evx-windows.md) implements an LPAC/Job Object test
+launcher and a real compile/run fixture on the same native primitives the
+backend uses; its six isolation cases and the real-runtime fixture pass
+natively. The [Android fixture](evx-android.md) compiles against official
+API 36 and passes 32 portable protocol/lifecycle assertions, with no
+emulator or device result, and is not a node backend. The Windows CI job
+`Windows native EVX` runs the `windows` profile of
+`scripts/evx-platform-acceptance.py` on a real Windows runner; creating a
+job does not establish its results, the retained evidence does.
 
-The node's optional EVX dependency and plugin registration are restricted to
-macOS and Linux. Windows and mobile products have no EVX management or execution
-commands. The native messaging host also excludes EVX. Enabling the node's
-`evx` feature on another target does not bypass the target gate. The direct
-supervisor, worker, host and workspace crates still require Unix APIs; on
-other targets they compile as empty crates, so `cargo build --workspace`
-succeeds on Windows too without providing any EVX API there.
+The node's optional EVX dependency and plugin registration cover macOS,
+Linux and Windows. On Windows the plugin uses the direct worker backend
+described in [evx-windows-backend.md](evx-windows-backend.md): the same
+service, journal and broker over an AppContainer and Job Object launcher.
+Mobile products have no EVX management or execution commands. The native
+messaging host also excludes EVX. Enabling the node's `evx` feature on
+another target does not bypass the target gate; on mobile targets the EVX
+crates compile as empty crates, so `cargo build --workspace` still succeeds.
 
 ```sh
 python3 scripts/check-evx-platforms.py
 ```
 
 This guard resolves 11 separate product/target dependency graphs. It requires
-EVX for macOS/Linux browser and server builds and excludes the runtime from
-Windows browser/server, iOS/Android FFI and native messaging hosts. Before the
-fix, the Windows browser graph included `evx-workspace`, and cross-checking that
-crate for `x86_64-pc-windows-msvc` failed on unavailable `rustix` filesystem APIs.
-After the fix, all 11 graphs and a native node check passed. Graph checks do not
-compile or link the full Windows product; its native toolchain build remains
-required in Windows release CI.
+the Unix EVX set for macOS/Linux browser and server builds, the Windows set
+(the Unix set plus `evx-windows-native`) for Windows browser and server
+builds, and excludes every EVX runtime crate from the iOS/Android FFI and
+the native messaging hosts. Graph checks do not compile or link the full
+Windows product; its native toolchain build remains required in Windows
+release CI.
 
 The Linux package build now builds and stages `evx-worker` beside the node.
 Tar, Debian/RPM and AppImage assembly include it, and stage validation rejects

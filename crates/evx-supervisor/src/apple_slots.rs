@@ -268,8 +268,9 @@ impl AppleSlotRegistry {
         installation: [u8; 32],
         inventory: AppleSlotInventory,
     ) -> Result<Self, Denied> {
-        let directory =
-            evx_workspace::open_root(path).map_err(|_| denied("directory unavailable"))?;
+        let directory = OwnedFd::from(
+            evx_workspace::open_root(path).map_err(|_| denied("directory unavailable"))?,
+        );
         let metadata = safe_directory(&directory)?;
         let (device, inode) = file_identity(&metadata);
         Ok(Self {
@@ -311,8 +312,10 @@ impl AppleSlotRegistry {
     }
 
     fn check_namespace(&self) -> Result<(), Denied> {
-        let current = evx_workspace::open_root(&self.path)
-            .map_err(|_| denied("directory lost or replaced"))?;
+        let current = OwnedFd::from(
+            evx_workspace::open_root(&self.path)
+                .map_err(|_| denied("directory lost or replaced"))?,
+        );
         let metadata = safe_directory(&current)?;
         if file_identity(&metadata) != (self.device, self.inode) {
             return Err(denied("directory lost or replaced"));
@@ -523,7 +526,9 @@ fn parent(path: &Path) -> Result<(OwnedFd, String, PathBuf), Denied> {
         .parent()
         .ok_or_else(|| denied("invalid directory path"))?;
     let parent = std::fs::canonicalize(parent).map_err(|_| denied("trusted parent unavailable"))?;
-    let fd = evx_workspace::open_root(&parent).map_err(|_| denied("trusted parent unavailable"))?;
+    let fd = OwnedFd::from(
+        evx_workspace::open_root(&parent).map_err(|_| denied("trusted parent unavailable"))?,
+    );
     safe_directory(&fd)?;
     Ok((fd, name.into(), parent.join(name)))
 }

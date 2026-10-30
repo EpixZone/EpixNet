@@ -2,13 +2,22 @@
 name = "evx-workspace"
 version = "0.1.0"
 edition = "2021"
-description = "EVX private workspace operations: descriptor-relative, link-refusing, quota-bounded reads and staged writes."
+description = "EVX private workspace operations: handle-relative, link-refusing, quota-bounded reads and staged writes."
 
 [dependencies]
 evx-api = { path = "../evx-api" }
-rustix = { version = "1", features = ["fs"] }
 base64 = "0.22"
 rand = "0.9"
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Wdk_Foundation", "Wdk_Storage_FileSystem",
+  "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Threading",
+] }
 
 [dev-dependencies]
 tempfile = "3"

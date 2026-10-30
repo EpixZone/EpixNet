@@ -727,6 +727,7 @@ dependencies = [
  "cc",
  "evx-api",
  "evx-runtime",
+ "evx-windows-native",
  "evx-workspace",
  "hex",
  "libc",
@@ -735,6 +736,14 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "thiserror",
+ "windows-sys",
+]
+
+[[package]]
+name = "evx-windows-native"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
 ]
 
 [[package]]
@@ -745,6 +754,7 @@ dependencies = [
  "evx-api",
  "rand",
  "rustix",
+ "windows-sys",
 ]
 
 [[package]]

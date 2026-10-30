@@ -56,9 +56,9 @@
 //! page cannot mint, widen or forge a grant (the dispatcher gate plus the
 //! digest expected-version check).
 
-// The node includes EVX on macOS and Linux only (docs/evx-platforms.md).
-// Elsewhere this crate is empty, so a workspace build still succeeds.
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+// The node includes EVX on macOS, Linux and Windows (docs/evx-platforms.md).
+// On mobile targets this crate is empty, so a workspace build still succeeds.
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -78,7 +78,7 @@ pub mod commands;
 pub mod limits;
 pub mod scheduler;
 pub mod service;
-#[cfg(all(test, any(target_os = "macos", target_os = "linux")))]
+#[cfg(all(test, any(target_os = "macos", target_os = "linux", windows)))]
 mod service_execution_tests;
 
 pub use limits::{clamp, BACKGROUND_RUNS_PER_DAY, BACKGROUND_WORKERS, HOST_CEILING};
@@ -96,9 +96,9 @@ pub const PLUGIN_NAME: &str = "Evx";
 /// Key of the [`EvxService`] in `AppState`'s capability map.
 pub const CAPABILITY_KEY: &str = "evx.service";
 
-/// The Evx plugin. [`Default`] resolves the worker binary at start from
-/// `EVX_WORKER` or beside the node executable; [`EvxPlugin::with_worker`]
-/// pins one, for tests that build it themselves.
+/// The Evx plugin. [`Default`] resolves the worker binary at start beside
+/// the node executable (or from `EVX_WORKER` on Unix);
+/// [`EvxPlugin::with_worker`] pins one, for tests that build it themselves.
 #[derive(Default)]
 pub struct EvxPlugin {
     worker: Option<PathBuf>,

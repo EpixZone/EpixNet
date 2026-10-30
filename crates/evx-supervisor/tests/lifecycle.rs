@@ -1,5 +1,5 @@
 #![allow(clippy::field_reassign_with_default)]
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 //! Cancellation, commit authorization and workspace leases. Port of
 //! `test_supervisor_lifecycle.py`, including the supervisor-death fixture,
 //! which re-invokes this test binary as a controlled crashing supervisor.
@@ -98,7 +98,7 @@ fn blocked_native_helper_is_killed_and_next_operation_recovers() {
         .filter(|c| c.role == "file")
         .collect();
     assert_eq!(files.len(), 1, "{result:?}");
-    assert!(files[0].exit_code.unwrap() < 0, "{result:?}");
+    assert!(terminated_by_host(files[0].exit_code.unwrap()), "{result:?}");
     assert_clean_children(&f, &result);
     let recovery = f.run(&write_wat("recovered.txt", "ready"));
     assert_eq!(recovery.status, Status::Ok, "{recovery:?}");
@@ -159,7 +159,7 @@ fn terminal_worker_memory_follows_platform_attribution() {
     assert_eq!(peer.last_rss, None);
     peer.close(Duration::from_millis(50), Duration::from_secs(1)).unwrap();
     assert!(peer.max_cpu > 0.0);
-    #[cfg(target_os = "macos")]
+    #[cfg(any(target_os = "macos", windows))]
     assert!(peer.last_rss.is_some_and(|rss| rss > 0), "terminal RSS was lost");
     // Linux wait4 can include inherited parent memory. Without a live
     // post-exec sample, memory must remain unobserved instead of misattributed.
@@ -313,6 +313,12 @@ fn concurrent_admission_cannot_release_a_held_lease() {
 
 /// Controlled crashing supervisor: holds the lease, starts a real blocked
 /// helper that inherits it, prints the helper's pid, then exits abruptly.
+///
+/// On Windows the supervisor first releases its own lease handle, so the
+/// "workspace busy" the parent then observes is held by the helper's
+/// inherited handle alone. The abrupt exit closes the job, whose
+/// kill-on-close ends the helper: an orphan cannot outlive its supervisor
+/// there, which is the platform's answer to the Unix orphan case.
 fn lease_supervisor(workspace: &Path) {
     let broker = Broker::new(
         workspace,
@@ -320,13 +326,9 @@ fn lease_supervisor(workspace: &Path) {
         lifecycle_limits(),
     )
     .unwrap();
-    rustix::fs::flock(
-        broker.root_fd(),
-        rustix::fs::FlockOperation::NonBlockingLockExclusive,
-    )
-    .expect("lease");
+    let lease = broker.root().lease().expect("lease");
     let (tx, rx) = mpsc::sync_channel(8);
-    let lease_fd = rustix::fd::AsRawFd::as_raw_fd(&broker.root_fd());
+    let lease_fd = lease.raw();
     let config = config();
     let mut helper =
         Peer::spawn(&config, "file", workspace, Role::File, tx, Some(lease_fd)).expect("helper");
@@ -343,10 +345,21 @@ fn lease_supervisor(workspace: &Path) {
     })
     .unwrap();
     helper.send(&init).unwrap();
+    // On Windows the supervisor's own lease handle goes away now: the
+    // helper's inherited copy is the only holder from here on.
+    let lease = if cfg!(windows) {
+        lease.release();
+        None
+    } else {
+        Some(lease)
+    };
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         if let Ok(Event::Frame(_, _, body)) = rx.recv_timeout(Duration::from_millis(20)) {
             if String::from_utf8_lossy(&body).contains("fault_entered") {
+                if lease.is_none() {
+                    assert!(broker.root().lease().is_err(), "helper lost the lease");
+                }
                 println!("{}", helper.pid);
                 let mut line = String::new();
                 std::io::stdin().lock().read_line(&mut line).unwrap();
@@ -354,6 +367,7 @@ fn lease_supervisor(workspace: &Path) {
                 // Intentional controlled crash: no cleanup runs, the helper keeps
                 // the inherited lease.
                 std::mem::forget(helper);
+                std::mem::forget(lease);
                 std::mem::forget(broker);
                 std::process::exit(0);
             }
@@ -401,27 +415,67 @@ fn inherited_lease_survives_supervisor_death() {
         }
     };
     let mut stdin = supervisor.stdin.take().unwrap();
+    let artifact = compile_ok(&f.config, calc());
+    #[cfg(windows)]
+    {
+        // The controlled supervisor released its own lease handle before
+        // printing the pid: the helper's inherited handle holds it alone.
+        let denied = run_guest(&f.config, &artifact, &f.broker, RunOptions::default());
+        assert_eq!(denied.status, Status::Denied, "{denied:?}");
+        assert_eq!(denied.error.as_deref(), Some("workspace busy"));
+        assert!(!denied.worker_started);
+    }
     stdin.write_all(b"exit\n").unwrap();
     stdin.flush().unwrap();
     let status = supervisor.wait().unwrap();
     assert!(status.success(), "controlled supervisor failed");
-    // The lease now lives only in the orphaned helper.
-    let artifact = compile_ok(&f.config, calc());
-    let denied = run_guest(&f.config, &artifact, &f.broker, RunOptions::default());
-    assert_eq!(denied.status, Status::Denied, "{denied:?}");
-    assert_eq!(denied.error.as_deref(), Some("workspace busy"));
-    assert!(!denied.worker_started);
-    // Stop the known orphan and recover.
-    unsafe {
-        libc::killpg(helper_pid, libc::SIGKILL);
+    #[cfg(unix)]
+    {
+        // The lease now lives only in the orphaned helper.
+        let denied = run_guest(&f.config, &artifact, &f.broker, RunOptions::default());
+        assert_eq!(denied.status, Status::Denied, "{denied:?}");
+        assert_eq!(denied.error.as_deref(), Some("workspace busy"));
+        assert!(!denied.worker_started);
+        // Stop the known orphan and recover.
+        unsafe {
+            libc::killpg(helper_pid, libc::SIGKILL);
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline && unsafe { libc::kill(helper_pid, 0) } == 0 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    while Instant::now() < deadline && unsafe { libc::kill(helper_pid, 0) } == 0 {
-        std::thread::sleep(Duration::from_millis(10));
+    #[cfg(windows)]
+    {
+        // The supervisor's exit closed the job: kill-on-close ended the
+        // helper and released the lease. Terminate it if it is still there.
+        await_process_exit(helper_pid as u32);
     }
     let recovered = run_guest(&f.config, &artifact, &f.broker, RunOptions::default());
     assert_eq!(recovered.value, Some(42), "{recovered:?}");
     assert!(!f.workspace.join("never-committed.txt").exists());
+}
+
+/// Wait for `pid` to disappear, terminating it after a short grace.
+#[cfg(windows)]
+fn await_process_exit(pid: u32) {
+    use windows_sys::Win32::Foundation::{CloseHandle, WAIT_OBJECT_0};
+    use windows_sys::Win32::System::Threading::{
+        OpenProcess, TerminateProcess, WaitForSingleObject, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+    };
+    // SAFETY: plain process API calls on a pid the controlled supervisor
+    // reported; a handle that cannot be opened means the process is gone.
+    unsafe {
+        let process = OpenProcess(PROCESS_SYNCHRONIZE | PROCESS_TERMINATE, 0, pid);
+        if process.is_null() {
+            return;
+        }
+        if WaitForSingleObject(process, 2000) != WAIT_OBJECT_0 {
+            TerminateProcess(process, 1);
+            WaitForSingleObject(process, 2000);
+        }
+        CloseHandle(process);
+    }
 }
 
 #[test]

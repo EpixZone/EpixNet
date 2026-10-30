@@ -6,8 +6,6 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use rustix::fs::{flock, FlockOperation};
-
 use evx_api::frames::{
     encode, encode_worker_init, FromHelper, FromWorker, HelperFault, ToHelper, ToWorker,
     WorkerStatus,
@@ -31,6 +29,15 @@ pub struct Config {
     #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
     pub apple_xpc: Option<crate::apple::AppleXpcConfig>,
     pub worker_binary: PathBuf,
+    /// The pinned and staged worker plus the AppContainer registry
+    /// (`docs/evx-windows-backend.md`). `None` makes the first spawn build
+    /// a process-wide default from `worker_binary`, staged under
+    /// `WindowsBackend::default_staging_root()` (`%LOCALAPPDATA%\Epix\evx-stage`;
+    /// a host without that shell folder has no default backend).
+    /// The trusted-path rules apply either way; the node passes its own
+    /// backend through `Config::with_windows_backend`.
+    #[cfg(windows)]
+    pub windows: Option<Arc<crate::windows::WindowsBackend>>,
     /// Arguments inserted before the mode. Empty in production; a trusted
     /// test harness uses it to substitute a hostile peer script.
     pub worker_args: Vec<String>,
@@ -48,12 +55,23 @@ impl Config {
             #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
             apple_xpc: None,
             worker_binary,
+            #[cfg(windows)]
+            windows: None,
             worker_args: Vec::new(),
             compile_timeout: Duration::from_secs(30),
             compile_cpu_seconds: 10.0,
             compile_rss_bytes: 256 * 1024 * 1024,
             fail_compiler_cleanup: false,
         }
+    }
+
+    /// A configuration bound to an explicitly staged worker. The node uses
+    /// this with the staging directory inside its private tree.
+    #[cfg(windows)]
+    pub fn with_windows_backend(backend: Arc<crate::windows::WindowsBackend>) -> Config {
+        let mut config = Config::new(backend.source().to_path_buf());
+        config.windows = Some(backend);
+        config
     }
 }
 
@@ -142,11 +160,11 @@ pub fn run_guest_with_admission(
         if inner.running {
             return RunResult::denied("workspace busy");
         }
-        if flock(broker.root_fd(), FlockOperation::NonBlockingLockExclusive).is_err() {
+        if broker.take_lease(&mut inner).is_err() {
             return RunResult::denied("workspace busy");
         }
         if let Err(error) = admit(&inner.grant) {
-            let _ = flock(broker.root_fd(), FlockOperation::Unlock);
+            inner.lease.take();
             return RunResult::from_denial(error);
         }
         inner.running = true;
@@ -162,9 +180,7 @@ pub fn run_guest_with_admission(
         let mut inner = broker.lock();
         inner.running = false;
         inner.active_capabilities = None;
-        if !inner.quarantined {
-            let _ = flock(broker.root_fd(), FlockOperation::Unlock);
-        }
+        Broker::release_lease(&mut inner);
     }
     result
 }
@@ -405,6 +421,8 @@ fn observation_source(_config: &Config) -> &'static str {
     }
     if cfg!(target_os = "linux") {
         "Linux post-exec procfs RSS samples and terminal wait4 CPU; short-lived memory peaks may be unobserved, not a hard allocation ceiling"
+    } else if cfg!(windows) {
+        "Windows Job Object accounting and GetProcessTimes CPU; sampled working set and terminal job peak, not a hard allocation ceiling"
     } else {
         "macOS libproc and terminal wait4 CPU/RSS; sampled aggregate and individual terminal peaks, not a hard allocation ceiling"
     }
@@ -797,7 +815,7 @@ impl<'a> Loop<'a> {
                     self.broker.workspace(),
                     Role::File,
                     tx.clone(),
-                    self.broker.helper_lease_fd(),
+                    self.broker.helper_lease(),
                 )?;
                 helper.limits_generation = limits_generation;
                 if let Some(hook) = &self.options.after_helper_spawn {

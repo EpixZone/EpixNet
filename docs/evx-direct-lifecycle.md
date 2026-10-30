@@ -27,6 +27,12 @@ nonterminal. A stopped status is not a reap. `ECHILD` and other unexpected wait
 errors stop host admission and prevent further sampling or signalling of that
 PID, because its identity may no longer be owned.
 
+On Windows the owned identity is the process handle, not a PID, so it cannot
+be reused under the supervisor. Completion needs the process handle signalled
+and the child's Job Object reporting no active process; the exit code is read
+afterwards. A host-terminated child exits with `0x45565801`. A termination the
+job cannot confirm stops host admission exactly as an unknown wait does.
+
 Physical exit evidence and durable completion are separate. If the child was
 reaped but journal persistence fails, reports retain the known exit code and
 CPU/RSS. Cleanup still returns quarantine. A displayed exit code does not
@@ -59,6 +65,16 @@ interrupted staging files refuse admission. Changes use a synced staging file,
 atomic rename and directory sync. A visible replacement after a failed sync is
 resynced before deriving authority from it.
 
+The same checks run on Windows through `evx-workspace`'s handle-relative
+layer: identity is the volume serial number plus the file index, "owned and
+private" is the owner SID plus a DACL that names only the owner, SYSTEM and
+Administrators, every open refuses reparse points (symbolic links, junctions
+and mount points alike), the lock is `LockFileEx` on the lock file, and the
+staged rename is `FileRenameInformationEx` with POSIX semantics relative to
+the directory handle followed by a directory flush. One difference is in the
+host's favour: the retained directory handle pins the namespace, so the state
+directory cannot be renamed away while a session holds it.
+
 Journal operations serialize through a host mutex and filesystem lock. A
 bounded one-second retry handles a close-on-exec lock description transiently
 inherited by another host thread's fork. A lock that remains busy fails closed.
@@ -70,6 +86,12 @@ rollback-proof store or protection against a compromised host account.
 Journal version 2 records the kernel boot identity. macOS supplies the read-only
 [`kern.bootsessionuuid`](https://github.com/apple-oss-distributions/xnu/blob/main/bsd/kern/kern_sysctl.c);
 Linux supplies [`/proc/sys/kernel/random/boot_id`](https://www.kernel.org/doc/html/v6.12/admin-guide/sysctl/kernel.html#random).
+Windows has no documented boot UUID; the identity is the SHA-256 of the
+machine GUID (`HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid`) and the
+kernel's boot counter (`HKLM\SYSTEM\CurrentControlSet\Control\Session
+Manager\Memory Management\PrefetchParameters\BootId`), which the kernel
+increments on every boot; both are machine-wide values that need
+administrative rights to change.
 The host reads these fixed OS interfaces directly, without environment or
 caller overrides. Unavailable, malformed or zero identities refuse admission.
 Sleep, application restart, PID reuse and wall-clock changes cannot authorize
