@@ -12,6 +12,11 @@
 //! that authorization the result is `EffectUnknown`: the file may have changed
 //! and the caller must reconcile before retrying.
 
+// Unix process and descriptor APIs only. Elsewhere this crate is empty, so a
+// workspace build still succeeds; nothing there may depend on it
+// (docs/evx-platforms.md).
+#![cfg(unix)]
+
 pub mod apple_slots;
 #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
 pub mod apple_workspace;

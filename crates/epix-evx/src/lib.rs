@@ -56,6 +56,9 @@
 //! page cannot mint, widen or forge a grant (the dispatcher gate plus the
 //! digest expected-version check).
 
+// The node includes EVX on macOS and Linux only (docs/evx-platforms.md).
+// Elsewhere this crate is empty, so a workspace build still succeeds.
+#![cfg(any(target_os = "macos", target_os = "linux"))]
 #![forbid(unsafe_code)]
 #![warn(missing_docs)]
 

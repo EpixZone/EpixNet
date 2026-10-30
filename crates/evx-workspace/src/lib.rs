@@ -15,6 +15,9 @@
 //! the OS-confined file helper (for the actual read or write), which is why
 //! this crate has no dependency on either.
 
+// Unix descriptor APIs only. Elsewhere this crate is empty, so a workspace
+// build still succeeds; nothing there may depend on it (docs/evx-platforms.md).
+#![cfg(unix)]
 #![forbid(unsafe_code)]
 
 use std::io::{Read, Write};

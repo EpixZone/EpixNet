@@ -13,6 +13,10 @@
 //!
 //! Usage: `hostile_peer <mode> run` (the supervisor appends the mode name).
 
+// The supervisor exists on Unix hosts only; elsewhere this example is a stub,
+// so a workspace build still succeeds.
+#![cfg_attr(not(unix), allow(dead_code))]
+
 use std::io::{Read, Write};
 
 fn raw(bytes: &[u8]) {
@@ -40,6 +44,7 @@ fn consume_init() {
     }
 }
 
+#[cfg(unix)]
 fn transient_memory_peak() {
     // A bounded native accounting fixture. Release the resident pages before
     // emitting a result so a live sample can miss the high-water mark.
@@ -57,6 +62,13 @@ fn transient_memory_peak() {
     }
 }
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!("hostile_peer runs only on Unix hosts");
+    std::process::exit(1);
+}
+
+#[cfg(unix)]
 fn main() {
     let mode = std::env::args().nth(1).unwrap_or_default();
     if mode == "unread_init" {

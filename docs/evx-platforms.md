@@ -305,7 +305,9 @@ The node's optional EVX dependency and plugin registration are restricted to
 macOS and Linux. Windows and mobile products have no EVX management or execution
 commands. The native messaging host also excludes EVX. Enabling the node's
 `evx` feature on another target does not bypass the target gate. The direct
-supervisor and workspace crates still require Unix APIs.
+supervisor, worker, host and workspace crates still require Unix APIs; on
+other targets they compile as empty crates, so `cargo build --workspace`
+succeeds on Windows too without providing any EVX API there.
 
 ```sh
 python3 scripts/check-evx-platforms.py

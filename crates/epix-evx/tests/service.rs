@@ -7,6 +7,8 @@
 //! `unsupported host` and touch nothing, and the scheduler must admit
 //! nothing while saying so in status.
 
+#![cfg(any(target_os = "macos", target_os = "linux"))]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};

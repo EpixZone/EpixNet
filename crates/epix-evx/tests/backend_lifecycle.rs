@@ -1,4 +1,7 @@
 //! Existing state remains inspectable when its process ownership cannot be proven.
+
+#![cfg(any(target_os = "macos", target_os = "linux"))]
+
 use epix_evx::EvxService;
 use epix_ui::AppState;
 use std::sync::Arc;

@@ -14,13 +14,26 @@
 //! All frames travel over stdin and stdout with a 4-byte length prefix;
 //! stderr carries bounded diagnostics only.
 
+// The worker exists on Unix hosts only (docs/evx-platforms.md). Elsewhere the
+// binary is a stub, so a workspace build still succeeds.
+#[cfg(unix)]
 mod confine;
+#[cfg(unix)]
 mod ipc;
+#[cfg(unix)]
 mod modes;
+#[cfg(unix)]
 mod probe;
 
 use std::process::ExitCode;
 
+#[cfg(not(unix))]
+fn main() -> ExitCode {
+    eprintln!("evx-worker: EVX workers run only on Unix hosts");
+    ExitCode::from(1)
+}
+
+#[cfg(unix)]
 fn main() -> ExitCode {
     let mode = std::env::args().nth(1).unwrap_or_default();
     let outcome = match mode.as_str() {

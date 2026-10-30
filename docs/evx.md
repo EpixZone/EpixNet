@@ -189,9 +189,11 @@ on a desktop do not establish iOS device support.
   Native platform acceptance and runtime/broker integration remain required;
   see [`evx-windows.md`](evx-windows.md) and [`evx-android.md`](evx-android.md).
   The node includes EVX only on macOS and Linux with its `evx` feature enabled.
-  Unsupported targets omit execution and management commands. The current
-  supervisor and workspace crates themselves require Unix APIs; the target
-  gate excludes them from unsupported products rather than making them portable.
+  Unsupported targets omit execution and management commands. The
+  supervisor, worker, host and workspace crates themselves require Unix APIs;
+  the target gate excludes them from unsupported products, and on other
+  targets they compile as empty crates (their binaries as stubs) so a full
+  workspace build and test run still succeed there without providing any API.
 - Linux positive containment passed on Debian 13 ARM64 with Landlock ABI 6.
   Broader supported-kernel, architecture and package coverage remains required;
   see [`evx-linux-acceptance.md`](evx-linux-acceptance.md).

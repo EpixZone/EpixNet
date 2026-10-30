@@ -12,6 +12,10 @@
 //! {"command":"probe","workspace":"/abs","outside_file":"...","outside_write":"...","port":1234}
 //! ```
 
+// The supervisor exists on Unix hosts only (docs/evx-platforms.md). Elsewhere
+// this binary is a stub, so a workspace build still succeeds.
+#![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+
 use std::io::{Read, Write};
 use std::path::PathBuf;
 
@@ -21,6 +25,7 @@ use serde::{Deserialize, Serialize};
 
 use evx_api::frames::HelperFault;
 use evx_api::{Grant, Limits};
+#[cfg(unix)]
 use evx_supervisor::{compile_text, run_guest, Broker, CompiledArtifact, Config, RunOptions};
 
 #[derive(Deserialize)]
@@ -69,6 +74,13 @@ fn worker_binary() -> PathBuf {
     exe.with_file_name("evx-worker")
 }
 
+#[cfg(not(unix))]
+fn main() {
+    println!("{}", serde_json::json!({"error": "evx-host runs only on Unix hosts"}));
+    std::process::exit(2);
+}
+
+#[cfg(unix)]
 fn main() {
     let mut input = String::new();
     std::io::stdin().read_to_string(&mut input).expect("stdin");

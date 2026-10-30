@@ -15,6 +15,11 @@
 //! Neither input selects a broker, workspace, runtime option or key, and a
 //! denied binding check leaves the previous version runnable.
 
+// Built on the Unix-only supervisor. Elsewhere this crate is empty, so a
+// workspace build still succeeds; nothing there may depend on it
+// (docs/evx-platforms.md).
+#![cfg(unix)]
+
 use std::collections::BTreeSet;
 use std::path::Path;
 
