@@ -186,7 +186,9 @@ jobs:
 
   apple-filesystem-regressions:
     name: Apple filesystem regressions
-    runs-on: macos-14
+    # GitHub retires the macos-14 image on 2026-11-02 and fails its jobs
+    # during scheduled brownouts before then.
+    runs-on: macos-latest
     timeout-minutes: 10
     permissions:
       contents: read
