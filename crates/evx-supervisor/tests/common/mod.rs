@@ -293,12 +293,18 @@ impl Fixture {
         std::fs::create_dir(&workspace).unwrap();
         std::fs::create_dir(&other).unwrap();
         std::fs::write(other.join("private.txt"), "other-game-fixture").unwrap();
-        let broker = Broker::new(
-            &workspace,
-            Grant::new("game-a", true).unwrap(),
-            Limits::default(),
-        )
-        .unwrap();
+        #[allow(unused_mut)]
+        let mut limits = Limits::default();
+        // A file helper's host-call clock starts when its process is
+        // resumed, and a debug worker starting inside an AppContainer on a
+        // loaded, freshly imaged runner (Defender's first-run scan, parallel
+        // test launches) has taken over 800 ms before its commit. Tests of
+        // the deadline itself set their own budgets.
+        #[cfg(windows)]
+        {
+            limits.host_call_seconds = 1.5;
+        }
+        let broker = Broker::new(&workspace, Grant::new("game-a", true).unwrap(), limits).unwrap();
         Fixture {
             dir,
             workspace,

@@ -248,3 +248,13 @@ its event loop, never from the exit code, on both platforms.
   it creates or adopts a profile, and a native test proves no container can
   write to or list its own folder. Stale staged images are pruned when a
   newer image is staged.
+- A helper's host-call clock starts when its process is resumed, as on
+  Unix, so the child's own start-up inside the AppContainer counts against
+  the grant's `host_call_seconds`. On a loaded, freshly imaged CI runner a
+  debug worker has taken over 800 ms from resume to its commit (Defender's
+  first-run scan of the staged image and parallel test launches), once
+  exceeding the 0.8 s default; the supervisor test fixture therefore grants
+  1.5 s on Windows while the tests of the deadline itself keep their own
+  budgets. Whether the Windows default should be higher, or start-up should
+  be excluded from the host-call clock on every platform, is an open
+  decision; both change a cross-platform invariant and neither is made here.
