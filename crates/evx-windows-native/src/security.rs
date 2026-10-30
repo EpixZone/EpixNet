@@ -346,7 +346,8 @@ mod tests {
     fn granted_access_reports_the_mask_a_handle_was_opened_with() {
         use std::os::windows::fs::OpenOptionsExt;
         use windows_sys::Win32::Storage::FileSystem::{DELETE, FILE_READ_ATTRIBUTES};
-        let path = std::env::temp_dir().join(format!("evx-native-granted-{}", std::process::id()));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("granted");
         std::fs::write(&path, b"x").unwrap();
         let file = std::fs::OpenOptions::new()
             .access_mode(FILE_READ_ATTRIBUTES | DELETE)
@@ -382,8 +383,8 @@ mod tests {
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_FLAG_BACKUP_SEMANTICS, READ_CONTROL, WRITE_DAC,
         };
-        let directory =
-            std::env::temp_dir().join(format!("evx-native-protect-{}", std::process::id()));
+        let parent = tempfile::tempdir().unwrap();
+        let directory = parent.path().join("protect");
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("marker"), b"x").unwrap();
         let owner = current_user_sid_text().unwrap();

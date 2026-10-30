@@ -87,8 +87,13 @@ fn private_worker_copy(built: &std::path::Path) -> PathBuf {
     if !cfg!(windows) {
         return std::fs::canonicalize(built).unwrap();
     }
-    let dir = std::env::temp_dir().join(format!("epix-evx-test-worker-{}", std::process::id()));
-    std::fs::create_dir_all(&dir).unwrap();
+    // Securely created and uniquely named; kept for the rest of the test
+    // process because the pinned image must outlive every fixture.
+    let dir = tempfile::Builder::new()
+        .prefix("epix-evx-test-worker-")
+        .tempdir()
+        .unwrap()
+        .keep();
     let copy = dir.join(built.file_name().unwrap());
     std::fs::copy(built, &copy).unwrap();
     copy

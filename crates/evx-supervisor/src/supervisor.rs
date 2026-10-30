@@ -32,8 +32,8 @@ pub struct Config {
     /// The pinned and staged worker plus the AppContainer registry
     /// (`docs/evx-windows-backend.md`). `None` makes the first spawn build
     /// a process-wide default from `worker_binary`, staged under
-    /// `WindowsBackend::default_staging_root()` (`%LOCALAPPDATA%\Epix\evx-stage`,
-    /// or the temporary directory when the shell folder is unavailable).
+    /// `WindowsBackend::default_staging_root()` (`%LOCALAPPDATA%\Epix\evx-stage`;
+    /// a host without that shell folder has no default backend).
     /// The trusted-path rules apply either way; the node passes its own
     /// backend through `Config::with_windows_backend`.
     #[cfg(windows)]

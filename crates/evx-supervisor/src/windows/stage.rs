@@ -90,20 +90,22 @@ impl WindowsBackend {
         if let Some(backend) = map.get(worker) {
             return Ok(backend.clone());
         }
-        let backend = Self::new(worker, &Self::default_staging_root())?;
+        let backend = Self::new(worker, &Self::default_staging_root()?)?;
         map.insert(worker.to_path_buf(), backend.clone());
         Ok(backend)
     }
 
     /// `%LOCALAPPDATA%\Epix\evx-stage`, resolved through the shell rather
-    /// than the environment; the temporary directory when that fails.
-    pub fn default_staging_root() -> PathBuf {
-        match local_app_data() {
-            Ok(wide) => PathBuf::from(std::ffi::OsString::from_wide(&wide))
-                .join("Epix")
-                .join("evx-stage"),
-            Err(_) => std::env::temp_dir().join("evx-stage"),
-        }
+    /// than the environment. There is no fallback: a staged executable
+    /// image never goes under a shared temporary directory with a
+    /// predictable name, so a host without a per-user local application
+    /// data folder has no default backend.
+    pub fn default_staging_root() -> Result<PathBuf, Denied> {
+        let wide = local_app_data()
+            .map_err(|e| Denied::new(format!("local application data unavailable: {e}")))?;
+        Ok(PathBuf::from(std::ffi::OsString::from_wide(&wide))
+            .join("Epix")
+            .join("evx-stage"))
     }
 
     /// The pinned source image.

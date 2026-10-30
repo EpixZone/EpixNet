@@ -5,6 +5,9 @@ edition = "2021"
 publish = false
 description = "Win32 isolation primitives for EVX: handles, ACLs, AppContainer profiles, jobs, LPAC launch, pipes, registry reads. Empty on other targets."
 
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3"
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
   "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
