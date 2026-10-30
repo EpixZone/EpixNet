@@ -54,10 +54,16 @@ def commands(profile, output=None):
         # image and the product dependency gates (docs/evx-windows-backend.md).
         examples = ROOT / "target/release/examples"
         worker_copy = (output or ROOT / "target") / "evx-worker-verified.exe"
+        # Every test that spawns a child starts two or three AppContainer
+        # processes, and the hosted Windows runner has four vCPUs with a
+        # first-run Defender scan of each new image. Two tests at a time
+        # keep the suites' fixed deadlines meaningful instead of measuring
+        # the runner; the tests themselves are unchanged.
+        threads = ["--", "--test-threads", str(WINDOWS_TEST_THREADS)]
         return [
-            ("native", ["cargo", "test"] + package_args(NATIVE_PACKAGES) + ["--locked"]),
+            ("native", ["cargo", "test"] + package_args(NATIVE_PACKAGES) + ["--locked"] + threads),
             ("native-primitives", ["cargo", "test", "-p", "evx-windows-native", "-p", "evx-windows",
-                                   "--lib", "--locked"]),
+                                   "--lib", "--locked"] + threads),
             ("fixture-build", ["cargo", "build", "-p", "evx-windows", "--bins", "--example", "acceptance",
                                "--example", "execution_acceptance", "--release", "--locked"]),
             ("isolation", [str(examples / "acceptance.exe")]),
@@ -96,6 +102,8 @@ def tool_version(command):
 # Per-check wall budgets in seconds; the default covers a warm cache. The
 # native suites compile the node's whole dependency graph on a cold runner.
 TIMEOUTS = {"native": 5400, "fixture-build": 3600, "worker-build": 3600, "pulley": 3600}
+# Concurrent tests in the Windows native suites (see the profile).
+WINDOWS_TEST_THREADS = 2
 DEFAULT_TIMEOUT = 1800
 
 

@@ -568,10 +568,13 @@ fn late_helper_event(kind: u8) {
     use std::sync::atomic::AtomicU64;
     let f = fixture();
     let mut limits = lifecycle_limits();
-    limits.host_call_seconds = 0.2;
-    f.broker.set_limits(limits).unwrap();
+    f.broker.set_limits(limits.clone()).unwrap();
     let write = f.run(&write_wat("state.txt", "current"));
     assert_eq!(write.status, Status::Ok, "{write:?}");
+    // The short budget is for the helper the fault makes block; the plain
+    // write above keeps the ordinary one so a slow disk cannot fail set-up.
+    limits.host_call_seconds = 0.2;
+    f.broker.set_limits(limits).unwrap();
     let previous = Arc::new(AtomicU64::new(0));
     let saved = previous.clone();
     let result = f.run_with(

@@ -14,10 +14,10 @@
 
 use std::ffi::c_void;
 use std::fs::File;
-use std::mem::{size_of, zeroed};
+use std::mem::{offset_of, size_of, zeroed};
 use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle, RawHandle};
 use std::path::Path;
-use std::ptr::{null, null_mut};
+use std::ptr::{null, null_mut, NonNull};
 
 use evx_api::Denied;
 use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
@@ -870,7 +870,10 @@ fn privacy_of(handle: HANDLE) -> Result<Privacy, Denied> {
     let _descriptor = Local(descriptor);
     let owned = principals.is_caller(owner);
     // A missing DACL grants everyone everything.
-    let shared = dacl.is_null() || dacl_shared(dacl, &principals)?;
+    let shared = match NonNull::new(dacl) {
+        None => true,
+        Some(dacl) => dacl_shared(dacl, &principals)?,
+    };
     Ok(Privacy {
         owned,
         shared,
@@ -880,24 +883,31 @@ fn privacy_of(handle: HANDLE) -> Result<Privacy, Denied> {
 
 /// Whether any allow entry names a principal other than the caller, SYSTEM
 /// or Administrators. Unknown entry types count as shared.
-fn dacl_shared(dacl: *mut ACL, principals: &Principals) -> Result<bool, Denied> {
-    // SAFETY: GetSecurityInfo returned a valid ACL inside the descriptor.
-    let count = unsafe { (*dacl).AceCount };
+fn dacl_shared(dacl: NonNull<ACL>, principals: &Principals) -> Result<bool, Denied> {
+    // SAFETY: GetSecurityInfo returned this non-null ACL inside the
+    // descriptor, which outlives the walk.
+    let count = unsafe { dacl.as_ref() }.AceCount;
     for index in 0..u32::from(count) {
         let mut ace: *mut c_void = null_mut();
         // SAFETY: index is below AceCount.
-        if unsafe { GetAce(dacl, index, &mut ace) } == 0 {
+        if unsafe { GetAce(dacl.as_ptr(), index, &mut ace) } == 0 {
             return Err(denied("workspace owner"));
         }
-        // SAFETY: every ACE starts with an ACE_HEADER.
-        let header = unsafe { &*ace.cast::<ACE_HEADER>() };
+        let ace = NonNull::new(ace).ok_or_else(|| denied("workspace owner"))?;
+        // SAFETY: every ACE starts with an ACE_HEADER, inside the descriptor.
+        let header = unsafe { ace.cast::<ACE_HEADER>().as_ref() };
         if header.AceType != ACCESS_ALLOWED_ACE_TYPE {
             return Ok(true);
         }
-        // SAFETY: an access-allowed ACE carries its SID inline at SidStart.
-        let sid = unsafe { std::ptr::addr_of!((*ace.cast::<ACCESS_ALLOWED_ACE>()).SidStart) }
-            .cast_mut()
-            .cast::<c_void>();
+        // SAFETY: an access-allowed ACE carries its SID inline at SidStart,
+        // within the entry `header.AceSize` describes; this is address
+        // arithmetic inside that entry, not a read.
+        let sid: PSID = unsafe {
+            ace.as_ptr()
+                .cast::<u8>()
+                .add(offset_of!(ACCESS_ALLOWED_ACE, SidStart))
+        }
+        .cast::<c_void>();
         if !principals.is_caller(sid) && !principals.is_system_or_administrators(sid) {
             return Ok(true);
         }
