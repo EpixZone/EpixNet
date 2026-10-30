@@ -2,12 +2,12 @@
 //! temporary data root, the `Evx` plugin started the way the node starts it
 //! (scheduler task included), and every command sent through
 //! `CommandRegistry::dispatch`, where the wrapper-only gate lives. Execution
-//! itself runs only on macOS, through the real worker built like the
-//! `evx-host` suite builds it; everywhere else the run path must report
+//! runs on macOS, Linux and Windows through the real worker built like the
+//! `evx-host` suite builds it; a host without confinement must report
 //! `unsupported host` and touch nothing, and the scheduler must admit
 //! nothing while saying so in status.
 
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,13 +27,15 @@ use serde_json::{json, Value};
 
 const CALC: &str = r#"(module (memory (export "memory") 1) (func (export "run") (result i32) i32.const 19 i32.const 23 i32.add))"#;
 /// A module with a start function: instantiating it runs code. Inspection
-/// must report its hash without ever instantiating it.
+/// must report its hash without ever instantiating it. Only the Unix shell
+/// script fixture uses it.
+#[cfg(unix)]
 const START: &str = r#"(module (memory (export "memory") 1) (func $boot) (start $boot) (func (export "run") (result i32) i32.const 7))"#;
 const ENTRY_PATH: &str = "evx/main.wasm";
 const PROGRAM: &str = "calc";
 const MODIFIED: f64 = 1_700_000_000.0;
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::test]
 async fn failed_activation_checkpoint_persistence_prevents_guest_execution() {
     let f = Fixture::new(Options::default()).await;
@@ -53,12 +55,12 @@ const TEST_WORKER: &str = "EVX_TEST_WORKER";
 
 /// Build and locate `evx-worker` relative to this test binary's target
 /// directory, exactly as the `evx-host` suite does.
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn worker_binary() -> PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
         if let Some(worker) = std::env::var_os(TEST_WORKER) {
-            return std::fs::canonicalize(worker).unwrap();
+            return std::path::absolute(worker).unwrap();
         }
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
@@ -73,9 +75,23 @@ fn worker_binary() -> PathBuf {
         assert!(command.status().expect("cargo build -p evx-worker").success());
         let exe = std::env::current_exe().unwrap();
         let profile_dir = exe.parent().and_then(std::path::Path::parent).unwrap();
-        std::fs::canonicalize(profile_dir.join("evx-worker")).unwrap()
+        private_worker_copy(&profile_dir.join(format!("evx-worker{}", std::env::consts::EXE_SUFFIX)))
     })
     .clone()
+}
+
+/// Cargo hard-links the uplifted worker to its `deps/` copy, and the Windows
+/// worker rule requires exactly one link; run a private per-process copy
+/// there. Unix keeps the canonical build output.
+fn private_worker_copy(built: &std::path::Path) -> PathBuf {
+    if !cfg!(windows) {
+        return std::fs::canonicalize(built).unwrap();
+    }
+    let dir = std::env::temp_dir().join(format!("epix-evx-test-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join(built.file_name().unwrap());
+    std::fs::copy(built, &copy).unwrap();
+    copy
 }
 
 struct Options {
@@ -104,9 +120,9 @@ impl Default for Options {
             jobs: Vec::new(),
             pin_entry: true,
             signed: true,
-            #[cfg(any(target_os = "macos", target_os = "linux"))]
+            #[cfg(any(target_os = "macos", target_os = "linux", windows))]
             worker: Some(worker_binary()),
-            #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+            #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
             worker: None,
         }
     }
@@ -229,6 +245,13 @@ impl std::ops::Deref for FixtureDirectory {
 }
 impl Drop for FixtureDirectory {
     fn drop(&mut self) {
+        let root = self.service.root().to_path_buf();
+        self.settle();
+        forget_workspace_profiles(&root);
+    }
+}
+impl FixtureDirectory {
+    fn settle(&mut self) {
         self.service.shutdown();
         let journal = self.service.root().join("lifecycle/lifecycle.json");
         let deadline = Instant::now() + Duration::from_secs(120);
@@ -250,6 +273,23 @@ impl Drop for FixtureDirectory {
         }
     }
 }
+
+
+/// Delete the AppContainer profiles the fixture's workspaces created, so a
+/// test run leaves no operating-system state behind. Production profiles
+/// are retained by design; only test fixtures forget them.
+#[cfg(windows)]
+fn forget_workspace_profiles(root: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(root.join("workspaces")) {
+        for entry in entries.flatten() {
+            if entry.path().is_dir() {
+                let _ = evx_supervisor::windows::forget_workspace_profiles(&entry.path());
+            }
+        }
+    }
+}
+#[cfg(not(windows))]
+fn forget_workspace_profiles(_root: &std::path::Path) {}
 
 struct Fixture {
     dir: FixtureDirectory,
@@ -393,7 +433,7 @@ impl Fixture {
 
     /// The same for another xite of the node. Only the macOS execution tests
     /// use it.
-    #[cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code))]
+    #[cfg_attr(not(any(target_os = "macos", target_os = "linux", windows)), allow(dead_code))]
     async fn enable_params_for(&self, xite: &Xite) -> Value {
         self.enable_params_at(&xite.address, &xite.digest).await
     }
@@ -1486,7 +1526,7 @@ async fn a_content_change_for_a_xite_with_jobs_re_registers_it_with_no_evx_comma
     assert_eq!(row.declaration_digest, f.digest);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 mod execution {
     use super::*;
     use evx_api::Status;
@@ -1829,7 +1869,7 @@ mod execution {
     }
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn uncertain_workspace_write(f: &Fixture) {
     let workspace = f.service.workspace_dir(&f.address);
     std::fs::create_dir_all(&workspace).unwrap();
@@ -1855,7 +1895,7 @@ fn uncertain_workspace_write(f: &Fixture) {
     assert_eq!(result.status, evx_api::Status::EffectUnknown, "{result:?}");
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::test]
 async fn job_resume_refuses_unregistered_workspace_bytes_before_clearing_pause() {
     let f = Fixture::without_scheduler(Options { capabilities: vec!["workspace.write"], ..Options::with_job(3600) }).await;
@@ -1871,7 +1911,7 @@ async fn job_resume_refuses_unregistered_workspace_bytes_before_clearing_pause()
     assert!(f.service.durable().jobs(&f.address).unwrap()[0].paused_reason.is_none());
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::test]
 async fn explicit_operator_workspace_recovery_supports_interrupted_manual_runs() {
     let f = Fixture::without_scheduler(Options { capabilities: vec!["workspace.write"], ..Options::default() }).await;

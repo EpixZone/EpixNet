@@ -1,4 +1,4 @@
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 //! A xite's signed content.json runs one declared program through the real
 //! contained supervisor: the owner key signs the manifest the way the node
 //! does, `evx-declaration` parses and binds it from the stored bytes, and
@@ -43,9 +43,23 @@ fn worker_binary() -> PathBuf {
             .success());
         let exe = std::env::current_exe().unwrap();
         let profile_dir = exe.parent().and_then(std::path::Path::parent).unwrap();
-        std::fs::canonicalize(profile_dir.join("evx-worker")).unwrap()
+        private_worker_copy(&profile_dir.join(format!("evx-worker{}", std::env::consts::EXE_SUFFIX)))
     })
     .clone()
+}
+
+/// Cargo hard-links the uplifted worker to its `deps/` copy, and the Windows
+/// worker rule requires exactly one link; run a private per-process copy
+/// there. Unix keeps the canonical build output.
+fn private_worker_copy(built: &std::path::Path) -> PathBuf {
+    if !cfg!(windows) {
+        return std::fs::canonicalize(built).unwrap();
+    }
+    let dir = std::env::temp_dir().join(format!("evx-host-test-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join(built.file_name().unwrap());
+    std::fs::copy(built, &copy).unwrap();
+    copy
 }
 
 fn call_wat(request: Value) -> String {
@@ -71,6 +85,15 @@ struct Harness {
     content: Value,
     /// The xite's stored files, standing in for `XiteStorage`.
     files: BTreeMap<String, Vec<u8>>,
+}
+
+impl Drop for Harness {
+    /// Leave no AppContainer profile behind on Windows; production profiles
+    /// are retained by design, test fixtures forget theirs.
+    fn drop(&mut self) {
+        #[cfg(windows)]
+        let _ = evx_supervisor::windows::forget_workspace_profiles(&self.workspace);
+    }
 }
 
 impl Harness {

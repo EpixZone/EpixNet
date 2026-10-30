@@ -3,9 +3,10 @@
 //! `evx_activation::ActivationLoader` holds the version floor in memory and
 //! leaves persisting it to the host; `evx-state` has no table for it yet.
 //! Until it does, the service keeps one small JSON file per xite under
-//! `<private>/evx/checkpoints/<address>.json`, written atomically (temporary
-//! file, fsync, rename) so a crash mid-write leaves either the old floor or
-//! the new one and never a torn file.
+//! `<private>/evx/checkpoints/<address>.json`, written atomically through
+//! `evx_workspace::Dir` (temporary file, flush, handle-relative rename,
+//! directory flush) so a crash mid-write leaves either the old floor or the
+//! new one and never a torn file, on Unix and Windows alike.
 //!
 //! A file that exists but does not decode is an error, not an empty floor:
 //! starting from version 0 would let a rollback be admitted, which is the
@@ -15,6 +16,7 @@
 use std::path::{Path, PathBuf};
 
 use evx_activation::ActivationCheckpoint;
+use evx_workspace::sys::Dir;
 
 /// Most bytes a checkpoint file may hold. A real one is under 200 bytes; a
 /// larger file is not a checkpoint this build wrote.
@@ -59,26 +61,30 @@ pub(crate) fn admit(dir: &Path, xite: &str, expected: &ActivationCheckpoint, can
 
 /// Write one checkpoint while the caller owns its admission lease.
 pub(crate) fn store(dir: &Path, xite: &str, checkpoint: &ActivationCheckpoint) -> Result<(), String> {
-    let path = path(dir, xite);
-    let tmp = dir.join(format!("{xite}.json.tmp-{}", std::process::id()));
+    let target = format!("{xite}.json");
+    let tmp = format!("{xite}.json.tmp-{}", std::process::id());
     let raw = serde_json::to_vec(checkpoint).map_err(|error| format!("checkpoint encode: {error}"))?;
-    let write = || -> std::io::Result<()> {
-        use std::io::Write as _;
-        let mut file = std::fs::File::create(&tmp)?;
-        file.write_all(&raw)?;
-        file.sync_all()?;
-        std::fs::rename(&tmp, &path)?;
-        // Durability of the rename itself needs the directory synced on
-        // POSIX; Windows has no such call and the rename is already durable
-        // enough there for a floor that is re-admitted on the next run.
-        #[cfg(unix)]
-        std::fs::File::open(dir)?.sync_all()?;
-        Ok(())
-    };
-    write().map_err(|error| {
-        let _ = std::fs::remove_file(&tmp);
-        format!("activation checkpoint not persisted: {error}")
-    })
+    let directory = Dir::open_root(dir)
+        .map_err(|error| format!("activation checkpoint not persisted: {error}"))?;
+    let result = write_replacing(&directory, &tmp, &target, &raw);
+    if result.is_err() {
+        let _ = directory.unlink(&tmp);
+    }
+    result.map_err(|error| format!("activation checkpoint not persisted: {error}"))
+}
+
+/// Write `raw` to `tmp`, flush it, rename it over `target` and flush the
+/// directory, all relative to `directory`. A stale `tmp` of an earlier
+/// process with this id is removed first; anything else in its place fails.
+fn write_replacing(directory: &Dir, tmp: &str, target: &str, raw: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let _ = directory.unlink(tmp);
+    let mut file = directory.create_new(tmp).map_err(|error| error.to_string())?;
+    file.write_all(raw).map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
+    drop(file);
+    directory.rename(tmp, target).map_err(|error| error.to_string())?;
+    directory.sync().map_err(|error| error.to_string())
 }
 
 #[cfg(test)]

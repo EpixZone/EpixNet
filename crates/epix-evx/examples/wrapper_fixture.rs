@@ -14,11 +14,11 @@
 //! `https://<xite>.content.epix/` the page's own origin. It then prints the
 //! proxy address and the CA certificate path; point a browser at that proxy.
 
-// The EVX plugin exists on macOS and Linux only; elsewhere this example is a
-// stub, so a workspace build still succeeds.
-#![cfg_attr(not(any(target_os = "macos", target_os = "linux")), allow(dead_code, unused_imports))]
+// The EVX plugin exists on macOS, Linux and Windows; on mobile targets this
+// example is a stub, so a workspace build still succeeds.
+#![cfg_attr(not(any(target_os = "macos", target_os = "linux", windows)), allow(dead_code, unused_imports))]
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 use epix_evx::EvxPlugin;
 use epix_plugin::PluginRegistry;
 use epix_ui::{AppState, UiServer, XiteEntry};
@@ -96,13 +96,13 @@ window.addEventListener("load", function () {
 </script></body></html>
 "#;
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
 fn main() {
-    eprintln!("wrapper_fixture serves EVX on macOS and Linux only");
+    eprintln!("wrapper_fixture serves EVX on macOS, Linux and Windows only");
     std::process::exit(1);
 }
 
-#[cfg(any(target_os = "macos", target_os = "linux"))]
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
 #[tokio::main]
 async fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();

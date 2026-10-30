@@ -42,7 +42,22 @@ fn build_worker_binary() -> PathBuf {
     }
     assert!(command.status().expect("cargo build -p evx-worker").success());
     let exe = std::env::current_exe().unwrap();
-    std::fs::canonicalize(exe.parent().unwrap().parent().unwrap().join("evx-worker")).unwrap()
+    let built = exe.parent().unwrap().parent().unwrap().join(format!("evx-worker{}", std::env::consts::EXE_SUFFIX));
+    private_worker_copy(&built)
+}
+
+/// Cargo hard-links the uplifted worker to its `deps/` copy, and the Windows
+/// worker rule requires exactly one link; run a private per-process copy
+/// there. Unix keeps the canonical build output.
+fn private_worker_copy(built: &std::path::Path) -> PathBuf {
+    if !cfg!(windows) {
+        return std::fs::canonicalize(built).unwrap();
+    }
+    let dir = std::env::temp_dir().join(format!("epix-evx-unit-worker-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let copy = dir.join(built.file_name().unwrap());
+    std::fs::copy(built, &copy).unwrap();
+    copy
 }
 
 fn worker_binary() -> PathBuf {
@@ -58,7 +73,26 @@ async fn wait_for(what: &str, check: impl Fn() -> bool) {
     }).await.unwrap_or_else(|_| panic!("timed out waiting for {what}"));
 }
 
-async fn fixture(with_job: bool, scheduler: bool) -> (tempfile::TempDir, Arc<AppState>, Arc<EvxService>, String) {
+/// The fixture's data root; dropping it deletes the AppContainer profiles
+/// its workspaces created on Windows (production profiles are retained).
+struct TestRoot(tempfile::TempDir);
+impl Drop for TestRoot {
+    fn drop(&mut self) {
+        let workspaces = self.0.path().join("private/evx/workspaces");
+        #[cfg(windows)]
+        if let Ok(entries) = std::fs::read_dir(&workspaces) {
+            for entry in entries.flatten() {
+                if entry.path().is_dir() {
+                    let _ = evx_supervisor::windows::forget_workspace_profiles(&entry.path());
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        drop(workspaces);
+    }
+}
+
+async fn fixture(with_job: bool, scheduler: bool) -> (TestRoot, Arc<AppState>, Arc<EvxService>, String) {
     let worker = worker_binary();
     let dir = tempfile::tempdir().unwrap();
     let app = AppState::with_data_dir("test", dir.path());
@@ -99,7 +133,7 @@ async fn fixture(with_job: bool, scheduler: bool) -> (tempfile::TempDir, Arc<App
         program: None, limits: None, label: None, shown: Some(Shown::of(&inspection)),
     }).await.unwrap();
 
-    (dir, app, service, xite)
+    (TestRoot(dir), app, service, xite)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

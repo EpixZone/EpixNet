@@ -1,4 +1,7 @@
 #![allow(clippy::field_reassign_with_default)]
+// Envelope activations capture their artifact tree through the Unix-only
+// reader (`evx_host::run_activation`); the node path is covered on every
+// desktop target by `content_activation.rs`.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
 //! Signed fixture programs execute through the real contained supervisor.
 //! Port of `test_activation_runner.py`, plus the two-phase admission fix.

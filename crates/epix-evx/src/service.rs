@@ -673,6 +673,13 @@ pub struct EvxService {
     worker: Option<PathBuf>,
     direct_lifecycle: Option<Arc<evx_supervisor::direct_lifecycle::DirectLifecycle>>,
     direct_unavailable: Option<String>,
+    /// The pinned and staged worker image under `<root>/windows`, or why
+    /// there is none. Built once with the service so the pinned image stays
+    /// pinned for its whole life (docs/evx-windows-backend.md).
+    #[cfg(windows)]
+    windows_backend: Option<Arc<evx_supervisor::windows::WindowsBackend>>,
+    #[cfg(windows)]
+    windows_unavailable: Option<String>,
     #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
     apple: Option<Arc<crate::apple_backend::AppleBackend>>,
     /// Brokers of runs in flight, by xite, so a revocation reaches the
@@ -774,6 +781,14 @@ impl EvxService {
             Some(path) => path.is_file().then_some(path),
             None => default_worker_binary(),
         }};
+        #[cfg(windows)]
+        let (windows_backend, windows_unavailable) = match &worker {
+            Some(path) => match evx_supervisor::windows::WindowsBackend::new(path, &root.join("windows")) {
+                Ok(backend) => (Some(backend), None),
+                Err(error) => (None, Some(error.to_string())),
+            },
+            None => (None, None),
+        };
         Ok(EvxService {
             state,
             root,
@@ -781,6 +796,10 @@ impl EvxService {
             worker,
             direct_lifecycle,
             direct_unavailable,
+            #[cfg(windows)]
+            windows_backend,
+            #[cfg(windows)]
+            windows_unavailable,
             #[cfg(all(target_os = "macos", feature = "apple-xpc"))]
             apple: None,
             running: Mutex::new(HashMap::new()),
@@ -859,6 +878,10 @@ impl EvxService {
     pub fn execution(&self) -> Result<&Path, String> {
         self.direct_context()?.validate().map_err(|error| error.to_string())?;
         evx_supervisor::confinement_available().map_err(|_| UNSUPPORTED_HOST.to_string())?;
+        #[cfg(windows)]
+        if self.windows_backend.is_none() {
+            return Err(self.windows_unavailable.clone().unwrap_or_else(|| UNSUPPORTED_HOST.to_string()));
+        }
         self.worker.as_deref().ok_or_else(|| UNSUPPORTED_HOST.to_string())
     }
 
@@ -896,6 +919,17 @@ impl EvxService {
         // still permits metadata-only recovery and can never select a file.
         let worker = self.worker.clone().unwrap_or_default();
         let broker = Arc::new(Broker::new(&workspace, grant, limits).map_err(|error| format!("workspace: {error}"))?);
+        #[cfg(windows)]
+        let mut config = match (&self.windows_backend, self.worker.is_some()) {
+            (Some(backend), _) => Config::with_windows_backend(backend.clone()),
+            // No pinned image: metadata-only work with an empty path, which
+            // can never stage or launch anything.
+            (None, false) => Config::new(worker),
+            (None, true) => {
+                return Err(self.windows_unavailable.clone().unwrap_or_else(|| UNSUPPORTED_HOST.to_string()));
+            }
+        };
+        #[cfg(not(windows))]
         let mut config = Config::new(worker);
         config.direct_lifecycle = Some(direct_scope);
         broker.check_backend(&config).map_err(|error| error.to_string())?;
@@ -2206,14 +2240,17 @@ impl Drop for RunningRegistration<'_> {
     }
 }
 
-/// Resolve the worker binary the way the `evx-host` CLI does: `EVX_WORKER`
-/// when set, else [`WORKER_BINARY`] beside the running executable. A path
-/// that is not a regular file is `None`, which [`EvxService::execution`]
-/// reports as an unsupported host rather than failing at the first run.
+/// Resolve the worker binary the way the `evx-host` CLI does:
+/// [`WORKER_BINARY`] beside the running executable, or `EVX_WORKER` when
+/// set on Unix. Windows never honours the override: the worker there is
+/// trusted exactly as far as the node executable beside it, and tests pin
+/// one through `EvxPlugin::with_worker`. A path that is not a regular file
+/// is `None`, which [`EvxService::execution`] reports as an unsupported
+/// host rather than failing at the first run.
 pub fn default_worker_binary() -> Option<PathBuf> {
     let path = match std::env::var_os("EVX_WORKER") {
-        Some(path) => PathBuf::from(path),
-        None => std::env::current_exe().ok()?.with_file_name(WORKER_BINARY),
+        Some(path) if !cfg!(windows) => PathBuf::from(path),
+        _ => std::env::current_exe().ok()?.with_file_name(WORKER_BINARY),
     };
     path.is_file().then_some(path)
 }

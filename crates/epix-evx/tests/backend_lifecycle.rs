@@ -1,6 +1,6 @@
 //! Existing state remains inspectable when its process ownership cannot be proven.
 
-#![cfg(any(target_os = "macos", target_os = "linux"))]
+#![cfg(any(target_os = "macos", target_os = "linux", windows))]
 
 use epix_evx::EvxService;
 use epix_ui::AppState;
