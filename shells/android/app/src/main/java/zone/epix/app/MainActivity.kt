@@ -127,11 +127,11 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     private var currentTabIndex = 0
     private val currentTab: Tab get() = tabs[currentTabIndex]
     // Android 16+ does not dispatch the deprecated Activity.onBackPressed.
-    // Only intercept system Back while the selected tab has page history;
-    // otherwise leave Android's normal back-to-home behavior enabled.
+    // Root Back backgrounds the task like Home, keeping its live browser
+    // sessions available until Android needs to reclaim the process.
     private val browserBackCallback = object : OnBackPressedCallback(false) {
         override fun handleOnBackPressed() {
-            goBackInCurrentTab()
+            handleBrowserBack()
         }
     }
     private lateinit var backButton: TextView
@@ -979,7 +979,16 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         if (disposed || tabs.isEmpty()) return
         val canGoBack = fullScreenSession === currentTab.session || currentTab.canGoBack
         backButton.alpha = if (canGoBack) 1f else DISABLED_ALPHA
-        browserBackCallback.isEnabled = canGoBack
+        browserBackCallback.isEnabled = canGoBack || isTaskRoot
+    }
+
+    private fun handleBrowserBack() {
+        if (disposed || tabs.isEmpty()) return
+        if (fullScreenSession === currentTab.session || currentTab.canGoBack) {
+            goBackInCurrentTab()
+        } else if (isTaskRoot) {
+            moveTaskToBack(false)
+        }
     }
 
     private fun goBackInCurrentTab() {
