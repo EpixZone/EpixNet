@@ -11,6 +11,14 @@ use evx_supervisor::{compile_module, run_guest, Broker, CompiledArtifact, Config
 
 pub const PAGE: usize = 65_536;
 
+/// A test that re-executes itself hands the worker its parent already built
+/// to the child through this variable. A second Cargo build in the child can
+/// replace the executable while the parent suite is launching it, which the
+/// worker then reports as an unresolvable executable.
+pub const TEST_WORKER: &str = "EVX_TEST_WORKER";
+/// The same hand-off for the hostile peer example.
+pub const TEST_HOSTILE_PEER: &str = "EVX_TEST_HOSTILE_PEER";
+
 /// Build and locate `evx-worker`. The target directory is derived from this
 /// test binary's own location, so `CARGO_TARGET_DIR`, `--release` and
 /// `--target` all resolve correctly, and the build is always requested so an
@@ -18,21 +26,33 @@ pub const PAGE: usize = 65_536;
 /// it a no-op when fresh).
 pub fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
-    PATH.get_or_init(|| build_target("evx-worker", &["-p", "evx-worker"], ""))
-        .clone()
+    PATH.get_or_init(|| {
+        handed_down(TEST_WORKER)
+            .unwrap_or_else(|| build_target("evx-worker", &["-p", "evx-worker"], ""))
+    })
+    .clone()
 }
 
 /// Build and locate the hostile peer example of `evx-supervisor`.
 pub fn hostile_peer_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
-        build_target(
-            "hostile_peer",
-            &["-p", "evx-supervisor", "--example", "hostile_peer"],
-            "examples",
-        )
+        handed_down(TEST_HOSTILE_PEER).unwrap_or_else(|| {
+            build_target(
+                "hostile_peer",
+                &["-p", "evx-supervisor", "--example", "hostile_peer"],
+                "examples",
+            )
+        })
     })
     .clone()
+}
+
+fn handed_down(variable: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(variable)?;
+    Some(std::fs::canonicalize(&path).unwrap_or_else(|e| {
+        panic!("{variable} names {}: {e}", PathBuf::from(path).display())
+    }))
 }
 
 fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {

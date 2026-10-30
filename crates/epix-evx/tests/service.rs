@@ -46,12 +46,20 @@ async fn failed_activation_checkpoint_persistence_prevents_guest_execution() {
     assert_eq!(result["worker_started"], false, "no guest may start after failed admission persistence: {result}");
 }
 
+/// A test that re-executes this binary hands the worker it already built to
+/// the child here. A second Cargo build in the child can replace the
+/// executable while the parent suite is launching it.
+const TEST_WORKER: &str = "EVX_TEST_WORKER";
+
 /// Build and locate `evx-worker` relative to this test binary's target
 /// directory, exactly as the `evx-host` suite does.
 #[cfg(any(target_os = "macos", target_os = "linux"))]
 fn worker_binary() -> PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     PATH.get_or_init(|| {
+        if let Some(worker) = std::env::var_os(TEST_WORKER) {
+            return std::fs::canonicalize(worker).unwrap();
+        }
         let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let mut command = std::process::Command::new(cargo);
@@ -208,24 +216,36 @@ fn start_plugin(state: &Arc<AppState>, worker: Option<PathBuf>) -> (CommandRegis
 // Keep the journal alive until any admitted supervisor has reaped its child.
 // Dropping only TempDir while a scheduler is finishing correctly quarantines
 // the process now, so fixture teardown must follow the host shutdown contract.
+// That quarantine is process-wide and irreversible, so a slow reap under load
+// must never end in a deleted journal: after a generous wait the directory is
+// kept, never removed, and the test process stays admissible.
 struct FixtureDirectory {
-    dir: tempfile::TempDir,
+    dir: Option<tempfile::TempDir>,
     service: Arc<EvxService>,
 }
 impl std::ops::Deref for FixtureDirectory {
     type Target = tempfile::TempDir;
-    fn deref(&self) -> &Self::Target { &self.dir }
+    fn deref(&self) -> &Self::Target { self.dir.as_ref().expect("fixture directory") }
 }
 impl Drop for FixtureDirectory {
     fn drop(&mut self) {
         self.service.shutdown();
         let journal = self.service.root().join("lifecycle/lifecycle.json");
-        let deadline = Instant::now() + Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(120);
         loop {
-            let active = std::fs::read(&journal).ok()
-                .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-                .and_then(|value| value["active"].as_array().map(|rows| rows.len()));
-            if active == Some(0) || Instant::now() >= deadline { break; }
+            let active = match std::fs::read(&journal) {
+                Ok(bytes) => serde_json::from_slice::<Value>(&bytes).ok()
+                    .and_then(|value| value["active"].as_array().map(|rows| rows.len())),
+                // No journal was ever provisioned: nothing can still be reaped.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return,
+                Err(_) => None,
+            };
+            if active == Some(0) { return; }
+            if Instant::now() >= deadline {
+                let kept = self.dir.take().expect("fixture directory").keep();
+                eprintln!("kept {}: lifecycle journal still active after shutdown", kept.display());
+                return;
+            }
             std::thread::sleep(Duration::from_millis(5));
         }
     }
@@ -269,7 +289,7 @@ impl Fixture {
             (plugins.command_registry(), service)
         };
         Fixture {
-            dir: FixtureDirectory { dir, service: service.clone() },
+            dir: FixtureDirectory { dir: Some(dir), service: service.clone() },
             state,
             address: xite.address.clone(),
             commands,
@@ -1974,6 +1994,7 @@ int main(int argc, char **argv) {{
         .env("EVX_DIRECT_CRASH_ROOT", f.dir.path())
         .env("EVX_DIRECT_CRASH_XITE", &f.address)
         .env("EVX_DIRECT_CRASH_WORKER", &wrapper)
+        .env(TEST_WORKER, &worker)
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::inherit()).spawn().unwrap();
     let marker = f.service.workspace_dir(&f.address).join("peer-ready");
     let deadline = Instant::now() + Duration::from_secs(10);

@@ -608,6 +608,7 @@ fn unconfirmed_cleanup(commit: bool) {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", test, "--nocapture"])
             .env(CHILD, "1")
+            .env(common::TEST_WORKER, common::worker_binary())
             .output()
             .unwrap();
         assert!(
