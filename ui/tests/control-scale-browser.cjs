@@ -13,6 +13,19 @@ const { chromium } = require(tools
   ? path.join(tools, "playwright")
   : "playwright");
 const repo = path.resolve(__dirname, "../..");
+
+// Playwright's waitForFunction evaluates its predicate with eval, which the
+// production wrapper's Content-Security-Policy forbids. Poll with evaluate,
+// which passes the function itself, so the fixture runs under the real CSP.
+async function waitFor(page, predicate, arg, options = {}) {
+  const deadline = Date.now() + (options.timeout ?? 30000);
+  const interval = typeof options.polling === "number" ? options.polling : 100;
+  for (;;) {
+    if (await page.evaluate(predicate, arg)) return;
+    if (Date.now() > deadline) throw new Error("waitFor: condition not met within the timeout");
+    await page.waitForTimeout(interval);
+  }
+}
 const os = require("node:os");
 const crypto = require("node:crypto");
 const out = process.env.EPIX_BROWSER_TEST_OUTPUT || fs.mkdtempSync(path.join(os.tmpdir(), "epix-control-scale-"));
@@ -104,6 +117,7 @@ const server = http.createServer((req, res) => {
       homepage: `/${address}`,
       resolving_host: "",
       is_homepage: "false",
+      ui_restrict: "false",
       site_file_server: "",
       file_url: `/${address}/index.html`,
       query_string: "?wrapper_nonce=waiting",
@@ -236,7 +250,7 @@ wss.on("connection", (ws) => {
       {x: x + (end - x) / 2, y}, {x: end, y},
     ]);
     try {
-      await page.waitForFunction(opened => sidebar.opened === opened, direction === 'open', {timeout: 3000});
+      await waitFor(page, opened => sidebar.opened === opened, direction === 'open', {timeout: 3000});
     } catch (error) {
       const state = await page.evaluate(() => ({opened: sidebar.opened, lock: sidebar.move_lock,
         dragging: sidebar.fixbutton.hasClass('dragging'), left: sidebar.fixbutton[0].style.left,
@@ -253,7 +267,7 @@ wss.on("connection", (ws) => {
     const m = await measure(page), box = m.close;
     assert.ok(box && box.visibleWidth > 10, 'close button is visible');
     await page.mouse.click((box.x + box.width / 2) / m.viewport.scale, (box.y + box.height / 2) / m.viewport.scale);
-    await page.waitForFunction(() => !sidebar.opened, null, {timeout: 3000});
+    await waitFor(page, () => !sidebar.opened, null, {timeout: 3000});
     await settle(page);
   }
   async function openByHashEntry(page) {
@@ -275,7 +289,7 @@ wss.on("connection", (ws) => {
     const record = {name}; results.cases.push(record);
     try {
       await page.goto(`http://127.0.0.1:${server.address().port}/${address}/`, {waitUntil: 'load'});
-      await page.waitForFunction(() => window.sidebar && sidebar.wrapper.xite_info, null, {timeout: 5000});
+      await waitFor(page, () => window.sidebar && sidebar.wrapper.xite_info, null, {timeout: 5000});
       await settle(page);
       await page.evaluate(() => {
         window.controlScaleEvents = [];
@@ -396,7 +410,7 @@ wss.on("connection", (ws) => {
       record.before = await measure(page);
       manifestHint = hint(0.5);
       publish({content: {...info.content, viewport: manifestHint}});
-      await page.waitForFunction(expected => document.querySelector('#viewport')?.content === expected, manifestHint);
+      await waitFor(page, expected => document.querySelector('#viewport')?.content === expected, manifestHint);
       await settle(page); record.after = await measure(page);
       near('delayed author scale applied', record.after.viewport.scale, 0.5, 0.02);
       near('delayed viewport keeps button 48px', record.after.button.width, 48);

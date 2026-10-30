@@ -1,0 +1,1 @@
+{"files": {"main.wasm": {"size": 8, "sha512": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"}}, "evx": {"version": 1, "programs": {"tick": {"runtime_profile": "wasm-core-v1", "entry": "main.wasm", "capabilities": [{"api": "game.score.get"}], "allow_run_once": true}}, "jobs": {}}}

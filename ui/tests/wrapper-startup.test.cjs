@@ -1,5 +1,8 @@
 // Run: node --test ui/tests/wrapper-startup.test.cjs
 // Exercise the production Wrapper without its automatic DOM/WebSocket startup.
+// The inner frame is an opaque origin (docs/wrapper-sandbox.md): the chrome
+// cannot read its document, so every fixture frame refuses that access. What
+// the chrome sees is the frame's load event and the documents' own messages.
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
@@ -18,8 +21,6 @@ const transportClass = source.slice(transportStart, transportEnd);
 
 function fixture(options = {}) {
   const initialSrc = options.src || "https://current.epix/index.html?wrapper_nonce=oldNonce";
-  let activeDocument = makeDocument(initialSrc);
-  let documentInaccessible = false;
   let frame;
   let onPost = null;
   const messages = [], writes = [], requests = [], timers = [];
@@ -32,23 +33,17 @@ function fixture(options = {}) {
     document: { title: "Fixture" },
   };
   const inner = {
-    get document() {
-      if (documentInaccessible) throw new Error("Cross-origin document");
-      return activeDocument;
-    },
+    get document() { throw new Error("Cross-origin document"); },
     postMessage(message) {
       messages.push(message);
       if (onPost) onPost(message);
     },
   };
-  function makeDocument(href, readyState = "complete") {
-    return { location: { href }, readyState, documentElement: { dataset: {} } };
-  }
   function makeFrame(src) {
     let currentSrc = src;
     return {
       contentWindow: inner,
-      get contentDocument() { return inner.document; },
+      get contentDocument() { throw new Error("Cross-origin document"); },
       get src() { return currentSrc; },
       set src(value) {
         writes.push({ frame: this, src: value, expectedNonce: window.wrapper_nonce });
@@ -97,9 +92,10 @@ function fixture(options = {}) {
   });
   const wrapper = Object.assign(Object.create(context.Wrapper.prototype), {
     inner, inner_ready: false, inner_loaded: false, wrapperWsInited: false,
-    opener_tested: false, iframe_recovery_pending: false,
+    inner_generation: 0, inner_load_state: null, inner_probe_id: 0, inner_probe_counter: 0,
+    opener_tested: false, iframe_reload_request: null, iframe_recovery_pending: false,
     ws_lost_timer: null, ws_error: null,
-    xite_info: { content: { title: "Fixture" }, settings: { size: 1 }, size_limit: 1 },
+    xite_info: { content: { title: "Fixture" }, settings: { size: 1 }, size_limit: 1, clone_status: { state: "complete", attempt: 1 } },
     loading: { screen_visible: false, hideScreen() {} },
     notifications: { add() {} },
     log() {}, reloadXiteInfo() {}, pollNotificationCount() {},
@@ -110,20 +106,25 @@ function fixture(options = {}) {
   return {
     wrapper, window, inner, messages, writes, requests, decoy,
     get frame() { return frame; },
-    get document() { return activeDocument; },
     opens: () => messages.filter(message => message.cmd === "wrapperOpenedWebsocket").length,
+    asks: () => messages.filter(message => message.cmd === "ping").length,
     ready(nonce = window.wrapper_nonce, sender = inner) {
       return wrapper.onMessageInner({ source: sender, data: { cmd: "innerReady", id: 1, wrapper_nonce: nonce } });
     },
+    // The frame library's answer to the chrome's probe, for the given ping
+    // (the latest by default).
+    pong(index = -1, nonce = window.wrapper_nonce, sender = inner) {
+      const pings = messages.filter(message => message.cmd === "ping");
+      const ping = pings.at(index);
+      assert.ok(ping, "a probe must have been sent");
+      return wrapper.onMessageInner({ source: sender, data: { cmd: "response", to: ping.id, result: "pong", wrapper_nonce: nonce } });
+    },
+    // The inner frame's own load event: once per document it shows.
     load() { wrapper.onPageLoad({ target: frame }); },
+    // The wrapper window's load event, which says nothing about the frame.
+    outerLoad() { wrapper.onPageLoad({ target: window.document }); },
     open() { transport.ws.readyState = 1; transport.onOpenWebsocket({}); },
     close() { transport.ws.readyState = 3; transport.onCloseWebsocket({}); },
-    replaceDocument(href = activeDocument.location.href, readyState) {
-      activeDocument = makeDocument(href, readyState);
-      return activeDocument;
-    },
-    inaccessible(value = true) { documentInaccessible = value; },
-    nullDocument() { activeDocument = null; },
     replaceFrame() { frame = makeFrame(initialSrc); },
     onPost(callback) { onPost = callback; },
     nonceReply(index, result) {
@@ -135,61 +136,159 @@ function fixture(options = {}) {
 }
 
 test("initial ready/socket/load order announces exactly once", () => {
-  for (const order of [["ready", "load", "open"], ["load", "open", "ready"], ["open", "ready", "load"]]) {
+  for (const order of [["ready", "load", "open"], ["load", "open", "ready"], ["open", "ready", "load"], ["load", "ready", "open"]]) {
     const f = fixture({ connected: false });
     for (const event of order) f[event]();
-    f.ready(); f.load();
+    f.outerLoad();
     assert.equal(f.opens(), 1, order.join(" -> "));
+    assert.equal(f.wrapper.inner_ready, true, order.join(" -> "));
   }
 });
 
-test("same-URL iframe replacement boots without a new outer socket", () => {
-  const f = fixture(); f.ready(); f.load();
-  const oldDocument = f.document;
-  f.replaceDocument();
-  assert.notEqual(f.document, oldDocument);
-  f.ready(); f.load(); f.ready();
-  assert.equal(f.opens(), 2, "each Document receives its own initial socket announcement");
+test("the chrome never reads the inner document", () => {
+  const f = fixture();
+  assert.doesNotThrow(() => {
+    f.load(); f.ready(); f.close(); f.open(); f.ready(); f.load();
+    f.wrapper.reloadIframe(); f.nonceReply(0, "nextNonce"); f.ready(); f.load();
+  });
+  assert.equal(f.opens(), 4);
 });
 
-test("a replacement load requests readiness from the new document", () => {
+test("a document that introduces itself again is its replacement", () => {
+  // An in-frame reload keeps the frame's WindowProxy and URL; the frame
+  // library introduces each document once, so a second innerReady is the
+  // next document, announced to at once and not probed at its load.
   const f = fixture(); f.ready(); f.load();
-  f.replaceDocument("https://current.epix/next.html?wrapper_nonce=oldNonce");
+  f.ready();
+  assert.equal(f.opens(), 2);
   f.load();
-  assert.equal(f.wrapper.inner_ready, false);
-  assert.equal(f.messages.at(-1).cmd, "wrapperReady");
-  f.ready();
   assert.equal(f.opens(), 2);
+  assert.equal(f.asks(), 0);
+  assert.equal(f.wrapper.inner_generation, 1);
 });
 
-test("replacement early-ready does not wait for slow subresources or repeat after load", () => {
-  const f = fixture(); f.ready(); f.load();
-  f.replaceDocument(undefined, "interactive");
+test("a reload before the old document's load event still gets its announcement", () => {
+  // A missing subresource holds a load event back for minutes; the user
+  // reloads meanwhile. The new document's word is enough.
+  const f = fixture(); f.ready();
   f.ready();
-  assert.equal(f.opens(), 2, "the application can initialize before iframe load");
-  f.document.readyState = "complete";
-  f.load(); f.ready();
   assert.equal(f.opens(), 2);
+  f.load();
+  assert.equal(f.opens(), 2);
+  assert.equal(f.wrapper.inner_generation, 1);
 });
 
-test("same-document location changes and repeated outer loads retain readiness", () => {
+test("a load without a new document changes nothing", () => {
+  // Chromium fires the frame's load event for the chrome's own fragment-only
+  // src writes on a frame of another origin.
   const f = fixture(); f.ready(); f.load();
-  f.document.location.href = "https://current.epix/new-route#section";
-  f.load(); f.ready(); f.wrapper.onPageLoad({ target: f.window });
+  f.load(); f.load();
+  assert.equal(f.opens(), 1);
+  assert.equal(f.asks(), 0);
+  assert.equal(f.wrapper.inner_generation, 0);
+  assert.equal(f.wrapper.inner_ready, true);
+});
+
+test("the first document is probed at load until it answers", () => {
+  // It can speak before the chrome listens; later documents cannot.
+  const f = fixture(); f.load();
+  assert.equal(f.asks(), 1);
+  assert.equal(f.messages.at(-1).cmd, "ping");
+  f.load();
+  assert.equal(f.asks(), 2);
+  f.ready(); f.outerLoad(); f.load();
+  assert.equal(f.asks(), 2);
   assert.equal(f.opens(), 1);
 });
 
-test("reconnect announces once for a ready unchanged document", () => {
-  const f = fixture(); f.ready(); f.close(); f.open(); f.ready();
+test("a probe answered with pong readies the document without starting another", () => {
+  const f = fixture(); f.load();
+  f.pong();
+  assert.equal(f.opens(), 1);
+  assert.equal(f.wrapper.inner_ready, true);
+  assert.equal(f.wrapper.inner_generation, 0);
+  f.pong();
+  assert.equal(f.opens(), 1, "a probe is answered once");
+});
+
+test("a first document whose library starts at load is announced to once when its load arrives first", () => {
+  // Chromium can deliver the frame's load event before the innerReady the
+  // page posted from its own load handler: the chrome probes, then the page
+  // introduces itself and also answers the probe.
+  const f = fixture(); f.load();
+  f.ready();
+  assert.equal(f.opens(), 1);
+  f.pong();
+  assert.equal(f.opens(), 1, "the probe reply is not a new document");
+  assert.equal(f.wrapper.inner_generation, 0);
+});
+
+test("a later document whose library starts at load is announced to once", () => {
+  const f = fixture(); f.ready(); f.load();
+  f.load();
+  assert.equal(f.asks(), 0, "later documents are never probed");
+  f.ready();
+  assert.equal(f.opens(), 2);
+  assert.equal(f.wrapper.inner_generation, 1);
+});
+
+test("a pong for an earlier probe, a wrong nonce or another window is ignored", () => {
+  const f = fixture(); f.load(); f.load();
+  assert.equal(f.asks(), 2);
+  f.pong(0);
+  assert.equal(f.wrapper.inner_ready, false, "only the latest probe is answered");
+  f.pong(-1, "wrong");
+  assert.equal(f.wrapper.inner_ready, false);
+  f.pong(-1, undefined, {});
+  assert.equal(f.wrapper.inner_ready, false);
+  f.pong();
+  assert.equal(f.wrapper.inner_ready, true);
+  assert.equal(f.opens(), 1);
+});
+
+test("a page's other responses are ignored", () => {
+  const f = fixture(); f.load();
+  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "response", to: 12, result: "pong", wrapper_nonce: "oldNonce" } });
+  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "response", to: f.messages.at(-1).id, result: true, wrapper_nonce: "oldNonce" } });
+  assert.equal(f.wrapper.inner_ready, false);
+  assert.equal(f.opens(), 0);
+});
+
+test("the outer window load retains readiness", () => {
+  const f = fixture(); f.ready(); f.load();
+  f.outerLoad(); f.outerLoad();
+  assert.equal(f.opens(), 1);
+  assert.equal(f.asks(), 0);
+  assert.equal(f.wrapper.inner_ready, true);
+});
+
+test("reconnect announces once to a ready document", () => {
+  const f = fixture(); f.ready(); f.load(); f.close(); f.open();
+  assert.equal(f.opens(), 2);
+  f.close(); f.open();
+  assert.equal(f.opens(), 3);
+});
+
+test("a replacement that spoke while offline is announced to on reconnect", () => {
+  const f = fixture(); f.ready(); f.load(); f.close();
+  f.ready();
+  assert.equal(f.opens(), 1);
+  f.open();
+  assert.equal(f.opens(), 2);
+  f.load();
   assert.equal(f.opens(), 2);
 });
 
-test("reconnect cannot reuse readiness from a replaced document", () => {
-  const f = fixture(); f.ready(); f.close(); f.replaceDocument();
-  f.open();
-  assert.equal(f.opens(), 1, "wait for the new document's ready message");
-  f.ready();
+test("a silent replacement is invisible until a document speaks", () => {
+  // A page without a frame library cannot be told from the document before
+  // it; the reconnect announcement it inherits is addressed to nobody, and
+  // the next document that has a library introduces itself.
+  const f = fixture(); f.ready(); f.load(); f.close();
+  f.load(); f.open();
   assert.equal(f.opens(), 2);
+  f.ready();
+  assert.equal(f.opens(), 3);
+  assert.equal(f.wrapper.inner_generation, 1);
 });
 
 test("invalid nonce and unrelated-source ready cannot establish readiness", () => {
@@ -201,21 +300,75 @@ test("invalid nonce and unrelated-source ready cannot establish readiness", () =
   }
 });
 
-test("an inaccessible or missing document cannot retain old readiness", () => {
-  for (const makeUnavailable of [f => f.inaccessible(), f => f.nullDocument()]) {
-    const f = fixture(); f.ready(); f.close(); makeUnavailable(f);
-    assert.doesNotThrow(() => { f.open(); f.ready(); });
+test("a document that introduces itself clears the placeholder state", () => {
+  const f = fixture();
+  f.wrapper.inner_load_state = "waiting";
+  f.ready();
+  assert.equal(f.wrapper.inner_load_state, null);
+});
+
+test("announcement is marked before posting to prevent reentrant duplicates", () => {
+  // A page may react to the announcement at once; whatever that triggers in
+  // the chrome (another announce attempt, a probe reply) must not announce
+  // the same document twice.
+  for (const react of [f => f.wrapper.announceWebsocket(), f => f.pong()]) {
+    const f = fixture(); f.load();
+    f.onPost(message => {
+      if (message.cmd === "wrapperOpenedWebsocket" && f.opens() === 1) react(f);
+    });
+    f.ready();
     assert.equal(f.opens(), 1);
-    assert.equal(f.wrapper.inner_ready, false);
   }
 });
 
-test("announcement is marked before posting to prevent reentrant duplicate ready", () => {
+test("the waiting placeholder keeps its state across its own refreshes and loads", () => {
+  // The node's placeholder announces itself during parse and loads right
+  // after; every 30 s it refreshes into another placeholder until the
+  // clone completes. Its state must survive all of that.
   const f = fixture();
-  f.onPost(message => {
-    if (message.cmd === "wrapperOpenedWebsocket" && f.opens() === 1) f.ready();
-  });
+  f.wrapper.xite_info.clone_status = { state: "downloading", attempt: 1 };
+  f.wrapper.setInnerLoadState("waiting"); f.load();
+  assert.equal(f.wrapper.inner_load_state, "waiting");
+  assert.equal(f.wrapper.inner_loaded, false);
+  f.wrapper.setInnerLoadState("waiting"); f.load();
+  assert.equal(f.wrapper.inner_load_state, "waiting");
+  assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 0);
+  assert.equal(f.opens(), 0);
+});
+
+test("placeholder, recovery reload and real document handshake end to end", () => {
+  const f = fixture();
+  f.wrapper.xite_info.clone_status = { state: "complete", attempt: 2 };
+  // The placeholder announces itself after the clone completed: one reload.
+  f.wrapper.setInnerLoadState("waiting");
+  assert.equal(f.wrapper.iframe_recovery_pending, true);
+  assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 1);
+  f.load();
+  assert.equal(f.wrapper.inner_loaded, false, "the placeholder is not the xite");
+  assert.equal(f.wrapper.iframe_reload_request !== null, true, "the placeholder's own load keeps the reload");
+  f.wrapper.setInnerLoadState("waiting");
+  assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 2, "retried once the guard dropped");
+  f.nonceReply(1, { wrapper_nonce: "freshNonce" });
+  assert.equal(f.writes.length, 1);
+  assert.equal(f.wrapper.inner_load_state, null);
+  assert.equal(f.wrapper.inner_ready, false);
+  f.ready(); f.load();
+  assert.equal(f.opens(), 1);
+  assert.equal(f.wrapper.inner_loaded, true);
+  assert.equal(f.wrapper.iframe_recovery_pending, false);
+  f.nonceReply(0, "staleNonce");
+  assert.equal(f.writes.length, 1, "the superseded reply is dead");
+});
+
+test("a real document arriving on its own releases the reload made for the placeholder", () => {
+  const f = fixture();
+  f.wrapper.setInnerLoadState("waiting");
+  const nonceId = f.requests.find(r => r.command === "serverGetWrapperNonce").id;
   f.ready();
+  assert.equal(Object.hasOwn(f.wrapper.ws.waiting_cb, nonceId), false);
+  assert.equal(f.wrapper.iframe_recovery_pending, false);
+  f.nonceReply(0, "lateNonce");
+  assert.equal(f.writes.length, 0);
   assert.equal(f.opens(), 1);
 });
 
@@ -272,15 +425,19 @@ test("a superseded nonce response cannot undo a newer recovery", () => {
   assert.equal(f.writes.length, 1);
 });
 
-test("navigation while awaiting a nonce cannot be reverted by its late reply", () => {
-  const f = fixture();
-  f.wrapper.iframe_recovery_pending = true;
-  f.wrapper.reloadIframe();
-  f.replaceDocument("https://current.epix/next.html?wrapper_nonce=oldNonce");
-  f.nonceReply(0, "staleNonce");
-  assert.equal(f.writes.length, 0);
-  assert.equal(f.window.wrapper_nonce, "oldNonce");
-  assert.equal(f.wrapper.iframe_recovery_pending, false);
+test("a replacement document while awaiting a nonce cannot be reverted by the late reply", () => {
+  // Seen as a new document introducing itself, or as a load while no
+  // placeholder stands.
+  for (const replace of [f => f.ready(), f => f.load()]) {
+    const f = fixture(); f.ready(); f.load();
+    f.wrapper.iframe_recovery_pending = true;
+    f.wrapper.reloadIframe();
+    replace(f);
+    f.nonceReply(0, "staleNonce");
+    assert.equal(f.writes.length, 0);
+    assert.equal(f.window.wrapper_nonce, "oldNonce");
+    assert.equal(f.wrapper.iframe_recovery_pending, false);
+  }
 });
 
 test("replacing the iframe element invalidates its pending nonce reply", () => {
@@ -290,30 +447,15 @@ test("replacing the iframe element invalidates its pending nonce reply", () => {
   assert.equal(f.window.wrapper_nonce, "oldNonce");
 });
 
-test("route or src changes while awaiting a nonce cannot be reverted by its late reply", () => {
-  for (const navigate of [
-    f => { f.document.location.href = "https://current.epix/new-route#section"; },
-    f => { f.frame.src = "https://current.epix/next.html?wrapper_nonce=oldNonce"; },
-  ]) {
-    const f = fixture();
-    f.wrapper.reloadIframe(); navigate(f);
-    const writesBeforeReply = f.writes.length;
-    f.nonceReply(0, "staleNonce");
-    assert.equal(f.writes.length, writesBeforeReply);
-    assert.equal(f.window.wrapper_nonce, "oldNonce");
-    assert.equal(f.wrapper.iframe_recovery_pending, false);
-  }
-});
-
-test("a reload that cannot access its document still supersedes a prior nonce request", () => {
+test("an src change while awaiting a nonce cannot be reverted by its late reply", () => {
   const f = fixture();
   f.wrapper.reloadIframe();
-  f.inaccessible();
-  assert.doesNotThrow(() => f.wrapper.reloadIframe());
-  assert.equal(f.wrapper.iframe_recovery_pending, false);
-  f.inaccessible(false); f.nonceReply(0, "staleNonce");
-  assert.equal(f.writes.length, 0);
+  f.frame.src = "https://current.epix/next.html?wrapper_nonce=oldNonce";
+  const writesBeforeReply = f.writes.length;
+  f.nonceReply(0, "staleNonce");
+  assert.equal(f.writes.length, writesBeforeReply);
   assert.equal(f.window.wrapper_nonce, "oldNonce");
+  assert.equal(f.wrapper.iframe_recovery_pending, false);
 });
 
 test("socket loss releases nonce recovery and ignores its late reply after a retry", () => {
@@ -344,16 +486,18 @@ test("a disconnected reload leaves recovery available for the reconnect snapshot
 
 test("nonce completion and cancellation release only their own transport callbacks", () => {
   const cases = {
-    success: f => f.nonceReply(0, { wrapper_nonce: "freshNonce" }),
-    invalid: f => f.nonceReply(0, { error: "offline" }),
-    superseded: f => f.wrapper.reloadIframe(),
-    inaccessible: f => { f.inaccessible(); f.wrapper.reloadIframe(); },
-    disconnected: f => { f.wrapper.ws.ws.readyState = 0; f.wrapper.reloadIframe(); },
-    closed: f => f.close(),
-    navigated: f => { f.replaceDocument(); f.ready(); },
+    success: { settle: f => f.nonceReply(0, { wrapper_nonce: "freshNonce" }) },
+    invalid: { settle: f => f.nonceReply(0, { error: "offline" }) },
+    superseded: { settle: f => f.wrapper.reloadIframe() },
+    disconnected: { settle: f => { f.wrapper.ws.ws.readyState = 0; f.wrapper.reloadIframe(); } },
+    closed: { settle: f => f.close() },
+    loaded: { setup: f => { f.ready(); f.load(); }, settle: f => f.load() },
+    spoken: { setup: f => { f.ready(); f.load(); }, settle: f => f.ready() },
+    "real document after placeholder": { setup: f => { f.wrapper.inner_load_state = "waiting"; }, settle: f => f.ready() },
   };
-  for (const [name, settle] of Object.entries(cases)) {
+  for (const [name, { setup, settle }] of Object.entries(cases)) {
     const f = fixture(), sentinel = () => {};
+    if (setup) setup(f);
     const sentinelId = f.wrapper.ws.next_message_id;
     f.wrapper.ws.cmd("unrelated", [], sentinel);
     f.wrapper.reloadIframe();
@@ -383,13 +527,69 @@ test("cleanup preserves a callback that replaced its registry slot", () => {
   assert.equal(f.window.wrapper_nonce, "oldNonce");
 });
 
-test("successful nonce cleanup keeps navigation pending until the replacement loads", () => {
-  const f = fixture();
+test("successful nonce cleanup starts a new document and keeps navigation pending until it loads", () => {
+  const f = fixture(); f.ready(); f.load();
   f.wrapper.reloadIframe(); f.nonceReply(0, "freshNonce");
   assert.equal(Object.keys(f.wrapper.ws.waiting_cb).length, 0);
   assert.equal(f.wrapper.iframe_recovery_pending, true);
-  f.replaceDocument(f.frame.src, "interactive"); f.ready();
+  assert.equal(f.wrapper.inner_ready, false, "the old document's readiness does not carry over");
+  assert.equal(f.wrapper.wrapperWsInited, false);
+  f.ready();
   assert.equal(f.wrapper.iframe_recovery_pending, true, "early ready does not start another recovery");
-  f.document.readyState = "complete"; f.load();
+  assert.equal(f.opens(), 2, "the replacement is told the socket is open");
+  f.load();
   assert.equal(f.wrapper.iframe_recovery_pending, false);
+  assert.equal(f.opens(), 2);
+  assert.equal(f.asks(), 0);
+});
+
+test("a document that introduced itself cannot pose as the waiting placeholder", () => {
+  // The placeholder never speaks the frame protocol; a page that did and
+  // then claims to be waiting would otherwise make the chrome reload the
+  // frame and ask the node for a nonce on its behalf.
+  const f = fixture(); f.ready(); f.load();
+  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
+  assert.equal(f.wrapper.inner_load_state, null);
+  assert.equal(f.wrapper.inner_loaded, true);
+  assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 0);
+  assert.equal(f.wrapper.iframe_recovery_pending, false);
+});
+
+test("an orphaned chrome response never reaches the page", () => {
+  // A released recovery request still gets its answer from the node, and
+  // that answer holds a fresh wrapper nonce. Page-owned ids are forwarded.
+  const f = fixture(); f.ready(); f.load();
+  f.wrapper.handleMessageWebsocket({ cmd: "response", to: 1000005, result: { wrapper_nonce: "FRESH" } });
+  assert.equal(f.messages.filter(m => m.cmd === "response").length, 0);
+  f.wrapper.handleMessageWebsocket({ cmd: "response", to: 7, result: "ok" });
+  assert.deepEqual(f.messages.filter(m => m.cmd === "response").map(m => m.to), [7]);
+});
+
+test("a page cannot harvest the nonce of a reload it provoked", () => {
+  // Before it introduces itself a page can still claim to be waiting. The
+  // reload that provokes is released when the page speaks, and the node's
+  // reply is dropped rather than forwarded; once ready, it provokes nothing.
+  const f = fixture();
+  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
+  assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 1);
+  f.ready();
+  f.nonceReply(0, { wrapper_nonce: "FRESH" });
+  assert.equal(f.writes.length, 0);
+  assert.equal(f.messages.filter(m => m.cmd === "response").length, 0);
+  assert.equal(f.window.wrapper_nonce, "oldNonce");
+  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
+  assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 1, "a ready page provokes nothing more");
+  assert.equal(f.opens(), 1);
+});
+
+test("a repeated introduction keeps the document counted as loaded", () => {
+  // A legacy page with two frame instances introduces itself twice; the
+  // second counts as a replacement, which must not leave the loading
+  // overlay waiting for a load event that never comes.
+  const f = fixture(); f.ready(); f.load();
+  assert.equal(f.wrapper.inner_loaded, true);
+  f.ready();
+  assert.equal(f.wrapper.inner_generation, 1);
+  assert.equal(f.wrapper.inner_loaded, true);
+  assert.equal(f.opens(), 2);
 });

@@ -135,12 +135,16 @@ async fn text(response: axum::response::Response) -> String {
     .unwrap()
 }
 
-fn wrapper_value<'a>(html: &'a str, key: &str) -> &'a str {
+/// A wrapper template value, decoded from its JavaScript string literal (the
+/// wrapper escapes `&`, `<` and `>` as `\uXXXX` inside script strings).
+fn wrapper_value(html: &str, key: &str) -> String {
     let prefix = format!("{key} = \"");
-    html.lines()
+    let raw = html
+        .lines()
         .find_map(|line| line.strip_prefix(&prefix))
         .and_then(|line| line.strip_suffix('"'))
-        .unwrap_or_else(|| panic!("missing wrapper value {key}"))
+        .unwrap_or_else(|| panic!("missing wrapper value {key}"));
+    serde_json::from_str(&format!("\"{raw}\"")).unwrap_or_else(|_| panic!("invalid wrapper string {key}: {raw}"))
 }
 
 const NAVIGATE: &[(&str, &str)] = &[
@@ -213,7 +217,7 @@ async fn mixed_case_loopback_wrappers_bind_the_address_and_preserve_path_and_que
 }
 
 #[tokio::test]
-async fn mixed_case_proxy_wrappers_keep_host_relative_document_urls() {
+async fn mixed_case_proxy_wrappers_load_the_document_from_the_content_host() {
     let fixture = Fixture::new().await;
     for host in ["talk.epix", "Talk.epix", "TALK.EPIX", "tAlK.ePiX"] {
         let response = fixture
@@ -224,8 +228,14 @@ async fn mixed_case_proxy_wrappers_keep_host_relative_document_urls() {
         assert_eq!(wrapper_value(&html, "address"), fixture.address, "{host}");
         assert_eq!(wrapper_value(&html, "resolving_host"), "");
         assert_eq!(wrapper_value(&html, "file_inner_path"), "Docs/Mixed.html");
-        assert!(wrapper_value(&html, "iframe_src")
-            .starts_with(&format!("/Docs/Mixed.html?{QUERY}&wrapper_nonce=")));
+        // The page's own origin is the xite's content host, in lower case;
+        // the document path and query keep theirs.
+        assert!(
+            wrapper_value(&html, "iframe_src")
+                .starts_with(&format!("//talk.content.epix/Docs/Mixed.html?{QUERY}&wrapper_nonce=")),
+            "{host}: {}",
+            wrapper_value(&html, "iframe_src")
+        );
     }
 }
 
@@ -236,31 +246,49 @@ async fn domain_case_does_not_change_asset_path_case() {
         ("Docs/Mixed.txt", MIXED_BYTES),
         ("docs/lower.txt", LOWER_BYTES),
     ] {
-        for (host, uri, referer) in [
-            (
+        // Path mode serves the file under the loopback origin.
+        let response = fixture
+            .get(
                 "127.0.0.1:42222",
-                format!("/TaLk.EPIX/{path}?{QUERY}"),
-                "http://127.0.0.1:42222/talk.epix/Docs/Mixed.html",
-            ),
-            (
+                &format!("/TaLk.EPIX/{path}?{QUERY}"),
+                &[
+                    ("referer", "http://127.0.0.1:42222/talk.epix/Docs/Mixed.html"),
+                    ("sec-fetch-mode", "same-origin"),
+                ],
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(&to_bytes(response.into_body(), 1024).await.unwrap()[..], expected);
+        // A chrome host, whatever its case, sends the xite's files to its
+        // content host in lower case, with the path case and query intact.
+        let response = fixture
+            .get(
                 "TaLk.EPIX",
-                format!("/{path}?{QUERY}"),
-                "http://tAlK.ePiX/Docs/Mixed.html?Topic=Keep.epix/Mixed",
-            ),
-        ] {
-            let response = fixture
-                .get(
-                    host,
-                    &uri,
-                    &[("referer", referer), ("sec-fetch-mode", "same-origin")],
-                )
-                .await;
-            assert_eq!(response.status(), StatusCode::OK, "{host}{uri}");
-            assert_eq!(
-                &to_bytes(response.into_body(), 1024).await.unwrap()[..],
-                expected
-            );
-        }
+                &format!("/{path}?{QUERY}"),
+                &[
+                    ("referer", "http://tAlK.ePiX/Docs/Mixed.html?Topic=Keep.epix/Mixed"),
+                    ("sec-fetch-mode", "same-origin"),
+                ],
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT, "{path}");
+        assert_eq!(
+            response.headers()["location"],
+            format!("//talk.content.epix/{path}?{QUERY}")
+        );
+        // The content host serves it, whatever its case.
+        let response = fixture
+            .get(
+                "TaLk.CONTENT.EPIX",
+                &format!("/{path}?{QUERY}"),
+                &[
+                    ("referer", "http://tAlK.cOnTeNt.ePiX/Docs/Mixed.html?Topic=Keep.epix/Mixed"),
+                    ("sec-fetch-mode", "same-origin"),
+                ],
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{path}");
+        assert_eq!(&to_bytes(response.into_body(), 1024).await.unwrap()[..], expected);
     }
 }
 
@@ -268,12 +296,13 @@ async fn domain_case_does_not_change_asset_path_case() {
 async fn same_xite_origin_and_referer_ignore_host_case_without_allowing_foreign_origins() {
     let fixture = Fixture::new().await;
     let uri = "/Docs/Mixed.txt";
-    let same_referer = "https://tAlK.ePiX/Docs/Mixed.html";
+    // The page lives on the xite's content host; its own fetches pass in any case.
+    let same_referer = "https://tAlK.cOnTeNt.ePiX/Docs/Mixed.html";
     let response = fixture
         .get(
-            "TALK.EPIX",
+            "TALK.CONTENT.EPIX",
             uri,
-            &[("origin", "https://Talk.epix"), ("referer", same_referer)],
+            &[("origin", "https://Talk.content.epix"), ("referer", same_referer)],
         )
         .await;
     assert_eq!(response.status(), StatusCode::OK);
@@ -281,16 +310,28 @@ async fn same_xite_origin_and_referer_ignore_host_case_without_allowing_foreign_
         &to_bytes(response.into_body(), 1024).await.unwrap()[..],
         MIXED_BYTES
     );
+    // The chrome host never serves the file itself: it sends the page's own
+    // fetch on to the content host.
+    let response = fixture
+        .get(
+            "TALK.EPIX",
+            uri,
+            &[("origin", "https://Talk.epix"), ("referer", "https://tAlK.ePiX/Docs/Mixed.html")],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::TEMPORARY_REDIRECT);
     for headers in [
         vec![
             ("origin", "https://evil.example"),
             ("referer", same_referer),
         ],
         vec![("referer", "https://Other.EPIX/Docs/Mixed.html")],
+        vec![("referer", "https://oThEr.cOnTeNt.EPIX/Docs/Mixed.html")],
     ] {
         assert_eq!(
-            fixture.get("TALK.EPIX", uri, &headers).await.status(),
-            StatusCode::FORBIDDEN
+            fixture.get("TALK.CONTENT.EPIX", uri, &headers).await.status(),
+            StatusCode::FORBIDDEN,
+            "{headers:?}"
         );
     }
 }

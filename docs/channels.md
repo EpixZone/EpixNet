@@ -93,6 +93,9 @@ Talk, encrypted comments, ...) over the same pool, identities and hub:
   prompt (`wrapperPermissionAdd`); `<app>` is a short lowercase token such as
   `talk`. `CHANNELS` grants the whole inbox (every app) and is what a mail-type
   client holds; Epix Mail has it implicitly. `permissionDetails` explains both.
+  Only the wrapper's prompt can grant: the node refuses a `permissionAdd` that
+  a page sends itself, and an app name is a shared namespace, so the prompt
+  says that every xite granted the same name shares the channel.
 - **Scope.** A `Channels:<app>` xite sees, sends and edits only its app's
   threads: `channelThreads`, `channelSearch`, `channelSend`, `channelConversation`,
   `channelMarkRead`, `channelSetConvState`, `channelDeleteLocal` and the `unread`

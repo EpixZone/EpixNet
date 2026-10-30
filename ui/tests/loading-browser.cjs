@@ -13,6 +13,19 @@ const { chromium } = require(tools
   ? path.join(tools, "playwright")
   : "playwright");
 const repo = path.resolve(__dirname, "../..");
+
+// Playwright's waitForFunction evaluates its predicate with eval, which the
+// production wrapper's Content-Security-Policy forbids. Poll with evaluate,
+// which passes the function itself, so the fixture runs under the real CSP.
+async function waitFor(page, predicate, arg, options = {}) {
+  const deadline = Date.now() + (options.timeout ?? 30000);
+  const interval = typeof options.polling === "number" ? options.polling : 100;
+  for (;;) {
+    if (await page.evaluate(predicate, arg)) return;
+    if (Date.now() > deadline) throw new Error("waitFor: condition not met within the timeout");
+    await page.waitForTimeout(interval);
+  }
+}
 const out =
   process.env.EPIX_BROWSER_TEST_OUTPUT ||
   path.join(require("node:os").tmpdir(), "epix-discovery-browser-results");
@@ -100,7 +113,9 @@ const server = http.createServer((req, res) => {
           "Retry-After": "30",
         })
         .end(
-          '<!doctype html><html data-epix-load-state="waiting"><body>Waiting for this xite</body></html>'
+          // Mirrors the node's placeholder (lib.rs download_wait_response):
+          // the frame is an opaque origin, so it announces its state itself.
+          '<!doctype html><html data-epix-load-state="waiting"><head><script>try{var n=(location.search.match(/wrapper_nonce=([A-Za-z0-9]+)/)||[])[1];parent.postMessage({cmd:"innerLoadState",params:"waiting",wrapper_nonce:n},"*")}catch(e){}</script></head><body>Waiting for this xite</body></html>'
         );
     }
     return;
@@ -116,6 +131,7 @@ const server = http.createServer((req, res) => {
       homepage: `/${address}`,
       resolving_host: "",
       is_homepage: "false",
+      ui_restrict: "false",
       site_file_server: "",
       file_url: `/${address}/index.html`,
       query_string: "?wrapper_nonce=waiting",
@@ -186,9 +202,12 @@ wss.on("connection", (ws) => {
       viewport: { width: 1280, height: 900 },
     });
     page.on("pageerror", (e) => errors.push(e.message));
+    // Wait on the document's own ready state: the driver's load tracking can
+    // miss the event while the waiting frame answers 503.
     await page.goto(`http://127.0.0.1:${server.address().port}/${address}/`, {
-      waitUntil: "load",
+      waitUntil: "domcontentloaded",
     });
+    await waitFor(page, () => document.readyState === "complete", null, { polling: 250 });
     await page.waitForTimeout(400);
     async function shot(stage) {
       await page.screenshot({
@@ -225,7 +244,7 @@ wss.on("connection", (ws) => {
     results.countdownAdvanced =
       firstCountdown !== (await countdown.innerText());
     results.retryButtons = await page.locator(".button-retry").count();
-    await page.waitForFunction(() => document.querySelector(".loading-attempt")?.textContent === "Attempt 3");
+    await waitFor(page, () => document.querySelector(".loading-attempt")?.textContent === "Attempt 3");
     clearTimeout(automaticRetry);
     results.automaticAttempt = await page.locator(".loading-attempt").innerText();
     results.automaticFeedback = await page.locator(".loading-retry-note").innerText();
@@ -330,12 +349,13 @@ wss.on("connection", (ws) => {
       },
     });
     await page.waitForTimeout(2800);
+    // The inner frame is an opaque origin (no allow-same-origin), so the
+    // wrapper page cannot read its document; ask the frame itself.
     results.completedFrame = await page
-      .locator("#inner-iframe")
-      .evaluate(
-        (el) =>
-          el.contentDocument?.querySelector("#xite-ready")?.textContent || null
-      );
+      .frameLocator("#inner-iframe")
+      .locator("#xite-ready")
+      .textContent({ timeout: 5000 })
+      .catch(() => null);
     results.completed = await shot("completed");
     results.overlayDismissed =
       (await page.locator(".loadingscreen").count()) === 0;

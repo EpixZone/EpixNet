@@ -1,0 +1,19 @@
+[package]
+name = "evx-windows-native"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Win32 isolation primitives for EVX: handles, ACLs, AppContainer profiles, jobs, LPAC launch, pipes, registry reads. Empty on other targets."
+
+[target.'cfg(windows)'.dev-dependencies]
+tempfile = "3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = [
+  "Win32_Foundation", "Win32_Security", "Win32_Security_Authorization",
+  "Win32_Storage_FileSystem", "Win32_System_JobObjects", "Win32_System_Threading",
+  "Win32_System_SystemInformation", "Win32_System_Pipes", "Win32_System_IO",
+  "Win32_System_WindowsProgramming", "Win32_System_ProcessStatus",
+  "Win32_System_LibraryLoader", "Win32_System_Registry", "Win32_UI_Shell",
+  "Wdk_Foundation",
+] }

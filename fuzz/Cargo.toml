@@ -1,0 +1,74 @@
+[package]
+name = "evx-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+members = ["."]
+
+[features]
+runtime = ["dep:evx-runtime"]
+state = ["dep:evx-state"]
+lifecycle = ["dep:evx-supervisor"]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+evx-api = { path = "../crates/evx-api" }
+evx-declaration = { path = "../crates/evx-declaration" }
+evx-activation = { path = "../crates/evx-activation", features = ["fixtures"] }
+evx-runtime = { path = "../crates/evx-runtime", optional = true }
+evx-state = { path = "../crates/evx-state", optional = true }
+evx-supervisor = { path = "../crates/evx-supervisor", optional = true }
+ed25519-dalek = { version = "3", default-features = false }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+serde = "1"
+tempfile = "3"
+
+[[bin]]
+name = "declaration"
+path = "fuzz_targets/declaration.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "activation"
+path = "fuzz_targets/activation.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "wasm_profile"
+path = "fuzz_targets/wasm_profile.rs"
+required-features = ["runtime"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipc_frames"
+path = "fuzz_targets/ipc_frames.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "state_sequences"
+path = "fuzz_targets/state_sequences.rs"
+required-features = ["state"]
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "lifecycle_metadata"
+path = "fuzz_targets/lifecycle_metadata.rs"
+required-features = ["lifecycle"]
+test = false
+doc = false
+bench = false

@@ -32,19 +32,22 @@ function deferred() {
   };
 }
 
-function wrapper() {
+function wrapper(windowOverrides) {
   const context = vm.createContext({
-    window: { is_homepage: true },
+    window: Object.assign({ is_homepage: true }, windowOverrides || {}),
     $: { when: value => value, extend: Object.assign },
   });
   vm.runInContext(`var Wrapper = function() {}; var indexOf = [].indexOf;
     ${method("setXiteInfo")}
     ${method("actionPermissionAdd")}
+    ${method("handleMessage")}
   `, context);
   const instance = Object.create(context.Wrapper.prototype);
   const prompts = [];
   const commands = [];
   const replies = [];
+  const forwarded = [];
+  const logs = [];
   Object.assign(instance, {
     xite_info: null,
     event_xite_info: deferred(),
@@ -55,10 +58,15 @@ function wrapper() {
     },
     noteContentSync() {},
     displayConfirm(message, label, accept) { prompts.push({ message, label, accept }); },
-    ws: { cmd(command, params, callback) { commands.push({ command, params }); callback("ok"); } },
+    ws: {
+      cmd(command, params, callback) { commands.push({ command, params }); callback("ok"); },
+      send(message) { forwarded.push(message); },
+      ws: { readyState: 0 },
+    },
     sendInner(message) { replies.push(message); },
+    log(...args) { logs.push(args.join(" ")); },
   });
-  return { instance, prompts, commands, replies };
+  return { instance, prompts, commands, replies, forwarded, logs };
 }
 
 function fullInfo(permissions) {
@@ -111,4 +119,53 @@ test("a later full snapshot can revoke previously granted permissions", () => {
   instance.actionPermissionAdd({ id: 3, params: "ADMIN" });
   assert.equal(prompts.length, 1, "a revoked grant must not survive a new full snapshot");
   assert.equal(commands.length, 0);
+});
+
+// The node refuses a page's own permissionAdd; the chrome also never forwards
+// it, so an old page that calls the raw command still gets the user's prompt.
+test("a raw permissionAdd from the page is routed to the prompt, never forwarded", () => {
+  const { instance, prompts, commands, forwarded } = wrapper();
+  instance.setXiteInfo(fullInfo([]));
+  instance.handleMessage({ cmd: "permissionAdd", params: ["ADMIN"], id: 4 });
+  assert.equal(forwarded.length, 0, "the page's permissionAdd must not reach the node");
+  assert.equal(prompts.length, 1, "the user decides in the chrome");
+  assert.equal(commands.length, 0);
+  prompts[0].accept();
+  assert.deepEqual(commands, [{ command: "permissionAdd", params: "ADMIN" }]);
+});
+
+test("a page cannot answer the node's dialogs or claim an elevated id", () => {
+  const { instance, forwarded, logs } = wrapper();
+  instance.handleMessage({ cmd: "response", to: 12, result: true, id: 5 });
+  instance.handleMessage({ cmd: "siteList", params: [], id: 1000000 });
+  instance.handleMessage({ cmd: "siteList", params: [], id: 1000001 });
+  assert.equal(forwarded.length, 0);
+  assert.equal(logs.length, 3);
+  // An ordinary page command with its own small id is still forwarded.
+  instance.handleMessage({ cmd: "siteInfo", params: [], id: 6 });
+  assert.deepEqual(forwarded, [{ cmd: "siteInfo", params: [], id: 6 }]);
+});
+
+// A public gateway grants nothing to any visitor (the node refuses every
+// grant that is not the operator's), so the chrome answers the page instead
+// of opening a dialog whose Allow could only fail - on every load, for
+// everyone, as the dashboard's unconditional ADMIN request would otherwise do.
+test("on a public gateway the permission prompt is skipped and the page is told", () => {
+  const { instance, prompts, commands, replies } = wrapper({ ui_restrict: true });
+  instance.setXiteInfo(fullInfo([]));
+  instance.actionPermissionAdd({ id: 5, params: "ADMIN" });
+  assert.equal(prompts.length, 0, "no dead-end dialog");
+  assert.equal(commands.length, 0, "nothing is sent to the node");
+  assert.equal(replies.length, 1);
+  assert.equal(replies[0].to, 5);
+  assert.match(replies[0].result.error, /gateway/);
+});
+
+test("a grant the operator already made on a gateway keeps the silent contract", () => {
+  const { instance, prompts, commands, replies } = wrapper({ ui_restrict: true });
+  instance.setXiteInfo(fullInfo(["ADMIN"]));
+  instance.actionPermissionAdd({ id: 6, params: "ADMIN" });
+  assert.equal(prompts.length, 0);
+  assert.equal(commands.length, 0);
+  assert.equal(replies.length, 0, "already granted: no answer, as on a normal node");
 });

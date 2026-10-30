@@ -13,6 +13,7 @@ use epix_browser_net::{ca::LocalCa, proxy};
 mod addons;
 pub use addons::*;
 use epix_node::{boot_with_progress, AppState, NodeOptions, RunningNode};
+#[cfg(unix)]
 extern "C" { #[link_name = "dup2"] fn libc_dup2(oldfd: i32, newfd: i32) -> i32; }
 use std::sync::{
     atomic::{AtomicU8, Ordering},
@@ -177,6 +178,9 @@ impl EpixNode {
         // lifetime - stderr writes through it from here on - so ownership of
         // the descriptor is released instead of letting drop close it.
         let log_dir = std::path::PathBuf::from(&config.data_dir);
+        // The phones are Unix; the descriptor dance is gated so the crate
+        // still builds in a Windows workspace check.
+        #[cfg(unix)]
         if let Ok(file) = std::fs::File::create(log_dir.join("native-stderr.log")) {
             use std::os::unix::io::IntoRawFd;
             unsafe { libc_dup2(file.into_raw_fd(), 2) };

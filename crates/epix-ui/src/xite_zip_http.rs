@@ -55,9 +55,10 @@ pub(super) async fn download(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("");
     // Internal routes normally have no target. This one must authorize the
-    // query's xite, not the global /EpixNet-Internal path or proxy host.
+    // query's xite, not the global /EpixNet-Internal path or proxy host. An
+    // opaque-origin page never exports a xite (no null-origin read).
     if ctx.state.ui_check_cors().await
-        && is_cross_origin_request(&ctx, &headers, &format!("/{address}/"), host).await
+        && is_cross_origin_request(&ctx, &headers, &format!("/{address}/"), host, None).await
     {
         return (StatusCode::FORBIDDEN, "Cross-origin export blocked").into_response();
     }

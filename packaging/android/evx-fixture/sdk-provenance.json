@@ -1,0 +1,9 @@
+{
+  "url": "https://dl.google.com/android/repository/platform-36_r02.zip",
+  "repository": "https://dl.google.com/android/repository/repository2-1.xml",
+  "bytes": 65878410,
+  "sha1": "2c1a80dd4d9f7d0e6dd336ec603d9b5c55a6f576",
+  "sha256": "37607369a28c5b640b3a7998868d45898ebcb777565a0e85f9acf36f29631d2e",
+  "android_jar_bytes": 27768026,
+  "android_jar_sha256": "d9eb9da824d9e247a352f570f01e1169e725b2954bca9e283a71786c59b59f9a"
+}

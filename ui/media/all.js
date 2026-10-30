@@ -1620,7 +1620,11 @@ if (window.getComputedStyle(document.body).transform) {
       this.inner_loaded = false;
       this.inner_ready = false;
       this.wrapperWsInited = false;
-      this.inner_document = null;
+      // Per inner document, see newInnerDocument.
+      this.inner_generation = 0;
+      this.inner_load_state = null;
+      this.inner_probe_id = 0;
+      this.inner_probe_counter = 0;
       this.iframe_reload_request = null;
       this.iframe_recovery_pending = false;
       this.xite_error = null;
@@ -1684,6 +1688,12 @@ if (window.getComputedStyle(document.body).transform) {
       if (cmd === "response") {
         if (this.ws.waiting_cb[message.to] != null) {
           return this.ws.waiting_cb[message.to](message.result);
+        } else if (typeof message.to === "number" && message.to >= 1000000) {
+          // An answer to one of this chrome's own commands (ids from 1000000
+          // up) whose callback was released, such as a recovery nonce request
+          // a newer document superseded. It can carry chrome secrets and is
+          // nobody's business: never the page's.
+          return this.log("Dropping orphaned chrome response", message.to);
         } else {
           return this.sendInner(message);
         }
@@ -1752,11 +1762,19 @@ if (window.getComputedStyle(document.body).transform) {
         }
       }
       message = e.data;
+      // Only the inner frame commands this chrome. Any other window that
+      // holds a reference to it (a page that framed or opened the wrapper)
+      // could otherwise forward page commands as the bound xite or raise
+      // its dialogs. A nested frame inside the xite talks to its own parent.
+      if (e.source !== this.inner) {
+        this.log("Ignoring message from a window that is not the inner frame");
+        return false;
+      }
       // The xID xite announces a finished on-chain link this way. Only the
       // inner frame itself may say so, and the node re-verifies the link on
       // chain (and needs the address's key) before recording anything, so a
       // forged message can at most re-link an identity the user already has.
-      if (message && typeof message === "object" && message.type === "xid-identity-linked" && typeof message.address === "string" && e.source === this.inner) {
+      if (message && typeof message === "object" && message.type === "xid-identity-linked" && typeof message.address === "string") {
         this.ws.cmd("identityLinkComplete", { "auth_address": message.address });
         return false;
       }
@@ -1797,9 +1815,7 @@ if (window.getComputedStyle(document.body).transform) {
       var cmd, query, ref;
       cmd = message.cmd;
       if (cmd === "innerReady") {
-        if (!this.syncInnerDocument()) return;
-        this.inner_ready = true;
-        return this.announceWebsocket();
+        return this.innerIsReady(true);
       } else if (cmd === "innerLoaded" || cmd === "wrapperInnerLoaded") {
         if (window.location.hash) {
           $("#inner-iframe")[0].src += window.location.hash;
@@ -1847,6 +1863,44 @@ if (window.getComputedStyle(document.body).transform) {
         return this.actionOpenWindow(message.params);
       } else if (cmd === "wrapperPermissionAdd") {
         return this.actionPermissionAdd(message);
+      } else if (cmd === "permissionAdd") {
+        // A page may only ask; the grant is the user's decision in this
+        // chrome. Route a raw permissionAdd through the same prompt instead of
+        // forwarding it (the node refuses it from a page id regardless).
+        if (Array.isArray(message.params)) {
+          message.params = message.params[0];
+        }
+        return this.actionPermissionAdd(message);
+      } else if (cmd === "evxRequest") {
+        return this.actionEvxRequest(message);
+      } else if (cmd === "evxRecoverWorkspace") {
+        return this.actionEvxRecoverWorkspace(message);
+      } else if (cmd === "evxGrant" || cmd === "evxRunOnce") {
+        // A page may only ask for EVX; granting it, or running one of its
+        // programs once, is the user's decision in this chrome. Route the raw
+        // wrapper-only command through the same consent prompt instead of
+        // forwarding it (the node refuses it from a page id regardless).
+        return this.actionEvxRequest(message);
+      } else if (cmd === "evxRevoke" || cmd === "evxSetLimits") {
+        // Wrapper-only management with no consent prompt to route through:
+        // nothing a page says can narrow, widen or end a grant. Dropped and
+        // the page told, never forwarded.
+        this.log("Dropping wrapper-only command from the page:", cmd);
+        return this.sendInner({
+          "cmd": "response",
+          "to": message.id,
+          "result": {"error": cmd + " is not available to a page"}
+        });
+      } else if (cmd === "response") {
+        if (this.inner_probe_id && message.to === this.inner_probe_id && message.result === "pong") {
+          // The document answered this chrome's own probe (see probeInner).
+          return this.innerIsReady(false);
+        }
+        // Answers to the node's confirm/prompt dialogs come from this chrome
+        // over its own socket, never from the page.
+        return this.log("Ignoring inner response message");
+      } else if (cmd === "innerLoadState") {
+        return this.setInnerLoadState(message.params);
       } else if (cmd === "wrapperRequestFullscreen") {
         return this.actionRequestFullscreen();
       } else if (cmd === "wrapperWebNotification") {
@@ -2017,6 +2071,16 @@ if (window.getComputedStyle(document.body).transform) {
             // user had just tapped Grant, before their settings have loaded.
             return false;
           }
+          if (window.ui_restrict) {
+            // A public gateway grants nothing to anyone (the node refuses
+            // every grant that is not the operator's), so a dialog here could
+            // only dead-end. Tell the page and show nothing.
+            return _this.sendInner({
+              "cmd": "response",
+              "to": message.id,
+              "result": {"error": "Permissions cannot be granted on a public gateway"}
+            });
+          }
           grant = function () {
             return _this.ws.cmd("permissionAdd", permission, function (res) {
               return _this.sendInner({
@@ -2038,14 +2102,420 @@ if (window.getComputedStyle(document.body).transform) {
       })(this));
     };
 
+    // The page asked for EVX (an inner `evxRequest`, or a raw wrapper-only
+    // command routed here). The node is asked to inspect, never to compile:
+    // `evxInspect` is inert, and what it returns is what the user is shown.
+    // Only a tap on Enable or Allow once sends anything that grants, from
+    // this chrome's own socket (its ids are elevated, so the node accepts
+    // them as the user's), and always with the inspected payload's
+    // `declaration_digest`, so a declaration that changes between the prompt
+    // and the tap is refused by the node's expected-version check rather
+    // than silently covered. An enable grant also carries what the dialog
+    // showed of the bound closure (`evxShown`), so a re-sign that changes
+    // only the `files` manifest while the dialog is open is refused too
+    // rather than granting more than the text said. Deny, dismissal and
+    // every failure answer the page and send nothing. The answer closure
+    // settles once: the dialog's close cross and its buttons both route
+    // through it.
+    Wrapper.prototype.actionEvxRequest = function (message) {
+      var answer, chosen, program, prompt_id, settled;
+      settled = false;
+      chosen = false;
+      // The dialog's notification id comes from a chrome-private counter,
+      // never from the page's message id: a page notification, confirm or
+      // progress cannot name it, so it can neither close the open consent
+      // dialog nor stage a decoy in its slot (page ids are prefixed `page-`).
+      this.evx_prompt_count = (this.evx_prompt_count || 0) + 1;
+      prompt_id = "evx-prompt-" + this.evx_prompt_count;
+      answer = (function (_this) {
+        return function (result) {
+          if (settled) {
+            return false;
+          }
+          settled = true;
+          return _this.sendInner({
+            "cmd": "response",
+            "to": message.id,
+            "result": result
+          });
+        };
+      })(this);
+      // The program the page wants run once, if it named one. Only a string
+      // id is a request; anything else is no program, not a guess.
+      program = message.params && typeof message.params === "object" && typeof message.params.program === "string" ? message.params.program : null;
+      if (window.ui_restrict) {
+        // A public gateway grants nothing to anyone (every grant is the
+        // operator's), so a dialog here could only dead-end. Show nothing.
+        return answer({"error": "EVX cannot be enabled on a public gateway"});
+      }
+      return $.when(this.event_xite_info).done((function (_this) {
+        return function () {
+          var xite;
+          xite = _this.xite_info.address;
+          return _this.ws.cmd("evxInspect", {"xite": xite}, function (payload) {
+            var choices, digest, once;
+            if (!payload || typeof payload !== "object" || typeof payload.declaration_digest !== "string" || !payload.declaration_digest) {
+              // Without the digest nothing can be granted at all, so there
+              // is no dialog to show: the page learns why and that is all.
+              _this.log("evxInspect returned no declaration digest:", payload);
+              return answer({"error": payload && typeof payload.error === "string" ? payload.error : "EVX inspection returned no declaration digest"});
+            }
+            digest = payload.declaration_digest;
+            once = program !== null && _this.evxRunnableOnce(payload, program);
+            choices = [{"caption": "Enable EVX for this xite", "value": "enable"}];
+            if (once) {
+              // Allow once is offered only when it could do something: a
+              // named program that is usable and declared run-once. A button
+              // that could only fail would teach the user to tap through.
+              choices.push({"caption": "Allow once", "value": "once"});
+            }
+            // Deny is the only button that may take keyboard focus: a
+            // keystroke the user is already typing can at worst deny.
+            choices.push({"caption": "Deny", "value": "deny", "safe": true});
+            return _this.displayChoice(prompt_id, _this.evxPromptBody(payload, program, once), choices, function (choice) {
+              if (settled || chosen) {
+                // One choice per request: a dialog that fires again (or a
+                // caller that does), even while the first grant is still in
+                // flight, grants nothing more.
+                return false;
+              }
+              chosen = true;
+              if (choice === "enable") {
+                return _this.ws.cmd("evxGrant", {"xite": xite, "declaration_digest": digest, "mode": "enable", "shown": _this.evxShown(payload)}, function (res) {
+                  return answer(_this.evxGrantOutcome(res, "enable"));
+                });
+              } else if (choice === "once") {
+                return _this.ws.cmd("evxGrant", {"xite": xite, "declaration_digest": digest, "mode": "once", "program": program}, function (res) {
+                  var outcome;
+                  outcome = _this.evxGrantOutcome(res, "once");
+                  if (!outcome.granted) {
+                    return answer(outcome);
+                  }
+                  if (typeof res.token !== "string" || !res.token) {
+                    // Granted without the one-shot token is a node bug; say
+                    // so instead of running without one.
+                    return answer({"granted": false, "mode": "once", "error": "evxGrant returned no allow-once token"});
+                  }
+                  // The token is consumed here and never shown to the page:
+                  // the page asked for a run, not for a credential.
+                  return _this.ws.cmd("evxRunOnce", {"xite": xite, "program": program, "token": res.token}, function (result) {
+                    if (result && typeof result === "object" && result.error !== void 0 && result.error !== null) {
+                      // The grant happened; the run did not. Say both, so
+                      // the page never takes a refusal for a result.
+                      return answer({"granted": true, "mode": "once", "result": null, "error": typeof result.error === "string" ? result.error : String(result.error)});
+                    }
+                    return answer({"granted": true, "mode": "once", "result": result});
+                  });
+                });
+              }
+              // Deny, or the dialog dismissed (null): nothing is sent.
+              return answer({"granted": false});
+            });
+          });
+        };
+      })(this));
+    };
+
+    // Recovery is a host management choice, not a guest capability. A page
+    // can request this fixed confirmation for its bound xite only.
+    Wrapper.prototype.actionEvxRecoverWorkspace = function (message) {
+      var settled, chosen, prompt_id, answer;
+      settled = false;
+      chosen = false;
+      this.evx_prompt_count = (this.evx_prompt_count || 0) + 1;
+      prompt_id = "evx-prompt-" + this.evx_prompt_count;
+      answer = (function (_this) {
+        return function (result) {
+          if (settled) { return false; }
+          settled = true;
+          return _this.sendInner({"cmd": "response", "to": message.id, "result": result});
+        };
+      })(this);
+      if (window.ui_restrict) {
+        return answer({"error": "Workspace recovery is unavailable on a public gateway"});
+      }
+      return $.when(this.event_xite_info).done((function (_this) {
+        return function () {
+          var xite, label;
+          xite = _this.xite_info.address;
+          // Escape as plain text without the wrapper's small tag allowlist.
+          label = String(xite).slice(0, 200).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+          return _this.displayChoice(prompt_id,
+            "Recover interrupted EVX workspace writes for <b>" + label + "</b>?<br>" +
+            "This checks pending files against their previously authorized contents. It does not run a program, grant permissions or resume jobs. Unknown contents remain blocked.",
+            [{"caption": "Recover workspace", "value": "recover"}, {"caption": "Cancel", "value": "cancel", "safe": true}],
+            function (choice) {
+              if (settled || chosen) { return false; }
+              chosen = true;
+              if (choice !== "recover") { return answer({"recovered": false}); }
+              return _this.ws.cmd("evxRecoverWorkspace", {"xite": xite}, function (result) { return answer(result); });
+            });
+        };
+      })(this));
+    };
+
+    // What this dialog showed of the bound closure, sent with an enable grant
+    // so the node can refuse one whose consent would be wider than the text
+    // the user read: the digest covers the `evx` object only, and which
+    // programs bind (so which jobs are usable, whether run-once is asked
+    // and whether background work is granted) also depends on the signed
+    // `files` manifest, which a re-sign can change while the dialog is
+    // open. Taken from the very payload the dialog was rendered from, in
+    // the node's own words: `requested.programs` and `requested.jobs` (the
+    // usable ones) and the two `effective` bits, exactly `true` or not.
+    Wrapper.prototype.evxShown = function (payload) {
+      var effective, ids, requested;
+      requested = payload && typeof payload.requested === "object" && payload.requested ? payload.requested : {};
+      effective = payload && typeof payload.effective === "object" && payload.effective ? payload.effective : {};
+      ids = function (value) {
+        var k, n, out;
+        out = [];
+        if (Array.isArray(value)) {
+          for (k = 0, n = value.length; k < n; k++) {
+            if (typeof value[k] === "string") {
+              out.push(value[k]);
+            }
+          }
+        }
+        return out;
+      };
+      return {
+        "programs": ids(requested.programs),
+        "jobs": ids(requested.jobs),
+        "allow_run_once": effective.allow_run_once === true,
+        "allow_background": effective.allow_background === true
+      };
+    };
+
+    // Whether the inspect payload lets `program` run once: it must be a
+    // declared, usable program that the publisher marked run-once. Own
+    // properties only, so an id such as `constructor` names nothing.
+    // The inspect payload's declaration part: the node nests the parsed
+    // summary under `declaration` (programs, jobs, unsupported) and the
+    // host's effective limits under `effective.limits`.
+    Wrapper.prototype.evxDeclaration = function (payload) {
+      var decl = payload && typeof payload.declaration === "object" && payload.declaration ? payload.declaration : payload;
+      return decl && typeof decl === "object" ? decl : {};
+    };
+
+    Wrapper.prototype.evxRunnableOnce = function (payload, program) {
+      var entry, programs;
+      programs = this.evxDeclaration(payload).programs;
+      if (!programs || typeof programs !== "object" || !Object.prototype.hasOwnProperty.call(programs, program)) {
+        return false;
+      }
+      entry = programs[program];
+      return !!entry && typeof entry === "object" && entry.usable === true && entry.allow_run_once === true;
+    };
+
+    // The page's view of an `evxGrant` answer: granted or not, the mode it
+    // asked for, and the node's reason when it refused. The token and every
+    // other field stay in the chrome.
+    Wrapper.prototype.evxGrantOutcome = function (res, mode) {
+      var outcome;
+      if (res && typeof res === "object" && res.granted === true) {
+        return {"granted": true, "mode": mode};
+      }
+      outcome = {"granted": false, "mode": mode};
+      if (res && typeof res === "object" && typeof res.error === "string") {
+        outcome.error = res.error;
+      }
+      return outcome;
+    };
+
+    // The consent text, built only from the inspect payload and escaped
+    // field by field with a strict local escaper (not toHtmlSafe, which
+    // re-enables <br>, <b>, <u>, <i> and <small>), so a publisher-chosen
+    // string in an id, a path, a limit key, a schedule value or an
+    // unsupported reason is shown as literal text and never rendered, and
+    // cannot restyle or hide the chrome's own lines. Each rendered string
+    // is capped at 200 characters. Lists what the user is deciding on: the
+    // xite and its publisher, each program with its entry hash prefix,
+    // capabilities and limits, the declared triggers, what this node cannot
+    // honour, and that enabling also covers the publisher's authenticated
+    // updates within these scopes. When the declaration has at least one
+    // usable job, a paragraph of its own says that enabling also lets those
+    // jobs run in the background with no page open (docs/evx-milestone-3.md
+    // section 3): that is the `allow_background` authority `evxGrant`
+    // mode "enable" confers for such a declaration, so the user must read
+    // it before granting; a declaration without a usable job confers none
+    // and the paragraph is absent, not empty.
+    Wrapper.prototype.evxPromptBody = function (payload, program, once) {
+      var background, body, cadence, decl, effective, entry, esc, file, grant, i, id, ids, j, job, len, limits, lines, list, max, schedule;
+      max = 200;
+      esc = function (value) {
+        var text;
+        text = value === void 0 || value === null ? "unknown" : String(value);
+        if (text.length > max) {
+          text = text.slice(0, max) + "\u2026";
+        }
+        return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;");
+      };
+      // A list of payload strings, each escaped and capped on its own.
+      list = function (values, separator) {
+        var k, n, parts;
+        parts = [];
+        for (k = 0, n = values.length; k < n; k++) {
+          parts.push(esc(values[k]));
+        }
+        return parts.join(separator);
+      };
+      // A pinned file is a path and its hash; a bare path is shown as such.
+      file = function (value) {
+        if (typeof value === "string") {
+          return esc(value);
+        }
+        if (value && typeof value === "object" && typeof value.path === "string") {
+          if (typeof value.sha512 === "string" && value.sha512) {
+            return esc(value.path) + " (sha512 " + esc(value.sha512.slice(0, 16)) + "\u2026)";
+          }
+          return esc(value.path);
+        }
+        return "unknown";
+      };
+      limits = function (value) {
+        var k, key, keys, n, parts;
+        if (!value || typeof value !== "object") {
+          return "unknown";
+        }
+        keys = Object.keys(value).sort();
+        parts = [];
+        for (k = 0, n = keys.length; k < n; k++) {
+          key = keys[k];
+          parts.push(esc(key) + " " + esc(value[key]));
+        }
+        return parts.length ? parts.join(", ") : "none";
+      };
+      ids = function (value) {
+        return value && typeof value === "object" ? Object.keys(value).sort() : [];
+      };
+      // How often a job runs, from its schedule: the period of an interval
+      // schedule, the only kind the declaration parser admits. Any other
+      // shape in the payload is named by its type so the user still sees
+      // what was declared rather than a line that silently says nothing.
+      // Shared by the trigger line and the background paragraph so the two
+      // never disagree about a job's cadence.
+      cadence = function (value) {
+        if (value && typeof value === "object" && value.type === "interval") {
+          return "every " + esc(value.seconds) + " s";
+        }
+        return "on a " + esc(value && typeof value === "object" ? value.type : value) + " schedule";
+      };
+      body = "This xite asks to run EVX programs on this node.";
+      body += "<br><small>Xite: <b>" + esc(payload.xite) + "</b> &middot; Publisher: " + esc(payload.publisher) + "</small>";
+      body += "<br><small>Integrity: " + esc(payload.integrity) + " &middot; Declaration: " + esc(String(payload.declaration_digest).slice(0, 16)) + "\u2026</small>";
+      grant = payload.grant;
+      if (grant && typeof grant === "object") {
+        body += "<br><small>Current grant: " + (grant.expired === true ? "expired" : grant.enabled === true ? "enabled" : "disabled") + " (generation " + esc(grant.generation) + ")</small>";
+      }
+      decl = this.evxDeclaration(payload);
+      body += "<br><br><b>Programs</b>";
+      lines = ids(decl.programs);
+      if (!lines.length) {
+        body += "<br>&bull; none declared";
+      }
+      for (i = 0, len = lines.length; i < len; i++) {
+        id = lines[i];
+        entry = decl.programs[id];
+        if (!entry || typeof entry !== "object") {
+          continue;
+        }
+        body += "<br>&bull; <b>" + esc(id) + "</b>";
+        if (entry.usable !== true) {
+          body += " &mdash; unsupported: " + (Array.isArray(entry.reasons) && entry.reasons.length ? list(entry.reasons, "; ") : "no reason given");
+          continue;
+        }
+        body += " &mdash; entry " + file(entry.files && entry.files.entry ? entry.files.entry : entry.entry);
+        if (Array.isArray(entry.dependencies) && entry.dependencies.length) {
+          body += "; depends on ";
+          for (j = 0; j < entry.dependencies.length; j++) {
+            body += (j ? ", " : "") + file(entry.dependencies[j]);
+          }
+        }
+        body += "<br><small>capabilities: " + (Array.isArray(entry.capabilities) && entry.capabilities.length ? list(entry.capabilities, ", ") : "none");
+        body += " &middot; limits: " + limits(entry.limits);
+        body += " &middot; run once: " + (entry.allow_run_once === true ? "allowed" : "not allowed") + "</small>";
+      }
+      body += "<br><br><b>Triggers</b>";
+      background = [];
+      lines = ids(decl.jobs);
+      if (!lines.length) {
+        body += "<br>&bull; none declared";
+      }
+      for (i = 0, len = lines.length; i < len; i++) {
+        id = lines[i];
+        job = decl.jobs[id];
+        if (!job || typeof job !== "object") {
+          continue;
+        }
+        body += "<br>&bull; <b>" + esc(id) + "</b>";
+        if (job.usable !== true) {
+          body += " &mdash; unsupported: " + (Array.isArray(job.reasons) && job.reasons.length ? list(job.reasons, "; ") : "no reason given");
+          continue;
+        }
+        schedule = job.schedule;
+        background.push(esc(id) + " runs " + esc(job.program) + " " + cadence(schedule));
+        body += " runs " + esc(job.program) + " " + cadence(schedule);
+        if (schedule && typeof schedule === "object" && schedule.type === "interval") {
+          body += " from " + esc(schedule.anchor) + ", missed: " + esc(schedule.missed);
+        }
+        body += ", concurrency " + esc(job.max_concurrency);
+      }
+      if (Array.isArray(decl.unsupported) && decl.unsupported.length) {
+        body += "<br><br><b>Not supported on this node</b>";
+        for (i = 0, len = decl.unsupported.length; i < len; i++) {
+          entry = decl.unsupported[i];
+          if (!entry || typeof entry !== "object") {
+            continue;
+          }
+          body += "<br>&bull; " + esc(entry.path) + ": " + esc(entry.reason);
+        }
+      }
+      effective = payload.effective && typeof payload.effective === "object" ? payload.effective.limits : payload.effective_limits;
+      if (effective && typeof effective === "object") {
+        body += "<br><br><small>Effective limits on this node: " + limits(effective) + "</small>";
+      }
+      // The paragraph follows the node's word, not this listing: the node
+      // computes `effective.allow_background` as "at least one usable, bound
+      // job", which is exactly what an enable grant records, so what the
+      // user is warned about and what the grant then allows cannot differ.
+      // Only that exact value counts; a payload without it grants no
+      // background authority and gets no paragraph. The jobs named are the
+      // ones the node called usable, which is the same set.
+      if (payload.effective && typeof payload.effective === "object" && payload.effective.allow_background === true) {
+        if (background.length) {
+          body += "<br><br>This xite also declares " + background.length + " scheduled job(s): " + background.join(", ") + ". Enabling lets them run in the background on this node, even when no page of this xite is open.";
+        } else {
+          body += "<br><br>This xite also declares scheduled jobs. Enabling lets them run in the background on this node, even when no page of this xite is open.";
+        }
+      }
+      body += "<br><br><small>Enabling also covers authenticated updates to this xite from the same publisher within these capabilities and limits, without another prompt. Nothing beyond them runs until you are asked again.</small>";
+      if (program !== null) {
+        if (once) {
+          body += "<br><small>Allow once runs <b>" + esc(program) + "</b> one time now and grants nothing further.</small>";
+        } else {
+          body += "<br><small>The page asked to run <b>" + esc(program) + "</b> once, which this declaration does not allow on this node.</small>";
+        }
+      }
+      return body;
+    };
+
     Wrapper.prototype.actionNotification = function (message) {
       var body;
       message.params = this.toHtmlSafe(message.params);
       body = $("<span class='message'>" + message.params[1] + "</span>");
-      return this.notifications.add("notification-" + message.id, message.params[0], body, message.params[2]);
+      return this.notifications.add(this.pageNotificationId(message.id), message.params[0], body, message.params[2]);
     };
 
-    Wrapper.prototype.displayConfirm = function (body, captions, cb) {
+    // The notification id for something the page asked to show, under a
+    // `page-` prefix. Chrome-owned ids (the EVX consent dialog's `evx-prompt-N`)
+    // never carry it, so no page-chosen id or progress type can address one.
+    Wrapper.prototype.pageNotificationId = function (id) {
+      return "notification-page-" + id;
+    };
+
+    // `id` is optional: the chrome's own confirms are keyed by their caption.
+    Wrapper.prototype.displayConfirm = function (body, captions, cb, id) {
       var button, buttons, caption, fn, i, j, len;
       body = $("<span class='message-outer'><span class='message'>" + body + "</span></span>");
       buttons = $("<span class='buttons'></span>");
@@ -2073,8 +2543,75 @@ if (window.getComputedStyle(document.body).transform) {
         buttons.append(button);
       }
       body.append(buttons);
-      this.notifications.add("notification-" + caption, "ask", body);
+      this.notifications.add(id != null ? id : "notification-" + caption, "ask", body);
       buttons.first().focus();
+      return $(".notification").scrollLeft(0);
+    };
+
+    // displayConfirm with named choices instead of numbered captions: each
+    // button carries a closed `value` the caller switches on, the close
+    // cross reports `null`, and the callback runs at most once however the
+    // dialog ends. Clicks must be trusted user events (verifyEvent), as for
+    // every grant made from this chrome.
+    //
+    // Keyboard focus never lands on a granting button: only a choice marked
+    // `safe` (Deny) may take it, otherwise focus stays where it was, so a
+    // keystroke the user is already typing into the page cannot activate a
+    // grant. For the first CHOICE_GUARD_MS after the dialog appears every
+    // button activation is ignored and the dialog stays open (the
+    // notification's own close-on-click is stopped too): a page that
+    // prompts on a keystroke cannot have the next one, or its auto-repeat,
+    // land on a button that has only just appeared.
+    Wrapper.prototype.CHOICE_GUARD_MS = 500;
+
+    Wrapper.prototype.displayChoice = function (id, body, choices, cb) {
+      var answered, button, buttons, choice, elem, fn, i, j, len, outer, safe, settle, shown;
+      outer = $("<span class='message-outer'><span class='message'>" + body + "</span></span>");
+      buttons = $("<span class='buttons'></span>");
+      answered = false;
+      shown = Date.now();
+      settle = function (value) {
+        if (answered) {
+          return false;
+        }
+        answered = true;
+        return cb(value);
+      };
+      fn = (function (_this) {
+        return function (button, value) {
+          return button.on("click", function (e) {
+            _this.verifyEvent(button, e);
+            if (Date.now() - shown < _this.CHOICE_GUARD_MS) {
+              e.stopImmediatePropagation();
+              return false;
+            }
+            settle(value);
+            return false;
+          });
+        };
+      })(this);
+      safe = null;
+      for (i = j = 0, len = choices.length; j < len; i = ++j) {
+        choice = choices[i];
+        button = $("<a></a>", {
+          href: "#" + choice.value,
+          "class": "button button-confirm button-choice-" + choice.value + " button-" + (i + 1)
+        });
+        button.text(choice.caption);
+        fn(button, choice.value);
+        buttons.append(button);
+        if (choice.safe === true) {
+          safe = button;
+        }
+      }
+      outer.append(buttons);
+      elem = this.notifications.add("notification-" + id, "ask", outer);
+      $(".close", elem).on("click", function () {
+        return settle(null);
+      });
+      if (safe) {
+        safe.focus();
+      }
       return $(".notification").scrollLeft(0);
     };
 
@@ -2098,7 +2635,7 @@ if (window.getComputedStyle(document.body).transform) {
           });
           return false;
         };
-      })(this));
+      })(this), this.pageNotificationId(caption));
     };
 
     Wrapper.prototype.displayPrompt = function (message, type, caption, placeholder, cb) {
@@ -2223,7 +2760,9 @@ if (window.getComputedStyle(document.body).transform) {
 
     Wrapper.prototype.actionProgress = function (message) {
       message.params = this.toHtmlSafe(message.params);
-      return this.displayProgress(message.params[0], message.params[1], message.params[2]);
+      // The progress type is the notification id: namespaced like every
+      // other page-chosen id (displayProgress adds the `notification-` part).
+      return this.displayProgress("page-" + message.params[0], message.params[1], message.params[2]);
     };
 
     Wrapper.prototype.actionSetViewport = function (message) {
@@ -2676,50 +3215,133 @@ if (window.getComputedStyle(document.body).transform) {
       });
     };
 
-    Wrapper.prototype.syncInnerDocument = function () {
-      var doc = null;
-      try {
-        var frame = document.getElementById("inner-iframe");
-        doc = frame && frame.contentDocument;
-      } catch (_) {}
-      // A reload keeps its WindowProxy and may keep its URL, but creates a new client.
-      if (!doc || doc !== this.inner_document) {
-        this.inner_document = doc;
-        this.inner_ready = false;
-        this.wrapperWsInited = false;
-        if (this.iframe_reload_request) {
+    // The inner frame is an opaque origin (in host mode, another origin), so
+    // the chrome can neither read its document nor tell one document from
+    // the next by identity, and the frame's `load` event is no help: a
+    // missing subresource can hold a document's load event back for minutes
+    // while the user reloads, and Chromium fires it for the chrome's own
+    // fragment-only src writes on the same document. What identifies a
+    // document is its own word: the frame library introduces a document
+    // once, at construction (`innerReady`). Readiness, the socket
+    // announcement, the placeholder state and the probe belong to one
+    // document and start over here, so a replacement (an in-frame reload
+    // keeps the WindowProxy and may keep the URL) is told the socket is
+    // open and inherits nothing the old one reported. A pending nonce
+    // recovery was the old document's: released, so its late reply cannot
+    // navigate the new one.
+    Wrapper.prototype.newInnerDocument = function () {
+      this.inner_generation = (this.inner_generation || 0) + 1;
+      this.inner_ready = false;
+      this.wrapperWsInited = false;
+      this.inner_probe_id = 0;
+      this.inner_load_state = null;
+      this.inner_loaded = false;
+      if (this.iframe_reload_request) {
+        this.clearIframeReload();
+        this.iframe_recovery_pending = false;
+      }
+    };
+
+    // What a document's word means. `introduced` is an innerReady: from a
+    // document that already introduced itself it can only be a replacement,
+    // whether or not the old document's load event ever arrived. A `pong`
+    // answers this chrome's own probe and never starts a document: it only
+    // confirms the current one.
+    Wrapper.prototype.innerIsReady = function (introduced) {
+      if (introduced) {
+        if (this.inner_ready) {
+          this.newInnerDocument();
+          // The document that speaks is up, whatever its load event does:
+          // a legacy page with two frame instances gets none after this.
+          this.inner_loaded = this.loadingDocumentReady();
+        } else if (this.iframe_reload_request) {
+          // The real document arrived on its own (the placeholder's refresh)
+          // while a recovery reload was still waiting for its nonce: that
+          // reload was for the placeholder this document replaced.
           this.clearIframeReload();
           this.iframe_recovery_pending = false;
         }
       }
-      return doc;
+      this.inner_ready = true;
+      this.inner_probe_id = 0;
+      // The node's waiting placeholder never speaks the frame protocol: a
+      // document that does is the xite, whatever the last one reported.
+      this.inner_load_state = null;
+      return this.announceWebsocket();
+    };
+
+    // Ask a document that has not spoken whether its frame library is up.
+    // The first document can start before this chrome listens (script_init
+    // navigates the frame before all.js runs), so its innerReady can be
+    // missed; every later document starts after the chrome listens and
+    // needs no probe. The library answers a ping with `pong` on the chrome's
+    // own message id, which only the latest probe accepts. `wrapperReady`
+    // would make it repeat innerReady, and a repeated innerReady cannot be
+    // told from a new document introducing itself.
+    Wrapper.prototype.probeInner = function () {
+      this.inner_probe_counter = (this.inner_probe_counter || 0) - 1;
+      this.inner_probe_id = this.inner_probe_counter;
+      return this.sendInner({ "cmd": "ping", "id": this.inner_probe_id });
     };
 
     Wrapper.prototype.announceWebsocket = function () {
-      if (this.syncInnerDocument() && this.inner_ready &&
-          this.ws.ws.readyState === 1 && !this.wrapperWsInited) {
+      if (this.inner_ready && this.ws.ws && this.ws.ws.readyState === 1 && !this.wrapperWsInited) {
+        // Marked before posting: a page that answers the announcement with
+        // another innerReady is not announced to twice.
         this.wrapperWsInited = true;
         return this.sendInner({ "cmd": "wrapperOpenedWebsocket" });
       }
     };
 
     Wrapper.prototype.loadingDocumentReady = function () {
-      try {
-        var frame = document.getElementById("inner-iframe");
-        var doc = frame.contentDocument;
-        if (!doc || doc.location.href === "about:blank" || doc.readyState !== "complete") return false;
-        if (doc.documentElement.dataset.epixLoadState) return false;
-        return true;
-      } catch (_) {
-        return !this.loading.screen_visible; // a loading xite must first produce its real document
+      // The inner frame is an opaque origin (the sandbox has no
+      // allow-same-origin), so its document cannot be read from here. A frame
+      // still on about:blank is not the xite; the placeholder the node serves
+      // while a xite is not ready announces itself from inside the frame
+      // (`innerLoadState`, see setInnerLoadState) and is not the xite either.
+      var frame = document.getElementById("inner-iframe");
+      var src = (frame && frame.getAttribute && frame.getAttribute("src")) || "";
+      if (!src || src === "about:blank") return false;
+      if (this.inner_load_state) return false;
+      return true;
+    };
+
+    Wrapper.prototype.setInnerLoadState = function (state) {
+      // The node's waiting placeholder reports "waiting" from inside the
+      // frame. It is not the xite: keep the loading screen up and, once the
+      // clone is complete, load the real document in its place (once).
+      // The placeholder never introduces itself: a document that did is the
+      // xite, and its "waiting" would only make this chrome reload the frame
+      // (and ask the node for a nonce) on a page's say-so.
+      if (this.inner_ready) {
+        return;
+      }
+      this.inner_load_state = state === "waiting" ? "waiting" : null;
+      if (!this.inner_load_state) {
+        return;
+      }
+      this.inner_loaded = false;
+      var status = this.xite_info && this.xite_info.clone_status;
+      if (status && status.state === "complete" && !this.iframe_recovery_pending) {
+        this.iframe_recovery_pending = true;
+        return this.reloadIframe();
       }
     };
 
     Wrapper.prototype.onPageLoad = function (e) {
       var ref;
       this.log("onPageLoad");
-      this.syncInnerDocument();
+      // Bound to the inner frame's `load` and to this window's own `load`.
+      // A load starts no document (see newInnerDocument): a new document
+      // introduces itself, and one that could not is probed below.
       this.inner_loaded = this.loadingDocumentReady();
+      // A recovery reload made for the waiting placeholder outlives the
+      // placeholder's own load event, which follows its announcement within
+      // milliseconds. Any other load while a reload awaits its nonce means
+      // the frame moved on: the reply must not navigate it back.
+      if (this.iframe_reload_request && this.inner_load_state !== "waiting") {
+        this.clearIframeReload();
+      }
       this.iframe_recovery_pending = false;
       if (window.resolving_host) {
         return; // the iframe is blank; there is no xite to ask about yet
@@ -2736,9 +3358,7 @@ if (window.getComputedStyle(document.body).transform) {
         this.loading.hideScreen();
       }
       if (!this.inner_ready) {
-        this.sendInner({
-          "cmd": "wrapperReady"
-        });
+        this.probeInner();
       }
       if (this.ws.ws.readyState === 1 && !this.xite_info) {
         return this.reloadXiteInfo();
@@ -3046,13 +3666,10 @@ if (window.getComputedStyle(document.body).transform) {
       if (xite_info.clone_status) {
         this.loading.showCloneStatus(xite_info.clone_status);
         if (xite_info.clone_status.state === "complete" && this.loading.screen_visible && !this.inner_loaded) {
-          var frame = document.getElementById("inner-iframe");
-          try {
-            if (frame.contentDocument && frame.contentDocument.documentElement.dataset.epixLoadState && !this.iframe_recovery_pending) {
-              this.iframe_recovery_pending = true;
-              this.reloadIframe();
-            }
-          } catch (_) {}
+          if (this.inner_load_state === "waiting" && !this.iframe_recovery_pending) {
+            this.iframe_recovery_pending = true;
+            this.reloadIframe();
+          }
         }
       }
       if (this.loading.screen_visible && !this.xite_info) {
@@ -3281,12 +3898,13 @@ if (window.getComputedStyle(document.body).transform) {
       if (!this.ws.ws || this.ws.ws.readyState !== 1) return;
       var frame = document.getElementById("inner-iframe");
       var src = frame && frame.getAttribute("src");
-      var doc = this.syncInnerDocument();
-      if (!frame || !doc || typeof src !== "string") {
+      if (!frame || typeof src !== "string") {
         this.iframe_recovery_pending = false;
         return;
       }
-      var request = { document: doc, href: doc.location.href, src: src, id: this.ws.next_message_id };
+      // The frame's document cannot be read: the request is bound to the
+      // frame element, its src and the document generation it was made for.
+      var request = { generation: this.inner_generation || 0, src: src, id: this.ws.next_message_id };
       this.ws.next_message_id += 1;
       this.iframe_reload_request = request;
       this.iframe_recovery_pending = true;
@@ -3294,10 +3912,8 @@ if (window.getComputedStyle(document.body).transform) {
         return function (result) {
           if (_this.iframe_reload_request !== request) return;
           _this.clearIframeReload();
-          var currentDocument = _this.syncInnerDocument();
           if (document.getElementById("inner-iframe") !== frame ||
-              frame.getAttribute("src") !== request.src || currentDocument !== request.document ||
-              !currentDocument || currentDocument.location.href !== request.href) {
+              frame.getAttribute("src") !== request.src || (_this.inner_generation || 0) !== request.generation) {
             _this.iframe_recovery_pending = false;
             return;
           }
@@ -3322,7 +3938,11 @@ if (window.getComputedStyle(document.body).transform) {
           if (!replaced) query += (query && !/&$/.test(query) ? "&" : "") + "wrapper_nonce=" + nonce;
           src += "?" + query + hash;
           _this.log("Reloading iframe using url", src);
+          // Nonce-secured xites sign their inner messages with the nonce in
+          // their URL; the new document carries the new one.
           window.wrapper_nonce = nonce;
+          // A new document is coming: forget what the old one reported.
+          _this.newInnerDocument();
           return frame.setAttribute("src", src);
         };
       })(this);

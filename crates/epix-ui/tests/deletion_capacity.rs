@@ -67,7 +67,9 @@ impl Fixture {
     }
 
     async fn delete(&self, address: &str) -> Result<serde_json::Value, String> {
-        let session = WsSession::new(self.state.clone(), Some(self.address.clone()));
+        // siteDelete is an admin command: only the wrapper chrome (a wrapper
+        // socket with an elevated id) may run it.
+        let session = WsSession::new_wrapper(self.state.clone(), Some(self.address.clone()));
         CommandRegistry::with_defaults()
             .dispatch(
                 &session,
