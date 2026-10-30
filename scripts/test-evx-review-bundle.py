@@ -101,6 +101,8 @@ class ReviewBundleTests(unittest.TestCase):
         script = self.write("scripts/check-evx-platforms.py", "#!/usr/bin/env python3\n")
         script.chmod(0o755)
         self.git("add", "--", "scripts/check-evx-platforms.py")
+        # Filesystems without an executable bit record the mode in the index only.
+        self.git("update-index", "--chmod=+x", "--", "scripts/check-evx-platforms.py")
         manifest, blobs = bundle.snapshot(self.root)
         modes = {record["path"]: record.get("mode") for record in manifest["files"]}
         self.assertEqual(modes["scripts/check-evx-platforms.py"], "100755")
@@ -113,7 +115,10 @@ class ReviewBundleTests(unittest.TestCase):
     def test_symlinked_source_and_parent_are_refused(self):
         source = self.root / "crates/evx-api/src/lib.rs"
         source.unlink()
-        source.symlink_to(self.root / "docs/evx.md")
+        try:
+            source.symlink_to(self.root / "docs/evx.md")
+        except OSError as error:  # Windows without the symlink privilege
+            self.skipTest(f"symbolic links are unavailable here: {error}")
         with self.assertRaisesRegex(ValueError, "symlink"):
             bundle.snapshot(self.root)
         source.unlink()

@@ -74,9 +74,24 @@ def eligible(name):
     return False
 
 
-def git(root, *args):
-    result = subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True)
+def git(root, *args, input=None):
+    result = subprocess.run(["git", "-C", str(root), *args], check=True, capture_output=True, input=input)
     return result.stdout
+
+
+def tracks_file_modes(root):
+    # Git's own rule: where the filesystem has no executable bit (Windows,
+    # some mounts) the index mode is authoritative, elsewhere the checkout is.
+    try:
+        return git(root, "config", "--bool", "--get", "core.filemode").strip() != b"false"
+    except subprocess.CalledProcessError:
+        return True
+
+
+def git_blob_id(root, name, data):
+    # Hash as git would store these bytes at this path: end-of-line and other
+    # clean filters apply, so a CRLF checkout of an LF blob is not a change.
+    return git(root, "hash-object", "--path", name, "--stdin", input=data).decode().strip()
 
 
 def names(raw):
@@ -117,6 +132,12 @@ def snapshot(root, include_untracked=()):
             metadata, path = item.split(b"\t", 1)
             mode, kind, oid = metadata.decode().split()
             baseline[path.decode()] = (mode, kind, oid)
+    index_modes = {}
+    if not tracks_file_modes(root):
+        for item in git(root, "ls-files", "--stage", "-z").split(b"\0"):
+            if item:
+                metadata, path = item.split(b"\t", 1)
+                index_modes[path.decode()] = metadata.decode().split()[0]
     # A staged deletion no longer appears in ls-files, but the overlay must
     # still remove the baseline file from the reviewer's checkout.
     selected = {name for name in tracked | baseline.keys() if eligible(name)} | extra
@@ -129,6 +150,7 @@ def snapshot(root, include_untracked=()):
         record = {"path": name, "head_blob": base[2] if base else None}
         try:
             data, mode = read_source(root, name)
+            mode = index_modes.get(name, mode)
         except FileNotFoundError:
             if name in extra:
                 raise ValueError(f"selected source disappeared: {name}") from None
@@ -138,6 +160,8 @@ def snapshot(root, include_untracked=()):
             if total > MAX_TOTAL:
                 raise ValueError("review source size exceeds limit")
             oid = hashlib.sha1(b"blob " + str(len(data)).encode() + b"\0" + data).hexdigest()
+            if base and base[2] != oid:
+                oid = git_blob_id(root, name, data)
             record.update(size=len(data), sha256=hashlib.sha256(data).hexdigest(), mode=mode,
                           status="unchanged" if base == (mode, "blob", oid) else "modified" if base else "added")
             blobs[name] = data

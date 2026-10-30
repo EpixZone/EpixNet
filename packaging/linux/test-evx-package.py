@@ -61,11 +61,13 @@ class EvxPackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evx-worker"):
             packaging.validate_stage(self.stage)
 
+    @unittest.skipUnless(os.name == "posix", "needs POSIX file modes")
     def test_worker_must_be_executable(self):
         (self.stage / "evx-worker").chmod(0o644)
         with self.assertRaisesRegex(ValueError, "evx-worker"):
             packaging.validate_stage(self.stage)
 
+    @unittest.skipUnless(os.name == "posix", "needs symbolic links without privilege")
     def test_worker_cannot_be_a_symlink(self):
         worker = self.stage / "evx-worker"
         worker.unlink()
@@ -75,6 +77,7 @@ class EvxPackagingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "evx-worker"):
             packaging.validate_stage(self.stage)
 
+    @unittest.skipUnless(os.name == "posix", "needs POSIX file modes")
     def test_install_check_rejects_missing_symlinked_or_nonexecutable_worker(self):
         script = (HERE / "test-install.sh").read_text()
         function = "check_evx_worker() {" + script.split("check_evx_worker() {", 1)[1].split("\n}", 1)[0] + "\n}"
@@ -115,6 +118,7 @@ class EvxPackagingTests(unittest.TestCase):
         self.assertTrue(worker.is_file(), "AppImage omitted the worker")
         self.assertEqual(worker.read_bytes(), (self.stage / "evx-worker").read_bytes())
 
+    @unittest.skipUnless(os.name == "posix", "needs POSIX file modes")
     def test_tar_keeps_the_validated_worker(self):
         args = ["package-linux.py", "--stage", str(self.stage), "--output", str(self.root / "out"),
                 "--version", "0.1.0", "--formats", "tar"]
