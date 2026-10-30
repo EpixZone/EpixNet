@@ -80,7 +80,14 @@ this regression before correction. Microsoft's [SDK error definition](https://gi
 identifies 367 as a process-creation block; Rust's current Windows mapping does
 not classify it as `PermissionDenied`.
 
-This is portable test/type/lint evidence only. No native Windows result is recorded locally.
+That was portable test/type/lint evidence only. A native run on 2026-10-29
+(Windows 11 Pro 10.0.26300, rustc 1.97.0, this branch merged with `main` at
+418fef1) passed the strict Clippy check, the seven library tests, both release
+fixtures below (the six isolation cases; the real compile/run, `evx.call`
+roundtrip, cancellation and fresh execution), the import inspection (no
+`userenv`, `shell32` or `ole32` import in `acceptance.exe` or
+`evx-windows-worker.exe`) and the `windows-core` profile (169 portable tests,
+11 Pulley tests, product exclusion). Product execution stays disabled.
 `.github/workflows/evx-windows-fixture.yml` builds on Windows and requires:
 
 ```powershell
