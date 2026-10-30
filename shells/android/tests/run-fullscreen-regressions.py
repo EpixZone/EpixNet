@@ -30,7 +30,12 @@ class View {
     fun hasFocus() = false
     companion object { const val GONE = 8; const val VISIBLE = 0 }
 }
+class CompositorController {
+    val clearColors = mutableListOf<Int>()
+    fun setClearColor(color: Int) { clearColors.add(color) }
+}
 class GeckoSession {
+    val compositorController = CompositorController()
     var isOpen = true
     var exits = 0
     var backs = 0
@@ -104,6 +109,7 @@ class Shell : Activity() {
     var lastTouchY = 0f
     var touchAccum = 0f
     val DISABLED_ALPHA = .3f
+    val COLOR_CHROME_BG = 0xff0b0e14.toInt()
     fun ownsSession(session: GeckoSession) = !disposed && session in ownedSessions
     fun leaveAddressEditing() { editingLeaves++ }
     fun refreshOfflineBanner() {}
@@ -127,8 +133,16 @@ kotlin += r'''
 fun main() {
     var checks=0
     fun verify(value: Boolean, message: String) { checks++; check(value) { message } }
-    val shell=Shell();val first=shell.add();val second=shell.add();shell.showTab(0)
+    val shell=Shell()
+    shell.setChromeHidden(true);shell.setChromeHidden(false)
+    verify(!shell.chromeHidden,"chrome can resize before a session is attached")
+    val first=shell.add();val second=shell.add();shell.showTab(0)
     shell.onFullScreen(first,true)
+    verify(first.compositorController.clearColors.last()==shell.COLOR_CHROME_BG,"fullscreen resize clears to browser chrome color")
+    verify(second.compositorController.clearColors.isEmpty(),"resize only changes the attached compositor")
+    val fills=first.compositorController.clearColors.size
+    shell.setChromeHidden(true)
+    verify(first.compositorController.clearColors.size==fills,"unchanged chrome visibility does not reset the compositor")
     verify(shell.fullScreenSession===first,"visible tab owns fullscreen")
     verify(shell.chromeHidden && shell.topBar.visibility==View.GONE && shell.bottomBar.visibility==View.GONE,"both browser rows hide")
     verify(shell.window.controller.hidden && !shell.window.fits,"system bars hide and viewport uses their space")
@@ -137,6 +151,7 @@ fun main() {
     shell.dispatchTouchEvent(android.view.MotionEvent(0,0f));shell.dispatchTouchEvent(android.view.MotionEvent(2,200f))
     verify(shell.chromeHidden,"scroll gestures cannot reveal app controls in fullscreen")
     shell.goBackInCurrentTab()
+    verify(first.compositorController.clearColors.size==fills+1 && first.compositorController.clearColors.last()==shell.COLOR_CHROME_BG,"revealing controls keeps the resize fill dark")
     verify(first.exits==1 && first.backs==0,"Back exits fullscreen before navigating")
     verify(shell.fullScreenSession==null && !shell.chromeHidden && !shell.window.controller.hidden && shell.window.fits,"Back restores browser chrome, bars and insets")
     verify(!shell.browserBackCallback.isEnabled,"no-history Back returns to Android after fullscreen")
