@@ -11,7 +11,7 @@ on:
     # branch, same rule (its macOS sandbox job only runs here).
     branches: [main, edx, evx]
   pull_request:
-    branches: [main]
+    branches: [main, evx]
 
 permissions: {}
 
