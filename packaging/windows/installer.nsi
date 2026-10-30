@@ -158,6 +158,10 @@ Section "EpixNet" SecMain
   IfFileExists "$INSTDIR\firefox\xul.dll" +2 0
     Abort "The bundled browser did not install completely (firefox\xul.dll is missing). Run Setup again."
 !endif
+  ; The EVX worker must land beside the launcher; without it the node reports
+  ; execution as unsupported instead of failing at the first run.
+  IfFileExists "$INSTDIR\evx-worker.exe" +2 0
+    Abort "The EVX worker did not install (evx-worker.exe is missing). Run Setup again."
 
   ; Register the epix:// scheme (per-user).
   WriteRegStr HKCU "Software\Classes\epix" "" "URL:Epix Protocol"

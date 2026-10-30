@@ -2,9 +2,11 @@ name: SonarCloud
 
 on:
   push:
-    branches: [main]
+    # evx: the long-lived EVX branch is analysed too, so a pull request
+    # that targets it has a baseline to measure its new code against.
+    branches: [main, evx]
   pull_request:
-    branches: [main]
+    branches: [main, evx]
 
 permissions: {}
 

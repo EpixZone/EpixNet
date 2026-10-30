@@ -44,7 +44,7 @@ jobs:
           if-no-files-found: error
 
   windows-core:
-    name: Windows portable core (execution disabled)
+    name: Windows portable core
     runs-on: windows-2025
     timeout-minutes: 45
     permissions:
@@ -57,13 +57,42 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
-      - name: Test portable runtime and preserve unsupported-product exclusion
+      - name: Test portable runtime and the product dependency gates
         shell: pwsh
         run: python scripts/evx-platform-acceptance.py windows-core --output "$env:RUNNER_TEMP/evx-evidence"
-      - name: Retain results without claiming worker containment
+      - name: Retain results
         if: always()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: evx-windows-core
+          path: ${{ runner.temp }}/evx-evidence
+          if-no-files-found: error
+
+  windows-native:
+    name: Windows native EVX (windows-2025)
+    runs-on: windows-2025
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: '2'
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          key: evx-windows-native-profile
+          cache-on-failure: true
+      - name: Run the native suites, fixtures, worker and packaging checks inside real AppContainers
+        shell: pwsh
+        run: python scripts/evx-platform-acceptance.py windows --output "$env:RUNNER_TEMP/evx-evidence"
+      - name: Retain native evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: evx-windows-native
           path: ${{ runner.temp }}/evx-evidence
           if-no-files-found: error

@@ -14,14 +14,18 @@ import sys
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+NATIVE_PACKAGES = ["evx-api", "evx-declaration", "evx-runtime", "evx-workspace",
+                   "evx-activation", "evx-state", "evx-worker", "evx-supervisor",
+                   "evx-host", "epix-evx"]
 
 
-def commands(profile):
+def package_args(packages):
+    return [arg for package in packages for arg in ("-p", package)]
+
+
+def commands(profile, output=None):
     if profile == "linux":
-        packages = ["evx-api", "evx-declaration", "evx-runtime", "evx-workspace",
-                    "evx-activation", "evx-state", "evx-worker", "evx-supervisor",
-                    "evx-host", "epix-evx"]
-        native = ["cargo", "test"] + [arg for package in packages for arg in ("-p", package)]
+        native = ["cargo", "test"] + package_args(NATIVE_PACKAGES)
         return [
             ("native", native + ["--locked"]),
             ("pulley", ["cargo", "test", "-p", "evx-runtime", "-p", "evx-worker",
@@ -34,13 +38,39 @@ def commands(profile):
             ("package", [sys.executable, "packaging/linux/test-evx-package.py", "-v"]),
         ]
     if profile == "windows-core":
-        # This deliberately cannot claim a Windows worker or product sandbox.
+        # The portable claim only: the runtime, the declaration and activation
+        # logic, and the product dependency gates. The `windows` profile carries
+        # the native evidence.
         return [
             ("portable-core", ["cargo", "test", "-p", "evx-api", "-p", "evx-runtime",
                                "-p", "evx-activation", "-p", "evx-declaration", "--locked"]),
             ("pulley-core", ["cargo", "test", "-p", "evx-runtime", "--features", "pulley", "--locked"]),
-            ("product-exclusion", [sys.executable, "scripts/check-evx-platforms.py",
-                                   "windows-browser", "windows-server", "windows-nmh"]),
+            ("product-gates", [sys.executable, "scripts/check-evx-platforms.py",
+                               "windows-browser", "windows-server", "windows-nmh"]),
+        ]
+    if profile == "windows":
+        # Native: every suite the node's backend depends on, inside real
+        # AppContainers and Job Objects, plus the fixtures, the staged worker
+        # image and the product dependency gates (docs/evx-windows-backend.md).
+        examples = ROOT / "target/release/examples"
+        worker_copy = (output or ROOT / "target") / "evx-worker-verified.exe"
+        return [
+            ("native", ["cargo", "test"] + package_args(NATIVE_PACKAGES) + ["--locked"]),
+            ("native-primitives", ["cargo", "test", "-p", "evx-windows-native", "-p", "evx-windows",
+                                   "--lib", "--locked"]),
+            ("fixture-build", ["cargo", "build", "-p", "evx-windows", "--bins", "--example", "acceptance",
+                               "--example", "execution_acceptance", "--release", "--locked"]),
+            ("isolation", [str(examples / "acceptance.exe")]),
+            ("execution", [str(examples / "execution_acceptance.exe")]),
+            ("worker-build", ["cargo", "build", "-p", "evx-worker", "--locked"]),
+            # Cargo hard-links the target binary; the verifier requires the
+            # single-link shape a staged worker has, so verify a copy.
+            ("worker-copy", [sys.executable, "-c", "import shutil, sys; shutil.copyfile(sys.argv[1], sys.argv[2])",
+                             str(ROOT / "target/debug/evx-worker.exe"), str(worker_copy)]),
+            ("worker", [sys.executable, "packaging/windows/verify-evx-worker.py", str(worker_copy), "--json"]),
+            ("product-gates", [sys.executable, "scripts/check-evx-platforms.py",
+                               "windows-browser", "windows-server", "windows-nmh"]),
+            ("package", [sys.executable, "packaging/windows/test-evx-package.py", "-v"]),
         ]
     raise ValueError("unknown acceptance profile")
 
@@ -63,6 +93,12 @@ def tool_version(command):
                           text=True, timeout=30).stdout.strip()
 
 
+# Per-check wall budgets in seconds; the default covers a warm cache. The
+# native suites compile the node's whole dependency graph on a cold runner.
+TIMEOUTS = {"native": 5400, "fixture-build": 3600, "worker-build": 3600, "pulley": 3600}
+DEFAULT_TIMEOUT = 1800
+
+
 def run_checks(checks, root, output, metadata, env):
     output.mkdir(parents=True, exist_ok=False)
     record = dict(metadata, checks=[], completed=False)
@@ -75,8 +111,11 @@ def run_checks(checks, root, output, metadata, env):
                  "started_at": datetime.datetime.now(datetime.timezone.utc).isoformat()}
         try:
             with log.open("w") as stream:
-                result = subprocess.run(command, cwd=root, env=env, stdout=stream,
-                                        stderr=subprocess.STDOUT, timeout=1800)
+                # Closed stdin: a check that reads its input must fail, not
+                # block on an inherited pipe until the budget runs out.
+                result = subprocess.run(command, cwd=root, env=env, stdin=subprocess.DEVNULL,
+                                        stdout=stream, stderr=subprocess.STDOUT,
+                                        timeout=TIMEOUTS.get(name, DEFAULT_TIMEOUT))
             entry["exit_code"] = result.returncode
         except (OSError, subprocess.TimeoutExpired) as error:
             entry.update(exit_code=None, error=str(error))
@@ -96,9 +135,19 @@ def run_checks(checks, root, output, metadata, env):
     return 0
 
 
+LIMITS = {
+    "linux": "Tests only. Linux native confinement evidence for the direct worker backend.",
+    "windows-core": "Tests only. Windows portable-core success does not by itself verify OS isolation; "
+                    "the windows profile does.",
+    "windows": "Tests only. Windows native evidence: confined compile, run and file helpers through "
+               "the supervisor, the LPAC and Job Object fixtures, and the staged worker image. "
+               "The operator socket is absent on Windows (docs/evx-windows-backend.md).",
+}
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("profile", choices=["linux", "windows-core"])
+    parser.add_argument("profile", choices=["linux", "windows-core", "windows"])
     parser.add_argument("--output", type=Path, required=True, help="New evidence directory")
     args = parser.parse_args()
     required = "Linux" if args.profile == "linux" else "Windows"
@@ -114,9 +163,9 @@ def main():
                 "head": tool_version(["git", "rev-parse", "HEAD"]),
                 "rustc": tool_version(["rustc", "--version", "--verbose"]),
                 "cargo": tool_version(["cargo", "--version"]),
-                "tests_native_worker_isolation": args.profile == "linux",
-                "limits": "Tests only. Windows portable-core success does not enable EVX or verify OS isolation."}
-    raise SystemExit(run_checks(commands(args.profile), ROOT, args.output, metadata, env))
+                "tests_native_worker_isolation": args.profile in ("linux", "windows"),
+                "limits": LIMITS[args.profile]}
+    raise SystemExit(run_checks(commands(args.profile, args.output), ROOT, args.output, metadata, env))
 
 
 if __name__ == "__main__":
