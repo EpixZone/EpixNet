@@ -69,6 +69,13 @@ object ViewCompat { var insetRequests = 0; fun requestApplyInsets(view: View) { 
 class BackCallback { var isEnabled = false }
 class Configuration
 open class Activity {
+    var isTaskRoot = false
+    var backgroundMoves = 0
+    fun moveTaskToBack(nonRoot: Boolean): Boolean {
+        check(!nonRoot)
+        backgroundMoves++
+        return true
+    }
     var configurationChanges = 0
     var focusChanges = 0
     open fun onConfigurationChanged(newConfig: Configuration) { configurationChanges++ }
@@ -115,7 +122,7 @@ class Shell : Activity() {
     fun add(): GeckoSession { val session=GeckoSession(); ownedSessions.add(session); tabs.add(Tab(session)); return session }
 '''
 names = ("handleFullScreen", "leaveFullScreen", "applyFullScreenPresentation", "setChromeHidden",
-         "refreshBackNavigation", "goBackInCurrentTab", "showTab", "closeTab",
+         "refreshBackNavigation", "handleBrowserBack", "goBackInCurrentTab", "showTab", "closeTab",
          "onConfigurationChanged", "onWindowFocusChanged", "dispatchTouchEvent")
 for name in names:
     body = method(name)
@@ -176,6 +183,22 @@ fun main() {
     val killed=Shell();val killedOwner=killed.add();killed.showTab(0);killed.onFullScreen(killedOwner,true)
     killedOwner.isOpen=false;killed.onKill(killedOwner)
     verify(killed.fullScreenSession==null && !killed.chromeHidden && killedOwner.exits==0,"owner kill releases fullscreen without a DOM exit event")
+    val root=Shell();root.isTaskRoot=true;val rootPage=root.add();root.showTab(0)
+    verify(root.browserBackCallback.isEnabled && root.backButton.alpha==root.DISABLED_ALPHA,"root system Back is handled while the toolbar still reflects page history")
+    root.handleBrowserBack()
+    verify(root.backgroundMoves==1 && rootPage.isOpen && rootPage.backs==0,"root Back backgrounds the task without closing or navigating its session")
+    root.currentTab.canGoBack=true;root.refreshBackNavigation();root.handleBrowserBack()
+    verify(rootPage.backs==1 && root.backgroundMoves==1,"page history takes priority over backgrounding")
+    root.onFullScreen(rootPage,true);root.handleBrowserBack()
+    verify(rootPage.exits==1 && rootPage.backs==1 && root.backgroundMoves==1,"fullscreen Back exits fullscreen before history or backgrounding")
+    root.currentTab.canGoBack=false;root.isTaskRoot=false;root.refreshBackNavigation()
+    verify(!root.browserBackCallback.isEnabled,"non-root activity leaves no-history Back to Android")
+    root.handleBrowserBack()
+    verify(root.backgroundMoves==1,"non-root activity cannot background another task")
+    root.isTaskRoot=true;root.disposed=true;root.handleBrowserBack()
+    verify(root.backgroundMoves==1,"destroyed activity ignores a late root Back")
+    val empty=Shell();empty.isTaskRoot=true;empty.handleBrowserBack()
+    verify(empty.backgroundMoves==0,"an uninitialized browser ignores Back safely")
     println("$checks Android fullscreen regression checks passed")
 }
 '''
