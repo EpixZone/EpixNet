@@ -2451,7 +2451,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
 
     /**
      * Point GeckoView's proxy at the node's Tor SOCKS listener (or direct).
-     * When on, all non-loopback (clearnet) requests go through Tor; the node's
+     * When on, general clearnet requests go through Tor; EPIX infrastructure
+     * stays direct, matching the desktop PAC. The node's
      * own loopback - the UI and every `.epix` page served from 127.0.0.1 - is
      * never proxied (allow_hijacking_localhost stays false), so xites keep
      * loading directly. socks_remote_dns keeps DNS inside Tor. This is the
@@ -2474,8 +2475,11 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             // SOCKS proxy, so it hung until Tor finished bootstrapping - a blank
             // screen on first launch. The node's UI and every .epix page load
             // over loopback and must never go through Tor.
+            // The leading dot matches only epix.zone subdomains, preserving
+            // the desktop infrastructure exception without bypassing Tor for
+            // the apex or lookalike domains.
             GeckoPreferenceController.setGeckoPref(
-                "network.proxy.no_proxies_on", "localhost, 127.0.0.1", user,
+                "network.proxy.no_proxies_on", "localhost, 127.0.0.1, .epix.zone", user,
             )
         } else {
             GeckoPreferenceController.setGeckoPref("network.proxy.type", 0, user)

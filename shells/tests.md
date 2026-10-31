@@ -70,6 +70,35 @@ The app uses the lifecycle-aware AndroidX Back dispatcher. An Activity-level
 `onBackPressed` override is not dispatched when targeting Android 16+ with
 predictive Back enabled, even if the current Gecko session has history.
 
+## Android wallet infrastructure routing
+
+With `JAVA_HOME` and `KOTLINC` set as above:
+
+```sh
+python3 shells/android/tests/run-proxy-routing-regressions.py
+```
+
+This compiles the production `applyClearnetRouting()` method against a recording
+Gecko preference controller. It checks SOCKS configuration, remote DNS, loopback
+protection, and switching Tor routing off and back on. A separate model of
+[Gecko 155's host filters](https://github.com/mozilla-firefox/firefox/blob/FIREFOX_155_0_RELEASE/netwerk/base/nsProtocolProxyService.cpp)
+checks that the `.epix.zone` bypass covers infrastructure subdomains without
+covering `epix.zone`, lookalikes, or unrelated hosts. This model is not an
+execution of Gecko's resolver.
+
+On a disposable debug emulator, keep **Route clearnet through Tor** on and
+verify that the wallet can read `eth_chainId` from `evmrpc.epix.zone`. Check that
+Gecko's actual proxy resolver selects a direct route for infrastructure.
+The resolver also applies extension filters: when Tor is explicitly disabled,
+the wallet already chooses direct routes for general clearnet. Such a result
+does not prove that a host matched Gecko's bypass list. The boundary checks
+above cover that list separately with the source-backed model.
+
+General clearnet should retain SOCKS when Tor is enabled, connecting or failed,
+and clearnet routing is on. Turning clearnet routing off should still select
+direct browsing. These checks do not require signing or broadcasting a
+transaction.
+
 ## Android wallet keyboard (issue #531)
 
 On a disposable Android emulator with the debug APK installed and no wallet:
