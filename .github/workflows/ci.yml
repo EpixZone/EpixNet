@@ -56,6 +56,7 @@ jobs:
           python3 shells/android/tests/run-browser-host-regressions.py
           python3 shells/android/tests/run-addon-policy-regressions.py
           python3 shells/android/tests/run-browser-settings-regressions.py
+          python3 shells/android/tests/run-proxy-routing-regressions.py
           python3 shells/android/tests/run-pending-operations-regressions.py
           python3 shells/android/tests/run-guarded-session-regressions.py
           python3 shells/android/tests/run-picked-file-regressions.py
