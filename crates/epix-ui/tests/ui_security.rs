@@ -13,10 +13,9 @@ use tower::ServiceExt;
 async fn test_server() -> (Arc<AppState>, axum::Router) {
     let state = AppState::new("sec-test");
     let dir = tempfile::tempdir().unwrap();
-    let storage = XiteStorage::new(dir.path());
-    storage.write("data.json", b"{}").unwrap();
     for addr in ["1Source", "1Target"] {
-        let storage = storage.clone();
+        let storage = XiteStorage::new(dir.path().join(addr));
+        storage.write("data.json", b"{}").unwrap();
         state
             .add_xite(addr, XiteEntry { storage, content: Some(json!({ "address": addr })) })
             .await;
@@ -383,6 +382,44 @@ async fn configuration_navigation_uses_node_origin_and_preserves_valid_posts() {
         ("host", "127.0.0.1:45678"), ("sec-fetch-mode", "navigate"),
     ])).await.unwrap();
     assert_eq!(response.status(), 403, "Public gateways cannot expose node configuration");
+}
+
+#[tokio::test]
+async fn gecko_null_origin_subresources_load_without_a_cors_read_grant() {
+    let (state, router) = test_server().await;
+    state.config_set("ui_check_cors", json!(true)).await;
+    // Newer Gecko (observed in 153 and 155) sends Origin: null on classic
+    // scripts and styles inside the opaque iframe too. These are no-cors
+    // loads, not readable fetches.
+    let resource = |uri: &str, dest: &str, origin: &str| get(uri, &[
+        ("host", "127.0.0.1:42222"), ("origin", origin),
+        ("sec-fetch-site", "cross-site"), ("sec-fetch-mode", "no-cors"),
+        ("sec-fetch-dest", dest),
+    ]);
+    for dest in ["script", "style", "image", "font", "audio", "video", "track"] {
+        let resp = router.clone().oneshot(resource("/1Target/data.json", dest, "null")).await.unwrap();
+        assert_eq!(resp.status(), 200, "Gecko no-cors {dest} must load");
+        assert!(resp.headers().get("access-control-allow-origin").is_none(), "{dest} must not gain a CORS read grant");
+    }
+    for dest in ["empty", "document", "iframe", "object", "embed", ""] {
+        let resp = router.clone().oneshot(resource("/1Target/data.json", dest, "null")).await.unwrap();
+        assert_eq!(resp.status(), 403, "unsupported no-cors destination {dest}");
+        assert!(resp.headers().get("access-control-allow-origin").is_none());
+    }
+    for path in ["/1Target", "/1Target/", "/1Target/sub/", "/Backup", "/Config", "/EpixNet-Internal/Status"] {
+        for dest in ["script", "style", "image"] {
+            let resp = router.clone().oneshot(resource(path, dest, "null")).await.unwrap();
+            assert_eq!(resp.status(), 403, "{path} must not become a {dest} resource");
+            assert!(resp.headers().get("access-control-allow-origin").is_none());
+        }
+    }
+    let resp = router.clone().oneshot(resource("/1Target/data.json", "script", "https://foreign.example")).await.unwrap();
+    assert_eq!(resp.status(), 403, "a real foreign origin remains blocked");
+
+    state.config_set("ui_check_cors", json!(false)).await;
+    let resp = router.oneshot(resource("/1Target/data.json", "script", "null")).await.unwrap();
+    assert_eq!(resp.status(), 200);
+    assert!(resp.headers().get("access-control-allow-origin").is_none(), "disabling the gate must not grant readable CORS");
 }
 
 /// The wrapper's iframe sandbox has no `allow-same-origin`, so the xite page

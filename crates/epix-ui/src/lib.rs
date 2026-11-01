@@ -527,11 +527,11 @@ Add it to the ui_host config key, or access the UI                  by IP."
         return (StatusCode::FORBIDDEN, "Cross-origin write blocked").into_response();
     }
 
-    // A CORS-mode request from the sandboxed inner frame (an opaque origin)
-    // says `Origin: null`. Decide once whether this one may read the file; the
-    // gate below refuses it otherwise, and an authorised one gets the
-    // `Access-Control-Allow-Origin: null` the browser needs to hand the bytes
-    // to the page - whether or not the gate itself is switched on.
+    // The sandboxed inner frame (an opaque origin) sends `Origin: null` on
+    // CORS requests and, in newer Gecko, no-cors subresource loads too.
+    // Decide once whether it may read the file or only load it opaquely.
+    // Only an authorised read gets `Access-Control-Allow-Origin: null`,
+    // whether or not the gate itself is switched on.
     let null_read = if req.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok()) == Some("null") {
         Some(null_origin_read(&ctx, req.headers(), req.uri().path(), req.uri().query()).await)
     } else {
@@ -654,10 +654,11 @@ fn strip_port(host: &str) -> &str {
 /// xite page makes over HTTP.
 const BIGFILE_UPLOAD_PATH: &str = "/EpixNet-Internal/BigfileUpload";
 
-/// Whether a request carrying `Origin: null` may read what it asked for.
+/// Whether a request carrying `Origin: null` may read or opaquely load a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NullOriginRead {
     Authorised,
+    OpaqueSubresource,
     Refused,
 }
 
@@ -673,6 +674,10 @@ enum NullOriginRead {
 ///    bytes to script (`Sec-Fetch-Dest: font` or `script`, set by the browser
 ///    and not forgeable), for the xite's own fonts and ES modules; or
 /// 3. the Bigfile upload POST, authorised by its own one-time nonce.
+///
+/// Newer Gecko also sends `Origin: null` on no-cors subresource loads.
+/// Browser-set script, style, image and media destinations may load xite
+/// files this way, but receive no CORS grant to read the response bytes.
 ///
 /// Everything else - a keyless fetch of a xite file, any node page - is
 /// refused, so a foreign opaque page learns nothing it could not already.
@@ -716,6 +721,11 @@ async fn null_origin_read(
     }
     let mode = headers.get("sec-fetch-mode").and_then(|v| v.to_str().ok());
     let dest = headers.get("sec-fetch-dest").and_then(|v| v.to_str().ok());
+    if mode == Some("no-cors")
+        && matches!(dest, Some("script" | "style" | "image" | "font" | "audio" | "video" | "track"))
+    {
+        return NullOriginRead::OpaqueSubresource;
+    }
     if mode == Some("cors") && matches!(dest, Some("font") | Some("script")) {
         return NullOriginRead::Authorised;
     }
@@ -723,11 +733,10 @@ async fn null_origin_read(
 }
 
 /// EpixNet's `isCrossOriginRequest`, same decision order, extended for the
-/// opaque-origin inner frame: it sends no `Referer` at all and `Origin: null`
-/// only on CORS-mode requests, so its loads arrive as either a null origin
-/// (decided by `null_read`, see [`null_origin_read`]) or as a no-cors request
-/// with neither header (`Sec-Fetch-Mode: no-cors`, which cannot read the
-/// bytes it fetches - scripts, styles, images).
+/// opaque-origin inner frame: it sends no `Referer` at all. Its loads arrive
+/// with `Origin: null` (decided by `null_read`, see [`null_origin_read`]) or
+/// as a no-cors request with neither header (`Sec-Fetch-Mode: no-cors`,
+/// which cannot read the bytes it fetches - scripts, styles, images).
 async fn is_cross_origin_request(
     ctx: &Ctx,
     headers: &header::HeaderMap,
@@ -752,9 +761,9 @@ async fn is_cross_origin_request(
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
     let referer = headers.get(header::REFERER).and_then(|v| v.to_str().ok());
     // A null origin is the sandboxed inner frame or some other opaque page;
-    // it passes only when the read was authorised (key, or an opaque kind).
+    // it passes only for an authorised read or an opaque subresource load.
     if origin == Some("null") {
-        return null_read != Some(NullOriginRead::Authorised);
+        return !matches!(null_read, Some(NullOriginRead::Authorised | NullOriginRead::OpaqueSubresource));
     }
     // Untraceable requests are blocked for xite paths (checked below for /) -
     // except the inner frame's own no-cors subresource loads, which carry no
