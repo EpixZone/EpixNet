@@ -19,8 +19,9 @@ served from the node's own host:
   wrapper offers `wrapperGetLocalStorage` / `wrapperSetLocalStorage`
   instead, keyed by xite and identity);
 - its subresources (scripts, styles, images) load with no `Referer` and
-  `Sec-Fetch-Site: cross-site`; its CORS-mode loads (fonts, ES modules,
-  fetch, XHR) carry `Origin: null`.
+  `Sec-Fetch-Site: cross-site`; newer Gecko also sends `Origin: null` on
+  these no-cors loads. Its CORS-mode loads (fonts, ES modules, fetch, XHR)
+  carry `Origin: null` too.
 
 The `NOSANDBOX` permission is exactly `allow-same-origin`. A same-origin page
 could open the node's WebSocket as the wrapper's origin and script a wrapper
@@ -61,6 +62,7 @@ default for loopback binds). For the opaque frame:
 | Navigation (`Sec-Fetch-Mode: navigate`) | allowed, as before |
 | No `Origin`, no `Referer`, `Sec-Fetch-Mode: no-cors` with a destination | allowed for xite paths: a script, style or image the page runs or renders but cannot read. Backup and operator pages stay blocked. |
 | No `Origin`, no `Referer`, no `Sec-Fetch-Mode` | blocked (untraceable, as before) |
+| `Origin: null`, `Sec-Fetch-Mode: no-cors`, destination `script`, `style`, `image`, `font`, `audio`, `video` or `track` | allowed for xite files, without a CORS read grant. This covers newer Gecko's sandboxed subresources. Wrapper documents, backup and operator pages stay blocked. |
 | `Origin: null` with a valid `ajax_key` | allowed when the key's xite is the target or holds `Cors:<target>`; the response gets `Access-Control-Allow-Origin: null` so the page can read it |
 | `Origin: null`, no key, `Sec-Fetch-Dest: font` or `script` in CORS mode | allowed with the CORS grant: the xite's own fonts and ES modules, which execute or render without exposing bytes |
 | `Origin: null` otherwise | blocked, and never given a CORS grant even with the gate off |
