@@ -42,6 +42,8 @@ epix-bt = { path = "../epix-bt", optional = true }
 # nothing it serves can compile, instantiate or execute a program.
 evx-declaration = { path = "../evx-declaration" }
 base64 = "0.23"
+png = "0.18"
+rusqlite = { version = "0.37", features = ["bundled"] }
 sha2 = "0.11"
 hmac = "0.13"
 hex = "0.4"
@@ -99,7 +101,6 @@ bittorrent = ["dep:epix-bt"]
 bridges = []
 
 [dev-dependencies]
-rusqlite = { version = "0.37", features = ["bundled"] }
 epix-reticulum = { path = "../epix-reticulum" }
 async-trait = "0.1"
 epix-crypt = { path = "../epix-crypt" }

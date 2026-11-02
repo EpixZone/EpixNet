@@ -140,6 +140,37 @@ production wrapper.
 - Fonts and ES modules load from the xite's own files. Fetching another
   xite's files needs `Cors:<address>`, requested through the wrapper.
 
+## Shared xID avatar thumbnails
+
+A xite can vendor the node's [avatar helper](../ui/media/epix-avatar.js) in
+its signed files. Call `EpixAvatar.bind(img, profile.avatar, 80)` for an
+80-pixel image, or pass `{background: true}` for a CSS background. Pass the
+original profile URL and the displayed side length in pixels (1 to 128).
+The helper uses the xite's `Page` frame by default. An explicit `{frame}`
+can be supplied to `bind`. Clearing or replacing the URL supersedes a pending
+image. `EpixAvatar.get(url, size, frame)` returns a promise for a PNG data URL
+or null for renderers with their own fallback.
+
+The wrapper looks up the original URL and size in a private node cache scoped
+to the selected user. Other xites on the same node can use that thumbnail.
+Entries expire after one day and the cache holds at most 128 across users.
+The node stores hashes of the keys and PNGs encoded from bounded RGBA pixels.
+Xites can request a known URL and size. As with other shared caches, response
+timing or availability offline can reveal that such an image was used before.
+
+On a miss a separate, opaque, node-supplied frame fetches an eligible remote
+raster image under the browser's network policy. It omits credentials and
+referrers, requires a readable CORS response, and rejects redirects and
+`Cache-Control: no-store`. It limits input to 5 MiB and 32 megapixels, requests
+Gravatars at the display size, and center-crops and downsamples larger images
+using Lanczos3 (Pica 10.0.3, MIT). The processor sends pixels to the wrapper
+over a private port. Only a local wrapper socket can populate the cache.
+A separate port returns the result to the requesting xite document, so a
+navigation during a download cannot deliver the image to its successor.
+
+Older nodes and images ineligible for caching use the xite's ordinary image
+display path. The helper still selects the display size for Gravatar URLs.
+
 ## Host mode: a real origin per xite
 
 In the Epix browsers (desktop, iOS) every xite is served under its own
