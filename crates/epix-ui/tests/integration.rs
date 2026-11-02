@@ -113,6 +113,7 @@ async fn the_wrapper_runs_the_xite_in_an_opaque_origin() {
     // node's WebSocket as the wrapper's origin.
     assert!(sandbox.contains("allow-scripts"), "{sandbox}");
     assert!(!sandbox.contains("allow-same-origin"), "default sandbox is opaque: {sandbox}");
+    assert!(html.contains(r#"allow="screen-wake-lock *""#), "delegate screen wake lock to the opaque frame");
     // The wrapper's own script receives the xite's secret keys and the
     // gateway flag; the keys are what its WebSocket authenticates with.
     assert!(html.contains(&format!("wrapper_key = \"{key}\"")), "wrapper embeds its key");
@@ -126,6 +127,7 @@ async fn the_wrapper_runs_the_xite_in_an_opaque_origin() {
     state.add_permission(&xite, "NOSANDBOX").await;
     let html = wrapper().await;
     assert!(html.contains("allow-popups-to-escape-sandbox allow-same-origin\""), "{html}");
+    assert!(html.contains(r#"allow="screen-wake-lock 'src'""#), "scope the grant to the trusted frame's source");
 }
 
 #[tokio::test]
@@ -285,6 +287,8 @@ async fn transparent_proxy_serves_epix_host() {
     );
     assert!(!html.contains("/talk.epix/index.html"), "no path-prefix in host mode");
     assert!(sandbox_of(&html).contains("allow-same-origin"), "host mode: own origin: {html}");
+
+    assert!(html.contains(r#"allow="screen-wake-lock 'src'""#), "scope the grant to the content host");
 
     // The chrome host serves no xite file: every file request moves to the
     // content host (an HTML file served raw here would run as the wrapper).

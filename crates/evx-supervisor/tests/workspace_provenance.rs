@@ -3,6 +3,7 @@
 mod common;
 use common::*;
 use evx_api::{Response, Status};
+use evx_supervisor::process::{Event, Role, Stream};
 
 #[test]
 fn unregistered_workspace_bytes_never_reach_the_guest() {
@@ -117,16 +118,7 @@ fn substituted_staged_source_cannot_be_read_as_authorized_content() {
         &write_wat("score.txt", "authorized"),
         evx_supervisor::RunOptions {
             before_file_commit: Some(Box::new(|broker| {
-                let pending = std::fs::read_dir(broker.workspace())
-                    .unwrap()
-                    .map(|e| e.unwrap().path())
-                    .find(|path| {
-                        path.file_name()
-                            .unwrap()
-                            .to_string_lossy()
-                            .starts_with(".pending-")
-                    })
-                    .unwrap();
+                let pending = staged_file(broker.workspace());
                 std::fs::write(pending, "outside source bytes").unwrap();
             })),
             ..Default::default()
@@ -140,32 +132,83 @@ fn substituted_staged_source_cannot_be_read_as_authorized_content() {
     f.denied_call(&read_wat("score.txt"));
 }
 
+fn staged_file(parent: &std::path::Path) -> std::path::PathBuf {
+    let mut entries = std::fs::read_dir(parent)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .filter(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".pending-")
+        });
+    let path = entries.next().expect("expected a staged write");
+    assert!(entries.next().is_none(), "expected only one staged write");
+    path
+}
+
+// A one-write fixture. Queue an event while the supervisor handles Prepared.
+// It finishes recording and sending Commit before it can consume the event.
+fn inject_at_commit(
+    make_event: impl Fn(u64) -> Event + Send + 'static,
+) -> evx_supervisor::RunOptions {
+    let (helper, prepared) = std::sync::mpsc::sync_channel(1);
+    evx_supervisor::RunOptions {
+        after_helper_spawn: Some(Box::new(move |_, id, events| {
+            helper.try_send((id, events.clone())).unwrap();
+        })),
+        before_file_commit: Some(Box::new(move |_| {
+            let (id, events) = prepared.try_recv().expect("file helper already spawned");
+            events.try_send(make_event(id)).expect("room for test event");
+        })),
+        ..Default::default()
+    }
+}
+
+fn interrupt_before_replace() -> evx_supervisor::RunOptions {
+    evx_supervisor::RunOptions {
+        // Keep the real helper from renaming the staged file or acknowledging.
+        file_fault: Some(evx_api::frames::HelperFault::BlockAfterAuthorization),
+        ..inject_at_commit(|id| {
+            Event::Closed(
+                Role::File,
+                id,
+                Stream::Stdout,
+                Some("truncated worker frame"),
+            )
+        })
+    }
+}
+
+fn assert_authorized_write_is_uncertain(result: &evx_api::RunResult) {
+    assert_eq!(result.status, Status::EffectUnknown, "{result:?}");
+    assert!(result.effect_outcome_unknown, "{result:?}");
+    assert!(
+        result.events.iter().any(|e| e == "file_commit_authorized"),
+        "{result:?}"
+    );
+    assert!(
+        !result.events.iter().any(|e| e == "native_call_deadline"),
+        "{result:?}"
+    );
+}
+
 #[test]
 fn uncertain_write_requires_explicit_reconciliation_before_different_content() {
     use evx_api::frames::HelperFault;
     for after_replace in [false, true] {
         let f = Fixture::new();
         assert_eq!(f.run(&write_wat("score.txt", "old")).status, Status::Ok);
-        // The short host-call budget is for the helper the fault makes
-        // block; the plain runs after it get the ordinary one back, so a
-        // slow runner cannot turn a reconciled write into a second fault.
-        let ordinary = f.broker.limits();
-        let mut limits = ordinary.clone();
-        limits.host_call_seconds = 0.25;
-        f.broker.set_limits(limits).unwrap();
-        let result = f.run_with(
-            &write_wat("score.txt", "candidate"),
+        let options = if after_replace {
             evx_supervisor::RunOptions {
-                file_fault: Some(if after_replace {
-                    HelperFault::FailAfterReplace
-                } else {
-                    HelperFault::BlockAfterAuthorization
-                }),
+                file_fault: Some(HelperFault::FailAfterReplace),
                 ..Default::default()
-            },
-        );
-        assert_eq!(result.status, Status::EffectUnknown, "{result:?}");
-        f.broker.set_limits(ordinary).unwrap();
+            }
+        } else {
+            interrupt_before_replace()
+        };
+        let result = f.run_with(&write_wat("score.txt", "candidate"), options);
+        assert_authorized_write_is_uncertain(&result);
         let read = f.run(&read_wat("score.txt"));
         assert_eq!(
             read_bytes(&read.responses[0]),
@@ -251,20 +294,17 @@ fn failed_provenance_persistence_prevents_the_native_commit() {
 #[test]
 fn first_write_interrupted_before_replace_can_reconcile_absence() {
     let f = Fixture::new();
-    // Short budget for the blocked helper only (see above).
-    let ordinary = f.broker.limits();
-    let mut limits = ordinary.clone();
-    limits.host_call_seconds = 0.2;
-    f.broker.set_limits(limits).unwrap();
-    let interrupted = f.run_with(
+    let result = f.run_with(
         &write_wat("state/score.txt", "candidate"),
-        evx_supervisor::RunOptions {
-            file_fault: Some(evx_api::frames::HelperFault::BlockAfterAuthorization),
-            ..Default::default()
-        },
+        interrupt_before_replace(),
     );
-    assert_eq!(interrupted.status, Status::EffectUnknown, "{interrupted:?}");
-    f.broker.set_limits(ordinary).unwrap();
+    assert_authorized_write_is_uncertain(&result);
+    assert!(
+        result.responses.is_empty(),
+        "the helper never acknowledged: {result:?}"
+    );
+    let staged = staged_file(&f.workspace.join("state"));
+    assert_eq!(std::fs::read(&staged).unwrap(), b"candidate");
     assert!(!f.workspace.join("state/score.txt").exists());
     assert_eq!(
         evx_supervisor::reconcile_workspace(&f.config, &f.broker).unwrap(),
@@ -272,41 +312,34 @@ fn first_write_interrupted_before_replace_can_reconcile_absence() {
     );
     let write = f.run(&write_wat("state/score.txt", "later"));
     assert_eq!(write.status, Status::Ok, "{write:?}");
+    assert!(
+        !staged.exists(),
+        "the next write cleans up the orphaned stage"
+    );
+    assert_eq!(
+        std::fs::read(f.workspace.join("state/score.txt")).unwrap(),
+        b"later"
+    );
 }
 
 #[test]
 fn invalid_write_acknowledgement_preserves_effect_uncertainty() {
-    use evx_supervisor::process::{Event, Role};
-    use std::sync::{Arc, Mutex};
     let f = Fixture::new();
-    let saved = Arc::new(Mutex::new(
-        None::<(u64, std::sync::mpsc::SyncSender<Event>)>,
-    ));
-    let spawn = saved.clone();
     let result = f.run_with(
         &write_wat("score.txt", "authorized"),
-        evx_supervisor::RunOptions {
-            after_helper_spawn: Some(Box::new(move |_, id, tx| {
-                *spawn.lock().unwrap() = Some((id, tx.clone()));
-            })),
-            before_file_commit: Some(Box::new(move |_| {
-                let guard = saved.lock().unwrap();
-                let (id, tx) = guard.as_ref().unwrap();
-                tx.send(Event::Frame(
-                    Role::File,
-                    *id,
-                    serde_json::to_vec(&evx_api::frames::FromHelper::FileResult {
-                        response: Response::Write {
-                            ok: true,
-                            bytes: 999,
-                        },
-                    })
-                    .unwrap(),
-                ))
-                .unwrap();
-            })),
-            ..Default::default()
-        },
+        inject_at_commit(|id| {
+            Event::Frame(
+                Role::File,
+                id,
+                serde_json::to_vec(&evx_api::frames::FromHelper::FileResult {
+                    response: Response::Write {
+                        ok: true,
+                        bytes: 999,
+                    },
+                })
+                .unwrap(),
+            )
+        }),
     );
     assert_eq!(result.status, Status::EffectUnknown, "{result:?}");
     assert!(result.effect_outcome_unknown, "{result:?}");
