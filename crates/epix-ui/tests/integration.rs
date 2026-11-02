@@ -89,6 +89,19 @@ async fn start_server_with_state(
 }
 
 #[tokio::test]
+async fn the_avatar_processor_is_sandboxed_by_its_own_response() {
+    let (addr, _, _, _dir) = start_server().await;
+    let response = reqwest::get(format!("http://{addr}/uimedia/avatar-processor.html")).await.unwrap();
+    assert_eq!(response.status(), 200);
+    let headers = response.headers();
+    let policy = headers["content-security-policy"].to_str().unwrap();
+    assert!(policy.split(';').any(|part| part.trim() == "sandbox allow-scripts"));
+    assert!(policy.contains("frame-ancestors 'self'"));
+    assert_eq!(headers["referrer-policy"], "no-referrer");
+    assert!(headers.get("access-control-allow-origin").is_none());
+}
+
+#[tokio::test]
 async fn the_wrapper_runs_the_xite_in_an_opaque_origin() {
     let (addr, xite, key, state, _dir) = start_server_with_state().await;
     let wrapper = || async {

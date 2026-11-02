@@ -169,3 +169,32 @@ test("a grant the operator already made on a gateway keeps the silent contract",
   assert.equal(commands.length, 0);
   assert.equal(replies.length, 0, "already granted: no answer, as on a normal node");
 });
+
+test("a page cannot read or supply trusted shared-cache entries directly", () => {
+  const {instance, forwarded, commands, replies} = wrapper();
+  for (const cmd of ["avatarCacheGet", "avatarCachePut"]) {
+    instance.handleMessage({cmd, id: 42, params: {url: "https://images.example.org/profile.png", size: 56}});
+  }
+  assert.equal(forwarded.length, 0);
+  assert.equal(commands.length, 0);
+  assert.deepEqual(replies.map(r => r.result), [null, null]);
+});
+
+test("cache replies stay on the requesting document's port and transport", async () => {
+  const waits = [], replies = [];
+  const context = {window: {}, avatarCacheCommand: () => new Promise(resolve => waits.push(resolve))};
+  vm.runInNewContext("function Wrapper() {}\n" + method("actionGetAvatarThumbnail"), context);
+  const w = Object.assign(new context.Wrapper(), {inner_generation: 1, ws: {ws: {}}});
+  const port = () => ({postMessage: r => replies.push(r.thumbnail), close() {}});
+  const message = {id: 0, params: {url: "https://images.example.org/avatar.png", size: 56}};
+  const first = w.actionGetAvatarThumbnail(message, port());
+  w.inner_generation++;
+  const second = w.actionGetAvatarThumbnail(message, port());
+  w.ws.ws = {};
+  const third = w.actionGetAvatarThumbnail(message, port());
+  assert.equal(waits.length, 3, "a new document or socket never inherits a pending lookup");
+  waits[0]({thumbnail: "first"}); await first;
+  waits[1]({thumbnail: "second"}); await second;
+  waits[2]({thumbnail: "third"}); await third;
+  assert.deepEqual(replies, [null, null, "third"]);
+});

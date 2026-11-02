@@ -1789,6 +1789,9 @@ if (window.getComputedStyle(document.body).transform) {
       if (message.cmd === "innerReady" && e.source !== this.inner) {
         return;
       }
+      if (message.cmd === "wrapperGetAvatarThumbnail" && e.ports && e.ports.length === 1) {
+        return this.actionGetAvatarThumbnail(message, e.ports[0]);
+      }
       return this.handleMessage(message);
     };
 
@@ -1837,6 +1840,12 @@ if (window.getComputedStyle(document.body).transform) {
         return this.is_title_changed = true;
       } else if (cmd === "wrapperReload") {
         return this.actionReload(message);
+      } else if (cmd === "wrapperAvatarThumbnailVersion") {
+        return this.sendInner({cmd: "response", to: message.id, result: 1});
+      } else if (cmd === "wrapperGetAvatarThumbnail" || cmd === "avatarCacheGet" || cmd === "avatarCachePut") {
+        // A xite can ask to display an avatar, never supply pixels for
+        // another xite to display or inspect the node's cache directly.
+        return this.sendInner({cmd: "response", to: message.id, result: null});
       } else if (cmd === "wrapperGetLocalStorage") {
         return this.actionGetLocalStorage(message);
       } else if (cmd === "wrapperSetLocalStorage") {
@@ -2803,6 +2812,108 @@ if (window.getComputedStyle(document.body).transform) {
       } else {
         return window.location.reload();
       }
+    };
+
+    function avatarCacheCommand(ws, cmd, params) {
+      if (!ws.connected || !ws.ws || ws.ws.readyState !== 1) return Promise.resolve(null);
+      return new Promise(function (resolve) {
+        var id = ws.next_message_id++;
+        function finish(value) {
+          clearTimeout(timer);
+          if (ws.waiting_cb[id] === finish) delete ws.waiting_cb[id];
+          resolve(value);
+        }
+        var timer = setTimeout(function () { finish(null); }, 2500);
+        try { ws.send({cmd: cmd, id: id, params: params}, finish); }
+        catch (_) { finish(null); }
+      });
+    }
+
+    // The browser fetches in an opaque origin using its current routing
+    // policy. The parent accepts pixels only from its own static processor.
+    function processAvatar(url, size, timeout) {
+      return new Promise(function (resolve) {
+        var frame = document.createElement("iframe"), port;
+        var random = crypto.getRandomValues(new Uint8Array(16));
+        var token = Array.from(random, function (n) { return n.toString(16).padStart(2, "0"); }).join("");
+        function finish(value) {
+          clearTimeout(timer);
+          window.removeEventListener("message", ready);
+          if (port) port.close();
+          frame.remove();
+          resolve(value);
+        }
+        function ready(event) {
+          if (event.source !== frame.contentWindow || event.origin !== "null" ||
+              !event.data || event.data.epixAvatarProcessor !== token || event.ports.length !== 1) return;
+          window.removeEventListener("message", ready);
+          port = event.ports[0];
+          port.onmessage = function (reply) {
+            var data = reply.data;
+            if (!data || !Number.isInteger(data.width) || data.width < 1 || data.width > size ||
+                !(data.rgba instanceof ArrayBuffer) || data.rgba.byteLength !== data.width * data.width * 4) return finish(null);
+            var binary = "";
+            for (var byte of new Uint8Array(data.rgba)) binary += String.fromCharCode(byte);
+            finish({width: data.width, rgba: btoa(binary)});
+          };
+          port.postMessage({url: url, size: size});
+        }
+        var timer = setTimeout(function () { finish(null); }, timeout);
+        frame.hidden = true;
+        frame.setAttribute("sandbox", "allow-scripts");
+        frame.setAttribute("referrerpolicy", "no-referrer");
+        frame.src = "/uimedia/avatar-processor.html#" + token;
+        window.addEventListener("message", ready);
+        document.body.appendChild(frame);
+      });
+    }
+
+    Wrapper.prototype.actionGetAvatarThumbnail = function (message, replyPort) {
+      var wrapper = this, args = message.params || {};
+      var source = args.url, size = args.size, generation = this.inner_generation;
+      var transport = this.ws.ws;
+      function sameContext() {
+        return wrapper.inner_generation === generation && wrapper.ws.ws === transport;
+      }
+      function reply(thumbnail) {
+        replyPort.postMessage({thumbnail: sameContext() ? thumbnail : null});
+        replyPort.close();
+      }
+      if (!Number.isSafeInteger(message.id) || message.id < 0 || message.id >= 1000000) return reply(null);
+      if (typeof source !== "string" || source.length > 2048 || !Number.isInteger(size) ||
+          size < 1 || size > 128 || window.ui_restrict) return reply(null);
+      var scope = this.avatar_job_scope;
+      if (!scope || scope.generation !== generation || scope.transport !== transport) {
+        scope = this.avatar_job_scope = {generation: generation, transport: transport, jobs: new Map()};
+      }
+      var jobs = scope.jobs;
+      var key = JSON.stringify([source, size]);
+      if (jobs.has(key)) return jobs.get(key).then(reply);
+      if (jobs.size >= 96) return reply(null);
+      var deadline = Date.now() + 12000;
+      async function obtain() {
+        var cached = await avatarCacheCommand(wrapper.ws, "avatarCacheGet", {url: source, size: size});
+        // Only a recognised, eligible miss can cause a browser fetch.
+        if (!cached || cached.error || !Object.prototype.hasOwnProperty.call(cached, "thumbnail")) return null;
+        if (cached.thumbnail !== null) return cached.thumbnail;
+        if (!wrapper.avatar_slots) wrapper.avatar_slots = [Promise.resolve(), Promise.resolve(), Promise.resolve()];
+        var slot = wrapper.avatar_slots.shift();
+        var next = slot.then(async function () {
+          var left = deadline - Date.now();
+          if (left <= 0 || !sameContext()) return null;
+          var pixels = await processAvatar(source, size, Math.min(left, 9000));
+          if (!pixels || !sameContext()) return null;
+          var saved = await avatarCacheCommand(wrapper.ws, "avatarCachePut", {
+            url: source, size: size, width: pixels.width, rgba: pixels.rgba
+          });
+          return saved && saved.thumbnail || null;
+        });
+        wrapper.avatar_slots.push(next.then(function () {}, function () {}));
+        return next;
+      }
+      var job = obtain().catch(function () { return null; }).finally(function () { jobs.delete(key); });
+      jobs.set(key, job);
+      return job.then(reply);
     };
 
     // Per-xite, per-identity storage key. An anonymous xite (no identity

@@ -4,6 +4,7 @@
 //! and plugins register additional commands into the [`CommandRegistry`].
 
 use crate::state::AppState;
+use crate::state::avatar_cache::AvatarCommand;
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -227,6 +228,8 @@ pub struct WsSession {
     /// only the wrapper page receives. Only on such a socket do elevated ids
     /// (>= [`WRAPPER_ID_BASE`]) carry the chrome's authority.
     pub wrapper: bool,
+    /// Bind an in-flight thumbnail fill to the user who looked it up.
+    pub(crate) avatar_user: std::sync::OnceLock<String>,
     /// The session was rebound through `as` by a caller whose own bound
     /// xite holds ADMIN. It passes the admin gate the way the caller would
     /// have, and nothing more: it is a page-level session with the page's
@@ -265,6 +268,7 @@ impl WsSession {
             allsite_channels: std::sync::Mutex::new(std::collections::HashSet::new()),
             trusted,
             wrapper,
+            avatar_user: Default::default(),
             admin: false,
         }
     }
@@ -435,6 +439,14 @@ impl CommandRegistry {
         // gateway restrictions entirely (that is the sanctioned way to change a
         // locked-down node).
         let restrict = session.state.ui_restrict().await && !session.trusted;
+        // Thumbnail bytes are produced by our sandboxed image processor.
+        // A page (including an ADMIN xite) must never plant pixels for a
+        // different xite or enumerate which public avatars the user saw.
+        if AvatarCommand::is_cache_command(cmd)
+            && (restrict || !session.wrapper || !session.elevated(req_id) || session.xite.is_none())
+        {
+            return Err("Avatar cache requires local wrapper authority".into());
+        }
         if cmd == "networkRetry" && params.get("address").is_none() && !session.trusted {
             let admin = session.admin
                 || match session.xite.as_deref() {
@@ -571,6 +583,9 @@ impl CommandRegistry {
                 .and_then(|v| v.as_str())
                 .ok_or("Missing cmd")?
                 .to_string();
+            if AvatarCommand::is_cache_command(&inner_cmd) {
+                return Err("Avatar cache cannot be accessed through as".into());
+            }
             let inner_params = params
                 .get("params")
                 .or_else(|| params.as_array().and_then(|a| a.get(2)))
@@ -626,6 +641,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
     #[allow(unused_mut)]
     let mut cmds: Vec<Arc<dyn WsCommand>> = vec![
         Arc::new(Ping),
+        Arc::new(AvatarCommand::Get),
+        Arc::new(AvatarCommand::Put),
         Arc::new(ServerInfo),
         Arc::new(ResolveStatusCmd),
         Arc::new(NetworkRetry),

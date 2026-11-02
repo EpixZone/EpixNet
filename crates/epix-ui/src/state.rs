@@ -4,6 +4,7 @@
 mod xite_export;
 mod merger_index;
 pub(crate) mod addon_install;
+pub(crate) mod avatar_cache;
 
 use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
 use epix_db::{Database, DbSchema};
@@ -4119,6 +4120,7 @@ const XID_RETRY_BACKOFF_MAX_SECS: u64 = 30 * 60;
 pub type EvxGrantSummarySource = Box<dyn Fn(&str) -> Option<Value> + Send + Sync>;
 
 pub struct AppState {
+    avatar_cache: avatar_cache::AvatarCache,
     addon_profiles: std::sync::Mutex<crate::addons::Profiles>,
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
@@ -5640,6 +5642,7 @@ impl AppState {
             .and_then(|path| path.parent())
             .map(|directory| crate::deletion_reserve::DeletionReserve::new(directory.to_path_buf()));
         let state = Arc::new(Self {
+            avatar_cache: avatar_cache::AvatarCache::default(),
             addon_profiles: std::sync::Mutex::new(crate::addons::Profiles::default()),
             self_weak: std::sync::OnceLock::new(),
             version: version.into(),

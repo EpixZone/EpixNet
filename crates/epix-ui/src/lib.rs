@@ -1269,6 +1269,23 @@ async fn redirect_to_slash(
 /// contributions: `all.js`/`all.css` get each plugin's client code appended,
 /// and plugins can add extra files (e.g. the sidebar's `globe/*`).
 async fn serve_uimedia(State(ctx): State<Ctx>, Path(path): Path<String>) -> Response {
+    if path == "avatar-processor.html" {
+        // Keep the decoder and its source together in one static, opaque
+        // document. It never inherits the wrapper's origin or credentials.
+        const PROCESSOR: &str = concat!(
+            "<!doctype html><meta charset=utf-8><title>Avatar processor</title><script>",
+            include_str!("../../../ui/media/lib/avatar-pica.min.js"),
+            "\n</script><script>",
+            include_str!("../../../ui/media/avatar-processor.js"),
+            "\n</script>"
+        );
+        return ([
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, "sandbox allow-scripts; default-src 'none'; script-src 'unsafe-inline'; connect-src http: https:; img-src blob:; base-uri 'none'; form-action 'none'; frame-ancestors 'self'"),
+            (header::REFERRER_POLICY, "no-referrer"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ], PROCESSOR).into_response();
+    }
     let ct = content_type(&path);
     // Base bundle + each *enabled* plugin's appended JS/CSS (assembled per
     // request, so enabling/disabling a plugin takes effect on the next reload).

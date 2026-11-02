@@ -3334,6 +3334,7 @@ dependencies = [
  "include_dir",
  "libc",
  "maxminddb",
+ "png",
  "postcard",
  "reqwest",
  "rusqlite",
