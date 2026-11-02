@@ -1727,10 +1727,12 @@ async fn render_wrapper(
     // origin). In path mode it would make the page the wrapper - able to open
     // the WebSocket as this origin and script a wrapper through a popup - so
     // only the user's NOSANDBOX grant adds it there (the prompt says so).
-    let sandbox_permissions = if proxy_mode || permissions.iter().any(|p| p == "NOSANDBOX") {
-        "allow-same-origin".to_string()
+    // Delegate screen wake lock to the frame's source when it has an origin.
+    // Gecko requires `*` for this feature when the frame's origin is opaque.
+    let (sandbox_permissions, wake_lock_allowlist) = if proxy_mode || permissions.iter().any(|p| p == "NOSANDBOX") {
+        ("allow-same-origin", "'src'")
     } else {
-        String::new()
+        ("", "*")
     };
     // Grants are impossible on a public gateway (the node refuses them from
     // every visitor); the wrapper skips the dead-end prompt when it knows.
@@ -1791,7 +1793,8 @@ async fn render_wrapper(
         ("show_loadingscreen", if loading { "true" } else { "false" }.into()),
         ("resolving_host", script_string(&resolving_host)),
         ("is_homepage", if is_homepage { "true" } else { "false" }.into()),
-        ("sandbox_permissions", sandbox_permissions),
+        ("sandbox_permissions", sandbox_permissions.into()),
+        ("wake_lock_allowlist", wake_lock_allowlist.into()),
         ("ui_restrict", if ui_restrict { "true" } else { "false" }.into()),
         ("server_url", String::new()),
         ("lang", html_escape(&lang)),

@@ -99,7 +99,7 @@ const server = http.createServer((req, res) => {
       address, wrapper_nonce: "n1", wrapper_key: address, ajax_key: "review",
       postmessage_nonce_security: "true", file_inner_path: "index.html", permissions: "[]",
       show_loadingscreen: "false", server_url: `http://127.0.0.1:${server.address().port}`,
-      script_nonce: "reviewnonce", sandbox_permissions: "", lang: "en",
+      script_nonce: "reviewnonce", sandbox_permissions: "", wake_lock_allowlist: "*", lang: "en",
     };
     const html = source("wrapper.html").toString().replace(/\{(\w+)\}/g, (all, key) => vars[key] ?? all);
     res.writeHead(200, {

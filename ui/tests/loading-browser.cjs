@@ -146,6 +146,7 @@ const server = http.createServer((req, res) => {
       server_url: `http://127.0.0.1:${server.address().port}`,
       script_nonce: "reviewnonce",
       sandbox_permissions: "",
+      wake_lock_allowlist: "*",
       lang: "en",
     };
     let html = source("wrapper.html")

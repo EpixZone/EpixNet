@@ -102,7 +102,7 @@ else if (window.opener && window.opener.location.toString()) {
 <!-- No allow-same-origin: the xite runs in an opaque origin, so it cannot
      reach this window, the WebSocket as this origin, or the keys below. The
      NOSANDBOX grant adds it through {sandbox_permissions}. -->
-<iframe src='about:blank' id='inner-iframe' sandbox="allow-forms allow-scripts allow-top-navigation allow-popups allow-modals allow-presentation allow-pointer-lock allow-popups-to-escape-sandbox {sandbox_permissions}" allowfullscreen="true"></iframe>
+<iframe src='about:blank' id='inner-iframe' sandbox="allow-forms allow-scripts allow-top-navigation allow-popups allow-modals allow-presentation allow-pointer-lock allow-popups-to-escape-sandbox {sandbox_permissions}" allow="screen-wake-lock {wake_lock_allowlist}" allowfullscreen="true"></iframe>
 
 <!-- Xite info -->
 <script id="script_init" nonce="{script_nonce}">
