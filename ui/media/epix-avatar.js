@@ -11,7 +11,10 @@
     try {
       var url = new URL(source);
       return /^https?:$/.test(url.protocol) && !url.username && !url.password;
-    } catch (_) { return false; }
+    } catch {
+      // Relative and legacy image paths use the existing display path.
+      return false;
+    }
   }
 
   function displayUrl(source, size) {
@@ -24,15 +27,29 @@
     return url.href;
   }
 
-  function supported(frame) {
+  function wrapperOrigin(info) {
+    if (info?.version !== 1 || typeof info.origin !== "string") return null;
+    try {
+      var url = new URL(info.origin);
+      return /^https?:$/.test(url.protocol) && info.origin === url.origin ? url.origin : null;
+    } catch {
+      // Invalid or missing capability metadata selects ordinary image display.
+      return null;
+    }
+  }
+
+  function wrapperFor(frame) {
     if (capabilities.has(frame)) return capabilities.get(frame);
     var check = new Promise(function (resolve) {
-      var timer = setTimeout(function () { capabilities.delete(frame); resolve(false); }, 900);
-      function reply(version) { clearTimeout(timer); resolve(version === 1); }
+      var timer = setTimeout(function () { capabilities.delete(frame); resolve(null); }, 900);
+      function reply(info) { clearTimeout(timer); resolve(wrapperOrigin(info)); }
       try {
         var result = frame.cmd("wrapperAvatarThumbnailVersion", {}, reply);
         if (result && typeof result.then === "function") result.then(reply, function () { reply(null); });
-      } catch (_) { reply(null); }
+      } catch {
+        // A disconnected or legacy bridge may throw before invoking its callback.
+        reply(null);
+      }
     });
     capabilities.set(frame, check);
     return check;
@@ -45,8 +62,8 @@
     if (!pending) { pending = new Map(); requests.set(frame, pending); }
     var key = JSON.stringify([source, size]);
     if (pending.has(key)) return pending.get(key);
-    var request = supported(frame).then(function (available) {
-      if (!available || typeof MessageChannel !== "function") return null;
+    var request = wrapperFor(frame).then(function (origin) {
+      if (!origin || typeof MessageChannel !== "function") return null;
       return new Promise(function (resolve) {
         // WindowProxy survives navigation. A transferred port delivers the
         // image only to the document that actually asked for it.
@@ -58,10 +75,10 @@
             /^data:image\/png;base64,[A-Za-z0-9+/]+=*$/.test(png) ? png : null);
         }
         var timer = setTimeout(function () { finish(null); }, 16000);
-        channel.port1.onmessage = function (event) { finish(event.data && event.data.thumbnail); };
+        channel.port1.onmessage = function (event) { finish(event.data?.thumbnail); };
         try {
           root.parent.postMessage({cmd: "wrapperGetAvatarThumbnail", id: 0,
-            wrapper_nonce: frame.wrapper_nonce, params: {url: source, size: size}}, "*", [channel.port2]);
+            wrapper_nonce: frame.wrapper_nonce, params: {url: source, size: size}}, origin, [channel.port2]);
         } catch (_) { channel.port2.close(); finish(null); }
       });
     }).finally(function () { pending.delete(key); });
@@ -73,7 +90,7 @@
     if (background) {
       // Serialize a single CSS string even for legacy relative URLs.
       var escaped = source.replace(/["\\\x00-\x1f\x7f]/g, function (ch) {
-        return "\\" + ch.charCodeAt(0).toString(16) + " ";
+        return "\\" + ch.codePointAt(0).toString(16) + " ";
       });
       element.style.backgroundImage = source ? 'url("' + escaped + '")' : "";
     } else if (source) {
@@ -86,14 +103,14 @@
 
   function bind(element, source, size, options) {
     source = typeof source === "string" ? source : "";
-    var background = !!(options && options.background);
+    var background = !!options?.background;
     var previous = bindings.get(element);
     if (previous && previous.source === source && previous.size === size && previous.background === background) return previous.done;
     var current = {source: source, size: size, background: background};
     bindings.set(element, current);
     if (previous || !source) paint(element, "", previous ? previous.background : background);
     if (!source) { current.done = Promise.resolve(); return current.done; }
-    current.done = get(source, size, options && options.frame).then(function (thumbnail) {
+    current.done = get(source, size, options?.frame).then(function (thumbnail) {
       if (bindings.get(element) === current) paint(element, thumbnail || displayUrl(source, size), background);
     });
     return current.done;

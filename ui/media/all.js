@@ -1841,7 +1841,7 @@ if (window.getComputedStyle(document.body).transform) {
       } else if (cmd === "wrapperReload") {
         return this.actionReload(message);
       } else if (cmd === "wrapperAvatarThumbnailVersion") {
-        return this.sendInner({cmd: "response", to: message.id, result: 1});
+        return this.sendInner({cmd: "response", to: message.id, result: {version: 1, origin: window.location.origin}});
       } else if (cmd === "wrapperGetAvatarThumbnail" || cmd === "avatarCacheGet" || cmd === "avatarCachePut") {
         // A xite can ask to display an avatar, never supply pixels for
         // another xite to display or inspect the node's cache directly.

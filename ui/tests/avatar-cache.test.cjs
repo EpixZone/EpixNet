@@ -7,13 +7,14 @@ const script = fs.readFileSync(path.join(__dirname, "../media/epix-avatar.js"), 
 const png = "data:image/png;base64,iVBORw0KGgoAAA==";
 const original = "https://2.gravatar.com/avatar/" + "0".repeat(32) + "?size=2048&d=retro";
 
-function client() {
+function client(capability = {version: 1, origin: "https://talk.epix"}) {
   const calls = [];
   const window = {parent: {postMessage(message, origin, ports) {
+    assert.equal(origin, "https://talk.epix");
     calls.push({command: message.cmd, params: message.params, reply(value) {
       ports[0].postMessage(value); ports[0].close();
     }});
-  }}, Page: {cmd(command, params, reply) { assert.equal(command, "wrapperAvatarThumbnailVersion"); reply(1); }}};
+  }}, Page: {cmd(command, params, reply) { assert.equal(command, "wrapperAvatarThumbnailVersion"); reply(capability); }}};
   vm.runInNewContext(script, {window, URL, setTimeout, clearTimeout, MessageChannel});
   const image = {style: {}, setAttribute(k, v) { this[k] = v; }, removeAttribute(k) { delete this[k]; }};
   return {avatar: window.EpixAvatar, calls, image};
@@ -62,4 +63,13 @@ test("legacy fallback sizes Gravatars and quotes a single background URL", async
   await avatar.bind(image, 'images/my"avatar.png', 56, {background: true});
   assert.equal(image.style.backgroundImage, 'url("images/my\\22 avatar.png")');
   assert.equal(calls.length, 1);
+});
+
+
+test("a missing or malformed wrapper origin cannot receive an avatar port", async () => {
+  for (const origin of ["*", "null", "https://talk.epix/path", "data:text/plain,avatar"]) {
+    const {avatar, calls} = client({version: 1, origin});
+    assert.equal(await avatar.get(original, 56), null);
+    assert.equal(calls.length, 0);
+  }
 });

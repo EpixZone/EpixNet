@@ -84,5 +84,5 @@
   };
   // Give the parent a private port. Never send jobs or pixel data through a
   // WindowProxy, which outlives its document when a frame navigates.
-  parent.postMessage({epixAvatarProcessor: token}, "*", [channel.port2]);
+  parent.postMessage({epixAvatarProcessor: token}, new URL(location.href).origin, [channel.port2]);
 })();
