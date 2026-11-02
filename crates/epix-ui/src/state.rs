@@ -18436,22 +18436,18 @@ impl AppState {
         // name instead of its bech32 address (and the wrapper's tab title
         // doesn't read "undefined"). try_read because this is called from
         // sync per-file progress callbacks: under momentary write contention
-        // the title just rides the next event instead.
+        // the event goes out with an empty content and a full site info
+        // follows (below).
         // For an installed xite carry the same content summary and settings
         // the full site info sends: xites read `content.settings` (EpixTalk's
         // admins and sticky topics) and `settings.own` from every event.
-        let (content, settings) = self
-            .xites
-            .try_read()
-            .ok()
-            .and_then(|xites| {
-                let entry = xites.get(address)?;
-                Some((
-                    entry.content.as_ref().map(summarize_content),
-                    Some(public_settings(&entry.settings)),
-                ))
+        let summary = self.xites.try_read().ok().map(|xites| {
+            xites.get(address).map(|entry| {
+                (entry.content.as_ref().map(summarize_content), Some(public_settings(&entry.settings)))
             })
-            .unwrap_or((None, None));
+        });
+        let xites_contended = summary.is_none();
+        let (content, settings) = summary.flatten().unwrap_or((None, None));
         let content = content.unwrap_or_else(|| json!({}));
         let settings = settings.unwrap_or_else(|| json!({ "size": 0 }));
         // The wrapper relays every `setSiteInfo` into the page, and xites
@@ -18497,9 +18493,11 @@ impl AppState {
         }
         self.push_event("setSiteInfo", params, Some("siteChanged"), Some(address.to_string()),
         );
-        if identity.is_none() {
-            // The identity store was being written: the page must not be left
-            // holding an identity-less event, so a full site info follows.
+        if identity.is_none() || xites_contended {
+            // The identity store or the xite table was being written: the page
+            // must not be left holding an event without its identity or its
+            // content (a xite that reads `content.settings` would see its
+            // configuration vanish), so a full site info follows.
             if let (Ok(handle), Some(state)) = (
                 tokio::runtime::Handle::try_current(),
                 self.self_weak.get().and_then(std::sync::Weak::upgrade),
@@ -51076,6 +51074,35 @@ mod tests {
         let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
         assert!(p["params"].get("auth_address").is_some(), "field present");
         assert!(p["params"]["auth_address"].is_null());
+    }
+
+    /// A sync progress event raised while the xite table is write-locked has
+    /// no content to carry. EpixSites read that empty `content` as a removed
+    /// removal policy and hid the whole directory until some later event
+    /// happened to restore it, so a full site info must follow on its own.
+    #[tokio::test]
+    async fn contended_clone_event_is_followed_by_full_site_info() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = AppState::new("test");
+        s.add_xite("epix1x", XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        s.update_content("epix1x", Some(json!({ "title": "Sites", "settings": { "removals": {} } })))
+            .await;
+        let mut events = s.subscribe_events();
+
+        let writer = s.xites.write().await;
+        s.push_clone_event("epix1x", json!(["file_done", "data/users/a/data.json"]), json!({}));
+        let p: Value = serde_json::from_str(&events.try_recv().unwrap().payload).unwrap();
+        assert_eq!(p["params"]["content"], json!({}), "fixture: the table was contended");
+        drop(writer);
+
+        let next = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
+            .await
+            .expect("a full site info follows")
+            .unwrap();
+        let p: Value = serde_json::from_str(&next.payload).unwrap();
+        assert_eq!(p["params"]["content"]["settings"]["removals"], json!({}));
+        assert_eq!(p["params"]["content"]["title"], "Sites");
     }
 
     #[tokio::test]
