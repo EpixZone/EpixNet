@@ -343,6 +343,15 @@ pub trait FetchObserver: Send + Sync {
     /// taken from.
     fn on_batch(&self, booked: &str, peer: Option<&str>, class: Option<Class>, bytes: u64,
                 elapsed: Option<Duration>, duplicates: u64);
+    /// A fetch started for `wanted` (the groups it was asked for). They
+    /// stay queued for this observer's lifetime unless they land first.
+    fn on_fetch_wanted(&self, _wanted: &GroupBits) {}
+    /// The groups of a batch just booked onto a peer, for a chunk map of
+    /// what is downloading right now. Called alongside `on_request`.
+    fn on_groups_requested(&self, _groups: &[u64]) {}
+    /// The groups of a batch that left flight, landed or not. Called
+    /// alongside `on_batch` with the same groups `on_groups_requested` saw.
+    fn on_groups_settled(&self, _groups: &[u64]) {}
 }
 
 /// A peer available to fetch from: its connection, transport class, and
@@ -759,6 +768,7 @@ impl<'a> Window<'a> {
         let bytes = swarm.bytes_of(&groups);
         if let Some(obs) = &swarm.observer {
             obs.on_request(&peers[idx].label, peers[idx].class, bytes);
+            obs.on_groups_requested(&groups);
         }
         // Charge this batch's bytes to the LINK before reading its depth,
         // so the counter includes us. The charge lives inside the batch
@@ -1027,6 +1037,9 @@ impl Swarm {
     ) -> std::io::Result<FetchReport> {
         let mut report = FetchReport::default();
         let mut remaining = needed.clone();
+        if let Some(obs) = &self.observer {
+            obs.on_fetch_wanted(needed);
+        }
 
         // Ensure the sparse object exists before writing slices, keeping the
         // namespace it was reserved under - a hardcoded Ns::Plain here reset
@@ -1160,6 +1173,7 @@ impl Swarm {
                 outcome.elapsed,
                 outcome.duplicates,
             );
+            obs.on_groups_settled(&outcome.groups);
         }
         report.duplicates_issued += outcome.duplicates;
         // Fold the winner's measured latency into the class prior, so

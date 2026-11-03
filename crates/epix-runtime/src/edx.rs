@@ -5919,19 +5919,36 @@ impl EdxFetcher for RuntimeEdxFetcher {
         // own (a seek preview, say); the node's own frontier is exact, where
         // a caller can only estimate it from playback time.
         let head = offset.or_else(|| self.xfer.read_head(id));
-        let (have, ahead) = match self.state.edx_store().await {
-            Some(store) => match store.present_bits(id) {
-                Ok(bits) => (
-                    Some(crate::xfer::have_bytes(&bits, size)),
-                    head.map(|o| crate::xfer::contiguous_from(&bits, size, o)),
-                ),
-                Err(_) => (None, None),
-            },
-            None => (None, None),
+        let bits = match self.state.edx_store().await {
+            Some(store) => store.present_bits(id).ok(),
+            None => None,
         };
+        let have = bits.as_ref().map(|bits| crate::xfer::have_bytes(bits, size));
+        let ahead = bits
+            .as_ref()
+            .and_then(|bits| head.map(|o| crate::xfer::contiguous_from(bits, size, o)));
         let mut out = self.xfer.snapshot(id, now_secs(), have);
-        if let (Some(obj), Some(ahead)) = (out.as_object_mut(), ahead) {
-            obj.insert("have_ahead".into(), serde_json::json!(ahead));
+        // A file held whole from an earlier run has no live record; its chunk
+        // map still says so.
+        if out.is_null() && bits.is_some() {
+            out = serde_json::json!({
+                "address": address,
+                "inner_path": inner_path,
+                "size": size,
+                "have": have,
+                "peers": [],
+            });
+        }
+        if let Some(obj) = out.as_object_mut() {
+            if let Some(ahead) = ahead {
+                obj.insert("have_ahead".into(), serde_json::json!(ahead));
+            }
+            if let Some(bits) = &bits {
+                obj.insert(
+                    "chunks".into(),
+                    self.xfer.chunk_map(id, bits, size, crate::xfer::CHUNK_MAP_CELLS),
+                );
+            }
         }
         out
     }
@@ -8000,6 +8017,12 @@ mod tests {
             other => panic!("re-fetch: {other:?}"),
         };
         assert_eq!(seek, movie[300_000..340_000], "re-fetched range is byte-exact");
+
+        // The player's chunk map reads the whole file as downloaded.
+        let stats = state_a.edx_transfer_stats(&address, "movie.bin", None).await;
+        let map = stats["chunks"]["map"].as_str().expect("chunk map in the stats reply");
+        assert_eq!(stats["chunks"]["groups"].as_u64(), Some(map.len() as u64));
+        assert!(map.chars().all(|c| c == 'h'), "a complete file maps as all held: {map}");
     }
 
     /// Full-file download is the default for a large media file: ONE Range
