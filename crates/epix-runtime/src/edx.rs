@@ -2000,12 +2000,29 @@ struct Streaming {
 /// seek from waiting behind a two-hour film's remainder.
 const COMPLETION_BATCH_GROUPS: u64 = 1024;
 
-/// The first [`COMPLETION_BATCH_GROUPS`] of `needed`, so one completion pass
-/// stays bounded.
-fn completion_batch(needed: &epix_blob::bitfield::GroupBits) -> epix_blob::bitfield::GroupBits {
+/// The next [`COMPLETION_BATCH_GROUPS`] of `needed` in play order: from
+/// group `from` (the play head) forward to the end of the file, then the gaps
+/// behind it. Taken from the start of the file instead, a pass after a seek
+/// spent the links on minutes the viewer had skipped while the bytes they
+/// were about to watch waited. Ahead first, the completion extends the
+/// buffer past the read-ahead window before it backfills. Bounded, so one
+/// completion pass stays short.
+fn completion_batch(
+    needed: &epix_blob::bitfield::GroupBits,
+    from: u64,
+) -> epix_blob::bitfield::GroupBits {
+    let ranges = needed.ranges();
+    let ahead = ranges.iter().filter_map(|r| {
+        let start = r.start.max(from);
+        (start < r.end).then_some(start..r.end)
+    });
+    let behind = ranges.iter().filter_map(|r| {
+        let end = r.end.min(from);
+        (r.start < end).then_some(r.start..end)
+    });
     let mut batch = epix_blob::bitfield::GroupBits::new();
     let mut left = COMPLETION_BATCH_GROUPS;
-    for r in needed.ranges() {
+    for r in ahead.chain(behind) {
         if left == 0 {
             break;
         }
@@ -3437,18 +3454,28 @@ impl RuntimeEdxFetcher {
         ForegroundFetch { streaming: self.streaming.clone() }
     }
 
-    /// Wait until no foreground range fetch is on the network. Polling is
-    /// fine here: only the background completion waits, and 200ms of extra
-    /// quiet costs it nothing.
-    async fn wait_foreground_idle(&self) {
+    /// Wait until playback needs nothing more urgent than the completion: no
+    /// foreground range fetch on the network, and no read-ahead still filling
+    /// the window in front of `key`'s play head. After a seek into missing
+    /// bytes that window is what decides whether playback stalls, so it gets
+    /// the links to itself until it is full. Returns the play head (the
+    /// read-ahead anchor) once idle, or `None` if nothing is playing the
+    /// file. Polling is fine here: only the background completion waits, and
+    /// 200ms of extra quiet costs it nothing.
+    async fn wait_playback_idle(&self, key: &(String, String)) -> Option<u64> {
         loop {
-            let busy = self
+            let (busy, anchor) = self
                 .streaming
                 .lock()
-                .map(|s| s.foreground_fetches > 0)
-                .unwrap_or(false);
+                .map(|s| {
+                    (
+                        s.foreground_fetches > 0 || s.inflight.contains(key),
+                        s.anchor.get(key).copied(),
+                    )
+                })
+                .unwrap_or((false, None));
             if !busy {
-                return;
+                return anchor;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
@@ -3513,12 +3540,14 @@ impl RuntimeEdxFetcher {
     /// and must never surface an error into a serve.
     async fn run_completion(&self, address: &str, inner_path: &str, id: ObjId, size: u64) {
         let Some(store) = self.state.edx_store().await else { return };
+        let key = (address.to_string(), inner_path.to_string());
         loop {
-            // Yield to any player-blocking fetch before starting the next
-            // batch: the deadline tiers order work WITHIN a peer's serving,
-            // but this pull still occupies the same few links/circuits a
-            // seek needs to dial through.
-            self.wait_foreground_idle().await;
+            // Yield to playback before starting the next batch: a
+            // player-blocking fetch, or the read-ahead filling the window in
+            // front of the play head. The deadline tiers order work WITHIN a
+            // peer's serving, but this pull still occupies the same few
+            // links/circuits a seek needs to dial through.
+            let play_head = self.wait_playback_idle(&key).await;
             let now = now_secs();
             let Ok(needed) = needed_groups(&store, id, size) else { return };
             if needed.is_empty() {
@@ -3534,8 +3563,11 @@ impl RuntimeEdxFetcher {
             let mut swarm =
                 Swarm::new(store.clone(), id, size).with_observer(self.xfer.scope(id, address));
             // Bounded batch per pass (16 MiB), so a seek arriving mid-download
-            // waits out one batch at most, not the whole remaining file.
-            let batch = completion_batch(&needed);
+            // waits out one batch at most, not the whole remaining file. Taken
+            // from the play head (re-read every pass, so a seek moves it) when
+            // the file is being played, from the start otherwise.
+            let from = play_head.map_or(0, |byte| byte / epix_blob::bitfield::GROUP_BYTES);
+            let batch = completion_batch(&needed, from);
             let Ok(report) = swarm.fetch(&batch, &handles, Deadline::background(), now).await
             else {
                 return;
@@ -7820,6 +7852,81 @@ mod tests {
         assert_eq!(w3.end, size, "window capped at EOF");
         // Serving the exact tail leaves nothing ahead to warm.
         assert!(plan_readahead(&(size - 10..size), size, None).is_none());
+    }
+
+    /// A completion batch follows the play head: everything missing from the
+    /// play head to the end of the file comes before the gaps behind it, and
+    /// the batch stays bounded. Pure - no network.
+    #[test]
+    fn completion_batch_starts_at_the_play_head() {
+        let mut needed = epix_blob::bitfield::GroupBits::new();
+        needed.add(0..100);
+        needed.add(5_000..5_100);
+
+        // Not playing: from the start of the file, as before.
+        let batch = completion_batch(&needed, 0);
+        assert_eq!(batch.ranges(), &[0..100, 5_000..5_100]);
+
+        // Seeked to group 5_050: the rest of that run first, then the gaps
+        // behind the play head, the run it landed in included.
+        let batch = completion_batch(&needed, 5_050);
+        assert_eq!(batch.count(), 200, "everything still fits one batch");
+
+        // More missing than one batch holds: what the play head reaches next
+        // wins the bound over what it has passed.
+        let mut big = epix_blob::bitfield::GroupBits::new();
+        big.add(0..COMPLETION_BATCH_GROUPS * 2);
+        big.add(10 * COMPLETION_BATCH_GROUPS..10 * COMPLETION_BATCH_GROUPS + 50);
+        let from = 10 * COMPLETION_BATCH_GROUPS;
+        let batch = completion_batch(&big, from);
+        assert_eq!(batch.count(), COMPLETION_BATCH_GROUPS, "one batch stays bounded");
+        assert!(
+            batch.contains_all(&(from..from + 50)),
+            "the missing groups ahead of the play head are taken first"
+        );
+        assert!(batch.contains(0), "the remainder backfills from the start");
+        assert!(!batch.contains(COMPLETION_BATCH_GROUPS * 2 - 1), "and stops at the bound");
+
+        // Play head past every gap: wraps round to them.
+        let batch = completion_batch(&needed, 9_000);
+        assert_eq!(batch.ranges(), &[0..100, 5_000..5_100]);
+    }
+
+    /// The background completion holds off while the read-ahead for the same
+    /// file is still filling the window in front of the play head, so after a
+    /// seek those bytes get the links first, and it resumes from that play
+    /// head once the window is full. A read-ahead of another file does not
+    /// hold it.
+    #[tokio::test]
+    async fn completion_waits_for_the_read_ahead_of_its_file() {
+        let state = AppState::new("node-a");
+        let fetcher = RuntimeEdxFetcher::new(state, epix_crypt::new_seed(), None);
+        let key = ("epix1xite".to_string(), "video/film.mp4".to_string());
+        let other = ("epix1xite".to_string(), "video/other.mp4".to_string());
+        {
+            let mut s = fetcher.streaming.lock().unwrap();
+            s.anchor.insert(key.clone(), 7 * epix_blob::bitfield::GROUP_BYTES);
+            s.inflight.insert(key.clone());
+            s.inflight.insert(other.clone());
+        }
+        let waiter = {
+            let fetcher = fetcher.clone();
+            let key = key.clone();
+            tokio::spawn(async move { fetcher.wait_playback_idle(&key).await })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert!(!waiter.is_finished(), "completion ran while its read-ahead was filling");
+
+        fetcher.streaming.lock().unwrap().inflight.remove(&key);
+        let play_head = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
+            .await
+            .expect("completion never resumed after the read-ahead finished")
+            .unwrap();
+        assert_eq!(play_head, Some(7 * epix_blob::bitfield::GROUP_BYTES));
+
+        // Not being played at all: no wait, and no play head.
+        let idle = ("epix1xite".to_string(), "video/idle.mp4".to_string());
+        assert_eq!(fetcher.wait_playback_idle(&idle).await, None);
     }
 
     /// moov head/tail span selection: gated by size, and both spans clamp to
