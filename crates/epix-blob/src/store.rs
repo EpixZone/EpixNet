@@ -1506,7 +1506,8 @@ impl Store {
         }
         self.ensure_extern_destination_available(id, &normalized_extern_key(&rel)?)?;
         let source = self.open_xite_file(path)?;
-        let size = source.metadata()?.len();
+        let meta = source.metadata()?;
+        let size = meta.len();
         let ob = OutboardBytes::from_reader(io::BufReader::new(source), size)?;
         if ob.root != id {
             return Err(io::Error::new(
@@ -1535,7 +1536,7 @@ impl Store {
         };
         let outboard_existed = self.obao_path(id).exists();
         self.install_outboard_atomic(id, &ob.data)?;
-        match self.commit_extern(id, ns, size, &rel, now) {
+        match self.commit_extern(id, ns, size, &rel, now, Some(&meta)) {
             Ok(inserted) => {
                 if sparse_write.is_some() {
                     self.remove_sparse_duplicate_file(id)?;
@@ -1584,7 +1585,8 @@ impl Store {
             return Ok(0);
         }
         let source = self.open_xite_file(path)?;
-        if source.metadata()?.len() != rec.size {
+        let meta = source.metadata()?;
+        if meta.len() != rec.size {
             return Ok(0);
         }
         // Re-verify the TREE copy against the object id before trusting it:
@@ -1602,7 +1604,7 @@ impl Store {
         // Guarded like `materialize`: no delete path may unlink the sparse
         // file between the swap and our own removal of it.
         let _writing = SparseWriteGuard::register(self, id);
-        match self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now) {
+        match self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now, Some(&meta)) {
             Ok(_) => {
                 self.remove_sparse_duplicate_file(id)?;
                 Ok(freed)
@@ -1671,7 +1673,7 @@ impl Store {
             // swap idempotently on restart.
             self.verify_extern_bytes_at(id, &rec, dst)?;
             self.install_outboard_from_path(id, rec.size, dst)?;
-            self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now)?;
+            self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now, None)?;
             return Ok(());
         }
         if !src.is_file() {
@@ -1703,7 +1705,7 @@ impl Store {
             )
         })?;
         self.install_outboard_atomic(id, &outboard.data)?;
-        if let Err(error) = self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now) {
+        if let Err(error) = self.commit_extern(id, u8_to_ns(rec.ns), rec.size, &rel, now, None) {
             // redb may have made the commit durable before reporting an I/O
             // error. Keep both verified copies so the idempotent retry can
             // inspect the live row and complete the right side.
@@ -3091,13 +3093,21 @@ impl Store {
 
     /// Commit the record + path row for an extern object in one txn, so a
     /// reader can never see `Loc::Extern` without a path to resolve it.
+    ///
+    /// `verified` is the metadata of the file at `rel`, taken from the open
+    /// file before the caller hashed it end to end against `id`. When given,
+    /// the stamp is written in the same txn, so the next revalidate skips the
+    /// re-read. Without it, a freshly adopted file was read in full again on
+    /// the next startup, with the activation gate held, only to record the
+    /// stamp the adopt could have recorded itself.
     fn commit_extern(
         &self,
         id: ObjId,
         ns: Ns,
         size: u64,
         rel: &str,
-        now: u64) -> io::Result<bool> {
+        now: u64,
+        verified: Option<&fs::Metadata>) -> io::Result<bool> {
         let destination_key = normalized_extern_key(rel)?;
         let txn = self.db.begin_write().map_err(db_err)?;
         let prev_loc;
@@ -3156,6 +3166,12 @@ impl Store {
             }
             externs.insert(id.0.as_slice(), rel).map_err(db_err)?;
             Self::clear_extern_stamp_in(&txn, id)?;
+            if let Some(stamp) = verified.and_then(Self::extern_stamp_bytes) {
+                txn.open_table(EXTERN_STAMP)
+                    .map_err(db_err)?
+                    .insert(id.0.as_slice(), stamp.as_slice())
+                    .map_err(db_err)?;
+            }
         }
         txn.commit().map_err(db_err)?;
         // Same race, sparse flavor (adopt vs a concurrent ensure_sparse): the
@@ -4650,7 +4666,9 @@ impl Store {
         // re-reading the whole file would prove the same thing again. This is
         // what keeps startup registration from re-hashing an entire xite
         // tree; anything that does not match still gets the full check below.
-        if self.extern_stamp_matches(id, &meta) {
+        // The stamp vouches for the file, not the outboard, so a missing
+        // outboard still takes the full path below, which rebuilds it.
+        if self.extern_stamp_matches(id, &meta) && self.obao_path(id).is_file() {
             return Ok(true);
         }
         let all = GroupBits::complete(rec.size);
@@ -6092,7 +6110,7 @@ mod tests {
         std::fs::write(&path, &bytes).unwrap();
         assert!(store.adopt_extern(id, Ns::Plain, &path, 1).unwrap());
 
-        // First pass reads the bytes and records the stamp.
+        // The adopt hashed the file end to end and recorded the stamp.
         assert!(store.revalidate(id).unwrap().is_complete(size));
         let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
 
@@ -6115,6 +6133,52 @@ mod tests {
 
         // Move only the mtime. Same length, same (corrupt) bytes - the stamp
         // no longer matches, so the real check must run and reject it.
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified + std::time::Duration::from_secs(5))
+            .unwrap();
+        assert!(
+            !store.revalidate(id).unwrap().is_complete(size),
+            "a modified extern of the same length was trusted"
+        );
+    }
+
+    /// Adopting a file reads and hashes all of it, so the adopt itself must
+    /// record the stamp. Before, only a revalidate wrote one, and every file
+    /// adopted since the last boot (all of a freshly signed xite's media) was
+    /// read in full again on the next startup with the activation gate held.
+    ///
+    /// Asserted the same way as above: corrupt the bytes, restore the mtime,
+    /// and the FIRST revalidate after the adopt must still answer complete.
+    #[test]
+    fn adopt_records_the_stamp_so_the_next_revalidate_skips_the_read() {
+        let store_dir = tempfile::tempdir().unwrap();
+        let tree = tempfile::tempdir().unwrap();
+        let store = rooted_store(&store_dir, &tree);
+        let bytes = test_data(120_000);
+        let (id, size, _) = slice_for(&bytes, &[0..bytes.len() as u64]);
+        let path = tree.path().join("site/movie.bin");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, &bytes).unwrap();
+        assert!(store.adopt_extern(id, Ns::Plain, &path, 1).unwrap());
+        let modified = std::fs::metadata(&path).unwrap().modified().unwrap();
+
+        let mut altered = bytes.clone();
+        altered[0] ^= 0xff;
+        std::fs::write(&path, &altered).unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        assert!(
+            store.revalidate(id).unwrap().is_complete(size),
+            "a freshly adopted extern was re-read instead of trusting the adopt's stamp"
+        );
+
         std::fs::File::options()
             .write(true)
             .open(&path)
@@ -6180,7 +6244,7 @@ mod tests {
         let rel = store.rel_of(&alias).unwrap();
         assert!(
             store
-                .commit_extern(other, Ns::Plain, data.len() as u64, &rel, 2)
+                .commit_extern(other, Ns::Plain, data.len() as u64, &rel, 2, None)
                 .is_err(),
             "normal commits reject portable path aliases"
         );

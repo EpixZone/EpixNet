@@ -2233,20 +2233,38 @@ impl Xite {
                 store.claim_manifest(id).map_err(Error::Io)?;
                 return Ok(true);
             }
-            let Ok((actual, actual_size)) = epix_blob::ObjId::of_file(&path) else {
-                return Ok(false);
+            // A fresh adopt hashes the whole file and refuses one that does
+            // not hash to `id` (the root covers the length too), so it is the
+            // only read a new file needs. Hashing it with `of_file` first, as
+            // this used to, read every newly signed file twice.
+            let file_matches = || {
+                matches!(epix_blob::ObjId::of_file(&path),
+                    Ok((actual, actual_size)) if actual == id && actual_size == size)
             };
-            if actual != id || actual_size != size {
-                return Ok(false);
-            }
-            let fresh = store
-                .adopt_extern(id, epix_blob::Ns::Plain, &path, now)
-                .map_err(Error::Io)?;
-            if !fresh {
-                // A record already existed. If it is a store-side copy of
-                // this same file, hand the space back and read through to the
-                // tree instead. No-op for anything else.
-                store.reclaim_duplicate(id, &path, now).map_err(Error::Io)?;
+            match store.adopt_extern(id, epix_blob::Ns::Plain, &path, now) {
+                Ok(true) => {}
+                Ok(false) => {
+                    // A record already existed, so the adopt returned without
+                    // reading this file. Check it here before claiming.
+                    if !file_matches() {
+                        return Ok(false);
+                    }
+                    // If the record is a store-side copy of this same file,
+                    // hand the space back and read through to the tree
+                    // instead. No-op for anything else.
+                    store.reclaim_duplicate(id, &path, now).map_err(Error::Io)?;
+                }
+                // Keep the old outcome for every failure: a file that is not
+                // `id` is a stale or missing local copy (fetch it from the
+                // swarm), while a matching file that still failed to adopt is
+                // a real error. The adopt can fail before hashing, e.g. when
+                // the previous version's object still claims this path.
+                Err(error) => {
+                    if !file_matches() {
+                        return Ok(false);
+                    }
+                    return Err(Error::Io(error));
+                }
             }
         }
         store.claim_manifest(id).map_err(Error::Io)?;
@@ -3087,6 +3105,53 @@ mod tests {
             (1, 0)
         );
         assert!(store.is_complete(id).unwrap());
+    }
+
+    /// A node that has the new manifest but still the previous version of a
+    /// large file: the old object still claims the path, so the adopt fails
+    /// before it reads anything. That must stay a skip (fetch the new bytes
+    /// from the swarm), not an error, as it was when every file was hashed
+    /// before the adopt.
+    #[test]
+    fn stale_large_file_claimed_by_its_old_object_is_skipped() {
+        let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let storage = XiteStorage::new(dir.path());
+        let old: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let mut new = old.clone();
+        new[0] ^= 0xff;
+        storage.write("movie.bin", &old).unwrap();
+        let xite = Xite::new(Address::parse(address).unwrap(), storage);
+        let manifest = |bytes: &[u8]| {
+            json!({
+                "files": {
+                    "movie.bin": {
+                        "size": bytes.len(),
+                        "sha512": XiteStorage::hash_bytes(bytes),
+                        "b3": epix_blob::ObjId::of(bytes).to_string(),
+                    }
+                }
+            })
+        };
+        let store_dir = tempfile::tempdir().unwrap();
+        let store = epix_blob::store::Store::open_with(
+            store_dir.path(),
+            epix_blob::store::StoreConfig {
+                xite_root: Some(dir.path().to_path_buf()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            xite.register_file_entries(&store, &manifest(&old), "", 1).unwrap(),
+            (1, 0)
+        );
+
+        assert_eq!(
+            xite.register_file_entries(&store, &manifest(&new), "", 2).unwrap(),
+            (0, 1)
+        );
+        assert!(!store.is_complete(epix_blob::ObjId::of(&new)).unwrap_or(false));
     }
 
     #[test]
