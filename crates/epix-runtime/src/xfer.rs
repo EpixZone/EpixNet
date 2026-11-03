@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-use epix_blob::bitfield::bytes_of_group;
+use epix_blob::bitfield::{bytes_of_group, group_count, GroupBits};
 use epix_blob::ObjId;
 use epix_edx::sim::Class;
 use serde_json::{json, Value};
@@ -34,6 +34,13 @@ const MAX_FILES: usize = 24;
 /// A peer with no activity for this long is dropped from the readout - it
 /// left the session and its stale row is just noise.
 const PEER_IDLE_DROP: u64 = 300;
+/// Most cells in a chunk map. A 567 MB film is ~34k groups; the panel bar
+/// is a few hundred pixels wide, so the node folds the groups into at most
+/// this many cells rather than shipping a bitfield every poll.
+pub const CHUNK_MAP_CELLS: u64 = 300;
+
+/// Hands every fetch scope its own key in the file record.
+static SCOPE_SERIAL: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Per-second byte buckets in a ring, for a rate readout without keeping a
 /// sample log. Stale buckets are cleared as the clock moves over them, so a
@@ -105,6 +112,15 @@ struct PeerXfer {
     rate: Rate,
 }
 
+/// What one running fetch of a file is after, for the chunk map.
+#[derive(Default)]
+struct ActiveFetch {
+    /// The groups it was asked for. Those not yet present are queued.
+    wanted: GroupBits,
+    /// One run per batch booked onto a peer and not yet settled.
+    inflight: Vec<std::ops::Range<u64>>,
+}
+
 /// Everything known about one object's transfer.
 struct FileXfer {
     address: String,
@@ -151,6 +167,9 @@ struct FileXfer {
     last_error: Option<(u64, String)>,
     /// Requests in flight across all peers (a cheap top-line number).
     inflight: u32,
+    /// The fetches running for this file right now (serve, read-ahead,
+    /// completion), keyed by their scope.
+    active: HashMap<u64, ActiveFetch>,
 }
 
 impl FileXfer {
@@ -179,6 +198,7 @@ impl FileXfer {
             last_served_end: 0,
             last_error: None,
             inflight: 0,
+            active: HashMap::new(),
         }
     }
 
@@ -422,8 +442,55 @@ impl Xfer {
             xfer: self.clone(),
             id,
             address: address.to_string(),
+            serial: SCOPE_SERIAL.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             booked: Mutex::new(HashMap::new()),
         })
+    }
+
+    /// The torrent-client strip for one file: its chunk groups folded into
+    /// at most `cells` cells, each the most urgent state of the groups in
+    /// it. `d` downloading (booked onto a peer now), `q` queued (wanted by
+    /// a running fetch, not here yet), `h` have, `p` partly have, `.` not
+    /// downloaded and not asked for. `present` is the store's bitfield.
+    /// Answers even for a file nothing is fetching, from `present` alone.
+    pub fn chunk_map(&self, id: ObjId, present: &GroupBits, size: u64, cells: u64) -> Value {
+        let groups = group_count(size);
+        if groups == 0 || cells == 0 {
+            return Value::Null;
+        }
+        let mut inflight = GroupBits::new();
+        let mut queued = GroupBits::new();
+        if let Some(f) = self.files.lock().expect("xfer").get(&id) {
+            for fetch in f.active.values() {
+                for r in &fetch.inflight {
+                    inflight.add(r.clone());
+                }
+                for r in fetch.wanted.ranges() {
+                    queued.add(r.clone());
+                }
+            }
+        }
+        for r in present.ranges().iter().chain(inflight.ranges()) {
+            queued.remove(r.clone());
+        }
+        let cells = cells.min(groups);
+        let map: String = (0..cells)
+            .map(|i| {
+                let cell = i * groups / cells..(i + 1) * groups / cells;
+                if holds_any(&inflight, &cell) {
+                    'd'
+                } else if holds_any(&queued, &cell) {
+                    'q'
+                } else if present.contains_all(&cell) {
+                    'h'
+                } else if holds_any(present, &cell) {
+                    'p'
+                } else {
+                    '.'
+                }
+            })
+            .collect();
+        json!({ "cells": cells, "groups": groups, "map": map })
     }
 
     /// One file's telemetry as JSON, or `Null` when nothing is tracked for
@@ -445,6 +512,8 @@ pub struct Scope {
     xfer: std::sync::Arc<Xfer>,
     id: ObjId,
     address: String,
+    /// This fetch's key in the file's `active` table.
+    serial: u64,
     /// Requests booked and not yet resolved, per peer. The scheduler
     /// abandons in-flight duplicates when a fetch completes early, so the
     /// counts are released on drop rather than trusted to balance.
@@ -477,6 +546,34 @@ impl Scope {
 }
 
 impl epix_edx::sched::FetchObserver for Scope {
+    fn on_fetch_wanted(&self, wanted: &GroupBits) {
+        let serial = self.serial;
+        self.touch(now_secs(), |f| {
+            f.active.entry(serial).or_default().wanted = wanted.clone();
+        });
+    }
+
+    fn on_groups_requested(&self, groups: &[u64]) {
+        let (Some(first), Some(last)) = (groups.first(), groups.last()) else { return };
+        let serial = self.serial;
+        self.touch(now_secs(), |f| {
+            f.active.entry(serial).or_default().inflight.push(*first..*last + 1);
+        });
+    }
+
+    fn on_groups_settled(&self, groups: &[u64]) {
+        let (Some(first), Some(last)) = (groups.first(), groups.last()) else { return };
+        let run = *first..*last + 1;
+        let serial = self.serial;
+        self.touch(now_secs(), |f| {
+            if let Some(fetch) = f.active.get_mut(&serial) {
+                if let Some(at) = fetch.inflight.iter().position(|r| *r == run) {
+                    fetch.inflight.swap_remove(at);
+                }
+            }
+        });
+    }
+
     fn on_request(&self, peer: &str, class: Class, bytes: u64) {
         let now = now_secs();
         {
@@ -532,6 +629,12 @@ impl Drop for Scope {
     /// Release every booking the fetch never resolved (an abandoned
     /// duplicate, or a fetch that returned with batches still racing).
     fn drop(&mut self) {
+        // The fetch is over: nothing it wanted is queued any more. Only an
+        // existing record is touched, so a scope outliving its evicted file
+        // does not bring the file back.
+        if let Some(f) = self.xfer.files.lock().expect("xfer").get_mut(&self.id) {
+            f.active.remove(&self.serial);
+        }
         let outstanding: Vec<(String, (u32, u64))> = self
             .booked
             .lock()
@@ -553,6 +656,12 @@ impl Drop for Scope {
             }
         });
     }
+}
+
+/// Whether `bits` holds any group of `cell`.
+fn holds_any(bits: &GroupBits, cell: &std::ops::Range<u64>) -> bool {
+    let missing: u64 = bits.gaps(cell).iter().map(|g| g.end - g.start).sum();
+    missing < cell.end - cell.start
 }
 
 /// Bytes of an object present locally, from its group bitfield.
@@ -618,6 +727,48 @@ mod tests {
         r.add(1_000, 100_000);
         // A lap later the old bucket must not be counted again.
         assert_eq!(r.per_sec(1_000 + RATE_BUCKETS), 0);
+    }
+
+    /// The chunk map shows, per cell, what is downloading, what a running
+    /// fetch still wants, what is here and what nobody asked for, and the
+    /// queued and downloading cells clear when the fetch ends.
+    #[test]
+    fn chunk_map_shows_have_queued_downloading_and_gaps() {
+        use epix_edx::sched::FetchObserver;
+        let xfer = std::sync::Arc::new(Xfer::default());
+        let id = ObjId([5u8; 32]);
+        // Ten groups, one cell each.
+        let size = 10 * epix_blob::bitfield::GROUP_BYTES;
+        let mut present = GroupBits::new();
+        present.add(0..2);
+
+        // Nothing fetching: only what the store holds.
+        assert_eq!(xfer.chunk_map(id, &present, size, 10)["map"], json!("hh........"));
+
+        // A fetch wants groups 4..8 and has 4..6 booked onto a peer.
+        let scope = xfer.scope(id, "epix1test");
+        let mut wanted = GroupBits::new();
+        wanted.add(4..8);
+        scope.on_fetch_wanted(&wanted);
+        scope.on_request("peer-a", Class::Tor, 2 * epix_blob::bitfield::GROUP_BYTES);
+        scope.on_groups_requested(&[4, 5]);
+        assert_eq!(xfer.chunk_map(id, &present, size, 10)["map"], json!("hh..ddqq.."));
+
+        // That batch lands: downloaded, no longer downloading.
+        scope.on_groups_settled(&[4, 5]);
+        present.add(4..6);
+        assert_eq!(xfer.chunk_map(id, &present, size, 10)["map"], json!("hh..hhqq.."));
+
+        // Five cells over ten groups: a cell takes the most urgent state of
+        // its two groups, and half-held reads as partial.
+        present.add(8..9);
+        assert_eq!(xfer.chunk_map(id, &present, size, 5)["map"], json!("h.hqp"));
+
+        // The fetch ends with 6..8 never fetched: back to plain gaps.
+        drop(scope);
+        let map = xfer.chunk_map(id, &present, size, 10);
+        assert_eq!(map["map"], json!("hh..hh..h."));
+        assert_eq!(map["groups"], json!(10));
     }
 
     #[test]
