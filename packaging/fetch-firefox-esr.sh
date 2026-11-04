@@ -4,6 +4,7 @@
 # it honors the unsigned-extension pref the bundled Epix Wallet needs).
 #
 # Usage: packaging/fetch-firefox-esr.sh [os]   (os: osx | linux | win64)
+# On Linux, add --if-needed to reuse the same completed download.
 # EPIX_FF_VERSION overrides the pinned release (include the esr suffix).
 # Writes into packaging/firefox-esr/. build-app.sh picks it up automatically.
 set -euo pipefail
@@ -17,6 +18,10 @@ if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?esr$ ]]; then
   exit 1
 fi
 OS="${1:-osx}"
+if (( $# > 1 )) && [[ "$OS" != linux || $# != 2 || "$2" != --if-needed ]]; then
+  echo "usage: $0 [osx | linux [--if-needed] | win64]" >&2
+  exit 1
+fi
 MOZILLA_OS="$OS"
 # Mozilla's `linux` product is i686, even on a 64-bit host. Never bundle it
 # with our 64-bit Rust executables (the old Linux release did exactly that).
@@ -32,6 +37,17 @@ OUT="$REPO_ROOT/packaging/firefox-esr"
 mkdir -p "$OUT"
 
 URL="https://download.mozilla.org/?product=firefox-${VERSION}-ssl&os=${MOZILLA_OS}&lang=${LANG_}"
+if [[ "$OS" == linux ]]; then
+  # Serialize the cache check and installation, including unconditional downloads.
+  exec 9>"$OUT/.linux-download.lock"
+  flock 9
+  STAMP="$OUT/.linux-source-url"
+  if [[ ${2:-} == --if-needed && -f "$STAMP" && "$(<"$STAMP")" == "$URL" &&
+        -f "$OUT/firefox/firefox" && -x "$OUT/firefox/firefox" && -f "$OUT/firefox/libxul.so" ]]; then
+    echo "· reusing Firefox $VERSION ($OS, $LANG_)"
+    exit 0
+  fi
+fi
 echo "· downloading Firefox $VERSION ($OS, $LANG_)"
 
 case "$OS" in
@@ -48,16 +64,26 @@ case "$OS" in
     echo "  build with: EPIX_BUNDLE_FIREFOX=\"$OUT/Firefox.app\" packaging/macos/build-app.sh"
     ;;
   linux)
-    curl --fail --location --retry 3 -o "$OUT/firefox-esr.tar.xz" "$URL"
     # Extract into an empty tree so a new ESR cannot retain obsolete files.
     TMP="$(mktemp -d "$OUT/.firefox-XXXXXX")"
-    trap 'rm -rf "$TMP"' EXIT
-    tar -C "$TMP" -xf "$OUT/firefox-esr.tar.xz"
+    cleanup_linux() {
+      if [[ -d "$TMP/previous" && ! -e "$OUT/firefox" ]]; then
+        mv "$TMP/previous" "$OUT/firefox"
+      fi
+      rm -rf "$TMP"
+    }
+    trap cleanup_linux EXIT
+    curl --fail --location --retry 3 -o "$TMP/archive.tar.xz" "$URL"
+    tar -C "$TMP" -xf "$TMP/archive.tar.xz"
+    test -f "$TMP/firefox/firefox"
     test -x "$TMP/firefox/firefox"
     test -f "$TMP/firefox/libxul.so"
-    rm -rf "$OUT/firefox"
+    printf '%s\n' "$URL" > "$TMP/source-url"
+    # An interrupted replacement must never leave the old URL on a new tree.
+    rm -f "$STAMP"
+    if [[ -e "$OUT/firefox" ]]; then mv "$OUT/firefox" "$TMP/previous"; fi
     mv "$TMP/firefox" "$OUT/firefox"
-    rm -f "$OUT/firefox-esr.tar.xz"
+    mv "$TMP/source-url" "$STAMP"
     echo "· ready: $OUT/firefox/ (Linux)"
     ;;
   win64)

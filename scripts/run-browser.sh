@@ -1,12 +1,19 @@
 #!/usr/bin/env bash
-# Run the Epix desktop browser for local testing.
-#
-# `cargo run -p epix-browser` does NOT build the native-messaging host
-# (epix-nmh), which the extension talks to for the Tor status icon and name
-# resolution. If that binary is missing or stale the Tor icon shows "Off". This
-# helper builds both, then runs the browser. Pass a xite as an argument, e.g.
-#   scripts/run-browser.sh talk.epix
+# Launch the full desktop from this checkout, optionally opening a xite.
+# Example: ./scripts/run-browser.sh talk.epix
 set -euo pipefail
 cd "$(dirname "$0")/.."
-cargo build --release -p epix-nmh
-exec cargo run --release -p epix-browser -- "$@"
+
+if [[ "$(uname -s)" == Linux && -z "${EPIX_FIREFOX:-}" ]]; then
+  cache="$PWD/packaging/firefox-esr"
+  mkdir -p "$cache"
+  (
+    flock -x 9
+    packaging/fetch-firefox-esr.sh linux --if-needed
+    packaging/linux/prepare-firefox.sh "$cache/firefox"
+  ) 9>"$cache/.desktop-setup.lock"
+  export EPIX_FIREFOX="$cache/firefox/firefox"
+fi
+
+cargo build --release --locked -p epix-nmh -p evx-worker
+exec cargo run --release --locked -p epix-browser -- "$@"

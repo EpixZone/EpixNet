@@ -135,7 +135,8 @@ class EvxPackagingTests(unittest.TestCase):
         repo = self.root / "repo"
         package = repo / "packaging/linux"
         package.mkdir(parents=True)
-        shutil.copy2(HERE / "build-linux.sh", package / "build-linux.sh")
+        for script in ("build-linux.sh", "prepare-firefox.sh"):
+            shutil.copy2(HERE / script, package / script)
         shutil.copy2(HERE / "epix.desktop", package / "epix.desktop")
         # Isolate staging from compiler, browser downloads, extension
         # installation and package tools.

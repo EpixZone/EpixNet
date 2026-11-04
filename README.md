@@ -29,15 +29,11 @@ EpixNet is built from its source code. Pick your system below. Each guide starts
 
 Once it is built, there are three ways to start it:
 
-The desktop app requires its matching packaged Firefox ESR resources. For a
-local browser build, follow the [extension adapter setup](docs/xite-extensions.md#local-desktop-builds)
-and set `EPIX_FIREFOX` to that prepared copy. The standalone node uses your
-normal browser.
+On Linux, follow the [desktop setup](docs/install/linux.md#the-full-desktop-app-managed-firefox) once. The source launcher prepares and reuses a matching Firefox ESR. Other platforms can use a prepared runtime as described in the [extension adapter setup](docs/xite-extensions.md#local-desktop-builds). The standalone node uses your normal browser.
 
 ```sh
-# 1. The full desktop app: opens a managed Firefox that understands .epix names,
-#    so typing dashboard.epix or talk.epix just works.
-cargo run -p epix-browser
+# 1. Full desktop on Linux: launch the node, managed Firefox and wallet together.
+./scripts/run-browser.sh
 
 # 2. Just the node, no Firefox wrapper: it opens the dashboard in your normal
 #    browser. Good if you already have a browser you like.

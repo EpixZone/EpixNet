@@ -3,6 +3,7 @@
 ## Desktop installer
 
 Download the package for your system from [EpixNet releases](https://github.com/EpixZone/EpixNet/releases).
+For a Git checkout, see [launch the full desktop from source](#the-full-desktop-app-managed-firefox).
 The desktop packages include Firefox ESR and the Epix Wallet; you do not need
 Rust or a separate Firefox installation. These packages target 64-bit Intel/AMD
 PCs. See the release notes for the platforms validated for a particular build.
@@ -53,7 +54,7 @@ run `install.sh` again after moving it.
 
 ## Build from source
 
-Install the tools and clone the source once. Keep that checkout for [updates from GitHub](#update-a-headless-node-with-git).
+Install the tools and clone the source once. Keep that checkout for [updates from GitHub](#update-a-source-checkout-with-git).
 
 Type the commands into your terminal.
 
@@ -251,7 +252,7 @@ To serve it publicly instead, put a reverse proxy (for example nginx) in front a
 
 ### Updating to a new release
 
-For an existing service, you can [switch to Git-based updates](#update-a-headless-node-with-git) and keep the same service and data directory.
+For an existing service, you can [switch to Git-based updates](#update-a-source-checkout-with-git) and keep the same service and data directory.
 
 To stay with prebuilt releases, stop the service, repeat the download and extraction from step 1, then start it again. The service keeps its existing data directory.
 
@@ -272,11 +273,11 @@ EPIX_HEADLESS=1 ./target/release/epix-server
 
 Then visit **http://127.0.0.1:42222/** from a browser (use an SSH tunnel if the server is remote: `ssh -L 42222:127.0.0.1:42222 you@server`).
 
-### Update a headless node with Git
+## Update a source checkout with Git
 
 Reuse the checkout from step 3. If you installed the tarball and have no checkout yet, follow [source steps 1 to 3](#build-from-source) once. Git fetches source objects your checkout is missing. Keeping the checkout, Cargo's cache and `target/` lets later builds reuse downloaded dependencies and compiled files. New dependencies can still require downloads. Prebuilt Linux release packages are still full downloads.
 
-Run this from your login account. It looks up the [latest stable release](https://github.com/EpixZone/EpixNet/releases/latest) on GitHub, fetches that tag into your existing clean checkout, and builds it. The old node can keep running during the build.
+Run this from your login account. It looks up the [latest stable release](https://github.com/EpixZone/EpixNet/releases/latest) on GitHub, fetches that tag into your existing clean checkout, and prints the selected version.
 
 ```sh
 cd "$HOME/EpixNet" &&
@@ -284,13 +285,23 @@ tag=$(curl -fsSL https://api.github.com/repos/EpixZone/EpixNet/releases/latest |
   python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') &&
 git fetch --no-tags origin tag "$tag" &&
 git switch --detach "refs/tags/$tag" &&
+git describe --tags --exact-match
+```
+
+If you intentionally track development builds and your checkout is already on `main`, use `git pull --ff-only origin main` in place of the fetch and switch commands. `main` can include changes beyond the latest release.
+
+For a desktop, quit EpixNet from the tray, update the checkout, then [run the desktop launcher](#the-full-desktop-app-managed-firefox) again.
+
+### Update the headless service
+
+For the `epix.service` above, build the node and its matching worker in the updated checkout. Leave the old node running during the build.
+
+```sh
 cargo build --release --locked -p epix-server -p evx-worker &&
 ./target/release/epix-server --version
 ```
 
-If you intentionally track development builds and your checkout is already on `main`, use `git pull --ff-only origin main` in place of the fetch and switch commands. Then run the same build command. `main` can include changes beyond the latest release.
-
-For the `epix.service` above, check that the printed version is the one you built. Stage both executables before stopping the node, then replace them together.
+Check the printed version, then stage both executables before stopping the service.
 
 ```sh
 sudo install -d /opt/epix-stage &&
@@ -305,28 +316,41 @@ The service continues to use the same `epix` account and its existing identities
 
 ## The full desktop app (managed Firefox)
 
-On a machine with a screen, EpixNet can run inside a managed copy of Firefox that understands `.epix` names directly. Install Firefox with your package manager first.
-
-This part draws a window and a tray icon, so unlike the node it needs the
-desktop development libraries. Install those too, or the build fails at the
-LINK step with a bare `unable to find library -lxdo`, which does not say what
-wants it:
+From a graphical Linux session, one command opens the managed Firefox window, starts the embedded EpixNet node and connects the wallet through its native messaging host. Use your normal desktop account. Complete source steps 1 to 3 and install the desktop dependencies for your distribution once.
 
 ```sh
 # Debian or Ubuntu
-sudo apt install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev
+sudo apt install -y libgtk-3-dev libxdo-dev libayatana-appindicator3-dev libudev-dev xz-utils util-linux
 
 # Fedora
-sudo dnf install -y gtk3-devel libxdo-devel libayatana-appindicator-gtk3-devel
+sudo dnf install -y gtk3-devel libxdo-devel libappindicator-gtk3-devel systemd-devel xz util-linux
 
 # Arch
-sudo pacman -S --needed gtk3 xdotool libayatana-appindicator
+sudo pacman -S --needed gtk3 xdotool libayatana-appindicator systemd-libs xz util-linux
 ```
 
-Then:
+From the checkout, launch the full desktop:
 
 ```sh
-cargo run -p epix-browser
+./scripts/run-browser.sh
+```
+
+The helper prepares a private copy of the release’s supported Firefox ESR, stages the trusted extension resources, and builds the launcher, native messaging host and EVX worker. The launcher opens the dashboard with the bundled Epix Wallet. To open a specific xite, run `./scripts/run-browser.sh talk.epix`.
+
+The first launch can take a while. Later launches reuse the Firefox download while the pin, architecture and language match. Cargo also reuses its build output, and the wallet build reuses the staged extension while its pin matches. After [updating the Git checkout](#update-a-source-checkout-with-git), run the same launch command. Select **Quit** in the tray to stop the desktop node.
+
+**On the v0.6.3 tag**, the older helper expects you to prepare Firefox and the worker first. From the checkout, run these setup commands once:
+
+```sh
+packaging/fetch-firefox-esr.sh linux &&
+python3 packaging/firefox-addons/install.py packaging/firefox-esr/firefox &&
+cargo build --release --locked -p evx-worker
+```
+
+Then start that release with one command:
+
+```sh
+EPIX_FIREFOX="$PWD/packaging/firefox-esr/firefox/firefox" ./scripts/run-browser.sh
 ```
 
 ## Where your data lives

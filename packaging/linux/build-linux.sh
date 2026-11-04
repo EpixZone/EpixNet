@@ -46,30 +46,8 @@ cp "$TARGET_DIR/release/evx-worker" "$STAGE/evx-worker"
 
 # Bundle Firefox ESR (fetch-firefox-esr.sh linux) or a provided dir.
 cp -a "$FF/." "$STAGE/firefox/"
-"${CC:-cc}" -shared -fPIC -O2 -Wall -Wextra -Werror \
-  "$REPO_ROOT/packaging/linux/sandbox-probe.c" \
-  -o "$STAGE/firefox/libepix-sandbox-probe.so"
+bash "$REPO_ROOT/packaging/linux/prepare-firefox.sh" "$STAGE/firefox"
 cp "$REPO_ROOT/LICENSE" "$STAGE/LICENSE"
-
-# Firefox enterprise policies: trust the launcher's local CA so https://*.epix
-# is a secure context on machines without NSS certutil (the launcher writes
-# the CA itself to ~/.mozilla/certificates/epix-ca.pem at each run), and
-# default urlbar search to DuckDuckGo (ESR-only policy; the bundle is ESR).
-mkdir -p "$STAGE/firefox/distribution"
-cat > "$STAGE/firefox/distribution/policies.json" <<'POLICIES'
-{
-  "policies": {
-    "DisableAppUpdate": true,
-    "Certificates": {
-      "Install": ["epix-ca.pem"]
-    },
-    "SearchEngines": {
-      "Default": "DuckDuckGo"
-    }
-  }
-}
-POLICIES
-python3 "$REPO_ROOT/packaging/firefox-addons/install.py" "$STAGE/firefox"
 
 # Hicolor icons for the .desktop entry, prebuilt from the assets repo
 # (images/icons/generated/linux) and checked in under packaging/linux/icons.
