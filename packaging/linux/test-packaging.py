@@ -128,6 +128,91 @@ class PackagingTests(unittest.TestCase):
                                 capture_output=True)
         self.assertNotEqual(result.returncode, 0)
 
+    def test_linux_source_launcher_prepares_its_runtime_and_respects_an_override(self):
+        repo = self.root / "source checkout"
+        scripts = repo / "scripts"
+        scripts.mkdir(parents=True)
+        launcher = scripts / "run-browser.sh"
+        shutil.copy2(HERE.parents[1] / "scripts/run-browser.sh", launcher)
+        shutil.copytree(HERE, repo / "packaging/linux")
+        shutil.copytree(HERE.parent / "firefox-addons", repo / "packaging/firefox-addons")
+        shutil.copytree(HERE.parents[1] / "shells/epix-theme", repo / "shells/epix-theme")
+        fetch = repo / "packaging/fetch-firefox-esr.sh"
+        fetch.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > fetch-args\n'
+                         'mkdir -p packaging/firefox-esr/firefox\n'
+                         'cp /bin/true packaging/firefox-esr/firefox/firefox\n'
+                         'cp /bin/true packaging/firefox-esr/firefox/libxul.so\n')
+        fetch.chmod(0o755)
+        browser = self.root / "custom target/release/epix-browser"
+        browser.parent.mkdir(parents=True)
+        browser.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                           'with open("browser-call", "x") as out:\n'
+                           '    json.dump([os.environ.get("EPIX_FIREFOX"), sys.argv[1:]], out)\n')
+        browser.chmod(0o755)
+        cargo = self.root / "cargo"
+        cargo.write_text('#!/usr/bin/env python3\nimport json, os, sys\n'
+                         'with open("cargo-calls", "a") as out:\n'
+                         '    print(json.dumps(sys.argv[1:]), file=out)\n'
+                         'browser = os.environ["TEST_BROWSER"]\n'
+                         'if sys.argv[1] == "run":\n'
+                         '    os.execv(browser, [browser, *sys.argv[sys.argv.index("--") + 1:]])\n'
+                         'for name in ("epix-browser", "evx-worker"):\n'
+                         '    print(json.dumps({"reason": "compiler-artifact", "target": {"name": name, "kind": ["bin"]},\n'
+                         '                      "executable": os.path.join(os.path.dirname(browser), name)}))\n'
+                         'sys.exit(int(os.environ.get("TEST_CARGO_STATUS", "0")))\n')
+        cargo.chmod(0o755)
+        runtime = repo / "packaging/firefox-esr/firefox"
+        external = self.root / "custom firefox"
+        external.mkdir()
+        shutil.copy2("/bin/true", external / "firefox")
+        args = ["epix://talk.epix/", "argument with spaces"]
+        uname = self.root / "uname"
+        uname.write_text('#!/bin/sh\nprintf "%s\\n" "$TEST_OS"\n')
+        uname.chmod(0o755)
+        calls, launched, capture = (repo / name for name in ("cargo-calls", "browser-call", "fetch-args"))
+        for host, override in (("Linux", False), ("Linux", True), ("Darwin", False)):
+            with self.subTest(host=host, override=override):
+                for output in (calls, launched, capture):
+                    output.unlink(missing_ok=True)
+                env = {"PATH": str(self.root) + os.pathsep + os.environ["PATH"], "TEST_OS": host,
+                       "TEST_BROWSER": str(browser)}
+                selected = external / "firefox" if override else runtime / "firefox"
+                if override:
+                    env["EPIX_FIREFOX"] = str(selected)
+                subprocess.run(["bash", str(launcher), *args], cwd=self.root, env=env,
+                               check=True, capture_output=True, text=True)
+                build, *rest = map(json.loads, calls.read_text().splitlines())
+                self.assertEqual(build[0], "build")
+                self.assertTrue({"--release", "--locked"} <= set(build))
+                packages = {name for flag, name in zip(build, build[1:]) if flag == "-p"}
+                self.assertTrue({"epix-nmh", "evx-worker"} <= packages)
+                if host == "Linux":
+                    self.assertIn("epix-browser", packages)
+                    self.assertIn("--message-format=json-render-diagnostics", build)
+                    self.assertFalse(rest, "another Cargo command can change the unified feature graph")
+                else:
+                    launch, = rest
+                    self.assertEqual(launch[0], "run")
+                    self.assertTrue({"--release", "--locked", "epix-browser"} <= set(launch))
+                self.assertEqual(json.loads(launched.read_text()), [str(selected) if host == "Linux" else None, args])
+                if host == "Linux" and not override:
+                    self.assertEqual(capture.read_text().splitlines(), ["linux", "--if-needed"])
+                    self.assertTrue((runtime / "libepix-sandbox-probe.so").is_file())
+                    self.assertTrue((runtime / "distribution/epix-addon-installer/manager.sys.mjs").is_file())
+                    policy = json.loads((runtime / "distribution/policies.json").read_text())
+                    self.assertIn("epix-ca.pem", policy["policies"]["Certificates"]["Install"])
+                else:
+                    self.assertFalse(capture.exists())
+                    self.assertEqual(list(external.iterdir()), [external / "firefox"])
+
+        # Cargo can report the browser artifact and still fail while building a helper.
+        launched.unlink(missing_ok=True)
+        failed = subprocess.run(["bash", str(launcher), *args], cwd=self.root, capture_output=True,
+                                env=dict(env, TEST_OS="Linux", EPIX_FIREFOX=str(external / "firefox"),
+                                         TEST_CARGO_STATUS="101"))
+        self.assertNotEqual(failed.returncode, 0)
+        self.assertFalse(launched.exists())
+
     def test_relocated_tar_desktop_entry_launches_paths_with_reserved_characters(self):
         bundle = self.root / 'Epix & Space % "quote" $dollar `tick` \\ slash'
         bundle.mkdir()

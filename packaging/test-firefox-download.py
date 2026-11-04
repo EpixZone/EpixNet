@@ -44,6 +44,10 @@ class FirefoxDownloadTests(unittest.TestCase):
         stubs = {
             "curl": '''#!/bin/sh
 printf '%s\n' "$@" > "$EPIX_TEST_CAPTURE"
+if [ -n "${EPIX_TEST_CURL_LOG:-}" ]; then
+  echo called >> "$EPIX_TEST_CURL_LOG"
+  sleep 0.2
+fi
 if [ "${EPIX_TEST_HTTP_FAILURE:-0}" = 1 ]; then exit 22; fi
 while [ "$1" != -o ]; do shift; done
 cp "$EPIX_TEST_ARCHIVE" "$2"
@@ -73,9 +77,9 @@ done
         for variable in ("EPIX_FF_VERSION", "EPIX_FF_LANG", "EPIX_ARCH"):
             self.env.pop(variable, None)
 
-    def fetch(self, platform, **env):
+    def fetch(self, platform, *args, **env):
         self.capture.unlink(missing_ok=True)
-        return subprocess.run(["bash", str(self.script), platform],
+        return subprocess.run(["bash", str(self.script), platform, *args],
                               env=dict(self.env, **env), capture_output=True, text=True)
 
     def assert_download(self, result, product, platform, language="en-US"):
@@ -122,6 +126,69 @@ done
             with self.subTest(version=version):
                 result = self.fetch("linux", EPIX_ARCH="x86_64", EPIX_FF_VERSION=version)
                 self.assertNotEqual(result.returncode, 0)
+                self.assertFalse(self.capture.exists())
+
+    def test_cached_linux_runtime_can_be_reused_offline_but_default_still_downloads(self):
+        env = {"EPIX_ARCH": "x86_64"}
+        self.assert_download(self.fetch("linux", "--if-needed", **env), "firefox-153.4.0esr-ssl", "linux64")
+        offline = self.fetch("linux", "--if-needed", **env, EPIX_TEST_HTTP_FAILURE="1")
+        self.assertEqual(offline.returncode, 0, offline.stderr)
+        self.assertFalse(self.capture.exists())
+        self.assert_download(self.fetch("linux", **env), "firefox-153.4.0esr-ssl", "linux64")
+        self.assertEqual({p.name for p in (self.out / "firefox").iterdir()}, {"firefox", "libxul.so"})
+
+    def test_changed_linux_version_language_or_architecture_requires_a_fetch(self):
+        for version, lang, arch, mozilla in (
+            ("153.4.0esr", "en-US", "x86_64", "linux64"),
+            ("153.5.0esr", "en-US", "x86_64", "linux64"),
+            ("153.5.0esr", "de", "x86_64", "linux64"),
+            ("153.5.0esr", "de", "aarch64", "linux64-aarch64"),
+        ):
+            with self.subTest(version=version, lang=lang, arch=arch):
+                self.assert_download(self.fetch("linux", "--if-needed", EPIX_ARCH=arch, EPIX_FF_LANG=lang,
+                                                EPIX_FF_VERSION=version), f"firefox-{version}-ssl", mozilla, lang)
+
+    def test_missing_linux_runtime_files_are_restored(self):
+        env = {"EPIX_ARCH": "x86_64"}
+        self.assertEqual(self.fetch("linux", **env).returncode, 0)
+        for name in ("firefox", "libxul.so"):
+            with self.subTest(name=name):
+                (self.out / "firefox" / name).unlink()
+                self.assert_download(self.fetch("linux", "--if-needed", **env), "firefox-153.4.0esr-ssl", "linux64")
+
+    def test_cached_concurrent_calls_make_one_download(self):
+        log = self.root / "curl-calls"
+        args = ["bash", str(self.script), "linux", "--if-needed"]
+        env = dict(self.env, EPIX_ARCH="x86_64", EPIX_TEST_CURL_LOG=str(log))
+        with subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as first, \
+             subprocess.Popen(args, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE) as second:
+            for proc in (first, second):
+                _, err = proc.communicate(timeout=10)
+                self.assertEqual(proc.returncode, 0, err)
+        self.assertEqual(log.read_text().splitlines(), ["called"])
+
+    def test_cache_is_opt_in_only_for_linux(self):
+        for args in (("linux", "--wrong"), ("osx", "--if-needed"), ("win64", "--if-needed")):
+            with self.subTest(args=args):
+                self.assertNotEqual(self.fetch(*args).returncode, 0)
+                self.assertFalse(self.capture.exists())
+
+    def test_failed_refresh_does_not_mark_or_replace_the_previous_linux_runtime(self):
+        env = {"EPIX_ARCH": "x86_64"}
+        self.assertEqual(self.fetch("linux", **env).returncode, 0)
+        sentinel = self.out / "firefox" / "existing-browser"
+        sentinel.write_text("prior runtime")
+        broken = self.root / "incomplete.tar.xz"
+        with tarfile.open(broken, "w:xz") as tar:
+            tar.add(self.source / "firefox/firefox", arcname="firefox/firefox")
+        for failure in ({"EPIX_TEST_HTTP_FAILURE": "1"}, {"EPIX_TEST_ARCHIVE": str(broken)}):
+            with self.subTest(failure=failure):
+                result = self.fetch("linux", "--if-needed", EPIX_FF_VERSION="153.5.0esr", **env, **failure)
+                self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertTrue(self.capture.exists())
+                self.assertEqual(sentinel.read_text(), "prior runtime")
+                previous = self.fetch("linux", "--if-needed", EPIX_TEST_HTTP_FAILURE="1", **env)
+                self.assertEqual(previous.returncode, 0, previous.stderr)
                 self.assertFalse(self.capture.exists())
 
 
