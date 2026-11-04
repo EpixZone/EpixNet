@@ -53,31 +53,31 @@ run `install.sh` again after moving it.
 
 ## Build from source
 
-This guide starts from a fresh Linux machine with nothing installed. Follow the steps in order. You only do steps 1 to 3 once; after that, building again is just step 5.
+Install the tools and clone the source once. Keep that checkout for [updates from GitHub](#update-a-headless-node-with-git).
 
 Type the commands into your terminal.
 
 ## 1. Install the build tools
 
-EpixNet needs `git` (to download the code), a C compiler, and a couple of small helpers.
+EpixNet needs Git, a C compiler and build tools. The update commands below use curl and Python 3 to read the release tag from GitHub.
 
 **Debian or Ubuntu:**
 
 ```sh
 sudo apt update
-sudo apt install -y build-essential pkg-config git curl protobuf-compiler
+sudo apt install -y build-essential pkg-config git curl python3 protobuf-compiler
 ```
 
 **Fedora:**
 
 ```sh
-sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config git curl protobuf-compiler
+sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config git curl python3 protobuf-compiler
 ```
 
 **Arch:**
 
 ```sh
-sudo pacman -S --needed base-devel git curl protobuf
+sudo pacman -S --needed base-devel git curl python protobuf
 ```
 
 ## 2. Install Rust
@@ -104,21 +104,24 @@ You should see a version number.
 
 ## 3. Download EpixNet
 
+Use your normal login account. Replace `v0.6.3` with the tag shown on the [latest stable release](https://github.com/EpixZone/EpixNet/releases/latest). The shallow clone downloads that snapshot.
+
 ```sh
-git clone https://github.com/EpixZone/EpixNet.git
+cd "$HOME" &&
+git clone --depth 1 --no-tags --branch v0.6.3 https://github.com/EpixZone/EpixNet.git &&
 cd EpixNet
 ```
 
 ## 4. Build it
 
 ```sh
-cargo build --release -p epix-server
+cargo build --release --locked -p epix-server -p evx-worker &&
+./target/release/epix-server --version
 ```
 
-The first build downloads a lot and can take several minutes, that is normal. It is finished when you see `Finished`.
+The first build downloads dependencies and can take a while. Cargo prints `Finished` when the executables are ready. The version should match the tag you chose.
 
-`-p epix-server` builds the node and nothing else, which is all this guide
-needs. Building the WHOLE workspace (`cargo build --release`, with no `-p`)
+These two packages build the node and the worker it launches for EVX modules. Building the whole workspace (`cargo build --release`, with no `-p`)
 also builds the Ledger hardware-wallet bridge, and that one talks to the device
 over HID, which on Linux goes through udev. For that you need the udev
 DEVELOPMENT package as well, and having `libudev.so.1` already on your system
@@ -146,9 +149,9 @@ To open a specific site, add its name:
 
 ## Run a headless node from a release binary (Ubuntu server)
 
-If you just want to keep a node running on a server, you do not need to install Rust or build anything. The release tarball includes `epix-server`, a standalone node with no Firefox and no desktop libraries. Download it, extract it, and run it under systemd.
+The prebuilt Linux tarball contains the headless node, the desktop launcher and Firefox. The headless service runs without Firefox, but downloading the archive transfers the whole bundle. For smaller update downloads, you can [build from source](#build-from-source) and keep the Git checkout.
 
-The steps in this section replace steps 1 to 5 above. These commands assume Ubuntu (or Debian); adjust the package names for other distributions.
+Tarball users can skip the source build steps above. The service setup below assumes Ubuntu or Debian.
 
 ### 1. Download the latest release and extract it
 
@@ -164,9 +167,12 @@ sudo mkdir -p /opt/epix
 sudo tar xzf epix-linux.tar.gz -C /opt/epix --strip-components=1
 ```
 
-After this, `/opt/epix/epix-server` is the node. The tarball also carries the desktop launcher (`epix-browser`) and a bundled Firefox for desktop use; a headless server ignores them.
+For a **new service built from source**, skip the tarball commands above. Instead, run these commands from the checkout after step 4 of the source guide, then continue with the service account in step 2 below.
 
-`epix-server` links only against the standard C library, which every Ubuntu already has, so there are no extra packages to install.
+```sh
+sudo install -d /opt/epix &&
+sudo install -m 0755 target/release/epix-server target/release/evx-worker /opt/epix/
+```
 
 ### 2. Create a user to run it
 
@@ -245,7 +251,9 @@ To serve it publicly instead, put a reverse proxy (for example nginx) in front a
 
 ### Updating to a new release
 
-Stop the service, re-run the download and extract from step 1, then start again. The data directory is separate, so upgrading does not touch the node's identity or its sites:
+For an existing service, you can [switch to Git-based updates](#update-a-headless-node-with-git) and keep the same service and data directory.
+
+To stay with prebuilt releases, stop the service, repeat the download and extraction from step 1, then start it again. The service keeps its existing data directory.
 
 ```sh
 sudo systemctl stop epix
@@ -263,6 +271,37 @@ EPIX_HEADLESS=1 ./target/release/epix-server
 ```
 
 Then visit **http://127.0.0.1:42222/** from a browser (use an SSH tunnel if the server is remote: `ssh -L 42222:127.0.0.1:42222 you@server`).
+
+### Update a headless node with Git
+
+Reuse the checkout from step 3. If you installed the tarball and have no checkout yet, follow [source steps 1 to 3](#build-from-source) once. Git fetches source objects your checkout is missing. Keeping the checkout, Cargo's cache and `target/` lets later builds reuse downloaded dependencies and compiled files. New dependencies can still require downloads. Prebuilt Linux release packages are still full downloads.
+
+Run this from your login account. It looks up the [latest stable release](https://github.com/EpixZone/EpixNet/releases/latest) on GitHub, fetches that tag into your existing clean checkout, and builds it. The old node can keep running during the build.
+
+```sh
+cd "$HOME/EpixNet" &&
+tag=$(curl -fsSL https://api.github.com/repos/EpixZone/EpixNet/releases/latest |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') &&
+git fetch --no-tags origin tag "$tag" &&
+git switch --detach "refs/tags/$tag" &&
+cargo build --release --locked -p epix-server -p evx-worker &&
+./target/release/epix-server --version
+```
+
+If you intentionally track development builds and your checkout is already on `main`, use `git pull --ff-only origin main` in place of the fetch and switch commands. Then run the same build command. `main` can include changes beyond the latest release.
+
+For the `epix.service` above, check that the printed version is the one you built. Stage both executables before stopping the node, then replace them together.
+
+```sh
+sudo install -d /opt/epix-stage &&
+sudo install -m 0755 target/release/epix-server target/release/evx-worker /opt/epix-stage/ &&
+sudo systemctl stop epix &&
+sudo mv /opt/epix-stage/epix-server /opt/epix-stage/evx-worker /opt/epix/ &&
+sudo systemctl start epix &&
+systemctl status epix
+```
+
+The service continues to use the same `epix` account and its existing identities and sites in `/var/lib/epix/.local/share/EpixNet`. If you run the node directly, stop the old process and start the newly built server with the same account and data directory.
 
 ## The full desktop app (managed Firefox)
 
