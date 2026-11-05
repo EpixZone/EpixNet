@@ -30680,8 +30680,20 @@ impl AppState {
             return;
         }
         let plan = self.retention_completion_plan(addr).await;
-        // Same walk the row's countdown needs; cache it rather than repeat it.
-        self.set_optional_owed(addr, plan.paths.len()).await;
+        // The retry still asks for consent, but an unapproved full copy is
+        // not a pending download. Preserve any independent directory promise
+        // instead of replacing it with the over-limit plan's file count.
+        let owed = if plan.needs_consent && !self.retention_fetch_allowed(addr).await {
+            match self.optional_owed_scope(addr).await {
+                Some(Some(dirs)) if !dirs.is_empty() => {
+                    self.optional_scope_owed(addr, &Some(dirs)).await
+                }
+                _ => 0,
+            }
+        } else {
+            plan.paths.len()
+        };
+        self.set_optional_owed(addr, owed).await;
         if plan.paths.is_empty() {
             // Full copy on disk: park on the slow re-verify interval (a
             // dirty mark bypasses it the tick after new content lands).
@@ -42486,6 +42498,45 @@ mod tests {
         state.config_set("full_retention", json!(false)).await;
         assert!(state.full_retention_watch().await.is_empty());
         assert_eq!(state.refresh_optional_owed(&addr).await, 0);
+    }
+
+    #[tokio::test]
+    async fn full_retention_retry_count_waits_for_size_consent() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state.add_xite(&addr, XiteEntry {
+            storage: XiteStorage::new(dir.path()),
+            content: Some(json!({
+                "address": addr, "modified": 1.0, "files": {},
+                "files_optional": {
+                    "approved/clip.txt": { "size": 4, "sha512": "aa" },
+                    "video.webm": { "size": 2 * 1024 * 1024, "sha512": "bb" }
+                }
+            })),
+        }).await;
+        state.config_set("full_retention", json!(true)).await;
+        state.set_size_limit(&addr, 1).await;
+        assert_eq!(state.refresh_optional_owed(&addr).await, 0);
+        let mut schedule = HashMap::new();
+        state.optional_retry_tick(&mut schedule).await;
+        assert_eq!(state.xites.read().await.get(&addr).unwrap().optional_owed, 0,
+            "a retry must not advertise unapproved over-limit files as pending downloads");
+
+        // A separate directory promise remains counted while the broader
+        // full-copy request is waiting for consent.
+        state.xites.write().await.get_mut(&addr).unwrap().settings.optional_help
+            .insert("approved/".into(), json!("Selected media"));
+        schedule.clear();
+        state.optional_retry_tick(&mut schedule).await;
+        assert_eq!(state.xites.read().await.get(&addr).unwrap().optional_owed, 1,
+            "only the independently approved directory is pending");
+
+        state.retention_consents.lock().unwrap().insert(addr.clone());
+        schedule.clear();
+        state.retry_retention_candidate(&addr, &mut schedule).await;
+        assert_eq!(state.xites.read().await.get(&addr).unwrap().optional_owed, 2,
+            "accepting the full-copy prompt adds the rest of the plan");
     }
 
     /// Bytes held in CHILD content.json units count against the consent
