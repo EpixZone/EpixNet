@@ -29,6 +29,7 @@ mod nmh_auth;
 pub mod paths;
 pub mod pool;
 pub mod state;
+mod timestamp;
 
 /// Re-exported for callers (the CLI) that hold sign options without a
 /// direct epix-xite dependency.

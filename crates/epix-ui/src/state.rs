@@ -17805,13 +17805,15 @@ impl AppState {
             return;
         }
         let message = message.into();
-        println!("[{level}] {message}");
+        let timestamp = now_secs();
+        let formatted = format!("[{}] [{level}] {message}", crate::timestamp::format_utc(timestamp));
+        println!("{formatted}");
         // Append to the on-disk log file, if one is configured.
         if let Some(file) = self.log_file.lock().unwrap().as_mut() {
             use std::io::Write;
-            let _ = writeln!(file, "[{}] [{level}] {message}", now_secs());
+            let _ = writeln!(file, "{formatted}");
         }
-        let line = json!([now_secs() as f64, level, message]);
+        let line = json!([timestamp as f64, level, message]);
         {
             let mut logs = self.logs.write().await;
             logs.push_back(line.clone());
