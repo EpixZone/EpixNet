@@ -151,7 +151,13 @@ To open a specific site, add its name:
 ./target/release/epix-server talk.epix
 ```
 
-## 6. Optional: start the source-built node at boot
+## 6. Update to a later release
+
+Keep the checkout from step 3. To update the node you launched in step 5, stop it with `Ctrl+C`, run the [Git update commands](#update-a-source-checkout-with-git), then repeat [build it](#4-build-it) and [run it](#5-run-it). Use the same login account and any custom data-directory settings so the node continues to use your existing sites, keys and settings.
+
+Git reuses source objects already in the checkout. Keeping Cargo's cache and `target/` also lets builds reuse downloaded dependencies and compiled files. The amount downloaded depends on what changed; new dependency versions can still require downloads.
+
+## 7. Optional: start the source-built node at boot
 
 On Ubuntu or Debian with systemd, stop the node you started in step 5 with `Ctrl+C`, then install both built executables at the service's fixed paths. Run these commands from the checkout:
 
@@ -186,7 +192,7 @@ sudo mkdir -p /opt/epix
 sudo tar xzf epix-linux.tar.gz -C /opt/epix --strip-components=1
 ```
 
-For a **new service built from source**, use [source step 6](#6-optional-start-the-source-built-node-at-boot) to install the executables, then continue with step 2 below.
+For a **new service built from source**, use [source step 7](#7-optional-start-the-source-built-node-at-boot) to install the executables, then continue with step 2 below.
 
 ### 2. Create a user to run it
 
