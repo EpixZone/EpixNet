@@ -362,8 +362,7 @@ impl StructuralValidator {
         body: &wasmparser::FunctionBody<'_>,
         caps: &Caps,
     ) -> Result<(), ValidationError> {
-        let range = body.range();
-        if range.end - range.start > caps.max_body_bytes {
+        if body.as_bytes().len() > caps.max_body_bytes {
             return Err(ValidationError::new("function body size limit"));
         }
         let mut locals: u64 = 0;
@@ -501,6 +500,22 @@ mod tests {
         assert!(validate_module(b"\0asm\x0d\0\x01\0").is_err());
         assert!(validate_module(b"not wasm").is_err());
         assert!(validate_module(&vec![0u8; MAX_MODULE + 1]).is_err());
+    }
+
+    #[test]
+    fn function_body_byte_cap_includes_locals_declaration() {
+        // One locals-count byte, two two-byte constants, add and end.
+        let bytes = wasm(CALC);
+        let mut caps = Caps {
+            max_body_bytes: 7,
+            ..Caps::default()
+        };
+        assert!(validate_with(&bytes, &caps).is_ok());
+        caps.max_body_bytes = 6;
+        assert_eq!(
+            validate_with(&bytes, &caps).unwrap_err().0,
+            "function body size limit"
+        );
     }
 
     #[test]
