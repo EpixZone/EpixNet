@@ -105,12 +105,15 @@ You should see a version number.
 
 ## 3. Download EpixNet
 
-Use your normal login account. Replace `v0.6.3` with the tag shown on the [latest stable release](https://github.com/EpixZone/EpixNet/releases/latest). The shallow clone downloads that snapshot.
+Use your normal login account. These commands look up the [latest stable release](https://github.com/EpixZone/EpixNet/releases/latest) and make a shallow clone of that tag. The final command prints the selected version.
 
 ```sh
 cd "$HOME" &&
-git clone --depth 1 --no-tags --branch v0.6.3 https://github.com/EpixZone/EpixNet.git &&
-cd EpixNet
+tag=$(curl -fsSL https://api.github.com/repos/EpixZone/EpixNet/releases/latest |
+  python3 -c 'import json, sys; print(json.load(sys.stdin)["tag_name"])') &&
+git clone --depth 1 --no-tags --branch "$tag" https://github.com/EpixZone/EpixNet.git &&
+cd EpixNet &&
+git describe --tags --exact-match
 ```
 
 ## 4. Build it
@@ -148,6 +151,21 @@ To open a specific site, add its name:
 ./target/release/epix-server talk.epix
 ```
 
+## 6. Optional: start the source-built node at boot
+
+On Ubuntu or Debian with systemd, stop the node you started in step 5 with `Ctrl+C`, then install both built executables at the service's fixed paths. Run these commands from the checkout:
+
+```sh
+sudo install -d /opt/epix &&
+sudo install -m 0755 target/release/epix-server target/release/evx-worker /opt/epix/
+```
+
+Continue with [create the service user](#2-create-a-user-to-run-it), [set up the service](#3-set-up-the-service), and [start it and check it](#4-start-it-and-check-it) below. The same unit works for source builds and release binaries because both install `epix-server` and its matching `evx-worker` in `/opt/epix`.
+
+The service runs as the separate `epix` account and uses `/var/lib/epix/.local/share/EpixNet`. It does not use the sites, settings or identities from your login account's node. [Reach its dashboard](#5-reach-the-dashboard) after starting it.
+
+For later releases, [update this source checkout with Git](#update-a-source-checkout-with-git), then follow [update the headless service](#update-the-headless-service). Keep the checkout so Git and Cargo can reuse the files they already downloaded.
+
 ## Run a headless node from a release binary (Ubuntu server)
 
 The prebuilt Linux tarball contains the headless node, the desktop launcher and Firefox. The headless service runs without Firefox, but downloading the archive transfers the whole bundle. For smaller update downloads, you can [build from source](#build-from-source) and keep the Git checkout.
@@ -168,12 +186,7 @@ sudo mkdir -p /opt/epix
 sudo tar xzf epix-linux.tar.gz -C /opt/epix --strip-components=1
 ```
 
-For a **new service built from source**, skip the tarball commands above. Instead, run these commands from the checkout after step 4 of the source guide, then continue with the service account in step 2 below.
-
-```sh
-sudo install -d /opt/epix &&
-sudo install -m 0755 target/release/epix-server target/release/evx-worker /opt/epix/
-```
+For a **new service built from source**, use [source step 6](#6-optional-start-the-source-built-node-at-boot) to install the executables, then continue with step 2 below.
 
 ### 2. Create a user to run it
 

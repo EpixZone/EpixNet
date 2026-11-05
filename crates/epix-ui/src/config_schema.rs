@@ -40,7 +40,13 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
         "select:IPv4=ipv4|IPv6=ipv6|Dual (IPv4 & IPv6)=dual",
     ),
     ("Network", "fileserver_port", "File server port (0 to disable seeding)", "26552", "text"),
-    ("Network", "ip_external", "File server external ip (blank = auto-detect via UPnP)", "", "textarea"),
+    (
+        "Network",
+        "ip_external",
+        "Public clearnet IP for the file server (blank = automatic port checks and UPnP; a manual value assumes an open port without testing it; Tor/I2P addresses are managed automatically)",
+        "",
+        "text",
+    ),
     (
         "Network",
         "tor",
@@ -145,14 +151,14 @@ pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     (
         "Optional Files",
         "autodownloadoptional_default",
-        "Pre-download EVERY optional file on new xites, including ones you never open (you already share whatever you have downloaded - this is not needed to seed)",
+        "Pre-download every optional file for newly added xites, even files you never open (existing xites unchanged; publishers can opt out)",
         "false",
         "bool",
     ),
     (
         "Optional Files",
         "full_retention",
-        "Keep a full copy of every xite you visit (downloads everything, not just what you view)",
+        "Keep a full copy of all active xites, including required and optional files (also covers existing xites; overrides publisher defaults; asks before exceeding a size limit unless already approved)",
         "false",
         "bool",
     ),
