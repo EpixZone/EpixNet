@@ -151,9 +151,13 @@ To open a specific site, add its name:
 ./target/release/epix-server talk.epix
 ```
 
-## 6. Update to a later release
+## 6. Update an existing installation
 
-Keep the checkout from step 3. To update the node you launched in step 5, stop it with `Ctrl+C`, run the [Git update commands](#update-a-source-checkout-with-git), then repeat [build it](#4-build-it) and [run it](#5-run-it). Use the same login account and any custom data-directory settings so the node continues to use your existing sites, keys and settings.
+Keep the checkout from step 3. To update the node you launched in step 5, stop it with `Ctrl+C`.
+
+In that same checkout, use the [Git update commands](#update-a-source-checkout-with-git) for the latest stable release. If the checkout already tracks `main` and you want its latest changes, run `git pull --ff-only origin main` instead.
+
+Then repeat [build it](#4-build-it) and [run it](#5-run-it). Use the same login account and any custom data-directory settings so the node continues to use your existing sites, keys and settings.
 
 Git reuses source objects already in the checkout. Keeping Cargo's cache and `target/` also lets builds reuse downloaded dependencies and compiled files. The amount downloaded depends on what changed; new dependency versions can still require downloads.
 
