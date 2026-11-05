@@ -10,10 +10,10 @@ root = Path(__file__).resolve().parents[1]
 source = (root / "app/src/main/java/zone/epix/app/MainActivity.kt").read_text()
 
 
-def method(name, indent=4):
+def method(name, indent=4, within=source):
     spaces = " " * indent
     found = re.findall(r"^" + spaces + r"(?:private |override )?fun " + name
-                       + r"\(.*?^" + spaces + r"}", source, re.M | re.S)
+                       + r"\(.*?^" + spaces + r"}", within, re.M | re.S)
     if len(found) != 1:
         raise SystemExit(f"Expected one production method: {name}")
     return found[0].replace("private fun", "fun", 1).replace("override fun", "fun", 1)
@@ -89,6 +89,7 @@ open class Activity {
 }
 class Shell : Activity() {
     var disposed = false
+    private val pendingOperations = PendingOperations()
     val ownedSessions = mutableSetOf<GeckoSession>()
     val tabs = mutableListOf<Tab>()
     var currentTabIndex = 0
@@ -135,7 +136,8 @@ for name in names:
     if name in ("onConfigurationChanged", "onWindowFocusChanged", "dispatchTouchEvent"):
         body = body.replace("fun " + name, "override fun " + name, 1)
     kotlin += body + "\n"
-kotlin += "\n".join(method(name, 12) for name in ("onFullScreen", "onPageStart", "onCrash", "onKill")) + "\n}\n"
+kotlin += "\n".join(method(name, 12, method("newTab"))
+                    for name in ("onFullScreen", "onPageStart", "onCrash", "onKill")) + "\n}\n"
 kotlin += r'''
 fun main() {
     var checks=0
@@ -227,5 +229,7 @@ if popup is None or "leaveFullScreen(session)" not in method("disposeSession"):
     raise SystemExit("Wallet and session disposal must release fullscreen ownership")
 with tempfile.TemporaryDirectory(prefix="epix-fullscreen-") as directory:
     path=Path(directory);(path/'Fullscreen.kt').write_text(kotlin);(path/'MotionEvent.kt').write_text(motion)
-    subprocess.run([os.environ['KOTLINC'],str(path/'Fullscreen.kt'),str(path/'MotionEvent.kt'),'-no-reflect','-include-runtime','-d',str(path/'tests.jar')],check=True)
+    subprocess.run([os.environ['KOTLINC'],str(path/'Fullscreen.kt'),str(path/'MotionEvent.kt'),
+                    str(root/'app/src/main/java/zone/epix/app/PendingOperations.kt'),
+                    '-no-reflect','-include-runtime','-d',str(path/'tests.jar')],check=True)
     subprocess.run([str(Path(os.environ['JAVA_HOME'])/'bin/java'),'-jar',str(path/'tests.jar')],check=True)

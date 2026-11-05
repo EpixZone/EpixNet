@@ -199,6 +199,7 @@ class Shell : Activity() {
     var restoredUrls: List<String>? = null
     var restoredSelection = 0
     var walletUserEngaged = false
+    var downloadPickerOutstanding = false
     val tabs = mutableListOf(Tab(GeckoSession()))
     val addressBar = AddressBar()
     fun friendlyUrl(url: String) = url // Display boundary; retained Tab URL is production state.
