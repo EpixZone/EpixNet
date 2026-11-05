@@ -169,6 +169,7 @@ internal class Shell(val applicationContext: Context) : Activity() {
         jobs.forEach { it.join() }
         activityJob.join()
     }
+    private fun handleDownloadResult(requestCode: Int, resultCode: Int, data: Intent?) = false
 // INSERT_CALLBACKS
     companion object {
 // INSERT_COUNTER
