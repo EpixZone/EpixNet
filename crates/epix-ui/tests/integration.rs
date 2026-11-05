@@ -125,6 +125,7 @@ async fn the_wrapper_runs_the_xite_in_an_opaque_origin() {
     // it is not this origin, so it cannot script the wrapper or open the
     // node's WebSocket as the wrapper's origin.
     assert!(sandbox.contains("allow-scripts"), "{sandbox}");
+    assert!(sandbox.contains("allow-downloads"), "xites can save files through the browser: {sandbox}");
     assert!(!sandbox.contains("allow-same-origin"), "default sandbox is opaque: {sandbox}");
     assert!(html.contains(r#"allow="screen-wake-lock *""#), "delegate screen wake lock to the opaque frame");
     // The wrapper's own script receives the xite's secret keys and the
