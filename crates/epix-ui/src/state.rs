@@ -4330,8 +4330,8 @@ pub struct AppState {
     /// key "pending restart" when its saved value has drifted from this. None
     /// until snapshotted (test/in-memory nodes never are, so nothing pends).
     boot_config: std::sync::Mutex<Option<HashMap<String, String>>>,
-    /// The command and browser-profile behavior registered by the embedding
-    /// shell. Without a command, a restart request shuts down without relaunch.
+    /// The restart strategy registered by the embedding shell. Without one,
+    /// a restart request shuts down without relaunch.
     restart_command: std::sync::Mutex<Option<RestartCommand>>,
     /// Names of loaded plugins/features, reported in `serverInfo` (the dashboard
     /// menu shows plugin-gated items like Stats from this).
@@ -4568,7 +4568,9 @@ pub struct AppState {
     /// Optional file that `log()` also appends each line to (`debug.log`), so
     /// the node's activity survives restarts for support/debugging. Set by the
     /// host; None keeps logging in-memory + stdout only.
-    log_file: std::sync::Mutex<Option<std::fs::File>>,
+    log_file: Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    /// Keep stdout, file, buffer and event order consistent across async callers.
+    log_emission: Arc<tokio::sync::Mutex<()>>,
     /// Pending Bigfile uploads keyed by nonce (`bigfileUploadInit` → the
     /// `/EpixNet-Internal/BigfileUpload` POST consumes it).
     bigfile_uploads: std::sync::Mutex<HashMap<String, BigfileUpload>>,
@@ -5516,9 +5518,10 @@ pub fn self_exe() -> Option<String> {
     exe.is_file().then(|| exe.display().to_string())
 }
 
-struct RestartCommand {
-    argv: Vec<String>,
-    managed_browser_profile: bool,
+#[derive(Clone)]
+enum RestartCommand {
+    Relaunch { argv: Vec<String>, managed_browser_profile: bool },
+    Supervised,
 }
 
 /// Launch a detached helper that waits for this process to die, then starts
@@ -5776,7 +5779,8 @@ impl AppState {
             pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
-            log_file: std::sync::Mutex::new(None),
+            log_file: Arc::new(std::sync::Mutex::new(None)),
+            log_emission: Arc::new(tokio::sync::Mutex::new(())),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             pending_wrapper_keys: std::sync::Mutex::new(HashMap::new()),
@@ -6721,33 +6725,40 @@ impl AppState {
     /// `--background`); without it a restart request is a plain shutdown and
     /// the Config page words its restart bar accordingly.
     pub fn set_restart_argv(&self, argv: Vec<String>) {
-        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand::Relaunch {
             argv, managed_browser_profile: false,
         });
     }
 
+    /// A supervised standalone server asks its service manager to restart it.
+    /// Exiting with a failure status makes `Restart=on-failure` restart the
+    /// service after cleaning up its children. A detached relaunch helper
+    /// would be killed with those children when the original process exits.
+    pub fn set_supervised_restart(&self) {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand::Supervised);
+    }
+
     /// Register a shell whose browser profile changes with the data root.
     pub fn set_managed_browser_restart_argv(&self, argv: Vec<String>) {
-        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand::Relaunch {
             argv, managed_browser_profile: true,
         });
     }
 
     pub fn restart_uses_managed_browser_profile(&self) -> bool {
-        self.restart_command.lock().unwrap().as_ref()
-            .is_some_and(|command| command.managed_browser_profile)
+        matches!(self.restart_command.lock().unwrap().as_ref(),
+            Some(RestartCommand::Relaunch { managed_browser_profile: true, .. }))
     }
 
-    /// Whether a restart can actually relaunch the node (a shell registered
-    /// a relaunch argv).
+    /// Whether the shell registered a relaunch command or a service restart.
     pub fn can_restart(&self) -> bool {
         self.restart_command.lock().unwrap().is_some()
     }
 
-    /// Stop the node process; with `restart` a detached helper waits for this
-    /// process to die and starts it again (the Config page's restart button
-    /// and `serverShutdown {restart: true}`). State is persisted first, then
-    /// exit is delayed a moment so the caller's response can flush.
+    /// Stop or restart the node (the Config page's restart button and
+    /// `serverShutdown {restart: true}`). Supervised nodes exit with a failure
+    /// status to request a restart; other shells use a detached relaunch helper.
+    /// State is persisted first, then exit is delayed so the response can flush.
     pub async fn shutdown(&self, restart: bool) {
         self.log(
             "INFO",
@@ -6756,13 +6767,15 @@ impl AppState {
         .await;
         self.persist_peers().await;
         self.persist_xites().await;
-        let argv = if restart {
-            self.restart_command.lock().unwrap().as_ref().map(|command| command.argv.clone())
+        let command = if restart {
+            self.restart_command.lock().unwrap().clone()
         } else { None };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            if let Some(argv) = argv {
-                spawn_relauncher(&argv);
+            match command {
+                Some(RestartCommand::Supervised) => std::process::exit(75),
+                Some(RestartCommand::Relaunch { argv, .. }) => spawn_relauncher(&argv),
+                None => {}
             }
             std::process::exit(0);
         });
@@ -17794,14 +17807,23 @@ impl AppState {
         if log_rank(level) < log_rank(&self.log_level().await) {
             return;
         }
+        let emission = self.log_emission.clone().lock_owned().await;
         let message = message.into();
-        println!("[{level}] {message}");
-        // Append to the on-disk log file, if one is configured.
-        if let Some(file) = self.log_file.lock().unwrap().as_mut() {
+        let timestamp = now_secs();
+        let formatted = format!("[{}] [{level}] {message}", crate::timestamp::format_utc(timestamp));
+        let log_file = self.log_file.clone();
+        // Neither a slow disk nor a full stdout pipe may block the async
+        // executor. The worker owns the ordering guard until IO finishes,
+        // even if the caller cancels while awaiting its result.
+        let _emission = tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let _ = writeln!(file, "[{}] [{level}] {message}", now_secs());
-        }
-        let line = json!([now_secs() as f64, level, message]);
+            let _ = writeln!(std::io::stdout().lock(), "{formatted}");
+            if let Some(file) = log_file.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
+                let _ = writeln!(file, "{formatted}");
+            }
+            emission
+        }).await;
+        let line = json!([timestamp as f64, level, message]);
         {
             let mut logs = self.logs.write().await;
             logs.push_back(line.clone());
@@ -30646,7 +30668,7 @@ impl AppState {
             .filter(|(_, x)| {
                 x.settings.serving
                     && !x.settings.own
-                    && !(x.settings.download_optional || x.settings.autodownloadoptional)
+                    && !(x.settings.download_optional && x.settings.autodownloadoptional)
             })
             .map(|(a, _)| a.clone())
             .collect();
@@ -30670,8 +30692,20 @@ impl AppState {
             return;
         }
         let plan = self.retention_completion_plan(addr).await;
-        // Same walk the row's countdown needs; cache it rather than repeat it.
-        self.set_optional_owed(addr, plan.paths.len()).await;
+        // The retry still asks for consent, but an unapproved full copy is
+        // not a pending download. Preserve any independent directory promise
+        // instead of replacing it with the over-limit plan's file count.
+        let owed = if plan.needs_consent && !self.retention_fetch_allowed(addr).await {
+            match self.optional_owed_scope(addr).await {
+                Some(Some(dirs)) if !dirs.is_empty() => {
+                    self.optional_scope_owed(addr, &Some(dirs)).await
+                }
+                _ => 0,
+            }
+        } else {
+            plan.paths.len()
+        };
+        self.set_optional_owed(addr, owed).await;
         if plan.paths.is_empty() {
             // Full copy on disk: park on the slow re-verify interval (a
             // dirty mark bypasses it the tick after new content lands).
@@ -30746,11 +30780,11 @@ impl AppState {
         if !x.settings.optional_help.is_empty() {
             return Some(Some(x.settings.optional_help.keys().cloned().collect()));
         }
-        if x.settings.own || x.settings.download_optional {
-            // Own xites are authored here; `download_optional` alone is the
-            // on-demand permission, not a promise to fetch everything.
+        if x.settings.own {
             return None;
         }
+        // On-demand permission is not a promise to fetch everything, but it
+        // must not cancel the reader's separate global full-copy setting.
         // `retention_completion_plan` returns an empty plan when the global
         // setting is off, so this stays correct either way.
         Some(Some(Vec::new()))
@@ -42415,6 +42449,7 @@ mod tests {
             let mut xites = state.xites.write().await;
             // [0] plain -> watched. [1] has its own whole-xite promise.
             xites.get_mut(&addrs[1]).unwrap().settings.download_optional = true;
+            xites.get_mut(&addrs[1]).unwrap().settings.autodownloadoptional = true;
             // [2] own xite. [3] dir-scoped help only -> still watched.
             xites.get_mut(&addrs[2]).unwrap().settings.own = true;
             xites
@@ -42434,6 +42469,86 @@ mod tests {
         let mut expected = vec![addrs[0].clone(), addrs[3].clone()];
         expected.sort();
         assert_eq!(state.full_retention_watch().await, expected);
+    }
+
+    /// Enabling the global full-copy setting must also cover xites added
+    /// with the shipped on-demand default. That default permits opening one
+    /// optional file; it does not provide its own background retry pass.
+    #[tokio::test]
+    async fn full_retention_retries_xites_with_the_on_demand_default() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state.add_xite(&addr, XiteEntry {
+            storage: XiteStorage::new(dir.path()),
+            content: Some(json!({
+                "address": addr, "modified": 1.0,
+                "files": { "app.js": { "size": 10, "sha512": "aa" } },
+                "files_optional": {
+                    "video.webm": { "size": 2 * 1024 * 1024, "sha512": "bb" }
+                }
+            })),
+        }).await;
+        assert!(state.optional_fetch_allowed(&addr).await);
+        assert!(state.optional_retry_flagged().await.is_empty());
+        assert!(state.full_retention_watch().await.is_empty());
+        assert_eq!(state.refresh_optional_owed(&addr).await, 0);
+
+        state.config_set("full_retention", json!(true)).await;
+        assert_eq!(state.full_retention_watch().await, vec![addr.clone()]);
+        assert_eq!(state.refresh_optional_owed(&addr).await, 2,
+            "the full-copy countdown includes required and optional files");
+        let mut schedule = HashMap::new();
+        state.optional_retry_tick(&mut schedule).await;
+        assert!(schedule.contains_key(&format!("full:{addr}")),
+            "the periodic retry loop must schedule the full copy");
+
+        // The global setting still asks before exceeding the xite's limit.
+        state.set_size_limit(&addr, 1).await;
+        assert_eq!(state.refresh_optional_owed(&addr).await, 0,
+            "on-demand permission alone does not authorize an over-limit copy");
+        state.config_set("full_retention", json!(false)).await;
+        assert!(state.full_retention_watch().await.is_empty());
+        assert_eq!(state.refresh_optional_owed(&addr).await, 0);
+    }
+
+    #[tokio::test]
+    async fn full_retention_retry_count_waits_for_size_consent() {
+        let dir = tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+        state.add_xite(&addr, XiteEntry {
+            storage: XiteStorage::new(dir.path()),
+            content: Some(json!({
+                "address": addr, "modified": 1.0, "files": {},
+                "files_optional": {
+                    "approved/clip.txt": { "size": 4, "sha512": "aa" },
+                    "video.webm": { "size": 2 * 1024 * 1024, "sha512": "bb" }
+                }
+            })),
+        }).await;
+        state.config_set("full_retention", json!(true)).await;
+        state.set_size_limit(&addr, 1).await;
+        assert_eq!(state.refresh_optional_owed(&addr).await, 0);
+        let mut schedule = HashMap::new();
+        state.optional_retry_tick(&mut schedule).await;
+        assert_eq!(state.xites.read().await.get(&addr).unwrap().optional_owed, 0,
+            "a retry must not advertise unapproved over-limit files as pending downloads");
+
+        // A separate directory promise remains counted while the broader
+        // full-copy request is waiting for consent.
+        state.xites.write().await.get_mut(&addr).unwrap().settings.optional_help
+            .insert("approved/".into(), json!("Selected media"));
+        schedule.clear();
+        state.optional_retry_tick(&mut schedule).await;
+        assert_eq!(state.xites.read().await.get(&addr).unwrap().optional_owed, 1,
+            "only the independently approved directory is pending");
+
+        state.retention_consents.lock().unwrap().insert(addr.clone());
+        schedule.clear();
+        state.retry_retention_candidate(&addr, &mut schedule).await;
+        assert_eq!(state.xites.read().await.get(&addr).unwrap().optional_owed, 2,
+            "accepting the full-copy prompt adds the rest of the plan");
     }
 
     /// Bytes held in CHILD content.json units count against the consent
@@ -43528,6 +43643,69 @@ mod tests {
         };
         state.siteblock_add(&hashed, "hashed").await;
         assert_eq!(state.siteblock_reason("1HashBlocked").await.as_deref(), Some("hashed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_waiting_for_file_does_not_block_runtime() {
+        let state = AppState::new("test");
+        let writer = state.clone();
+        let (locked, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _file = writer.log_file.lock().unwrap();
+            locked.send(()).unwrap();
+            released.recv_timeout(std::time::Duration::from_secs(1)).is_ok()
+        });
+        ready.await.unwrap();
+        tokio::join!(biased; state.log("INFO", "file contention"), async {
+            tokio::task::yield_now().await;
+            let _ = release.send(());
+        });
+        assert!(holder.await.unwrap(), "waiting for log output blocked the async runtime");
+    }
+
+    #[tokio::test]
+    async fn concurrent_log_outputs_keep_the_same_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("debug.log");
+        let state = AppState::new("test");
+        state.set_log_file(&path);
+        state.console_log_stream_open("INFO").await;
+        let mut events = state.subscribe_events();
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move {
+                state.log("INFO", format!("ordered line {index}")).await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let buffered: Vec<String> = state.logs.read().await.iter()
+            .map(|line| line[2].as_str().unwrap().to_string()).collect();
+        let written = tokio::fs::read_to_string(path).await.unwrap();
+        let written: Vec<&str> = written.lines()
+            .map(|line| line.split_once("] [INFO] ").unwrap().1).collect();
+        assert_eq!(written, buffered);
+        let mut streamed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            let payload: Value = serde_json::from_str(&event.payload).unwrap();
+            let line = payload["params"]["lines"][0].as_str().unwrap();
+            streamed.push(line.split_once("INFO Node ").unwrap().1.to_string());
+        }
+        assert_eq!(streamed, buffered);
+    }
+
+    #[tokio::test]
+    async fn log_file_write_failure_keeps_console_entry() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::new("test");
+        // A read-only handle deterministically rejects the append.
+        let readonly = tokio::fs::File::open(file.path()).await.unwrap().into_std().await;
+        *state.log_file.lock().unwrap() = Some(readonly);
+        state.log("ERROR", "retained despite file failure").await;
+        assert_eq!(state.server_errors().await[0][2], "retained despite file failure");
     }
 
     #[tokio::test]
@@ -45885,6 +46063,9 @@ mod tests {
         assert!(state.restart_uses_managed_browser_profile());
         state.set_restart_argv(vec!["epix-server".into()]);
         assert!(!state.restart_uses_managed_browser_profile());
+        state.set_supervised_restart();
+        assert!(!state.restart_uses_managed_browser_profile());
+        assert!(state.can_restart());
     }
 
     #[tokio::test]

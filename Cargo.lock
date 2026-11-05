@@ -3522,7 +3522,7 @@ dependencies = [
  "hex",
  "sha2 0.10.9",
  "thiserror 2.0.21",
- "wasmparser 0.254.2",
+ "wasmparser 0.258.3",
  "wasmtime",
  "wat",
 ]
@@ -10621,16 +10621,6 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
-]
-
-[[package]]
-name = "wasmparser"
-version = "0.254.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5ff8685b587722894b6f25958fc608d315b93b8d23647bfb567664e7006d757"
-dependencies = [
- "bitflags 2.13.0",
- "indexmap 2.14.0",
 ]
 
 [[package]]

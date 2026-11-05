@@ -48,6 +48,10 @@ async fn raw_serves_without_wrapper_under_noscript_csp() {
     assert_eq!(resp.status(), 200);
     let csp = resp.headers().get("content-security-policy").unwrap().to_str().unwrap();
     assert!(csp.starts_with("default-src 'none'; sandbox"), "noscript CSP: {csp}");
+    let sandbox = csp.split(';').find(|part| part.trim().starts_with("sandbox")).unwrap();
+    assert!(sandbox.split_whitespace().any(|part| part == "allow-downloads"));
+    assert!(!sandbox.contains("allow-scripts"), "raw files cannot execute scripts");
+    assert!(!sandbox.contains("allow-same-origin"), "raw files cannot gain the node origin");
     let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
     assert_eq!(&body[..], b"<h1>hi</h1>", "raw bytes, no wrapper");
 }

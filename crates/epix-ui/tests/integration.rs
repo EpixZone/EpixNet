@@ -125,6 +125,7 @@ async fn the_wrapper_runs_the_xite_in_an_opaque_origin() {
     // it is not this origin, so it cannot script the wrapper or open the
     // node's WebSocket as the wrapper's origin.
     assert!(sandbox.contains("allow-scripts"), "{sandbox}");
+    assert!(sandbox.contains("allow-downloads"), "xites can save files through the browser: {sandbox}");
     assert!(!sandbox.contains("allow-same-origin"), "default sandbox is opaque: {sandbox}");
     assert!(html.contains(r#"allow="screen-wake-lock *""#), "delegate screen wake lock to the opaque frame");
     // The wrapper's own script receives the xite's secret keys and the
@@ -174,6 +175,8 @@ async fn serves_xite_files_over_http() {
     assert!(!wcsp.contains("unsafe-eval'") || wcsp.contains("wasm-unsafe-eval'"), "no plain unsafe-eval");
     assert!(!wcsp.contains(" 'unsafe-eval'"), "JS eval stays blocked: {wcsp}");
     assert!(!wcsp.contains("sandbox"));
+    assert!(wcsp.split(';').any(|directive| directive.trim() == "frame-src * blob:"),
+        "Gecko must be able to download blobs generated in the xite frame: {wcsp}");
 
     let missing = reqwest::get(format!("http://{addr}/{xite}/nope.txt"))
         .await

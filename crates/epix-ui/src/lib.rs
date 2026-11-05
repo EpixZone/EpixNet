@@ -29,6 +29,7 @@ mod nmh_auth;
 pub mod paths;
 pub mod pool;
 pub mod state;
+mod timestamp;
 
 /// Re-exported for callers (the CLI) that hold sign options without a
 /// direct epix-xite dependency.
@@ -3217,7 +3218,7 @@ async fn serve_raw(
     let mut headers = file_headers(content_type(&path), StatusCode::OK);
     headers.insert(
         header::CONTENT_SECURITY_POLICY,
-        "default-src 'none'; sandbox allow-top-navigation allow-forms; img-src *;          font-src * data:; media-src *; style-src * 'unsafe-inline';"
+        "default-src 'none'; sandbox allow-top-navigation allow-forms allow-downloads; img-src *;          font-src * data:; media-src *; style-src * 'unsafe-inline';"
             .parse()
             .unwrap(),
     );
@@ -3879,10 +3880,12 @@ fn wrapper_csp(script_nonce: &str) -> String {
     // (issue #337). Broadening these adds no exfiltration surface: `connect-src`
     // is already `*`, a strictly more capable channel. The script nonce, not
     // the resource origins, is the real boundary here.
+    // Gecko checks frame-src when a sandboxed xite downloads a generated blob.
+    // The iframe's sandbox still isolates that document from the wrapper.
     format!(
         "default-src 'none'; script-src 'nonce-{script_nonce}' 'wasm-unsafe-eval'; \
          img-src * blob: data:; media-src * blob: data:; font-src * data:; \
-         style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src *; frame-ancestors 'none'"
+         style-src 'self' blob: 'unsafe-inline'; connect-src *; frame-src * blob:; frame-ancestors 'none'"
     )
 }
 

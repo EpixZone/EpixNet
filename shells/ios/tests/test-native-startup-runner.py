@@ -76,6 +76,54 @@ class StartupRunnerTests(unittest.TestCase):
         self.assertIn("install still pending", log)
         self.assertIn("Timed out after 120 seconds", log)
 
+    def test_optional_timeout_returns_partial_output_and_keeps_evidence(self):
+        args = ("xcrun", "simctl", "spawn", "fixture-device", "log", "show")
+        error = subprocess.TimeoutExpired(args, 30, output=b"partial simulator log\n")
+        with patch.object(runner.subprocess, "run", side_effect=error):
+            partial = runner.command(self.output, *args, timeout=30, check=False)
+        self.assertEqual(partial, "partial simulator log")
+        log = (self.output / "commands.log").read_text()
+        self.assertIn("partial simulator log", log)
+        self.assertIn("Timed out after 30 seconds", log)
+
+    def run_with_cleanup_timeouts(self, assertions_pass):
+        container = self.output / "container"
+        documents = container / "Documents"
+        documents.mkdir(parents=True)
+        for scenario in ("portrait", "landscape"):
+            passed = assertions_pass or scenario == "landscape"
+            result = {"scenario": scenario, "passed": passed,
+                      "checks": [{"name": "startup progress is visible", "passed": passed}]}
+            (documents / f"{scenario}.json").write_text(json.dumps(result))
+        calls = []
+
+        def execute(args, **kwargs):
+            calls.append(args)
+            if args[:3] in (("xcrun", "simctl", "spawn"),
+                            ("xcrun", "simctl", "shutdown"),
+                            ("xcrun", "simctl", "delete")):
+                raise subprocess.TimeoutExpired(args, kwargs["timeout"], output="cleanup still pending\n")
+            stdout = str(container) if args[:3] == ("xcrun", "simctl", "get_app_container") else ""
+            return subprocess.CompletedProcess(args, 0, stdout=stdout)
+
+        with patch.object(runner, "select_device", return_value="fixture-device"), \
+                patch.object(runner.subprocess, "run", side_effect=execute):
+            try:
+                runner.run(self.output, self.output / "Fixture.app")
+            finally:
+                self.assertEqual([args[2] for args in calls[-3:]], ["spawn", "shutdown", "delete"])
+
+    def test_cleanup_timeouts_do_not_fail_passing_native_assertions(self):
+        self.run_with_cleanup_timeouts(assertions_pass=True)
+        results = json.loads((self.output / "results.json").read_text())
+        self.assertEqual([result["scenario"] for result in results], ["portrait", "landscape"])
+        self.assertTrue(all(result["passed"] for result in results))
+        self.assertEqual((self.output / "commands.log").read_text().count("Timed out after 30 seconds"), 3)
+
+    def test_cleanup_timeouts_preserve_original_assertion_failure(self):
+        with self.assertRaisesRegex(RuntimeError, "Native startup regressions:\\nstartup progress is visible"):
+            self.run_with_cleanup_timeouts(assertions_pass=False)
+
 
 if __name__ == "__main__":
     unittest.main()
