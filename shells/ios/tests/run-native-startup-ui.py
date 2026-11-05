@@ -295,7 +295,11 @@ def command(output, *args, timeout=120, check=True):
             if isinstance(partial, bytes):
                 partial = partial.decode(errors="replace")
             log.write(f"{partial}\nTimed out after {timeout} seconds\n")
-            raise
+            if check:
+                raise
+            # Diagnostic collection and cleanup must not replace the native
+            # assertion result, including its original failure if there is one.
+            return partial.strip()
         log.write(f"{result.stdout}\n")
         log.write(f"Finished in {time.monotonic() - started:.1f}s (exit {result.returncode})\n")
     if check and result.returncode:
