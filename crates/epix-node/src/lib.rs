@@ -1045,10 +1045,20 @@ async fn serve_standalone(server: UiServer, running: RunningNode) -> Result<(), 
     // Shells that call `boot` directly register their own argv (the desktop
     // browser) or none at all (the mobile apps, where the node is a library
     // and a restart request is a plain shutdown).
-    if let Some(exe) = epix_ui::self_exe() {
+    if systemd_service_process(std::env::var("SYSTEMD_EXEC_PID").ok().as_deref(), std::process::id()) {
+        running.state.set_supervised_restart();
+    } else if let Some(exe) = epix_ui::self_exe() {
         running.state.set_restart_argv(vec![exe]);
     }
     server.serve(running.ui_addr).await.map_err(|e| format!("server: {e}"))
+}
+
+/// systemd provides the PID of the process it launched (since v248). Match it
+/// exactly: desktop apps can inherit a terminal/session service's environment
+/// without themselves being the service manager's main process.
+fn systemd_service_process(exec_pid: Option<&str>, current_pid: u32) -> bool {
+    cfg!(target_os = "linux")
+        && exec_pid.and_then(|value| value.parse::<u32>().ok()) == Some(current_pid)
 }
 
 /// The inner paths of up to [`NAME_SAMPLE`] entries, with a `(+N more)` tail
@@ -5768,6 +5778,15 @@ mod navigation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn systemd_restart_only_applies_to_its_main_process() {
+        assert!(systemd_service_process(Some("42"), 42));
+        for pid in [None, Some(""), Some("invalid"), Some("41"), Some("4294967296")] {
+            assert!(!systemd_service_process(pid, 42), "{pid:?}");
+        }
+    }
 
     #[test]
     fn clock_skew_hint_names_the_clock_for_a_future_header() {

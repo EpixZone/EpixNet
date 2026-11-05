@@ -236,6 +236,12 @@ UNIT
 
 `EPIX_HEADLESS=1` stops it from trying to open a browser. `EPIX_UI_ADDR` sets the address the dashboard listens on. The default port `42222` increases one at a time if taken; a non-default port must be available. `LimitNOFILE=65536` gives the node room for many peer connections; the default limit is low enough that a busy public node can hit it.
 
+Keep `Restart=on-failure` in this unit. With systemd 248 or newer, the dashboard's
+**Restart EpixNet** button exits the service with status `75`, and systemd starts
+it again. **Quit** exits successfully and leaves the service stopped. `ExecStart`
+should invoke `epix-server` directly; a custom wrapper must use `exec` so the
+server remains the process systemd supervises.
+
 ### 4. Start it and check it
 
 ```sh

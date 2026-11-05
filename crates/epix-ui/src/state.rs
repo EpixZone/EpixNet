@@ -4330,8 +4330,8 @@ pub struct AppState {
     /// key "pending restart" when its saved value has drifted from this. None
     /// until snapshotted (test/in-memory nodes never are, so nothing pends).
     boot_config: std::sync::Mutex<Option<HashMap<String, String>>>,
-    /// The command and browser-profile behavior registered by the embedding
-    /// shell. Without a command, a restart request shuts down without relaunch.
+    /// The restart strategy registered by the embedding shell. Without one,
+    /// a restart request shuts down without relaunch.
     restart_command: std::sync::Mutex<Option<RestartCommand>>,
     /// Names of loaded plugins/features, reported in `serverInfo` (the dashboard
     /// menu shows plugin-gated items like Stats from this).
@@ -5516,9 +5516,10 @@ pub fn self_exe() -> Option<String> {
     exe.is_file().then(|| exe.display().to_string())
 }
 
-struct RestartCommand {
-    argv: Vec<String>,
-    managed_browser_profile: bool,
+#[derive(Clone)]
+enum RestartCommand {
+    Relaunch { argv: Vec<String>, managed_browser_profile: bool },
+    Supervised,
 }
 
 /// Launch a detached helper that waits for this process to die, then starts
@@ -6721,33 +6722,40 @@ impl AppState {
     /// `--background`); without it a restart request is a plain shutdown and
     /// the Config page words its restart bar accordingly.
     pub fn set_restart_argv(&self, argv: Vec<String>) {
-        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand::Relaunch {
             argv, managed_browser_profile: false,
         });
     }
 
+    /// A supervised standalone server asks its service manager to restart it.
+    /// Exiting with a failure status makes `Restart=on-failure` restart the
+    /// service after cleaning up its children. A detached relaunch helper
+    /// would be killed with those children when the original process exits.
+    pub fn set_supervised_restart(&self) {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand::Supervised);
+    }
+
     /// Register a shell whose browser profile changes with the data root.
     pub fn set_managed_browser_restart_argv(&self, argv: Vec<String>) {
-        *self.restart_command.lock().unwrap() = Some(RestartCommand {
+        *self.restart_command.lock().unwrap() = Some(RestartCommand::Relaunch {
             argv, managed_browser_profile: true,
         });
     }
 
     pub fn restart_uses_managed_browser_profile(&self) -> bool {
-        self.restart_command.lock().unwrap().as_ref()
-            .is_some_and(|command| command.managed_browser_profile)
+        matches!(self.restart_command.lock().unwrap().as_ref(),
+            Some(RestartCommand::Relaunch { managed_browser_profile: true, .. }))
     }
 
-    /// Whether a restart can actually relaunch the node (a shell registered
-    /// a relaunch argv).
+    /// Whether the shell registered a relaunch command or a service restart.
     pub fn can_restart(&self) -> bool {
         self.restart_command.lock().unwrap().is_some()
     }
 
-    /// Stop the node process; with `restart` a detached helper waits for this
-    /// process to die and starts it again (the Config page's restart button
-    /// and `serverShutdown {restart: true}`). State is persisted first, then
-    /// exit is delayed a moment so the caller's response can flush.
+    /// Stop or restart the node (the Config page's restart button and
+    /// `serverShutdown {restart: true}`). Supervised nodes exit with a failure
+    /// status to request a restart; other shells use a detached relaunch helper.
+    /// State is persisted first, then exit is delayed so the response can flush.
     pub async fn shutdown(&self, restart: bool) {
         self.log(
             "INFO",
@@ -6756,13 +6764,15 @@ impl AppState {
         .await;
         self.persist_peers().await;
         self.persist_xites().await;
-        let argv = if restart {
-            self.restart_command.lock().unwrap().as_ref().map(|command| command.argv.clone())
+        let command = if restart {
+            self.restart_command.lock().unwrap().clone()
         } else { None };
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            if let Some(argv) = argv {
-                spawn_relauncher(&argv);
+            match command {
+                Some(RestartCommand::Supervised) => std::process::exit(75),
+                Some(RestartCommand::Relaunch { argv, .. }) => spawn_relauncher(&argv),
+                None => {}
             }
             std::process::exit(0);
         });
@@ -45927,6 +45937,9 @@ mod tests {
         assert!(state.restart_uses_managed_browser_profile());
         state.set_restart_argv(vec!["epix-server".into()]);
         assert!(!state.restart_uses_managed_browser_profile());
+        state.set_supervised_restart();
+        assert!(!state.restart_uses_managed_browser_profile());
+        assert!(state.can_restart());
     }
 
     #[tokio::test]
