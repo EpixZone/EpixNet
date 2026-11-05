@@ -1496,10 +1496,12 @@ async fn a_content_change_for_a_xite_with_jobs_re_registers_it_with_no_evx_comma
     f.state.push_xite_info(&f.address).await;
     let row = wait_for(
         epix_evx::scheduler::CONTENT_WAKE_COALESCE + Duration::from_secs(3),
-        "the re-signed declaration to be registered",
+        "the scheduler to finish registering the re-signed declaration",
         || async {
             let row = f.service.durable().jobs(&f.address).unwrap().remove(0);
-            (row.declaration_digest == wider).then_some(row)
+            // A tick publishes durable state before awaiting its log writes;
+            // that state alone does not mean the tick has completed.
+            (row.declaration_digest == wider && f.service.scheduler_ticks() > settled).then_some(row)
         },
     )
     .await;
@@ -1515,9 +1517,9 @@ async fn a_content_change_for_a_xite_with_jobs_re_registers_it_with_no_evx_comma
     epix_content::sign(&mut gone, &f.xite.key).unwrap();
     XiteStorage::new(&root).write("content.json", epix_content::dumps_content(&gone).as_bytes()).unwrap();
     f.state.push_xite_info(&f.address).await;
-    wait_for(epix_evx::scheduler::CONTENT_WAKE_COALESCE + Duration::from_secs(3), "the job to be held", || async {
+    wait_for(epix_evx::scheduler::CONTENT_WAKE_COALESCE + Duration::from_secs(3), "the scheduler to finish holding the job", || async {
         let job = f.job(JOB).await;
-        (job["paused_reason"] == "declaration_unavailable").then_some(())
+        (job["paused_reason"] == "declaration_unavailable" && f.service.scheduler_ticks() > settled).then_some(())
     })
     .await;
     assert!(f.service.scheduler_ticks() > settled);
