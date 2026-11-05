@@ -17818,7 +17818,7 @@ impl AppState {
         let _emission = tokio::task::spawn_blocking(move || {
             use std::io::Write;
             let _ = writeln!(std::io::stdout().lock(), "{formatted}");
-            if let Some(file) = log_file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            if let Some(file) = log_file.lock().unwrap_or_else(std::sync::PoisonError::into_inner).as_mut() {
                 let _ = writeln!(file, "{formatted}");
             }
             emission
