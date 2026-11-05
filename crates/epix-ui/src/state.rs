@@ -4568,7 +4568,9 @@ pub struct AppState {
     /// Optional file that `log()` also appends each line to (`debug.log`), so
     /// the node's activity survives restarts for support/debugging. Set by the
     /// host; None keeps logging in-memory + stdout only.
-    log_file: std::sync::Mutex<Option<std::fs::File>>,
+    log_file: Arc<std::sync::Mutex<Option<std::fs::File>>>,
+    /// Keep stdout, file, buffer and event order consistent across async callers.
+    log_emission: Arc<tokio::sync::Mutex<()>>,
     /// Pending Bigfile uploads keyed by nonce (`bigfileUploadInit` → the
     /// `/EpixNet-Internal/BigfileUpload` POST consumes it).
     bigfile_uploads: std::sync::Mutex<HashMap<String, BigfileUpload>>,
@@ -5777,7 +5779,8 @@ impl AppState {
             pending_prompts: std::sync::Mutex::new(HashMap::new()),
             file_need_locks: std::sync::Mutex::new(HashMap::new()),
             callbacks: std::sync::Mutex::new(HashMap::new()),
-            log_file: std::sync::Mutex::new(None),
+            log_file: Arc::new(std::sync::Mutex::new(None)),
+            log_emission: Arc::new(tokio::sync::Mutex::new(())),
             bigfile_uploads: std::sync::Mutex::new(HashMap::new()),
             wrapper_nonces: std::sync::Mutex::new(std::collections::HashSet::new()),
             pending_wrapper_keys: std::sync::Mutex::new(HashMap::new()),
@@ -17804,15 +17807,22 @@ impl AppState {
         if log_rank(level) < log_rank(&self.log_level().await) {
             return;
         }
+        let emission = self.log_emission.clone().lock_owned().await;
         let message = message.into();
         let timestamp = now_secs();
         let formatted = format!("[{}] [{level}] {message}", crate::timestamp::format_utc(timestamp));
-        println!("{formatted}");
-        // Append to the on-disk log file, if one is configured.
-        if let Some(file) = self.log_file.lock().unwrap().as_mut() {
+        let log_file = self.log_file.clone();
+        // Neither a slow disk nor a full stdout pipe may block the async
+        // executor. The worker owns the ordering guard until IO finishes,
+        // even if the caller cancels while awaiting its result.
+        let _emission = tokio::task::spawn_blocking(move || {
             use std::io::Write;
-            let _ = writeln!(file, "{formatted}");
-        }
+            let _ = writeln!(std::io::stdout().lock(), "{formatted}");
+            if let Some(file) = log_file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                let _ = writeln!(file, "{formatted}");
+            }
+            emission
+        }).await;
         let line = json!([timestamp as f64, level, message]);
         {
             let mut logs = self.logs.write().await;
@@ -43633,6 +43643,69 @@ mod tests {
         };
         state.siteblock_add(&hashed, "hashed").await;
         assert_eq!(state.siteblock_reason("1HashBlocked").await.as_deref(), Some("hashed"));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn log_waiting_for_file_does_not_block_runtime() {
+        let state = AppState::new("test");
+        let writer = state.clone();
+        let (locked, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let holder = tokio::task::spawn_blocking(move || {
+            let _file = writer.log_file.lock().unwrap();
+            locked.send(()).unwrap();
+            released.recv_timeout(std::time::Duration::from_secs(1)).is_ok()
+        });
+        ready.await.unwrap();
+        tokio::join!(biased; state.log("INFO", "file contention"), async {
+            tokio::task::yield_now().await;
+            let _ = release.send(());
+        });
+        assert!(holder.await.unwrap(), "waiting for log output blocked the async runtime");
+    }
+
+    #[tokio::test]
+    async fn concurrent_log_outputs_keep_the_same_order() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("debug.log");
+        let state = AppState::new("test");
+        state.set_log_file(&path);
+        state.console_log_stream_open("INFO").await;
+        let mut events = state.subscribe_events();
+        let mut tasks = Vec::new();
+        for index in 0..16 {
+            let state = state.clone();
+            tasks.push(tokio::spawn(async move {
+                state.log("INFO", format!("ordered line {index}")).await;
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let buffered: Vec<String> = state.logs.read().await.iter()
+            .map(|line| line[2].as_str().unwrap().to_string()).collect();
+        let written = tokio::fs::read_to_string(path).await.unwrap();
+        let written: Vec<&str> = written.lines()
+            .map(|line| line.split_once("] [INFO] ").unwrap().1).collect();
+        assert_eq!(written, buffered);
+        let mut streamed = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            let payload: Value = serde_json::from_str(&event.payload).unwrap();
+            let line = payload["params"]["lines"][0].as_str().unwrap();
+            streamed.push(line.split_once("INFO Node ").unwrap().1.to_string());
+        }
+        assert_eq!(streamed, buffered);
+    }
+
+    #[tokio::test]
+    async fn log_file_write_failure_keeps_console_entry() {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let state = AppState::new("test");
+        // A read-only handle deterministically rejects the append.
+        let readonly = tokio::fs::File::open(file.path()).await.unwrap().into_std().await;
+        *state.log_file.lock().unwrap() = Some(readonly);
+        state.log("ERROR", "retained despite file failure").await;
+        assert_eq!(state.server_errors().await[0][2], "retained despite file failure");
     }
 
     #[tokio::test]
