@@ -175,6 +175,8 @@ async fn serves_xite_files_over_http() {
     assert!(!wcsp.contains("unsafe-eval'") || wcsp.contains("wasm-unsafe-eval'"), "no plain unsafe-eval");
     assert!(!wcsp.contains(" 'unsafe-eval'"), "JS eval stays blocked: {wcsp}");
     assert!(!wcsp.contains("sandbox"));
+    assert!(wcsp.split(';').any(|directive| directive.trim() == "frame-src * blob:"),
+        "Gecko must be able to download blobs generated in the xite frame: {wcsp}");
 
     let missing = reqwest::get(format!("http://{addr}/{xite}/nope.txt"))
         .await
