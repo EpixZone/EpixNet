@@ -33,6 +33,8 @@ pub mod local;
 pub mod xfer;
 #[cfg(feature = "inbound-seeding")]
 mod portcheck;
+#[cfg(all(test, feature = "inbound-seeding", target_os = "linux"))]
+mod upnp_lab;
 
 /// Re-export of the Tor routing mode so callers configure it without a direct
 /// `epix-tor` dependency. Only present with the `tor` feature.
@@ -2777,17 +2779,34 @@ async fn i2p_loop(
 /// forwarded ports.
 #[cfg(feature = "inbound-seeding")]
 async fn upnp_loop(state: Arc<AppState>, port: u16, clearnet: bool, shutdown: Arc<Notify>) {
-    upnp_loop_with_local_ip(state, port, clearnet, shutdown, local_ipv4).await;
+    upnp_loop_with_probe(
+        state,
+        port,
+        clearnet,
+        shutdown,
+        local_ipv4,
+        crate::portcheck::port_check,
+        Duration::from_secs(3600 * 4 / 5),
+    )
+    .await;
 }
 
+// Keep discovery, mapping, status updates, renewal and cleanup on one path.
+// The isolated router lab replaces only the external dial-back service and
+// renewal clock; normal startup always uses the production services above.
 #[cfg(feature = "inbound-seeding")]
-async fn upnp_loop_with_local_ip(
+async fn upnp_loop_with_probe<P, F>(
     state: Arc<AppState>,
     port: u16,
     clearnet: bool,
     shutdown: Arc<Notify>,
-    local_ip: impl FnOnce() -> Option<std::net::IpAddr>,
-) {
+    local_ip: impl Fn() -> Option<std::net::IpAddr>,
+    port_check: P,
+    refresh_interval: Duration,
+) where
+    P: Fn(u16) -> F,
+    F: std::future::Future<Output = Option<crate::portcheck::PortCheck>>,
+{
     use igd_next::aio::tokio::search_gateway;
     use igd_next::{PortMappingProtocol, SearchOptions};
     use std::net::SocketAddr;
@@ -2801,7 +2820,7 @@ async fn upnp_loop_with_local_ip(
     // A clearnet node with a directly-routable path (configured IP, or a
     // dial-back-confirmed public IP) needs no UPnP: the status is settled and
     // the task just holds until shutdown. Only a NAT'd host falls through.
-    if resolve_direct_port_status(&state, port).await {
+    if resolve_direct_port_status(&state, port, &local_ip, &port_check).await {
         shutdown.notified().await;
         state.set_port_status(false, None).await;
         return;
@@ -2835,7 +2854,9 @@ async fn upnp_loop_with_local_ip(
         {
             Ok(()) => {
                 if verified.is_none() {
-                    verified = Some(verify_mapped_port(&state, port, clearnet, &ext_ip).await);
+                    verified = Some(
+                        verify_mapped_port(&state, port, clearnet, &ext_ip, &port_check).await,
+                    );
                 }
                 let (opened, ip) = verified.clone().unwrap_or((true, ext_ip.clone()));
                 state.set_port_status(opened, ip).await;
@@ -2847,7 +2868,7 @@ async fn upnp_loop_with_local_ip(
         }
         tokio::select! {
             _ = shutdown.notified() => break,
-            _ = tokio::time::sleep(Duration::from_secs((LEASE * 4 / 5) as u64)) => {}
+            _ = tokio::time::sleep(refresh_interval) => {}
         }
     }
     // Remove the mapping on shutdown (best effort).
@@ -2866,7 +2887,16 @@ async fn upnp_loop_with_local_ip(
 /// firewalls (VPS hosts allow 22/80/443 by default) silently drop other
 /// ports, and assuming "public IP = open" hid exactly that on the gateway.
 #[cfg(feature = "inbound-seeding")]
-async fn resolve_direct_port_status(state: &Arc<AppState>, port: u16) -> bool {
+async fn resolve_direct_port_status<P, F>(
+    state: &Arc<AppState>,
+    port: u16,
+    local_ip: &impl Fn() -> Option<std::net::IpAddr>,
+    port_check: &P,
+) -> bool
+where
+    P: Fn(u16) -> F,
+    F: std::future::Future<Output = Option<crate::portcheck::PortCheck>>,
+{
     // Operator-configured external IP: trusted as-is (Python parity:
     // "Server port opened based on configuration").
     let configured = state
@@ -2882,11 +2912,11 @@ async fn resolve_direct_port_status(state: &Arc<AppState>, port: u16) -> bool {
         return true;
     }
 
-    let Some(check) = crate::portcheck::port_check(port).await else {
+    let Some(check) = port_check(port).await else {
         // No check service reachable: reachability is UNKNOWN. A public-IP
         // host records the address and lets the first inbound handshake
         // confirm; a NAT'd host falls through to UPnP.
-        let Some(ip) = public_ipv4() else { return false };
+        let Some(ip) = local_ip().filter(is_public_ipv4) else { return false };
         let (already_open, _) = state.port_status().await;
         state.set_port_status(already_open, Some(ip.to_string())).await;
         state
@@ -2920,7 +2950,7 @@ async fn resolve_direct_port_status(state: &Arc<AppState>, port: u16) -> bool {
     // something upstream drops the port. An inbound handshake still flips the
     // status if the path opens later (see seed_loop). A NAT'd host (no public
     // IP) returns false to try UPnP.
-    if public_ipv4().is_some() {
+    if local_ip().filter(is_public_ipv4).is_some() {
         state
             .log(
                 "WARNING",
@@ -2940,13 +2970,18 @@ async fn resolve_direct_port_status(state: &Arc<AppState>, port: u16) -> bool {
 /// to record; with no check service reachable, stays optimistic (the old
 /// behavior) and reports the router's external IP.
 #[cfg(feature = "inbound-seeding")]
-async fn verify_mapped_port(
+async fn verify_mapped_port<P, F>(
     state: &Arc<AppState>,
     port: u16,
     clearnet: bool,
     ext_ip: &Option<String>,
-) -> (bool, Option<String>) {
-    let check = if clearnet { crate::portcheck::port_check(port).await } else { None };
+    port_check: &P,
+) -> (bool, Option<String>)
+where
+    P: Fn(u16) -> F,
+    F: std::future::Future<Output = Option<crate::portcheck::PortCheck>>,
+{
+    let check = if clearnet { port_check(port).await } else { None };
     match check {
         Some(check) => {
             state
@@ -2978,17 +3013,6 @@ fn local_ipv4() -> Option<std::net::IpAddr> {
     sock.connect("8.8.8.8:80").ok()?;
     let ip = sock.local_addr().ok()?.ip();
     ip.is_ipv4().then_some(ip)
-}
-
-/// This host's own IPv4 if it is a publicly-routable address (a VPS/seedbox
-/// where the public IP sits directly on the interface, not behind NAT). The
-/// outbound-source-IP probe returns that public IP directly in that case; a
-/// NAT'd home machine returns a private `192.168.x`/`10.x` address instead and
-/// this yields `None`, leaving UPnP to open the port.
-#[cfg(feature = "inbound-seeding")]
-fn public_ipv4() -> Option<std::net::IpAddr> {
-    let ip = local_ipv4()?;
-    is_public_ipv4(&ip).then_some(ip)
 }
 
 /// Whether an IPv4 is reachable from the public internet: excludes private,
@@ -3025,9 +3049,17 @@ mod tests {
             let shutdown = std::sync::Arc::new(tokio::sync::Notify::new());
             tokio::time::timeout(
                 std::time::Duration::from_secs(1),
-                super::upnp_loop_with_local_ip(state.clone(), 43111, false, shutdown, || {
-                    panic!("Tor Always must not inspect LAN routing or discover a UPnP gateway")
-                }),
+                super::upnp_loop_with_probe(
+                    state.clone(),
+                    43111,
+                    false,
+                    shutdown,
+                    || panic!("Tor Always must not inspect LAN routing or discover a UPnP gateway"),
+                    |_| -> std::future::Ready<Option<super::portcheck::PortCheck>> {
+                        panic!("Tor Always must not contact a public port checker")
+                    },
+                    std::time::Duration::from_secs(2880),
+                ),
             )
             .await
             .expect("Tor Always must finish without waiting for a gateway or shutdown");
