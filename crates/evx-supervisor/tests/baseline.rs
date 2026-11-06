@@ -301,15 +301,24 @@ fn host_call_budget_capability_denial_and_live_revocation() {
 #[test]
 fn storage_quota_rejects_growth_and_preserves_data_after_reduction() {
     let f = Fixture::new();
-    let mut limits = Limits::default();
-    limits.storage_bytes = 1024;
-    f.broker.set_limits(limits).unwrap();
+    // Keep the fixture's platform-specific helper deadline while changing quota.
+    f.broker.set_storage_limit(1024).unwrap();
     let first = f.run(&write_wat("saved.txt", &"x".repeat(768)));
-    assert!(first.responses[0].is_ok(), "{first:?}");
+    assert_eq!(first.status, Status::Ok, "{first:?}");
+    assert_eq!(
+        first.responses,
+        vec![Response::Write {
+            ok: true,
+            bytes: 768
+        }],
+        "{first:?}"
+    );
     f.denied_call(&write_wat("extra.txt", &"x".repeat(512)));
     f.broker.set_storage_limit(32).unwrap();
     f.denied_call(&write_wat("small.txt", "x"));
     let readable = f.run(&read_wat("saved.txt"));
+    assert_eq!(readable.status, Status::Ok, "{readable:?}");
+    assert_eq!(readable.responses.len(), 1, "{readable:?}");
     assert_eq!(
         decode_read(&readable.responses[0]).len(),
         768,
@@ -317,7 +326,15 @@ fn storage_quota_rejects_growth_and_preserves_data_after_reduction() {
     );
     f.broker.set_storage_limit(2048).unwrap();
     let raised = f.run(&write_wat("extra.txt", &"x".repeat(512)));
-    assert!(raised.responses[0].is_ok(), "{raised:?}");
+    assert_eq!(raised.status, Status::Ok, "{raised:?}");
+    assert_eq!(
+        raised.responses,
+        vec![Response::Write {
+            ok: true,
+            bytes: 512
+        }],
+        "{raised:?}"
+    );
     assert_eq!(f.broker.usage().unwrap().0, 768 + 512);
 }
 
