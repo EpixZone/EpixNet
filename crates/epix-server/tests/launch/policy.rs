@@ -13,7 +13,7 @@ fn parse(args: &[&str]) -> Result<Arguments, String> {
     Arguments::parse(
         &args
             .iter()
-            .map(|value| value.to_string())
+            .map(ToString::to_string)
             .collect::<Vec<_>>(),
         "dashboard.epix",
     )
