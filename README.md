@@ -135,6 +135,15 @@ downloading or signing the xite before retrying. Exports run one at a time and
 use temporary disk space, with limits of 8 GiB per file and 16 GiB of file data
 per archive.
 
+Owner-key recovery uses the master seed in `private/users.json` and the
+`address_index` in the xite's signed `content.json`. Another installation with
+the same seed can recover the key even if its `users.json` copy predates the
+xite's creation. Enable **This is my xite** in the sidebar to attempt recovery.
+A `users.json` backup made after creation also contains the saved owner key.
+Earlier Rust-created or cloned xites may lack `address_index`; for those, restore
+a `users.json` backup containing the owner key or use your separately saved
+owner key when signing. Keep key backups private; public xite ZIPs exclude them.
+
 The same binary doubles as the authoring and diagnostics CLI, with the
 action name as the first argument (the EpixNet CLI shape):
 
