@@ -666,9 +666,10 @@ mod tests {
     }
 
     #[test]
-    fn skip_filter_rejects_unrelated_segments_and_never_misses_a_real_match() {
-        // Three days, three vocabularies. A query for one day's word must skip
-        // the other two segments outright and still find every real match.
+    fn skip_filter_never_misses_a_real_match() {
+        // Three days, three vocabularies. XOR8 may admit unrelated segments,
+        // but the record check must still return exactly the real matches.
+        // Random author/signature strings make these fixtures' filters vary.
         let day = SEGMENT_INTERVAL_MS as i64;
         let records = vec![
             comment_saying("c1", "p1", 1000, false, "banana smoothie recipe"),
@@ -682,8 +683,6 @@ mod tests {
 
         let resp = segment_search(&art, &["banana".into()], 50);
         assert_eq!(resp["segments_total"], json!(3));
-        assert_eq!(resp["segments_scanned"], json!(1), "only day 0 survives the filter");
-        assert_eq!(resp["segments_skipped"], json!(2), "unrelated segments are skipped");
         let ptrs = resp["pointers"].as_array().unwrap();
         assert_eq!(ptrs.len(), 2, "both banana comments found");
 
@@ -715,10 +714,45 @@ mod tests {
             }
         }
 
-        // A term nobody wrote skips everything (the whole point of the track).
+        // A filter false positive may cost a scan, but must not invent a hit.
         let none = segment_search(&art, &["xylophone".into()], 50);
         assert!(none["pointers"].as_array().unwrap().is_empty());
-        assert_eq!(none["segments_scanned"], json!(0), "no candidate segments at all");
+    }
+
+    #[test]
+    fn skip_filter_skips_known_absent_terms_and_checks_accepted_candidates() {
+        // A fixed, unsigned normalized record isolates this pure search-stage
+        // test from random signing strings. Signed records are covered above.
+        let record = Record {
+            canonical: br#"{"body":"banana"}"#.to_vec(),
+            id: "fixture".into(),
+            author: "fixture".into(),
+            target: String::new(),
+            clock: 0,
+            kind: epix_feed::Kind::Post,
+        };
+        let mut art = derive_feed(vec![record.clone()]);
+        let absent = vec!["xylophone".into()];
+        assert!(
+            !art.filters[0].contains(epix_search::term_hash("xylophone")),
+            "this fixed fixture must exercise a known filter rejection"
+        );
+        let rejected = segment_search(&art, &absent, 50);
+        assert_eq!(rejected["segments_scanned"], json!(0));
+        assert_eq!(rejected["segments_skipped"], json!(1));
+        assert!(rejected["pointers"].as_array().unwrap().is_empty());
+
+        // The valid seed-exhaustion fallback admits every candidate. Even
+        // this extreme false-positive case must return only exact matches.
+        art.filters[0] = Xor8::from_bytes(&[0; 16]).unwrap();
+        let accepted = segment_search(&art, &absent, 50);
+        assert_eq!(accepted["segments_scanned"], json!(1));
+        assert_eq!(accepted["segments_skipped"], json!(0));
+        assert!(accepted["pointers"].as_array().unwrap().is_empty());
+        let matched = segment_search(&art, &["banana".into()], 50);
+        let pointers = matched["pointers"].as_array().unwrap();
+        assert_eq!(pointers.len(), 1);
+        assert_eq!(pointers[0]["record"], json!(record.addr().to_string()));
     }
 
     /// A query the v1 tokenizer cannot index must return NOTHING, not the
