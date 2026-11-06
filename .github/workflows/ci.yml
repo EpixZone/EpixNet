@@ -165,6 +165,10 @@ jobs:
         run: |
           cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
           cargo test -p epix-ui --example merger_index_benchmark --locked
+      # These optional UI features are not enabled by the default test command.
+      # Keep password bootstrap, content isolation, and media route checks live.
+      - name: Test isolated xite origins with password and streaming
+        run: cargo test -p epix-ui --features ui-password,bittorrent --test loopback_content --test discovery_wait --locked
       # Security-critical channel suites must execute, not merely compile under
       # `build --all-targets`. These cover finality-backed identity resolution,
       # durable ratchet/outbox behavior, pairwise and group engines, and RLN.
