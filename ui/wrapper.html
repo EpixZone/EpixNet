@@ -99,9 +99,9 @@ else if (window.opener && window.opener.location.toString()) {
 
 
 <!-- Xite Iframe -->
-<!-- No allow-same-origin: the xite runs in an opaque origin, so it cannot
-     reach this window, the WebSocket as this origin, or the keys below. The
-     NOSANDBOX grant adds it through {sandbox_permissions}. -->
+<!-- A real xite origin is granted only on its separate content host. Shared
+     path origins stay opaque unless the user explicitly grants NOSANDBOX.
+     The content frame cannot reach this window, its WebSocket, or its keys. -->
 <iframe src='about:blank' id='inner-iframe' sandbox="allow-forms allow-scripts allow-downloads allow-top-navigation allow-popups allow-modals allow-presentation allow-pointer-lock allow-popups-to-escape-sandbox {sandbox_permissions}" allow="screen-wake-lock {wake_lock_allowlist}" allowfullscreen="true"></iframe>
 
 <!-- Xite info -->

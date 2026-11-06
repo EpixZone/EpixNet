@@ -30,6 +30,7 @@ pub mod paths;
 pub mod pool;
 pub mod state;
 mod timestamp;
+mod loopback_content;
 
 /// Re-exported for callers (the CLI) that hold sign options without a
 /// direct epix-xite dependency.
@@ -243,7 +244,12 @@ impl UiServer {
                 self.ctx.clone(),
                 ui_password_gate,
             ));
-        router.with_state(self.ctx.clone())
+        // Reserved localhost content hosts must never reach node routes,
+        // including the password form mounted above.
+        router.layer(axum::middleware::from_fn_with_state(
+            self.ctx.clone(),
+            loopback_content::gate,
+        )).with_state(self.ctx.clone())
     }
 
     pub async fn serve(mut self, addr: SocketAddr) -> std::io::Result<()> {
@@ -277,6 +283,7 @@ impl UiServer {
         // bind (a LAN/public bind is a deliberate multi-client deployment);
         // the `ui_check_cors` config key overrides either way.
         self.ctx.state.set_ui_loopback(addr.ip().is_loopback()).await;
+        self.ctx.state.set_ui_port(addr.port()).await;
         // Wrap the router so a transparent-proxy request (Firefox routing a
         // `*.epix` host to us) is rewritten from host form to the path form the
         // routes already understand, BEFORE routing. `Router::layer` runs after
@@ -1504,11 +1511,9 @@ async fn render_wrapper(
         return Redirect::temporary(&format!("//{origin}/{requested_path}{query}")).into_response();
     }
     let proxy_mode = host.eq_ignore_ascii_case(&requested);
-    // In host mode the xite page gets an origin of its own, distinct from this
-    // wrapper's: the iframe loads from the content host, and because that is
-    // a real origin the page may keep `allow-same-origin`. In path mode (the
-    // loopback UI, the Android shell) every xite shares the node's origin, so
-    // the page stays an opaque origin there.
+    // Proxy hosts and the local loopback UI use a separate content origin per
+    // xite. Shared LAN/gateway path access retains the opaque iframe sandbox.
+    // The loopback host is selected below after resolving the canonical address.
     let site_file_server = if proxy_mode { format!("//{}", content_host_for(&host)) } else { String::new() };
 
     // The path segment may be a `.epix` name (xID) or the bech32 address; the
@@ -1709,12 +1714,22 @@ async fn render_wrapper(
     // browser lands on its clean origin; an address links by path, which the
     // proxy rewrite routes as-is. File URLs stay relative to the current xite.
     let node_home = ctx.state.homepage().await.unwrap_or_else(|| requested.clone());
+    let local_content_server = if proxy_mode {
+        None
+    } else {
+        let authority = headers.get(header::HOST).and_then(|value| value.to_str().ok()).unwrap_or("");
+        loopback_content::iframe_server(&ctx, authority, &address).await
+    };
+    let isolated_content = proxy_mode || local_content_server.is_some();
+    let site_file_server = local_content_server.unwrap_or(site_file_server);
     let (homepage, file_url) = if proxy_mode {
         // Host mode always links the homepage as a dotted origin - a name
         // as-is, a bare address via its `<addr>.epix` alias - so the browser
         // lands on a clean origin without a path-form redirect hop.
         let home = format!("//{}", aliased_origin(&node_home));
         (home, format!("/{inner_path}"))
+    } else if isolated_content {
+        (format!("/{node_home}"), format!("/{inner_path}"))
     } else {
         (format!("/{node_home}"), format!("/{requested}/{inner_path}"))
     };
@@ -1740,14 +1755,12 @@ async fn render_wrapper(
     } else {
         ctx.state.wrapper_keys(&address).await
     };
-    // `allow-same-origin` is safe exactly when the page's origin is not the
-    // wrapper's: in host mode the frame is on the content host (its own real
-    // origin). In path mode it would make the page the wrapper - able to open
-    // the WebSocket as this origin and script a wrapper through a popup - so
-    // only the user's NOSANDBOX grant adds it there (the prompt says so).
+    // Separate proxy/loopback content hosts allow a real origin without the
+    // wrapper's authority. Shared LAN/gateway paths retain the opaque origin
+    // unless the user explicitly grants the existing NOSANDBOX permission.
     // Delegate screen wake lock to the frame's source when it has an origin.
     // Gecko requires `*` for this feature when the frame's origin is opaque.
-    let (sandbox_permissions, wake_lock_allowlist) = if proxy_mode || permissions.iter().any(|p| p == "NOSANDBOX") {
+    let (sandbox_permissions, wake_lock_allowlist) = if isolated_content || permissions.iter().any(|p| p == "NOSANDBOX") {
         ("allow-same-origin", "'src'")
     } else {
         ("", "*")
@@ -3165,10 +3178,11 @@ fn wrapper_background_color(value: &str) -> Option<&str> {
     })).then_some(value)
 }
 
-/// Drop a `wrapper_nonce=…` pair from a raw query string, keeping the rest.
+/// Drop wrapper nonce parameters, including encoded keys, without changing
+/// unrelated raw query bytes used by xite routers.
 fn strip_wrapper_nonce(q: &str) -> String {
     q.split('&')
-        .filter(|kv| !kv.starts_with("wrapper_nonce="))
+        .filter(|kv| percent_decode(kv.split('=').next().unwrap_or("")) != "wrapper_nonce")
         .collect::<Vec<_>>()
         .join("&")
 }
@@ -3273,12 +3287,17 @@ async fn serve_file(
     uri: axum::http::Uri,
     headers: axum::http::HeaderMap,
 ) -> Response {
+    // The dedicated localhost gate already selected this address and file.
+    // It cannot render wrapper chrome or resolve another merger underneath
+    // the content origin that the browser uses for wallet permissions.
+    let local_content = headers.get(header::HOST).and_then(|value| value.to_str().ok())
+        .and_then(loopback_content::address).is_some();
     // A top-level navigation to a directory or HTML page (no wrapper_nonce)
     // renders the wrapper with the iframe pointed at that inner file, matching
     // EpixNet's isWrapperNecessary. Multi-page xites (Git Epix's `index/`,
     // `myrepos/`) navigate this way. Iframe resource loads carry the nonce and
     // fall through to the raw file below.
-    if q.wrapper_nonce.is_none() {
+    if q.wrapper_nonce.is_none() && !local_content {
         let top_level_document = headers
             .get("sec-fetch-dest")
             .and_then(|v| v.to_str().ok())
@@ -3295,6 +3314,9 @@ async fn serve_file(
                 .map(String::from);
             return render_wrapper(ctx, address, inner, wrapper_request_path(&uri), outer_query, headers).await;
         }
+    }
+    if let Some(response) = loopback_content::redirect_node_file(&ctx, &address, &path, &uri, &headers).await {
+        return response;
     }
     // In host mode the chrome host serves only the wrapper. Every xite FILE
     // belongs on the content host: an HTML file served raw here - in a frame
@@ -3337,7 +3359,7 @@ async fn serve_file(
     // A merger xite's `merged-<type>/<address>/<path>` URL serves the merged
     // xite's file (MergerSite's checkMergerPath): retarget everything below -
     // the clone/wait loop, the Range branch, and the read - at the merged xite.
-    match ctx.state.resolve_merged(&address, &path).await {
+    match if local_content { Ok(None) } else { ctx.state.resolve_merged(&address, &path).await } {
         Ok(Some((maddr, minner))) => {
             requested = maddr.clone();
             address = maddr;
@@ -3667,7 +3689,13 @@ async fn bigfile_upload(
     } else {
         &body
     };
-    match ctx.state.bigfile_upload_finish(&nonce, data).await {
+    let result = match headers.get(header::HOST).and_then(|value| value.to_str().ok())
+        .and_then(loopback_content::address)
+    {
+        Some(xite) => ctx.state.bigfile_upload_finish_for_xite(&nonce, data, &xite).await,
+        None => ctx.state.bigfile_upload_finish(&nonce, data).await,
+    };
+    match result {
         Ok(r) => (
             StatusCode::OK,
             [(header::CONTENT_TYPE, "application/json")],
@@ -3733,12 +3761,11 @@ fn parse_range(header: &str, total: u64) -> Option<(u64, Option<u64>)> {
 /// Content-Disposition:attachment for file types dangerous to render inline
 /// (svg/xml/pdf/flash).
 ///
-/// Normal xite files carry **no** Content-Security-Policy - matching EpixNet,
-/// which only sends the restrictive `sandbox` CSP for `raw`/noscript requests.
-/// The inner content is sandboxed by the wrapper's iframe `sandbox` attribute
-/// (`allow-scripts …` without `allow-same-origin`, so the page is an opaque
-/// origin); putting `default-src 'none'; sandbox (no allow-scripts)` on the
-/// file itself would block the xite's own scripts.
+/// A xite's own files normally carry no Content-Security-Policy: its wrapper
+/// supplies the iframe sandbox and either a separate content origin or the
+/// shared-origin opaque fallback. Applying a noscript CSP to those files
+/// would block the xite's own scripts. Raw responses and foreign files served
+/// through a loopback content host add their restrictive response policy.
 fn file_headers(content_type: &str, status: StatusCode) -> axum::http::HeaderMap {
     let mut pairs = vec![
         (header::CONTENT_TYPE, content_type.to_string()),
@@ -3875,9 +3902,9 @@ fn wrapper_csp(script_nonce: &str) -> String {
     // desktop browser each xite is its OWN origin (https://<name>.epix), so a
     // xite that legitimately shows another's content - an EpixTalk avatar whose
     // URL lives on the poster's xite, an embedded image or video - is
-    // cross-origin and `'self'` would block it. On the loopback/mobile path
-    // every xite shares one origin, which is why it only broke in host mode
-    // (issue #337). Broadening these adds no exfiltration surface: `connect-src`
+    // cross-origin and `'self'` would block it. Loopback/mobile content now
+    // also has a separate origin per xite. These passive sources retain the
+    // existing policy from issue #337: `connect-src`
     // is already `*`, a strictly more capable channel. The script nonce, not
     // the resource origins, is the real boundary here.
     // Gecko checks frame-src when a sandboxed xite downloads a generated blob.
@@ -3959,7 +3986,7 @@ async fn ws_upgrade(
     // opens itself says `Origin: null`; in host mode it lives on a content
     // host, which is neither a wrapper origin nor a host the wrapper
     // connects to. Refuse both before anything else.
-    if origin == "null" {
+    if origin == "null" || loopback_content::is_content_origin(origin) {
         return (StatusCode::FORBIDDEN, "Invalid origin").into_response();
     }
     let origin_host = origin.rsplit("://").next().unwrap_or("");
@@ -4366,7 +4393,6 @@ fn form_field(body: &str, key: &str) -> String {
 }
 
 /// Minimal form-value decode: `+` to space and `%XX` escapes.
-#[cfg(feature = "ui-password")]
 fn percent_decode(s: &str) -> String {
     let bytes = s.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());

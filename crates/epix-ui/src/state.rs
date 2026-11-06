@@ -10193,6 +10193,11 @@ impl AppState {
         *self.ui_loopback.write().await = loopback;
     }
 
+    /// Whether the actual UI listener is local, independent of CORS settings.
+    pub(crate) async fn ui_is_loopback(&self) -> bool {
+        *self.ui_loopback.read().await
+    }
+
     /// Whether the cross-origin request gate is on: the `ui_check_cors`
     /// config key when set, else on for loopback binds only (a LAN/public
     /// bind is a deliberate multi-client deployment), like EpixNet.
@@ -16539,12 +16544,38 @@ impl AppState {
         upload_token: &str,
         body: &[u8],
     ) -> Result<BigfileUploadResult, String> {
-        let upload = self
-            .bigfile_uploads
-            .lock()
-            .unwrap()
-            .remove(upload_token)
-            .ok_or("Unknown or expired upload nonce")?;
+        self.bigfile_upload_finish_scoped(upload_token, body, None).await
+    }
+
+    pub(crate) fn bigfile_upload_belongs_to(&self, upload_token: &str, xite: &str) -> bool {
+        self.bigfile_uploads.lock().unwrap().get(upload_token)
+            .is_some_and(|upload| upload.canonical == xite)
+    }
+
+    pub(crate) async fn bigfile_upload_finish_for_xite(
+        &self,
+        upload_token: &str,
+        body: &[u8],
+        xite: &str,
+    ) -> Result<BigfileUploadResult, String> {
+        self.bigfile_upload_finish_scoped(upload_token, body, Some(xite)).await
+    }
+
+    async fn bigfile_upload_finish_scoped(
+        &self,
+        upload_token: &str,
+        body: &[u8],
+        xite: Option<&str>,
+    ) -> Result<BigfileUploadResult, String> {
+        let upload = {
+            let mut uploads = self.bigfile_uploads.lock().unwrap();
+            let pending = uploads.get(upload_token).ok_or("Unknown or expired upload nonce")?;
+            if xite.is_some_and(|xite| pending.canonical != xite) {
+                // A request on B must neither use nor invalidate A's upload.
+                return Err("Upload nonce belongs to another xite".into());
+            }
+            uploads.remove(upload_token).unwrap()
+        };
         let state = self.owned_state();
         let body = body.to_vec();
         tokio::spawn(async move { state.bigfile_upload_finish_owned(upload, &body).await })

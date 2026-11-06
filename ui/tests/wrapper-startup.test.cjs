@@ -49,7 +49,7 @@ function fixture(options = {}) {
         writes.push({ frame: this, src: value, expectedNonce: window.wrapper_nonce });
         currentSrc = value;
       },
-      getAttribute(name) { return name === "src" ? currentSrc : null; },
+      getAttribute(name) { return name === "src" ? currentSrc : name === "sandbox" ? "allow-scripts" : null; },
       setAttribute(name, value) { if (name === "src") this.src = value; },
     };
   }
@@ -109,7 +109,7 @@ function fixture(options = {}) {
     opens: () => messages.filter(message => message.cmd === "wrapperOpenedWebsocket").length,
     asks: () => messages.filter(message => message.cmd === "ping").length,
     ready(nonce = window.wrapper_nonce, sender = inner) {
-      return wrapper.onMessageInner({ source: sender, data: { cmd: "innerReady", id: 1, wrapper_nonce: nonce } });
+      return wrapper.onMessageInner({ origin: "null", source: sender, data: { cmd: "innerReady", id: 1, wrapper_nonce: nonce } });
     },
     // The frame library's answer to the chrome's probe, for the given ping
     // (the latest by default).
@@ -117,7 +117,7 @@ function fixture(options = {}) {
       const pings = messages.filter(message => message.cmd === "ping");
       const ping = pings.at(index);
       assert.ok(ping, "a probe must have been sent");
-      return wrapper.onMessageInner({ source: sender, data: { cmd: "response", to: ping.id, result: "pong", wrapper_nonce: nonce } });
+      return wrapper.onMessageInner({ origin: "null", source: sender, data: { cmd: "response", to: ping.id, result: "pong", wrapper_nonce: nonce } });
     },
     // The inner frame's own load event: once per document it shows.
     load() { wrapper.onPageLoad({ target: frame }); },
@@ -248,8 +248,8 @@ test("a pong for an earlier probe, a wrong nonce or another window is ignored", 
 
 test("a page's other responses are ignored", () => {
   const f = fixture(); f.load();
-  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "response", to: 12, result: "pong", wrapper_nonce: "oldNonce" } });
-  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "response", to: f.messages.at(-1).id, result: true, wrapper_nonce: "oldNonce" } });
+  f.wrapper.onMessageInner({ origin: "null", source: f.inner, data: { cmd: "response", to: 12, result: "pong", wrapper_nonce: "oldNonce" } });
+  f.wrapper.onMessageInner({ origin: "null", source: f.inner, data: { cmd: "response", to: f.messages.at(-1).id, result: true, wrapper_nonce: "oldNonce" } });
   assert.equal(f.wrapper.inner_ready, false);
   assert.equal(f.opens(), 0);
 });
@@ -294,7 +294,7 @@ test("a silent replacement is invisible until a document speaks", () => {
 test("invalid nonce and unrelated-source ready cannot establish readiness", () => {
   for (const [nonce, sender] of [["wrong", null], [undefined, null], ["oldNonce", {}]]) {
     const f = fixture();
-    f.wrapper.onMessageInner({ source: sender || f.inner, data: { cmd: "innerReady", wrapper_nonce: nonce } });
+    f.wrapper.onMessageInner({ origin: "null", source: sender || f.inner, data: { cmd: "innerReady", wrapper_nonce: nonce } });
     assert.equal(f.wrapper.inner_ready, false);
     assert.equal(f.opens(), 0);
   }
@@ -548,7 +548,7 @@ test("a document that introduced itself cannot pose as the waiting placeholder",
   // then claims to be waiting would otherwise make the chrome reload the
   // frame and ask the node for a nonce on its behalf.
   const f = fixture(); f.ready(); f.load();
-  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
+  f.wrapper.onMessageInner({ origin: "null", source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
   assert.equal(f.wrapper.inner_load_state, null);
   assert.equal(f.wrapper.inner_loaded, true);
   assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 0);
@@ -570,14 +570,14 @@ test("a page cannot harvest the nonce of a reload it provoked", () => {
   // reload that provokes is released when the page speaks, and the node's
   // reply is dropped rather than forwarded; once ready, it provokes nothing.
   const f = fixture();
-  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
+  f.wrapper.onMessageInner({ origin: "null", source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
   assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 1);
   f.ready();
   f.nonceReply(0, { wrapper_nonce: "FRESH" });
   assert.equal(f.writes.length, 0);
   assert.equal(f.messages.filter(m => m.cmd === "response").length, 0);
   assert.equal(f.window.wrapper_nonce, "oldNonce");
-  f.wrapper.onMessageInner({ source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
+  f.wrapper.onMessageInner({ origin: "null", source: f.inner, data: { cmd: "innerLoadState", params: "waiting", wrapper_nonce: "oldNonce" } });
   assert.equal(f.requests.filter(r => r.command === "serverGetWrapperNonce").length, 1, "a ready page provokes nothing more");
   assert.equal(f.opens(), 1);
 });
