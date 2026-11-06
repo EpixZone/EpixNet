@@ -92,6 +92,9 @@ pub struct RunOptions {
     pub fail_file_cleanup: bool,
     pub revoke_event: Option<Arc<AtomicBool>>,
     pub before_file_commit: Option<Box<FileCommitHook>>,
+    /// Trusted test hook after commit authority is recorded and sent. This
+    /// never derives from guest input, like `before_file_commit` above.
+    pub after_file_commit_authorized: Option<Box<FileCommitHook>>,
     pub after_file_result: Option<Box<FileCommitHook>>,
 }
 
@@ -899,6 +902,9 @@ impl<'a> Loop<'a> {
                     helper.send(&encode(&ToHelper::Commit)?)?;
                 }
                 self.events.push("file_commit_authorized".into());
+                if let Some(hook) = &self.options.after_file_commit_authorized {
+                    hook(self.broker);
+                }
                 Ok(())
             }
             FromHelper::FileResult { response } => {

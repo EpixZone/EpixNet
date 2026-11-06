@@ -681,9 +681,8 @@ fn unconfirmed_cleanup(commit: bool) {
     }
     let f = fixture();
     let artifact = compile_ok(&f.config, calc());
-    let mut limits = lifecycle_limits();
-    limits.host_call_seconds = 0.2;
-    f.broker.set_limits(limits).unwrap();
+    let authorized = Arc::new(AtomicBool::new(false));
+    let reached = authorized.clone();
     let result = f.run_with(
         &write_wat("pending.txt", "fixture"),
         RunOptions {
@@ -695,9 +694,25 @@ fn unconfirmed_cleanup(commit: bool) {
             // Inject an unconfirmed first reap. Final cleanup still kills the
             // sacrificial child; no real unkillable OS task is created.
             fail_file_cleanup: true,
+            after_file_commit_authorized: Some(Box::new(move |broker| {
+                // Allow normal helper startup and durable staging first.
+                // A short deadline before authorization tests a different
+                // outcome: no native effect was authorized, so it is known.
+                let mut limits = broker.limits();
+                limits.host_call_seconds = 0.05;
+                broker.set_limits(limits).unwrap();
+                reached.store(true, Ordering::SeqCst);
+            })),
             ..Default::default()
         },
     );
+    assert_eq!(authorized.load(Ordering::SeqCst), commit, "{result:?}");
+    assert_eq!(
+        result.events.iter().any(|event| event == "file_commit_authorized"),
+        commit,
+        "{result:?}"
+    );
+    assert!(result.events.iter().any(|event| event == "native_call_deadline"), "{result:?}");
     assert_eq!(
         result.status,
         Status::Quarantined,
