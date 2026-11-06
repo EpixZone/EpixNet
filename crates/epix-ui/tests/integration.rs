@@ -251,18 +251,26 @@ async fn transparent_proxy_serves_epix_host() {
     // A xite served under a `.epix` name, reachable via the transparent-proxy
     // host rewrite (what Firefox's PAC sends: Host: talk.epix, path /).
     let dir = tempfile::tempdir().unwrap();
-    let storage = XiteStorage::new(dir.path());
-    storage.write("index.html", b"<h1>inner</h1>").unwrap();
-    let state = AppState::new("0.1.0");
-    state
-        .add_xite(
-            "talk.epix",
-            XiteEntry {
-                storage,
-                content: Some(json!({ "title": "Talk", "files": { "index.html": {} } })),
-            },
-        )
-        .await;
+    let key = epix_crypt::new_seed();
+    let canonical = epix_crypt::privatekey_to_address(&key).unwrap();
+    let storage = XiteStorage::new(dir.path().join("data").join(&canonical));
+    let index = b"<h1>inner</h1>";
+    storage.write("index.html", index).unwrap();
+    let mut content = json!({
+        "address": canonical, "domain": "talk.epix", "title": "Talk", "modified": 1,
+        "files": { "index.html": {
+            "size": index.len(), "sha512": XiteStorage::hash_bytes(index)
+        } }
+    });
+    epix_content::sign(&mut content, &key).unwrap();
+    storage.write("content.json", epix_content::dumps_content(&content).as_bytes()).unwrap();
+    assert!(!epix_chain::verify_finality_enabled());
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs();
+    tokio::fs::write(dir.path().join("resolve-cache.json"),
+        json!({ "talk.epix": { "address": canonical, "resolved_at": now } }).to_string())
+        .await.unwrap();
+    let state = AppState::with_data_dir("proxy-origin-test", dir.path());
+    state.add_xite(&canonical, XiteEntry { storage, content: Some(content) }).await;
 
     // The full serve() path (includes the proxy rewrite wrap), not router().
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -362,17 +370,21 @@ async fn transparent_proxy_serves_epix_host() {
         assert!(tokio_tungstenite::connect_async(req).await.is_err(), "ws refused for {host} from {origin}");
     }
 
-    // Normal localhost path mode is unchanged: path-prefixed URLs, and the
-    // page stays an opaque origin because it would share the node's.
+    // Loopback wrappers now use the same canonical content identity across
+    // path aliases, separate from the node's trusted origin.
     let path_mode = client
         .get(format!("http://{addr}/talk.epix/"))
         .header("sec-fetch-mode", "navigate")
         .send()
         .await
         .unwrap();
+    assert_eq!(path_mode.status(), 200);
     let path_html = path_mode.text().await.unwrap();
-    assert!(path_html.contains("/talk.epix/index.html"), "path mode keeps the prefix");
-    assert!(!sandbox_of(&path_html).contains("allow-same-origin"), "path mode stays opaque: {path_html}");
+    let content_host = format!("epix-{canonical}.localhost:{}", addr.port());
+    assert!(path_html.contains(&format!(r#"iframe_src = "//{content_host}/index.html?"#)),
+        "loopback frame uses its canonical content origin: {path_html}");
+    assert!(sandbox_of(&path_html).contains("allow-same-origin"),
+        "the separate content origin retains browser storage: {path_html}");
     let raw = client
         .get(format!("http://{addr}/talk.epix/index.html"))
         .header("sec-fetch-mode", "navigate")
@@ -380,7 +392,17 @@ async fn transparent_proxy_serves_epix_host() {
         .send()
         .await
         .unwrap();
-    assert_eq!(raw.status(), 200, "path mode serves files on the node origin");
+    assert_eq!(raw.status(), 307, "raw xite HTML never executes on the node origin");
+    let location = reqwest::Url::parse(raw.headers()["location"].to_str().unwrap()).unwrap();
+    assert_eq!(location.origin().ascii_serialization(), format!("http://{content_host}"));
+    assert_eq!(location.path(), "/index.html");
+    let inner = client.get(format!("http://{addr}{}", location.path()))
+        .header("host", &content_host)
+        .header("sec-fetch-mode", "navigate")
+        .header("sec-fetch-dest", "iframe")
+        .send().await.unwrap();
+    assert_eq!(inner.status(), 200);
+    assert_eq!(inner.text().await.unwrap(), "<h1>inner</h1>");
 }
 
 #[tokio::test]
