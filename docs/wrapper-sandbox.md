@@ -7,11 +7,13 @@ node only through `postMessage` to the wrapper, which forwards page commands
 over that socket. This document describes what keeps that boundary real and
 what a xite loses because of it.
 
-## The iframe is an opaque origin
+## Shared-origin serving keeps the iframe opaque
 
-The inner iframe's `sandbox` attribute has no `allow-same-origin`. The xite
-page therefore runs in an opaque ("null") origin even though its files are
-served from the node's own host:
+When the page's files share the wrapper's host, the inner iframe's `sandbox`
+attribute has no `allow-same-origin`. The xite page therefore runs in an
+opaque ("null") origin. This remains the fallback for LAN and public gateway
+access. Local loopback access and the desktop browser use separate content
+origins, described below. An opaque page:
 
 - it cannot read or script the wrapper window, its globals or its DOM;
 - a WebSocket, fetch or XHR it opens itself carries `Origin: null`;
@@ -45,8 +47,8 @@ into the wrapper page's own script block and are stripped from every
 - Any other socket (an address or name as the key, an unknown key, no key) is
   a page-level session: it binds to the address for events and ordinary
   commands, and an elevated id on it is just a number the client chose.
-- An upgrade with `Origin: null` is refused outright: the wrapper is never an
-  opaque origin, the xite frame always is.
+- An upgrade with `Origin: null` or a reserved xite content origin is refused
+  outright. Only the trusted wrapper origin can open its privileged socket.
 - A wrapper rendered while its xite is still being added (the loading
   screen) gets keys reserved for that address; `add_xite` adopts them, so the
   page already open keeps its authority once the xite lands.
@@ -132,11 +134,10 @@ production wrapper.
 
 ## What a xite author must know
 
-- Use the wrapper storage commands, not `localStorage`; guard any direct use
-  with `try`/`catch` (it throws `SecurityError` in the sandbox).
-- `navigator.serviceWorker` throws in the sandbox; do not touch it unless
-  the xite holds `NOSANDBOX`. A xite that needs a service worker needs that
-  grant, or a future per-xite origin (see below).
+- Use the wrapper storage commands for portable storage. Guard direct
+  `localStorage` and `navigator.serviceWorker` access with `try`/`catch`:
+  they remain unavailable in the opaque fallback. Separate content origins
+  provide browser storage scoped to that xite without a `NOSANDBOX` grant.
 - Fonts and ES modules load from the xite's own files. Fetching another
   xite's files needs `Cors:<address>`, requested through the wrapper.
 
@@ -191,10 +192,82 @@ opaque, because it can have a real origin that is still not the wrapper's:
 - The wrapper page is unreadable from the content origin (no CORS grant),
   so the keys stay with the chrome. `content.epix` is a reserved name.
 
-Path mode (the loopback UI, Chrome and other browsers, the Android shell)
-keeps the opaque sandbox above: there every xite would share the node's
-origin. `crates/epix-evx/examples/wrapper_fixture.rs --host` serves host mode through the
-browsers' proxy for a real-browser check.
+`crates/epix-evx/examples/wrapper_fixture.rs --host` serves host mode through
+the browser's proxy for a real-browser check.
+
+## Loopback access: a canonical address origin per xite
+
+When the node listens on loopback and the wrapper is opened through
+`127.0.0.1`, `localhost`, or `::1`, its inner page uses
+`http://epix-<canonical-address>.localhost:<node-port>/`. The browser resolves
+these reserved localhost names locally. The wrapper remains on the node's
+trusted origin. The content iframe can keep `allow-same-origin` because it
+shares neither the wrapper's origin nor another xite's origin.
+
+The host contains the full checksum-valid bech32 address. Names and address
+aliases that resolve to the same xite use that same content host. The node
+port remains part of the origin. Wallet account grants therefore belong to
+the xite and local node instance, rather than every path on a shared
+`127.0.0.1` origin. Provider messaging uses its normal exact-origin transport.
+
+The content-host route is separate from node routing and remains enforced
+when `ui_check_cors` is disabled:
+
+- File reads are bound to the xite and its existing grants. The content host never renders the
+  wrapper, Login, configuration, backup, wallet UI, or other node controls.
+  Malformed and trailing-dot content-host aliases are rejected as well.
+- Raw file requests to the local node also redirect to the canonical content
+  host, including iframe requests and URLs containing a forged wrapper nonce.
+  Only trusted wrapper pages render on the node origin. Non-HTML files remain
+  on their content origin for viewing or downloading, avoiding a redirect loop.
+- Content hosts cannot open the node WebSocket, even with a wrapper key.
+  Encoded separators, traversal, raw routes, and another xite's path cannot
+  place that other xite's active content under the current wallet identity.
+- Top-level navigation returns to the node wrapper. The dashboard's exact
+  configuration, plugin, statistics, and backup links redirect to the node
+  UI only for top-level GET navigation. These redirects happen before content
+  cookie checks because partitioned iframe cookies do not follow top-level
+  navigation; the destination node still authenticates with its own session.
+  Inner-file nonce parameters are removed so the destination renders its wrapper.
+  A top-level image or download without a content session first returns through
+  the node's normal authentication and receives a fresh content bootstrap.
+  The return address uses the trusted connection's loopback address family. Passive cross-xite
+  resources are redirected to their own canonical content host.
+- Authorized merger and `Cors:` data reads keep their existing same-origin
+  URL and authenticated session. Each request rechecks the source, target,
+  and grant; another origin cannot borrow those grants. Foreign file responses
+  use `Content-Security-Policy: sandbox`, `nosniff`, and `no-store`, so a
+  headerless navigation cannot execute those bytes as the requesting xite.
+  `Cross-Origin-Resource-Policy: same-origin` also blocks foreign classic
+  script embeds, including clients without fetch metadata. Known foreign
+  active/data requests without source identity are denied.
+  Document, iframe, object, and embed requests instead go to the target's own
+  content origin. Revoking a grant invalidates subsequent data reads.
+- Two existing xite endpoints remain available under narrow rules: passive
+  audio/video reads of `/bt/stream`, and same-origin `BigfileUpload` POSTs
+  with a one-time upload grant bound to that xite. Other global routes remain
+  blocked. Stream and upload responses are sandboxed and cannot act as pages.
+- The existing UI password remains required. A content document can inherit
+  authenticated access only through its issued wrapper nonce or a valid
+  content-host session. Authorized cross-xite redirects reuse the existing
+  one-use nonce bootstrap for the target host. Content cookies are host-only,
+  `Secure`, `HttpOnly`, and `SameSite=None` so the isolated iframe can retain
+  its own session. The node cookie is unchanged. This does not grant access
+  to node routes.
+
+The wrapper also binds both directions of its page transport to the
+configured content origin. It checks the source WindowProxy and exact origin
+before handling a message, including xID link completion. Normal EpixFrame
+commands retain their existing nonce check.
+Replies and events use the exact target origin. Navigating the same iframe
+to a merged xite cannot transfer the first xite's wrapper authority or
+pending replies. The opaque fallback accepts the browser's literal `null`
+origin and retains its existing opaque-frame response transport.
+
+Loopback content hosts are not advertised for LAN or public gateway
+visitors: their localhost would refer to a different machine. Those modes
+retain the opaque sandbox unless their deployment supplies the existing
+separate `.epix` content hosts. The wrapper's script-nonce CSP is unchanged.
 
 ## Known limits
 
@@ -202,8 +275,10 @@ browsers' proxy for a real-browser check.
   a page that suppresses its `Referer`; the bytes are not readable. Modern
   browsers' local-network-access rules and the browser extension's clearnet
   block both stand in front of this.
-- Path mode cannot give a xite a real origin of its own; a xite that needs
-  storage or a service worker there needs `NOSANDBOX` or the Epix browser.
+- LAN and public-gateway path mode still has an opaque origin. Wallets that
+  require an exact-origin page transport need a local node or a deployment
+  with separate content hosts; removing the shared-origin sandbox is not a
+  substitute.
 
 ## Trusted rendering and consent
 

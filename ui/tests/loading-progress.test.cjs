@@ -40,7 +40,7 @@ function fixture() {
   const context = vm.createContext({
     window: { show_loadingscreen: false, resolving_host: '', file_inner_path: 'index.html',
       location: { reload() { reloaded++; } }, document: {}, },
-    document: { getElementById: () => ({ contentWindow: inner, getAttribute: (name) => name === 'src' ? innerDocument.location.href : null }) },
+    document: { getElementById: () => ({ contentWindow: inner, getAttribute: (name) => name === 'src' ? innerDocument.location.href : name === 'sandbox' ? 'allow-scripts' : null }) },
     $, console, Date: { now: () => now },
     setTimeout(fn, delay) { const id = ++next; timers.set(id, { fn, at: now + delay }); return id; },
     clearTimeout(id) { timers.delete(id); },
@@ -49,7 +49,7 @@ function fixture() {
     RateLimit(delay, fn) { fn(); },
   });
   const loading = source.slice(source.indexOf('/* ---- Loading.coffee ---- */'), source.indexOf('/* ---- Notifications.coffee ---- */'));
-  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'newInnerDocument', 'innerIsReady', 'probeInner', 'announceWebsocket', 'clearIframeReload', 'loadingDocumentReady', 'setInnerLoadState', 'onMessageInner', 'handleMessage', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
+  vm.runInContext(loading + '\nvar Wrapper=function(){};\n' + ['setXiteInfo', 'onPageLoad', 'reloadXiteInfo', 'startResolvePoll', 'pollResolveStatus', 'setResolveStatus', 'newInnerDocument', 'innerIsReady', 'probeInner', 'announceWebsocket', 'clearIframeReload', 'loadingDocumentReady', 'setInnerLoadState', 'expectedInnerOrigin', 'onMessageInner', 'handleMessage', 'onOpenWebsocket', 'handleMessageWebsocket'].map(method).join('\n'), context);
   const wrapper = Object.assign(Object.create(context.Wrapper.prototype), {
     xite_info: null, inner, inner_loaded: false, inner_ready: false,
     event_xite_info: { resolve() {} }, noteContentSync() {}, log() {}, reloadXiteInfo() {},
@@ -334,9 +334,9 @@ test('a nonce-secured xite still hears its placeholder announce itself', () => {
   f.wrapper.opener_tested = true;
   f.wrapper.reloadIframe = () => { reloads++; f.wrapper.inner_load_state = null; };
   f.wrapper.xite_info = info(['clone_status', 'complete'], { clone_status: { state: 'complete', attempt: 1 } });
-  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting' }, source: f.wrapper.inner });
+  f.wrapper.onMessageInner({ origin: 'null', data: { cmd: 'innerLoadState', params: 'waiting' }, source: f.wrapper.inner });
   assert.equal(f.wrapper.inner_load_state, undefined, 'an unsigned announce is dropped');
-  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting', wrapper_nonce: 'abc123' }, source: f.wrapper.inner });
+  f.wrapper.onMessageInner({ origin: 'null', data: { cmd: 'innerLoadState', params: 'waiting', wrapper_nonce: 'abc123' }, source: f.wrapper.inner });
   assert.equal(reloads, 1, 'the signed announce reaches the recovery');
   assert.equal(f.wrapper.inner_loaded, false);
 });
@@ -347,9 +347,9 @@ test('only the inner frame may command the wrapper', () => {
   f.wrapper.reloadIframe = () => { reloads++; };
   f.wrapper.xite_info = info(['clone_status', 'complete'], { clone_status: { state: 'complete', attempt: 1 } });
   const stranger = {};
-  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting' }, source: stranger });
+  f.wrapper.onMessageInner({ origin: 'null', data: { cmd: 'innerLoadState', params: 'waiting' }, source: stranger });
   assert.equal(f.wrapper.inner_load_state, undefined, 'a message from another window is ignored');
   assert.equal(reloads, 0);
-  f.wrapper.onMessageInner({ data: { cmd: 'innerLoadState', params: 'waiting' }, source: f.wrapper.inner });
+  f.wrapper.onMessageInner({ origin: 'null', data: { cmd: 'innerLoadState', params: 'waiting' }, source: f.wrapper.inner });
   assert.equal(f.wrapper.inner_load_state, 'waiting');
 });

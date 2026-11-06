@@ -122,3 +122,45 @@ async fn an_unlisted_document_in_a_complete_registered_xite_is_not_retryable() {
         "a manifest-known missing path must not ask the browser to retry forever");
     assert!(response.headers().get("retry-after").is_none());
 }
+
+#[cfg(feature = "ui-password")]
+#[tokio::test]
+async fn a_waiting_content_document_keeps_its_authenticated_session_for_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("waiting-session-test", directory.path());
+    state.set_ui_loopback(true).await;
+    state.set_ui_port(42222).await;
+    state.config_set("ui_password", json!("fixture-password")).await;
+    state.set_on_demand(Arc::new(UnavailablePeer)).await;
+    let address = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+    let host = format!("epix-{address}.localhost:42222");
+    let router = UiServer::new(state.clone()).router();
+    let request = |query: &str, cookie: &str| {
+        Request::builder().uri(format!("/index.html{query}"))
+            .header("host", &host)
+            .header("sec-fetch-mode", "navigate")
+            .header("sec-fetch-dest", "iframe")
+            .header("cookie", cookie)
+            .body(Body::empty()).unwrap()
+    };
+    let denied = router.clone().oneshot(request("", "")).await.unwrap();
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    assert!(denied.headers().get("set-cookie").is_none());
+
+    let nonce = state.issue_wrapper_nonce();
+    let response = tokio::time::timeout(std::time::Duration::from_secs(2),
+        router.clone().oneshot(request(&format!("?wrapper_nonce={nonce}"), "")))
+        .await.unwrap().unwrap();
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(!state.wrapper_nonce_outstanding(&nonce));
+    let session = response.headers().get("set-cookie")
+        .expect("the admitted waiting page must retain its session for its automatic retry")
+        .to_str().unwrap();
+    assert!(session.contains("SameSite=None; Secure; HttpOnly"));
+    assert!(!session.to_ascii_lowercase().contains("domain="));
+    let cookie = session.split(';').next().unwrap().to_string();
+    let retry = tokio::time::timeout(std::time::Duration::from_secs(2),
+        router.oneshot(request("", &cookie))).await.unwrap().unwrap();
+    assert_eq!(retry.status(), StatusCode::SERVICE_UNAVAILABLE,
+        "a still-unavailable xite remains retryable after the one-use nonce was consumed");
+}

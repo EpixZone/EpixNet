@@ -1750,6 +1750,25 @@ if (window.getComputedStyle(document.body).transform) {
       }
     };
 
+    Wrapper.prototype.expectedInnerOrigin = function () {
+      var frame, sandbox, configured;
+      frame = document.getElementById("inner-iframe");
+      if (!frame) return null;
+      sandbox = frame.getAttribute("sandbox");
+      if (typeof sandbox !== "string") return null;
+      if (sandbox.split(/\s+/).indexOf("allow-same-origin") === -1) return "null";
+      // The configured URL comes from the trusted wrapper render. Never use
+      // an incoming message, or a frame's later navigation, as its identity.
+      if (typeof window.iframe_src !== "string" || !window.iframe_src) return null;
+      try {
+        configured = new URL(window.iframe_src, window.location.href);
+        if (configured.protocol !== "http:" && configured.protocol !== "https:") return null;
+        return configured.origin;
+      } catch (error) {
+        return null;
+      }
+    };
+
     Wrapper.prototype.onMessageInner = function (e) {
       var message;
       if (!window.postmessage_nonce_security && this.opener_tested === false) {
@@ -1768,6 +1787,10 @@ if (window.getComputedStyle(document.body).transform) {
       // its dialogs. A nested frame inside the xite talks to its own parent.
       if (e.source !== this.inner) {
         this.log("Ignoring message from a window that is not the inner frame");
+        return false;
+      }
+      if (typeof e.origin !== "string" || e.origin !== this.expectedInnerOrigin()) {
+        this.log("Ignoring message from a different content origin");
         return false;
       }
       // The xID xite announces a finished on-chain link this way. Only the
@@ -3594,7 +3617,11 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.sendInner = function (message) {
-      return this.inner.postMessage(message, '*');
+      var origin = this.expectedInnerOrigin();
+      if (origin === null) return false;
+      // A frame keeps its WindowProxy when it navigates. Pending replies and
+      // events must not follow it to another xite's real origin.
+      return this.inner.postMessage(message, origin === "null" ? "*" : origin);
     };
 
     Wrapper.prototype.reloadXiteInfo = function () {
