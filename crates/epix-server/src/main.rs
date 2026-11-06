@@ -5,9 +5,10 @@
 //! logging, the bundled GeoIP asset, and `epix://` argument handling.
 
 mod actions;
+mod launch;
 mod platform;
 
-use epix_node::{NodeOptions, DEFAULT_UI_ADDR};
+use epix_node::NodeOptions;
 
 /// Bundled peer-geolocation database for the dashboard's world map: DB-IP City
 /// Lite (CC-BY-4.0), shipped gzipped and expanded into the data dir at runtime.
@@ -17,16 +18,6 @@ const GEOIP_CITY_GZ: &[u8] = include_bytes!("../assets/dbip-city-lite.mmdb.gz");
 /// A bech32 address (not the `dashboard.epix` name) so boot never depends on
 /// chain name resolution being reachable.
 const DEFAULT_DASHBOARD: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
-
-/// The UI bind address: `EPIX_UI_ADDR` if set, else a Python client's
-/// `epixnet.conf` `ui_ip`/`ui_port` (carry-over for a headless/seedbox node),
-/// else the default loopback bind.
-fn ui_bind() -> String {
-    if let Some(addr) = std::env::var("EPIX_UI_ADDR").ok().filter(|s| !s.is_empty()) {
-        return addr;
-    }
-    epix_node::legacy_ui_bind().unwrap_or_else(|| DEFAULT_UI_ADDR.to_string())
-}
 
 #[tokio::main]
 async fn main() {
@@ -52,7 +43,7 @@ async fn main() {
     match cli.first().map(String::as_str) {
         Some("-h") | Some("--help") | Some("help") => {
             println!("epix-server {}", env!("EPIX_VERSION"));
-            println!("Usage: epix-server [xite address | name.epix | epix://link]");
+            println!("Usage: epix-server [--browser epix|system] [xite address | name.epix | epix://link]");
             println!("       epix-server <action> [args...]");
             println!();
             println!("Actions: siteCreate, siteSign, sitePublish, siteVerify, siteList,");
@@ -61,7 +52,9 @@ async fn main() {
             println!("         cryptSign, cryptVerify, cryptGetPrivatekey,");
             println!("         cryptPrivatekeyToAddress, peerPing, siteCmd");
             println!();
-            println!("Env: EPIX_DATA_DIR, EPIX_UI_ADDR, EPIX_HEADLESS, EPIX_TOR");
+            println!("Env: EPIX_DATA_DIR, EPIX_UI_ADDR, EPIX_HEADLESS, EPIX_TOR, EPIX_BROWSER");
+            println!("Browser: --browser > EPIX_BROWSER > saved browser setting > epix");
+            println!("EPIX_HEADLESS or saved open_browser=false disables automatic opening.");
             return;
         }
         Some("-V") | Some("--version") => {
@@ -70,7 +63,11 @@ async fn main() {
         }
         _ => {}
     }
-    if let Some(action) = cli.first().map(String::as_str).filter(|a| actions::is_action(a)) {
+    if let Some(action) = cli
+        .first()
+        .map(String::as_str)
+        .filter(|a| actions::is_action(a))
+    {
         let root = platform::data_root();
         std::fs::create_dir_all(&root).expect("create data root");
         let code = actions::run(action, &cli[1..], &root, env!("EPIX_VERSION")).await;
@@ -79,8 +76,10 @@ async fn main() {
 
     // Accept a raw `epix1…` address, a `.epix` name, or an `epix://…` deep link
     // (from the OS handing off a clicked link). Default to the dashboard xite.
-    let raw = cli.first().cloned().unwrap_or_else(|| DEFAULT_DASHBOARD.to_string());
-    let target = epix_node::parse_target(&raw);
+    let arguments = launch::Arguments::parse(&cli, DEFAULT_DASHBOARD).unwrap_or_else(|error| {
+        eprintln!("{error}. Use epix-server --help for usage.");
+        std::process::exit(2);
+    });
 
     // Headless mode (`EPIX_HEADLESS=1`): serve the node but don't open a browser
     // window - for servers/seedboxes. The dashboard is still reachable at the UI
@@ -88,6 +87,41 @@ async fn main() {
     let headless = std::env::var("EPIX_HEADLESS")
         .map(|v| !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false"))
         .unwrap_or(false);
+
+    let browser_environment = match std::env::var("EPIX_BROWSER") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => {
+            eprintln!("EPIX_BROWSER must be epix or system");
+            std::process::exit(2);
+        }
+    };
+    // Match prepare_data_root's OS-string handling of explicit paths, including
+    // valid filesystem paths that cannot be represented as Unicode.
+    let settings_root = std::env::var_os("EPIX_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(platform::data_root);
+    let browser = launch::select(
+        &settings_root,
+        arguments.browser,
+        browser_environment.as_deref(),
+        headless,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("{error}");
+        std::process::exit(1);
+    });
+    if browser == Some(launch::Browser::Epix) {
+        // epix-browser owns its own node and handles existing managed instances.
+        // Hand over before preparing data, because that pins a process-long lease.
+        let code = launch::handoff(&arguments.target).unwrap_or_else(|error| {
+            eprintln!("{error}");
+            1
+        });
+        std::process::exit(code);
+    }
+    let target = epix_node::parse_target(&arguments.target);
 
     // Apply a queued move before opening the log or any persistent node data.
     let data_lease = match epix_node::prepare_data_root() {
@@ -109,9 +143,9 @@ async fn main() {
     let opts = NodeOptions {
         data_root: root.clone(),
         target,
-        ui_addr: ui_bind(),
+        ui_addr: epix_node::ui_bind(),
         tor_mode,
-        open_browser: !headless,
+        open_browser: browser == Some(launch::Browser::System),
         geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
         log_file: Some(platform::log_path(&root, 8 * 1024 * 1024)),
         version: env!("EPIX_VERSION").to_string(),

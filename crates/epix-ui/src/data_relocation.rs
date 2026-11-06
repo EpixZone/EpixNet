@@ -45,7 +45,7 @@ pub struct DataRootLease {
 
 impl DataRootLease {
     pub fn acquire(root: &Path) -> io::Result<Self> {
-        let root = trusted_root(root)?;
+        let root = resolve_trusted_root(root)?;
         let directory = Directory::open(&root, true)?;
         let lock = Lease::acquire(&directory, DATA_LOCK)?;
         directory.assert_bound()?;
@@ -131,9 +131,11 @@ struct Plan {
     snapshot: Option<Snapshot>,
 }
 
-// NodeOptions and EPIX_DATA_DIR are trusted caller paths and historically
-// accept relative paths. Config-page input is validated separately.
-fn trusted_root(root: &Path) -> io::Result<PathBuf> {
+/// Resolve a trusted NodeOptions or EPIX_DATA_DIR path without creating or
+/// locking it. These callers historically accept relative paths; the existing
+/// prefix is canonicalized and any missing suffix is retained. Config-page
+/// input must use its separate, stricter validation.
+pub fn resolve_trusted_root(root: &Path) -> io::Result<PathBuf> {
     let absolute = if root.is_absolute() {
         root.to_path_buf()
     } else {
@@ -674,7 +676,7 @@ impl NativeReadDirectory {
 
 impl ProtectedDirectory {
     pub(crate) fn open_child(parent: &Path, name: &str) -> io::Result<Self> {
-        let parent = Directory::open(&trusted_root(parent)?, false)?;
+        let parent = Directory::open(&resolve_trusted_root(parent)?, false)?;
         Self::child_of(&parent, name)
     }
 
@@ -993,7 +995,7 @@ fn configured_root(directory: &Directory, conf: &Path, default: &Path) -> io::Re
         })
         .last()
         .unwrap_or_else(|| default.to_path_buf());
-    trusted_root(&value)
+    resolve_trusted_root(&value)
 }
 
 fn commit_conf(directory: &Directory, conf: &Path, root: Option<&Path>) -> io::Result<()> {

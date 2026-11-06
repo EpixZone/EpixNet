@@ -4,6 +4,10 @@ This guide starts from a fresh Mac with nothing installed. Follow the steps in o
 
 You will type the commands into the **Terminal** app (press `Cmd + Space`, type `Terminal`, press Enter).
 
+For the full desktop, complete steps 1 to 3 and follow
+[the EpixNet Browser setup](#the-full-desktop-app-managed-firefox). Steps 4 and
+5 build the standalone node and explicitly use your system browser.
+
 ## 1. Install the Apple build tools
 
 These give you `git` (to download the code) and a C compiler (to build it). Run:
@@ -54,16 +58,31 @@ The first build downloads a lot and can take several minutes, that is normal. It
 ## 5. Run it
 
 ```sh
-./target/release/epix-server
+./target/release/epix-server --browser system
 ```
 
-Your browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
+Your system browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
+
+For **v0.6.4 and earlier**, omit `--browser system`; those releases already
+use the system browser and do not support this flag.
 
 To open a specific site, add its name:
 
 ```sh
-./target/release/epix-server talk.epix
+./target/release/epix-server --browser system talk.epix
 ```
+
+The default choice is EpixNet Browser, launched through the `epix-browser`
+executable beside `epix-server`. The standalone build above does not include
+it. Use the desktop setup below or explicitly select the system browser.
+Save your choice under **Browser for standalone node startup** on the Config
+page. `--browser epix|system` overrides `EPIX_BROWSER=epix|system`, then the
+saved choice. Turning off browser opening on startup or setting
+`EPIX_HEADLESS=1` disables automatic browser opening. This does not change
+macOS's default browser.
+
+EpixNet Browser requires a loopback UI address. For a LAN-facing bind such as
+`EPIX_UI_ADDR=0.0.0.0:42222`, use `--browser system` or `EPIX_HEADLESS=1`.
 
 ## Running headless (no browser window)
 
@@ -77,10 +96,12 @@ Then visit **http://127.0.0.1:42222/** from any browser when you want the dashbo
 
 ## The full desktop app (managed Firefox)
 
-EpixNet can also run inside a managed copy of Firefox that understands `.epix` names directly. You need Firefox installed first ([download it here](https://www.mozilla.org/firefox/)), then:
+EpixNet Browser runs the node, managed Firefox and wallet together. Prepare a
+matching Firefox ESR runtime using the [local desktop setup](../xite-extensions.md#local-desktop-builds),
+including its extension adapter and `EPIX_FIREFOX` path, then run:
 
 ```sh
-cargo run -p epix-browser
+EPIX_FIREFOX="/absolute/path/to/Firefox.app/Contents/MacOS/firefox" ./scripts/run-browser.sh
 ```
 
 ## Where your data lives
@@ -95,4 +116,4 @@ EpixNet keeps your sites, keys, and settings in:
 
 - **`xcrun: error` or `cc` not found:** step 1 did not finish. Run `xcode-select --install` again.
 - **`cargo: command not found`:** close and reopen Terminal, or run `source "$HOME/.cargo/env"`.
-- **Port already in use:** If dashboard port `42222` is taken, EpixNet tries `42223`, `42224`, and so on until one is available. The selected port is saved in `ui_port` inside your data folder. The file server does the same from its configured port, `26552` by default; use the selected port from the node log for port forwarding. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server`. A non-default dashboard port must be available or startup fails.
+- **Port already in use:** If dashboard port `42222` is taken, EpixNet tries `42223`, `42224`, and so on until one is available. The selected port is saved in `ui_port` inside your data folder. The file server does the same from its configured port, `26552` by default; use the selected port from the node log for port forwarding. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server --browser system`. A non-default dashboard port must be available or startup fails.

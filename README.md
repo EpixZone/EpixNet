@@ -29,15 +29,14 @@ EpixNet is built from its source code. Pick your system below. Each guide starts
 
 Once it is built, there are three ways to start it:
 
-On Linux, follow the [desktop setup](docs/install/linux.md#the-full-desktop-app-managed-firefox) once. The source launcher prepares and reuses a matching Firefox ESR. Other platforms can use a prepared runtime as described in the [extension adapter setup](docs/xite-extensions.md#local-desktop-builds). The standalone node uses your normal browser.
+Use EpixNet Browser for the full desktop experience. On Linux, follow the [desktop setup](docs/install/linux.md#the-full-desktop-app-managed-firefox) once. The source launcher prepares and reuses a matching Firefox ESR. Other platforms can use a prepared runtime as described in the [extension adapter setup](docs/xite-extensions.md#local-desktop-builds).
 
 ```sh
 # 1. Full desktop on Linux: launch the node, managed Firefox and wallet together.
 ./scripts/run-browser.sh
 
-# 2. Just the node, no Firefox wrapper: it opens the dashboard in your normal
-#    browser. Good if you already have a browser you like.
-cargo run -p epix-server
+# 2. Explicitly use your system browser with the standalone node.
+cargo run -p epix-server -- --browser system
 
 # 3. Headless, for a server or seedbox with no screen: serve the network but
 #    do not open any browser. Then visit the dashboard yourself.
@@ -47,8 +46,29 @@ EPIX_HEADLESS=1 cargo run -p epix-server
 The dashboard uses **http://127.0.0.1:42222/** by default. If that port is taken, it tries `42223`, `42224`, and so on until one is available. Open a specific xite by passing its name:
 
 ```sh
-cargo run -p epix-server talk.epix
+cargo run -p epix-server -- --browser system talk.epix
 ```
+
+Without an explicit browser choice, `epix-server` starts the `epix-browser`
+executable beside it, which runs the node and managed browser together. If it
+is missing, use the desktop setup above, select `--browser system`, or run
+headless. EpixNet does not silently switch to a different browser.
+
+Save a choice under **Browser for standalone node startup** on the Config
+page. `--browser epix|system` overrides `EPIX_BROWSER=epix|system`, which
+overrides the saved choice. Disabling browser opening on startup or setting
+`EPIX_HEADLESS=1` prevents automatic browser opening. These choices do not
+change your operating system's default browser.
+
+Startup reads these choices from the current data directory before applying a
+queued restore or profile move. Browser preferences introduced by that operation
+take effect on the following launch.
+
+EpixNet Browser requires a loopback UI address. For a LAN-facing bind such as
+`EPIX_UI_ADDR=0.0.0.0:42222`, use `--browser system` or `EPIX_HEADLESS=1`.
+
+For **v0.6.4 and earlier**, omit `--browser system` from the commands above;
+those releases already open the system browser and do not support this flag.
 
 Desktop and Android can also install Mozilla-signed Firefox extensions
 published on verified xites. See [xite extensions](docs/xite-extensions.md)
@@ -148,6 +168,7 @@ Set these before you start EpixNet to change how it runs:
 | Setting | What it does | Default |
 | --- | --- | --- |
 | `EPIX_HEADLESS=1` | Serve the network but never open a browser (for servers). | off |
+| `EPIX_BROWSER=epix` or `system` | Choose the browser for standalone node startup. The `--browser` flag takes precedence. | saved choice, otherwise `epix` |
 | `EPIX_UI_ADDR` | The address the dashboard listens on. | `127.0.0.1:42222` |
 | `EPIX_TOR` | Node Tor mode: `enable`, `disable`, or `always`. `always` requires Tor for node peer traffic; browser and wallet routing have separate controls. | `enable` |
 | `EPIX_DATA_DIR` | Where EpixNet keeps its data (xites, keys, settings). | see below |
@@ -170,7 +191,7 @@ Open the dashboard, then **Settings**. It shows the version and the exact code t
 
 EpixNet is a set of small Rust pieces (in `crates/`) that fit together:
 
-- `epix-server` is the node you run on a desktop.
+- `epix-server` selects desktop, system-browser, or headless startup and provides the node's CLI actions.
 - `epix-browser` wraps a real Firefox so `.epix` names load like normal web pages.
 - `epix-ffi` is the same node packaged for Android and iOS.
 - The rest handle the network, signing and verifying xites, storage, Tor, I2P, and the dashboard.

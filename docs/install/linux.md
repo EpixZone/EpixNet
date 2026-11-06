@@ -56,6 +56,10 @@ run `install.sh` again after moving it.
 
 Install the tools and clone the source once. Keep that checkout for [updates from GitHub](#update-a-source-checkout-with-git).
 
+For the full desktop with EpixNet Browser and its wallet, complete steps 1 to 3,
+then follow [the desktop setup](#the-full-desktop-app-managed-firefox). Steps 4
+and 5 below build the standalone node and explicitly select your system browser.
+
 Type the commands into your terminal.
 
 ## 1. Install the build tools
@@ -140,16 +144,34 @@ sudo pacman -S --needed systemd-libs   # Arch
 ## 5. Run it
 
 ```sh
-./target/release/epix-server
+./target/release/epix-server --browser system
 ```
 
-Your browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
+Your system browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
+
+For **v0.6.4 and earlier**, omit `--browser system`; those releases already
+use the system browser and do not support this flag.
 
 To open a specific site, add its name:
 
 ```sh
-./target/release/epix-server talk.epix
+./target/release/epix-server --browser system talk.epix
 ```
+
+The default browser choice is EpixNet Browser. Starting `epix-server` without
+an override delegates to `epix-browser` beside it before starting the node.
+The standalone build above does not include that launcher; use the
+[desktop setup](#the-full-desktop-app-managed-firefox) to prepare it.
+
+You can save **Browser for standalone node startup** as **EpixNet Browser** or
+**System browser** on the Config page. `--browser epix|system` takes precedence
+over `EPIX_BROWSER=epix|system`, then the saved choice. The startup checkbox and
+`EPIX_HEADLESS=1` can disable browser opening. These settings do not change the
+operating system's default browser.
+
+EpixNet Browser requires a loopback UI address. If you configure a LAN-facing
+bind such as `EPIX_UI_ADDR=0.0.0.0:42222`, use `--browser system` or
+`EPIX_HEADLESS=1`.
 
 ## 6. Update an existing installation
 
@@ -407,4 +429,4 @@ EpixNet keeps your sites, keys, and settings in:
   it as shown under step 4, or build just what you need instead, for example
   `cargo build --release -p epix-server`, which does not depend on `hidapi` at
   all.
-- **Port already in use:** If dashboard port `42222` is taken, EpixNet tries `42223`, `42224`, and so on until one is available. The selected port is saved in `ui_port` inside your data folder. The file server does the same from its configured port, `26552` by default; use the selected port from the node log for port forwarding. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server`. A non-default dashboard port must be available or startup fails.
+- **Port already in use:** If dashboard port `42222` is taken, EpixNet tries `42223`, `42224`, and so on until one is available. The selected port is saved in `ui_port` inside your data folder. The file server does the same from its configured port, `26552` by default; use the selected port from the node log for port forwarding. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server --browser system`. A non-default dashboard port must be available or startup fails.
