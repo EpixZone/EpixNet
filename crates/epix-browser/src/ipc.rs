@@ -1,100 +1,158 @@
-//! Single-instance control channel.
+//! Single-instance control channel, scoped to the selected data directory.
 //!
-//! The node now stays running in the background after the browser window
-//! closes (anchored by the tray), so a second launch must not boot a second
-//! node against the same data directory. On startup we try to reach an
-//! already-running instance over a fixed loopback port; if one answers we hand
-//! it the target to open and exit, otherwise we claim the port and become the
-//! primary. The primary forwards each open-request to the tray loop, which
-//! reopens the browser.
-//!
-//! The same channel carries a quit request (`epix-browser --quit`), so an
-//! installer or a script can close a running EpixNet cleanly - browser window
-//! and node - instead of killing the process tree under a live data directory.
+//! Later launches confirm that they selected the same root before sending a
+//! navigation target. The fixed control port still supports installer PING and
+//! QUIT requests, but a different root or an older, unscoped listener cannot
+//! silently receive a target or cause a second node to start.
 
-use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use sha2::{Digest, Sha256};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::path::Path;
 use std::sync::mpsc::{Receiver, Sender};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-/// Loopback control port the primary instance listens on. Kept well clear of
-/// the UI (42222), proxy (43112), and SOCKS (43111) cluster - the node's UI
-/// port can fall back into that range, and other Epix services roam it, so a
-/// distinctive high port avoids colliding with them.
 const CONTROL_ADDR: &str = "127.0.0.1:47821";
-/// One-line requests the secondary sends; the primary replies `OK`.
+const ROOT_PREFIX: &str = "EPIX-ROOT-V1 ";
 const OPEN_PREFIX: &str = "EPIX-OPEN ";
-/// Detect-only ping (background launch): primary acks but opens nothing.
 const PING: &str = "EPIX-PING";
-/// Ask the primary to quit: close its browser, shut the node down, exit.
 const QUIT: &str = "EPIX-QUIT";
 const ACK: &str = "OK";
-
-/// How long `--quit` waits for the primary to go away after it acknowledged.
-/// Covers the browser's own close plus the node's bounded shutdown grace.
+const DIFFERENT_ROOT: &str = "ERR-DIFFERENT-ROOT";
+const PREPARING: &str = "ERR-PREPARING";
+const ROOT_CHANGED: &str = "ERR-ROOT-CHANGED";
+const MAX_REQUEST_BYTES: usize = 16 * 1024;
 const QUIT_WAIT: Duration = Duration::from_secs(30);
 
-/// Whether this process is the primary (owns the node) or a secondary that
-/// handed its target to the running primary and should now exit.
+type SharedScope = Arc<Mutex<ScopeState>>;
+static ACTIVE_SCOPE: OnceLock<SharedScope> = OnceLock::new();
+
+enum ScopeState {
+    Preparing(String),
+    Ready(String),
+    Changed,
+}
+
 pub enum Role {
-    /// Another instance is already running; it was given the target to open.
     Secondary,
-    /// This process owns the node; drain the receiver for requests from later
-    /// launches.
     Primary(Receiver<Request>),
 }
 
-/// One request a later launch handed to the running primary.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Request {
-    /// Open this launch argument (a xite name / epix:// URL) in the browser.
     Open(String),
-    /// Close the browser, shut the node down and exit.
     Quit,
 }
 
-/// Outcome of a `--quit` launch.
 #[derive(Debug, PartialEq, Eq)]
 pub enum QuitOutcome {
-    /// No instance was running (or none that speaks this protocol).
     NotRunning,
-    /// The primary acknowledged and its control port went silent.
     Stopped,
-    /// The primary acknowledged but was still answering after the wait.
     StillRunning,
 }
 
-/// Decide this process's role. If an instance is already running, detect it and
-/// return [`Role::Secondary`]; otherwise claim the control port and return
-/// [`Role::Primary`] with the request receiver. When `forward_open` is true a
-/// detected instance is also asked to open `arg` (a normal launch); in
-/// background mode it is false, so autostart doesn't pop a window on top of
-/// what the user is doing - it just detects and steps aside.
-pub fn init(arg: &str, forward_open: bool) -> Role {
-    if forward(arg, forward_open) {
-        return Role::Secondary;
+fn root_scope(root: &Path) -> Result<String, String> {
+    let resolved =
+        epix_ui::data_relocation::resolve_trusted_root(root).map_err(|e| e.to_string())?;
+    // Lossless OS bytes avoid making two non-Unicode directory names equal.
+    // This is an identity comparison, not authentication of local processes.
+    Ok(Sha256::digest(resolved.as_os_str().as_encoded_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
+/// Detect an instance for this root or claim the control listener. Never boot
+/// a second node when an occupied port cannot confirm the same root.
+pub fn init(arg: &str, forward_open: bool, data_root: &Path) -> Result<Role, String> {
+    let requested = root_scope(data_root)?;
+    let state = Arc::new(Mutex::new(ScopeState::Preparing(requested.clone())));
+    let address = CONTROL_ADDR
+        .parse()
+        .map_err(|_| "Invalid browser control address")?;
+    let role = init_at(address, arg, forward_open, &requested, state.clone())?;
+    if matches!(role, Role::Primary(_)) {
+        ACTIVE_SCOPE
+            .set(state)
+            .map_err(|_| "Browser control scope was already initialized")?;
     }
-    match TcpListener::bind(CONTROL_ADDR) {
-        Ok(listener) => Role::Primary(spawn_listener(listener)),
-        Err(_) => {
-            // Lost a startup race (or the port is otherwise taken). Try once
-            // more to hand off; if that fails too, run as a best-effort primary
-            // without a live control channel rather than refusing to start.
-            if forward(arg, forward_open) {
-                Role::Secondary
+    Ok(role)
+}
+
+fn init_at(
+    address: SocketAddr,
+    arg: &str,
+    open: bool,
+    requested: &str,
+    state: SharedScope,
+) -> Result<Role, String> {
+    validate_target(arg)?;
+    if forward_at(address, arg, open, requested)? {
+        return Ok(Role::Secondary);
+    }
+    match TcpListener::bind(address) {
+        Ok(listener) => Ok(Role::Primary(spawn_listener(listener, state))),
+        Err(error) => {
+            // A simultaneous launcher may have won the listener. It must
+            // still confirm the selected root before receiving this target.
+            if forward_at(address, arg, open, requested)? {
+                Ok(Role::Secondary)
             } else {
-                eprintln!("· note: could not bind the single-instance control port; running without it");
-                let (_tx, rx) = std::sync::mpsc::channel();
-                Role::Primary(rx)
+                Err(format!(
+                    "Cannot claim the Epix Browser control port: {error}"
+                ))
             }
         }
     }
 }
 
-/// Ask a running primary to quit and wait for it to go. Used by the Windows
-/// installer before it replaces the install tree: a browser or node still
-/// running from that tree keeps its DLLs locked, and a half-replaced Firefox
-/// starts and exits at once ("Couldn't load XPCOM", exit 255).
+/// Call immediately after the eventual owner prepares the data directory.
+/// Bind forwarding to the actual leased root, which a queued move may change
+/// after preflight. Preparing never accepts navigation. An unexpected later
+/// root change disables forwarding until the browser is restarted.
+pub fn confirm_data_root(root: &Path) -> Result<(), String> {
+    let actual = root_scope(root)?;
+    if let Some(state) = ACTIVE_SCOPE.get() {
+        confirm_scope(state, &actual)?;
+    }
+    Ok(())
+}
+
+fn confirm_scope(state: &SharedScope, actual: &str) -> Result<(), String> {
+    let mut state = state
+        .lock()
+        .map_err(|_| "Browser control scope is unavailable")?;
+    *state = match &*state {
+        ScopeState::Preparing(_) => ScopeState::Ready(actual.to_string()),
+        ScopeState::Ready(current) if current == actual => ScopeState::Ready(actual.to_string()),
+        ScopeState::Ready(_) | ScopeState::Changed => ScopeState::Changed,
+    };
+    Ok(())
+}
+
+fn scope_reply(state: &SharedScope, requested: &str) -> &'static str {
+    let Ok(state) = state.lock() else {
+        return ROOT_CHANGED;
+    };
+    match &*state {
+        ScopeState::Preparing(root) if root == requested => PREPARING,
+        ScopeState::Ready(root) if root == requested => ACK,
+        ScopeState::Preparing(_) | ScopeState::Ready(_) => DIFFERENT_ROOT,
+        ScopeState::Changed => ROOT_CHANGED,
+    }
+}
+
+fn validate_target(arg: &str) -> Result<(), String> {
+    if arg.contains(['\r', '\n', '\0']) || arg.len() + OPEN_PREFIX.len() >= MAX_REQUEST_BYTES {
+        Err("The browser launch target is invalid or too long".into())
+    } else {
+        Ok(())
+    }
+}
+
+/// Installer quit stays compatible with old and new launchers. It deliberately
+/// closes whichever managed browser owns the fixed control port.
 pub fn request_quit() -> QuitOutcome {
     if !send(QUIT) {
         return QuitOutcome::NotRunning;
@@ -109,60 +167,114 @@ pub fn request_quit() -> QuitOutcome {
     QuitOutcome::StillRunning
 }
 
-/// Reach a running primary. With `open`, ask it to open `arg`; without, just
-/// ping it. Returns true only if one answered and acknowledged - so a stray
-/// connection to some other service on the port doesn't count as an instance.
-fn forward(arg: &str, open: bool) -> bool {
-    if open {
-        send(&format!("{OPEN_PREFIX}{arg}"))
+fn response_error(response: &str) -> String {
+    match response {
+        DIFFERENT_ROOT => "Another Epix Browser instance uses a different data directory. Quit it before switching directories.",
+        PREPARING => "Epix Browser is still preparing its data directory. Wait for startup to finish, then try again.",
+        ROOT_CHANGED => "The running Epix Browser changed data directories during startup. Quit and restart it before opening another target.",
+        _ => "The Epix Browser control port is occupied by an older or incompatible instance. Quit it before starting this version.",
+    }.into()
+}
+
+fn control_stream(address: SocketAddr) -> std::io::Result<TcpStream> {
+    let stream = TcpStream::connect_timeout(&address, Duration::from_millis(300))?;
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    Ok(stream)
+}
+
+/// The target is sent only after the same connection confirms the root. An
+/// older listener therefore never sees a target intended for another node.
+fn forward_at(address: SocketAddr, arg: &str, open: bool, requested: &str) -> Result<bool, String> {
+    let mut stream = match control_stream(address) {
+        Ok(stream) => stream,
+        Err(error) if error.kind() == std::io::ErrorKind::ConnectionRefused => return Ok(false),
+        Err(error) => {
+            return Err(format!(
+                "Cannot contact the Epix Browser control port: {error}"
+            ))
+        }
+    };
+    let read_half = stream.try_clone().map_err(|e| e.to_string())?;
+    let mut reader = BufReader::new(read_half);
+    writeln!(stream, "{ROOT_PREFIX}{requested}").map_err(|e| e.to_string())?;
+    let response = read_request(&mut reader).map_err(|_| response_error(""))?;
+    if response != ACK {
+        return Err(response_error(&response));
+    }
+    let request = if open {
+        format!("{OPEN_PREFIX}{arg}")
     } else {
-        send(PING)
+        PING.to_string()
+    };
+    writeln!(stream, "{request}").map_err(|e| e.to_string())?;
+    let response = read_request(&mut reader).map_err(|_| response_error(""))?;
+    if response != ACK {
+        return Err(response_error(&response));
     }
+    Ok(true)
 }
 
-/// Send one request line to the primary; true only on an acknowledgement.
 fn send(request: &str) -> bool {
-    let addr = match CONTROL_ADDR.parse() {
-        Ok(a) => a,
-        Err(_) => return false,
-    };
-    let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(300)) else {
+    let Ok(address) = CONTROL_ADDR.parse() else {
         return false;
     };
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
-    if stream.write_all(format!("{request}\n").as_bytes()).is_err() {
+    let Ok(mut stream) = control_stream(address) else {
+        return false;
+    };
+    if writeln!(stream, "{request}").is_err() {
         return false;
     }
-    let mut line = String::new();
-    let mut reader = BufReader::new(stream);
-    match reader.read_line(&mut line) {
-        Ok(_) => line.trim() == ACK,
-        Err(_) => false,
-    }
+    read_request(&mut BufReader::new(stream)).is_ok_and(|response| response == ACK)
 }
 
-/// Accept control connections on a background thread, sending each request
-/// to the returned receiver.
-fn spawn_listener(listener: TcpListener) -> Receiver<Request> {
+fn read_request(reader: &mut impl BufRead) -> std::io::Result<String> {
+    let mut line = String::new();
+    let size = reader
+        .take((MAX_REQUEST_BYTES + 1) as u64)
+        .read_line(&mut line)?;
+    if size > MAX_REQUEST_BYTES || !line.ends_with('\n') {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Invalid control request",
+        ));
+    }
+    line.pop();
+    if line.ends_with('\r') {
+        line.pop();
+    }
+    Ok(line)
+}
+
+fn spawn_listener(listener: TcpListener, state: SharedScope) -> Receiver<Request> {
     let (tx, rx) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         for conn in listener.incoming() {
             let Ok(stream) = conn else { continue };
-            handle_conn(stream, &tx);
+            handle_conn(stream, &tx, &state);
         }
     });
     rx
 }
 
-fn handle_conn(mut stream: TcpStream, tx: &Sender<Request>) {
-    let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
-    let Ok(read_half) = stream.try_clone() else { return };
-    let mut line = String::new();
-    if BufReader::new(read_half).read_line(&mut line).is_err() {
+fn handle_conn(mut stream: TcpStream, tx: &Sender<Request>, state: &SharedScope) {
+    if stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .is_err()
+        || stream
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .is_err()
+    {
         return;
     }
-    let (request, ack) = parse(line.trim());
+    let Some((line, scoped)) = read_control_request(&mut stream, state) else {
+        return;
+    };
+    let (request, ack) = if scoped {
+        parse_scoped(&line)
+    } else {
+        parse(&line)
+    };
     if let Some(request) = request {
         let _ = tx.send(request);
     }
@@ -171,14 +283,35 @@ fn handle_conn(mut stream: TcpStream, tx: &Sender<Request>) {
     }
 }
 
-/// One request line -> what to hand the tray loop (if anything) and whether
-/// to acknowledge. Unknown lines get neither, so a stray client on the port
-/// cannot pass for an instance.
-fn parse(line: &str) -> (Option<Request>, bool) {
+/// Confirm the selected directory before accepting a navigation request.
+/// Installer PING/QUIT retain their one-line protocol.
+fn read_control_request(stream: &mut TcpStream, state: &SharedScope) -> Option<(String, bool)> {
+    let read_half = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(read_half);
+    let line = read_request(&mut reader).ok()?;
+    if let Some(requested) = line.strip_prefix(ROOT_PREFIX) {
+        let response = scope_reply(state, requested);
+        if writeln!(stream, "{response}").is_err() || response != ACK {
+            return None;
+        }
+        return Some((read_request(&mut reader).ok()?, true));
+    }
+    Some((line, false))
+}
+
+fn parse_scoped(line: &str) -> (Option<Request>, bool) {
     if let Some(arg) = line.strip_prefix(OPEN_PREFIX) {
-        (Some(Request::Open(arg.to_string())), true)
-    } else if line == PING {
-        // Detect-only (a background launch): acknowledge, open nothing.
+        if validate_target(arg).is_ok() {
+            return (Some(Request::Open(arg.to_string())), true);
+        }
+        return (None, false);
+    }
+    parse(line)
+}
+
+/// Unscoped requests are restricted to installer/liveness operations.
+fn parse(line: &str) -> (Option<Request>, bool) {
+    if line == PING {
         (None, true)
     } else if line == QUIT {
         (Some(Request::Quit), true)
@@ -188,23 +321,5 @@ fn parse(line: &str) -> (Option<Request>, bool) {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn open_ping_and_quit_lines_parse() {
-        assert_eq!(
-            parse("EPIX-OPEN talk.epix"),
-            (Some(Request::Open("talk.epix".to_string())), true)
-        );
-        assert_eq!(parse("EPIX-PING"), (None, true));
-        assert_eq!(parse("EPIX-QUIT"), (Some(Request::Quit), true));
-    }
-
-    #[test]
-    fn unknown_lines_are_neither_forwarded_nor_acknowledged() {
-        assert_eq!(parse("GET / HTTP/1.1"), (None, false));
-        assert_eq!(parse(""), (None, false));
-        assert_eq!(parse("EPIX-QUIT now"), (None, false));
-    }
-}
+#[path = "tests/ipc.rs"]
+mod tests;

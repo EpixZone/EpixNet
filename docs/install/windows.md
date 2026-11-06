@@ -4,6 +4,10 @@ This guide starts from a fresh Windows PC with nothing installed. Follow the ste
 
 You will use **PowerShell**. To open it, press the Start button, type `PowerShell`, and click it.
 
+For the full desktop, complete steps 1 to 5 and follow
+[the EpixNet Browser setup](#the-full-desktop-app-managed-firefox). Steps 6 and
+7 build the standalone node and explicitly use your system browser.
+
 ## 1. Install the C++ build tools
 
 EpixNet needs Microsoft's C++ compiler to build.
@@ -73,16 +77,32 @@ The first build downloads a lot and can take several minutes, that is normal. It
 ## 7. Run it
 
 ```powershell
-.\target\release\epix-server.exe
+.\target\release\epix-server.exe --browser system
 ```
 
-Your browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
+Your system browser opens the EpixNet dashboard. If it does not open on its own, go to **http://127.0.0.1:42222/**. If that port was taken, use the selected port saved in `ui_port` inside your data folder instead.
+
+For **v0.6.4 and earlier**, omit `--browser system`; those releases already
+use the system browser and do not support this flag.
 
 To open a specific site, add its name:
 
 ```powershell
-.\target\release\epix-server.exe talk.epix
+.\target\release\epix-server.exe --browser system talk.epix
 ```
+
+The default choice is EpixNet Browser, launched through `epix-browser.exe`
+beside `epix-server.exe`. The standalone build above does not include it.
+Use the desktop setup below or explicitly select the system browser.
+Save your choice under **Browser for standalone node startup** on the Config
+page. `--browser epix|system` overrides `$env:EPIX_BROWSER`, then the saved
+choice. Turning off browser opening on startup or setting `$env:EPIX_HEADLESS`
+to `"1"` disables automatic browser opening. This does not change Windows's
+default browser.
+
+EpixNet Browser requires a loopback UI address. For a LAN-facing bind such as
+`$env:EPIX_UI_ADDR = "0.0.0.0:42222"`, use `--browser system` or set
+`$env:EPIX_HEADLESS` to `"1"`.
 
 ## Running headless (no browser window)
 
@@ -97,19 +117,17 @@ Then visit **http://127.0.0.1:42222/** from any browser.
 
 ## The full desktop app (managed Firefox)
 
-EpixNet can also run inside a managed copy of Firefox that understands `.epix` names directly. It needs a Firefox to drive - any of these works:
-
-- the Firefox ESR bundled with an installed EpixNet desktop app (preferred; it
-  loads the wallet extension):
-  ```powershell
-  $env:EPIX_FIREFOX = "$env:LOCALAPPDATA\Epix\firefox\firefox.exe"
-  ```
-- a normal Firefox install ([download it here](https://www.mozilla.org/firefox/)) - found automatically, no variable needed.
+EpixNet Browser runs the node, managed Firefox and wallet together. Prepare a
+matching Firefox ESR runtime using the [local desktop setup](../xite-extensions.md#local-desktop-builds),
+including its extension adapter, and set `$env:EPIX_FIREFOX` to that copy's
+`firefox.exe` path. A source build requires the adapter matching that checkout.
 
 Then:
 
 ```powershell
-cargo run --release -p epix-browser
+$env:EPIX_FIREFOX = "C:\path\to\prepared\firefox\firefox.exe"
+cargo build --release --locked -p epix-nmh -p evx-worker
+cargo run --release --locked -p epix-browser
 ```
 
 The desktop app opens no terminal window of its own. Run it from a terminal

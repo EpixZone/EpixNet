@@ -800,13 +800,21 @@ fn migrate_legacy_conf(data_root: &std::path::Path) {
     }
 }
 
+/// The requested UI listener for desktop launchers. An explicit environment
+/// address takes precedence over an imported Python configuration.
+pub fn ui_bind() -> String {
+    if let Some(addr) = std::env::var("EPIX_UI_ADDR").ok().filter(|s| !s.is_empty()) {
+        return addr;
+    }
+    legacy_ui_bind().unwrap_or_else(|| DEFAULT_UI_ADDR.to_string())
+}
+
 /// The UI bind address a Python client's `epixnet.conf` asks for (`ui_ip` /
 /// `ui_port`), if either is set - so a headless/seedbox carry-over keeps its
 /// address. `None` when neither is set or `EPIX_DATA_DIR` overrides the layout.
-/// The desktop browser keeps its fixed loopback bind (its proxy depends on it);
-/// only the server binary consults this.
+/// The managed desktop browser additionally requires a loopback address.
 pub fn legacy_ui_bind() -> Option<String> {
-    if std::env::var("EPIX_DATA_DIR").ok().filter(|s| !s.is_empty()).is_some() {
+    if std::env::var_os("EPIX_DATA_DIR").filter(|s| !s.is_empty()).is_some() {
         return None;
     }
     legacy_ui_addr(&epix_ui::paths::read_conf(&epix_ui::paths::default_conf_path()))
@@ -1047,10 +1055,25 @@ async fn serve_standalone(server: UiServer, running: RunningNode) -> Result<(), 
     // and a restart request is a plain shutdown).
     if systemd_service_process(std::env::var("SYSTEMD_EXEC_PID").ok().as_deref(), std::process::id()) {
         running.state.set_supervised_restart();
-    } else if let Some(exe) = epix_ui::self_exe() {
-        running.state.set_restart_argv(vec![exe]);
+    } else if let Some(argv) = epix_ui::self_exe()
+        .and_then(|exe| standalone_restart_argv(exe, std::env::args_os().skip(1)))
+    {
+        running.state.set_restart_argv(argv);
     }
     server.serve(running.ui_addr).await.map_err(|e| format!("server: {e}"))
+}
+
+fn standalone_restart_argv(
+    exe: String,
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<Vec<String>> {
+    // argv[0] comes only from current_exe. Keep the launcher's validated
+    // options and target as separate arguments, including --browser system.
+    let mut argv = vec![exe];
+    for arg in args {
+        argv.push(arg.into_string().ok()?);
+    }
+    Some(argv)
 }
 
 /// systemd provides the PID of the process it launched (since v248). Match it
@@ -5774,6 +5797,10 @@ pub fn open_in_browser(url: &str) {
 #[cfg(test)]
 #[path = "tests/navigation.rs"]
 mod navigation_tests;
+
+#[cfg(test)]
+#[path = "tests/standalone_launch.rs"]
+mod standalone_launch_tests;
 
 #[cfg(test)]
 mod tests {

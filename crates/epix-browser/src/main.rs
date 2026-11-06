@@ -49,7 +49,6 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-const UI_ADDR: &str = "127.0.0.1:42222";
 const PROXY_ADDR: &str = "127.0.0.1:43112";
 const SOCKS_ADDR: &str = "127.0.0.1:43111";
 /// The `.i2p` (eepsite) HTTP proxy the PAC routes `*.i2p` hosts to.
@@ -132,14 +131,22 @@ fn main() {
     // is already up, hand this launch's target to it and exit instead of
     // booting a second node against the same data directory. A background
     // launch only detects a running instance (it does not pop a window).
-    let open_rx = match ipc::init(&raw_arg, !background) {
-        ipc::Role::Secondary => {
+    let requested_root = std::env::var_os("EPIX_DATA_DIR")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(epix_node::data_root);
+    let open_rx = match ipc::init(&raw_arg, !background, &requested_root) {
+        Ok(ipc::Role::Secondary) => {
             if !background {
                 println!("· EpixNet is already running - opened {raw_arg} in it");
             }
             return;
         }
-        ipc::Role::Primary(rx) => rx,
+        Ok(ipc::Role::Primary(rx)) => rx,
+        Err(error) => {
+            eprintln!("Could not start Epix Browser: {error}");
+            std::process::exit(1);
+        }
     };
 
     // The tray needs the main thread for its native event loop (macOS menu bar,
@@ -249,6 +256,10 @@ async fn boot(
     progress: startup::Progress,
     window_size: Option<browser_process::BrowserWindowSize>,
 ) -> Result<(Ready, Option<std::process::Child>), String> {
+    // The native add-on broker requires loopback. Validate before acquiring
+    // the data directory or starting a listener, including inherited settings
+    // when epix-server hands startup to this executable.
+    let requested_ui_addr = browser_ui_addr(&epix_node::ui_bind())?;
     let target = epix_node::parse_target(raw_arg);
     progress.report(startup::Stage::Preparing);
 
@@ -256,6 +267,7 @@ async fn boot(
     let data_lease = tokio::task::spawn_blocking(epix_node::prepare_data_root)
         .await.map_err(|e| format!("Cannot prepare the data folder: {e}"))??;
     let data_root = data_lease.root().to_path_buf();
+    ipc::confirm_data_root(&data_root)?;
 
     let firefox = find_firefox().ok_or_else(|| {
         "The Epix Browser engine was not found. Reinstall EpixNet.".to_string()
@@ -282,7 +294,7 @@ async fn boot(
     let opts = epix_node::NodeOptions {
         data_root: data_root.clone(),
         target: target.clone(),
-        ui_addr: UI_ADDR.to_string(),
+        ui_addr: requested_ui_addr.to_string(),
         tor_mode: tor_mode.clone(),
         open_browser: false,
         geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),
@@ -1345,6 +1357,20 @@ fn file_url(path: &Path) -> std::io::Result<String> {
 
 #[cfg(test)]
 mod file_url_tests;
+
+fn browser_ui_addr(value: &str) -> Result<SocketAddr, String> {
+    let address: SocketAddr = value
+        .parse()
+        .map_err(|_| format!("Invalid UI address: {value}"))?;
+    if !address.ip().is_loopback() {
+        return Err("EpixNet Browser requires a loopback UI address. For a LAN or public listener, use epix-server --browser system or EPIX_HEADLESS=1.".into());
+    }
+    Ok(address)
+}
+
+#[cfg(test)]
+#[path = "../tests/ui_bind/mod.rs"]
+mod ui_bind_tests;
 
 /// Poll `addr` until a TCP connection succeeds or `timeout` elapses.
 async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {

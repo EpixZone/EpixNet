@@ -28,7 +28,14 @@ use crate::state::DEFAULT_VOLUNTEER_QUOTA;
 ///     for keys whose backend (Tor transport, SOCKS proxy) isn't built yet.
 pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     // --- Web Interface
-    ("Web Interface", "open_browser", "Open web browser on EpixNet startup", "true", "bool"),
+    ("Web Interface", "open_browser", "Open browser on standalone node startup (applies on next launch)", "true", "bool"),
+    (
+        "Web Interface",
+        "browser",
+        "Browser for standalone node startup (applies on next launch)",
+        "epix",
+        "select:EpixNet Browser=epix|System browser=system",
+    ),
     ("Web Interface", "language", "Interface language", "en", "text"),
     // --- Network
     ("Network", "offline", "Offline mode", "false", "bool"),
