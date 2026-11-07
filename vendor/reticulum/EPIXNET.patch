@@ -1,0 +1,390 @@
+diff --git a/src/channel.rs b/src/channel.rs
+index 95dc0a1..622585f 100644
+--- a/src/channel.rs
++++ b/src/channel.rs
+@@ -84,17 +84,14 @@ async fn outlet_send(
+ 
+ async fn outlet_resend(
+     link: &Arc<Mutex<Link>>,
+-    packet: Packet,
++    raw: &[u8],
+     transport: Weak<Mutex<Transport>>,
+-) -> bool {
+-    if link.lock().await.status() == LinkStatus::Active {
+-        if let Some(transport) = transport.upgrade() {
+-            transport.lock().await.send_packet(packet).await;
+-            return true;
+-        }
+-    }
+-
+-    false
++) -> Option<Packet> {
++    let transport = transport.upgrade()?;
++    // A retry keeps the channel sequence, but uses fresh authenticated
++    // ciphertext. Routed networks filter identical proof packet hashes.
++    let (packet, active) = outlet_send(link, raw, &transport).await;
++    active.then_some(packet)
+ }
+ 
+ 
+@@ -326,7 +323,8 @@ fn watch_message_try(
+ }
+ 
+ struct SentMessage {
+-    pub packet: Packet,
++    pub raw: Vec<u8>,
++    pub hashes: Vec<Hash>,
+     pub delivered: broadcast::Sender<bool>,
+     pub tries: u16,
+ }
+@@ -366,13 +364,9 @@ impl<M: Message> Inbound<M> {
+ 
+         let sequence = envelope.sequence;
+ 
+-        if sequence < self.sequence {
+-            let overflow = sequence.saturating_add(WINDOW_MAX);
+-
+-            if overflow >= self.sequence || sequence > overflow {
+-                log::trace!("channel({}): received packet out of sequence window", self.link_id);
+-                return;
+-            }
++        if sequence.wrapping_sub(self.sequence) >= WINDOW_MAX {
++            log::trace!("channel({}): received packet out of sequence window", self.link_id);
++            return;
+         }
+ 
+         let replaced = self.on_hold.insert(sequence, envelope.message);
+@@ -457,7 +451,10 @@ impl Outbound {
+     }
+ 
+     async fn handle_proof(&mut self, packet_hash: Hash) {
+-        let sent_message = match self.sent_messages.remove(&packet_hash) {
++        let original_hash = self.sent_messages.iter().find_map(|(original, sent)| {
++            sent.hashes.contains(&packet_hash).then_some(*original)
++        });
++        let sent_message = match original_hash.and_then(|hash| self.sent_messages.remove(&hash)) {
+             Some(m) => m,
+             None => {
+                 log::trace!(
+@@ -472,7 +469,7 @@ impl Outbound {
+         let rtt = *self.outlet.lock().await.rtt();
+         adjust_params(&mut self.params.lock().await, rtt);
+ 
+-        self.delivered.insert(packet_hash);
++        self.delivered.insert(original_hash.unwrap());
+ 
+         let result = sent_message.delivered.send(true);
+ 
+@@ -487,7 +484,7 @@ impl Outbound {
+     }
+ 
+     async fn handle_timeout(&mut self, packet_hash: Hash) {
+-        let packet;
++        let raw;
+         let mut tries;
+ 
+         let max_tries = self.params.lock().await.max_tries;
+@@ -500,7 +497,7 @@ impl Outbound {
+                 return;
+             }
+ 
+-            packet = entry.packet;
++            raw = entry.raw.clone();
+         } else {
+             log::error!(
+                 "channel({}) internal error: timeout set for unknown message {}",
+@@ -512,11 +509,11 @@ impl Outbound {
+ 
+         let sent = outlet_resend(
+             &self.outlet,
+-            packet,
++            &raw,
+             self.transport.clone()
+         ).await;
+ 
+-        if !sent {
++        if sent.is_none() {
+             log::error!(
+                 "channel ({}): failed to resend message {}",
+                 self.link_id,
+@@ -528,7 +525,11 @@ impl Outbound {
+ 
+         self.schedule_timeout(packet_hash).await;
+ 
+-        self.sent_messages.get_mut(&packet_hash).unwrap().tries = tries;
++        let entry = self.sent_messages.get_mut(&packet_hash).unwrap();
++        entry.tries = tries;
++        if let Some(packet) = sent {
++            entry.hashes.push(packet.hash());
++        }
+     }
+ 
+     async fn schedule_timeout(&self, packet_hash: Hash) {
+@@ -553,6 +554,7 @@ impl Outbound {
+     async fn teardown(&mut self) {
+         log::info!("channel({}): message timed out, tearing down channel", self.link_id);
+         outlet_timed_out(&self.outlet).await;
++        self.cancel.cancel();
+     }
+ 
+     pub async fn send<M: Message>(&mut self, message: &M) -> Result<Hash, RnsError> {
+@@ -586,7 +588,8 @@ impl Outbound {
+ 
+             if sent {
+                 let sent_message = SentMessage {
+-                    packet,
++                    raw,
++                    hashes: vec![packet_hash],
+                     delivered: delivery_tx,
+                     tries: 1,
+                 };
+@@ -661,13 +664,16 @@ async fn spawn_watch_outbound(
+                                 our_link_id,
+                                 err
+                             );
++                            cancel.cancel();
+                             return;
+                         }
+                     };
+ 
+                     if event_data.id == our_link_id {
+-                        if let LinkEvent::Proof(hash) = event_data.event {
+-                            outbound.lock().await.handle_proof(hash).await;
++                        match event_data.event {
++                            LinkEvent::Proof(hash) => outbound.lock().await.handle_proof(hash).await,
++                            LinkEvent::Closed => { cancel.cancel(); return; }
++                            _ => {}
+                         }
+                     }
+                 },
+@@ -691,9 +697,11 @@ async fn spawn_receiver<M: Message>(
+     mut rx: broadcast::Receiver<LinkPayload>,
+     our_link_id: LinkId,
+     cancel: CancellationToken,
+-) -> broadcast::Sender<M> {
++) -> (broadcast::Sender<M>, broadcast::Receiver<M>) {
+     let mut inbound = Inbound::new(our_link_id);
+     let incoming = inbound.get_incoming();
++    // Subscribe before spawning: buffered Link payloads may already be ACKed.
++    let incoming_rx = incoming.subscribe();
+ 
+     tokio::spawn(async move {
+         loop {
+@@ -707,7 +715,8 @@ async fn spawn_receiver<M: Message>(
+                                 our_link_id,
+                                 err
+                             );
+-                            continue;
++                            cancel.cancel();
++                            break;
+                         }
+                     }
+                 },
+@@ -719,7 +728,7 @@ async fn spawn_receiver<M: Message>(
+         }
+     });
+ 
+-    incoming
++    (incoming, incoming_rx)
+ }
+ 
+ 
+@@ -772,8 +781,7 @@ impl<M: Message> Channel<M> {
+ 
+         let rx = link.lock().await.bind_to_channel()?;
+ 
+-        let incoming = spawn_receiver(rx, link_id, cancel).await;
+-        let incoming_rx = incoming.subscribe();
++        let (incoming, incoming_rx) = spawn_receiver(rx, link_id, cancel).await;
+ 
+         let channel = Self { link, outbound, incoming };
+ 
+@@ -811,6 +819,16 @@ impl<M: Message> Channel<M> {
+         self.outbound.lock().await.is_ready_to_send().await
+     }
+ 
++    /// Whether the link or its channel event stream has closed.
++    pub async fn is_closed(&self) -> bool {
++        self.outbound.lock().await.cancel.is_cancelled()
++    }
++
++    /// Release delivery history after the application has consumed its result.
++    pub async fn forget_delivered(&self, packet_hash: &Hash) {
++        self.outbound.lock().await.delivered.remove(packet_hash);
++    }
++
+     /// Create an additional receiver for the channel's incoming messages.
+     pub fn subscribe(&self) -> broadcast::Receiver<M> {
+         self.incoming.subscribe()
+@@ -838,6 +856,7 @@ mod mock {
+         pub data: PacketDataBuffer,
+         pub id: LinkId,
+         pub context: PacketContext,
++        pub wire_hash: Hash,
+     }
+ 
+     impl Packet {
+@@ -845,12 +864,13 @@ mod mock {
+             Self {
+                 data: PacketDataBuffer::new_from_slice(raw),
+                 id,
+-                context: PacketContext::None
++                context: PacketContext::None,
++                wire_hash: Hash::new_from_rand(OsRng),
+             }
+         }
+ 
+         pub fn hash(&self) -> Hash {
+-            Hash::new_from_slice(self.data.as_slice())
++            self.wire_hash
+         }
+ 
+         pub fn payload(&self) -> LinkPayload {
+@@ -1213,4 +1233,76 @@ mod tests {
+ 
+         assert!(incoming_b.is_empty());
+     }
++    #[tokio::test]
++    async fn retry_uses_fresh_packet_and_preserves_original_delivery_handle() {
++        let fixture = Fixture::new();
++        let (channel, _) = Channel::<TestMessage>::new(fixture.link_a.clone(), &fixture.transport_a).await.unwrap();
++        let original = channel.send(&TestMessage::Short(42)).await.unwrap();
++        channel.outbound.lock().await.handle_timeout(original).await;
++        let packets = fixture.transport_a.lock().await.packets().await;
++        assert_eq!(packets.len(), 2);
++        assert_ne!(packets[0].hash(), packets[1].hash(), "retry must be re-encrypted");
++        assert_eq!(packets[0].data.as_slice(), packets[1].data.as_slice(), "same envelope sequence and bytes");
++        channel.outbound.lock().await.handle_proof(packets[1].hash()).await;
++        assert_eq!(channel.message_status(&original).await, MessageStatus::Delivered);
++        channel.forget_delivered(&original).await;
++        assert_eq!(channel.message_status(&original).await, MessageStatus::Unknown);
++    }
++
++    #[tokio::test]
++    async fn retries_and_proof_aliases_are_bounded_and_exhaustion_closes_channel() {
++        let fixture = Fixture::new();
++        let (channel, _) = Channel::<TestMessage>::new(fixture.link_a.clone(), &fixture.transport_a).await.unwrap();
++        let original = channel.send(&TestMessage::Short(42)).await.unwrap();
++        let mut outbound = channel.outbound.lock().await;
++        let maximum = outbound.params.lock().await.max_tries;
++        for _ in 1..maximum { outbound.handle_timeout(original).await; }
++        assert_eq!(outbound.sent_messages[&original].hashes.len(), maximum as usize);
++        assert_eq!(outbound.sent_messages[&original].tries, maximum);
++        outbound.handle_timeout(original).await;
++        assert!(outbound.cancel.is_cancelled());
++        assert_eq!(fixture.link_a.lock().await.status(), LinkStatus::Closed);
++        assert_eq!(fixture.transport_a.lock().await.packets().await.len(), maximum as usize);
++    }
++
++    #[tokio::test]
++    async fn inbound_window_handles_wraparound_and_rejects_replays_and_far_future() {
++        let mut inbound = Inbound::<TestMessage>::new(LinkId::new_empty());
++        let mut receiver = inbound.incoming.subscribe();
++        inbound.sequence = u16::MAX;
++        inbound.receive(&message_raw(&TestMessage::Short(2), Some(0))).await;
++        assert_eq!(inbound.on_hold.len(), 1);
++        inbound.receive(&message_raw(&TestMessage::Short(99), Some(WINDOW_MAX))).await;
++        assert_eq!(inbound.on_hold.len(), 1);
++        inbound.receive(&message_raw(&TestMessage::Short(1), Some(u16::MAX))).await;
++        assert_eq!(receiver.recv().await.unwrap(), TestMessage::Short(1));
++        assert_eq!(receiver.recv().await.unwrap(), TestMessage::Short(2));
++        assert!(inbound.on_hold.is_empty());
++        inbound.receive(&message_raw(&TestMessage::Short(1), Some(u16::MAX))).await;
++        assert!(receiver.try_recv().is_err());
++        assert!(inbound.on_hold.is_empty());
++    }
++
++    #[tokio::test]
++    async fn receiver_lag_closes_instead_of_skipping_stream_bytes() {
++        let (tx, rx) = broadcast::channel(1);
++        tx.send(LinkPayload::new_from_slice(&[1])).unwrap();
++        tx.send(LinkPayload::new_from_slice(&[2])).unwrap();
++        let cancel = CancellationToken::new();
++        let _incoming = spawn_receiver::<TestMessage>(rx, LinkId::new_empty(), cancel.clone()).await;
++        tokio::time::timeout(Duration::from_secs(1), cancel.cancelled()).await.unwrap();
++    }
++
++    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
++    async fn queued_first_payload_has_a_subscriber_before_receiver_task_starts() {
++        let (tx, rx) = broadcast::channel(16);
++        tx.send(LinkPayload::new_from_slice(&message_raw(&TestMessage::Short(7), Some(0)))).unwrap();
++        let cancel = CancellationToken::new();
++        let (_sender, mut incoming) = spawn_receiver::<TestMessage>(rx, LinkId::new_empty(), cancel.clone()).await;
++        // Allow the spawned receiver to run before our first poll.
++        tokio::time::sleep(Duration::from_millis(20)).await;
++        assert_eq!(incoming.try_recv().unwrap(), TestMessage::Short(7));
++        cancel.cancel();
++    }
++
+ }
+diff --git a/src/transport.rs b/src/transport.rs
+index aee7bb1..6e8177c 100644
+--- a/src/transport.rs
++++ b/src/transport.rs
+@@ -439,7 +439,13 @@ impl Transport {
+     }
+ 
+     pub async fn find_out_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+-        self.handler.lock().await.out_links.get(link_id).cloned()
++        let links: Vec<_> = self.handler.lock().await.out_links.values().cloned().collect();
++        for link in links {
++            if link.lock().await.id() == link_id {
++                return Some(link);
++            }
++        }
++        None
+     }
+ 
+     pub async fn find_in_link(&self, link_id: &AddressHash) -> Option<Arc<Mutex<Link>>> {
+@@ -608,8 +614,23 @@ impl Drop for Transport {
+ 
+ impl TransportHandler {
+     async fn send_packet(&self, packet: Packet) {
++        let (packet, iface) = if packet.header.packet_type == PacketType::LinkRequest {
++            match self.path_table.get(&packet.destination) {
++                Some(path) if path.hops > 1 => {
++                    let mut routed = packet;
++                    routed.header.header_type = crate::packet::HeaderType::Type2;
++                    routed.header.propagation_type = crate::packet::PropagationType::Transport;
++                    routed.transport = Some(path.received_from);
++                    (routed, Some(path.iface))
++                }
++                Some(path) => (packet, Some(path.iface)),
++                None => (packet, None),
++            }
++        } else {
++            (packet, None)
++        };
+         let message = TxMessage {
+-            tx_type: TxMessageType::Broadcast(None),
++            tx_type: iface.map_or(TxMessageType::Broadcast(None), TxMessageType::Direct),
+             packet,
+         };
+ 
+@@ -640,7 +661,7 @@ impl TransportHandler {
+                 allow_duplicate = true;
+             }
+             PacketType::Data => {
+-                allow_duplicate = packet.context == PacketContext::KeepAlive;
++                allow_duplicate = matches!(packet.context, PacketContext::KeepAlive | PacketContext::Channel);
+             }
+             PacketType::Proof => {
+                 if packet.context == PacketContext::LinkRequestProof {
+@@ -1497,4 +1518,17 @@ mod tests {
+                 .await
+         );
+     }
++    #[tokio::test]
++    async fn outbound_link_lookup_and_close_use_link_id_not_destination_hash() {
++        let transport = TransportConfig::default().build();
++        let identity = PrivateIdentity::new_from_rand(OsRng);
++        let destination = SingleInputDestination::new(identity, DestinationName::new("epix", "node.v2")).desc;
++        let link = transport.link(destination).await;
++        let id = *link.lock().await.id();
++        assert_ne!(id, destination.address_hash);
++        assert!(Arc::ptr_eq(&transport.find_out_link(&id).await.unwrap(), &link));
++        transport.link_close(id).await.unwrap();
++        assert_eq!(link.lock().await.status(), LinkStatus::Closed);
++    }
++
+ }

@@ -1128,6 +1128,7 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
     let i2p_mode = i2p.get("mode").and_then(|v| v.as_str()).unwrap_or("disable").to_string();
     let i2p_address = ctx.state.i2p_address().await;
     let mesh_address = ctx.state.rns_address().await;
+    let mesh_reliable_address = ctx.state.rns_reliable_address().await;
     // Live pool connections split by network, so the status page can show
     // how the node actually talks (clearnet vs Tor vs I2P), not just which
     // services are up.
@@ -1143,6 +1144,10 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
         "i2p_address": i2p_address,
         "mesh_enabled": mesh_address.is_some(),
         "mesh_address": mesh_address,
+        "mesh_endpoints": {
+            "legacy": mesh_address.as_ref().map(|address| format!("rns:{address}")),
+            "reliable_v2": mesh_reliable_address.map(|address| format!("rns:{address}")),
+        },
         "connections": {
             "total": conns.total,
             "in": conns.incoming,

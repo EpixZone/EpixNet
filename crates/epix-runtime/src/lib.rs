@@ -2631,6 +2631,7 @@ async fn mesh_loop(
     // Layer `rns:` dialing onto the transport (composed with TCP/Tor/I2P).
     state.set_rns_transport(Arc::new(node.transport())).await;
     state.set_rns_address(&node.dest_hash_hex()).await;
+    state.set_rns_reliable_address(&node.reliable_dest_hash_hex()).await;
     // A Hello over a mesh link now offers this destination hash as our
     // dial-back address (Phase 6) - the inbound link id a peer sees is not it.
     let advert_hash = node.dest_hash_hex();

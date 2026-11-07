@@ -164,6 +164,9 @@ jobs:
       - name: Test EDX runtime, UI and wire crates
         run: |
           cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
+          cp Cargo.lock vendor/reticulum/Cargo.lock
+          cargo test --manifest-path vendor/reticulum/Cargo.toml --lib --offline
+          rm vendor/reticulum/Cargo.lock
           cargo test -p epix-ui --example merger_index_benchmark --locked
       # These optional UI features are not enabled by the default test command.
       # Keep password bootstrap, content isolation, and media route checks live.

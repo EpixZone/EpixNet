@@ -18,15 +18,27 @@ use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::{Transport as RnsTransport, TransportConfig};
 use tokio::sync::mpsc;
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 #[tokio::test]
 async fn edx_served_over_mesh() {
-    timeout(Duration::from_secs(30), run()).await.expect("mesh serve round-trip timed out");
+    timeout(Duration::from_secs(30), run("node", 52041))
+        .await
+        .expect("mesh serve round-trip timed out");
 }
 
-async fn run() {
-    let name = DestinationName::new("epix", "mesh");
+#[tokio::test]
+async fn edx_served_over_reliable_mesh() {
+    timeout(Duration::from_secs(30), run("node.v2", 52043))
+        .await
+        .expect("reliable mesh serve round-trip timed out");
+}
+
+async fn run(aspect: &str, port: u16) {
+    let name = DestinationName::new("epix", aspect);
+    let server_address = format!("127.0.0.1:{port}");
+    let client_address = format!("127.0.0.1:{}", port + 1);
 
     // Server: register + announce a destination, bring EDX up on every
     // inbound link. An RNS link is already encrypted, so this is the
@@ -51,9 +63,9 @@ async fn run() {
     let server_id = PrivateIdentity::new_from_rand(OsRng);
     let mut server_tp = RnsTransport::new(TransportConfig::new("server", &server_id, true));
     let server_dest = server_tp.add_destination(server_id.clone(), name).await;
-    let server_tp = Arc::new(server_tp);
-    server_tp.iface_manager().lock().await.spawn(
-        UdpInterface::new("0.0.0.0:52041", Some("127.0.0.1:52042"), false),
+    let server_tp = Arc::new(Mutex::new(server_tp));
+    server_tp.lock().await.iface_manager().lock().await.spawn(
+        UdpInterface::new(&server_address, Some(&client_address), false),
         UdpInterface::spawn,
     );
 
@@ -65,7 +77,11 @@ async fn run() {
         let server_dest = server_dest.clone();
         tokio::spawn(async move {
             loop {
-                server_tp.send_announce(&server_dest, None).await;
+                server_tp
+                    .lock()
+                    .await
+                    .send_announce(&server_dest, None)
+                    .await;
                 sleep(Duration::from_millis(400)).await;
             }
         });
@@ -74,18 +90,30 @@ async fn run() {
 
     // Client: a ReticulumTransport, then an EDX link over the dialed link.
     let client_id = PrivateIdentity::new_from_rand(OsRng);
-    let client_rns = Arc::new(RnsTransport::new(TransportConfig::new("client", &client_id, true)));
-    client_rns.iface_manager().lock().await.spawn(
-        UdpInterface::new("0.0.0.0:52042", Some("127.0.0.1:52041"), false),
+    let client_rns = Arc::new(Mutex::new(RnsTransport::new(TransportConfig::new(
+        "client", &client_id, true,
+    ))));
+    client_rns.lock().await.iface_manager().lock().await.spawn(
+        UdpInterface::new(&client_address, Some(&server_address), false),
         UdpInterface::spawn,
     );
     let client = ReticulumTransport::new(client_rns);
 
-    let stream = client.dial(&PeerAddr::Rns(hash)).await.expect("dial over mesh");
-    let (conn, _incoming) =
-        epix_edx::link::dial_overlay(stream).await.expect("EDX magic exchange over mesh");
-    served_rx.recv().await.expect("the server brought EDX up on its side");
+    let stream = client
+        .dial(&PeerAddr::Rns(hash))
+        .await
+        .expect("dial over mesh");
+    let (conn, _incoming) = epix_edx::link::dial_overlay(stream)
+        .await
+        .expect("EDX magic exchange over mesh");
+    served_rx
+        .recv()
+        .await
+        .expect("the server brought EDX up on its side");
 
     let rtt = conn.ping().await.expect("ping answered over mesh");
-    assert!(rtt < Duration::from_secs(30), "measured an RTT, got {rtt:?}");
+    assert!(
+        rtt < Duration::from_secs(30),
+        "measured an RTT, got {rtt:?}"
+    );
 }

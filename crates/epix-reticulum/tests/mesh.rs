@@ -14,6 +14,7 @@ use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::{Transport, TransportConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 const REQUEST: &[u8] = b"getFile content.json over the mesh";
@@ -27,22 +28,24 @@ async fn wire_bytes_round_trip_over_rns_link() {
 }
 
 async fn run() {
-    let name = DestinationName::new("epix", "mesh");
+    let name = DestinationName::new("epix", "node");
 
     // --- Server: registers its destination, announces, serves inbound links.
     let server_id = PrivateIdentity::new_from_rand(OsRng);
     let mut server_tp = Transport::new(TransportConfig::new("server", &server_id, true));
     let server_dest = server_tp.add_destination(server_id.clone(), name).await;
-    let server_tp = Arc::new(server_tp);
-    server_tp.iface_manager().lock().await.spawn(
+    let server_tp = Arc::new(Mutex::new(server_tp));
+    server_tp.lock().await.iface_manager().lock().await.spawn(
         UdpInterface::new("0.0.0.0:52011", Some("127.0.0.1:52012"), false),
         UdpInterface::spawn,
     );
 
     // --- Client: dials the announced destination.
     let client_id = PrivateIdentity::new_from_rand(OsRng);
-    let client_tp = Arc::new(Transport::new(TransportConfig::new("client", &client_id, true)));
-    client_tp.iface_manager().lock().await.spawn(
+    let client_tp = Arc::new(Mutex::new(Transport::new(TransportConfig::new(
+        "client", &client_id, true,
+    ))));
+    client_tp.lock().await.iface_manager().lock().await.spawn(
         UdpInterface::new("0.0.0.0:52012", Some("127.0.0.1:52011"), false),
         UdpInterface::spawn,
     );
@@ -53,7 +56,11 @@ async fn run() {
         let server_dest = server_dest.clone();
         tokio::spawn(async move {
             loop {
-                server_tp.send_announce(&server_dest, None).await;
+                server_tp
+                    .lock()
+                    .await
+                    .send_announce(&server_dest, None)
+                    .await;
                 sleep(Duration::from_millis(400)).await;
             }
         });
@@ -63,7 +70,7 @@ async fn run() {
     let server_task = {
         let server_tp = server_tp.clone();
         tokio::spawn(async move {
-            let mut in_events = server_tp.in_link_events();
+            let mut in_events = server_tp.lock().await.in_link_events();
             let link_id = loop {
                 let ev = in_events.recv().await.expect("server link events");
                 if let LinkEvent::Activated = ev.event {
@@ -71,24 +78,31 @@ async fn run() {
                 }
             };
             let link = server_tp
+                .lock()
+                .await
                 .find_in_link(&link_id)
                 .await
                 .expect("server in-link handle");
-            let mut stream =
-                ReticulumStream::wrap(server_tp.clone(), link, link_id, in_events);
+            let mut stream = ReticulumStream::wrap(server_tp.clone(), link, link_id, in_events);
 
             let mut buf = vec![0u8; REQUEST.len()];
-            stream.read_exact(&mut buf).await.expect("server read request");
+            stream
+                .read_exact(&mut buf)
+                .await
+                .expect("server read request");
             assert_eq!(buf, REQUEST, "server received the request bytes intact");
 
-            stream.write_all(RESPONSE).await.expect("server write response");
+            stream
+                .write_all(RESPONSE)
+                .await
+                .expect("server write response");
             sleep(Duration::from_millis(500)).await; // let the writer task flush
         })
     };
 
     // Client side: wait for the announce, link, round-trip.
-    let mut announces = client_tp.recv_announces().await;
-    let out_events = client_tp.out_link_events();
+    let mut announces = client_tp.lock().await.recv_announces().await;
+    let out_events = client_tp.lock().await.out_link_events();
     let desc = timeout(Duration::from_secs(15), async {
         let ann = announces.recv().await.expect("client announce recv");
         // Bound so the guard drops before `ann` does.
@@ -98,7 +112,7 @@ async fn run() {
     .await
     .expect("client learns server destination");
 
-    let link = client_tp.link(desc).await;
+    let link = client_tp.lock().await.link(desc).await;
     // Wait for the link to activate.
     timeout(Duration::from_secs(15), async {
         loop {
@@ -116,10 +130,16 @@ async fn run() {
 
     // Give the server a beat to accept the inbound link and start reading.
     sleep(Duration::from_millis(600)).await;
-    stream.write_all(REQUEST).await.expect("client write request");
+    stream
+        .write_all(REQUEST)
+        .await
+        .expect("client write request");
 
     let mut buf = vec![0u8; RESPONSE.len()];
-    stream.read_exact(&mut buf).await.expect("client read response");
+    stream
+        .read_exact(&mut buf)
+        .await
+        .expect("client read response");
     assert_eq!(buf, RESPONSE, "client received the response bytes intact");
 
     server_task.await.expect("server task");

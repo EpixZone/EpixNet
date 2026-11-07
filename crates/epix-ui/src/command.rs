@@ -4080,7 +4080,7 @@ impl WsCommand for XiteFavourite {
     }
 }
 
-/// `peerAdd(ip, port, xite_address?)` - add a peer to a xite's known set.
+/// `peerAdd(ip, port, site_address?)` or `{peer, site_address?}`.
 struct PeerAdd;
 #[async_trait]
 impl WsCommand for PeerAdd {
@@ -4088,17 +4088,23 @@ impl WsCommand for PeerAdd {
         "peerAdd"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = match arg_str(p, "site_address", 2) {
+            Some(a) => a.to_string(),
+            None => s.address()?.to_string(),
+        };
+        if let Some(peer) = p.get("peer") {
+            let peer = peer.as_str().ok_or("peer must be an endpoint string")?;
+            s.state.add_peer_endpoint(&address, peer).await?;
+            return Ok(Value::from("updated"));
+        }
         let ip = arg_str(p, "ip", 0).ok_or("ip required")?;
         let port = p
             .get("port")
             .or_else(|| p.as_array().and_then(|a| a.get(1)))
             .and_then(|v| v.as_i64().or_else(|| v.as_str().and_then(|s| s.parse().ok())))
             .ok_or("port required")?;
-        let address = match arg_str(p, "site_address", 2) {
-            Some(a) => a.to_string(),
-            None => s.address()?.to_string(),
-        };
-        s.state.add_peer_ipport(&address, ip, port as u16).await?;
+        let port = u16::try_from(port).map_err(|_| "port must be between 1 and 65535")?;
+        s.state.add_peer_ipport(&address, ip, port).await?;
         Ok(Value::from("updated"))
     }
 }
@@ -4693,6 +4699,10 @@ impl WsCommand for SimpleCommand {
         Ok(self.value.clone())
     }
 }
+
+#[cfg(test)]
+#[path = "command/tests/peer_add.rs"]
+mod peer_add_tests;
 
 #[cfg(test)]
 mod tests {

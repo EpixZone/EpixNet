@@ -7266,7 +7266,6 @@ dependencies = [
 [[package]]
 name = "reticulum"
 version = "0.1.0"
-source = "git+https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs?rev=dc4e03bb08a2069d03ba038bcc63eb9358201dd5#dc4e03bb08a2069d03ba038bcc63eb9358201dd5"
 dependencies = [
  "aes 0.8.4",
  "cbc 0.1.2",

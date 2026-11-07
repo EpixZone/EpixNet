@@ -4,21 +4,23 @@
 //! BLE, packet radio, TCP, serial…). The EpixNet wire protocol, on the other
 //! hand, is a byte stream: EDX frames over a [`PeerStream`]
 //! (`AsyncRead` + `AsyncWrite`). [`ReticulumStream`] is the adapter between the
-//! two - it presents a Reticulum `Link` as a byte stream, so the *entire*
+//! two. The v2 destination uses acknowledged, ordered Reticulum Channel
+//! messages. The original destination retains its raw-packet adapter for
+//! existing peers on reliable TCP interfaces. The *entire*
 //! FileRequest command set (handshake, getFile, the DHT `kad` RPCs, …) runs
 //! over mesh with no protocol changes.
 //!
 //! Direction of travel:
 //! - **write** - bytes are chunked to the link MTU, turned into encrypted data
 //!   packets ([`Link::data_packet`]), and sent on the transport.
-//! - **read** - the link's inbound `Data` events are concatenated back into a
-//!   byte stream. Because a `Link` delivers packets reliably and in order, the
-//!   reassembled stream is faithful; the reader neither knows nor cares that it
-//!   arrived as packets.
+//! - **read** - v2 reassembles ordered Channel messages and fails closed on
+//!   exhausted retries or receiver lag. Raw legacy Link data has no transport
+//!   retransmission and is not suitable for lossy radio interfaces.
 //!
 //! [`PeerStream`]: epix_transport::PeerStream
 
 mod node;
+mod reliable;
 mod server;
 mod transport;
 pub use node::{MeshConfig, MeshNode};
@@ -34,10 +36,32 @@ use reticulum::transport::Transport;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::{broadcast, mpsc, Mutex};
 
-/// Bytes per data packet. Well under the Reticulum MDU (2048) once link
-/// encryption overhead is accounted for; larger writes are split across packets
-/// and the reader reassembles them transparently.
-const CHUNK: usize = 1024;
+/// Fit the standard 500-byte Reticulum interface MTU including link encryption
+/// and packet headers. Larger writes are split and reassembled by the reader.
+const CHUNK: usize = 400;
+
+#[derive(Clone, Copy)]
+enum StreamProtocol {
+    Legacy,
+    Reliable,
+}
+
+fn stream_protocol(
+    name: &reticulum::destination::DestinationName,
+) -> std::io::Result<StreamProtocol> {
+    use reticulum::destination::DestinationName;
+    if name.as_name_hash_slice() == DestinationName::new("epix", "node.v2").as_name_hash_slice() {
+        Ok(StreamProtocol::Reliable)
+    } else if name.as_name_hash_slice() == DestinationName::new("epix", "node").as_name_hash_slice()
+    {
+        Ok(StreamProtocol::Legacy)
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            "unsupported Epix mesh protocol",
+        ))
+    }
+}
 
 /// A Reticulum [`Link`] presented as a byte stream.
 ///
@@ -56,7 +80,7 @@ impl ReticulumStream {
     /// link-event stream this link's data arrives on - `in_link_events()` for a
     /// server-side in-link, `out_link_events()` for a client-side out-link.
     pub fn wrap(
-        transport: Arc<Transport>,
+        transport: Arc<Mutex<Transport>>,
         link: Arc<Mutex<Link>>,
         link_id: LinkId,
         mut events: broadcast::Receiver<LinkEventData>,
@@ -78,9 +102,8 @@ impl ReticulumStream {
                         _ => {}
                     },
                     Ok(_) => {}
-                    // A slow consumer can lag the broadcast; keep going rather
-                    // than tearing down the stream.
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    // Missing bytes cannot be safely skipped in a byte stream.
+                    Err(broadcast::error::RecvError::Lagged(_)) => break,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
@@ -92,14 +115,19 @@ impl ReticulumStream {
                 for chunk in bytes.chunks(CHUNK) {
                     let packet = { link.lock().await.data_packet(chunk) };
                     match packet {
-                        Ok(p) => transport.send_packet(p).await,
+                        Ok(p) => transport.lock().await.send_packet(p).await,
                         Err(_) => return, // link closed
                     }
                 }
             }
         });
 
-        Self { incoming: in_rx, outgoing: out_tx, read_buf: Vec::new(), read_pos: 0 }
+        Self {
+            incoming: in_rx,
+            outgoing: out_tx,
+            read_buf: Vec::new(),
+            read_pos: 0,
+        }
     }
 }
 

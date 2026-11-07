@@ -15,6 +15,7 @@ use reticulum::identity::PrivateIdentity;
 use reticulum::iface::udp::UdpInterface;
 use reticulum::transport::{Transport as RnsTransport, TransportConfig};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Mutex;
 use tokio::time::{sleep, timeout};
 
 const REQUEST: &[u8] = b"handshake + getFile, dialed by destination hash";
@@ -28,14 +29,14 @@ async fn dial_by_hash_streams_over_mesh() {
 }
 
 async fn run() {
-    let name = DestinationName::new("epix", "mesh");
+    let name = DestinationName::new("epix", "node");
 
     // Server node: register + announce a destination, echo on inbound links.
     let server_id = PrivateIdentity::new_from_rand(OsRng);
     let mut server_tp = RnsTransport::new(TransportConfig::new("server", &server_id, true));
     let server_dest = server_tp.add_destination(server_id.clone(), name).await;
-    let server_tp = Arc::new(server_tp);
-    server_tp.iface_manager().lock().await.spawn(
+    let server_tp = Arc::new(Mutex::new(server_tp));
+    server_tp.lock().await.iface_manager().lock().await.spawn(
         UdpInterface::new("0.0.0.0:52031", Some("127.0.0.1:52032"), false),
         UdpInterface::spawn,
     );
@@ -49,7 +50,11 @@ async fn run() {
         let server_dest = server_dest.clone();
         tokio::spawn(async move {
             loop {
-                server_tp.send_announce(&server_dest, None).await;
+                server_tp
+                    .lock()
+                    .await
+                    .send_announce(&server_dest, None)
+                    .await;
                 sleep(Duration::from_millis(400)).await;
             }
         });
@@ -58,14 +63,19 @@ async fn run() {
     let server_task = {
         let server_tp = server_tp.clone();
         tokio::spawn(async move {
-            let mut in_events = server_tp.in_link_events();
+            let mut in_events = server_tp.lock().await.in_link_events();
             let link_id = loop {
                 let ev = in_events.recv().await.expect("server link events");
                 if let LinkEvent::Activated = ev.event {
                     break ev.id;
                 }
             };
-            let link = server_tp.find_in_link(&link_id).await.expect("in-link");
+            let link = server_tp
+                .lock()
+                .await
+                .find_in_link(&link_id)
+                .await
+                .expect("in-link");
             let mut stream = ReticulumStream::wrap(server_tp.clone(), link, link_id, in_events);
             let mut buf = vec![0u8; REQUEST.len()];
             stream.read_exact(&mut buf).await.expect("server read");
@@ -77,8 +87,10 @@ async fn run() {
 
     // Client node wrapped as a ReticulumTransport.
     let client_id = PrivateIdentity::new_from_rand(OsRng);
-    let client_rns = Arc::new(RnsTransport::new(TransportConfig::new("client", &client_id, true)));
-    client_rns.iface_manager().lock().await.spawn(
+    let client_rns = Arc::new(Mutex::new(RnsTransport::new(TransportConfig::new(
+        "client", &client_id, true,
+    ))));
+    client_rns.lock().await.iface_manager().lock().await.spawn(
         UdpInterface::new("0.0.0.0:52032", Some("127.0.0.1:52031"), false),
         UdpInterface::spawn,
     );
@@ -94,7 +106,10 @@ async fn run() {
     stream.write_all(REQUEST).await.expect("client write");
     let mut buf = vec![0u8; RESPONSE.len()];
     stream.read_exact(&mut buf).await.expect("client read");
-    assert_eq!(buf, RESPONSE, "client streamed the response over the dialed link");
+    assert_eq!(
+        buf, RESPONSE,
+        "client streamed the response over the dialed link"
+    );
 
     server_task.await.expect("server task");
 }

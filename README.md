@@ -24,6 +24,7 @@ EpixNet is built from its source code. Pick your system below. Each guide starts
 - [macOS](docs/install/macos.md)
 - [Android](docs/install/android.md)
 - [iOS](docs/install/ios.md)
+- [Offline LAN and Reticulum mesh](docs/mesh-offline.md)
 
 ## Ways to run it (desktop)
 

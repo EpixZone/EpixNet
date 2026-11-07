@@ -5015,7 +5015,7 @@ async fn serve(
     };
     let mut runtime =
         epix_runtime::NodeRuntime::with_config(state.clone(), trackers, runtime_config);
-    #[cfg(any(feature = "tor", feature = "i2p"))]
+    #[cfg(any(feature = "tor", feature = "i2p", feature = "mesh"))]
     {
         runtime = runtime.with_data_dir(opts.data_root.clone());
     }
