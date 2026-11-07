@@ -73,6 +73,11 @@ impl Class {
             PeerAddr::Ip(_) => Class::Clearnet,
             PeerAddr::I2p { .. } => Class::I2p,
             PeerAddr::Onion { .. } | PeerAddr::Rns(_) => Class::Tor,
+            PeerAddr::Session { network, .. } => match network {
+                epix_core::IpType::Ipv4 | epix_core::IpType::Ipv6 => Class::Clearnet,
+                epix_core::IpType::I2p => Class::I2p,
+                epix_core::IpType::Onion | epix_core::IpType::Rns => Class::Tor,
+            },
         }
     }
 }
