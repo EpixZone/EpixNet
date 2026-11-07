@@ -757,6 +757,7 @@ pub async fn pex(
     need: u32,
     have: Vec<epix_core::PeerAddr>,
 ) -> std::io::Result<Vec<epix_core::PeerAddr>> {
+    let have = have.into_iter().filter(|peer| !peer.is_session()).collect();
     match conn.request(Req::Pex { xite: xite.into(), need, peers: have }).await? {
         Resp::Peers { peers } => Ok(peers),
         Resp::Err { code, msg } => Err(remote_err(code, &msg)),

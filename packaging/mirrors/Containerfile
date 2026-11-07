@@ -1,0 +1,7 @@
+# Disposable native-client verification only. Never install fixtures on the host.
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    apt-utils dpkg-dev gnupg rpm createrepo-c dnf ca-certificates iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+# Mount the locally built Rust client_lab executable read-only at this path.
+ENTRYPOINT ["/usr/local/bin/epix-mirror-lab"]

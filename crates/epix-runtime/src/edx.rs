@@ -33,6 +33,9 @@ use epix_ui::state::{
 };
 use epix_ui::AppState;
 
+mod incoming_session;
+use incoming_session::IncomingSession;
+
 /// The peer's EDX Hello, in the shape the diagnostics Stats page renders. Only
 /// `version` and the node key are real over EDX; `rev`, `fileserver_port` and
 /// the crypt list were msgpack handshake fields with no EDX equivalent, and
@@ -1026,6 +1029,7 @@ fn safe_inner_path(inner_path: &str) -> bool {
 /// index and exact-chain update application.
 struct AppStateProvider {
     state: Arc<AppState>,
+    incoming: Option<Arc<IncomingSession>>,
 }
 
 /// Narrow adapter around the authenticated connection that delivered an
@@ -1103,6 +1107,11 @@ impl InboundEdxSource for LiveUpdateSource {
 
 #[async_trait::async_trait]
 impl SignedProvider for AppStateProvider {
+    async fn note_interest(&self, xite: &str, source: UpdateSource) {
+        if let Some(incoming) = &self.incoming {
+            incoming.note_interest(xite, source).await;
+        }
+    }
     async fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>> {
         if !safe_inner_path(inner_path) {
             return None;
@@ -1340,10 +1349,18 @@ pub fn edx_hook(
     shards: bool,
     on_inbound: Option<InboundHook>,
 ) -> EdxHook {
-    let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state: state.clone() });
+    edx_hook_with_sessions(state, store, privatekey, choker, control, shards, on_inbound, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn edx_hook_with_sessions(
+    state: Arc<AppState>, store: Arc<Store>, privatekey: String,
+    choker: Option<SharedChoker>, control: ControlHandles, shards: bool,
+    on_inbound: Option<InboundHook>, fetcher: Option<Arc<RuntimeEdxFetcher>>,
+) -> EdxHook {
     Arc::new(move |peer: PeerAddr, stream| {
         let store = store.clone();
-        let provider = provider.clone();
+        let fetcher = fetcher.clone();
         let privatekey = privatekey.clone();
         let choker = choker.clone();
         let on_inbound = on_inbound.clone();
@@ -1357,12 +1374,21 @@ pub fn edx_hook(
                 epix_edx::link::accept(stream),
             );
             let Ok(Ok(l)) = handshake.await else { return };
+            let session = fetcher.as_ref().map(|fetcher| IncomingSession::new(
+                state.clone(), fetcher, &peer, l.conn.clone(), reg.clone(),
+            ));
+            let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider {
+                state: state.clone(), incoming: session.clone(),
+            });
             let mut ctx = serve_ctx(&state, store, provider, privatekey, control, shards);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
             }
             let incoming = tap_inbound(reg, l.incoming, peer, on_inbound, dialback);
             serve(l.conn, incoming, Arc::new(ctx), Some(l.handshake_hash)).await;
+            if let Some(session) = session {
+                session.close().await;
+            }
         })
     })
 }
@@ -1433,10 +1459,17 @@ pub fn edx_hook_overlay(
     control: ControlHandles,
     shards: bool,
 ) -> EdxHook {
-    let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider { state: state.clone() });
+    edx_hook_overlay_with_sessions(state, store, privatekey, choker, control, shards, None)
+}
+
+fn edx_hook_overlay_with_sessions(
+    state: Arc<AppState>, store: Arc<Store>, privatekey: String,
+    choker: Option<SharedChoker>, control: ControlHandles, shards: bool,
+    fetcher: Option<Arc<RuntimeEdxFetcher>>,
+) -> EdxHook {
     Arc::new(move |peer: PeerAddr, stream| {
         let store = store.clone();
-        let provider = provider.clone();
+        let fetcher = fetcher.clone();
         let privatekey = privatekey.clone();
         let choker = choker.clone();
         let dialback: DialbackSlot = Arc::new(Mutex::new(None));
@@ -1449,6 +1482,12 @@ pub fn edx_hook_overlay(
                 epix_edx::link::accept_overlay(stream),
             );
             let Ok(Ok((conn, incoming))) = handshake.await else { return };
+            let session = fetcher.as_ref().map(|fetcher| IncomingSession::new(
+                state.clone(), fetcher, &peer, conn.clone(), reg.clone(),
+            ));
+            let provider: Arc<dyn SignedProvider> = Arc::new(AppStateProvider {
+                state: state.clone(), incoming: session.clone(),
+            });
             let mut ctx = serve_ctx(&state, store, provider, privatekey, control, shards);
             if let Some(c) = choker {
                 ctx = ctx.with_choker(c);
@@ -1457,6 +1496,9 @@ pub fn edx_hook_overlay(
             // nothing about whether our clearnet port is open.
             let incoming = tap_inbound(reg, incoming, peer, None, dialback);
             serve(conn, incoming, Arc::new(ctx), None).await;
+            if let Some(session) = session {
+                session.close().await;
+            }
         })
     })
 }
@@ -1475,6 +1517,7 @@ pub struct EdxServe {
     /// `caps::SHARDS`). Read once from `volunteer_quota_bytes` at setup; a
     /// live re-advertise on toggle is a deferred follow-up.
     shards: bool,
+    fetcher: Arc<RuntimeEdxFetcher>,
 }
 
 impl EdxServe {
@@ -1482,7 +1525,7 @@ impl EdxServe {
     /// `on_inbound` fires per peer that completes the handshake, which is how
     /// the node learns its fileserver port is open from the internet.
     pub fn clearnet_hook(&self, on_inbound: Option<InboundHook>) -> EdxHook {
-        edx_hook(
+        edx_hook_with_sessions(
             self.state.clone(),
             self.store.clone(),
             self.privatekey.clone(),
@@ -1490,17 +1533,19 @@ impl EdxServe {
             self.control.clone(),
             self.shards,
             on_inbound,
+            Some(self.fetcher.clone()),
         )
     }
     /// The overlay (no-Noise) accept hook for Tor/I2P/Reticulum.
     pub fn overlay_hook(&self) -> EdxHook {
-        edx_hook_overlay(
+        edx_hook_overlay_with_sessions(
             self.state.clone(),
             self.store.clone(),
             self.privatekey.clone(),
             self.choker.clone(),
             self.control.clone(),
             self.shards,
+            Some(self.fetcher.clone()),
         )
     }
 }
@@ -1585,7 +1630,7 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
     let dir = state.data_root_path()?;
     let key = node_key(state).await;
     let choker = make_choker();
-    let store = enable_serving(state, &dir, key.clone(), choker.clone()).await?;
+    let (store, fetcher) = enable_serving_with_sessions(state, &dir, key.clone(), choker.clone()).await?;
     // Volunteer role: advertise caps::SHARDS only when the operator donated
     // disk. Read once here; a live toggle is a deferred follow-up.
     let shards = state.volunteer_quota_bytes().await > 0;
@@ -1596,6 +1641,7 @@ pub async fn ensure_edx_serve(cell: &EdxServeCell, state: &Arc<AppState>) -> Opt
         choker,
         control: cell.control.clone(),
         shards,
+        fetcher,
     };
     *guard = Some(es.clone());
     Some(es)
@@ -2401,7 +2447,7 @@ impl RuntimeEdxFetcher {
             .filter_map(|s| PeerAddr::parse(s).ok())
             .collect();
         let provider: Arc<dyn SignedProvider> =
-            Arc::new(AppStateProvider { state: self.state.clone() });
+            Arc::new(AppStateProvider { state: self.state.clone(), incoming: None });
         let mut ctx = ServeCtx::new(store, provider, self.privatekey.clone())
             .with_on_served(upload_recorder(self.state.clone()))
             .with_foreground(edx_foreground_flag())
@@ -2509,6 +2555,13 @@ impl RuntimeEdxFetcher {
         peer: &PeerAddr,
         lane: u8,
     ) -> Result<Link, AttemptError<String>> {
+        if peer.is_session() {
+            if !incoming_session::routing_allows(peer, epix_core::route_all_via_overlay()) {
+                return Err(AttemptError::Failed("direct session forbidden by Tor policy".into()));
+            }
+            return self.link_pool.live(peer, 0)
+                .ok_or_else(|| AttemptError::Failed("authenticated session is closed".into()));
+        }
         self.link_pool
             .get_or_dial(peer, lane, || async {
                 let transport = self.state.transport().await.ok_or("no transport")?;
@@ -6017,6 +6070,13 @@ pub async fn enable_serving(
     privatekey: String,
     choker: Option<SharedChoker>,
 ) -> Option<Arc<Store>> {
+    enable_serving_with_sessions(state, data_dir, privatekey, choker).await.map(|(store, _)| store)
+}
+
+async fn enable_serving_with_sessions(
+    state: &Arc<AppState>, data_dir: &std::path::Path,
+    privatekey: String, choker: Option<SharedChoker>,
+) -> Option<(Arc<Store>, Arc<RuntimeEdxFetcher>)> {
     let path = data_dir.join("edx-store");
     if let Err(e) = tokio::fs::create_dir_all(&path).await {
         state.log("WARN", format!("EDX store dir {}: {e}", path.display())).await;
@@ -6049,9 +6109,9 @@ pub async fn enable_serving(
     state.set_edx_fetcher(fetcher.clone()).await;
     // Same object behind both seams: the warm pool needs only a ping, so it
     // takes the narrow one.
-    state.set_link_opener(fetcher).await;
+    state.set_link_opener(fetcher.clone()).await;
     state.log("INFO", format!("EDX object store enabled: registered {tally}")).await;
-    Some(store)
+    Some((store, fetcher))
 }
 
 /// Hold our responsible shards of every private file every served xite
@@ -6399,7 +6459,7 @@ mod tests {
                 },
             )
             .await;
-        let p = AppStateProvider { state };
+        let p = AppStateProvider { state, incoming: None };
 
         assert_eq!(p.get_signed(&address, "content.json").await, Some(content));
         assert_eq!(
@@ -6481,7 +6541,7 @@ mod tests {
             )
             .await;
         state.set_pool_admission(Arc::new(RejectPoolRescan)).await;
-        let served = AppStateProvider { state }
+        let served = AppStateProvider { state, incoming: None }
             .get_signed(&address, &shard)
             .await
             .expect("the shard is served as a sanitized empty container");
@@ -6543,7 +6603,7 @@ mod tests {
                 },
             )
             .await;
-        let provider = AppStateProvider { state: state.clone() };
+        let provider = AppStateProvider { state: state.clone(), incoming: None };
         assert_eq!(provider.get_signed(&address, child_path).await, Some(child_bytes));
         assert_eq!(provider.get_signed(&address, merge_path).await, Some(merge_bytes));
         assert!(provider
@@ -6630,7 +6690,7 @@ mod tests {
                 },
             )
             .await;
-        let p = AppStateProvider { state };
+        let p = AppStateProvider { state, incoming: None };
         assert!(p.get_signed(&address, "content.json").await.is_none(), "over the cap: refused");
     }
 
@@ -6665,7 +6725,7 @@ mod tests {
                 },
             )
             .await;
-        let p = AppStateProvider { state };
+        let p = AppStateProvider { state, incoming: None };
         assert_eq!(
             p.get_signed(&address, "content.json").await.map(|b| b.len()),
             Some(body.len()),
@@ -8703,7 +8763,7 @@ mod tests {
         let state = AppState::new("relay");
         let store = Arc::new(tokio::sync::Mutex::new(epix_propagation::PropagationStore::new()));
         state.set_prop_store(store.clone());
-        let provider = AppStateProvider { state: state.clone() };
+        let provider = AppStateProvider { state: state.clone(), incoming: None };
 
         let res = provider
             .apply_update(
@@ -9923,7 +9983,7 @@ mod tests {
         std::mem::forget(a_dir);
         let ctx = ServeCtx::new(
             a_store,
-            Arc::new(AppStateProvider { state: state_a.clone() }),
+            Arc::new(AppStateProvider { state: state_a.clone(), incoming: None }),
             epix_crypt::new_seed(),
         )
         .with_version("4.5.6".into());
@@ -10043,7 +10103,7 @@ mod tests {
         std::mem::forget(dir);
         let ctx = ServeCtx::new(
             store,
-            Arc::new(AppStateProvider { state: state.clone() }),
+            Arc::new(AppStateProvider { state: state.clone(), incoming: None }),
             epix_crypt::new_seed(),
         );
 
@@ -10065,7 +10125,7 @@ mod tests {
         std::mem::forget(cdir);
         let cctx = ServeCtx::new(
             cstore,
-            Arc::new(AppStateProvider { state: AppState::new("client") }),
+            Arc::new(AppStateProvider { state: AppState::new("client"), incoming: None }),
             epix_crypt::new_seed(),
         );
         client_hello(&conn, &cctx, vec![], None).await.unwrap();
@@ -10887,7 +10947,7 @@ mod tests {
             let l = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             l.local_addr().unwrap()
         };
-        let provider = AppStateProvider { state: state_r.clone() };
+        let provider = AppStateProvider { state: state_r.clone(), incoming: None };
         let applied = provider
             .apply_update(
                 &xite_addr,

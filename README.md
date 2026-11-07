@@ -142,6 +142,11 @@ to 4096 UTF-8 bytes. Each user's 512 KiB document retains up to 128 public and 3
 private messages. The API reports read limits and truncation; it is bounded chat
 history, not permanent archival storage.
 
+To carry package repositories over signed xites, use the
+[package mirror workflow](docs/package-mirrors.md). It exports complete verified
+snapshots for APT, DNF, Homebrew artifacts, and Chocolatey folder sources while
+preserving upstream signature and checksum checks.
+
 Owner-key recovery uses the master seed in `private/users.json` and the
 `address_index` in the xite's signed `content.json`. Another installation with
 the same seed can recover the key even if its `users.json` copy predates the
