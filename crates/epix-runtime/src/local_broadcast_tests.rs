@@ -1,6 +1,6 @@
-use super::*;
-use if_addrs::{IfOperStatus, Ifv4Addr, Ifv6Addr};
-use std::net::Ipv6Addr;
+use super::select_destinations;
+use if_addrs::{IfAddr, IfOperStatus, Ifv4Addr, Ifv6Addr, Interface};
+use std::net::{Ipv4Addr, Ipv6Addr};
 
 fn interface(ip: [u8; 4], prefix: u8) -> Interface {
     let mask = if prefix == 0 {

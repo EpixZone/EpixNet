@@ -1,7 +1,15 @@
 //! Reuse an authenticated incoming channel without inventing a dial-back address.
 
-use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use super::{LinkActivity, LinkActivityState, RuntimeEdxFetcher};
+use epix_core::PeerAddr;
+use epix_edx::{choke::Reach, conn::Conn, server::UpdateSource};
+use epix_protocol::registry::ConnHandle;
+use epix_ui::AppState;
+use std::collections::HashMap;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 #[cfg(test)]
 #[path = "incoming_session_tests.rs"]

@@ -1,4 +1,4 @@
-use super::*;
+use super::{IpType, PeerAddr};
 
 #[test]
 fn session_handles_cannot_enter_from_text_json_or_compact_addresses() {
