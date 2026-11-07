@@ -1,6 +1,8 @@
 # Native folder-source compatibility only. Node signature/export is tested separately.
 # Run exclusively on a disposable Windows CI runner, never a user's installation.
 $ErrorActionPreference = 'Stop'
+$mirror = if ($env:EPIX_MIRROR_BINARY) { $env:EPIX_MIRROR_BINARY } else { Join-Path $PSScriptRoot '..\target\debug\epix-mirror.exe' }
+if (-not (Test-Path $mirror)) { throw 'Build epix-mirror before running this test.' }
 if ($env:GITHUB_ACTIONS -ne 'true' -or -not $env:RUNNER_TEMP) {
     throw 'Use a disposable GitHub Actions Windows runner.'
 }
@@ -49,9 +51,9 @@ try {
             if ($LASTEXITCODE -ne 0) { throw 'Packing fixture failed.' }
         }
         $snapshot = Join-Path $taskRoot "snapshot-$version"
-        python scripts/epix-mirror.py stage --manager chocolatey --source $feed --output $snapshot --expires $expiry
+        & $mirror stage --manager chocolatey --source $feed --output $snapshot --expires $expiry
         if ($LASTEXITCODE -ne 0) { throw 'Staging folder source failed.' }
-        python scripts/epix-mirror.py verify --snapshot $snapshot
+        & $mirror verify --snapshot $snapshot
         if ($LASTEXITCODE -ne 0) { throw 'Snapshot verification failed.' }
         $operation = if ($version -eq '1.0.0') { 'install' } else { 'upgrade' }
         & $choco $operation epix-mirror-folder-fixture --yes --no-progress --limit-output --source (Join-Path $snapshot 'repo') --cache-location (Join-Path $taskRoot 'cache')

@@ -1,9 +1,14 @@
 # Package repositories over EpixNet
 
-`scripts/epix-mirror.py` transports a bounded repository snapshot through an
+`epix-mirror` transports a bounded repository snapshot through an
 ordinary signed xite, exports it from a local node, and serves it to an ordinary
-package manager. It requires Python 3.10 or newer. It does not change system
+package manager. It is a native Rust executable. It does not change system
 package sources, install packages, sign xites, or publish files automatically.
+
+Build it from the checkout with `cargo build -p epix-mirror --release --locked`,
+then use `target/release/epix-mirror` (`epix-mirror.exe` on Windows). Alternatively,
+`cargo install --path crates/epix-mirror --locked` installs it in Cargo's binary
+directory. It is currently built separately from the desktop release bundle.
 
 The xite signature authenticates the snapshot publisher and its bytes. Keep
 the package manager's upstream signature and checksum checks enabled as well.
@@ -29,6 +34,8 @@ tool's supported layouts. Snapshot limits are 60,000 files, 8 GiB per file,
 15 GiB total, 8 MiB catalog, and 64 MiB expanded repository metadata. The local
 node's public ZIP exporter has its own bounds. Large distributions should use
 separate complete repositories, not incomplete slices of an upstream index.
+Import accepts the node's single-disk ZIP/ZIP64 format without archive comments;
+it bounds the index to 65,536 entries and 64 MiB before decoding ZIP metadata.
 
 ## Prepare and publish a snapshot
 
@@ -45,7 +52,7 @@ collections need an operator-selected expiry because they do not supply the
 same signed freshness field. Repackaging old metadata does not make it current.
 
 ```sh
-python3 scripts/epix-mirror.py stage \
+epix-mirror stage \
   --manager apt --source /path/to/public-repository \
   --output /path/to/new-snapshot --expires 2026-12-01T00:00:00Z
 ```
@@ -81,18 +88,18 @@ private/unsigned files, and refuses changed or missing required content. Export
 does not ask the node to execute commands or fetch arbitrary remote URLs.
 
 ```sh
-python3 scripts/epix-mirror.py export \
+epix-mirror export \
   --node http://127.0.0.1:42222 --address <canonical-epix1-address> \
   --output /path/to/snapshot-001
-python3 scripts/epix-mirror.py verify --snapshot /path/to/snapshot-001
-python3 scripts/epix-mirror.py serve --snapshot /path/to/snapshot-001 --port 42700
+epix-mirror verify --snapshot /path/to/snapshot-001
+epix-mirror serve --snapshot /path/to/snapshot-001 --port 42700
 ```
 
 The node URL must be a literal loopback address with its UI port. Redirects and
 environment proxy settings are refused. For a password-protected node, pass a
 private Netscape-format cookie file with `--cookie-file`; credentials are not
 put in command-line arguments or exported files. Normal node authentication
-remains in force. The script does not disable CORS or use a public gateway's
+remains in force. The executable does not disable CORS or use a public gateway's
 administrator interface.
 
 Export validates the catalog, every file size/hash, repository completeness and
@@ -219,28 +226,37 @@ normal signed-update acceptance rules.
 
 ## Verification
 
-`python3 scripts/test_epix_mirror.py -v` checks atomic imports, incomplete and
+`cargo test -p epix-mirror --locked` checks atomic imports, incomplete and
 tampered repositories, expiry, path safety, exact URL maps and read-only HTTP.
-The native fixture runner `scripts/test_mirror_clients.py` refuses to run on the
-host or with a container default route. Its disposable APT/DNF fixtures include
+The Rust `client_lab` example refuses package operations outside a container
+whose only network interface is loopback. Its disposable APT/DNF fixtures include
 upstream signatures and a dependency, and check installation followed by an
 upgrade. Repository fixtures must first pass through the real local node's ZIP
 export, which is recorded by `epix-export.json`.
 
-For a repeatable Linux run, use disposable absolute paths for `FIXTURES` and
-`QA_OUTPUT`, and a locally built `NODE_BINARY` from the checkout under test:
+For a repeatable Linux run, create a disposable absolute `QA_ROOT` directory and
+use a locally built `NODE_BINARY` from the checkout under test. Set `LAB_BINARY`
+to the absolute path of the built `target/debug/examples/client_lab` executable:
 
 ```sh
-podman build --network host -f scripts/package_mirror/Containerfile -t localhost/epix-mirror-qa .
-podman run --rm --network none -v "$FIXTURES:/qa" localhost/epix-mirror-qa generate --root /qa
+cargo build -p epix-mirror --example client_lab --locked
+podman build --network host -f packaging/mirrors/Containerfile -t localhost/epix-mirror-rust-qa .
+podman run --rm --network none -v "$QA_ROOT:/qa" \
+  -v "$LAB_BINARY:/usr/local/bin/epix-mirror-lab:ro" \
+  localhost/epix-mirror-rust-qa generate --root /qa/fixtures
 unshare --user --map-current-user --keep-caps --net \
-  python3 scripts/test_mirror_node.py --node-binary "$NODE_BINARY" \
-  --fixtures "$FIXTURES" --output "$QA_OUTPUT"
-podman run --rm --network none -v "$FIXTURES:/qa" localhost/epix-mirror-qa apt --root /qa
-podman run --rm --network none -v "$FIXTURES:/qa" localhost/epix-mirror-qa dnf --root /qa
-podman build --network host -f scripts/package_mirror/BrewContainerfile -t localhost/epix-mirror-brew-qa .
+  "$LAB_BINARY" export-node --node-binary "$NODE_BINARY" \
+  --root "$QA_ROOT/fixtures" --output "$QA_ROOT/node-export"
+podman run --rm --network none -v "$QA_ROOT:/qa" \
+  -v "$LAB_BINARY:/usr/local/bin/epix-mirror-lab:ro" \
+  localhost/epix-mirror-rust-qa apt --root /qa/fixtures
+podman run --rm --network none -v "$QA_ROOT:/qa" \
+  -v "$LAB_BINARY:/usr/local/bin/epix-mirror-lab:ro" \
+  localhost/epix-mirror-rust-qa dnf --root /qa/fixtures
+podman build --network host -f packaging/mirrors/BrewContainerfile -t localhost/epix-mirror-brew-rust-qa .
 podman run --rm --network none --userns=keep-id:uid=2000,gid=2000 \
-  -v "$FIXTURES:/qa:ro" localhost/epix-mirror-brew-qa --root /qa
+  -v "$QA_ROOT:/qa:ro" -v "$LAB_BINARY:/usr/local/bin/epix-mirror-lab:ro" \
+  localhost/epix-mirror-brew-rust-qa brew --root /qa/fixtures
 ```
 
 Container-image preparation downloads tools; fixture generation, node export,

@@ -1,6 +1,6 @@
-# Build after Containerfile as localhost/epix-mirror-qa:latest.
+# Build after Containerfile as localhost/epix-mirror-rust-qa:latest.
 # Downloads are preparation only. Native fixture runs use --network none.
-FROM localhost/epix-mirror-qa:latest
+FROM localhost/epix-mirror-rust-qa:latest
 USER root
 RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     git curl procps file build-essential ruby && rm -rf /var/lib/apt/lists/*
@@ -18,4 +18,4 @@ RUN git init Homebrew && git -C Homebrew remote add origin https://github.com/Ho
     && git -C Homebrew/Library/Taps/homebrew/homebrew-core fetch --depth 1 origin 5d320c851bd742f000ebf997bf2380c1d0957798 \
     && git -C Homebrew/Library/Taps/homebrew/homebrew-core checkout --detach FETCH_HEAD
 RUN /home/linuxbrew/.linuxbrew/bin/brew ruby -e 'puts RUBY_VERSION'
-ENTRYPOINT ["python3", "/opt/epix-tests/test_mirror_brew.py"]
+ENTRYPOINT ["/usr/local/bin/epix-mirror-lab"]
