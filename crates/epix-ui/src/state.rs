@@ -10,7 +10,7 @@ use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
 use epix_db::{Database, DbSchema};
 use epix_peer::{DialableNets, Peer, PeerCounts, Peers};
 use epix_transport::Transport;
-use epix_user::User;
+use epix_user::{NewXiteData, User};
 use epix_xite::{content_stats, FileEntry, Xite, XiteSettings, XiteStorage};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -10251,18 +10251,18 @@ impl AppState {
 
         // The new owner's key: a fresh derivation, or the target's saved key.
         let is_upgrade = target_address.is_some();
-        let (address, privatekey) = match target_address {
+        let (address, privatekey, address_index) = match target_address {
             Some(target) => {
                 let key = self
                     .xite_privatekey(&target)
                     .await
                     .ok_or("Target xite private key not known")?;
-                (target, key)
+                (target, key, None)
             }
             None => {
-                let pair = self.user.write().await.new_xite_data()?;
+                let new_xite = self.user.write().await.new_xite_data()?;
                 self.save_user().await;
-                pair
+                (new_xite.address, new_xite.privatekey, Some(new_xite.address_index))
             }
         };
 
@@ -10327,6 +10327,9 @@ impl AppState {
                 map.insert("clone_root".into(), json!(root));
             }
             map.insert("address".into(), json!(address));
+            if let Some(index) = address_index {
+                map.insert("address_index".into(), json!(index));
+            }
             map.insert("files".into(), json!({}));
             content
         };
@@ -10440,7 +10443,8 @@ impl AppState {
     /// and owned. Returns (address, privatekey WIF) - the caller shows the
     /// key to the author once.
     pub async fn create_xite(self: &Arc<Self>) -> Result<(String, String), String> {
-        let (address, privatekey) = self.user.write().await.new_xite_data()?;
+        let NewXiteData { address, privatekey, address_index } =
+            self.user.write().await.new_xite_data()?;
         self.save_user().await;
         let dir = self.xite_dir(&address).ok_or("No data root")?;
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
@@ -10455,7 +10459,12 @@ impl AppState {
                 .as_bytes(),
             )
             .map_err(|e| e.to_string())?;
-        let content = json!({ "address": address, "title": "My new xite", "files": {} });
+        let content = json!({
+            "address": address,
+            "address_index": address_index,
+            "title": "My new xite",
+            "files": {}
+        });
         storage
             .write("content.json", epix_content::dumps_content(&content).as_bytes(),
             )
@@ -34777,6 +34786,10 @@ fn next_size_limit(size_bytes: i64) -> i64 {
     }
     999999
 }
+
+#[cfg(test)]
+#[path = "state/tests/xite_key_recovery.rs"]
+mod xite_key_recovery_tests;
 
 #[cfg(test)]
 mod tests {

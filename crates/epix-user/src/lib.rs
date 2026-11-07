@@ -159,6 +159,14 @@ pub struct XiteAuth {
     pub settings: Map<String, Value>,
 }
 
+/// A new owned xite and the public index needed to recover its key.
+/// Store `address_index` in the signed root content.json alongside `address`.
+pub struct NewXiteData {
+    pub address: String,
+    pub privatekey: String,
+    pub address_index: u64,
+}
+
 /// The local user: master seed + per-xite keys + linked identities.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct User {
@@ -252,9 +260,10 @@ impl User {
     }
 
     /// Derive a brand-new owned-xite keypair from the master seed (EpixNet's
-    /// `getNewSiteData`): a random index into `hd_privatekey`, recorded with
-    /// the privatekey so publishes auto-sign. Returns (address, privatekey).
-    pub fn new_xite_data(&mut self) -> Result<(String, String), String> {
+    /// `getNewSiteData`): a random index into `hd_privatekey`. Save the key
+    /// locally so publishes auto-sign and return its index for the signed
+    /// manifest, allowing recovery from an earlier backup of the master seed.
+    pub fn new_xite_data(&mut self) -> Result<NewXiteData, String> {
         // Index from fresh key entropy (no extra RNG dependency).
         let entropy = epix_crypt::new_seed();
         let index = u64::from_str_radix(&entropy[..12], 16).map_err(|e| e.to_string())?
@@ -268,7 +277,7 @@ impl User {
         if let Some(auth) = self.xites.get_mut(&address) {
             auth.privatekey = Some(privatekey.clone());
         }
-        Ok((address, privatekey))
+        Ok(NewXiteData { address, privatekey, address_index: index })
     }
 
     // --- Identities ---------------------------------------------------------
