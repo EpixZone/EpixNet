@@ -326,14 +326,11 @@ fn symlinks_and_fifo_substitution_fail_without_blocking() {
     symlink(&f.source, f.snapshot.join("linked")).unwrap();
     assert!(open_regular(&f.snapshot, "linked/fixture.1.nupkg").is_err());
     let fifo = f.snapshot.join("fifo");
-    rustix::fs::mknodat(
-        rustix::fs::CWD,
-        &fifo,
-        rustix::fs::FileType::Fifo,
-        rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-        0,
-    )
-    .unwrap();
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&fifo)
+        .status()
+        .unwrap()
+        .success());
     let start = std::time::Instant::now();
     assert!(open_regular(&f.snapshot, "fifo").is_err());
     assert!(start.elapsed() < std::time::Duration::from_secs(1));
