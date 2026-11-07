@@ -1,0 +1,7 @@
+# Disposable native-client verification only. Never install fixtures on the host.
+FROM docker.io/library/ubuntu:24.04
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    python3 apt-utils dpkg-dev gnupg rpm createrepo-c dnf ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+COPY scripts/ /opt/epix-tests/
+ENTRYPOINT ["python3", "/opt/epix-tests/test_mirror_clients.py"]

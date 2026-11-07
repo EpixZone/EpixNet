@@ -1,0 +1,36 @@
+name: Package mirror compatibility
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/package_mirror/**'
+      - 'scripts/epix-mirror.py'
+      - 'scripts/test*mirror*'
+      - '.github/workflows/package-mirrors.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/package_mirror/**'
+      - 'scripts/epix-mirror.py'
+      - 'scripts/test*mirror*'
+      - '.github/workflows/package-mirrors.yml'
+
+permissions: {}
+
+jobs:
+  snapshot-contracts:
+    name: Snapshot safety (${{ matrix.os }})
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python scripts/test_epix_mirror.py -v
+      - name: Test Chocolatey in a private installation
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/test-mirror-chocolatey.ps1
