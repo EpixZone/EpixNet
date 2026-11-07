@@ -1,4 +1,3 @@
-use core::cmp;
 use core::convert::From;
 
 use aes::cipher::block_padding::Pkcs7;
@@ -92,18 +91,20 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
         }
     }
 
-    pub fn new_from_slices(sign_key: &[u8], enc_key: &[u8], rng: R) -> Self {
-        let mut sign_key_bytes = [0u8; AES_KEY_SIZE];
-        sign_key_bytes[..cmp::min(AES_KEY_SIZE, sign_key.len())].copy_from_slice(sign_key);
+    pub fn new_from_slices(
+        sign_key: &[u8],
+        enc_key: &[u8],
+        rng: R,
+    ) -> Result<Self, RnsError> {
+        let sign_key_bytes = sign_key.try_into().map_err(|_| RnsError::InvalidArgument)?;
+        let enc_key_bytes: [u8; AES_KEY_SIZE] =
+            enc_key.try_into().map_err(|_| RnsError::InvalidArgument)?;
 
-        let mut enc_key_bytes = [0u8; AES_KEY_SIZE];
-        enc_key_bytes[..cmp::min(AES_KEY_SIZE, enc_key.len())].copy_from_slice(enc_key);
-
-        Self {
+        Ok(Self {
             rng,
             sign_key: sign_key_bytes,
             enc_key: enc_key_bytes.into(),
-        }
+        })
     }
 
     pub fn new_rand(mut rng: R) -> Self {
@@ -204,6 +205,40 @@ mod tests {
     use crate::crypt::fernet::Fernet;
     use core::str;
     use rand_core::OsRng;
+
+    #[test]
+    fn slice_keys_require_exact_selected_key_size() {
+        let generated = Fernet::new_rand(OsRng);
+        let mut invalid_key = generated.sign_key.to_vec();
+        invalid_key.push(1);
+        for len in [0, super::AES_KEY_SIZE - 1, super::AES_KEY_SIZE + 1] {
+            assert!(matches!(
+                Fernet::new_from_slices(&invalid_key[..len], &generated.enc_key, OsRng),
+                Err(crate::error::RnsError::InvalidArgument)
+            ));
+            assert!(matches!(
+                Fernet::new_from_slices(&generated.sign_key, &invalid_key[..len], OsRng),
+                Err(crate::error::RnsError::InvalidArgument)
+            ));
+        }
+    }
+
+    #[test]
+    fn slice_keys_preserve_generated_key_material() {
+        let generated = Fernet::new_rand(OsRng);
+        let restored =
+            Fernet::new_from_slices(&generated.sign_key, &generated.enc_key, OsRng).unwrap();
+        let mut ciphertext = [0u8; 128];
+        let token = generated
+            .encrypt("Exact-length key material".into(), &mut ciphertext)
+            .unwrap();
+        let verified = restored.verify(token).unwrap();
+        let mut plaintext = [0u8; 128];
+        assert_eq!(
+            restored.decrypt(verified, &mut plaintext).unwrap().as_slice(),
+            b"Exact-length key material"
+        );
+    }
 
     #[test]
     fn encrypt_then_decrypt() {

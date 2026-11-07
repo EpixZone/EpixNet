@@ -32,7 +32,11 @@ vendored path build compatible with warnings-as-errors without suppressing lints
 The upstream Fernet token HMAC comparison now uses `Mac::verify_slice` for
 constant-time verification instead of an early-exit byte comparison. Tests reject
 first, middle, and last tag-bit changes, IV changes, and ciphertext changes while
-preserving valid decryption. Wire formats, cryptographic primitives, key formats,
+preserving valid decryption. Its slice constructor now rejects incomplete or
+oversized key material instead of zero-padding or panicking. Identity encryption
+splits derived keys at the selected AES key width, with exact-key and identity
+round-trip tests for both AES-256 and the optional AES-128 configuration.
+Wire formats, cryptographic primitives, key formats,
 and xite/announcement signature checks remain unchanged.
 The application announces a separate signed `epix.node.v2` destination for
 Channel streams. Existing `epix.node` destinations retain the legacy raw
@@ -53,6 +57,7 @@ root lockfile seeds the standalone vendor test graph:
 ```sh
 cp Cargo.lock vendor/reticulum/Cargo.lock
 cargo test --manifest-path vendor/reticulum/Cargo.toml --lib --offline
+cargo test --manifest-path vendor/reticulum/Cargo.toml --lib --features fernet-aes128 --offline
 rm vendor/reticulum/Cargo.lock
 cargo test -p epix-reticulum --locked
 ```

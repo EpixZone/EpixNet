@@ -166,6 +166,7 @@ jobs:
           cargo test -p epix-runtime -p epix-ui -p epix-dht-net -p epix-reticulum --features epix-runtime/i2p --locked
           cp Cargo.lock vendor/reticulum/Cargo.lock
           cargo test --manifest-path vendor/reticulum/Cargo.toml --lib --offline
+          cargo test --manifest-path vendor/reticulum/Cargo.toml --lib --features fernet-aes128 --offline
           rm vendor/reticulum/Cargo.lock
           cargo test -p epix-ui --example merger_index_benchmark --locked
       # These optional UI features are not enabled by the default test command.

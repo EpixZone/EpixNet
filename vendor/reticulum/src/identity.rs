@@ -178,10 +178,10 @@ impl EncryptIdentity for Identity {
         }
 
         let token = Fernet::new_from_slices(
-            &derived_key.as_bytes()[..16],
-            &derived_key.as_bytes()[16..],
+            &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+            &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
-        )
+        )?
         .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
 
         out_offset += token.as_bytes().len();
@@ -357,7 +357,7 @@ impl EncryptIdentity for PrivateIdentity {
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
-        )
+        )?
         .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
 
         out_offset += token.len();
@@ -382,7 +382,7 @@ impl DecryptIdentity for PrivateIdentity {
             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
             rng,
-        );
+        )?;
 
         let token = Token::from(data);
 
@@ -446,7 +446,33 @@ impl DerivedKey {
 mod tests {
     use rand_core::OsRng;
 
-    use super::PrivateIdentity;
+    use super::{DecryptIdentity, EncryptIdentity, PrivateIdentity, PUBLIC_KEY_LENGTH};
+
+    #[test]
+    fn public_and_private_encryption_use_selected_key_width() {
+        let identity = PrivateIdentity::new_from_rand(OsRng);
+        let derived_key = identity.identity.derive_key(OsRng, None);
+        let message = b"Identity key width matches selected cipher";
+        let mut ciphertext = [0u8; 256];
+        let mut plaintext = [0u8; 256];
+
+        let packet = identity
+            .identity
+            .encrypt(OsRng, message, &derived_key, &mut ciphertext)
+            .unwrap();
+        let decoded = identity
+            .decrypt(OsRng, &packet[PUBLIC_KEY_LENGTH..], &derived_key, &mut plaintext)
+            .unwrap();
+        assert_eq!(decoded, message);
+
+        let token = identity
+            .encrypt(OsRng, message, &derived_key, &mut ciphertext)
+            .unwrap();
+        let decoded = identity
+            .decrypt(OsRng, token, &derived_key, &mut plaintext)
+            .unwrap();
+        assert_eq!(decoded, message);
+    }
 
     #[test]
     fn private_identity_hex_string() {

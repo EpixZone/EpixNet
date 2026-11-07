@@ -318,10 +318,44 @@ index 95dc0a1..622585f 100644
 +
  }
 diff --git a/src/crypt/fernet.rs b/src/crypt/fernet.rs
-index 2b68107..c40005d 100644
+index 2b68107..e6d1e18 100644
 --- a/src/crypt/fernet.rs
 +++ b/src/crypt/fernet.rs
-@@ -131,7 +131,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
+@@ -1,4 +1,3 @@
+-use core::cmp;
+ use core::convert::From;
+ 
+ use aes::cipher::block_padding::Pkcs7;
+@@ -92,18 +91,20 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
+         }
+     }
+ 
+-    pub fn new_from_slices(sign_key: &[u8], enc_key: &[u8], rng: R) -> Self {
+-        let mut sign_key_bytes = [0u8; AES_KEY_SIZE];
+-        sign_key_bytes[..cmp::min(AES_KEY_SIZE, sign_key.len())].copy_from_slice(sign_key);
++    pub fn new_from_slices(
++        sign_key: &[u8],
++        enc_key: &[u8],
++        rng: R,
++    ) -> Result<Self, RnsError> {
++        let sign_key_bytes = sign_key.try_into().map_err(|_| RnsError::InvalidArgument)?;
++        let enc_key_bytes: [u8; AES_KEY_SIZE] =
++            enc_key.try_into().map_err(|_| RnsError::InvalidArgument)?;
+ 
+-        let mut enc_key_bytes = [0u8; AES_KEY_SIZE];
+-        enc_key_bytes[..cmp::min(AES_KEY_SIZE, enc_key.len())].copy_from_slice(enc_key);
+-
+-        Self {
++        Ok(Self {
+             rng,
+             sign_key: sign_key_bytes,
+             enc_key: enc_key_bytes.into(),
+-        }
++        })
+     }
+ 
+     pub fn new_rand(mut rng: R) -> Self {
+@@ -131,7 +132,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
  
          // Generate random IV
          let iv = AesCbcEnc::generate_iv(self.rng);
@@ -330,7 +364,7 @@ index 2b68107..c40005d 100644
  
          out_len += iv.len();
  
-@@ -149,7 +149,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
+@@ -149,7 +150,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
  
          let tag = hmac.finalize().into_bytes();
  
@@ -339,7 +373,7 @@ index 2b68107..c40005d 100644
          out_len += tag.len();
  
          Ok(Token(&out_buf[..out_len]))
-@@ -169,21 +169,9 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
+@@ -169,21 +170,9 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
  
          hmac.update(&token_data[..token_data.len() - HMAC_OUT_SIZE]);
  
@@ -364,7 +398,48 @@ index 2b68107..c40005d 100644
      }
  
      pub fn decrypt<'a, 'b>(
-@@ -249,4 +237,37 @@ mod tests {
+@@ -217,6 +206,40 @@ mod tests {
+     use core::str;
+     use rand_core::OsRng;
+ 
++    #[test]
++    fn slice_keys_require_exact_selected_key_size() {
++        let generated = Fernet::new_rand(OsRng);
++        let mut invalid_key = generated.sign_key.to_vec();
++        invalid_key.push(1);
++        for len in [0, super::AES_KEY_SIZE - 1, super::AES_KEY_SIZE + 1] {
++            assert!(matches!(
++                Fernet::new_from_slices(&invalid_key[..len], &generated.enc_key, OsRng),
++                Err(crate::error::RnsError::InvalidArgument)
++            ));
++            assert!(matches!(
++                Fernet::new_from_slices(&generated.sign_key, &invalid_key[..len], OsRng),
++                Err(crate::error::RnsError::InvalidArgument)
++            ));
++        }
++    }
++
++    #[test]
++    fn slice_keys_preserve_generated_key_material() {
++        let generated = Fernet::new_rand(OsRng);
++        let restored =
++            Fernet::new_from_slices(&generated.sign_key, &generated.enc_key, OsRng).unwrap();
++        let mut ciphertext = [0u8; 128];
++        let token = generated
++            .encrypt("Exact-length key material".into(), &mut ciphertext)
++            .unwrap();
++        let verified = restored.verify(token).unwrap();
++        let mut plaintext = [0u8; 128];
++        assert_eq!(
++            restored.decrypt(verified, &mut plaintext).unwrap().as_slice(),
++            b"Exact-length key material"
++        );
++    }
++
+     #[test]
+     fn encrypt_then_decrypt() {
+         const BUF_SIZE: usize = 4096;
+@@ -249,4 +272,37 @@ mod tests {
          let mut out_buf = [0u8; 12];
          assert!(fernet.encrypt(test_msg.into(), &mut out_buf[..]).is_err());
      }
@@ -415,6 +490,77 @@ index f0a6ede..f77c5c8 100644
      );
  }
  
+diff --git a/src/identity.rs b/src/identity.rs
+index 2f9914c..6b3219a 100644
+--- a/src/identity.rs
++++ b/src/identity.rs
+@@ -178,10 +178,10 @@ impl EncryptIdentity for Identity {
+         }
+ 
+         let token = Fernet::new_from_slices(
+-            &derived_key.as_bytes()[..16],
+-            &derived_key.as_bytes()[16..],
++            &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
++            &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+             rng,
+-        )
++        )?
+         .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
+ 
+         out_offset += token.as_bytes().len();
+@@ -357,7 +357,7 @@ impl EncryptIdentity for PrivateIdentity {
+             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+             rng,
+-        )
++        )?
+         .encrypt(PlainText::from(text), &mut out_buf[out_offset..])?;
+ 
+         out_offset += token.len();
+@@ -382,7 +382,7 @@ impl DecryptIdentity for PrivateIdentity {
+             &derived_key.as_bytes()[..DERIVED_KEY_LENGTH / 2],
+             &derived_key.as_bytes()[DERIVED_KEY_LENGTH / 2..],
+             rng,
+-        );
++        )?;
+ 
+         let token = Token::from(data);
+ 
+@@ -446,7 +446,33 @@ impl DerivedKey {
+ mod tests {
+     use rand_core::OsRng;
+ 
+-    use super::PrivateIdentity;
++    use super::{DecryptIdentity, EncryptIdentity, PrivateIdentity, PUBLIC_KEY_LENGTH};
++
++    #[test]
++    fn public_and_private_encryption_use_selected_key_width() {
++        let identity = PrivateIdentity::new_from_rand(OsRng);
++        let derived_key = identity.identity.derive_key(OsRng, None);
++        let message = b"Identity key width matches selected cipher";
++        let mut ciphertext = [0u8; 256];
++        let mut plaintext = [0u8; 256];
++
++        let packet = identity
++            .identity
++            .encrypt(OsRng, message, &derived_key, &mut ciphertext)
++            .unwrap();
++        let decoded = identity
++            .decrypt(OsRng, &packet[PUBLIC_KEY_LENGTH..], &derived_key, &mut plaintext)
++            .unwrap();
++        assert_eq!(decoded, message);
++
++        let token = identity
++            .encrypt(OsRng, message, &derived_key, &mut ciphertext)
++            .unwrap();
++        let decoded = identity
++            .decrypt(OsRng, token, &derived_key, &mut plaintext)
++            .unwrap();
++        assert_eq!(decoded, message);
++    }
+ 
+     #[test]
+     fn private_identity_hex_string() {
 diff --git a/src/transport.rs b/src/transport.rs
 index aee7bb1..6e8177c 100644
 --- a/src/transport.rs
