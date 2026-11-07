@@ -131,7 +131,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         // Generate random IV
         let iv = AesCbcEnc::generate_iv(self.rng);
-        out_buf[..iv.len()].copy_from_slice(iv.as_slice());
+        out_buf[..iv.len()].copy_from_slice(&iv);
 
         out_len += iv.len();
 
@@ -149,7 +149,7 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         let tag = hmac.finalize().into_bytes();
 
-        out_buf[out_len..out_len + tag.len()].copy_from_slice(tag.as_slice());
+        out_buf[out_len..out_len + tag.len()].copy_from_slice(&tag);
         out_len += tag.len();
 
         Ok(Token(&out_buf[..out_len]))
@@ -169,21 +169,9 @@ impl<R: CryptoRngCore + Copy> Fernet<R> {
 
         hmac.update(&token_data[..token_data.len() - HMAC_OUT_SIZE]);
 
-        let actual_tag = hmac.finalize().into_bytes();
-
-        let valid = expected_tag
-            .iter()
-            .zip(actual_tag.as_slice())
-            .map(|(x, y)| x.cmp(y))
-            .find(|&ord| ord != cmp::Ordering::Equal)
-            .unwrap_or(actual_tag.len().cmp(&expected_tag.len()))
-            == cmp::Ordering::Equal;
-
-        if valid {
-            Ok(VerifiedToken(token_data))
-        } else {
-            Err(RnsError::IncorrectSignature)
-        }
+        hmac.verify_slice(expected_tag)
+            .map_err(|_| RnsError::IncorrectSignature)?;
+        Ok(VerifiedToken(token_data))
     }
 
     pub fn decrypt<'a, 'b>(
@@ -248,5 +236,38 @@ mod tests {
 
         let mut out_buf = [0u8; 12];
         assert!(fernet.encrypt(test_msg.into(), &mut out_buf[..]).is_err());
+    }
+
+    #[test]
+    fn altered_tag_iv_and_ciphertext_are_rejected() {
+        let fernet = Fernet::new_rand(OsRng);
+        let mut buffer = [0u8; 256];
+        let token = fernet
+            .encrypt("Authenticated mesh payload".into(), &mut buffer)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let tag_start = token.len() - super::HMAC_OUT_SIZE;
+        for index in [
+            tag_start,
+            tag_start + super::HMAC_OUT_SIZE / 2,
+            token.len() - 1,
+            0,
+            super::IV_KEY_SIZE,
+            tag_start - 1,
+        ] {
+            let mut altered = token.clone();
+            altered[index] ^= 1;
+            assert!(matches!(
+                fernet.verify(altered.as_slice().into()),
+                Err(crate::error::RnsError::IncorrectSignature)
+            ));
+        }
+        let verified = fernet.verify(token.as_slice().into()).unwrap();
+        let mut plaintext = [0u8; 256];
+        assert_eq!(
+            fernet.decrypt(verified, &mut plaintext).unwrap().as_slice(),
+            b"Authenticated mesh payload"
+        );
     }
 }

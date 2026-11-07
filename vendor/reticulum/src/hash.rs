@@ -14,7 +14,7 @@ pub const ADDRESS_HASH_SIZE: usize = 16;
 
 pub fn create_hash(data: &[u8], out: &mut [u8]) {
     out.copy_from_slice(
-        &Sha256::new().chain_update(data).finalize().as_slice()[..cmp::min(out.len(), HASH_SIZE)],
+        &Sha256::new().chain_update(data).finalize()[..cmp::min(out.len(), HASH_SIZE)],
     );
 }
 

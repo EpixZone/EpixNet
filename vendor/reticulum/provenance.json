@@ -1,7 +1,7 @@
 {
   "repository": "https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs",
   "revision": "dc4e03bb08a2069d03ba038bcc63eb9358201dd5",
-  "patch_sha256": "4dea086818f03ac9fecd9d67819e87db5588a2826cacb26a48ee0ec4be32c78b",
+  "patch_sha256": "74b8c7785b31ea964cb0d6d28918a71f826a633b50ee2368b90ad3a7ecf49ec0",
   "files": {
     "LICENSE": {
       "upstream_sha256": "3815a3099d9af387e0e0fa90de91e48b446d6da927596b9ffa86fbb87ba1018c",
@@ -29,7 +29,7 @@
     },
     "src/crypt/fernet.rs": {
       "upstream_sha256": "cd637176359e54c129049a0b101413e613b159d0a1e39ca4e80245265854ab44",
-      "vendored_sha256": "cd637176359e54c129049a0b101413e613b159d0a1e39ca4e80245265854ab44"
+      "vendored_sha256": "70d353790e24bc13166481a96170995726d177194fb58a61b22e7756ea0ab214"
     },
     "src/crypt.rs": {
       "upstream_sha256": "abf3c4d79d0d519eb494614f44a4e29ab7b3a1b131b0de38a2f982d31d082ed4",
@@ -53,7 +53,7 @@
     },
     "src/hash.rs": {
       "upstream_sha256": "91e8d726b25b87f065b6053cf601d69fe6369bf0a7183a222ddc5f45ae41348c",
-      "vendored_sha256": "91e8d726b25b87f065b6053cf601d69fe6369bf0a7183a222ddc5f45ae41348c"
+      "vendored_sha256": "03db490ca811826a479b15df83f2a7d9b49d6dc7f9e704a23232fea6477b697f"
     },
     "src/identity.rs": {
       "upstream_sha256": "7ff6ac56bb58d4484714902fffa27175de9007770832e2d3b729cdd6c504a18e",

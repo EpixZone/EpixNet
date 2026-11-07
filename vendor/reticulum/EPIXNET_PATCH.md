@@ -11,7 +11,7 @@ manifest omits the daemon workspace and unused example targets. Only the
 library, build script, required protobuf files, README, and license are copied.
 The application root lockfile resolves the same dependencies.
 
-The production changes are limited to `src/transport.rs` and `src/channel.rs`:
+The transport changes are limited to `src/transport.rs` and `src/channel.rs`:
 
 - Route initial and retried link requests through the learned transport hop.
   Preserve direct one-hop requests and the existing no-path behavior.
@@ -26,7 +26,14 @@ The production changes are limited to `src/transport.rs` and `src/channel.rs`:
   closed event streams, or exhausted retries instead of skipping stream bytes.
 - Expose closure state and allow callers to discard consumed receipt history.
 
-No cryptographic primitive, signature verification, or key format is changed.
+Deprecated `GenericArray::as_slice()` calls in `src/crypt/fernet.rs`
+and `src/hash.rs` use equivalent slice borrows or iteration. This keeps the
+vendored path build compatible with warnings-as-errors without suppressing lints.
+The upstream Fernet token HMAC comparison now uses `Mac::verify_slice` for
+constant-time verification instead of an early-exit byte comparison. Tests reject
+first, middle, and last tag-bit changes, IV changes, and ciphertext changes while
+preserving valid decryption. Wire formats, cryptographic primitives, key formats,
+and xite/announcement signature checks remain unchanged.
 The application announces a separate signed `epix.node.v2` destination for
 Channel streams. Existing `epix.node` destinations retain the legacy raw
 protocol; a client upgrades only after receiving a valid v2 announcement with
