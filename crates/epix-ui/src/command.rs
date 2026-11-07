@@ -3559,6 +3559,7 @@ impl WsCommand for PermissionRemove {
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .ok_or("permissionRemove: permission required")?;
         s.state.remove_permission(&address, permission).await;
+        s.state.push_xite_info(&address).await;
         Ok(Value::from("ok"))
     }
 }
