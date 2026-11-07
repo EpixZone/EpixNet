@@ -33436,6 +33436,10 @@ impl AppState {
             return Err("This endpoint belongs to this node".into());
         }
         self.add_peers(&canonical, [peer]).await;
+        // Explicit operator choices must survive a process stop even when no
+        // trackers are configured and the periodic announce pass never runs.
+        // persist_peers keeps the existing PeerDb opt-out in force.
+        self.persist_peers().await;
         Ok(())
     }
 

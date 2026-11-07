@@ -1,6 +1,84 @@
-use super::*;
+use super::{AppState, CommandRegistry, PeerAdd, WsCommand, WsSession, WRAPPER_ID_BASE};
 use crate::state::XiteEntry;
 use epix_xite::XiteStorage;
+use serde_json::{json, Value};
+use std::path::Path;
+use std::sync::Arc;
+
+async fn persistent_peer_fixture(root: &Path) -> Arc<AppState> {
+    let state = AppState::with_data_dir("peer-bootstrap-test", root);
+    for address in ["selected", "other"] {
+        state
+            .add_xite(
+                address,
+                XiteEntry {
+                    storage: XiteStorage::new(root.join("data").join(address)),
+                    content: None,
+                },
+            )
+            .await;
+    }
+    state
+}
+
+#[tokio::test]
+async fn peer_endpoint_survives_immediate_restart_without_trackers_or_shutdown() {
+    for (args, endpoint) in [
+        (
+            json!({"peer":"rns:0123456789abcdef0123456789abcdef"}),
+            "rns:0123456789abcdef0123456789abcdef",
+        ),
+        (json!(["127.0.0.1", 42424]), "127.0.0.1:42424"),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let peers_path = dir.path().join("private/peers.json");
+        {
+            let state = persistent_peer_fixture(dir.path()).await;
+            state.config_set("trackers", json!([])).await;
+            let session = WsSession::new_wrapper(state.clone(), Some("selected".into()));
+            let commands = CommandRegistry::with_defaults();
+            assert!(!peers_path.exists());
+            assert_eq!(
+                commands
+                    .dispatch(&session, "peerAdd", &args, WRAPPER_ID_BASE)
+                    .await
+                    .unwrap(),
+                "updated"
+            );
+            let saved: Value =
+                serde_json::from_slice(&tokio::fs::read(&peers_path).await.unwrap()).unwrap();
+            assert_eq!(saved["selected"][0]["addr"], endpoint);
+            assert!(saved.get("other").is_none());
+            // No runtime, manual flush, or orderly shutdown occurs here.
+        }
+        let restored = persistent_peer_fixture(dir.path()).await;
+        assert_eq!(restored.peer_counts("selected").await.total, 1);
+        assert_eq!(restored.peer_counts("other").await.total, 0);
+    }
+}
+
+#[tokio::test]
+async fn peer_endpoint_preserves_peer_database_opt_out() {
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let state = persistent_peer_fixture(dir.path()).await;
+        state.set_plugin_enabled("PeerDb", false).await;
+        let session = WsSession::new_wrapper(state.clone(), Some("selected".into()));
+        CommandRegistry::with_defaults()
+            .dispatch(
+                &session,
+                "peerAdd",
+                &json!({"peer":"rns:0123456789abcdef0123456789abcdef"}),
+                WRAPPER_ID_BASE,
+            )
+            .await
+            .unwrap();
+        assert_eq!(state.peer_counts("selected").await.total, 1);
+        assert!(!dir.path().join("private/peers.json").exists());
+    }
+    let restored = persistent_peer_fixture(dir.path()).await;
+    assert_eq!(restored.peer_counts("selected").await.total, 0);
+}
 
 #[tokio::test]
 async fn peer_endpoint_requires_operator_permission_and_preserves_network_policy() {
