@@ -8596,6 +8596,7 @@ impl AppState {
                 Some(r) => addr.to_string() == format!("rns:{}", r.to_lowercase()),
                 None => false,
             },
+            PeerAddr::Session { .. } => false,
         }
     }
 
@@ -8613,6 +8614,10 @@ impl AppState {
         if generation.is_none() || self.xite_membership_generation(address).await != generation {
             return false;
         }
+        if peer.is_session() && self.xites.read().await.get(address)
+            .is_none_or(|xite| xite.peers.get(&peer).is_none()) {
+            return false;
+        }
         self.add_peers(address, [peer]).await;
         self.push_clone_event(address, json!(["peers_added", count]), json!({"peers":count}));
         true
@@ -8626,7 +8631,7 @@ impl AppState {
     pub async fn add_peers(&self, address: &str, addrs: impl IntoIterator<Item = PeerAddr>) {
         let mut filtered = Vec::new();
         for a in addrs {
-            if a.is_wellformed() && !self.is_own_peer(&a).await {
+            if !a.is_session() && a.is_wellformed() && !self.is_own_peer(&a).await {
                 filtered.push(a);
             }
         }
@@ -8649,6 +8654,54 @@ impl AppState {
             self.request_xite_update(address).await;
             self.push_xite_info(address).await;
         }
+    }
+
+    /// An accepted channel has ended. Never retain its handle as a peer that
+    /// could be dialed later, or remove another connection from the same node.
+    pub async fn remove_session_peer(&self, peer: &PeerAddr) {
+        if !peer.is_session() {
+            return;
+        }
+        let changed = {
+            let mut xites = self.xites.write().await;
+            let mut changed = Vec::new();
+            for (address, xite) in xites.iter_mut() {
+                if xite.peers.retain(|entry| &entry.addr != peer) > 0 {
+                    xite.settings.peers = xite.peers.len() as i64;
+                    changed.push(address.clone());
+                }
+            }
+            changed
+        };
+        for address in changed {
+            self.push_xite_info(&address).await;
+        }
+    }
+
+    /// Admit a live authenticated channel only to an existing registration.
+    /// The connection owner serializes this with its disconnect cleanup.
+    pub async fn record_session_peer(&self, address: &str, generation: u64, peer: PeerAddr) -> bool {
+        if !peer.is_session() || !peer.is_wellformed() {
+            return false;
+        }
+        let _activation = self.xite_activation_gate.clone().read_owned().await;
+        let grew = {
+            let mut xites = self.xites.write().await;
+            let Some(xite) = xites.get_mut(address) else { return false };
+            if xite.membership_generation != generation || !xite.settings.serving {
+                return false;
+            }
+            let before = xite.peers.len();
+            xite.peers.add(peer, now_secs());
+            xite.settings.peers = xite.peers.len() as i64;
+            xite.peers.len() > before
+        };
+        if grew {
+            self.wake_clone_retry(address);
+            self.request_xite_update(address).await;
+            self.push_xite_info(address).await;
+        }
+        true
     }
 
     /// Connectable public peers for a PEX reply: up to `need`, excluding any in
@@ -9004,7 +9057,7 @@ impl AppState {
             .map(|(k, _)| k.clone());
         let Some(key) = key else { return false };
         let x = xites.get_mut(&key).unwrap();
-        if registerable {
+        if registerable && (!peer.is_session() || x.peers.get(peer).is_some()) {
             x.peers.add(peer.clone(), now_secs());
             x.settings.peers = x.peers.len() as i64;
             x.peer_hashfields
@@ -9344,7 +9397,8 @@ impl AppState {
                 continue;
             }
             let now = now_secs();
-            let list: Vec<Value> = x.peers.peers().map(|p| Self::persisted_peer(p, now)).collect();
+            let list: Vec<Value> = x.peers.peers().filter(|p| !p.addr.is_session())
+                .map(|p| Self::persisted_peer(p, now)).collect();
             map.insert(canonical, Value::Array(list));
         }
         if let Ok(bytes) = serde_json::to_vec_pretty(&map) {
@@ -14034,7 +14088,9 @@ impl AppState {
             let now = now_secs();
             if let Some(x) = self.xites.write().await.get_mut(address) {
                 for (p, _) in &results {
-                    x.peers.add(p.clone(), now);
+                    if !p.is_session() {
+                        x.peers.add(p.clone(), now);
+                    }
                 }
             }
         }
@@ -14066,7 +14122,9 @@ impl AppState {
         let now = now_secs();
         if let Some(x) = self.xites.write().await.get_mut(address) {
             for addr in served {
-                x.peers.add(addr.clone(), now);
+                if !addr.is_session() {
+                    x.peers.add(addr.clone(), now);
+                }
                 if let Some(p) = x.peers.get_mut(&addr) {
                     p.note_data_served(now);
                 }
@@ -17674,6 +17732,7 @@ impl AppState {
                 PeerAddr::I2p { .. } => "i2p",
                 PeerAddr::Rns(_) => "mesh",
                 PeerAddr::Ip(_) => "ip",
+                PeerAddr::Session { .. } => "session",
             };
             let dir = match d.direction {
                 epix_protocol::registry::Direction::In => "in",

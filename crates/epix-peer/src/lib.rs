@@ -45,6 +45,14 @@ impl DialableNets {
             PeerAddr::Onion { .. } => self.onion,
             PeerAddr::I2p { .. } => self.i2p,
             PeerAddr::Rns(_) => self.rns,
+            PeerAddr::Session { network, .. } => match network {
+                epix_core::IpType::Ipv4 | epix_core::IpType::Ipv6 => {
+                    self.clearnet && !epix_core::route_all_via_overlay()
+                }
+                epix_core::IpType::Onion => self.onion,
+                epix_core::IpType::I2p => self.i2p,
+                epix_core::IpType::Rns => self.rns,
+            },
         }
     }
 }
@@ -327,6 +335,7 @@ impl Peer {
             PeerAddr::Onion { port, .. } => *port != 0,
             // I2P is addressed by destination, not port - always dialable.
             PeerAddr::I2p { .. } | PeerAddr::Rns(_) => true,
+            PeerAddr::Session { .. } => self.addr.is_wellformed(),
         }
     }
 

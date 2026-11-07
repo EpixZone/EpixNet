@@ -109,6 +109,10 @@ async fn encode_queue_slot() -> Option<tokio::sync::SemaphorePermit<'static>> {
 /// node's registry is behind async locks and disk IO.
 #[async_trait::async_trait]
 pub trait SignedProvider: Send + Sync + 'static {
+    /// A peer requested this xite over its authenticated channel. Implementors
+    /// may make that live channel available to an already-requested local xite.
+    /// This is a transport observation, never permission to register a xite.
+    async fn note_interest(&self, _xite: &str, _source: UpdateSource) {}
     /// Raw signed content.json bytes (root or per-user path).
     async fn get_signed(&self, xite: &str, inner_path: &str) -> Option<Vec<u8>>;
     /// Signed files changed since `since`: (inner_path, modified, size).
@@ -215,9 +219,10 @@ pub struct PeerIdentity {
     pub version: String,
 }
 
-/// Authenticated origin of a pushed update.
+/// Authenticated origin of a peer request.
 ///
-/// The connection is the live session that carried `Req::Update`. Providers
+/// The connection is the live session that carried an Update or xite-interest
+/// request. Providers
 /// should prefer it over opening a reverse connection to a self-declared
 /// address. `identity` and `reach` come from the same completed Hello exchange
 /// and let callers label, tune, and account for a same-session pull without
@@ -356,7 +361,7 @@ pub async fn client_hello(
             .map_err(std::io::Error::other)?,
         binding_sig: binding_sig(&ctx.privatekey, handshake_hash.as_ref(), noise::Role::Initiator)?,
         caps: ctx.caps,
-        listen,
+        listen: listen.into_iter().filter(|peer| !peer.is_session()).collect(),
         version: ctx.version.clone(),
     };
     match conn.request(Req::Hello(hello)).await? {
@@ -694,6 +699,11 @@ async fn handle(
     inc: Incoming,
 ) {
     let stream = inc.stream;
+    if let Req::GetSigned { xite, .. } | Req::Pex { xite, .. } = &inc.req {
+        ctx.provider.note_interest(xite, UpdateSource {
+            conn: conn.clone(), identity: (*identity).clone(), reach,
+        }).await;
+    }
     match inc.req {
         Req::Hello(_) => {
             let _ = conn
@@ -1527,6 +1537,10 @@ impl std::io::Write for FrameSink {
 
 #[cfg(test)]
 mod tests {
+    mod interest {
+        include!("server_interest_tests.rs");
+    }
+
     use super::*;
     use crate::choke::{Choker, Reach, FIRST_PAINT_FREE_BYTES};
     use crate::frame;

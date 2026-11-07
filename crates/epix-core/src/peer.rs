@@ -4,9 +4,13 @@ use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 
+#[cfg(test)]
+#[path = "peer_session_tests.rs"]
+mod session_tests;
+
 /// The peer-address category, matching EpixNet's `helper.getIpType` and the
 /// PEX buckets (`ipv4`/`ipv6`/`onion`/`i2p`). Reticulum peers are `rns`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum IpType {
     Ipv4,
     Ipv6,
@@ -66,6 +70,10 @@ pub enum PeerAddr {
     I2p { dest: String, port: u16 },
     /// Reticulum 16-byte destination hash.
     Rns([u8; 16]),
+    /// A process-local handle to an authenticated, accepted EDX connection.
+    /// It is never an address another node can dial or advertise.
+    #[serde(skip)]
+    Session { id: [u8; 32], network: IpType },
 }
 
 impl PeerAddr {
@@ -75,6 +83,12 @@ impl PeerAddr {
             PeerAddr::Onion { .. } => "onion",
             PeerAddr::I2p { .. } => "i2p",
             PeerAddr::Rns(_) => "rns",
+            PeerAddr::Session { network, .. } => match network {
+                IpType::Ipv4 | IpType::Ipv6 => "tcp",
+                IpType::Onion => "onion",
+                IpType::I2p => "i2p",
+                IpType::Rns => "rns",
+            },
         }
     }
 
@@ -88,7 +102,12 @@ impl PeerAddr {
         matches!(
             self,
             PeerAddr::Onion { .. } | PeerAddr::I2p { .. } | PeerAddr::Rns(_)
+                | PeerAddr::Session { network: IpType::Onion | IpType::I2p | IpType::Rns, .. }
         )
+    }
+
+    pub fn is_session(&self) -> bool {
+        matches!(self, PeerAddr::Session { .. })
     }
 
     /// Whether this address is a complete, dialable shape - not one of the
@@ -108,6 +127,7 @@ impl PeerAddr {
             PeerAddr::Onion { host, port } => !host.is_empty() && *port != 0,
             PeerAddr::I2p { dest, .. } => !dest.is_empty(),
             PeerAddr::Rns(hash) => *hash != [0u8; 16],
+            PeerAddr::Session { id, .. } => *id != [0; 32],
         }
     }
 
@@ -197,6 +217,7 @@ impl PeerAddr {
             PeerAddr::Onion { .. } => IpType::Onion,
             PeerAddr::I2p { .. } => IpType::I2p,
             PeerAddr::Rns(_) => IpType::Rns,
+            PeerAddr::Session { network, .. } => *network,
         }
     }
 
@@ -223,6 +244,7 @@ impl PeerAddr {
                         || (ip.segments()[0] & 0xffc0) == 0xfe80
                 }
             },
+            PeerAddr::Session { .. } => true,
             _ => false,
         }
     }
@@ -264,6 +286,7 @@ impl PeerAddr {
                 Some(out)
             }
             PeerAddr::Rns(hash) => Some(hash.to_vec()),
+            PeerAddr::Session { .. } => None,
         }
     }
 
@@ -331,6 +354,7 @@ impl std::fmt::Display for PeerAddr {
             PeerAddr::Onion { host, port } => write!(f, "{host}.onion:{port}"),
             PeerAddr::I2p { dest, port } => write!(f, "{dest}.i2p:{port}"),
             PeerAddr::Rns(h) => write!(f, "rns:{}", hex::encode(h)),
+            PeerAddr::Session { id, .. } => write!(f, "session:{}", hex::encode(id)),
         }
     }
 }
