@@ -5,6 +5,7 @@ mod xite_export;
 mod merger_index;
 pub(crate) mod addon_install;
 pub(crate) mod avatar_cache;
+pub(crate) mod local_profile;
 
 use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
 use epix_db::{Database, DbSchema};
@@ -3686,10 +3687,23 @@ impl Default for CloneStatus {
     }
 }
 
+impl ManagedXite {
+    fn permission_scope(&self, address: &str, permission: &str) -> Option<String> {
+        if permission == "LOCAL_PROFILE" {
+            self.local_profile_address.clone()
+        } else {
+            Some(canonical_address(self.content.as_ref(), address))
+        }
+    }
+}
+
 /// A served xite with its derived runtime state.
 struct ManagedXite {
     storage: XiteStorage,
     content: Option<Value>,
+    /// Captured from the registered address, or a verified alias registration.
+    /// Editable root drafts never change the native local-profile key scope.
+    local_profile_address: Option<String>,
     /// Stable only for this served membership. Removing and re-adding the
     /// same address creates a new value, invalidating capabilities such as a
     /// pending bigfile upload nonce.
@@ -4121,6 +4135,7 @@ pub type EvxGrantSummarySource = Box<dyn Fn(&str) -> Option<Value> + Send + Sync
 
 pub struct AppState {
     avatar_cache: avatar_cache::AvatarCache,
+    local_profile_lock: Arc<tokio::sync::Mutex<()>>,
     addon_profiles: std::sync::Mutex<crate::addons::Profiles>,
     /// Weak self-reference used only to detach cancellation-safe completion
     /// tasks. The weak edge cannot keep the state alive by itself.
@@ -5646,6 +5661,7 @@ impl AppState {
             .map(|directory| crate::deletion_reserve::DeletionReserve::new(directory.to_path_buf()));
         let state = Arc::new(Self {
             avatar_cache: avatar_cache::AvatarCache::default(),
+            local_profile_lock: Arc::new(tokio::sync::Mutex::new(())),
             addon_profiles: std::sync::Mutex::new(crate::addons::Profiles::default()),
             self_weak: std::sync::OnceLock::new(),
             version: version.into(),
@@ -7197,6 +7213,21 @@ impl AppState {
         } else {
             None
         };
+        let local_profile_address = if epix_crypt::is_valid_address(&address) {
+            Some(address.clone())
+        } else if verified_index.is_some() && epix_crypt::is_valid_address(&canonical) {
+            Some(canonical.clone())
+        } else {
+            None
+        };
+        settings.permissions.retain(|permission| permission != "LOCAL_PROFILE");
+        if let Some(scope) = &local_profile_address {
+            if self.grants.read().await.get(scope)
+                .is_some_and(|grants| grants.iter().any(|grant| grant == "LOCAL_PROFILE"))
+            {
+                settings.permissions.push("LOCAL_PROFILE".into());
+            }
+        }
         let accepted_db_snapshot = match verified_index.as_ref() {
             Some(index) => Self::db_snapshot_from_authority(
                 &canonical,
@@ -7276,6 +7307,7 @@ impl AppState {
             ManagedXite {
                 storage: entry.storage,
                 content: entry.content,
+                local_profile_address,
                 membership_generation: self.next_db_generation(),
                 settings,
                 display: None,
@@ -17187,13 +17219,13 @@ impl AppState {
         let _metadata = self.metadata_persistence_lock.lock().await;
         let mut xites = self.xites.write().await;
         let Some(target) = self.resolve_xite(&xites, address) else { return };
-        let canonical = canonical_address(target.content.as_ref(), address);
+        let Some(canonical) = target.permission_scope(address, permission) else { return };
         if permission.starts_with("Merger:") {
             self.bump_db_source_epoch(&canonical);
         }
         // Apply to every served alias that shares this canonical address.
         for (key, x) in xites.iter_mut() {
-            if canonical_address(x.content.as_ref(), key) == canonical
+            if x.permission_scope(key, permission).as_ref() == Some(&canonical)
                 && !x.settings.permissions.iter().any(|p| p == permission)
             {
                 x.settings.permissions.push(permission.to_string());
@@ -17216,16 +17248,22 @@ impl AppState {
     /// Revoke a permission from a xite (and every alias of the same xite).
     /// Persisted.
     pub async fn remove_permission(&self, address: &str, permission: &str) {
+        // A revoked grant cannot race an accepted native profile transaction.
+        let _profiles = if permission == "LOCAL_PROFILE" {
+            Some(self.local_profile_lock.lock().await)
+        } else {
+            None
+        };
         let _metadata = self.metadata_persistence_lock.lock().await;
         let mut xites = self.xites.write().await;
         let Some(target) = self.resolve_xite(&xites, address) else { return };
-        let canonical = canonical_address(target.content.as_ref(), address);
+        let Some(canonical) = target.permission_scope(address, permission) else { return };
         let merger_permission = permission.starts_with("Merger:");
         if merger_permission {
             self.bump_db_source_epoch(&canonical);
         }
         for (key, x) in xites.iter_mut() {
-            if canonical_address(x.content.as_ref(), key) == canonical {
+            if x.permission_scope(key, permission).as_ref() == Some(&canonical) {
                 x.settings.permissions.retain(|p| p != permission);
                 if merger_permission
                     && x.db_schema.as_ref().is_some_and(|schema| schema.version == 3)
@@ -18050,7 +18088,11 @@ impl AppState {
     /// seed ever leaving the node. Recomputable across restarts / restore-from-seed.
     pub async fn derive_consumer_seed(&self, domain: &str, key: &str) -> [u8; 32] {
         let seed = self.master_seed().await;
-        let mut material = hex::decode(&seed).unwrap_or_else(|_| seed.into_bytes());
+        Self::consumer_seed(&seed, domain, key)
+    }
+
+    fn consumer_seed(seed: &str, domain: &str, key: &str) -> [u8; 32] {
+        let mut material = hex::decode(seed).unwrap_or_else(|_| seed.as_bytes().to_vec());
         material.extend_from_slice(domain.as_bytes());
         material.push(0);
         material.extend_from_slice(key.as_bytes());
@@ -33889,6 +33931,8 @@ impl AppState {
     /// Switch the active identity to a known master_address (`userSet`).
     #[cfg(feature = "multiuser")]
     pub async fn multiuser_select(&self, master_address: &str) -> Result<(), String> {
+        // Accepted local-profile operations finish with their original identity.
+        let _profiles = self.local_profile_lock.lock().await;
         // Persist the currently-active identity into the store first.
         self.multiuser_sync_active().await;
         let target = self
