@@ -87,6 +87,9 @@ impl IncomingSession {
         let Some(fetcher) = self.fetcher.upgrade() else {
             return;
         };
+        if self.conn.is_closed() {
+            return;
+        }
         binding
             .identity
             .get_or_insert_with(|| source.identity.node_pk.clone());

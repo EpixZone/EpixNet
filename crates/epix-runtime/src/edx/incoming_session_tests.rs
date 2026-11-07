@@ -256,3 +256,42 @@ async fn repeated_interest_preserves_activity_and_only_restores_a_live_channel()
     assert!(f.fetcher.link(&session.peer).await.is_err());
     other.shutdown();
 }
+
+#[tokio::test]
+async fn a_closed_socket_cannot_register_an_interest() {
+    let f = Fixture::new().await;
+    f.register().await;
+    let (session, source, other) = f.channel();
+    other.shutdown();
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while !source.conn.is_closed() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    session.note_interest(&f.address, source).await;
+    assert_eq!(f.state.peer_counts(&f.address).await.total, 0);
+    assert!(f.fetcher.link(&session.peer).await.is_err());
+    assert_eq!(f.dials.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn dropping_the_connection_owner_removes_its_transient_memberships() {
+    let f = Fixture::new().await;
+    f.register().await;
+    let (session, source, other) = f.channel();
+    session.note_interest(&f.address, source).await;
+    let peer = session.peer.clone();
+    drop(session);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        while f.state.peer_counts(&f.address).await.total != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(f.fetcher.link(&peer).await.is_err());
+    assert_eq!(f.dials.load(Ordering::SeqCst), 0);
+    other.shutdown();
+}
