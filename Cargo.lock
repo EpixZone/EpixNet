@@ -3170,6 +3170,7 @@ dependencies = [
  "epix-transport",
  "rand_core 0.6.4",
  "reticulum",
+ "tempfile",
  "tokio",
 ]
 
