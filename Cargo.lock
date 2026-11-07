@@ -3034,6 +3034,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "epix-mirror"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "epix-crypt",
+ "epix-fs",
+ "flate2",
+ "hex",
+ "liblzma",
+ "percent-encoding",
+ "reqwest",
+ "roxmltree",
+ "rustix",
+ "serde",
+ "serde_json",
+ "sha2 0.11.1",
+ "socket2 0.6.5",
+ "tar",
+ "tempfile",
+ "windows-sys 0.61.2",
+ "zip",
+]
+
+[[package]]
 name = "epix-nmh"
 version = "0.1.0"
 dependencies = [
@@ -3215,6 +3240,7 @@ dependencies = [
  "epix-ui",
  "epix-xite",
  "hex",
+ "if-addrs",
  "igd-next 0.18.0",
  "postcard",
  "reqwest",
@@ -4833,6 +4859,16 @@ checksum = "cb68373c0d6620ef8105e855e7745e18b0d00d3bdb07fb532e434244cdb9a714"
 dependencies = [
  "icu_normalizer",
  "icu_properties",
+]
+
+[[package]]
+name = "if-addrs"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0a05c691e1fae256cf7013d99dad472dc52d5543322761f83ec8d47eab40d2b"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -7378,6 +7414,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a4e1d4b9b938a26d2996af33229f0ca0956c652c1375067f0b45291c1df8417"
 dependencies = [
  "rmp",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9da7f59328b09405b181fee1018925fad50f157afb43c0c0f5c522c256dd5907"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

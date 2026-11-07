@@ -215,6 +215,11 @@ impl Conn {
         self.shared.closed.load(Ordering::Relaxed)
     }
 
+    /// Whether two handles belong to the exact same underlying connection.
+    pub fn same_connection(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
     /// Tear the connection down NOW, from any context (sync, callable off
     /// blocking serve threads). For a peer that stopped draining its lane:
     /// an error frame cannot be sent to it — the wedged lane is exactly

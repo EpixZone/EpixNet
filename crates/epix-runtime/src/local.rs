@@ -29,6 +29,9 @@
 //! whether this loop exists at all, and the `AnnounceLocal` plugin toggle is
 //! the live pause - it stops both our broadcasts and our replies.
 
+#[path = "local_broadcast.rs"]
+mod broadcast;
+
 use epix_core::PeerAddr;
 use epix_discovery::address_hash;
 use epix_ui::AppState;
@@ -142,7 +145,10 @@ pub async fn local_discovery_loop(
         }
     });
 
-    broadcast_discover(&socket, &id).await;
+    let mut broadcast_warned = false;
+    if state.plugin_enabled("AnnounceLocal").await {
+        broadcast_discover(&state, &socket, &id, &mut broadcast_warned).await;
+    }
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
@@ -152,7 +158,7 @@ pub async fn local_discovery_loop(
             _ = tick.tick() => {
                 // The AnnounceLocal plugin toggle pauses LAN broadcasts.
                 if state.plugin_enabled("AnnounceLocal").await {
-                    broadcast_discover(&socket, &id).await;
+                    broadcast_discover(&state, &socket, &id, &mut broadcast_warned).await;
                 }
             }
         }
@@ -203,10 +209,32 @@ async fn our_xites_changed(state: &AppState) -> i64 {
     (h.finish() & 0x7fff_ffff) as i64
 }
 
-async fn broadcast_discover(sock: &UdpSocket, id: &Identity) {
+async fn broadcast_discover(state: &AppState, sock: &UdpSocket, id: &Identity, warned: &mut bool) {
+    let outcome = send_discovery(sock, id).await;
+    match outcome {
+        Ok(()) => *warned = false,
+        Err(error) if !*warned => {
+            state.log("WARN", format!("LAN discovery: {error}; will retry on the next tick")).await;
+            *warned = true;
+        }
+        Err(_) => {}
+    }
+}
+
+async fn send_discovery(sock: &UdpSocket, id: &Identity) -> Result<(), String> {
+    let targets = broadcast::destinations().map_err(|error| format!("interface enumeration failed: {error}"))?;
+    if targets.is_empty() {
+        return Err("no active IPv4 broadcast interface".into());
+    }
     let msg = encode_msg(Cmd::DiscoverRequest, Params::default(), id);
-    let dest = SocketAddr::new(Ipv4Addr::BROADCAST.into(), BROADCAST_PORT);
-    let _ = sock.send_to(&msg, dest).await;
+    let mut failed = None;
+    for address in targets {
+        let destination = SocketAddr::new(address.into(), BROADCAST_PORT);
+        if let Err(error) = sock.send_to(&msg, destination).await {
+            failed = Some(format!("broadcast to {address} failed: {error}"));
+        }
+    }
+    failed.map_or(Ok(()), Err)
 }
 
 async fn handle_message(

@@ -136,6 +136,11 @@ downloading or signing the xite before retrying. Exports run one at a time and
 use temporary disk space, with limits of 8 GiB per file and 16 GiB of file data
 per archive.
 
+To carry package repositories over signed xites, use the
+[package mirror workflow](docs/package-mirrors.md). It exports complete verified
+snapshots for APT, DNF, Homebrew artifacts, and Chocolatey folder sources while
+preserving upstream signature and checksum checks.
+
 Owner-key recovery uses the master seed in `private/users.json` and the
 `address_index` in the xite's signed `content.json`. Another installation with
 the same seed can recover the key even if its `users.json` copy predates the
