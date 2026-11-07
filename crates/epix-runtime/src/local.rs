@@ -142,7 +142,9 @@ pub async fn local_discovery_loop(
         }
     });
 
-    broadcast_discover(&socket, &id).await;
+    if state.plugin_enabled("AnnounceLocal").await {
+        broadcast_discover(&socket, &id).await;
+    }
     let mut tick = tokio::time::interval(period);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     tick.tick().await;
