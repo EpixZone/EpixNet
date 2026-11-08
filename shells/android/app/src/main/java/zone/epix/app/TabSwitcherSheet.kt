@@ -142,9 +142,13 @@ internal class TabSwitcherSheet(
         val innerWidth = (width - root.paddingLeft - root.paddingRight).coerceAtLeast(1)
         val chrome = measureHeight(header, innerWidth) + measureHeight(footer, innerWidth) +
             root.paddingTop + root.paddingBottom
-        val firstRow = if (entries.isEmpty()) dp(80) else measureHeight(adapter.getView(0, null, list), innerWidth)
+        // Large text can make the current row taller than its neighbours.
+        // Fit that complete row when the available display height allows it.
+        val currentPosition = entries.indexOfFirst { it.current }.coerceAtLeast(0)
+        val minimumRow = if (entries.isEmpty()) dp(80) else
+            measureHeight(adapter.getView(currentPosition, null, list), innerWidth)
         val limit = (availableHeight * 0.86f).toInt()
-            .coerceAtLeast(chrome + firstRow)
+            .coerceAtLeast(chrome + minimumRow)
             .coerceAtMost((availableHeight - margin * 2).coerceAtLeast(1))
         val rows = if (entries.isEmpty()) dp(80) else (0 until minOf(entries.size, 6)).sumOf {
             measureHeight(adapter.getView(it, null, list), innerWidth) + if (it > 0) list.dividerHeight else 0
