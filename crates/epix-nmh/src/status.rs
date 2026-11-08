@@ -4,7 +4,7 @@ use serde_json::{json, Value};
 pub(super) async fn handle(settings: &Settings, ui_port: u16) -> Value {
     let result = match settings.data_root() {
         Some(root) => match epix_node::read_nmh_auth_token(root) {
-            Ok(token) => query(ui_port, &token).await,
+            Ok(token) => query(settings.ui_endpoint(ui_port), &token).await,
             Err(error) => Err(error),
         },
         None => Err("native-messaging data root is unavailable".into()),
@@ -24,7 +24,7 @@ pub(super) async fn handle(settings: &Settings, ui_port: u16) -> Value {
     }
 }
 
-async fn query(ui_port: u16, token: &str) -> Result<Value, String> {
+async fn query(endpoint: std::net::SocketAddr, token: &str) -> Result<Value, String> {
     let nonce = epix_node::new_nmh_nonce()?;
     let path = epix_node::NMH_STATUS_PATH;
     let mac = epix_node::nmh_request_mac(token, &nonce, path)?;
@@ -37,7 +37,7 @@ async fn query(ui_port: u16, token: &str) -> Result<Value, String> {
         .build()
         .map_err(|error| error.to_string())?;
     let response = client
-        .post(format!("http://127.0.0.1:{ui_port}{path}"))
+        .post(format!("http://{endpoint}{path}"))
         .json(&json!({"nonce": nonce, "mac": mac}))
         .send()
         .await

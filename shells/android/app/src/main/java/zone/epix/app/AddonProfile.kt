@@ -33,6 +33,7 @@ internal class AddonProfile private constructor(val directory: File, val profile
             "  network.proxy.socks_port: $socksPort\n" +
             "  network.proxy.socks_version: 5\n" +
             "  network.proxy.socks_remote_dns: true\n" +
+            "  network.proxy.failover_direct: false\n" +
             "  network.proxy.allow_hijacking_localhost: false\n" +
             "  network.proxy.no_proxies_on: 'localhost, 127.0.0.1, .epix.zone'\n"
         return File(directory, "epix-browser-runtime.yaml").also {

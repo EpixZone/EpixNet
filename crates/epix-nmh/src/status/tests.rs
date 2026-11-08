@@ -83,10 +83,33 @@ fn unavailable_or_invalid_endpoints_never_become_routing_metadata() {
 async fn respond(
     make_response: impl FnOnce(&Value) -> String + Send + 'static,
 ) -> (Result<Value, String>, Vec<u8>) {
-    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let port = listener.local_addr().unwrap().port();
+    respond_at("127.0.0.1:0", false, make_response).await
+}
+
+async fn respond_at(
+    address: &str,
+    resolve: bool,
+    make_response: impl FnOnce(&Value) -> String + Send + 'static,
+) -> (Result<Value, String>, Vec<u8>) {
+    let listener = std::net::TcpListener::bind(address).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let endpoint = listener.local_addr().unwrap();
     let task = tokio::task::spawn_blocking(move || {
-        let (mut stream, _) = listener.accept().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let mut stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) => {
+                    assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock);
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "client did not reach the selected listener"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
         let request = crate::tests::read_http_request(&mut stream);
         let index = request
             .windows(4)
@@ -97,7 +120,13 @@ async fn respond(
         stream.write_all(make_response(&parsed).as_bytes()).unwrap();
         request
     });
-    let result = query(port, &"66".repeat(32)).await;
+    let result = if resolve {
+        crate::node_resolve(endpoint, &"66".repeat(32), "talk.epix")
+            .await
+            .map(|address| json!({"address": address}))
+    } else {
+        query(endpoint, &"66".repeat(32)).await
+    };
     (result, task.await.unwrap())
 }
 
@@ -129,6 +158,45 @@ async fn actual_authenticated_response_supplies_its_selected_port() {
     })
     .await;
     assert_eq!(result.unwrap()["tor_socks_port"], 42329);
+}
+
+#[tokio::test]
+async fn authenticated_status_and_resolve_reach_an_ipv6_only_listener() {
+    for resolve in [false, true] {
+        let (result, request) = respond_at("[::1]:0", resolve, move |request| {
+            let nonce = request["nonce"].as_str().unwrap();
+            if resolve {
+                let mac = epix_node::nmh_response_mac(
+                    &"66".repeat(32),
+                    nonce,
+                    "talk.epix",
+                    200,
+                    Some("epix1verified"),
+                    None,
+                )
+                .unwrap();
+                http(json!({"nonce": nonce, "address": "epix1verified", "mac": mac}))
+            } else {
+                http(signed(
+                    &"66".repeat(32),
+                    nonce,
+                    200,
+                    json!({"serving": true, "tor_socks_port": 42330}),
+                ))
+            }
+        })
+        .await;
+        let result = result.unwrap();
+        if resolve {
+            assert_eq!(result["address"], "epix1verified");
+        } else {
+            assert_eq!(result["tor_socks_port"], 42330);
+        }
+        assert!(String::from_utf8(request)
+            .unwrap()
+            .to_ascii_lowercase()
+            .contains("host: [::1]:"));
+    }
 }
 
 #[tokio::test]

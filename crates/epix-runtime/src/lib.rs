@@ -1796,6 +1796,7 @@ mod seed_binding_tests {
             let first = tokio::net::TcpListener::bind((host, 0)).await.unwrap();
             let base = first.local_addr().unwrap().port();
             let Some(end) = base.checked_add(count - 1) else { continue };
+            if base <= 43113 && end >= 43110 { continue; }
             let mut listeners = vec![first];
             for port in base + 1..=end {
                 match tokio::net::TcpListener::bind((host, port)).await {

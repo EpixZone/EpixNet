@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub mod ledger;
+mod endpoint;
 
 /// Per-browser settings persisted next to the node data. `tor_clearnet` selects
 /// direct or Tor transport for general clearnet. `clearnet_allow` is retained
@@ -103,11 +104,15 @@ impl Settings {
 /// this returns a future.
 mod status;
 
-async fn node_resolve(ui_port: u16, token: &str, name: &str) -> Result<String, String> {
-    let url = format!("http://127.0.0.1:{ui_port}{}", epix_node::NMH_RESOLVE_PATH);
+async fn node_resolve(endpoint: std::net::SocketAddr, token: &str, name: &str) -> Result<String, String> {
+    let url = format!("http://{endpoint}{}", epix_node::NMH_RESOLVE_PATH);
     let nonce = epix_node::new_nmh_nonce()?;
     let request_mac = epix_node::nmh_request_mac(token, &nonce, name)?;
-    let mut response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|error| error.to_string())?;
+    let mut response = client
         .post(url)
         .json(&json!({
             "name": name,
@@ -209,7 +214,7 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
                 Ok(token) => token,
                 Err(error) => return json!({ "error": error }),
             };
-            match node_resolve(ui_port, &token, &full).await {
+            match node_resolve(settings.ui_endpoint(ui_port), &token, &full).await {
                 Ok(address) => json!({ "address": address }),
                 Err(error) => json!({ "error": format!("resolve {full}: {error}") }),
             }
@@ -321,7 +326,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            node_resolve(port, &token, "talk.epix"),
+            node_resolve(([127, 0, 0, 1], port).into(), &token, "talk.epix"),
         )
         .await;
         let _ = release_tx.send(());
@@ -484,7 +489,7 @@ mod tests {
             request_tx.send(request).unwrap();
         });
 
-        let error = node_resolve(port, &token, "talk.epix").await.unwrap_err();
+        let error = node_resolve(([127, 0, 0, 1], port).into(), &token, "talk.epix").await.unwrap_err();
         assert!(error.contains("response authentication failed"));
         let request = request_rx.recv().unwrap();
         assert!(

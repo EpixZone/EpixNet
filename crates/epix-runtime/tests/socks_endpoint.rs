@@ -7,9 +7,20 @@ use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
+fn reserve_test_start() -> TcpListener {
+    for _ in 0..32 {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        if port < u16::MAX - 4 && !(43110..=43113).contains(&port) {
+            return listener;
+        }
+    }
+    panic!("could not reserve a non-legacy test port");
+}
+
 #[tokio::test]
 async fn offline_start_reserves_its_socks_endpoint_before_returning() {
-    let probe = TcpListener::bind("127.0.0.1:0").unwrap();
+    let probe = reserve_test_start();
     let port = probe.local_addr().unwrap().port();
     drop(probe);
     let state = AppState::new("socks-port-regression");
@@ -42,7 +53,7 @@ async fn offline_start_reserves_its_socks_endpoint_before_returning() {
 
 #[tokio::test]
 async fn simultaneous_runtimes_retain_distinct_owned_endpoints() {
-    let foreign = TcpListener::bind("127.0.0.1:0").unwrap();
+    let foreign = reserve_test_start();
     foreign.set_nonblocking(true).unwrap();
     let start = foreign.local_addr().unwrap().port();
     let mut runtimes = Vec::new();

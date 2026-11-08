@@ -75,6 +75,7 @@ fun main() {
         verify(prefs["network.proxy.socks_port"] == shell.nativeSocksPort, "Uses the actual native-owned SOCKS port")
         verify(prefs["network.proxy.socks_version"] == 5, "SOCKS5 stays enabled")
         verify(prefs["network.proxy.socks_remote_dns"] == true, "General DNS stays inside Tor")
+        verify(prefs["network.proxy.failover_direct"] == false, "Unavailable Tor must not fall back to direct networking")
         verify(prefs["network.proxy.allow_hijacking_localhost"] == false, "Loopback cannot be hijacked")
         for (host in listOf("localhost", "127.0.0.1", "api.epix.zone", "rpc.epix.zone",
                             "evmrpc.epix.zone", "explorer.epix.zone", "nested.rpc.epix.zone",

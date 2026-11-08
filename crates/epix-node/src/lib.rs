@@ -1031,8 +1031,8 @@ fn bind_and_publish_ui_endpoint_with<T>(
     Ok((listener, bind, published))
 }
 
-/// Publish the selected UI port before rotating the bearer token. If the port
-/// file cannot be updated, retaining the old token fails native messaging
+/// Publish the selected UI port and address before rotating the secret. If
+/// either file cannot be updated, retaining the old secret fails native messaging
 /// closed instead of sending the new token to a stale, attacker-owned port.
 fn publish_nmh_endpoint(
     data_root: &std::path::Path,
@@ -1045,6 +1045,14 @@ fn publish_nmh_endpoint(
         warnings.push(format!(
             "cannot publish native-messaging UI port {}: {error}; refusing to publish the current token",
             port_path.display()
+        ));
+        return warnings;
+    }
+    let address_path = data_root.join("ui_addr");
+    if let Err(error) = std::fs::write(&address_path, bind.to_string()) {
+        warnings.push(format!(
+            "cannot publish native-messaging UI address {}: {error}; refusing to publish the current token",
+            address_path.display()
         ));
         return warnings;
     }
@@ -5068,16 +5076,14 @@ async fn serve(
         .ok_or_else(|| "node runtime did not reserve its SOCKS endpoint".to_string())?;
     state.log("INFO", format!("Local Tor SOCKS endpoint: 127.0.0.1:{socks_port}")).await;
 
-    // Tor-always: once the Arti SOCKS listener is up (tor_status == "Always"),
+    // Tor-always: once Arti can route SOCKS traffic (tor_status == "Always"),
     // route all chain RPC through it, so name resolution never exposes the
     // node's IP or which `.epix` names it looks up. Peer/tracker traffic already
     // rides Tor via the always-mode transport.
     //
-    // Cold-start gap: Tor takes ~10-40s to bootstrap. Any chain RPC that runs
-    // before this fires (e.g. resolving the xite named on the command line at
-    // startup) goes direct. Steady-state resolves - on-demand navigation, the
-    // native host, re-verification - all wait until the proxy is set and route
-    // through Tor.
+    // Startup policy blocks chain requests until this proxy is installed.
+    // The endpoint stays owned during recovery and rejects requests until
+    // the next Tor generation is ready.
     #[cfg(feature = "tor")]
     if tor_mode == epix_runtime::TorMode::Always {
         let state = state.clone();
@@ -6508,12 +6514,31 @@ mod tests {
             std::fs::read_to_string(dir.path().join("ui_port")).unwrap(),
             bound.port().to_string()
         );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ui_addr")).unwrap(),
+            bound.to_string()
+        );
         assert_eq!(read_nmh_auth_token(dir.path()).unwrap(), token);
         assert!(
             std::net::TcpListener::bind(bound).is_err(),
             "UiServer must receive a retained listener, not a probe result"
         );
         drop(listener);
+    }
+
+    #[test]
+    fn failed_endpoint_metadata_does_not_rotate_native_messaging_secret() {
+        for field in ["ui_port", "ui_addr"] {
+            let dir = tempfile::tempdir().unwrap();
+            let token = "11".repeat(32);
+            write_nmh_auth_token(dir.path(), &token).unwrap();
+            std::fs::create_dir(dir.path().join(field)).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let warnings = publish_nmh_endpoint(dir.path(), listener.local_addr().unwrap(), &"22".repeat(32));
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("refusing to publish"));
+            assert_eq!(read_nmh_auth_token(dir.path()).unwrap(), token);
+        }
     }
 
     #[test]

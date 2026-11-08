@@ -81,6 +81,7 @@ fun main() {
         val runtimeConfig = profile.browserRuntimeConfig(55331, true)
         expect(runtimeConfig.readText().startsWith(AddonProfile.CONFIG))
         expect(runtimeConfig.readText().contains("network.proxy.socks_port: 55331"))
+        expect(runtimeConfig.readText().contains("network.proxy.failover_direct: false"))
         expect(runtimeConfig.readText().contains("network.proxy.type: 1"))
         expect(profile.configFile.readText() == AddonProfile.CONFIG)
         expect(profile.browserRuntimeConfig(55332, false).readText().contains("network.proxy.type: 0"))

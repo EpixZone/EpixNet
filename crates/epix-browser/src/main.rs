@@ -344,8 +344,7 @@ async fn boot(
     let socks_addr = SocketAddr::from(([127, 0, 0, 1], socks_port));
     // The effective Tor mode the node booted with: the EPIX_TOR override when
     // set, else the Config page's persisted choice (default enable). Must match
-    // the node's resolution, or the PAC would route clearnet at a SOCKS
-    // listener that never binds.
+    // the node's resolution so disabling Tor keeps explicit direct browsing.
     let tor_mode = if tor_mode.is_empty() {
         running
             .state
@@ -357,8 +356,8 @@ async fn boot(
         tor_mode
     };
     // Route clearnet through Tor by default (opt-out), but only when Tor is on -
-    // otherwise there is no SOCKS listener and clearnet would break. An explicit
-    // saved setting overrides the default.
+    // The owned SOCKS listener refuses traffic when Tor is off. An explicit
+    // saved setting overrides the clearnet preference default.
     let tor_on = tor_mode != "disable";
     let tor_clearnet = tor_on && tor_clearnet_setting(&data_root).unwrap_or(true);
     if tor_clearnet {

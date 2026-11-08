@@ -2606,6 +2606,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             GeckoPreferenceController.setGeckoPref("network.proxy.socks_port", nativeSocksPort ?: UnavailableTorProxy.port, user)
             GeckoPreferenceController.setGeckoPref("network.proxy.socks_version", 5, user)
             GeckoPreferenceController.setGeckoPref("network.proxy.socks_remote_dns", true, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.failover_direct", false, user)
             GeckoPreferenceController.setGeckoPref(
                 "network.proxy.allow_hijacking_localhost", false, user,
             )
