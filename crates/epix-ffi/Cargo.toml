@@ -43,7 +43,7 @@ tempfile = "3"
 # two transports that work with no internet at all (an isolated LAN, an
 # air-gapped mesh). Both are inert until switched on in Config - `mesh`
 # defaults to disable and `local_discovery` to false, so an unconfigured phone
-# spawns no task and binds no socket for either. They cost ~12 crates
+# opens no network interface or socket for either. They cost ~12 crates
 # (`reticulum`, `tonic`, `prost` and support) on top of the hyper/tower stack
 # reqwest and arti already pull in.
 #

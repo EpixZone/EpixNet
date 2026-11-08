@@ -6,6 +6,7 @@ mod merger_index;
 pub(crate) mod addon_install;
 pub(crate) mod avatar_cache;
 pub(crate) mod local_profile;
+pub mod native_radio;
 
 use epix_core::{Address, AttemptError, DeferredAttempt, PeerAddr};
 use epix_db::{Database, DbSchema};
@@ -4188,6 +4189,7 @@ pub struct AppState {
     i2p_transport: RwLock<Option<Arc<dyn Transport>>>,
     /// The Reticulum mesh transport (dials `rns:` dest hashes), once up.
     rns_transport: RwLock<Option<Arc<dyn Transport>>>,
+    native_radio: native_radio::NativeRadioControl,
     /// Latest I2P status snapshot for the Stats page (JSON; `{}` when off).
     i2p_status: RwLock<Value>,
     /// On-demand resolver: resolve + clone a `.epix` host not yet served (set by
@@ -5688,6 +5690,7 @@ impl AppState {
             base_transport: RwLock::new(None),
             i2p_transport: RwLock::new(None),
             rns_transport: RwLock::new(None),
+            native_radio: native_radio::NativeRadioControl::default(),
             i2p_status: RwLock::new(json!({})),
             on_demand: RwLock::new(None),
             xite_domain_lookups: Arc::new(std::sync::Mutex::new(HashMap::new())),
@@ -6870,6 +6873,7 @@ impl AppState {
 
     /// Set a node config value (`configSet`), persisted to `data_dir/config.json`.
     pub async fn config_set(&self, key: &str, value: Value) {
+        let _serial = self.native_radio.config_write.lock().await;
         {
             let mut cfg = self.config.write().await;
             if value.is_null() {
@@ -6887,6 +6891,9 @@ impl AppState {
         // (or away from) the bridge instead of waiting for a node restart.
         if key == "tor_use_bridges" {
             self.tor_config_changed.notify_waiters();
+        }
+        if matches!(key, "mesh" | "offline") {
+            self.native_mesh_policy_changed().await;
         }
         if matches!(key, "plugins_disabled" | "plugins_enabled") {
             self.plugin_changes.send_replace(());
@@ -14103,7 +14110,7 @@ impl AppState {
                 })
                 .unwrap_or_default()
         };
-        for p in self.tracker_seed_peers().await {
+        for p in self.native_mesh_candidates(address).await.into_iter().chain(self.tracker_seed_peers().await) {
             let key = p.to_string();
             if !benched.contains(&key) && seen.insert(key) {
                 out.push(p);
@@ -46356,8 +46363,9 @@ mod tests {
         };
         assert_eq!(default_for("local_discovery"), "false");
         assert_eq!(default_for("mesh"), "disable");
-        // Both are read once at boot, so a change must offer a restart.
-        for key in ["local_discovery", "mesh"] {
+        // Mesh on/off applies live; interface configuration still needs restart.
+        assert!(!CONFIG_RESTART_KEYS.contains(&"mesh"));
+        for key in ["local_discovery", "mesh_peers", "mesh_listen"] {
             assert!(CONFIG_RESTART_KEYS.contains(&key), "{key} must be a restart key");
         }
         // Both must be reachable from the Config page, or "turn it on" means

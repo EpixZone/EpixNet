@@ -28,24 +28,38 @@ use crate::{reliable::ReliableStream, stream_protocol, ReticulumStream, StreamPr
 /// A mesh transport over a Reticulum node.
 pub struct ReticulumTransport {
     inner: Arc<Mutex<RnsTransport>>,
-    known: Arc<Mutex<HashMap<AddressHash, DestinationDesc>>>,
+    known: Arc<Mutex<HashMap<AddressHash, (DestinationDesc, Instant)>>>,
     dial_timeout: Duration,
+    announce_task: tokio::task::JoinHandle<()>,
 }
 
 impl ReticulumTransport {
     /// Wrap a running Reticulum node (interfaces already spawned). Starts a
     /// task that learns destination descriptors from announces.
     pub fn new(inner: Arc<Mutex<RnsTransport>>) -> Self {
-        let known: Arc<Mutex<HashMap<AddressHash, DestinationDesc>>> =
+        let known: Arc<Mutex<HashMap<AddressHash, (DestinationDesc, Instant)>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let inner_task = inner.clone();
         let known_task = known.clone();
-        tokio::spawn(async move {
+        let announce_task = tokio::spawn(async move {
             let mut announces = inner_task.lock().await.recv_announces().await;
-            while let Ok(announce) = announces.recv().await {
+            drop(inner_task);
+            loop {
+                let announce = match announces.recv().await {
+                    Ok(announce) => announce,
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                };
                 let desc = announce.destination.lock().await.desc;
-                known_task.lock().await.insert(desc.address_hash, desc);
+                if stream_protocol(&desc.name).is_err() {
+                    continue;
+                }
+                let mut known = known_task.lock().await;
+                // Radio discovery is untrusted input even after signature validation.
+                // Evict the oldest entry at capacity, so departed peers cannot
+                // permanently prevent learning a newly encountered device.
+                remember_announce(&mut known, desc, Instant::now());
             }
         });
 
@@ -53,6 +67,7 @@ impl ReticulumTransport {
             inner,
             known,
             dial_timeout: Duration::from_secs(20),
+            announce_task,
         }
     }
 
@@ -67,8 +82,11 @@ impl ReticulumTransport {
         loop {
             {
                 let known = self.known.lock().await;
-                if let Some(desc) = known.get(hash).copied() {
-                    return Ok(preferred_descriptor(desc, &known));
+                if let Some((desc, _)) = known.get(hash).copied() {
+                    return Ok(preferred_descriptor(
+                        desc,
+                        known.values().map(|(desc, _)| desc),
+                    ));
                 }
             }
             if Instant::now() >= deadline {
@@ -79,17 +97,61 @@ impl ReticulumTransport {
             sleep(Duration::from_millis(100)).await;
         }
     }
+
+    /// Signature-verified, supported node destinations, not assertions about
+    /// which xites the remote node serves. Prefer reliable radio streams.
+    pub async fn candidates(&self) -> Vec<PeerAddr> {
+        let known = self.known.lock().await;
+        let now = Instant::now();
+        let mut candidates: Vec<_> = known
+            .values()
+            .filter(|(desc, seen)| {
+                now.duration_since(*seen) <= Duration::from_secs(120)
+                    && matches!(stream_protocol(&desc.name), Ok(StreamProtocol::Reliable))
+            })
+            .map(|(desc, _)| {
+                let mut hash = [0; 16];
+                hash.copy_from_slice(desc.address_hash.as_slice());
+                PeerAddr::Rns(hash)
+            })
+            .collect();
+        candidates.sort_by_key(ToString::to_string);
+        candidates.truncate(32);
+        candidates
+    }
 }
 
-fn preferred_descriptor(
+impl Drop for ReticulumTransport {
+    fn drop(&mut self) {
+        self.announce_task.abort();
+    }
+}
+
+fn remember_announce(
+    known: &mut HashMap<AddressHash, (DestinationDesc, Instant)>,
     desc: DestinationDesc,
-    known: &HashMap<AddressHash, DestinationDesc>,
+    now: Instant,
+) {
+    if known.len() >= 256 && !known.contains_key(&desc.address_hash) {
+        if let Some(oldest) = known
+            .iter()
+            .min_by_key(|(_, (_, seen))| *seen)
+            .map(|(hash, _)| *hash)
+        {
+            known.remove(&oldest);
+        }
+    }
+    known.insert(desc.address_hash, (desc, now));
+}
+
+fn preferred_descriptor<'a>(
+    desc: DestinationDesc,
+    mut known: impl Iterator<Item = &'a DestinationDesc>,
 ) -> DestinationDesc {
     if !matches!(stream_protocol(&desc.name), Ok(StreamProtocol::Legacy)) {
         return desc;
     }
     known
-        .values()
         .find(|candidate| {
             matches!(
                 stream_protocol(&candidate.name),

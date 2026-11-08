@@ -1273,7 +1273,7 @@ async fn start_clone_discovery(
             }
             drop(source);
         });
-        for peer in state.connectable_peers(address, 50).await {
+        for peer in state.connectable_peers(address, 50).await.into_iter().chain(state.native_mesh_candidates(address).await) {
             if found.lock().unwrap().insert(peer.to_string()) {
                 let _ = tx.send(Some(peer));
             }

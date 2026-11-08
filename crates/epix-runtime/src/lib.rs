@@ -202,6 +202,10 @@ impl NodeRuntime {
             self.shutdown.clone(),
             self.config.chart_interval,
         )));
+        self.state.configure_native_mesh(cfg!(feature = "mesh"), self.config.offline, {
+            #[cfg(feature = "mesh")] { self.config.mesh_enabled }
+            #[cfg(not(feature = "mesh"))] { false }
+        });
         if self.config.offline {
             return;
         }
@@ -384,10 +388,10 @@ impl NodeRuntime {
         // dialing onto the transport, serve the wire protocol to peers that
         // link to us, and announce our destination so they can.
         #[cfg(feature = "mesh")]
-        if self.config.mesh_enabled {
+        {
             let identity_path =
                 self.data_dir.clone().map(|d| d.join("mesh").join("identity"));
-            self.handles.push(tokio::spawn(mesh_loop(
+            self.handles.push(tokio::spawn(native_mesh::supervise(
                 self.state.clone(),
                 identity_path,
                 self.config.mesh_peers.clone(),
@@ -2583,76 +2587,8 @@ async fn apply_bridge_change(
     }
 }
 
-/// Bring up I2P and run its surfaces until shutdown, none of it on the startup
-/// path: the embedded (or external) router boots on its own task, `.b32.i2p`
-/// dialing is layered onto the peer transport, inbound I2P streams feed the
-/// same node handler as the TCP/onion loops, and the live status is polled into
-/// the app state for the Stats page. The node keeps working over clearnet/Tor
-/// throughout the (minutes-long) embedded bootstrap.
-/// Join the Reticulum mesh and run its surfaces until shutdown: bring up the
-/// mesh node (identity + destination + TCP interfaces), layer `rns:` dialing
-/// onto the peer transport, feed inbound mesh links to the same node handler
-/// as the TCP/onion/I2P loops, and announce our destination on an interval so
-/// peers can find a path to us. LoRa/BLE radios become further interface
-/// types on the same mesh node later; this loop does not change.
 #[cfg(feature = "mesh")]
-async fn mesh_loop(
-    state: Arc<AppState>,
-    identity_path: Option<std::path::PathBuf>,
-    tcp_peers: Vec<String>,
-    tcp_listen: Option<String>,
-    edx_cell: edx::EdxServeCell,
-    shutdown: Arc<Notify>,
-) {
-    let config = epix_reticulum::MeshConfig {
-        identity_path,
-        tcp_peers: tcp_peers.clone(),
-        tcp_listen: tcp_listen.clone(),
-    };
-    let node = match epix_reticulum::MeshNode::spawn(config).await {
-        Ok(node) => node,
-        Err(e) => {
-            state.log("WARNING", format!("Mesh: bring-up failed: {e}")).await;
-            return;
-        }
-    };
-    let listen_note = tcp_listen.map(|l| format!(", listening on {l}")).unwrap_or_default();
-    state
-        .log(
-            "INFO",
-            format!(
-                "Mesh: up, our address rns:{} ({} interface peer(s){listen_note})",
-                node.dest_hash_hex(),
-                tcp_peers.len(),
-            ),
-        )
-        .await;
-
-    // Layer `rns:` dialing onto the transport (composed with TCP/Tor/I2P).
-    state.set_rns_transport(Arc::new(node.transport())).await;
-    state.set_rns_address(&node.dest_hash_hex()).await;
-    state.set_rns_reliable_address(&node.reliable_dest_hash_hex()).await;
-    // A Hello over a mesh link now offers this destination hash as our
-    // dial-back address (Phase 6) - the inbound link id a peer sees is not it.
-    let advert_hash = node.dest_hash_hex();
-    epix_protocol::update_self_advert(move |a| a.rns = Some(advert_hash));
-
-    // Announce our destination and serve inbound links until shutdown. Mesh
-    // links are already encrypted, so EDX skips Noise (the overlay hook).
-    let announce = node.spawn_announce(Duration::from_secs(60));
-    let serve = edx::ensure_edx_serve(&edx_cell, &state)
-        .await
-        .map(|es| {
-            let hook = es.overlay_hook();
-            tokio::spawn(async move { node.serve(hook).await })
-        });
-
-    shutdown.notified().await;
-    announce.abort();
-    if let Some(serve) = serve {
-        serve.abort();
-    }
-}
+mod native_mesh;
 
 #[cfg(all(test, feature = "i2p"))]
 mod i2p_startup_tests;

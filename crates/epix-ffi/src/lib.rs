@@ -11,6 +11,8 @@
 
 use epix_browser_net::{ca::LocalCa, proxy};
 mod addons;
+mod native_radio;
+pub use native_radio::*;
 pub use addons::*;
 use epix_node::{boot_with_progress, AppState, NodeOptions, RunningNode};
 #[cfg(unix)]

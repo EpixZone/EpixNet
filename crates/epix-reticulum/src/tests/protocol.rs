@@ -32,20 +32,59 @@ fn legacy_upgrade_requires_both_identity_keys_and_known_signed_protocol() {
         known.insert(candidate.address_hash, candidate);
     }
     assert_eq!(
-        preferred_descriptor(legacy, &known).address_hash,
+        preferred_descriptor(legacy, known.values()).address_hash,
         legacy.address_hash
     );
     known.insert(reliable.address_hash, reliable);
     assert_eq!(
-        preferred_descriptor(legacy, &known).address_hash,
+        preferred_descriptor(legacy, known.values()).address_hash,
         reliable.address_hash
     );
     known.clear();
     known.insert(legacy.address_hash, legacy);
     assert_eq!(
-        preferred_descriptor(reliable, &known).address_hash,
+        preferred_descriptor(reliable, known.values()).address_hash,
         reliable.address_hash,
         "explicit v2 never falls back"
     );
     assert!(stream_protocol(&wrong_version.name).is_err());
+}
+
+#[test]
+fn announcement_descriptor_cache_is_bounded_and_replaces_oldest() {
+    let owner = PrivateIdentity::new_from_rand(OsRng);
+    let mut desc = descriptor(&owner, "node.v2");
+    let now = Instant::now();
+    let mut known = HashMap::new();
+    for index in 0..257u16 {
+        let mut hash = [0; 16];
+        hash[..2].copy_from_slice(&index.to_le_bytes());
+        desc.address_hash = AddressHash::new(hash);
+        remember_announce(
+            &mut known,
+            desc,
+            now + Duration::from_millis(u64::from(index)),
+        );
+    }
+    assert_eq!(known.len(), 256);
+    assert!(!known.contains_key(&AddressHash::new([0; 16])));
+    assert!(known.contains_key(&desc.address_hash));
+}
+
+#[tokio::test]
+async fn departed_nodes_stop_being_automatic_candidates() {
+    let identity = PrivateIdentity::new_from_rand(OsRng);
+    let inner = Arc::new(Mutex::new(RnsTransport::new(
+        reticulum::transport::TransportConfig::new("candidate-test", &identity, false),
+    )));
+    let transport = ReticulumTransport::new(inner);
+    let desc = descriptor(&identity, "node.v2");
+    remember_announce(
+        &mut *transport.known.lock().await,
+        desc,
+        Instant::now() - Duration::from_secs(121),
+    );
+    assert!(transport.candidates().await.is_empty());
+    remember_announce(&mut *transport.known.lock().await, desc, Instant::now());
+    assert_eq!(transport.candidates().await.len(), 1);
 }

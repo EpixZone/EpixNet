@@ -62,8 +62,8 @@ i2p = ["dep:epix-i2p"]
 # Adds the embedded pure-Rust I2P router (emissary) for the no-sidecar default.
 # Pulls a reseeder (reqwest/openssl), so it's desktop-only for now. Off mobile.
 i2p-embedded = ["i2p", "epix-i2p/embedded"]
-# Reticulum mesh: dial + serve peers over mesh links (TCP interfaces now,
-# LoRa/BLE radios later). All platforms.
+# Reticulum mesh: dial, serve and relay over TCP or bounded native radio
+# streams. Android supplies BLE and Wi-Fi Aware sockets.
 mesh = ["dep:epix-reticulum"]
 # BitTorrent media engine and tracker discovery. Desktop and Android enable
 # this; the iOS release profile excludes it as a product restriction.

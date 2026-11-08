@@ -48,6 +48,7 @@ pub struct MeshNode {
     legacy_destination: Arc<Mutex<SingleInputDestination>>,
     dest_hash: [u8; 16],
     reliable_dest_hash: [u8; 16],
+    shutdown: Box<dyn Fn() + Send + Sync>,
 }
 
 impl MeshNode {
@@ -72,13 +73,17 @@ impl MeshNode {
             None => PrivateIdentity::new_from_rand(OsRng),
         };
 
-        let mut transport = RnsTransport::new(TransportConfig::new("epix", &identity, true));
+        // Mesh is explicitly opted in. Forward encrypted RNS packets so nearby
+        // devices can reach one another through an intermediate phone.
+        let mut transport =
+            RnsTransport::new(TransportConfig::new("epix", &identity, true).set_retransmit(true));
         let legacy_destination = transport
             .add_destination(identity.clone(), DestinationName::new("epix", "node"))
             .await;
         let destination = transport
             .add_destination(identity, DestinationName::new("epix", "node.v2"))
             .await;
+        let shutdown = transport.shutdown_token();
         let transport = Arc::new(Mutex::new(transport));
 
         let mut dest_hash = [0u8; 16];
@@ -106,6 +111,7 @@ impl MeshNode {
             legacy_destination,
             dest_hash,
             reliable_dest_hash,
+            shutdown: Box::new(move || shutdown.cancel()),
         })
     }
 
@@ -132,6 +138,16 @@ impl MeshNode {
         ReticulumTransport::new(self.transport.clone())
     }
 
+    /// Attach native byte streams to this generation's interface manager.
+    pub async fn radio_hub(&self) -> crate::radio::RadioHub {
+        crate::radio::RadioHub::new(self.transport.lock().await.iface_manager())
+    }
+
+    /// Revoke this generation even if an in-flight peer still retains it.
+    pub fn shutdown(&self) {
+        (self.shutdown)();
+    }
+
     /// Announce our destination every `interval` so peers (re)learn the path
     /// to us. Runs until the returned task is aborted.
     pub fn spawn_announce(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
@@ -156,5 +172,11 @@ impl MeshNode {
         ReticulumServer::new(edx)
             .serve(self.transport.clone())
             .await;
+    }
+}
+
+impl Drop for MeshNode {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
