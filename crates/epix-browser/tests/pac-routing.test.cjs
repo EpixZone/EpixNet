@@ -83,6 +83,7 @@ fn main() {
       });
       vm.runInContext(fs.readFileSync(fileURLToPath(pacUrl), "utf8"), context);
       const route = host => context.FindProxyForURL(`http://${host}/`, host);
+      assert.equal(prefs.get("network.proxy.allow_hijacking_localhost"), false);
       assert.equal(route("a".repeat(56) + ".onion"), "SOCKS5 127.0.0.1:42328",
         `onion service must use Tor with clearnet routing ${enabled ? "on" : "off"}`);
       assert.equal(route("example.com"), enabled ? "SOCKS5 127.0.0.1:42328" : "DIRECT");
@@ -91,6 +92,12 @@ fn main() {
       assert.equal(route("example.i2p"), "PROXY 127.0.0.1:42527");
       assert.equal(route("rpc.epix.zone"), "DIRECT");
       assert.equal(route("127.0.0.1"), "DIRECT");
+      for (const host of ["localhost.", "epix-fixture.localhost", "epix-fixture.localhost.", "LOCALHOST", "::1", "[::1]", "127.0.0.2", "127.255.255.255"]) {
+        assert.equal(route(host), "DIRECT", `reserved local origin ${host} must stay local`);
+      }
+      for (const host of ["notlocalhost", "localhost.example", "epix-fixture.localhost.example", "127.attacker.example", "127.256.0.1", "[::ffff:7f00:1]", "198.18.0.1"]) {
+        assert.equal(route(host), enabled ? "SOCKS5 127.0.0.1:42328" : "DIRECT");
+      }
     }
   } finally {
     fs.rmSync(root, { recursive: true, force: true });

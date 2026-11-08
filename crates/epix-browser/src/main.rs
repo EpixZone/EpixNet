@@ -1228,7 +1228,11 @@ fn write_profile(
          \x20 if (shExpMatch(host, \"*.i2p\")) {{ return \"PROXY {eepsite_addr}\"; }}\n\
          \x20 // Onion services always need Tor, independently of clearnet routing.\n\
          \x20 if (shExpMatch(host, \"*.onion\")) {{ return \"SOCKS5 {socks_addr}\"; }}\n\
-         \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
+         \x20 // Reserved loopback names keep their distinct origins and never use Tor.\n\
+         \x20 // Classify literal IPv4 locally; DNS lookups here would bypass Tor.\n\
+         \x20 var octets = host.split(\".\");\n\
+         \x20 var loopbackV4 = octets.length === 4 && octets[0] === \"127\" && octets.every(function(part) {{ return /^[0-9]{{1,3}}$/.test(part) && Number(part) <= 255; }});\n\
+         \x20 if (loopbackV4 || host === \"::1\" || host === \"[::1]\" || /(^|\\.)localhost\\.?$/i.test(host)) {{ return \"DIRECT\"; }}\n\
          \x20 // The EPIX chain's own infrastructure (rpc/api/evmrpc.epix.zone) always\n\
          \x20 // goes direct: it is the wallet's essential backend, and the endpoints\n\
          \x20 // refuse Tor exits, so routing chain RPC through Tor would break the\n\
@@ -1249,7 +1253,7 @@ fn write_profile(
     let proxy_prefs = format!(
         "user_pref(\"network.proxy.type\", 2);\n\
          user_pref(\"network.proxy.autoconfig_url\", \"{pac_url}\");\n\
-         user_pref(\"network.proxy.allow_hijacking_localhost\", true);\n\
+         user_pref(\"network.proxy.allow_hijacking_localhost\", false);\n\
          user_pref(\"network.proxy.socks_remote_dns\", true);\n\
          user_pref(\"network.proxy.failover_direct\", false);\n\
          user_pref(\"network.proxy.failover_timeout\", 10);\n\
