@@ -73,6 +73,7 @@ open class View(val name: String) {
 }
 class LinearLayout {
     private val children = mutableListOf<View>()
+    private val posted = mutableListOf<() -> Unit>()
     val childCount get() = children.size
     var moves = 0
     var transitionWrites = 0
@@ -98,7 +99,10 @@ class LinearLayout {
         child.detachCount++
     }
     fun removeAllViews() { children.toList().forEach(::removeView) }
+    fun post(action: () -> Unit) { posted.add(action) }
+    fun runPosted() { val work = posted.toList(); posted.clear(); work.forEach { it() } }
 }
+class TabSwitcherDouble { var resizes = 0; fun resize() { resizes++ } }
 open class ActivityDouble {
     val resources = Resources(Configuration(Configuration.ORIENTATION_PORTRAIT))
     var configurationCallbacks = 0
@@ -115,6 +119,7 @@ internal class Shell(val preferences: Preferences = Preferences(), initialize: B
     val offlineBanner = View("offline")
     val bottomBar = View("navigation")
     var fullScreenSession: Any? = null
+    var tabSwitcher: TabSwitcherDouble? = null
     fun applyFullScreenPresentation() {}
     fun getPreferences(mode: Int): Preferences {
         check(mode == Context.MODE_PRIVATE)
@@ -217,6 +222,17 @@ fun main() {
     hidden.onConfigurationChanged(Configuration(Configuration.ORIENTATION_UNDEFINED))
     expectOrder(hidden, listOf(hidden.pageFrame, hidden.topBar, hidden.offlineBanner, hidden.bottomBar),
         "undefined orientation uses the Automatic portrait fallback")
+    val resizing = Shell()
+    val switcher = TabSwitcherDouble()
+    resizing.tabSwitcher = switcher
+    resizing.onConfigurationChanged(Configuration(Configuration.ORIENTATION_LANDSCAPE))
+    verify(switcher.resizes == 0, "tab sheet resizing waits for the posted layout callback")
+    resizing.browserChrome.runPosted()
+    verify(switcher.resizes == 1, "rotation resizes an open tab sheet")
+    resizing.onConfigurationChanged(Configuration(Configuration.ORIENTATION_PORTRAIT))
+    resizing.tabSwitcher = null
+    resizing.browserChrome.runPosted()
+    verify(switcher.resizes == 1, "a sheet closed before the callback is not resized")
     println("$failures Android toolbar regression failure(s), $checks checks")
     check(failures == 0)
 }
