@@ -69,6 +69,9 @@ jobs:
           python3 shells/android/tests/run-fullscreen-regressions.py
           python3 shells/android/tests/run-window-insets-regressions.py
           node shells/android/tests/run-tab-label-regressions.cjs
+          node shells/android/tests/run-ble-mesh-regressions.cjs
+          node shells/android/tests/run-wifi-aware-regressions.cjs
+          node shells/android/tests/run-nearby-pump-regressions.cjs
 
   linux-packaging:
     name: Linux packaging (${{ matrix.os }})

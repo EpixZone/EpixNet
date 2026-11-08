@@ -81,6 +81,9 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     private val node: EpixNode? get() = EmbeddedNodeHost.node
     private val activityJob = SupervisorJob()
     private val scope = CoroutineScope(activityJob + Dispatchers.Main)
+    private val nearbyUi = NearbyMeshUi(this, scope) { dialog, dismissed ->
+        showOwnedDialog(dialog, onDismiss = dismissed)
+    }
     private var disposed = false
     private var connectivityRegistration: Pair<android.net.ConnectivityManager,
         android.net.ConnectivityManager.NetworkCallback>? = null
@@ -395,6 +398,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         splashAnimationsActive = true
         animateSplashMark()
         wakeNodeForForeground()
+        NearbyMeshService.resumeIfWanted(this)
     }
 
     /** A foreground return can need fresh xite content without a network change. */
@@ -1946,6 +1950,11 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             }
             layout.addView(controlsPosition, LinearLayout.LayoutParams(-1, -2))
             layout.addView(android.widget.Button(this@MainActivity).apply {
+                text = "Nearby mesh"
+                isAllCaps = false
+                setOnClickListener { nearbyUi.show() }
+            }, LinearLayout.LayoutParams(-1, -2))
+            layout.addView(android.widget.Button(this@MainActivity).apply {
                 text = "Extensions"
                 isAllCaps = false
                 setOnClickListener { showAddonManager() }
@@ -1953,7 +1962,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
 
             val panel = AlertDialog.Builder(this@MainActivity)
                 .setTitle("Epix")
-                .setView(layout)
+                .setView(android.widget.ScrollView(this@MainActivity).apply { addView(layout) })
                 .setPositiveButton("OK", null)
                 .create()
             showOwnedDialog(panel)
