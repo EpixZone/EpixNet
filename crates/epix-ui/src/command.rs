@@ -5,6 +5,7 @@
 
 use crate::state::AppState;
 use crate::state::avatar_cache::AvatarCommand;
+use crate::state::local_profile::LocalProfileCommand;
 use async_trait::async_trait;
 use base64::Engine as _;
 use serde_json::{json, Value};
@@ -43,7 +44,7 @@ pub fn validate_grantable_permission(permission: &str) -> Result<(), String> {
             && suffix.as_bytes()[0].is_ascii_alphanumeric()
     }
     match permission {
-        "ADMIN" | "NOSANDBOX" | "CHANNELS" => Ok(()),
+        "ADMIN" | "NOSANDBOX" | "CHANNELS" | "LOCAL_PROFILE" => Ok(()),
         p if p.starts_with("Merger:") && suffix_ok(&p["Merger:".len()..]) => Ok(()),
         p if p.starts_with("Channels:") && suffix_ok(&p["Channels:".len()..]) => Ok(()),
         _ => Err(format!("Unknown or malformed permission: {}", permission.chars().take(64).filter(|c| !c.is_control()).collect::<String>())),
@@ -230,6 +231,8 @@ pub struct WsSession {
     pub wrapper: bool,
     /// Bind an in-flight thumbnail fill to the user who looked it up.
     pub(crate) avatar_user: std::sync::OnceLock<String>,
+    /// Bind native profile commands to the original local user and canonical xite.
+    pub(crate) local_profile_scope: std::sync::OnceLock<String>,
     /// The session was rebound through `as` by a caller whose own bound
     /// xite holds ADMIN. It passes the admin gate the way the caller would
     /// have, and nothing more: it is a page-level session with the page's
@@ -269,6 +272,7 @@ impl WsSession {
             trusted,
             wrapper,
             avatar_user: Default::default(),
+            local_profile_scope: Default::default(),
             admin: false,
         }
     }
@@ -583,6 +587,9 @@ impl CommandRegistry {
                 .and_then(|v| v.as_str())
                 .ok_or("Missing cmd")?
                 .to_string();
+            if LocalProfileCommand::is_command(&inner_cmd) {
+                return Err("Local profiles cannot be accessed through as".into());
+            }
             if AvatarCommand::is_cache_command(&inner_cmd) {
                 return Err("Avatar cache cannot be accessed through as".into());
             }
@@ -643,6 +650,15 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(Ping),
         Arc::new(AvatarCommand::Get),
         Arc::new(AvatarCommand::Put),
+        Arc::new(LocalProfileCommand::Info),
+        Arc::new(LocalProfileCommand::Create),
+        Arc::new(LocalProfileCommand::PublicPost),
+        Arc::new(LocalProfileCommand::GroupCreate),
+        Arc::new(LocalProfileCommand::Seal),
+        Arc::new(LocalProfileCommand::Open),
+        Arc::new(LocalProfileCommand::Verify),
+        Arc::new(LocalProfileCommand::List),
+        Arc::new(LocalProfileCommand::LinkXid),
         Arc::new(ServerInfo),
         Arc::new(ResolveStatusCmd),
         Arc::new(NetworkRetry),
@@ -3543,6 +3559,7 @@ impl WsCommand for PermissionRemove {
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_str()))
             .ok_or("permissionRemove: permission required")?;
         s.state.remove_permission(&address, permission).await;
+        s.state.push_xite_info(&address).await;
         Ok(Value::from("ok"))
     }
 }
@@ -3567,6 +3584,7 @@ impl WsCommand for PermissionDetails {
             "NOSANDBOX" => "Allow this xite to run any code on your machine \
                 <span style='color: red'>(Make sure you trust the xite developer before accepting!)</span>"
                 .to_string(),
+            "LOCAL_PROFILE" => "Allow this xite to create a local profile, publish public messages, and read and send private group messages for this xite. Your signing and encryption keys stay in EpixNet.".to_string(),
             "CHANNELS" => "Allow this xite to read your whole private message inbox (every app) \
                 and to send private messages as your identity"
                 .to_string(),
@@ -5517,7 +5535,7 @@ mod tests {
 
     #[tokio::test]
     async fn only_known_well_formed_permissions_can_be_granted() {
-        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "Merger:EpixPost", "Channels:talk", "Channels:a.b-c_1"] {
+        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "LOCAL_PROFILE", "Merger:EpixPost", "Channels:talk", "Channels:a.b-c_1"] {
             assert!(validate_grantable_permission(ok).is_ok(), "{ok}");
         }
         let long = format!("Merger:{}", "x".repeat(129));

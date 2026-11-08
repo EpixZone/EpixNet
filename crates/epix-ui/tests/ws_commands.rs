@@ -464,6 +464,33 @@ async fn permission_add_merger_rebuilds_db_and_pushes_xite_info() {
     assert_eq!(pushed.target.as_deref(), Some(merger.as_str()));
 }
 
+#[tokio::test]
+async fn permission_remove_pushes_fresh_permissions_to_the_xite() {
+    let (state, _root, address, _key) = state_with_xite().await;
+    state.add_permission(&address, "LOCAL_PROFILE").await;
+    state.add_permission(&address, "ADMIN").await;
+    let registry = CommandRegistry::with_defaults();
+    let session = WsSession::new_wrapper(state.clone(), Some(address.clone()));
+    let mut events = state.subscribe_events();
+
+    let result = registry
+        .dispatch(&session, "permissionRemove", &json!("LOCAL_PROFILE"), WRAPPER_ID)
+        .await
+        .unwrap();
+    assert_eq!(result, json!("ok"));
+    assert_eq!(state.xite_permissions(&address).await, vec!["ADMIN"]);
+
+    // The wrapper uses this snapshot to decide whether a subsequent request
+    // needs a Grant dialog. A stale grant makes it silently ignore that request.
+    let pushed = events.try_recv().expect("permissionRemove pushes fresh setSiteInfo");
+    assert_eq!(pushed.channel.as_deref(), Some("siteChanged"));
+    assert_eq!(pushed.target.as_deref(), Some(address.as_str()));
+    let message: Value = serde_json::from_str(&pushed.payload).unwrap();
+    assert_eq!(message["cmd"], "setSiteInfo");
+    assert_eq!(message["params"]["address"], address);
+    assert_eq!(message["params"]["settings"]["permissions"], json!(["ADMIN"]));
+}
+
 /// A private key is checked when it is SAVED, not later when it is used. A
 /// malformed key, or a valid key belonging to another xite, can never sign this
 /// one - storing it just moves the failure to signing time, where the wrapper

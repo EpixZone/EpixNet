@@ -136,6 +136,13 @@ downloading or signing the xite before retrying. Exports run one at a time and
 use temporary disk space, with limits of 8 GiB per file and 16 GiB of file data
 per archive.
 
+Xite authors can use [local profiles](docs/local-profiles.md) for signed public
+messages and encrypted private groups without requiring xID. Users grant access
+per xite; keys stay in the node. Groups are limited to eight members and messages
+to 4096 UTF-8 bytes. Each user's 512 KiB document retains up to 128 public and 32
+private messages. The API reports read limits and truncation; it is bounded chat
+history, not permanent archival storage.
+
 To carry package repositories over signed xites, use the
 [package mirror workflow](docs/package-mirrors.md). It exports complete verified
 snapshots for APT, DNF, Homebrew artifacts, and Chocolatey folder sources while
