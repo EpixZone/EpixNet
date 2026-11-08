@@ -17,6 +17,9 @@ pub struct PathTable {
 }
 
 impl PathTable {
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize { self.map.len() }
+
     pub fn new(reroute_eager: bool) -> Self {
         Self {
             map: HashMap::new(),
@@ -26,6 +29,10 @@ impl PathTable {
 
     pub fn get(&self, destination: &AddressHash) -> Option<&PathEntry> {
         self.map.get(destination)
+    }
+
+    pub fn remove(&mut self, destination: &AddressHash) {
+        self.map.remove(destination);
     }
 
     pub fn next_hop_full(&self, destination: &AddressHash) -> Option<(AddressHash, AddressHash)> {

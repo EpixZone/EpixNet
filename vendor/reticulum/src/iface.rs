@@ -105,6 +105,10 @@ pub struct InterfaceManager {
 
 impl InterfaceManager {
     pub fn new(rx_cap: usize) -> Self {
+        Self::with_cancellation(rx_cap, CancellationToken::new())
+    }
+
+    pub(crate) fn with_cancellation(rx_cap: usize, cancel: CancellationToken) -> Self {
         let (rx_send, rx_recv) = InterfaceChannel::make_rx_channel(rx_cap);
         let rx_recv = Arc::new(tokio::sync::Mutex::new(rx_recv));
 
@@ -112,7 +116,7 @@ impl InterfaceManager {
             counter: 0,
             rx_recv,
             rx_send,
-            cancel: CancellationToken::new(),
+            cancel,
             ifaces: Vec::new(),
         }
     }
@@ -127,7 +131,7 @@ impl InterfaceManager {
 
         log::debug!("iface: create channel {}", address);
 
-        let stop = CancellationToken::new();
+        let stop = self.cancel.child_token();
 
         self.ifaces.push(LocalInterface {
             address,
@@ -175,6 +179,17 @@ impl InterfaceManager {
 
     pub fn cleanup(&mut self) {
         self.ifaces.retain(|iface| !iface.stop.is_cancelled());
+    }
+
+    pub(crate) fn is_active(&self, address: &AddressHash) -> bool {
+        self.ifaces.iter().any(|iface| iface.address == *address && !iface.stop.is_cancelled())
+    }
+
+    /// Stop listeners, accepted sockets, and pending connections immediately,
+    /// even when streams still retain this generation's manager.
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+        for iface in &self.ifaces { iface.stop.cancel(); }
     }
 
     pub async fn send(&self, message: TxMessage) {

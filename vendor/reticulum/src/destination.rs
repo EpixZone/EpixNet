@@ -167,10 +167,11 @@ impl DestinationAnnounce {
 
         identity.verify(signed_data.as_slice(), &signature)?;
 
-        Ok((
-            SingleOutputDestination::new(identity, DestinationName::new_from_hash_slice(name_hash)),
-            app_data,
-        ))
+        let output = SingleOutputDestination::new(identity, DestinationName::new_from_hash_slice(name_hash));
+        if output.desc.address_hash != packet.destination {
+            return Err(RnsError::IncorrectHash);
+        }
+        Ok((output, app_data))
     }
 }
 
@@ -458,6 +459,13 @@ mod tests {
             .announce(OsRng, None)
             .expect("valid announce packet");
 
-        DestinationAnnounce::validate(&announce).expect("valid announce");
+        let (accepted, _) = DestinationAnnounce::validate(&announce).expect("valid announce");
+        // Reticulum derives a destination from the first 10 name-hash bytes
+        // and the first 16 SHA-256 bytes of the complete public identity.
+        use sha2::{Digest, Sha256};
+        let public = [destination.desc.identity.public_key_bytes().as_slice(), destination.desc.identity.verifying_key_bytes().as_slice()].concat();
+        let identity_hash = Sha256::digest(&public);
+        let expected = Sha256::digest([destination.desc.name.as_name_hash_slice(), &identity_hash[..16]].concat());
+        assert_eq!(accepted.desc.address_hash.as_slice(), &expected[..16]);
     }
 }

@@ -117,8 +117,27 @@ impl AnnounceTable {
         Self {
             map: BTreeMap::new(),
             responses: BTreeMap::new(),
-            cache: AnnounceCache::new(100000), // TODO make capacity configurable
+            cache: AnnounceCache::new(super::MAX_REMOTE_DESTINATIONS),
         }
+    }
+
+    pub(super) fn remove_destination(&mut self, address: &AddressHash) {
+        self.map.retain(|_, entry| entry.packet.destination != *address);
+        self.responses.retain(|_, entry| entry.packet.destination != *address);
+        if let Some(cache) = self.cache.newer.as_mut() {
+            cache.retain(|_, entry| entry.packet.destination != *address);
+        }
+        if let Some(cache) = self.cache.older.as_mut() {
+            cache.retain(|_, entry| entry.packet.destination != *address);
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn contains_destination(&self, address: &AddressHash) -> bool {
+        self.map.values().chain(self.responses.values())
+            .chain(self.cache.newer.iter().flat_map(|cache| cache.values()))
+            .chain(self.cache.older.iter().flat_map(|cache| cache.values()))
+            .any(|entry| entry.packet.destination == *address)
     }
 
     pub fn add(

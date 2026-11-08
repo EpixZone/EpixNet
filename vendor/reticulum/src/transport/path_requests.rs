@@ -1,4 +1,4 @@
-use alloc::collections::{BTreeSet, BTreeMap};
+use alloc::collections::{BTreeSet, BTreeMap, VecDeque};
 
 use rand_core::OsRng;
 
@@ -78,16 +78,20 @@ impl PathRequest {
 
 pub struct PathRequests {
     cache: BTreeSet<(AddressHash, TagBytes)>,
+    oldest: VecDeque<(AddressHash, TagBytes)>,
     name: String,
     transport_id: Option<AddressHash>,
     controlled_destination: PlainInputDestination,
     discovery: BTreeMap<AddressHash, Instant>,
 }
 
+const MAX_CACHED_REQUESTS: usize = 4096;
+
 impl PathRequests {
     pub fn new(name: &str, transport_id: Option<AddressHash>) -> Self {
         Self {
             cache: BTreeSet::new(),
+            oldest: VecDeque::new(),
             name: name.into(),
             transport_id,
             controlled_destination: create_path_request_destination(),
@@ -99,9 +103,8 @@ impl PathRequests {
         let path_request = PathRequest::decode(data, &self.name);
 
         if let Some(ref request) = path_request {
-            let is_new = self.cache.insert(
-                (request.destination, request.tag_bytes.clone())
-            );
+            let key = (request.destination, request.tag_bytes.clone());
+            let is_new = self.cache.insert(key.clone());
 
             if !is_new {
                 log::info!(
@@ -110,6 +113,10 @@ impl PathRequests {
                     request.destination
                 );
                 return None;
+            }
+            self.oldest.push_back(key);
+            if self.oldest.len() > MAX_CACHED_REQUESTS {
+                if let Some(oldest) = self.oldest.pop_front() { self.cache.remove(&oldest); }
             }
         }
 
@@ -207,5 +214,22 @@ mod tests {
         let decoded = testee.decode(encoded.data.as_slice()).unwrap();
 
         assert_eq!(decoded.destination, dest);
+    }
+
+    #[test]
+    fn bounded_request_cache_preserves_recent_duplicate_filtering() {
+        let mut requests = PathRequests::new("bounded", None);
+        let destination = AddressHash::new([1; 16]);
+        let first = requests.generate(&destination, Some(0u64.to_be_bytes().to_vec()));
+        for index in 0..=MAX_CACHED_REQUESTS {
+            let packet = requests.generate(&destination, Some((index as u64).to_be_bytes().to_vec()));
+            assert!(requests.decode(packet.data.as_slice()).is_some());
+        }
+        assert_eq!(requests.cache.len(), MAX_CACHED_REQUESTS);
+        assert_eq!(requests.oldest.len(), MAX_CACHED_REQUESTS);
+        let recent = requests.generate(&destination, Some((MAX_CACHED_REQUESTS as u64).to_be_bytes().to_vec()));
+        assert!(requests.decode(recent.data.as_slice()).is_none());
+        assert!(requests.decode(first.data.as_slice()).is_some(), "oldest request was evicted");
+        assert_eq!(requests.cache.len(), MAX_CACHED_REQUESTS);
     }
 }

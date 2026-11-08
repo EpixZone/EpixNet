@@ -77,6 +77,11 @@ pub struct AnnounceLimits {
 }
 
 impl AnnounceLimits {
+    pub(super) fn remove(&mut self, address: &AddressHash) { self.limits.remove(address); }
+
+    #[cfg(test)]
+    pub(super) fn len(&self) -> usize { self.limits.len() }
+
     pub fn new() -> Self {
         Self { limits: BTreeMap::new() }
     }

@@ -91,7 +91,11 @@ impl Packet {
             data: StaticBuffer::new(),
         };
 
-        buffer.read(packet.data.accuire_buf(buffer.bytes_left()))?;
+        let payload_size = buffer.bytes_left();
+        if payload_size > crate::packet::PACKET_MDU {
+            return Err(RnsError::OutOfMemory);
+        }
+        buffer.read(packet.data.accuire_buf(payload_size))?;
 
         Ok(packet)
     }
@@ -174,5 +178,34 @@ mod tests {
         assert_eq!(packet.transport, new_packet.transport);
         assert_eq!(packet.context, new_packet.context);
         assert_eq!(packet.data.as_slice(), new_packet.data.as_slice());
+    }
+}
+
+#[cfg(test)]
+mod receive_bounds_tests {
+    use super::*;
+    use crate::{iface::hdlc::Hdlc, packet::PACKET_MDU};
+
+    #[test]
+    fn oversized_hdlc_payload_is_rejected_and_valid_limit_remains_readable() {
+        for size in [PACKET_MDU + 1, PACKET_MDU] {
+            let packet = Packet::default();
+            let mut raw = vec![0; 19 + size];
+            let mut out = OutputBuffer::new(&mut raw);
+            packet.serialize(&mut out).unwrap();
+            out.write(&vec![0x42; size]).unwrap();
+            let mut encoded = vec![0; raw.len() * 2 + 2];
+            let mut framed = OutputBuffer::new(&mut encoded);
+            Hdlc::encode(&raw, &mut framed).unwrap();
+            let mut decoded = vec![0; raw.len()];
+            let mut decoded_out = OutputBuffer::new(&mut decoded);
+            Hdlc::decode(framed.as_slice(), &mut decoded_out).unwrap();
+            let result = Packet::deserialize(&mut InputBuffer::new(decoded_out.as_slice()));
+            if size > PACKET_MDU {
+                assert_eq!(result, Err(RnsError::OutOfMemory));
+            } else {
+                assert_eq!(result.unwrap().data.as_slice(), vec![0x42; size]);
+            }
+        }
     }
 }

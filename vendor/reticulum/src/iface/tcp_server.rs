@@ -43,7 +43,10 @@ impl TcpServer {
 
             if listener.is_err() {
                 log::warn!("tcp_server: couldn't bind to <{}>", addr);
-                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                tokio::select! {
+                    _ = context.cancel.cancelled() => break,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {},
+                }
                 continue;
             }
 
