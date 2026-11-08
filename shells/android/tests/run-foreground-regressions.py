@@ -218,6 +218,7 @@ class Shell : Activity() {
     var holdPort = false
     val portResult = CompletableDeferred<Boolean>()
     var multicastAcquisitions = 0
+    var tabSwitcherRefreshes = 0
     var splashes = 0
     var splashOverlay: Any? = null
     val errors = mutableListOf<String>()
@@ -235,6 +236,11 @@ class Shell : Activity() {
     fun updateSplash(stage: SplashStage) {}
     fun observeStartup(generation: Int) {}
     fun showStartupError(message: String) { errors.add(message) }
+    fun refreshTabSwitcher() {
+        check(Scheduler.lane == "MAIN")
+        check(!disposed)
+        tabSwitcherRefreshes++
+    }
     fun errorPage(message: String?) = "error:" + (message ?: "unavailable")
     fun acquireMulticastLockIfDiscovering() {
         check(Scheduler.lane == "MAIN")
@@ -434,7 +440,11 @@ fun main() {
         // has been issued. The selected tab can finish before a background
         // tab has reported its real location, then Android recreates again.
         restored.tabs.forEach { restored.deliverLocation(it, "about:blank") }
+        verify(restored.tabSwitcherRefreshes == 0,
+            "initial placeholder callbacks do not refresh restored tab labels")
         restored.deliverLocation(restored.tabs.first(), locationUrls.first())
+        verify(restored.tabSwitcherRefreshes == 1,
+            "a real selected-tab location refreshes the tab switcher")
         val saved = Bundle()
         restored.onSaveInstanceState(saved)
         verify(saved.urls() == locationUrls && saved.selected() == 0,
@@ -446,6 +456,8 @@ fun main() {
         val redirect = "https://example.test/redirected%20page?q=a%2Fb#changed"
         restored.deliverLocation(restored.tabs.last(), redirect)
         verify(restored.tabs.last().url == redirect, "real background redirect still replaces the saved location")
+        verify(restored.tabSwitcherRefreshes == 2,
+            "a real background redirect also refreshes the tab switcher")
         restored.deliverLocation(restored.tabs.first(), "about:blank")
         val deliberateBlank = Bundle()
         restored.onSaveInstanceState(deliberateBlank)
@@ -455,6 +467,12 @@ fun main() {
         restored.ownedSessions.remove(restored.tabs.last().session)
         restored.deliverLocation(restored.tabs.last(), "https://closed.example.test/")
         verify(restored.tabs.last().url == redirect, "null or closed-session location callbacks cannot change retained state")
+        verify(restored.tabSwitcherRefreshes == 3,
+            "deliberate blank navigation refreshes labels but null and closed-session callbacks do not")
+        restored.dispose()
+        restored.deliverLocation(restored.tabs.first(), "https://disposed.example.test/")
+        verify(restored.tabSwitcherRefreshes == 3,
+            "a late location callback cannot refresh a disposed tab switcher")
     } }
     val restoredUrls = listOf(encodedUrl, "https://example.test/a%20b?first=x%2Fy#second")
     var pendingState: Bundle? = null
