@@ -26,8 +26,12 @@ class View {
     var visibility = VISIBLE
     var alpha = 1f
     @JvmField var text = ""
+    var contentDescription = ""
+    private val posted = mutableListOf<() -> Unit>()
     fun setText(value: String) { text = value }
     fun hasFocus() = false
+    fun post(action: () -> Unit) { posted.add(action) }
+    fun runPosted() { val work = posted.toList(); posted.clear(); work.forEach { it() } }
     companion object { const val GONE = 8; const val VISIBLE = 0 }
 }
 class CompositorController {
@@ -53,7 +57,8 @@ class GeckoView(private var attached: GeckoSession?) {
     fun releaseSession() { attached = null }
     fun setSession(value: GeckoSession) { attached = value }
 }
-class Tab(val session: GeckoSession, var canGoBack: Boolean = false, var canGoForward: Boolean = false, var url: String = "fixture")
+class Tab(val session: GeckoSession, var canGoBack: Boolean = false, var canGoForward: Boolean = false, var url: String = "fixture", var title: String = "Fixture")
+class TabSwitcherDouble { var resizes = 0; fun resize() { resizes++ } }
 class Dialog(var isShowing: Boolean)
 class Window { val decorView = View(); var fits = true; val controller = WindowInsetsControllerCompat() }
 class WindowInsetsControllerCompat {
@@ -103,6 +108,9 @@ class Shell : Activity() {
     val backButton = View()
     val forwardButton = View()
     val tabCountView = View()
+    val tabButton = View()
+    var tabSwitcher: TabSwitcherDouble? = null
+    var tabSwitcherRefreshes = 0
     val addressBar = View()
     val browserBackCallback = BackCallback()
     val geckoView = GeckoView(null)
@@ -121,6 +129,7 @@ class Shell : Activity() {
     fun ownsSession(session: GeckoSession) = !disposed && session in ownedSessions
     fun leaveAddressEditing() { editingLeaves++ }
     fun refreshOfflineBanner() {}
+    fun refreshTabSwitcher() { tabSwitcherRefreshes++ }
     fun applyBrowserControlsPosition() { positionUpdates++ }
     fun friendlyUrl(url: String) = url
     fun nodeUrl(url: String) = "local/$url"
@@ -130,6 +139,7 @@ class Shell : Activity() {
 '''
 names = ("handleFullScreen", "leaveFullScreen", "applyFullScreenPresentation", "setChromeHidden",
          "refreshBackNavigation", "handleBrowserBack", "goBackInCurrentTab", "showTab", "closeTab",
+         "refreshTabControls",
          "onConfigurationChanged", "onWindowFocusChanged", "dispatchTouchEvent")
 for name in names:
     body = method(name)
@@ -146,6 +156,7 @@ fun main() {
     shell.setChromeHidden(true);shell.setChromeHidden(false)
     verify(!shell.chromeHidden,"chrome can resize before a session is attached")
     val first=shell.add();val second=shell.add();shell.showTab(0)
+    verify(shell.tabCountView.text=="2" && shell.tabButton.contentDescription=="Tabs, 2 open","tab count and accessible opener stay synchronized")
     shell.onFullScreen(first,true)
     verify(first.compositorController.clearColors.last()==shell.COLOR_CHROME_BG,"fullscreen resize clears to browser chrome color")
     verify(second.compositorController.clearColors.isEmpty(),"resize only changes the attached compositor")
@@ -184,8 +195,12 @@ fun main() {
     verify(shell.fullScreenSession==null && second.exits==2 && !shell.chromeHidden,"navigation clears fullscreen")
     shell.onFullScreen(second,true);shell.closeTab(1)
     verify(!second.isOpen && shell.fullScreenSession==null && !shell.chromeHidden,"closing the owning tab restores display before disposal")
+    verify(shell.tabCountView.text=="1" && shell.tabButton.contentDescription=="Tabs, 1 open","closing a tab refreshes both count labels")
+    shell.currentTab.title="Old page title"
+    val refreshes=shell.tabSwitcherRefreshes
     shell.onFullScreen(first,true);shell.closeTab(0)
     verify(first.isOpen && first.loads.last()=="local/dashboard.epix" && shell.fullScreenSession==null,"closing last tab exits fullscreen before dashboard reuse")
+    verify(shell.currentTab.title.isEmpty() && shell.currentTab.url=="local/dashboard.epix" && shell.tabSwitcherRefreshes==refreshes+1,"dashboard reuse clears the stale tab label and refreshes the sheet")
     shell.walletDialog=Dialog(true);val exits=first.exits;shell.onFullScreen(first,true)
     verify(first.exits==exits+1 && !shell.chromeHidden,"wallet prompt keeps its native exit path")
     shell.walletDialog=null;shell.onFullScreen(first,true);shell.leaveFullScreen()

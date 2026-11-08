@@ -97,6 +97,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     private val ownedSessions = mutableSetOf<GeckoSession>()
     private val popupViews = mutableMapOf<GeckoSession, GeckoView>()
     private val dialogs = mutableMapOf<AlertDialog, GeckoSession?>()
+    private var tabSwitcher: TabSwitcherSheet? = null
+    private lateinit var tabButton: FrameLayout
     private val pendingOperations = PendingOperations()
     private val promptOperations = mutableMapOf<GeckoSession.PromptDelegate.BasePrompt, PendingOperations.Operation>()
     private var permissionSession: GeckoSession? = null
@@ -409,6 +411,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         super.onConfigurationChanged(newConfig)
         applyBrowserControlsPosition()
         if (fullScreenSession != null) applyFullScreenPresentation()
+        browserChrome.post { tabSwitcher?.resize() }
     }
 
     override fun onWindowFocusChanged(hasFocus: Boolean) {
@@ -445,6 +448,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 if (tab === currentTab && !addressBar.hasFocus()) {
                     addressBar.setText(friendlyUrl(url))
                 }
+                refreshTabSwitcher()
             }
 
             override fun onCanGoBack(session: GeckoSession, value: Boolean) {
@@ -600,7 +604,10 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             }
 
             override fun onTitleChange(session: GeckoSession, title: String?) {
-                if (ownsSession(session)) tab.title = title ?: ""
+                if (ownsSession(session)) {
+                    tab.title = title ?: ""
+                    refreshTabSwitcher()
+                }
             }
 
             override fun onCloseRequest(session: GeckoSession) {
@@ -609,7 +616,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             }
         }
         tabs.add(tab)
-        tabCountView.text = tabs.size.toString()
+        refreshTabControls()
         if (select) showTab(tabs.size - 1)
         return tab
     }
@@ -629,7 +636,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         if (!addressBar.hasFocus()) addressBar.setText(friendlyUrl(tab.url))
         refreshBackNavigation()
         forwardButton.alpha = if (tab.canGoForward) 1f else DISABLED_ALPHA
-        tabCountView.text = tabs.size.toString()
+        refreshTabControls()
         VerifiedAddonManager.selectSession(tab.session)
     }
 
@@ -641,7 +648,10 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         if (tabs.size == 1) {
             // Last tab: reuse it for a fresh dashboard rather than exiting.
             currentDisplay = "dashboard.epix"
-            tab.session.loadUri(nodeUrl(currentDisplay))
+            tab.title = ""
+            tab.url = nodeUrl(currentDisplay)
+            tab.session.loadUri(tab.url)
+            refreshTabSwitcher()
             return
         }
         if (geckoView.session === tab.session) geckoView.releaseSession()
@@ -655,57 +665,47 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         showTab(next.coerceIn(0, tabs.size - 1))
     }
 
-    /** The tab list: tap a row to switch, its ✕ to close, or open a new tab. */
+    private fun tabEntries(): List<TabSwitcherEntry> = tabs.map { tab ->
+        val label = tabLabel(tab.title, tab.url, NODE_BASE)
+        TabSwitcherEntry(tab, label.title, label.subtitle, tab === currentTab)
+    }
+
+    private fun refreshTabSwitcher() {
+        if (tabSwitcher != null) tabSwitcher?.refresh(tabEntries())
+    }
+
+    private fun refreshTabControls() {
+        tabCountView.text = if (tabs.size > 99) "99+" else tabs.size.toString()
+        tabButton.contentDescription = "Tabs, ${tabs.size} open"
+        refreshTabSwitcher()
+    }
+
+    /** Resolve tab identity at tap time: background tabs can close at any time. */
     private fun showTabSwitcher() {
-        if (disposed) return
-        val layout = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(dp(20), dp(8), dp(20), 0)
+        if (disposed || tabSwitcher != null) return
+        leaveAddressEditing()
+        val sheet = TabSwitcherSheet(
+            this,
+            tabEntries(),
+            onSelect = { id ->
+                tabSwitcher?.dismiss()
+                showTab(tabs.indexOf(id))
+            },
+            onClose = { id -> closeTab(tabs.indexOf(id)) },
+            onNewTab = {
+                tabSwitcher?.dismiss()
+                if (!disposed) {
+                    currentDisplay = "dashboard.epix"
+                    val tab = newTab(GeckoSession().apply { open(runtime) })
+                    tab.url = nodeUrl(currentDisplay)
+                    tab.session.loadUri(tab.url)
+                }
+            },
+        )
+        tabSwitcher = sheet
+        showOwnedDialog(sheet) {
+            if (tabSwitcher === sheet) tabSwitcher = null
         }
-        lateinit var dialog: AlertDialog
-        tabs.forEachIndexed { i, tab ->
-            val name = tab.title.ifEmpty {
-                tab.url.removePrefix("$NODE_BASE/").trimEnd('/').ifEmpty { "New tab" }
-            }
-            val row = LinearLayout(this).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-            }
-            row.addView(
-                label(if (i == currentTabIndex) "● $name" else name).apply {
-                    isSingleLine = true
-                    ellipsize = android.text.TextUtils.TruncateAt.END
-                    setOnClickListener {
-                        dialog.dismiss()
-                        showTab(i)
-                    }
-                },
-                LinearLayout.LayoutParams(0, -2, 1f),
-            )
-            row.addView(
-                label("✕").apply {
-                    setPadding(dp(16), dp(4), dp(4), dp(4))
-                    contentDescription = "Close tab"
-                    setOnClickListener {
-                        dialog.dismiss()
-                        closeTab(i)
-                    }
-                },
-            )
-            layout.addView(row)
-        }
-        dialog = AlertDialog.Builder(this)
-            .setTitle("Tabs")
-            .setView(layout)
-            .setPositiveButton("New tab") { _, _ ->
-                if (disposed) return@setPositiveButton
-                currentDisplay = "dashboard.epix"
-                newTab(GeckoSession().apply { open(runtime) })
-                currentTab.session.loadUri(nodeUrl(currentDisplay))
-            }
-            .setNegativeButton("Close", null)
-            .create()
-        showOwnedDialog(dialog)
     }
 
     /** Content prompt UI (selects, alert/confirm/prompt) over AlertDialogs. */
@@ -1316,6 +1316,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 setTextColor(COLOR_TEXT)
                 gravity = Gravity.CENTER
                 contentDescription = description
+                minimumHeight = dp(48)
                 setPadding(0, dp(6), 0, dp(10))
                 setOnClickListener { if (!disposed && tabs.isNotEmpty()) onTap() }
             }
@@ -1341,24 +1342,30 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         // mobile browser's switcher button.
         tabCountView = TextView(this).apply {
             text = "1"
-            textSize = 13f
+            // The badge is icon artwork; its full count is spoken by the button.
+            setTextSize(android.util.TypedValue.COMPLEX_UNIT_DIP, 13f)
             setTextColor(COLOR_TEXT)
             gravity = Gravity.CENTER
-            contentDescription = "Tabs"
+            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
             background = GradientDrawable().apply {
                 cornerRadius = dp(6).toFloat()
                 setStroke(dp(2), COLOR_TEXT)
             }
-            setOnClickListener { showTabSwitcher() }
         }
         for (b in listOf(backButton, forwardButton, reload)) {
             bar.addView(b, LinearLayout.LayoutParams(0, -2, 1f))
         }
-        val holder = FrameLayout(this).apply {
+        tabButton = FrameLayout(this).apply {
             addView(tabCountView, FrameLayout.LayoutParams(dp(26), dp(26), Gravity.CENTER))
-            setPadding(0, dp(6), 0, dp(10))
+            minimumHeight = dp(48)
+            contentDescription = "Tabs, 1 open"
+            isFocusable = true
+            val backgroundAttr = android.util.TypedValue()
+            theme.resolveAttribute(android.R.attr.selectableItemBackground, backgroundAttr, true)
+            setBackgroundResource(backgroundAttr.resourceId)
+            setOnClickListener { showTabSwitcher() }
         }
-        bar.addView(holder, LinearLayout.LayoutParams(0, -2, 1f))
+        bar.addView(tabButton, LinearLayout.LayoutParams(0, -1, 1f))
         return bar
     }
 
