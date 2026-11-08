@@ -1257,6 +1257,9 @@ impl WsCommand for ConfigSet {
             _ => (None, Value::Null),
         };
         let key = key.ok_or("configSet: key required")?;
+        if key == "ui_port" && crate::config_schema::ui_port(&value).is_none() {
+            return Err("ui_port must be an integer from 1 to 65535".into());
+        }
         // data_dir queues an offline move for the next start, not
         // config.json - config.json lives inside the directory it would name.
         if key == "data_dir" {
@@ -5157,6 +5160,20 @@ mod tests {
         state.config_set("ui_restrict", json!("true")).await;
         let info = ServerInfo.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(info["ui_restrict"], true);
+    }
+
+    #[tokio::test]
+    async fn config_set_rejects_unusable_dashboard_ports() {
+        let state = AppState::new("test");
+        let session = WsSession::new(state.clone(), Some("1site".into()));
+        for value in [json!(0), json!(65536), json!("wrong"), json!(false), json!(null)] {
+            assert!(ConfigSet.handle(&session, &json!(["ui_port", value])).await.is_err());
+            assert_eq!(state.config_get("ui_port").await, None);
+        }
+        for value in [json!(44990), json!("44991")] {
+            ConfigSet.handle(&session, &json!(["ui_port", value])).await.unwrap();
+            assert_eq!(state.config_get("ui_port").await, Some(value));
+        }
     }
 
     #[tokio::test]

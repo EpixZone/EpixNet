@@ -45,6 +45,7 @@ class AddressBar { val windowToken = Any(); fun clearFocus() {} }
 class Session { var url = ""; fun loadUri(value: String) { url = value } }
 class Tab { val session = Session() }
 class Shell {
+    var nodeBase = "http://127.0.0.1:42222"
     var disposed = false
     var localUiReady = true
     var pendingTarget = "dashboard.epix"
@@ -106,7 +107,7 @@ fun main() {
 methods = ["navigate", "searchUrl", "friendlyUrl", "xiteRewrite", "nodeUrl", "intentTarget"]
 kotlin = stub + "\n".join(method(name) for name in methods)
 kotlin += "\n    companion object {\n"
-kotlin += "\n".join(constant(name) for name in ["UI_PORT", "NODE_BASE", "XITE_ADDRESS", "BARE_XITE_NAME", "SEARCH_BASE"])
+kotlin += "\n".join(constant(name) for name in ["UI_PORT", "XITE_ADDRESS", "BARE_XITE_NAME", "SEARCH_BASE"])
 kotlin += "\n    }\n" + checks
 with tempfile.TemporaryDirectory(prefix="epix-android-regressions-") as directory:
     root = pathlib.Path(directory)

@@ -28,6 +28,7 @@ internal data class BootResult(
     val state: NodeState?,
     val error: String?,
     val succeeded: Boolean,
+    val uiBase: String? = null,
 )
 
 /** The scope and native handle belong to the process, never to an activity waiter. */
@@ -95,13 +96,14 @@ internal class StartupCoordinator<N : Any>(
             if (lifecycle != NodeState.SERVING) {
                 return BootResult(id, lifecycle, lastError(handle) ?: "The built-in node did not start.", false)
             }
-            if (!matchesUiOrigin(uiUrl(handle), request.uiPort)) {
+            val uiBase = trustedNodeBase(uiUrl(handle))
+            if (uiBase == null) {
                 return BootResult(
                     id, lifecycle,
                     "The built-in node did not report the expected local browser address.", false,
                 )
             }
-            return BootResult(id, lifecycle, null, true)
+            return BootResult(id, lifecycle, null, true, uiBase)
         } catch (error: CancellationException) {
             throw error
         } catch (error: Exception) {
@@ -126,17 +128,30 @@ internal class StartupCoordinator<N : Any>(
     }
 }
 
-/** Match the actual listener origin without accepting lookalike hosts or credentials. */
-internal fun matchesUiOrigin(url: String?, expectedPort: Int): Boolean {
-    if (url == null) return false
+/** Accept only the owned endpoint returned by native startup, never a probed web service. */
+internal fun trustedNodeBase(url: String?): String? {
+    if (url == null) return null
     val uri = try {
         URI(url)
     } catch (_: URISyntaxException) {
-        return false
+        return null
     }
-    val port = if (uri.port == -1) 80 else uri.port
-    return uri.scheme.equals("http", ignoreCase = true) && uri.host == "127.0.0.1" &&
-        uri.rawUserInfo == null && port == expectedPort
+    return if (uri.scheme.equals("http", ignoreCase = true) && uri.host == "127.0.0.1" &&
+        uri.rawUserInfo == null && uri.port in 1..65535
+    ) "http://127.0.0.1:${uri.port}" else null
+}
+
+/** Rebase saved node tabs only from the recorded old origin, keeping encoded paths intact. */
+internal fun restoreNodeUrl(url: String, previousBase: String, currentBase: String): String {
+    if (trustedNodeBase(previousBase) != previousBase || trustedNodeBase(currentBase) != currentBase) return url
+    val uri = try { URI(url) } catch (_: URISyntaxException) { return url }
+    if (!uri.scheme.equals("http", ignoreCase = true) || uri.rawUserInfo != null ||
+        uri.port != URI(previousBase).port) return url
+    val host = uri.host ?: return url
+    if (host != "127.0.0.1" && !Regex("epix-epix1[a-z0-9]+\\.localhost").matches(host)) return url
+    val suffix = uri.rawPath.orEmpty() + (uri.rawQuery?.let { "?$it" } ?: "") +
+        (uri.rawFragment?.let { "#$it" } ?: "")
+    return "http://$host:${URI(currentBase).port}$suffix"
 }
 
 /** Preserve the failed settings file; a failed move must never become deletion. */

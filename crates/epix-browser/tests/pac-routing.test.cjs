@@ -36,7 +36,6 @@ url = "=${urlVersion}"
     fs.mkdirSync(path.join(root, "src"));
     fs.copyFileSync(path.join(__dirname, "../src/file_url_tests.rs"), path.join(root, "src/file_url_tests.rs"));
     const rust = `use std::{path::Path, net::SocketAddr, io::Write};
-${source.match(/^const EEPSITE_PROXY_ADDR:.*$/m)[0]}
 ${extract("write_profile")}
 ${extract("file_url")}
 #[cfg(test)]
@@ -45,7 +44,8 @@ fn main() {
     let root = std::fs::canonicalize(std::env::args().nth(1).unwrap()).unwrap();
     for enabled in [false, true] {
         write_profile(&root.join(enabled.to_string()),
-            "127.0.0.1:43112".parse().unwrap(), "127.0.0.1:43111".parse().unwrap(),
+            "127.0.0.1:42429".parse().unwrap(), "127.0.0.1:42328".parse().unwrap(),
+            "127.0.0.1:42527".parse().unwrap(),
             "dashboard.epix", true, enabled, true).unwrap();
     }
 }`;
@@ -83,12 +83,12 @@ fn main() {
       });
       vm.runInContext(fs.readFileSync(fileURLToPath(pacUrl), "utf8"), context);
       const route = host => context.FindProxyForURL(`http://${host}/`, host);
-      assert.equal(route("a".repeat(56) + ".onion"), "SOCKS5 127.0.0.1:43111",
+      assert.equal(route("a".repeat(56) + ".onion"), "SOCKS5 127.0.0.1:42328",
         `onion service must use Tor with clearnet routing ${enabled ? "on" : "off"}`);
-      assert.equal(route("example.com"), enabled ? "SOCKS5 127.0.0.1:43111" : "DIRECT");
-      assert.equal(route("pretend.onion.example.com"), enabled ? "SOCKS5 127.0.0.1:43111" : "DIRECT");
-      assert.equal(route("dashboard.epix"), "PROXY 127.0.0.1:43112");
-      assert.equal(route("example.i2p"), "PROXY 127.0.0.1:43113");
+      assert.equal(route("example.com"), enabled ? "SOCKS5 127.0.0.1:42328" : "DIRECT");
+      assert.equal(route("pretend.onion.example.com"), enabled ? "SOCKS5 127.0.0.1:42328" : "DIRECT");
+      assert.equal(route("dashboard.epix"), "PROXY 127.0.0.1:42429");
+      assert.equal(route("example.i2p"), "PROXY 127.0.0.1:42527");
       assert.equal(route("rpc.epix.zone"), "DIRECT");
       assert.equal(route("127.0.0.1"), "DIRECT");
     }

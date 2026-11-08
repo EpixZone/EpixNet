@@ -62,6 +62,7 @@ import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 object VerifiedAddonManager {
     var refreshes = 0
@@ -95,6 +96,7 @@ class Node {
     var lifecycle = NodeState.IDLE
     var wakes = 0
     var reads = 0
+    fun torSocksPort(): UShort? = 42322u
     fun state(): NodeState { check(Scheduler.lane == "IO"); reads++; return lifecycle }
     fun networkChanged() {
         check(Scheduler.lane == "IO") { "foreground wake must leave the UI thread" }
@@ -104,7 +106,7 @@ class Node {
 }
 data class StartupRequest(val dataDir: String, val target: String, val version: String,
                           val torClearnet: Boolean, val uiPort: Int)
-data class BootResult(val attemptId: Long, val state: NodeState?, val error: String?, val succeeded: Boolean)
+data class BootResult(val attemptId: Long, val state: NodeState?, val error: String?, val succeeded: Boolean, val uiBase: String? = "http://127.0.0.1:42222")
 object EmbeddedNodeHost {
     data class Pending(val request: StartupRequest, val retryOf: Long?, val resetConfig: Boolean,
                        val result: CompletableDeferred<BootResult> = CompletableDeferred())
@@ -117,9 +119,10 @@ object EmbeddedNodeHost {
         return pending.result.await()
     }
     fun complete(state: NodeState, succeeded: Boolean = state == NodeState.SERVING,
-                 error: String? = if (succeeded) null else "failed", index: Int = requests.lastIndex) {
+                 error: String? = if (succeeded) null else "failed", index: Int = requests.lastIndex,
+                 uiBase: String = "http://127.0.0.1:42222") {
         node?.lifecycle = state
-        requests[index].result.complete(BootResult(index.toLong() + 1, state, error, succeeded))
+        requests[index].result.complete(BootResult(index.toLong() + 1, state, error, succeeded, uiBase))
     }
     fun reset() {
         requests.forEach { it.result.cancel() }
@@ -195,6 +198,11 @@ class Shell : Activity() {
     var currentDisplay = ""
     var pendingTarget = "dashboard.epix"
     var bootResult: BootResult? = null
+    var nativeSocksPort: Int? = null
+    var restoredNodeBase = "http://127.0.0.1:42222"
+    var proxyUpdates = 0
+    fun applyClearnetRouting() { proxyUpdates++ }
+    fun restoreNodeUrl(url: String, old: String, new: String) = url
     var bootJob: Job? = null
     var restoredUrls: List<String>? = null
     var restoredSelection = 0
@@ -210,7 +218,7 @@ class Shell : Activity() {
     val filesDir = File("fixture-node")
     var torClearnet = true
     val UI_PORT = 42222
-    val NODE_BASE = "http://127.0.0.1:$UI_PORT"
+    var nodeBase = "http://127.0.0.1:$UI_PORT"
     val XITE_ADDRESS = Regex("^epix1[a-z0-9]{20,}$")
     var nodeLoadRetries = 3
     var portProbes = 0
@@ -320,6 +328,15 @@ fun main() {
         val request = EmbeddedNodeHost.requests.single().request
         verify(request.target == "dashboard.epix" && request.torClearnet && request.uiPort == 42222,
             "shared boot receives target, saved routing and expected port")
+    }
+    scenario { selected ->
+        selected.bootAndOpen("dashboard.epix"); Scheduler.drain()
+        EmbeddedNodeHost.complete(NodeState.SERVING, uiBase = "http://127.0.0.1:42227")
+        Scheduler.drain()
+        verify(selected.nodeBase == "http://127.0.0.1:42227" && selected.nativeSocksPort == 42322,
+            "native-owned UI and SOCKS endpoints replace startup defaults")
+        verify(selected.proxyUpdates == 1 && selected.startupLoads.single().second.startsWith(selected.nodeBase),
+            "selected proxy and local origin are installed before first navigation")
     }
     scenario { background ->
         background.bootAndOpen("dashboard.epix"); Scheduler.drain()

@@ -31,6 +31,7 @@ pub mod i2p_health;
 #[cfg(feature = "local-discovery")]
 pub mod local;
 pub mod xfer;
+mod socks;
 #[cfg(feature = "inbound-seeding")]
 mod portcheck;
 #[cfg(all(test, feature = "inbound-seeding", target_os = "linux"))]
@@ -63,9 +64,9 @@ pub struct RuntimeConfig {
     /// Tor routing mode. Ignored without the `tor` feature.
     #[cfg(feature = "tor")]
     pub tor_mode: epix_tor::TorMode,
-    /// Local SOCKS5 port the browser shells route page traffic through (dialed
-    /// via Tor). `None` disables the listener. Ignored without `tor`.
-    #[cfg(feature = "tor")]
+    /// First loopback SOCKS port to try. The listener stays owned even while
+    /// Tor is disabled, unavailable or bootstrapping, rejecting requests then.
+    /// `None` disables this local endpoint, independent of the Tor feature.
     pub tor_socks_port: Option<u16>,
     /// Route Tor's guard channel through an in-process Snowflake bridge (for
     /// censored networks). Always present so the field never has to be
@@ -107,7 +108,6 @@ impl Default for RuntimeConfig {
             offline: false,
             #[cfg(feature = "tor")]
             tor_mode: epix_tor::TorMode::default(),
-            #[cfg(feature = "tor")]
             tor_socks_port: None,
             tor_use_bridges: false,
             #[cfg(feature = "i2p")]
@@ -134,6 +134,7 @@ pub struct NodeRuntime {
     config: RuntimeConfig,
     shutdown: Arc<Notify>,
     handles: Vec<JoinHandle<()>>,
+    socks: Option<socks::SocksControl>,
     /// The node's DHT participant (serves `kad` RPCs + drives lookups). Shared
     /// with the inbound handler so peers can query us as a DHT node.
     dht: Arc<epix_dht::Node>,
@@ -175,6 +176,7 @@ impl NodeRuntime {
             config,
             shutdown: Arc::new(Notify::new()),
             handles: Vec::new(),
+            socks: None,
             dht,
             prop_store,
             #[cfg(any(feature = "tor", feature = "i2p", feature = "mesh"))]
@@ -191,8 +193,17 @@ impl NodeRuntime {
 
     /// Bind the file server and spawn the background loops. Call once per
     /// instance. The local chart collector always runs; peer-networking loops
-    /// are skipped in offline mode.
-    pub async fn start(&mut self) {
+    /// are skipped in offline mode. A requested local SOCKS endpoint must be
+    /// owned first; its allocation failure returns before any task starts.
+    pub async fn start(&mut self) -> std::io::Result<()> {
+        // Reserve before returning, including offline and no-Tor builds. No
+        // shell can accidentally send traffic to somebody else's fixed port.
+        if let Some(port) = self.config.tor_socks_port {
+            let (control, task) = socks::SocksControl::bind(port, self.shutdown.clone())?;
+            self.state.set_tor_socks_port(Some(control.port())).await;
+            self.socks = Some(control);
+            self.handles.push(task);
+        }
         // Share the propagation hint store with the app state, so a received
         // EDX update records a gossip hint into the same book the EDX control
         // plane serves and `propagation_loop` polls.
@@ -203,7 +214,7 @@ impl NodeRuntime {
             self.config.chart_interval,
         )));
         if self.config.offline {
-            return;
+            return Ok(());
         }
         // Tor-Always mode closes clearnet: every outbound dial must go through
         // Tor. But the node installs a plain TCP transport at startup and
@@ -408,7 +419,7 @@ impl NodeRuntime {
                     dir,
                     self.config.tor_mode,
                     fileserver_port,
-                    self.config.tor_socks_port,
+                    self.socks.clone(),
                     self.config.tor_use_bridges,
                     edx_cell.clone(),
                     self.shutdown.clone(),
@@ -447,10 +458,15 @@ impl NodeRuntime {
                 Duration::from_secs(5 * 60),
             )));
         }
+        Ok(())
     }
 
     /// Signal the loops to stop and wait for them.
     pub async fn shutdown(self) {
+        if let Some(socks) = &self.socks {
+            socks.stop();
+        }
+        self.state.set_tor_socks_port(None).await;
         self.shutdown.notify_waiters();
         for handle in self.handles {
             // `notify_waiters` wakes only the loops parked on `notified()` at the
@@ -1507,7 +1523,7 @@ mod update_tests {
             resync_interval: Duration::from_millis(20),
             ..RuntimeConfig::default()
         });
-        runtime.start().await;
+        runtime.start().await.unwrap();
         state.network_changed().await;
         let dial = tokio::time::timeout(Duration::from_millis(100), transport.dialed.notified()).await;
         runtime.shutdown().await;
@@ -1685,7 +1701,11 @@ where
     F: FnMut(u16) -> Fut,
     Fut: std::future::Future<Output = std::io::Result<T>>,
 {
+    let requested = port;
     loop {
+        if port != requested && (43110..=43113).contains(&port) {
+            port = 43114;
+        }
         match bind(port).await {
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && port != 0 => {
                 let Some(next) = port.checked_add(1) else { return Err(e) };
@@ -1847,6 +1867,23 @@ mod seed_binding_tests {
     }
 
     #[tokio::test]
+    async fn seed_fallback_skips_legacy_ports_but_preserves_explicit_requests() {
+        let mut attempted = Vec::new();
+        let chosen = bind_seed_port(43109, |port| {
+            attempted.push(port);
+            std::future::ready(if port == 43109 {
+                Err(std::io::Error::from(std::io::ErrorKind::AddrInUse))
+            } else {
+                Ok(port)
+            })
+        }).await.unwrap();
+        assert_eq!(attempted, [43109, 43114]);
+        assert_eq!(chosen, 43114);
+        let explicit = bind_seed_port(43111, |port| std::future::ready(Ok(port))).await.unwrap();
+        assert_eq!(explicit, 43111);
+    }
+
+    #[tokio::test]
     async fn seed_binding_never_wraps_or_retries_ephemeral_ports() {
         for (start, expected) in [
             (u16::MAX - 2, vec![u16::MAX - 2, u16::MAX - 1, u16::MAX]),
@@ -1881,7 +1918,7 @@ mod seed_binding_tests {
                     ..Default::default()
                 },
             );
-            runtime.start().await;
+            runtime.start().await.unwrap();
             let actual = state.fileserver_port().await;
             assert_ne!(actual, 0);
             if requested != 0 {
@@ -2291,7 +2328,7 @@ async fn tor_loop(
     data_dir: std::path::PathBuf,
     mode: epix_tor::TorMode,
     fileserver_port: Option<u16>,
-    socks_port: Option<u16>,
+    socks: Option<socks::SocksControl>,
     tor_use_bridges: bool,
     edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
@@ -2308,7 +2345,7 @@ async fn tor_loop(
             data_dir.clone(),
             mode,
             fileserver_port,
-            socks_port,
+            socks.clone(),
             tor_use_bridges,
             edx_cell.clone(),
             shutdown.clone(),
@@ -2343,8 +2380,8 @@ async fn tor_loop(
                         ),
                     )
                     .await;
-                // Give the decommissioned onion service and the SOCKS listener a
-                // moment to release the port the next generation rebinds.
+                // Give the decommissioned onion service a moment to release
+                // its identity before relaunch. The SOCKS socket stays owned.
                 tokio::time::sleep(Duration::from_secs(3)).await;
             }
         }
@@ -2353,22 +2390,22 @@ async fn tor_loop(
 }
 
 /// One Tor generation: bootstrap a client, run the transport, onion service and
-/// SOCKS listener on it, and serve until shutdown or an onion health failure.
-/// Every task spawned here is tied to `generation` so the whole set is torn down
-/// together when the generation ends.
+/// SOCKS forwarding on it, and serve until shutdown or an onion health failure.
+/// The socket owner survives recovery; old SOCKS connections are canceled when
+/// forwarding is disabled at the end of this generation.
 #[cfg(feature = "tor")]
 async fn run_tor_generation(
     state: Arc<AppState>,
     data_dir: std::path::PathBuf,
     mode: epix_tor::TorMode,
     fileserver_port: Option<u16>,
-    socks_port: Option<u16>,
+    socks: Option<socks::SocksControl>,
     tor_use_bridges: bool,
     edx_cell: edx::EdxServeCell,
     shutdown: Arc<Notify>,
     earliest_rebuild: i64,
 ) -> TorGenerationEnd {
-    // Cancels this generation's spawned tasks (onion accept loop, SOCKS).
+    // Cancels this generation's onion accept loop; SOCKS has a stable owner.
     let (generation, _) = tokio::sync::watch::channel(false);
     // Bootstrap under a watchdog (heartbeat + timeout + retry). It starts a
     // Snowflake bridge when `tor_use_bridges` forces it, or automatically after
@@ -2382,6 +2419,9 @@ async fn run_tor_generation(
         return TorGenerationEnd::Shutdown;
     };
     state.log("INFO", "Tor: bootstrapped".to_string()).await;
+    if let Some(endpoint) = &socks {
+        endpoint.enable(tor.clone());
+    }
     // Set once the onion service is up; what the health watchdog probes.
     let mut onion_probe: Option<(String, u16)> = None;
 
@@ -2392,11 +2432,13 @@ async fn run_tor_generation(
     // background.
     #[cfg(feature = "bridges")]
     {
-        let state = state.clone();
-        let data_dir = data_dir.clone();
-        tokio::spawn(async move {
-            refresh_snowflake_params(&state, &data_dir, socks_port).await;
-        });
+        if let Some(port) = socks.as_ref().map(socks::SocksControl::port) {
+            let state = state.clone();
+            let data_dir = data_dir.clone();
+            tokio::spawn(async move {
+                refresh_snowflake_params(&state, &data_dir, Some(port)).await;
+            });
+        }
     }
 
     // Route peer dials through Tor: onion peers always, everything in Always
@@ -2482,26 +2524,6 @@ async fn run_tor_generation(
         }
     }
 
-    // Local SOCKS5 for the browser shells to route page traffic through Tor.
-    if let Some(sport) = socks_port {
-        match tokio::net::TcpListener::bind(("127.0.0.1", sport)).await {
-            Ok(listener) => {
-                state.log("INFO", format!("Tor: SOCKS5 listener on 127.0.0.1:{sport}")).await;
-                let tor = tor.clone();
-                let mut gen_rx = generation.subscribe();
-                tokio::spawn(async move {
-                    // Cancelling drops the listener, freeing the port for the
-                    // next generation to rebind.
-                    tokio::select! {
-                        _ = gen_rx.changed() => {}
-                        _ = tor.serve_socks(listener) => {}
-                    }
-                });
-            }
-            Err(e) => state.log("WARNING", format!("Tor: SOCKS bind on {sport} failed: {e}")).await,
-        }
-    }
-
     // Serve until shutdown. The bridges setting (`tor_use_bridges`) applies live:
     // when it changes, reconfigure the running client to add or drop the
     // Snowflake bridge (Arti retires the affected circuits and rebuilds them over
@@ -2535,7 +2557,11 @@ async fn run_tor_generation(
         }
     };
 
-    // Tear down this generation's surfaces before the client is dropped.
+    // Clear forwarding and cancel old SOCKS connections without releasing
+    // the endpoint; the next Tor generation uses the same retained socket.
+    if let Some(endpoint) = &socks {
+        endpoint.disable();
+    }
     let _ = generation.send(true);
     end
 }

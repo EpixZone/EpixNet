@@ -56,7 +56,7 @@ async fn isolated_mesh_endpoint() {
         ..Default::default()
     };
     let mut runtime = NodeRuntime::with_config(state.clone(), vec![], config).with_data_dir(&root);
-    runtime.start().await;
+    runtime.start().await.unwrap();
     let rns = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
             if let Some(address) = state.rns_reliable_address().await { break address; }

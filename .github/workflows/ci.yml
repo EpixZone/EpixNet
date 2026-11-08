@@ -299,6 +299,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 shells/ios/tests/run-regressions.py
+      - name: Test selected UI and Tor proxy ports
+        run: node shells/ios/tests/run-port-regressions.cjs
 
   evx-sandbox:
     name: EVX sandbox (macOS)

@@ -33,7 +33,7 @@ pub struct NodeConfig {
     /// The xite to open: a raw `epix1…` address, a `.epix` name, or an
     /// `epix://…` deep link.
     pub target: String,
-    /// UI bind. Loopback on desktop; the shells usually keep `127.0.0.1:43110`
+    /// UI bind. Loopback on desktop; the shells request `127.0.0.1:42222`
     /// and point their web view at it.
     pub ui_addr: String,
     /// Tor mode: `disable` / `enable` / `always`.
@@ -266,7 +266,7 @@ impl EpixNode {
     }
 
     /// The local UI URL the shell should load once [`NodeState::Serving`], e.g.
-    /// `http://127.0.0.1:43110/dashboard.epix/`. `None` until serving.
+    /// `http://127.0.0.1:42222/dashboard.epix/`. `None` until serving.
     pub fn ui_url(&self) -> Option<String> {
         let inner = self.inner.lock().unwrap();
         if inner.state != NodeState::Serving {
@@ -284,6 +284,14 @@ impl EpixNode {
     /// HTTPS proxy for distinct `.epix` origins, available after boot.
     pub fn browser_proxy(&self) -> Option<BrowserProxy> {
         self.inner.lock().unwrap().browser_proxy.clone()
+    }
+
+    /// The owned loopback SOCKS endpoint. Available once Serving, including
+    /// offline/no-Tor builds, where the listener rejects rather than forwards.
+    /// Never substitute a guessed port when this is absent during startup.
+    pub fn tor_socks_port(&self) -> Option<u16> {
+        let node = self.inner.lock().unwrap().node.clone()?;
+        self.rt.block_on(async move { node.tor_socks_port().await })
     }
 
     /// Our onion address (no `.onion` suffix), once the onion service has

@@ -507,6 +507,12 @@ impl Tor {
             });
         }
     }
+
+    /// Serve one accepted connection through this Tor client. The caller owns
+    /// listener lifetime, connection limits and cancellation during recovery.
+    pub async fn serve_socks_connection(&self, stream: TcpStream) -> std::io::Result<()> {
+        socks5_handle(self.client.clone(), stream).await
+    }
 }
 
 /// One SOCKS5 CONNECT exchange, then a bidirectional copy over Tor.

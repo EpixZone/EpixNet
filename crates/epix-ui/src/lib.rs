@@ -26,6 +26,7 @@ mod xite_zip_http;
 pub mod geoip;
 pub mod local_feed;
 mod nmh_auth;
+mod nmh_status;
 pub mod paths;
 pub mod pool;
 pub mod state;
@@ -69,6 +70,7 @@ const WRAPPER_HTML: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/..
 
 /// Authenticated node endpoint used by the separate native-messaging process.
 pub const NMH_RESOLVE_PATH: &str = "/EpixNet-Internal/Resolve";
+pub const NMH_STATUS_PATH: &str = "/EpixNet-Internal/NmhStatus";
 
 /// One plugin's `/uimedia/*` contributions.
 #[derive(Default, Clone)]
@@ -168,6 +170,8 @@ impl UiServer {
             .route("/EpixNet-Internal/Status", get(serve_status))
             .route("/EpixNet-Internal/Zip", get(xite_zip_http::download))
             .route(NMH_RESOLVE_PATH, axum::routing::post(serve_nmh_resolve))
+            .route(NMH_STATUS_PATH, axum::routing::post(nmh_status::serve)
+                .layer(axum::extract::DefaultBodyLimit::max(2048)))
             .route(addon_broker::PATH, axum::routing::post(addon_broker::serve)
                 .layer(axum::extract::DefaultBodyLimit::max(addon_broker::MAX_REQUEST_BYTES)))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
@@ -1115,25 +1119,25 @@ async fn health(State(ctx): State<Ctx>) -> Response {
 /// host polls to drive the wallet's Epix panel: whether the node is serving,
 /// the Tor state (`tor_enabled`/`tor_status`) + our onion address, and the I2P
 /// state (`i2p_enabled`/`i2p_status`) + our `.b32.i2p` address if published.
-async fn serve_status(State(ctx): State<Ctx>) -> Response {
-    let (tor_enabled, tor_status) = ctx.state.tor_status().await;
-    let onion = ctx.state.onion_address().await;
+async fn status_body(state: &AppState) -> Value {
+    let (tor_enabled, tor_status) = state.tor_status().await;
+    let onion = state.onion_address().await;
     // I2P: the runtime keeps a status object (mode, phase, b32, tunnels, ...);
     // surface a concise view. `i2p_status` is the phase label ("Off",
     // "Starting…", "Ready", "Failed: …"), `i2p_mode` is
     // disable/embedded/external, and `i2p_enabled` is true once the router has
     // published our address (fully ready).
-    let i2p = ctx.state.i2p_status().await;
+    let i2p = state.i2p_status().await;
     let i2p_phase = i2p.get("phase").and_then(|v| v.as_str()).unwrap_or("Off").to_string();
     let i2p_mode = i2p.get("mode").and_then(|v| v.as_str()).unwrap_or("disable").to_string();
-    let i2p_address = ctx.state.i2p_address().await;
-    let mesh_address = ctx.state.rns_address().await;
-    let mesh_reliable_address = ctx.state.rns_reliable_address().await;
+    let i2p_address = state.i2p_address().await;
+    let mesh_address = state.rns_address().await;
+    let mesh_reliable_address = state.rns_reliable_address().await;
     // Live pool connections split by network, so the status page can show
     // how the node actually talks (clearnet vs Tor vs I2P), not just which
     // services are up.
-    let conns = ctx.state.connection_stats().await;
-    let body = json!({
+    let conns = state.connection_stats().await;
+    json!({
         "serving": true,
         "tor_enabled": tor_enabled,
         "tor_status": tor_status,
@@ -1156,7 +1160,11 @@ async fn serve_status(State(ctx): State<Ctx>) -> Response {
             "i2p": conns.i2p,
             "mesh": conns.mesh,
         },
-    });
+    })
+}
+
+async fn serve_status(State(ctx): State<Ctx>) -> Response {
+    let body = status_body(&ctx.state).await;
     (
         [
             (header::CONTENT_TYPE, "application/json".to_string()),
@@ -4265,7 +4273,9 @@ async fn ui_password_gate(
     let path = request.uri().path();
     // The native addon endpoint has independent per-run authentication. It
     // never inherits page cookies or grants access to other UI routes.
-    if path == "/Login" || path.ends_with("favicon.ico") || path == addon_broker::PATH {
+    if path == "/Login" || path.ends_with("favicon.ico") || path == addon_broker::PATH
+        || path == NMH_STATUS_PATH
+    {
         return next.run(request).await;
     }
     let cookie = request

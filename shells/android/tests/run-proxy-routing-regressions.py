@@ -23,7 +23,7 @@ methods = re.findall(r"^    private fun applyClearnetRouting\(\) \{.*?^    }",
                      source, re.MULTILINE | re.DOTALL)
 assert len(methods) == 1, "Expected one production proxy configuration method"
 port = re.search(r"private const val SOCKS_PORT = (\d+)", source)
-assert port, "Missing production SOCKS port"
+
 
 kotlin = r'''
 package zone.epix.app
@@ -38,6 +38,7 @@ object GeckoPreferenceController {
 }
 class Shell(var torClearnet: Boolean) {
     private val SOCKS_PORT = __SOCKS_PORT__
+    var nativeSocksPort: Int? = 55333
     PRODUCTION_METHOD
 }
 
@@ -71,7 +72,7 @@ fun main() {
         val prefs = GeckoPreferenceController.values
         verify(prefs["network.proxy.type"] == 1, "Tor browsing uses manual proxy")
         verify(prefs["network.proxy.socks"] == "127.0.0.1", "SOCKS stays on loopback")
-        verify(prefs["network.proxy.socks_port"] == 43111, "Node SOCKS port is unchanged")
+        verify(prefs["network.proxy.socks_port"] == shell.nativeSocksPort, "Uses the actual native-owned SOCKS port")
         verify(prefs["network.proxy.socks_version"] == 5, "SOCKS5 stays enabled")
         verify(prefs["network.proxy.socks_remote_dns"] == true, "General DNS stays inside Tor")
         verify(prefs["network.proxy.allow_hijacking_localhost"] == false, "Loopback cannot be hijacked")
@@ -89,10 +90,24 @@ fun main() {
         shell.applyClearnetRouting()
         verify(prefs["network.proxy.type"] == 0, "User can still select direct browsing")
     }
+    shell.nativeSocksPort = null
+    shell.torClearnet = true
+    shell.applyClearnetRouting()
+    val fallback = GeckoPreferenceController.values["network.proxy.socks_port"] as Int
+    verify(fallback == UnavailableTorProxy.port && fallback in 1..65535, "Missing native endpoint keeps the owned refusal listener")
+    java.net.Socket("127.0.0.1", fallback).use {
+        it.soTimeout = 2000
+        verify(it.getInputStream().read() == -1, "Preboot proxy rejects connections")
+    }
+    verify(runCatching { java.net.ServerSocket(fallback, 1, java.net.InetAddress.getByName("127.0.0.1")).close() }.isFailure,
+        "Fallback listener remains owned after selecting it")
+    shell.nativeSocksPort = 55334
+    shell.applyClearnetRouting()
+    verify(GeckoPreferenceController.values["network.proxy.socks_port"] == 55334, "Boot installs the new native endpoint")
     println("$failures Android proxy regression failure(s), $checks checks")
     check(failures == 0)
 }
-'''.replace("__SOCKS_PORT__", port.group(1)).replace(
+'''.replace("__SOCKS_PORT__", (port.group(1) if port else "0")).replace(
     "PRODUCTION_METHOD", methods[0].replace("private fun", "fun", 1))
 
 with tempfile.TemporaryDirectory(prefix="epix-android-proxy-tests-") as directory:
@@ -100,7 +115,8 @@ with tempfile.TemporaryDirectory(prefix="epix-android-proxy-tests-") as director
     production = temporary / "ProxyRegressions.kt"
     production.write_text(kotlin)
     jar = temporary / "tests.jar"
-    subprocess.run([os.environ["KOTLINC"], str(production), "-no-reflect",
+    subprocess.run([os.environ["KOTLINC"], str(production),
+                    str(root / "app/src/main/java/zone/epix/app/UnavailableTorProxy.kt"), "-no-reflect",
                     "-include-runtime", "-d", str(jar)], check=True, timeout=90)
     subprocess.run([str(pathlib.Path(os.environ["JAVA_HOME"]) / "bin/java"),
                     "-jar", str(jar)], check=True, timeout=20)

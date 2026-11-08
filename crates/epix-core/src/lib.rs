@@ -9,6 +9,7 @@ pub mod attempt;
 pub mod emitter;
 pub mod error;
 pub mod peer;
+pub mod ports;
 pub mod time;
 
 pub use address::{classify_label, Address, LabelClass};
