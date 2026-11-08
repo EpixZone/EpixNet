@@ -23,11 +23,11 @@ use reticulum::transport::Transport as RnsTransport;
 use tokio::sync::Mutex;
 use tokio::time::{sleep, Instant};
 
-use crate::ReticulumStream;
+use crate::{reliable::ReliableStream, stream_protocol, ReticulumStream, StreamProtocol};
 
 /// A mesh transport over a Reticulum node.
 pub struct ReticulumTransport {
-    inner: Arc<RnsTransport>,
+    inner: Arc<Mutex<RnsTransport>>,
     known: Arc<Mutex<HashMap<AddressHash, DestinationDesc>>>,
     dial_timeout: Duration,
 }
@@ -35,21 +35,25 @@ pub struct ReticulumTransport {
 impl ReticulumTransport {
     /// Wrap a running Reticulum node (interfaces already spawned). Starts a
     /// task that learns destination descriptors from announces.
-    pub fn new(inner: Arc<RnsTransport>) -> Self {
+    pub fn new(inner: Arc<Mutex<RnsTransport>>) -> Self {
         let known: Arc<Mutex<HashMap<AddressHash, DestinationDesc>>> =
             Arc::new(Mutex::new(HashMap::new()));
 
         let inner_task = inner.clone();
         let known_task = known.clone();
         tokio::spawn(async move {
-            let mut announces = inner_task.recv_announces().await;
+            let mut announces = inner_task.lock().await.recv_announces().await;
             while let Ok(announce) = announces.recv().await {
                 let desc = announce.destination.lock().await.desc;
                 known_task.lock().await.insert(desc.address_hash, desc);
             }
         });
 
-        Self { inner, known, dial_timeout: Duration::from_secs(20) }
+        Self {
+            inner,
+            known,
+            dial_timeout: Duration::from_secs(20),
+        }
     }
 
     /// How long `dial` waits for an announce / link activation. Defaults to 20s.
@@ -61,8 +65,11 @@ impl ReticulumTransport {
     async fn await_desc(&self, hash: &AddressHash) -> Result<DestinationDesc> {
         let deadline = Instant::now() + self.dial_timeout;
         loop {
-            if let Some(desc) = self.known.lock().await.get(hash).copied() {
-                return Ok(desc);
+            {
+                let known = self.known.lock().await;
+                if let Some(desc) = known.get(hash).copied() {
+                    return Ok(preferred_descriptor(desc, &known));
+                }
             }
             if Instant::now() >= deadline {
                 return Err(Error::Protocol(format!(
@@ -73,6 +80,31 @@ impl ReticulumTransport {
         }
     }
 }
+
+fn preferred_descriptor(
+    desc: DestinationDesc,
+    known: &HashMap<AddressHash, DestinationDesc>,
+) -> DestinationDesc {
+    if !matches!(stream_protocol(&desc.name), Ok(StreamProtocol::Legacy)) {
+        return desc;
+    }
+    known
+        .values()
+        .find(|candidate| {
+            matches!(
+                stream_protocol(&candidate.name),
+                Ok(StreamProtocol::Reliable)
+            ) && candidate.identity.public_key.as_bytes() == desc.identity.public_key.as_bytes()
+                && candidate.identity.verifying_key.as_bytes()
+                    == desc.identity.verifying_key.as_bytes()
+        })
+        .copied()
+        .unwrap_or(desc)
+}
+
+#[cfg(test)]
+#[path = "tests/protocol.rs"]
+mod protocol_tests;
 
 #[async_trait]
 impl Transport for ReticulumTransport {
@@ -92,9 +124,11 @@ impl Transport for ReticulumTransport {
         };
 
         let desc = self.await_desc(&hash).await?;
+        let protocol =
+            stream_protocol(&desc.name).map_err(|error| Error::Protocol(error.to_string()))?;
         // Subscribe before the link is up so no early data slips past.
-        let events = self.inner.out_link_events();
-        let link = self.inner.link(desc).await;
+        let events = self.inner.lock().await.out_link_events();
+        let link = self.inner.lock().await.link(desc).await;
 
         let deadline = Instant::now() + self.dial_timeout;
         loop {
@@ -110,6 +144,17 @@ impl Transport for ReticulumTransport {
         }
 
         let link_id = *link.lock().await.id();
-        Ok(Box::pin(ReticulumStream::wrap(self.inner.clone(), link, link_id, events)))
+        match protocol {
+            StreamProtocol::Legacy => Ok(Box::pin(ReticulumStream::wrap(
+                self.inner.clone(),
+                link,
+                link_id,
+                events,
+            ))),
+            StreamProtocol::Reliable => ReliableStream::wrap(self.inner.clone(), link, link_id)
+                .await
+                .map(|stream| Box::pin(stream) as PeerStream)
+                .map_err(|error| Error::Protocol(error.to_string())),
+        }
     }
 }

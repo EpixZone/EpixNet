@@ -285,7 +285,13 @@ fn render_sidebar(
           <li class='color-purple'><span>Onion:</span><b>{onion}</b></li>\
           <li class='color-yellow'><span>Local:</span><b>{local}</b></li>\
           <li class='color-black'><span>Total:</span><b>{total_n}</b></li>\
-         </ul></li>",
+         </ul>\
+         <form id='form-addpeer'>\
+          <label for='peer-endpoint'>Add peer</label>\
+          <input id='peer-endpoint' type='text' maxlength='128' autocomplete='off' spellcheck='false' \
+            placeholder='rns:destination or IP:port'>\
+          <button type='submit' class='button'>Add peer</button>\
+         </form></li>",
         connectable_w = pct(counts.connectable as f64, total),
         onion_w = pct(counts.onion as f64, total),
         connected_w = pct(counts.connected as f64, total),

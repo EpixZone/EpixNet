@@ -10,8 +10,9 @@ use epix_core::PeerAddr;
 use epix_protocol::EdxHook;
 use reticulum::destination::link::LinkEvent;
 use reticulum::transport::Transport as RnsTransport;
+use tokio::sync::Mutex;
 
-use crate::ReticulumStream;
+use crate::{reliable::ReliableStream, stream_protocol, ReticulumStream, StreamProtocol};
 
 /// Serves EDX over inbound Reticulum links.
 pub struct ReticulumServer {
@@ -28,25 +29,37 @@ impl ReticulumServer {
     /// Accept inbound links on `transport` forever, serving each on its own
     /// task. The transport's destination(s) must already be registered (via
     /// `add_destination`) and announced so peers can link to it.
-    pub async fn serve(self, transport: Arc<RnsTransport>) {
-        let mut events = transport.in_link_events();
+    pub async fn serve(self, transport: Arc<Mutex<RnsTransport>>) {
+        let mut events = transport.lock().await.in_link_events();
         while let Ok(ev) = events.recv().await {
             let LinkEvent::Activated = ev.event else {
                 continue;
             };
             // Subscribe this link's stream before fetching the handle so no
             // early request data slips past between activation and wrapping.
-            let stream_events = transport.in_link_events();
-            let Some(link) = transport.find_in_link(&ev.id).await else {
+            let stream_events = transport.lock().await.in_link_events();
+            let Some(link) = transport.lock().await.find_in_link(&ev.id).await else {
                 continue;
             };
-
-            let stream = Box::pin(ReticulumStream::wrap(
-                transport.clone(),
-                link,
-                ev.id,
-                stream_events,
-            ));
+            let protocol = stream_protocol(&link.lock().await.destination().name);
+            let stream: epix_transport::PeerStream = match protocol {
+                Ok(StreamProtocol::Legacy) => Box::pin(ReticulumStream::wrap(
+                    transport.clone(),
+                    link,
+                    ev.id,
+                    stream_events,
+                )),
+                Ok(StreamProtocol::Reliable) => {
+                    match ReliableStream::wrap(transport.clone(), link, ev.id).await {
+                        Ok(stream) => Box::pin(stream),
+                        Err(_) => continue,
+                    }
+                }
+                Err(_) => {
+                    let _ = transport.lock().await.link_close(ev.id).await;
+                    continue;
+                }
+            };
 
             let edx = self.edx.clone();
             tokio::spawn(async move {

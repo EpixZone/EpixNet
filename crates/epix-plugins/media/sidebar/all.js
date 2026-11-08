@@ -1093,6 +1093,31 @@ window.initScrollable = function (chrome) {
       })(this));
     };
 
+    Sidebar.prototype.addPeer = function() {
+      var input = this.tag.find("#peer-endpoint");
+      var peer = input.val().trim();
+      if (!peer || this.addingPeer) return;
+      this.addingPeer = true;
+      var sidebar = this;
+      this.wrapper.ws.cmd("peerAdd", {
+        peer: peer,
+        site_address: this.wrapper.xite_info.address
+      }, function(res) {
+        sidebar.addingPeer = false;
+        if (res === "updated") {
+          input.val("");
+          sidebar.wrapper.notifications.add("peer-add", "done", "Peer added", 5000);
+          sidebar.updateHtmlTag();
+        } else {
+          var detail = res && typeof res.error === "string" ? res.error : "Could not add this peer";
+          // Notifications render HTML; the endpoint/error is untrusted text.
+          sidebar.wrapper.notifications.add("peer-add", "error", detail.replace(/[&<>"']/g, function(character) {
+            return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[character];
+          }), 10000);
+        }
+      });
+    };
+
     Sidebar.prototype.onOpened = function() {
       var menu;
       this.log("Opened");
@@ -1296,6 +1321,13 @@ window.initScrollable = function (chrome) {
       this.tag.find("#link-directory").off("click touchend").on("click touchend", (function(_this) {
         return function() {
           _this.wrapper.ws.cmd("serverShowdirectory", ["xite", _this.wrapper.xite_info.address]);
+          return false;
+        };
+      })(this));
+      this.tag.find("#form-addpeer").off("submit").on("submit", (function(_this) {
+        return function(e) {
+          e.preventDefault();
+          _this.addPeer();
           return false;
         };
       })(this));

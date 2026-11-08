@@ -4381,6 +4381,8 @@ pub struct AppState {
     bad_certs: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Our Reticulum mesh address (destination hash, hex), once the mesh is up.
     rns_address: RwLock<Option<String>>,
+    /// Reliable mesh endpoint; the legacy endpoint remains the global advert.
+    rns_reliable_address: RwLock<Option<String>>,
     /// In-memory announce tracker: peers other nodes announced to us, keyed by
     /// xite hash, so this node answers `announce` like a Bootstrapper.
     tracker: crate::tracker::TrackerDb,
@@ -5733,6 +5735,7 @@ impl AppState {
             ui_loopback: RwLock::new(false),
             bad_certs: std::sync::Mutex::new(std::collections::HashSet::new()),
             rns_address: RwLock::new(None),
+            rns_reliable_address: RwLock::new(None),
             tracker: crate::tracker::TrackerDb::new(),
             pins_path: persist.pins_path,
             updates_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -8592,10 +8595,8 @@ impl AppState {
             PeerAddr::I2p { dest, .. } => {
                 self.i2p_address().await.as_deref() == Some(dest.as_str())
             }
-            PeerAddr::Rns(_) => match self.rns_address().await {
-                Some(r) => addr.to_string() == format!("rns:{}", r.to_lowercase()),
-                None => false,
-            },
+            PeerAddr::Rns(_) => [self.rns_address().await, self.rns_reliable_address().await]
+                .iter().flatten().any(|r| addr.to_string() == format!("rns:{}", r.to_lowercase())),
             PeerAddr::Session { .. } => false,
         }
     }
@@ -10913,6 +10914,16 @@ impl AppState {
     /// Our mesh destination hash (hex), once the mesh is up.
     pub async fn rns_address(&self) -> Option<String> {
         self.rns_address.read().await.clone()
+    }
+
+    /// Record the reliable v2 endpoint without changing legacy peer adverts.
+    pub async fn set_rns_reliable_address(&self, hex: &str) {
+        *self.rns_reliable_address.write().await = Some(hex.to_string());
+    }
+
+    /// Reliable mesh destination hash, once the mesh is up.
+    pub async fn rns_reliable_address(&self) -> Option<String> {
+        self.rns_reliable_address.read().await.clone()
     }
 
     /// Record this build's short git commit (reported in `serverInfo.rev`).
@@ -33466,8 +33477,28 @@ impl AppState {
 
     /// Add a peer (ip + port) to a xite's known-peer set (`peerAdd`).
     pub async fn add_peer_ipport(&self, address: &str, ip: &str, port: u16) -> Result<(), String> {
-        let peer = PeerAddr::parse(&format!("{ip}:{port}")).map_err(|e| e.to_string())?;
-        self.add_peers(address, [peer]).await;
+        self.add_peer_endpoint(address, &format!("{ip}:{port}")).await
+    }
+
+    /// Add an operator-selected endpoint through the normal peer registry.
+    /// This does not enable an interface or change the node's routing policy.
+    pub async fn add_peer_endpoint(&self, address: &str, endpoint: &str) -> Result<(), String> {
+        let peer = PeerAddr::parse(endpoint).map_err(|e| e.to_string())?;
+        if !peer.is_wellformed() || matches!(&peer, PeerAddr::Ip(socket) if socket.port() == 0) {
+            return Err("Peer endpoint is not connectable".into());
+        }
+        let canonical = self.canonical_key(address).await;
+        if !self.has_xite(&canonical).await {
+            return Err(format!("Unknown xite: {address}"));
+        }
+        if self.is_own_peer(&peer).await {
+            return Err("This endpoint belongs to this node".into());
+        }
+        self.add_peers(&canonical, [peer]).await;
+        // Explicit operator choices must survive a process stop even when no
+        // trackers are configured and the periodic announce pass never runs.
+        // persist_peers keeps the existing PeerDb opt-out in force.
+        self.persist_peers().await;
         Ok(())
     }
 

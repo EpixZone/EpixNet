@@ -43,9 +43,11 @@ pub struct MeshConfig {
 /// A running mesh presence: the Reticulum node, our announced destination,
 /// and the adapters that put the wire protocol on top.
 pub struct MeshNode {
-    transport: Arc<RnsTransport>,
+    transport: Arc<Mutex<RnsTransport>>,
     destination: Arc<Mutex<SingleInputDestination>>,
+    legacy_destination: Arc<Mutex<SingleInputDestination>>,
     dest_hash: [u8; 16],
+    reliable_dest_hash: [u8; 16],
 }
 
 impl MeshNode {
@@ -70,30 +72,41 @@ impl MeshNode {
             None => PrivateIdentity::new_from_rand(OsRng),
         };
 
-        let mut transport =
-            RnsTransport::new(TransportConfig::new("epix", &identity, true));
-        let destination =
-            transport.add_destination(identity, DestinationName::new("epix", "node")).await;
-        let transport = Arc::new(transport);
+        let mut transport = RnsTransport::new(TransportConfig::new("epix", &identity, true));
+        let legacy_destination = transport
+            .add_destination(identity.clone(), DestinationName::new("epix", "node"))
+            .await;
+        let destination = transport
+            .add_destination(identity, DestinationName::new("epix", "node.v2"))
+            .await;
+        let transport = Arc::new(Mutex::new(transport));
 
         let mut dest_hash = [0u8; 16];
-        dest_hash.copy_from_slice(destination.lock().await.desc.address_hash.as_slice());
+        dest_hash.copy_from_slice(legacy_destination.lock().await.desc.address_hash.as_slice());
+        let mut reliable_dest_hash = [0u8; 16];
+        reliable_dest_hash.copy_from_slice(destination.lock().await.desc.address_hash.as_slice());
 
         {
-            let manager = transport.iface_manager();
-            let mut manager = manager.lock().await;
+            let manager_shared = transport.lock().await.iface_manager();
+            let mut manager = manager_shared.lock().await;
             for peer in &config.tcp_peers {
                 manager.spawn(TcpClient::new(peer.clone()), TcpClient::spawn);
             }
             if let Some(listen) = &config.tcp_listen {
                 manager.spawn(
-                    TcpServer::new(listen.clone(), transport.iface_manager()),
+                    TcpServer::new(listen.clone(), manager_shared.clone()),
                     TcpServer::spawn,
                 );
             }
         }
 
-        Ok(MeshNode { transport, destination, dest_hash })
+        Ok(MeshNode {
+            transport,
+            destination,
+            legacy_destination,
+            dest_hash,
+            reliable_dest_hash,
+        })
     }
 
     /// Our mesh address (the destination hash peers dial).
@@ -106,6 +119,14 @@ impl MeshNode {
         self.dest_hash.iter().map(|b| format!("{b:02x}")).collect()
     }
 
+    /// Reliable v2 destination, signed by the same persistent mesh identity.
+    pub fn reliable_dest_hash_hex(&self) -> String {
+        self.reliable_dest_hash
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect()
+    }
+
     /// A dialing [`ReticulumTransport`] over this mesh node.
     pub fn transport(&self) -> ReticulumTransport {
         ReticulumTransport::new(self.transport.clone())
@@ -116,9 +137,13 @@ impl MeshNode {
     pub fn spawn_announce(&self, interval: Duration) -> tokio::task::JoinHandle<()> {
         let transport = self.transport.clone();
         let destination = self.destination.clone();
+        let legacy_destination = self.legacy_destination.clone();
         tokio::spawn(async move {
             loop {
+                let transport = transport.lock().await;
                 transport.send_announce(&destination, None).await;
+                transport.send_announce(&legacy_destination, None).await;
+                drop(transport);
                 tokio::time::sleep(interval).await;
             }
         })
@@ -128,6 +153,8 @@ impl MeshNode {
     /// forever; spawn it. `edx` must be the no-Noise overlay hook - an RNS
     /// link already encrypts.
     pub async fn serve(&self, edx: epix_protocol::EdxHook) {
-        ReticulumServer::new(edx).serve(self.transport.clone()).await;
+        ReticulumServer::new(edx)
+            .serve(self.transport.clone())
+            .await;
     }
 }
