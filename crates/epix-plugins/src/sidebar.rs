@@ -370,6 +370,7 @@ fn render_sidebar(
           <li><span>Stored</span><b>{size_mb:.2}MB</b></li>\
          </ul><div class='sidebar-file-actions'>\
           <a href='/list/{addr}' class='button' id='browse-files'>Browse files</a>\
+          <a href='#Directory' id='link-directory' class='button'>Show directory</a>\
           <a href='/EpixNet-Internal/Zip?address={addr}' id='link-zip' class='button' download='xite.zip'>Save as .zip</a>\
          </div></li>",
         addr = esc(address),
@@ -464,8 +465,6 @@ fn render_sidebar(
          <div class='sidebar-file-actions'>\
           <a href='#DB-Reload' class='button' id='button-dbreload'>Reload schema</a>\
           <a href='#DB-Rebuild' class='button' id='button-dbrebuild'>Rebuild database</a></div></li>\
-         <li class='sidebar-section'><h2>Xite files</h2>\
-          <a href='#Directory' id='link-directory' class='button'>Show directory</a></li>\
          <li class='sidebar-section sidebar-danger'><h2>Remove xite</h2>\
           <p class='sidebar-help'>Remove this xite from your node.</p>\
           <a href='#Delete' class='button' id='button-delete'>Delete xite</a></li>\
@@ -504,11 +503,11 @@ mod tests {
             assert!(overview.contains(&format!("id='{id}'")), "overview control {id}");
         }
         assert!(overview.contains("Data transfer"));
-        for id in ["browse-files", "link-zip", "input-xitelimit", "button-xitelimit", "checkbox-downloadoptional", "checkbox-autodownloadoptional"] {
+        for id in ["browse-files", "link-directory", "link-zip", "input-xitelimit", "button-xitelimit", "checkbox-downloadoptional", "checkbox-autodownloadoptional"] {
             assert!(files.contains(&format!("id='{id}'")), "files control {id}");
         }
         assert!(files.contains("1 file(s)"), "unsynced files stay with storage");
-        for id in ["checkbox-owned", "settings-title", "settings-description", "settings-xid-name", "button-settings", "input-contents", "button-sign-publish", "menu-sign-publish", "button-dbreload", "button-dbrebuild", "link-directory", "button-delete"] {
+        for id in ["checkbox-owned", "settings-title", "settings-description", "settings-xid-name", "button-settings", "input-contents", "button-sign-publish", "menu-sign-publish", "button-dbreload", "button-dbrebuild", "button-delete"] {
             assert!(manage.contains(&format!("id='{id}'")), "manage control {id}");
             assert_eq!(html.matches(&format!("id='{id}'")).count(), 1, "unique action {id}");
         }

@@ -256,6 +256,8 @@ async function noOverflow(page) {
     await page.locator("#optional-files-toggle").click();
     await page.locator("#optional-file-list").waitFor({state: "visible"});
     assert.equal(await page.locator("#browse-files").getAttribute("href"), "/list/" + address);
+    assert.equal(await page.locator("#sidebar-panel-files #link-directory").isVisible(), true);
+    await command(page, "serverShowdirectory", () => page.locator("#link-directory").click());
     const downloadEvent = page.waitForEvent("download"); await page.locator("#link-zip").click();
     assert.equal((await downloadEvent).suggestedFilename(), "xite.zip");
     info.settings.size_optional = 0; info.optional_progress = null;
@@ -265,7 +267,7 @@ async function noOverflow(page) {
     results.cases.push("files, storage limit, conditional optional files, dependency, progress and ZIP");
 
     await tab(page, "manage");
-    for (const [id, name] of [["button-dbreload", "dbReload"], ["button-dbrebuild", "dbRebuild"], ["link-directory", "serverShowdirectory"]]) {
+    for (const [id, name] of [["button-dbreload", "dbReload"], ["button-dbrebuild", "dbRebuild"]]) {
       await command(page, name, () => page.locator("#" + id).click());
     }
     await command(page, "siteRecoverPrivatekey", () => page.locator("#checkbox-owned").check());
