@@ -10,6 +10,10 @@ cargo-fuzz = true
 [workspace]
 members = ["."]
 
+[patch.crates-io]
+# Match the application's patched SQLite dependency.
+rusqlite = { path = "../vendor/rusqlite" }
+
 [features]
 runtime = ["dep:evx-runtime"]
 state = ["dep:evx-state"]

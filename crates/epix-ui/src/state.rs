@@ -1198,23 +1198,41 @@ impl ManifestLease {
         inner_path: &str,
         bytes: &[u8],
     ) -> Result<String, String> {
-        let staged_inner = self.register_staged(storage, inner_path, None)?;
+        if storage.root() != self.storage_root {
+            return Err("staged materialization belongs to another storage root".into());
+        }
+        let recovery_id = epix_blob::ObjId::of(bytes);
+        // The recovery journal authenticates these bytes by digest just like
+        // an EDX object. Use its canonical namespace even without a Store row.
+        let staged_inner = format!("objects/{recovery_id}/{inner_path}");
+        let staged_path = XiteStorage::new(self.stage_root.clone())
+            .path(&staged_inner)
+            .map_err(|error| error.to_string())?;
         let mut cleanup = self
             .cleanup
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let staged = cleanup
-            .files
-            .get_mut(inner_path)
-            .ok_or_else(|| format!("staged byte registration disappeared: {inner_path}"))?;
-        let recovery_id = epix_blob::ObjId::of(bytes);
-        if staged
-            .recovery_id
-            .is_some_and(|existing| existing != recovery_id)
-        {
-            return Err(format!("conflicting staged bytes for {inner_path}"));
+        if let Some(staged) = cleanup.files.get_mut(inner_path) {
+            let existing_id = staged.object.as_ref().map(|(_, id)| *id).or(staged.recovery_id);
+            if staged.merge_records
+                || existing_id != Some(recovery_id)
+                || staged.recovery_id.is_some_and(|id| id != recovery_id)
+                || staged.staged_inner != staged_inner
+                || staged.staged_path != staged_path
+            {
+                return Err(format!("conflicting staged bytes for {inner_path}"));
+            }
+            staged.recovery_id = Some(recovery_id);
+            return Ok(staged_inner);
         }
-        staged.recovery_id = Some(recovery_id);
+        cleanup.files.insert(inner_path.to_string(), StagedMaterialization {
+            inner_path: inner_path.to_string(),
+            staged_inner: staged_inner.clone(),
+            staged_path,
+            object: None,
+            recovery_id: Some(recovery_id),
+            merge_records: false,
+        });
         Ok(staged_inner)
     }
 
@@ -4797,6 +4815,12 @@ pub struct UserContentSigner {
     pub cert_user_id: Option<String>,
     pub cert_auth_type: Option<String>,
     pub cert_sign: Option<String>,
+}
+
+struct SignedFileWrite {
+    inner_path: String,
+    bytes: Vec<u8>,
+    expected: Vec<u8>,
 }
 
 impl UserContentSigner {
@@ -10502,6 +10526,7 @@ impl AppState {
                 Some((rel[..end].replace("-default", ""), end < rel.len()))
             })
             .collect();
+        let mut initialized_manifests = std::collections::HashSet::new();
         for inner in &files {
             let Some(rel) = inner.strip_prefix(&prefix) else {
                 continue;
@@ -10531,6 +10556,9 @@ impl AppState {
             dst_storage
                 .write(rel, &bytes)
                 .map_err(|e| format!("Could not copy {inner} to {rel}: {e}"))?;
+            if !is_upgrade && rel.ends_with("/content.json") {
+                initialized_manifests.insert(rel.to_string());
+            }
             if is_default {
                 let target_rel = rel.replace("-default", "");
                 // An evicted optional file still belongs to the owner. Do not
@@ -10544,6 +10572,66 @@ impl AppState {
                     dst_storage
                         .write(&target_rel, &bytes)
                         .map_err(|e| format!("Could not initialize {target_rel}: {e}"))?;
+                    if target_rel.ends_with("/content.json") {
+                        initialized_manifests.insert(target_rel);
+                    }
+                }
+            }
+        }
+        // Discover explicit includes parent-first before signing the root.
+        // Validate initialized templates with path-specific errors, but leave
+        // unrelated manifests and dynamic user_contents authors untouched.
+        let mut manifests_to_sign = Vec::new();
+        let mut pending = std::collections::VecDeque::from(["content.json".to_string()]);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(path) = pending.pop_front() {
+            if !visited.insert(path.clone()) {
+                continue;
+            }
+            let initialized = initialized_manifests.contains(&path);
+            let manifest = if path == "content.json" {
+                content.clone()
+            } else {
+                let bytes = match dst_storage.read(&path) {
+                    Ok(bytes) => bytes,
+                    Err(epix_core::Error::Io(error))
+                        if !initialized && error.kind() == std::io::ErrorKind::NotFound =>
+                    {
+                        continue;
+                    }
+                    Err(error) => {
+                        return Err(format!("Could not read cloned manifest {path}: {error}"));
+                    }
+                };
+                match serde_json::from_slice::<Value>(&bytes) {
+                    Ok(manifest) => manifest,
+                    Err(error) if initialized => {
+                        return Err(format!("Invalid cloned manifest {path}: {error}"));
+                    }
+                    // An upgrade can retain an unpublished existing manifest.
+                    Err(_) => continue,
+                }
+            };
+            if initialized && !manifest.is_object() {
+                return Err(format!("Invalid cloned manifest {path}: expected an object"));
+            }
+            if initialized {
+                manifests_to_sign.push(path.clone());
+            }
+            if let Some(includes) = manifest.get("includes").and_then(Value::as_object) {
+                let directory = path
+                    .rsplit_once('/')
+                    .map(|(dir, _)| format!("{dir}/"))
+                    .unwrap_or_default();
+                for relative in includes.keys() {
+                    if !epix_content::verify::is_valid_relative_path(relative) {
+                        return Err(format!("Invalid cloned include {relative} in {path}"));
+                    }
+                    let child = format!("{directory}{relative}");
+                    dst_storage
+                        .path(&child)
+                        .map_err(|error| format!("Invalid cloned include {child}: {error}"))?;
+                    pending.push_back(child);
                 }
             }
         }
@@ -10577,6 +10665,17 @@ impl AppState {
             },
         )
         .await?;
+        // A root signature alone does not authorize writes below an unsigned
+        // user_contents manifest. Initialize declared includes parent-first
+        // with the new owner's key before returning the clone to the page.
+        // Upgrades sign only newly seeded defaults; existing default-backed
+        // manifests keep the owner's exact bytes. Missing includes remain
+        // available for lazy creation; cloning must not invent their contents.
+        for path in manifests_to_sign {
+            self.sign_user_content(&address, &path, Some(privatekey.clone()), None)
+                .await
+                .map_err(|error| format!("Could not initialize cloned manifest {path}: {error}"))?;
+        }
         self.set_owned(&address, true).await;
         self.log(
             "INFO",
@@ -24739,6 +24838,19 @@ impl AppState {
             Self::verify_staged_materialization(transaction, &entry)?;
             let (lower, upper) =
                 epix_content::verify::portable_path_case_keys(&entry.inner_path);
+            let (governing_lower, governing_upper) =
+                epix_content::verify::portable_path_case_keys(&lease.governing);
+            if lower == governing_lower || upper == governing_upper {
+                return Err(format!("staged path aliases governing manifest: {}", entry.inner_path));
+            }
+            if let Some(candidate) = candidate_lower.get(&lower).or_else(|| candidate_upper.get(&upper)) {
+                if candidate != &entry.inner_path {
+                    return Err(format!(
+                        "staged path case-aliases candidate destination: {} and {candidate}",
+                        entry.inner_path
+                    ));
+                }
+            }
             let previous = claimed_lower
                 .get(&lower)
                 .or_else(|| claimed_upper.get(&upper));
@@ -27754,6 +27866,46 @@ impl AppState {
         self.sign_user_content_with(address, content_inner_path, Some(signer), origin).await
     }
 
+    /// Replace an existing required child file and its verified signature in
+    /// one staged transaction. A stale page or rejected signer changes neither
+    /// the live file nor the accepted manifest.
+    pub async fn write_file_signed(
+        &self,
+        address: &str,
+        inner_path: &str,
+        bytes: &[u8],
+        expected: &[u8],
+        privatekey: Option<String>,
+        origin: Option<u64>,
+    ) -> Result<(), String> {
+        if !epix_content::verify::is_valid_relative_path(inner_path)
+            || inner_path == "content.json"
+            || inner_path.ends_with("/content.json")
+        {
+            return Err("signed writes require a normal child data file".into());
+        }
+        let state = self.owned_state();
+        let address = address.to_string();
+        let replacement = SignedFileWrite {
+            inner_path: inner_path.to_string(),
+            bytes: bytes.to_vec(),
+            expected: expected.to_vec(),
+        };
+        tokio::spawn(async move {
+            state.require_identity_for(&address, &replacement.inner_path).await?;
+            let governing = state.content_inner_path(&address, &replacement.inner_path).await;
+            if governing == "content.json" || !governing.ends_with("/content.json") {
+                return Err("signed writes require a child content.json".into());
+            }
+            state.sign_user_content_owned(
+                &address, &governing, privatekey.map(UserContentSigner::raw_key),
+                origin, Some(replacement),
+            ).await
+        })
+        .await
+        .map_err(|error| format!("Signed file write completion failed: {error}"))?
+    }
+
     async fn sign_user_content_with(
         &self,
         address: &str,
@@ -27771,6 +27923,7 @@ impl AppState {
                     &content_inner_path,
                     signer,
                     origin,
+                    None,
                 )
                 .await
         })
@@ -27804,6 +27957,7 @@ impl AppState {
         content_inner_path: &str,
         signer: Option<UserContentSigner>,
         origin: Option<u64>,
+        replacement: Option<SignedFileWrite>,
     ) -> Result<(), String> {
         let activation = self.xite_activation_gate.clone().read_owned().await;
         let (storage, canonical, managed_content) = {
@@ -27872,6 +28026,29 @@ impl AppState {
             .ok()
             .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
             .unwrap_or_else(|| json!({}));
+        let mut replacements = std::collections::BTreeMap::new();
+        if let Some(replacement) = &replacement {
+            let path = &replacement.inner_path;
+            if self.content_inner_path(address, path).await != content_inner_path {
+                return Err("the governing manifest changed before the signed write".into());
+            }
+            let prefix = content_inner_path.strip_suffix("content.json").unwrap();
+            let relative = path.strip_prefix(prefix)
+                .ok_or("signed write escaped its governing manifest")?;
+            if !current_content.get("files").and_then(|files| files.get(relative)).is_some()
+                || ["files_optional", "files_merged", "files_shard"].iter().any(|section| {
+                    current_content.get(section).and_then(|files| files.get(relative)).is_some()
+                })
+            {
+                return Err("signed writes require an existing required hashed file".into());
+            }
+            let current = storage.read(path)
+                .map_err(|error| format!("Could not read file before signed write: {error}"))?;
+            if current != replacement.expected {
+                return Err("File changed since it was read. Reload and retry the update.".into());
+            }
+            replacements.insert(path.clone(), replacement.bytes.clone());
+        }
         let rules = Self::child_rules_from_authority(
             &authority,
             content_inner_path,
@@ -27904,12 +28081,13 @@ impl AppState {
             staged: None,
         };
         let prepared = xite
-            .prepare_child_sign_with_context(
+            .prepare_child_sign_with_replacements(
                 content_inner_path,
                 &key,
                 modified,
                 &extend,
                 &context,
+                &replacements,
             )
             .map_err(|e| e.to_string())?;
         let signed = prepared.content().clone();
@@ -27929,10 +28107,23 @@ impl AppState {
         for (inner_path, bytes) in prepared.pruned_files() {
             let staged_inner = transaction
                 .lease
-                .register_staged(&storage, inner_path, None)?;
+                .register_staged_bytes(&storage, inner_path, bytes)?;
             stage_storage
                 .write_atomic_durable(&staged_inner, bytes)
                 .map_err(|error| error.to_string())?;
+        }
+        if let Some(replacement) = &replacement {
+            // Preserve the first JSON version until the existing inline diff
+            // publisher consumes it. The snapshot is committed with the edit,
+            // so a rejected signature cannot leave even a transient draft.
+            let old_path = format!("{}-old", replacement.inner_path);
+            if replacement.inner_path.ends_with(".json") && !storage.exists(&old_path) {
+                let staged_inner = transaction.lease.register_staged_bytes(
+                    &storage, &old_path, &replacement.expected,
+                )?;
+                stage_storage.write_atomic_durable(&staged_inner, &replacement.expected)
+                    .map_err(|error| error.to_string())?;
+            }
         }
         drop(tree);
         let mut payload = UpdatePayload::default();
@@ -27946,8 +28137,18 @@ impl AppState {
             &mut payload,
         )
         .await?;
-        self.verify_current_store_xite_activated(address, &canonical, &storage)
-            .await?;
+        let store_result = self.verify_current_store_xite_activated(address, &canonical, &storage)
+            .await;
+        if replacement.is_some() {
+            // The data and signature are already durably committed. A Store
+            // maintenance failure must not masquerade as a rejected edit or
+            // cause a client to roll back a later writer's accepted update.
+            if let Err(error) = store_result {
+                self.log("WARN", format!("Signed file committed; Store refresh deferred: {error}")).await;
+            }
+        } else {
+            store_result?;
+        }
         self.log("INFO", format!("Signed {content_inner_path} on {address}")).await;
         // The Store check above still needs the activation read; the ingest
         // takes its own, so the transaction's goes first.
@@ -27958,7 +28159,8 @@ impl AppState {
 
     /// The per-file diffs for a publish (EpixNet's `getDiffs`): for each file
     /// of `content_inner_path` with a `<file>-old` snapshot (kept by
-    /// [`Self::write_file`]), diff old vs current and drop the snapshot. Keys
+    /// [`Self::write_file`] or [`Self::write_file_signed`]), diff old vs current
+    /// and drop the snapshot before peer delivery. Keys
     /// are relative to the content.json's directory, as Python peers expect.
     pub async fn take_diffs(
         &self,
@@ -27966,10 +28168,26 @@ impl AppState {
         content_inner_path: &str,
     ) -> HashMap<String, Vec<epix_content::DiffAction>> {
         let mut out = HashMap::new();
-        let Some(storage) = self.xites.read().await.get(address).map(|x| x.storage.clone())
-        else {
+        let _activation = self.activation_read_fresh().await;
+        let Some((storage, canonical)) = self.xites.read().await.get(address).map(|xite| {
+            (xite.storage.clone(), canonical_address(xite.content.as_ref(), address))
+        }) else {
             return out;
         };
+        // A staged promotion owns both the new file and its publication
+        // snapshot until commit or rollback completes. A publisher must not
+        // consume that snapshot while the transaction may still need it.
+        let Ok(_manifest) = self.acquire_manifest_mutex(&canonical, content_inner_path).await else {
+            return out;
+        };
+        let _tree = self.tree_mutation_lock(&canonical).lock_owned().await;
+        let current_matches = self.xites.read().await.get(address).is_some_and(|xite| {
+            canonical_address(xite.content.as_ref(), address) == canonical
+                && xite.storage.root() == storage.root()
+        });
+        if !current_matches {
+            return out;
+        }
         let Some(files) = storage
             .read(content_inner_path)
             .ok()
@@ -34505,6 +34723,14 @@ fn next_size_limit(size_bytes: i64) -> i64 {
 #[cfg(test)]
 #[path = "state/tests/xite_key_recovery.rs"]
 mod xite_key_recovery_tests;
+
+#[cfg(test)]
+#[path = "state/tests/signed_file_write.rs"]
+mod signed_file_write_tests;
+
+#[cfg(test)]
+#[path = "state/tests/staged_bytes_recovery.rs"]
+mod staged_bytes_recovery_tests;
 
 #[cfg(test)]
 mod tests {

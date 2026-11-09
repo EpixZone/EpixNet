@@ -394,20 +394,23 @@ fn http_server_enforces_host_methods_ranges_and_exact_catalog() {
     );
     assert_eq!(
         client
-            .get(format!("{url}?ignored=1"))
-            .send()
-            .unwrap()
-            .status(),
-        404
-    );
-    assert_eq!(
-        client
             .get(&url)
             .header("Range", "bytes=999-")
             .send()
             .unwrap()
             .status(),
         416
+    );
+    // The server handles one request at a time. Finish with a route rejection,
+    // which opens no file, so the prior response has released its checked
+    // descriptor before this test mutates the fixture on Windows.
+    assert_eq!(
+        client
+            .get(format!("{url}?ignored=1"))
+            .send()
+            .unwrap()
+            .status(),
+        404
     );
     fs::write(f.snapshot.join("repo/fixture.1.nupkg"), b"mutation").unwrap();
     assert_eq!(client.get(&url).send().unwrap().status(), 409);

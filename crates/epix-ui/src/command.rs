@@ -171,6 +171,7 @@ const DELETE_XITE_COMMANDS: &[&str] = &["siteDelete", "mergerSiteDelete"];
 /// delete files on a xite the gateway only serves.
 const WRITE_COMMANDS: &[&str] = &[
     "fileWrite",
+    "fileWriteSign",
     "fileDelete",
     "siteSign",
     "sitePublish",
@@ -685,6 +686,7 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(XiteSign),
         Arc::new(XitePublish),
         Arc::new(FileWrite),
+        Arc::new(FileWriteSign),
         Arc::new(FileDelete),
         Arc::new(FileRules),
         Arc::new(CorsPermission),
@@ -2072,6 +2074,36 @@ impl WsCommand for FileWrite {
     }
 }
 
+/// Atomically replace an existing child file and sign its governing manifest.
+/// The caller supplies the exact bytes it read, so a concurrent edit is rejected.
+struct FileWriteSign;
+#[async_trait]
+impl WsCommand for FileWriteSign {
+    fn name(&self) -> &'static str {
+        "fileWriteSign"
+    }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let inner_path = p.get("inner_path").and_then(Value::as_str)
+            .ok_or("fileWriteSign: inner_path required")?;
+        let encoded = p.get("content_base64").and_then(Value::as_str)
+            .ok_or("fileWriteSign: content_base64 required")?;
+        let expected = p.get("expected_base64").and_then(Value::as_str)
+            .ok_or("fileWriteSign: expected_base64 required")?;
+        let bytes = b64_decode(encoded).ok_or("fileWriteSign: invalid content_base64")?;
+        let expected = b64_decode(expected).ok_or("fileWriteSign: invalid expected_base64")?;
+        let (target, inner) = s.resolve_target(inner_path).await?;
+        // The dispatcher checks the bound xite. Cross-xite routing must also
+        // check the resolved target, even when the caller owns its own xite.
+        if s.state.ui_restrict().await && !s.trusted && !s.state.xite_owned(&target).await {
+            return Err("This node is a read-only gateway; changes are disabled here".into());
+        }
+        let privatekey = resolve_signing_privatekey(s, &target, sign_privatekey(p)).await?;
+        s.state.write_file_signed(&target, &inner, &bytes, &expected, privatekey, Some(s.id)).await?;
+        s.state.push_xite_info(&target).await;
+        Ok(Value::from("ok"))
+    }
+}
+
 /// `fileDelete(inner_path)` - delete a file from the xite (optional files are
 /// also removed from content.json's `files_optional`, like EpixNet).
 struct FileDelete;
@@ -2440,18 +2472,7 @@ async fn sign_for(
     privatekey: Option<String>,
     opts: epix_xite::SignOpts,
 ) -> Result<String, String> {
-    // `"stored"` is EpixNet's sentinel for "use the xite key saved in
-    // users.json" (the sidebar and wrapper infopanel send it when
-    // xite_info.privatekey is true) - never a literal key.
-    let privatekey = match privatekey {
-        Some(pk) if pk == "stored" => Some(
-            s.state
-                .xite_privatekey(address)
-                .await
-                .ok_or("Xite sign failed: Private key not found in users.json")?,
-        ),
-        other => other,
-    };
+    let privatekey = resolve_signing_privatekey(s, address, privatekey).await?;
     let content_path = s.state.content_inner_path(address, inner_path).await;
     if content_path == "content.json" {
         let key = match privatekey {
@@ -2467,6 +2488,25 @@ async fn sign_for(
         s.state.sign_user_content(address, &content_path, privatekey, Some(s.id)).await?;
     }
     Ok(content_path)
+}
+
+async fn resolve_signing_privatekey(
+    s: &WsSession,
+    address: &str,
+    privatekey: Option<String>,
+) -> Result<Option<String>, String> {
+    // `"stored"` is EpixNet's sentinel for "use the xite key saved in
+    // users.json" (the sidebar and wrapper infopanel send it when
+    // xite_info.privatekey is true) - never a literal key.
+    match privatekey {
+        Some(pk) if pk == "stored" => Ok(Some(
+            s.state
+                .xite_privatekey(address)
+                .await
+                .ok_or("Xite sign failed: Private key not found in users.json")?,
+        )),
+        other => Ok(other),
+    }
 }
 
 /// The sign options of a sign command: `full` re-hashes every file instead
@@ -4724,6 +4764,10 @@ impl WsCommand for SimpleCommand {
 #[cfg(test)]
 #[path = "command/tests/peer_add.rs"]
 mod peer_add_tests;
+
+#[cfg(test)]
+#[path = "command/tests/file_write_sign.rs"]
+mod file_write_sign_tests;
 
 #[cfg(test)]
 mod tests {

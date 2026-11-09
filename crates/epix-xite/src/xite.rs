@@ -2531,6 +2531,23 @@ impl Xite {
         extend: &serde_json::Map<String, Value>,
         context: &dyn VerifyContext,
     ) -> Result<PreparedChildSign> {
+        self.prepare_child_sign_with_replacements(
+            inner_path, privatekey, modified, extend, context,
+            &std::collections::BTreeMap::new(),
+        )
+    }
+
+    /// Prepare a signed replacement of existing required files without writing
+    /// live bytes. The returned staged files belong in the manifest transaction.
+    pub fn prepare_child_sign_with_replacements(
+        &self,
+        inner_path: &str,
+        privatekey: &str,
+        modified: f64,
+        extend: &serde_json::Map<String, Value>,
+        context: &dyn VerifyContext,
+        replacements: &std::collections::BTreeMap<String, Vec<u8>>,
+    ) -> Result<PreparedChildSign> {
         let Some((dir, name)) = inner_path.rsplit_once('/') else {
             return Err(Error::Protocol(format!("not a child content.json: {inner_path}")));
         };
@@ -2553,10 +2570,13 @@ impl Xite {
         // variants). Trim before hashing so the signed hashes reflect the
         // pruned data and the result passes the receiver's max_items check.
         let rules = epix_content::verify::get_rules(inner_path, &content, context);
-        let pruned_files = match &rules {
+        let mut pruned_files = match &rules {
             Some(rules) => self.pruned_data_files(dir, rules, modified)?,
             None => std::collections::BTreeMap::new(),
         };
+        // Explicit edits take precedence over pruning the old bytes. The
+        // candidate verifier below checks the edited bytes against the rules.
+        pruned_files.extend(replacements.clone());
         let map = content
             .as_object_mut()
             .ok_or_else(|| Error::Protocol("content.json is not a JSON object".into()))?;
@@ -2623,6 +2643,24 @@ impl Xite {
                 files_optional.retain(|name, _| epix_content::verify::regex_full_match(pat, name));
             }
         }
+        for path in replacements.keys() {
+            let relative = path.strip_prefix(&format!("{dir}/"));
+            if !epix_content::verify::is_valid_relative_path(path)
+                || !relative.is_some_and(|relative| files.contains_key(relative))
+            {
+                return Err(Error::Protocol(format!(
+                    "replacement is not an existing required file of {inner_path}: {path}"
+                )));
+            }
+        }
+        // Recursive pruning may encounter ignored files or another signed
+        // unit. Only stage edits whose hashes this candidate actually owns.
+        let prefix = format!("{dir}/");
+        pruned_files.retain(|path, _| {
+            path.strip_prefix(&prefix).is_some_and(|relative| {
+                files.contains_key(relative) || files_optional.contains_key(relative)
+            })
+        });
         map.insert("files".into(), Value::Object(files));
         Self::merge_files_optional(map, files_optional, declared_optional);
         if modified.fract() == 0.0 {

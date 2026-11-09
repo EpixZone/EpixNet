@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/rln", "vendor/ark-relations", "vendor/rdrand", "vendor/emissary-util", "vendor/askama_derive", "vendor/saturating-time", "vendor/reticulum"]
+exclude = ["vendor/rln", "vendor/ark-relations", "vendor/rdrand", "vendor/emissary-util", "vendor/askama_derive", "vendor/saturating-time", "vendor/reticulum", "vendor/rusqlite"]
 members = ["crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/epix-ui", "crates/epix-server", "crates/epix-chain", "crates/epix-dht", "crates/epix-dht-net", "crates/epix-reticulum", "crates/epix-propagation", "crates/epix-runtime", "crates/epix-user", "crates/epix-peer", "crates/epix-plugin", "crates/epix-plugins", "crates/epix-tor", "crates/epix-i2p", "crates/epix-node", "crates/iptproxy-sys", "crates/epix-ffi", "crates/epix-browser", "crates/epix-browser-net", "crates/epix-nmh", "crates/epix-build", "crates/epix-bt", "crates/xid-spike", "crates/epix-blob", "crates/epix-fs", "crates/epix-selfenc", "crates/epix-edx", "crates/epix-feed", "crates/epix-search", "crates/epix-envelope", "crates/epix-channel", "crates/epix-pairwise-engine", "crates/epix-group-engine", "crates/epix-rln", "crates/evx-api", "crates/evx-runtime", "crates/evx-worker", "crates/evx-supervisor", "crates/evx-state", "crates/evx-activation", "crates/evx-host", "crates/evx-workspace", "crates/evx-declaration", "crates/epix-evx", "crates/evx-windows", "crates/evx-android", "crates/evx-windows-native"]
 
 # saturating-time 0.5.0 hangs forever on Windows: its platform-limit search
@@ -10,6 +10,9 @@ members = ["crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crate
 # required by Arti 0.47. See vendor/saturating-time/EPIXNET_PATCH.md.
 [patch.crates-io]
 saturating-time = { path = "vendor/saturating-time" }
+# Keep Arti and r2d2 on their compatible rusqlite API while using patched SQLite.
+# See vendor/rusqlite/EPIXNET_PATCH.md.
+rusqlite = { path = "vendor/rusqlite" }
 # Vendored rln (zerokit) with the sled-backed tree + C FFI gated off by default.
 # Upstream rln pulls sled with the `compression` feature, which links native
 # zstd and conflicts with arti's async-compression zstd (`links = "zstd"` may
