@@ -588,6 +588,7 @@ body.theme-dark .sidebar {
     position: relative; width: min(280px, 100%); height: auto; aspect-ratio: 1;
     margin: 0 auto; border-radius: 10px; overflow: hidden; background-color: transparent;
 }
+.sidebar .sidebar-properties .globe:focus { outline: 2px solid transparent; }
 .sidebar .sidebar-properties .globe canvas { position: absolute !important; inset: 0; display: block; width: 100% !important; height: 100% !important; }
 .sidebar .sidebar-properties .globe.error {
     display: flex; align-items: center; justify-content: center;
