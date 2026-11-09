@@ -8,7 +8,7 @@ use path_requests::PathRequests;
 use path_requests::TagBytes;
 use path_table::PathTable;
 use rand_core::OsRng;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 use tokio::time;
 use tokio_util::sync::CancellationToken;
@@ -54,6 +54,9 @@ mod packet_cache;
 mod path_requests;
 mod path_table;
 
+#[cfg(test)]
+mod bounds_tests;
+
 // TODO: Configure via features
 const PACKET_TRACE: bool = false;
 pub const PATHFINDER_M: usize = 128; // Max hops
@@ -61,6 +64,11 @@ pub const PATHFINDER_M: usize = 128; // Max hops
 // Other constants
 const KEEP_ALIVE_REQUEST: u8 = 0xFF;
 const KEEP_ALIVE_RESPONSE: u8 = 0xFE;
+// Remote discovery and logical links share physical bearers; bounding only
+// sockets does not bound their memory. These limits leave live links intact.
+const MAX_REMOTE_DESTINATIONS: usize = 1024;
+const MAX_LOGICAL_LINKS: usize = 1024;
+const REMOTE_DESTINATION_TTL: Duration = Duration::from_secs(3600);
 
 #[derive(Clone)]
 pub struct ReceivedData {
@@ -143,6 +151,7 @@ pub(crate) struct TransportHandler {
     link_table: LinkTable,
     single_in_destinations: HashMap<AddressHash, Arc<Mutex<SingleInputDestination>>>,
     single_out_destinations: HashMap<AddressHash, Arc<Mutex<SingleOutputDestination>>>,
+    remote_announces: HashMap<AddressHash, time::Instant>,
 
     announce_limits: AnnounceLimits,
 
@@ -244,7 +253,8 @@ impl Transport {
         let (received_data_tx, _) = tokio::sync::broadcast::channel(16);
         let (iface_messages_tx, _) = tokio::sync::broadcast::channel(16);
 
-        let iface_manager = InterfaceManager::new(16);
+        let cancel = CancellationToken::new();
+        let iface_manager = InterfaceManager::with_cancellation(16, cancel.clone());
 
         let rx_receiver = iface_manager.receiver();
 
@@ -259,7 +269,6 @@ impl Transport {
 
         let path_request_dest = create_path_request_destination().desc.address_hash;
 
-        let cancel = CancellationToken::new();
         let name = config.name.clone();
         let reroute_eager = config.reroute_eager;
         let handler = Arc::new(Mutex::new(TransportHandler {
@@ -270,6 +279,7 @@ impl Transport {
             path_table: PathTable::new(reroute_eager),
             single_in_destinations: HashMap::new(),
             single_out_destinations: HashMap::new(),
+            remote_announces: HashMap::new(),
             announce_limits: AnnounceLimits::new(),
             out_links: HashMap::new(),
             in_links: HashMap::new(),
@@ -316,6 +326,17 @@ impl Transport {
 
     pub fn iface_manager(&self) -> Arc<Mutex<InterfaceManager>> {
         self.iface_manager.clone()
+    }
+
+    /// Explicit lifecycle boundary for embedders that retain in-flight streams.
+    pub fn shutdown(&self) {
+        self.cancel.cancel();
+    }
+
+    /// A retained lifecycle signal can revoke a generation without waiting
+    /// for a transport lock held by an in-flight peer operation.
+    pub fn shutdown_token(&self) -> CancellationToken {
+        self.cancel.clone()
     }
 
     pub fn iface_rx(&self) -> broadcast::Receiver<RxMessage> {
@@ -613,6 +634,67 @@ impl Drop for Transport {
 }
 
 impl TransportHandler {
+    fn forget_remote_destination(&mut self, address: &AddressHash) {
+        self.remote_announces.remove(address);
+        self.single_out_destinations.remove(address);
+        self.path_table.remove(address);
+        self.announce_limits.remove(address);
+        self.announce_table.remove_destination(address);
+    }
+
+    async fn prune_remote_destinations(&mut self, now: time::Instant) -> HashSet<AddressHash> {
+        self.link_table.remove_stale();
+        let mut protected: HashSet<_> = self.link_table.protected_destinations().collect();
+        for link in self.out_links.values() {
+            let link = link.lock().await;
+            if link.status() != LinkStatus::Closed {
+                protected.insert(link.destination().address_hash);
+            }
+        }
+        let expired: Vec<_> = self.remote_announces.iter()
+            .filter(|(address, seen)| now.duration_since(**seen) >= REMOTE_DESTINATION_TTL && !protected.contains(*address))
+            .map(|(address, _)| *address).collect();
+        for address in expired { self.forget_remote_destination(&address); }
+        protected
+    }
+
+    async fn admit_remote_destination(&mut self, address: AddressHash, now: time::Instant) -> bool {
+        if let Some(seen) = self.remote_announces.get_mut(&address) {
+            *seen = now;
+            return true;
+        }
+        let protected = self.prune_remote_destinations(now).await;
+        if self.remote_announces.len() >= MAX_REMOTE_DESTINATIONS {
+            let oldest = self.remote_announces.iter()
+                .filter(|(address, _)| !protected.contains(*address))
+                .min_by_key(|(_, seen)| *seen).map(|(address, _)| *address);
+            let Some(oldest) = oldest else { return false; };
+            self.forget_remote_destination(&oldest);
+        }
+        self.remote_announces.insert(address, now);
+        true
+    }
+
+    async fn admit_incoming_link(&mut self, id: &LinkId) -> bool {
+        if self.in_links.contains_key(id) || self.in_links.len() < MAX_LOGICAL_LINKS { return true; }
+        let mut expired = Vec::new();
+        let mut teardowns = Vec::new();
+        for (id, link) in &self.in_links {
+            let mut link = link.lock().await;
+            let stale = link.status() == LinkStatus::Stale
+                && link.elapsed() > self.config.timer_config.in_link_stale + self.config.timer_config.in_link_close;
+            if link.status() == LinkStatus::Closed || stale {
+                if stale {
+                    if let Ok(Some(packet)) = link.teardown() { teardowns.push(packet); }
+                }
+                expired.push(*id);
+            }
+        }
+        for id in expired { self.in_links.remove(&id); }
+        for packet in teardowns { self.send_packet(packet).await; }
+        self.in_links.len() < MAX_LOGICAL_LINKS
+    }
+
     async fn send_packet(&self, packet: Packet) {
         let (packet, iface) = if packet.header.packet_type == PacketType::LinkRequest {
             match self.path_table.get(&packet.destination) {
@@ -747,10 +829,10 @@ async fn send_to_next_hop<'a>(
 
 async fn handle_keepalive_response<'a>(
     packet: &Packet,
-    handler: &MutexGuard<'a, TransportHandler>,
+    handler: &mut MutexGuard<'a, TransportHandler>,
 ) -> bool {
     if packet.context == PacketContext::KeepAlive
-        && packet.data.as_slice()[0] == KEEP_ALIVE_RESPONSE
+        && packet.data.as_slice().first() == Some(&KEEP_ALIVE_RESPONSE)
     {
         let lookup = handler.link_table.handle_keepalive(packet);
 
@@ -768,7 +850,7 @@ async fn handle_keepalive_response<'a>(
     false
 }
 
-async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_data<'a>(packet: &Packet, mut handler: MutexGuard<'a, TransportHandler>) {
     let mut data_handled = false;
 
     if packet.header.destination_type == DestinationType::Link {
@@ -803,7 +885,7 @@ async fn handle_data<'a>(packet: &Packet, handler: MutexGuard<'a, TransportHandl
             }
         }
 
-        if !local_out_link_handled && handle_keepalive_response(packet, &handler).await {
+        if !local_out_link_handled && handle_keepalive_response(packet, &mut handler).await {
             return;
         }
 
@@ -864,6 +946,11 @@ async fn handle_announce<'a>(
         return;
     }
 
+    // Invalid signatures must not allocate even rate-limit metadata. The
+    // peer's radio handshake is not an authentication or admission decision.
+    let Ok((destination, app_data)) = DestinationAnnounce::validate(packet) else { return; };
+    if !handler.admit_remote_destination(packet.destination, time::Instant::now()).await { return; }
+
     if let Some(blocked_until) = handler.announce_limits.check(&packet.destination) {
         log::info!(
             "tp({}): too many announces from {}, blocked for {} seconds",
@@ -874,9 +961,7 @@ async fn handle_announce<'a>(
         return;
     }
 
-    if let Ok(result) = DestinationAnnounce::validate(packet) {
-        let destination = result.0;
-        let app_data = result.1;
+    {
         let dest_hash = destination.identity.address_hash;
         let destination = Arc::new(Mutex::new(destination));
 
@@ -896,6 +981,13 @@ async fn handle_announce<'a>(
         }
 
         handler.announce_table.add(packet, dest_hash, iface);
+
+        // A reconnect gets a new interface address. Keep equal-hop preference
+        // for live routes, but never pin a verified announce to a closed socket.
+        if let Some(previous) = handler.path_table.get(&packet.destination) {
+            let active = handler.iface_manager.lock().await.is_active(&previous.iface);
+            if !active { handler.path_table.remove(&packet.destination); }
+        }
 
         handler
             .path_table
@@ -976,15 +1068,17 @@ async fn handle_path_request<'a>(
             }
         }
 
-        if let Some(packet) =
+        if packet.header.hops as usize >= PATHFINDER_M { return; }
+        if let Some(mut forwarded) =
             handler
                 .path_requests
-                .generate_recursive(&request.destination, Some(iface), None)
+                .generate_recursive(&request.destination, Some(iface), Some(request.tag_bytes))
         {
+            forwarded.header.hops = packet.header.hops + 1;
             handler
                 .send(TxMessage {
                     tx_type: TxMessageType::Broadcast(Some(iface)),
-                    packet,
+                    packet: forwarded,
                 })
                 .await;
         }
@@ -1009,6 +1103,7 @@ async fn handle_link_request_as_destination<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
+    if !handler.admit_incoming_link(&LinkId::from(packet)).await { return; }
     let mut destination = destination.lock().await;
     match destination.handle_packet(packet) {
         DestinationHandleStatus::LinkProof => {
@@ -1053,12 +1148,12 @@ async fn handle_link_request_as_intermediate<'a>(
     packet: &Packet,
     mut handler: MutexGuard<'a, TransportHandler>,
 ) {
-    handler.link_table.add(
+    if !handler.link_table.add(
         packet,
         packet.destination,
         received_from,
         next_hop,
-    );
+    ) { return; }
 
     send_to_next_hop(packet, &handler, None).await;
 }
@@ -1186,8 +1281,9 @@ async fn handle_keep_links<'a>(handler: MutexGuard<'a, TransportHandler>) {
     }
 }
 
-async fn handle_cleanup<'a>(handler: MutexGuard<'a, TransportHandler>) {
+async fn handle_cleanup<'a>(mut handler: MutexGuard<'a, TransportHandler>) {
     handler.iface_manager.lock().await.cleanup();
+    handler.prune_remote_destinations(time::Instant::now()).await;
 }
 
 async fn retransmit_announces<'a>(
@@ -1250,6 +1346,12 @@ async fn manage_transport(
                         let _ = iface_messages_tx.send(message);
 
                         let packet = message.packet;
+
+                        // Hops are mutable routing metadata, not covered by an
+                        // announce signature. Reject before any table adds one.
+                        if usize::from(packet.header.hops) >= PATHFINDER_M {
+                            continue;
+                        }
 
                         let mut handler = handler.lock().await;
 

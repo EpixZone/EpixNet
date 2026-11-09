@@ -68,6 +68,12 @@ object VerifiedAddonManager {
     var refreshes = 0
     fun refresh() { refreshes++ }
 }
+object NearbyMeshService {
+    fun resumeIfWanted(activity: Shell): Boolean {
+        check(Scheduler.lane == "MAIN")
+        return true
+    }
+}
 object Scheduler {
     var lane = "MAIN"
         private set

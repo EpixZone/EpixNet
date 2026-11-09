@@ -307,7 +307,6 @@ pub const CONFIG_RESTART_KEYS: &[&str] = &[
     "i2p",
     "i2p_sam_port",
     "local_discovery",
-    "mesh",
     "mesh_peers",
     "mesh_listen",
     "trackers",

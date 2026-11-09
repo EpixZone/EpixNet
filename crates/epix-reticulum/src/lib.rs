@@ -20,6 +20,7 @@
 //! [`PeerStream`]: epix_transport::PeerStream
 
 mod node;
+pub mod radio;
 mod reliable;
 mod server;
 mod transport;

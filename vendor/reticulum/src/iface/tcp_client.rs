@@ -153,7 +153,11 @@ impl TcpClient {
                                                             if PACKET_TRACE {
                                                                 log::trace!("tcp_client: rx << ({}) {}", iface_address, packet);
                                                             }
-                                                            let _ = rx_channel.send(RxMessage { address: iface_address, packet }).await;
+                                                            tokio::select! {
+                                                                _ = cancel.cancelled() => return,
+                                                                _ = stop.cancelled() => return,
+                                                                _ = rx_channel.send(RxMessage { address: iface_address, packet }) => {},
+                                                            }
                                                         } else {
                                                             log::warn!("tcp_client: couldn't decode packet");
                                                         }
@@ -215,8 +219,14 @@ impl TcpClient {
                                     let mut hdlc_output = OutputBuffer::new(&mut hdlc_tx_buffer[..]);
 
                                     if Hdlc::encode(output.as_slice(), &mut hdlc_output).is_ok() {
-                                        let _ = stream.write_all(hdlc_output.as_slice()).await;
-                                        let _ = stream.flush().await;
+                                        tokio::select! {
+                                            _ = cancel.cancelled() => return,
+                                            _ = stop.cancelled() => return,
+                                            _ = async {
+                                                stream.write_all(hdlc_output.as_slice()).await?;
+                                                stream.flush().await
+                                            } => {},
+                                        }
                                     }
                                 }
                             }

@@ -326,7 +326,11 @@ impl Link {
                 let mut buffer = [0u8; PACKET_MDU];
                 if let Ok(plain_text) = self.decrypt(packet.data.as_slice(), &mut buffer[..]) {
                     if let Ok(rtt) = rmp::decode::read_f64(&mut &plain_text[..]) {
-                        self.rtt = Duration::from_secs_f64(rtt);
+                        if let Ok(rtt) = Duration::try_from_secs_f64(rtt) {
+                            self.rtt = rtt;
+                        } else {
+                            log::warn!("link({}): ignoring invalid rtt", self.id);
+                        }
                     } else {
                         log::error!("link({}): failed to decode rtt", self.id);
                     }
