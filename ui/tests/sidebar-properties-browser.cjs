@@ -23,12 +23,17 @@ const commands = [], requests = [], clients = new Set(), errors = [];
 const production = new Map();
 for (const name of ["ui/wrapper.html", "ui/media/all.js", "ui/media/all.css",
   "crates/epix-plugins/src/sidebar.rs", "crates/epix-plugins/media/sidebar/all.js",
+  "crates/epix-plugins/src/sidebar_details.rs", "crates/epix-plugins/src/sidebar_i18n.rs",
   "crates/epix-plugins/media/sidebar/all.css", "crates/epix-plugins/media/sidebar/globe/all.js"]) {
   production.set(name, fs.readFileSync(path.join(sourceRoot, name)));
 }
+for (const name of fs.readdirSync(path.join(sourceRoot, "crates/epix-plugins/media/sidebar/languages"))) {
+  const relative = "crates/epix-plugins/media/sidebar/languages/" + name;
+  production.set(relative, fs.readFileSync(path.join(sourceRoot, relative)));
+}
 const provenance = Object.fromEntries([...production].map(([name, bytes]) =>
   [name, crypto.createHash("sha256").update(bytes).digest("hex")]));
-let scale = 1, nonce = 1, globalSettings = {}, peerFailure = false, info;
+let scale = 1, nonce = 1, globalSettings = {}, peerFailure = false, signFailure = false, holdUpdateCompletion = false, info;
 let heldCommand = null;
 const heldReplies = [];
 function releaseReplies() {heldCommand = null; for (const reply of heldReplies.splice(0)) reply();}
@@ -37,11 +42,24 @@ function reset() {
   info = {
     address, peers: 3, peers_serving: 3, size_limit: 100, next_size_limit: 100,
     auth_address: "epix1fixtureauthor", cert_user_id: null, privatekey: false,
+    sidebar_language: "en",
+    // Real response shape, illustrative UI data only. Backend coverage lives
+    // in the real-server suite, not these fixtures.
+    sidebar_details: {
+      storage: {files: 124, total: 24 * 1024 * 1024, types: [
+        {name: "HTML", bytes: 102400}, {name: "CSS", bytes: 51200}, {name: "JavaScript", bytes: 1048576},
+        {name: "Images", bytes: 4194304}, {name: "JSON", bytes: 2097152}, {name: "User data", bytes: 16777216}, {name: "Other", bytes: 894976}]},
+      free_bytes: 160 * 1024 * 1024 * 1024,
+      database: {path: "cache/fixture.sqlite", bytes: 262144, feeds: 3},
+      identity_quota: {used: 512, limit: 2097152},
+    },
     settings: {size: 24 * 1024 * 1024, serving: true, favorite: false, own: false,
-      permissions: [], download_optional: true, autodownloadoptional: false,
+      permissions: [], download_optional: true, autodownloadoptional: false, autodownload_bigfile_size_limit: 0,
       size_optional: 32 * 1024 * 1024, optional_downloaded: 8 * 1024 * 1024,
       cache: {bad_files: {"index.html": 1, "data/post.json": 1}}},
-    content: {title: "Properties fixture", description: "Fixture description", domain: "fixture.epix", files: 124},
+    content: {title: "Properties fixture", description: "Fixture description", domain: "fixture.epix", files: 124,
+      donate: "https://fixture.example/support", "donate-generic": "Keep stored metadata",
+      "donate-btc": "bc1qexampleaddress123", "donate-xmr": "moneroexampleaddress123", "donate-ada": "addr1exampleaddress123"},
     optional_progress: {total_files: 3, done_files: 1, failed_files: 1, percent: 25,
       current: "data/media/cover.jpg", status: "Downloading 25%", files: [
         {path: "data/media/one.jpg", size: 2000000, state: "done"},
@@ -51,9 +69,12 @@ function reset() {
     clone_status: {state: "complete", attempt: 1, reason: null, next_retry_at: null},
   };
   peerFailure = false;
+  signFailure = false;
+  holdUpdateCompletion = false;
 }
 reset();
 function fixtureHtml() {
+  info.sidebar_details.peer_share_url = `http://127.0.0.1:${server.address().port}/${address}/?epixnet_peers=8.8.8.8%3A42222`;
   return render({address, info, counts, includes, received: 13002342, sent: 3334471,
     peer_map_open: globalSettings.sidebar_peer_map_open !== false});
 }
@@ -68,6 +89,11 @@ function source(name) {
 }
 function publish() {
   for (const ws of clients) if (ws.readyState === 1) ws.send(JSON.stringify({cmd: "setSiteInfo", params: info}));
+}
+function publishUpdate(requestId) {
+  info.event = ["updated"]; info.content_updated = true; info.update_applied = false;
+  info.update_request_id = requestId;
+  publish(); delete info.event; delete info.update_request_id;
 }
 const server = http.createServer((req, res) => {
   const pathname = new URL(req.url, "http://localhost").pathname;
@@ -122,13 +148,24 @@ wss.on("connection", ws => {
     else if (cmd === "sitePause" || cmd === "siteResume") {info.settings.serving = cmd === "siteResume"; changed = true;}
     else if (cmd === "siteFavourite" || cmd === "siteUnfavourite") {info.settings.favorite = cmd === "siteFavourite"; changed = true;}
     else if (cmd === "siteSetOwned") {info.settings.own = first; changed = true;}
+    else if (cmd === "siteRecoverPrivatekey") {info.privatekey = true; changed = true;}
+    else if (cmd === "userSetSitePrivatekey") {info.privatekey = !!first; changed = true;}
     else if (cmd === "siteSetDownloadoptional") {info.settings.download_optional = first; changed = true;}
     else if (cmd === "siteSetAutodownloadoptional") {info.settings.autodownloadoptional = first; if (first) info.settings.download_optional = true; changed = true;}
     else if (cmd === "siteSetLimit") {info.size_limit = Number(first); changed = true;}
+    else if (cmd === "siteSetAutodownloadBigfileLimit") {info.settings.autodownload_bigfile_size_limit = Number(params.limit ?? first); changed = true;}
+    else if (cmd === "siteDownloadOptionalPrevious") result = {status: "started"};
+    else if (cmd === "siteUpdate") {
+      result = "Updated";
+      if (!holdUpdateCompletion) setTimeout(() => publishUpdate(params.update_request_id), 30);
+    }
     else if (cmd === "certXid") {info.cert_user_id = "fixture.epix"; changed = true;}
+    else if (cmd === "certSet") {info.cert_user_id = null; changed = true;}
     else if (cmd === "fileGet") result = JSON.stringify({...info.content, includes: Object.fromEntries(includes.map(name => [name, {}]))});
     else if (cmd === "fileRules") result = {signers: [info.auth_address]};
     else if (cmd === "fileWrite") {info.content = {...info.content, ...JSON.parse(Buffer.from(params[1], "base64").toString())}; changed = true;}
+    else if (cmd === "fileWriteSign") result = {error: "fileWriteSign does not sign root manifests"};
+    else if (cmd === "siteSign") result = signFailure ? {error: "Fixture signing failure"} : "ok";
     const reply = () => {if (message.id !== undefined) ws.send(JSON.stringify({cmd: "response", to: message.id, result}));};
     if (cmd === heldCommand) heldReplies.push(reply); else reply();
     if (changed) setImmediate(publish);
@@ -255,7 +292,9 @@ async function globeInteraction(page) {
   await waitFor(page, before => Math.hypot(...window.globeFrames.position.map((v, i) => v - before[i])) > 20, before);
   const distance = await page.evaluate(() => Math.hypot(...window.globeFrames.position));
   await page.mouse.wheel(0, -200);
-  await waitFor(page, before => Math.hypot(...window.globeFrames.position) < before - 50, distance);
+  // Wait for most of the wheel animation before reversing it with a key.
+  // Sampling its first frame can still be farther out than the key's target.
+  await waitFor(page, before => Math.hypot(...window.globeFrames.position) < before - 160, distance);
   const zoomed = await page.evaluate(() => Math.hypot(...window.globeFrames.position));
   await globe.focus(); await globe.press("ArrowDown");
   await waitFor(page, before => Math.hypot(...window.globeFrames.position) > before + 30, zoomed);
@@ -277,6 +316,9 @@ async function globeInteraction(page) {
       await page.goto(url); await open(page); return page;
     }
     const page = await newPage();
+    assert.equal(await page.locator(".sidebar-donation, .sidebar-donation-note").count(), 0);
+    assert.equal(await page.locator('.sidebar a[href="https://fixture.example/support"], .sidebar a[href^="bitcoin:"], .sidebar a[href^="monero:"], .sidebar a[href^="web+cardano:"]').count(), 0,
+      "Donation metadata never adds a sidebar section or link");
     await page.context().grantPermissions(["clipboard-read", "clipboard-write"]);
     await waitFor(page, () => sidebar.globe && sidebar.globe.points && document.querySelector(".globe canvas"));
     assert.equal(await page.locator("#sidebar-peer-map-toggle").getAttribute("aria-expanded"), "true");
@@ -306,6 +348,19 @@ async function globeInteraction(page) {
     await waitForGlobePalette(page, lightPalette);
     results.cases.push("map default, fixture preference reload, reopen, production WebGL, drag/wheel/keyboard, and live light/dark/system themes");
 
+    info.sidebar_language = "de";
+    await refresh(page, "Untranslated xite title");
+    assert.equal(await page.locator("#sidebar-tab-overview").textContent(), "Übersicht");
+    assert.equal(await page.locator("#sidebar-tab-files").textContent(), "Dateien");
+    assert.equal(await page.locator("#sidebar-tab-manage").textContent(), "Verwalten");
+    assert.equal(await page.locator(".sidebar-peer-map-state").textContent(), "Ausblenden");
+    await command(page, "userSetGlobalSettings", () => page.locator("#sidebar-peer-map-toggle").click());
+    assert.equal(await page.locator(".sidebar-peer-map-state").textContent(), "Anzeigen");
+    await command(page, "userSetGlobalSettings", () => page.locator("#sidebar-peer-map-toggle").click());
+    info.sidebar_language = "en";
+    await refresh(page, "English restored");
+    results.cases.push("interface locale updates tabs and map state without translating xite titles");
+
     await page.locator("#peer-endpoint").fill("  192.0.2.10:42424  ");
     const added = await command(page, "peerAdd", () => page.locator("#peer-endpoint").press("Enter"));
     assert.deepEqual(added.params, {peer: "192.0.2.10:42424", site_address: address});
@@ -317,15 +372,37 @@ async function globeInteraction(page) {
     await refresh(page, "Peer error retained");
     assert.ok((await page.locator("#peer-add-status").textContent()).includes("Invalid <peer> endpoint"));
     await command(page, "certXid", () => page.locator("#button-identity").click());
+    await command(page, "certSet", () => page.locator("#button-cert-disconnect").click());
     await page.locator("#link-copypeers").click();
-    assert.ok((await page.evaluate(() => navigator.clipboard.readText())).includes(address), "Copy retains the current xite address");
+    const copiedPeers = await page.evaluate(() => navigator.clipboard.readText());
+    assert.ok(copiedPeers.includes(address) && copiedPeers.includes("epixnet_peers="), "Copy uses the supplied peer share URL");
     for (const [id, name] of [["button-update", "siteUpdate"], ["button-pause", "sitePause"],
       ["button-resume", "siteResume"], ["button-favourite", "siteFavourite"], ["button-unfavourite", "siteUnfavourite"]]) {
-      await command(page, name, () => page.locator("#" + id).click());
+      if (name === "siteUpdate") holdUpdateCompletion = true;
+      const request = await command(page, name, () => page.locator("#" + id).click());
+      if (name === "siteUpdate") {
+        assert.equal(request.params.address, address);
+        assert.equal(typeof request.params.update_request_id, "string");
+        publishUpdate("unrelated-update");
+        await waitFor(page, () => sidebar.wrapper.xite_info.update_request_id === "unrelated-update");
+        assert.equal(await page.evaluate(() => sidebar.update_requested), true,
+          "An unrelated update event cannot complete this action");
+        assert.equal(await page.locator(".notification").filter({hasText: "Xite is already up to date."}).count(), 0);
+        publishUpdate(request.params.update_request_id);
+        await waitFor(page, () => !sidebar.update_requested && !document.querySelector("#button-update").classList.contains("loading"));
+        holdUpdateCompletion = false;
+      }
     }
     results.cases.push("peer submission and failure retention, identity, update, serving and favorite actions");
 
     await tab(page, "files");
+    await page.locator(".sidebar-details summary").click();
+    assert.ok(await page.locator(".sidebar-storage-types").isVisible());
+    await refresh(page, "Storage details refresh");
+    assert.equal(await page.locator(".sidebar-details").evaluate(details => details.open), true,
+      "Live refresh keeps an opened storage breakdown open");
+    assert.ok((await page.locator("#sidebar-panel-files").textContent()).includes("Available disk space"));
+    await noOverflow(page);
     await page.locator("#input-xitelimit").fill("250");
     const limit = await command(page, "siteSetLimit", () => page.locator("#button-xitelimit").click());
     assert.equal(Array.isArray(limit.params) ? limit.params[0] : limit.params, "250");
@@ -339,6 +416,10 @@ async function globeInteraction(page) {
     await command(page, "siteSetDownloadoptional", () => page.locator("#checkbox-downloadoptional").uncheck());
     await command(page, "siteSetAutodownloadoptional", () => page.locator("#checkbox-autodownloadoptional").check());
     await waitFor(page, () => document.querySelector("#checkbox-downloadoptional").checked);
+    await page.locator("#input-autodownload_bigfile_size_limit").fill("25");
+    const bigLimit = await command(page, "siteSetAutodownloadBigfileLimit", () => page.locator("#button-autodownload_bigfile_size_limit").click());
+    assert.equal(Number(bigLimit.params.limit), 25);
+    await command(page, "siteDownloadOptionalPrevious", () => page.locator("#button-autodownload_previous").click());
     await page.locator("#optional-files-toggle").click();
     await page.locator("#optional-file-list").waitFor({state: "visible"});
     assert.equal(await page.locator("#browse-files").getAttribute("href"), "/list/" + address);
@@ -357,12 +438,17 @@ async function globeInteraction(page) {
       await command(page, name, () => page.locator("#" + id).click());
     }
     await command(page, "siteRecoverPrivatekey", () => page.locator("#checkbox-owned").check());
+    await page.locator("#privatekey-forget").waitFor({state: "visible"});
     await page.locator("#settings-title").fill("Edited title");
     await page.locator("#settings-description").fill("Edited description");
     await page.locator("#settings-xid-name").fill("edited.epix");
+    await waitFor(page, () => sidebar.wrapper.xite_info.privatekey === true);
     const written = await command(page, "fileWrite", () => page.locator("#button-settings").click());
     const saved = JSON.parse(Buffer.from(written.params[1], "base64").toString());
     assert.equal(saved.title, "Edited title"); assert.equal(saved.description, "Edited description"); assert.equal(saved.domain, "edited.epix");
+    assert.equal(saved.donate, "https://fixture.example/support", "Metadata edits preserve stored donation fields without displaying them");
+    assert.equal(saved["donate-btc"], "bc1qexampleaddress123");
+    await waitFor(page, () => !sidebar.pending_actions["#button-settings"]);
     heldCommand = "fileWrite";
     await page.locator("#settings-title").fill("Submitted title");
     await command(page, "fileWrite", () => page.locator("#button-settings").click());
@@ -370,6 +456,38 @@ async function globeInteraction(page) {
     await command(page, "sidebarGetHtmlTag", async () => releaseReplies());
     await refresh(page, "Late settings save response");
     assert.equal(await page.locator("#settings-title").inputValue(), "Newer title draft", "A completed save cannot clear newer metadata edits");
+    await waitFor(page, () => !sidebar.pending_actions["#button-settings"]);
+    await page.evaluate(() => {
+      window.metadataNotices = [];
+      const add = sidebar.wrapper.notifications.add;
+      sidebar.wrapper.notifications.add = function(id, type, body) {
+        if (id === "file-write") window.metadataNotices.push({type, body});
+        return add.apply(this, arguments);
+      };
+    });
+    heldCommand = "siteSign";
+    await page.locator("#settings-title").fill("Awaiting signature");
+    const signRequest = await command(page, "siteSign", () => page.locator("#button-settings").click());
+    assert.equal(signRequest.params.inner_path, "content.json");
+    assert.equal(signRequest.params.privatekey, "stored");
+    assert.equal(await page.evaluate(() => window.metadataNotices.some(item => item.body.includes("saved and signed"))), false,
+      "Saving bytes alone cannot report signing success");
+    await page.locator("#settings-title").fill("Draft changed while signing");
+    await command(page, "sidebarGetHtmlTag", async () => releaseReplies());
+    await waitFor(page, () => window.metadataNotices.some(item => item.type === "done" && item.body.includes("saved and signed")));
+    await refresh(page, "Late signature result");
+    assert.equal(await page.locator("#settings-title").inputValue(), "Draft changed while signing");
+    signFailure = true; heldCommand = "siteSign";
+    await page.evaluate(() => {window.metadataNotices = [];});
+    await page.locator("#settings-title").fill("Unsigned saved metadata");
+    await command(page, "siteSign", () => page.locator("#button-settings").click());
+    await page.locator("#settings-title").fill("Newer draft after failed signature");
+    releaseReplies();
+    await waitFor(page, () => window.metadataNotices.some(item => item.type === "error" && item.body.includes("Settings saved, but signing failed")));
+    assert.equal(await page.evaluate(() => window.metadataNotices.some(item => item.type === "done")), false);
+    await refresh(page, "Signing failure refresh");
+    assert.equal(await page.locator("#settings-title").inputValue(), "Newer draft after failed signature");
+    signFailure = false;
     await page.locator('.contents-content[data-content-path="data/users/content.json"]').click();
     assert.equal(await page.locator("#input-contents").inputValue(), "data/users/content.json");
     assert.equal(await page.locator('.contents-content[data-content-path="data/users/content.json"]').getAttribute("aria-pressed"), "true");
@@ -459,8 +577,15 @@ async function globeInteraction(page) {
   } catch (error) {
     results.failure = error.stack;
     results.recentCommands = commands.slice(-20);
+    results.fixtureSettings = info.settings;
+    results.browserState = [];
     let index = 0;
     for (const context of browser?.contexts() || []) for (const page of context.pages()) {
+      results.browserState.push(await page.evaluate(() => ({
+        settings: window.sidebar?.wrapper.xite_info?.settings,
+        checkboxes: [...document.querySelectorAll(".sidebar input[type=checkbox]")].map(input =>
+          ({id: input.id, checked: input.checked, attribute: input.getAttribute("checked"), disabled: input.disabled})),
+      })).catch(() => null));
       await page.screenshot({path: path.join(output, `failure-${index++}.png`)}).catch(() => {});
     }
     throw error;

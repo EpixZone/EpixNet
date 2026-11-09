@@ -14,6 +14,11 @@ module.exports = function buildSidebarRenderer(repo, output) {
   if (!sizeLimit) throw new Error("Cannot locate the production default size limit");
   const directory = path.join(output, "renderer");
   fs.mkdirSync(path.join(directory, "src"), {recursive: true});
+  for (const name of ["sidebar_details.rs", "sidebar_i18n.rs"]) {
+    fs.copyFileSync(path.join(repo, "crates/epix-plugins/src", name), path.join(directory, "src", name));
+  }
+  fs.cpSync(path.join(repo, "crates/epix-plugins/media/sidebar/languages"),
+    path.join(directory, "media/sidebar/languages"), {recursive: true});
   fs.writeFileSync(path.join(directory, "Cargo.toml"), `[package]
 name = "sidebar-properties-fixture"
 version = "0.0.0"
@@ -26,6 +31,8 @@ serde_json = "1"
 `);
   fs.writeFileSync(path.join(directory, "src/main.rs"), `use serde_json::{json, Value};
 use std::io::{self, Read};
+#[path = "sidebar_details.rs"] mod details;
+#[path = "sidebar_i18n.rs"] mod i18n;
 #[derive(Clone, Copy, Default)]
 struct PeerCounts { total: u64, connected: u64, connectable: u64, onion: u64, local: u64 }
 mod epix_ui { pub const DEFAULT_SIZE_LIMIT_MB: i64 = ${sizeLimit[1]}; }
@@ -49,6 +56,7 @@ ${sidebar.slice(end)}
   execFileSync("cargo", ["build", "--quiet", "--offline", "--manifest-path", path.join(directory, "Cargo.toml"),
     "--target-dir", path.join(directory, "target")], {
     cwd: directory, stdio: ["ignore", "pipe", "pipe"], timeout: 120000,
+    env: {...process.env, CARGO_BUILD_JOBS: "2", CARGO_PROFILE_DEV_DEBUG: "0", CARGO_PROFILE_TEST_DEBUG: "0", CARGO_INCREMENTAL: "0"},
   });
   const executable = path.join(directory, "target/debug/sidebar-properties-fixture" + (process.platform === "win32" ? ".exe" : ""));
   return fixture => execFileSync(executable, {input: JSON.stringify(fixture), encoding: "utf8", timeout: 5000});

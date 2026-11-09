@@ -6,11 +6,14 @@ const {test} = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '../../crates/epix-plugins/media/sidebar/all.js'), 'utf8');
 function instance(method) {
-  const start = source.indexOf(`Sidebar.prototype.${method} = function`);
-  const end = source.indexOf('\n    };', start);
-  assert.ok(start >= 0 && end > start);
+  const methods = ['t', 'escapeText', 'notify', 'notifyError', method].map(name => {
+    const start = source.indexOf(`Sidebar.prototype.${name} = function`);
+    const end = source.indexOf('\n    };', start);
+    assert.ok(start >= 0 && end > start);
+    return source.slice(start, end + 7);
+  }).join('\n');
   const context = vm.createContext({});
-  vm.runInContext('var Sidebar = function() {};\n' + source.slice(start, end + 7), context);
+  vm.runInContext('var Sidebar = function() {};\n' + methods, context);
   return Object.create(context.Sidebar.prototype);
 }
 

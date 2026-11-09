@@ -1,0 +1,191 @@
+{
+  "ar": {
+    "Overview": "نظرة عامة",
+    "Manage": "إدارة",
+    "Peer map": "خريطة الأقران",
+    "Show": "إظهار",
+    "Hide": "إخفاء",
+    "Files & storage": "الملفات والتخزين",
+    "Xite properties": "خصائص Xite"
+  },
+  "da": {
+    "Overview": "Oversigt",
+    "Manage": "Administrer",
+    "Peer map": "Peer-kort",
+    "Show": "Vis",
+    "Hide": "Skjul",
+    "Files & storage": "Filer og lager",
+    "Xite properties": "Xite-egenskaber"
+  },
+  "de": {
+    "Overview": "Übersicht",
+    "Manage": "Verwalten",
+    "Peer map": "Peer-Karte",
+    "Show": "Anzeigen",
+    "Hide": "Ausblenden",
+    "Files & storage": "Dateien und Speicher",
+    "Xite properties": "Xite-Eigenschaften"
+  },
+  "es": {
+    "Overview": "Resumen",
+    "Manage": "Administrar",
+    "Peer map": "Mapa de pares",
+    "Show": "Mostrar",
+    "Hide": "Ocultar",
+    "Files & storage": "Archivos y almacenamiento",
+    "Xite properties": "Propiedades del xite"
+  },
+  "fa": {
+    "Overview": "نمای کلی",
+    "Manage": "مدیریت",
+    "Peer map": "نقشهٔ همتاها",
+    "Show": "نمایش",
+    "Hide": "پنهان کردن",
+    "Files & storage": "پرونده‌ها و فضای ذخیره‌سازی",
+    "Xite properties": "ویژگی‌های Xite"
+  },
+  "fr": {
+    "Overview": "Vue d’ensemble",
+    "Manage": "Gérer",
+    "Peer map": "Carte des pairs",
+    "Show": "Afficher",
+    "Hide": "Masquer",
+    "Files & storage": "Fichiers et stockage",
+    "Xite properties": "Propriétés du xite"
+  },
+  "hu": {
+    "Overview": "Áttekintés",
+    "Manage": "Kezelés",
+    "Peer map": "Partnerek térképe",
+    "Show": "Megjelenítés",
+    "Hide": "Elrejtés",
+    "Files & storage": "Fájlok és tárhely",
+    "Xite properties": "Xite tulajdonságai"
+  },
+  "it": {
+    "Overview": "Panoramica",
+    "Manage": "Gestisci",
+    "Peer map": "Mappa dei peer",
+    "Show": "Mostra",
+    "Hide": "Nascondi",
+    "Files & storage": "File e spazio di archiviazione",
+    "Xite properties": "Proprietà del xite"
+  },
+  "jp": {
+    "Overview": "概要",
+    "Manage": "管理",
+    "Peer map": "ピアの地図",
+    "Show": "表示",
+    "Hide": "非表示",
+    "Files & storage": "ファイルとストレージ",
+    "Xite properties": "Xiteのプロパティ"
+  },
+  "kr": {
+    "Overview": "개요",
+    "Manage": "관리",
+    "Peer map": "피어 지도",
+    "Show": "표시",
+    "Hide": "숨기기",
+    "Files & storage": "파일 및 저장 공간",
+    "Xite properties": "Xite 속성"
+  },
+  "nl": {
+    "Overview": "Overzicht",
+    "Manage": "Beheren",
+    "Peer map": "Peerkaart",
+    "Show": "Tonen",
+    "Hide": "Verbergen",
+    "Files & storage": "Bestanden en opslag",
+    "Xite properties": "Xite-eigenschappen"
+  },
+  "pl": {
+    "Overview": "Przegląd",
+    "Manage": "Zarządzaj",
+    "Peer map": "Mapa węzłów",
+    "Show": "Pokaż",
+    "Hide": "Ukryj",
+    "Files & storage": "Pliki i miejsce na dysku",
+    "Xite properties": "Właściwości xite"
+  },
+  "pt": {
+    "Overview": "Visão geral",
+    "Manage": "Gerir",
+    "Peer map": "Mapa de pares",
+    "Show": "Mostrar",
+    "Hide": "Ocultar",
+    "Files & storage": "Ficheiros e armazenamento",
+    "Xite properties": "Propriedades do xite"
+  },
+  "pt-br": {
+    "Overview": "Visão geral",
+    "Manage": "Gerenciar",
+    "Peer map": "Mapa de pares",
+    "Show": "Mostrar",
+    "Hide": "Ocultar",
+    "Files & storage": "Arquivos e armazenamento",
+    "Xite properties": "Propriedades do xite"
+  },
+  "ru": {
+    "Overview": "Обзор",
+    "Manage": "Управление",
+    "Peer map": "Карта пиров",
+    "Show": "Показать",
+    "Hide": "Скрыть",
+    "Files & storage": "Файлы и хранилище",
+    "Xite properties": "Свойства xite"
+  },
+  "sk": {
+    "Overview": "Prehľad",
+    "Manage": "Správa",
+    "Peer map": "Mapa partnerov",
+    "Show": "Zobraziť",
+    "Hide": "Skryť",
+    "Files & storage": "Súbory a úložisko",
+    "Xite properties": "Vlastnosti xite"
+  },
+  "sl": {
+    "Overview": "Pregled",
+    "Manage": "Upravljanje",
+    "Peer map": "Zemljevid vrstnikov",
+    "Show": "Prikaži",
+    "Hide": "Skrij",
+    "Files & storage": "Datoteke in shramba",
+    "Xite properties": "Lastnosti xite"
+  },
+  "tr": {
+    "Overview": "Genel bakış",
+    "Manage": "Yönet",
+    "Peer map": "Eş haritası",
+    "Show": "Göster",
+    "Hide": "Gizle",
+    "Files & storage": "Dosyalar ve depolama",
+    "Xite properties": "Xite özellikleri"
+  },
+  "uk": {
+    "Overview": "Огляд",
+    "Manage": "Керування",
+    "Peer map": "Карта пірів",
+    "Show": "Показати",
+    "Hide": "Приховати",
+    "Files & storage": "Файли та сховище",
+    "Xite properties": "Властивості xite"
+  },
+  "zh": {
+    "Overview": "概览",
+    "Manage": "管理",
+    "Peer map": "节点地图",
+    "Show": "显示",
+    "Hide": "隐藏",
+    "Files & storage": "文件和存储",
+    "Xite properties": "Xite 属性"
+  },
+  "zh-tw": {
+    "Overview": "概覽",
+    "Manage": "管理",
+    "Peer map": "節點地圖",
+    "Show": "顯示",
+    "Hide": "隱藏",
+    "Files & storage": "檔案與儲存空間",
+    "Xite properties": "Xite 屬性"
+  }
+}

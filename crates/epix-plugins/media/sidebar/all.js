@@ -650,6 +650,9 @@ window.initScrollable = function (chrome) {
       this.peer_map_open = null;
       this.peer_map_saving = false;
       this.sign_publish_menu = null;
+      this.pending_actions = {};
+      this.translations = {};
+      this.update_requested = false;
       this.original_set_xite_info = this.wrapper.setXiteInfo;
       if (window.top.location.hash === "#EpixNet:OpenSidebar") {
         this.startDrag();
@@ -793,6 +796,12 @@ window.initScrollable = function (chrome) {
     };
 
     Sidebar.prototype.setXiteInfo = function(xite_info) {
+      if (this.update_requested && xite_info.update_request_id === this.update_request_id && xite_info.address === this.wrapper.xite_info.address && xite_info.event && xite_info.event[0] === "updated") {
+        this.update_requested = false;
+        this.setActionBusy("#button-update", false);
+        if (xite_info.content_updated === false) this.notify("siteUpdate", "error", "Update failed. No changes were applied.");
+        else this.notify("siteUpdate", "done", xite_info.update_applied ? "Xite updated!" : "Xite is already up to date.");
+      }
       RateLimit(1500, (function(_this) {
         return function() {
           return _this.updateHtmlTag();
@@ -827,6 +836,10 @@ window.initScrollable = function (chrome) {
 
     Sidebar.prototype.setHtmlTag = function(res) {
       if (!this.tag) return;
+      if (typeof res !== "string") {
+        this.notifyError("properties-load", "Could not load properties", res);
+        return;
+      }
       var firstRender = this.tag.find(".content").children().length === 0;
       var scroll = this.tag.find(".content-wrapper").scrollTop();
       var focused = document.activeElement;
@@ -839,6 +852,11 @@ window.initScrollable = function (chrome) {
       } else {
         morphdom(this.tag.find(".content")[0], '<div class="content">' + res + '</div>', {
           onBeforeMorphEl: function(from_el, to_el) {
+            if (from_el.tagName === "DETAILS") to_el.open = from_el.open;
+            // A user-toggled checkbox no longer follows its HTML attribute.
+            // Apply the acknowledged server value, including coupled switches
+            // and rollbacks after a rejected change. Text drafts stay separate.
+            if (from_el.tagName === "INPUT" && from_el.type === "checkbox") from_el.checked = to_el.checked;
             if (from_el.classList.contains("globe") || from_el.className.indexOf("noupdate") >= 0) {
               return false;
             } else {
@@ -847,35 +865,11 @@ window.initScrollable = function (chrome) {
           }
         });
       }
-      this.tag.find("#privatekey-add").off("click, touchend").on("click touchend", (function(_this) {
-        return function(e) {
-          _this.wrapper.displayPrompt("Enter your private key:", "password", "Save", "", function(privatekey) {
-            return _this.wrapper.ws.cmd("userSetSitePrivatekey", [privatekey], function(res) {
-              // The key is validated server-side (malformed, or belongs to
-              // another xite). Reporting "saved" regardless is how a bad key
-              // used to get stored and only fail later, at signing time.
-              if (res !== "ok") {
-                return _this.wrapper.notifications.add("privatekey", "error", "Private key not saved: " + (res && res.error ? res.error : "unknown error"));
-              }
-              return _this.wrapper.notifications.add("privatekey", "done", "Private key saved for xite signing", 5000);
-            });
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#privatekey-forget").off("click, touchend").on("click touchend", (function(_this) {
-        return function(e) {
-          _this.wrapper.displayConfirm("Remove saved private key for this xite?", "Forget", function(res) {
-            if (!res) {
-              return false;
-            }
-            return _this.wrapper.ws.cmd("userSetSitePrivatekey", [""], function(res) {
-              return _this.wrapper.notifications.add("privatekey", "done", "Saved private key removed", 5000);
-            });
-          });
-          return false;
-        };
-      })(this));
+      if (this.tag[0]) {
+        var root = this.tag[0].querySelector(".sidebar-properties");
+        try { this.translations = JSON.parse(root && root.getAttribute("data-i18n") || "{}"); }
+        catch (error) { this.translations = {}; }
+      }
       // Keep the server's current-xite URL. On a .epix origin the address
       // lives in the hostname, so rebuilding this link from pathname loses it.
       this.updateOptionalProgress();
@@ -929,7 +923,7 @@ window.initScrollable = function (chrome) {
         if (sidebar.peer_map_open !== value) {
           sidebar.savePeerMapPreference();
         } else if (result !== "ok") {
-          sidebar.wrapper.notifications.add("peer-map-setting", "error", "Could not save the peer map preference. Try again.", 5000);
+          sidebar.notifyError("peer-map-setting", "Could not save the peer map preference. Try again.", result);
         }
       });
     };
@@ -939,7 +933,7 @@ window.initScrollable = function (chrome) {
       this.peer_map_open = open;
       if (this.tag) {
         this.tag.find("#sidebar-peer-map-toggle").attr("aria-expanded", String(open));
-        this.tag.find(".sidebar-peer-map-state").text(open ? "Hide" : "Show");
+        this.tag.find(".sidebar-peer-map-state").text(this.t(open ? "Hide" : "Show"));
         this.tag.find("#sidebar-peer-map-panel").prop("hidden", !open);
         if (this.scrollable) this.scrollable();
       }
@@ -959,10 +953,11 @@ window.initScrollable = function (chrome) {
       Object.keys(this.property_drafts).forEach(function(id) {
         sidebar.tag.find("#" + id).val(sidebar.property_drafts[id]);
       });
+      Object.keys(this.pending_actions || {}).forEach(function(selector) { sidebar.setActionBusy(selector, true); });
       this.selectPropertiesTab(this.properties_tab || "overview", false);
       this.setPeerMapOpen(this.peer_map_open, false);
       this.updateContentSelection();
-      this.tag.find("#form-addpeer button[type=submit]").prop("disabled", !!this.addingPeer).text(this.addingPeer ? "Adding…" : "Add peer");
+      this.tag.find("#form-addpeer button[type=submit]").prop("disabled", !!this.addingPeer).text(this.t(this.addingPeer ? "Adding…" : "Add peer"));
       this.tag.find("#peer-add-status").text(this.peer_feedback || "");
       this.tag.off(".properties").on("click.properties", ".sidebar-tab", function() {
         sidebar.selectPropertiesTab(this.getAttribute("data-tab"), true);
@@ -978,7 +973,7 @@ window.initScrollable = function (chrome) {
         tabs[next].focus();
       }).on("click.properties", "#sidebar-peer-map-toggle", function() {
         sidebar.setPeerMapOpen(!sidebar.peer_map_open, true);
-      }).on("input.properties", "#peer-endpoint, #input-xitelimit, #input-contents, #settings-title, #settings-description, #settings-xid-name", function() {
+      }).on("input.properties", "#peer-endpoint, #input-xitelimit, #input-autodownload_bigfile_size_limit, #input-contents, #settings-title, #settings-description, #settings-xid-name", function() {
         sidebar.property_drafts[this.id] = this.value;
         if (this.id === "peer-endpoint") { sidebar.peer_feedback = ""; sidebar.tag.find("#peer-add-status").text(""); }
         if (this.id === "input-contents") sidebar.updateContentSelection();
@@ -999,13 +994,13 @@ window.initScrollable = function (chrome) {
           list.addClass("expanded");
           toggle.addClass("expanded");
         }
-        toggle.text((this.optional_expanded ? "Hide files" : "Show files") + " (" + list.children().length + ")");
-        toggle.off("click touchend").on("click touchend", function(e) {
+        toggle.text(this.t(this.optional_expanded ? "Hide files" : "Show files") + " (" + list.children().length + ")");
+        toggle.off("click touchend").on("click", function(e) {
           e.preventDefault();
           _this.optional_expanded = !_this.optional_expanded;
           list.toggleClass("expanded", _this.optional_expanded);
           toggle.toggleClass("expanded", _this.optional_expanded);
-          toggle.text((_this.optional_expanded ? "Hide files" : "Show files") + " (" + list.children().length + ")");
+          toggle.text(_this.t(_this.optional_expanded ? "Hide files" : "Show files") + " (" + list.children().length + ")");
           return false;
         });
         // Only self-poll while the panel is actually on screen; opening the
@@ -1146,67 +1141,175 @@ window.initScrollable = function (chrome) {
       }
     };
 
-    Sidebar.prototype.sign = function(inner_path, privatekey) {
-      this.wrapper.displayProgress("sign", "Signing: " + inner_path + "...", 0);
-      return this.wrapper.ws.cmd("siteSign", {
-        privatekey: privatekey,
-        inner_path: inner_path,
-        update_changed_files: true
-      }, (function(_this) {
-        return function(res) {
-          if (res === "ok") {
-            return _this.wrapper.displayProgress("sign", inner_path + " signed!", 100);
-          } else {
-            // Say why - "Error signing x" alone leaves a bad key, a missing
-            // key, or a permission failure looking identical.
-            return _this.wrapper.displayProgress("sign", "Error signing " + inner_path + ": " + (res && res.error ? res.error : "unknown error"), -1);
-          }
-        };
-      })(this));
+    Sidebar.prototype.t = function(message) {
+      return this.translations && this.translations[message] || message;
     };
 
-    Sidebar.prototype.publish = function(inner_path, privatekey) {
-      return this.wrapper.ws.cmd("sitePublish", {
-        privatekey: privatekey,
-        inner_path: inner_path,
-        sign: true,
-        update_changed_files: true
-      }, (function(_this) {
-        return function(res) {
-          if (res === "ok") {
-            return _this.wrapper.notifications.add("sign", "done", inner_path + " Signed and published!", 5000);
+    Sidebar.prototype.escapeText = function(value) {
+      return String(value).replace(/[&<>"']/g, function(character) {
+        return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[character];
+      });
+    };
+
+    Sidebar.prototype.notify = function(id, type, message, detail) {
+      var text = this.t(message);
+      if (detail) text += ": " + detail;
+      return this.wrapper.notifications.add(id, type, this.escapeText(text), type === "error" ? 10000 : 5000);
+    };
+
+    Sidebar.prototype.notifyError = function(id, message, response) {
+      var detail = response && typeof response.error === "string" ? response.error :
+        typeof response === "string" ? response : this.t("The request failed. Try again.");
+      return this.notify(id, "error", message, detail);
+    };
+
+    Sidebar.prototype.setActionBusy = function(selector, busy) {
+      this.pending_actions = this.pending_actions || {};
+      if (busy) this.pending_actions[selector] = true;
+      else delete this.pending_actions[selector];
+      if (this.tag) this.tag.find(selector).toggleClass("loading", busy).attr("aria-busy", String(busy)).prop("disabled", busy);
+    };
+
+    Sidebar.prototype.runAction = function(selector, command, params, options) {
+      options = options || {};
+      if (this.pending_actions && this.pending_actions[selector]) return false;
+      var sidebar = this;
+      this.setActionBusy(selector, true);
+      if (options.pending) this.notify(command, "info", options.pending);
+      this.wrapper.ws.cmd(command, params, function(response) {
+        sidebar.setActionBusy(selector, false);
+        var ok = options.accept ? options.accept(response) : response === "ok";
+        if (!ok) {
+          if (options.failed) options.failed(response);
+          sidebar.notifyError(command, options.error || "Action failed", response);
+        } else {
+          var message = typeof options.success === "function" ? options.success(response) : options.success;
+          if (message) sidebar.notify(command, options.type || "done", message);
+          if (options.done) options.done(response);
+        }
+        if (options.refresh !== false && sidebar.tag) sidebar.updateHtmlTag();
+      });
+      return false;
+    };
+
+    Sidebar.prototype.sign = function(inner_path, privatekey) {
+      if (this.pending_actions && this.pending_actions["#button-sign-publish"]) return;
+      var sidebar = this;
+      this.setActionBusy("#button-sign-publish", true);
+      this.wrapper.displayProgress("sign", this.escapeText(this.t("Signing") + ": " + inner_path), 0);
+      this.wrapper.ws.cmd("siteSign", {privatekey: privatekey, inner_path: inner_path, update_changed_files: true}, function(res) {
+        sidebar.setActionBusy("#button-sign-publish", false);
+        if (res === "ok") {
+          sidebar.wrapper.displayProgress("sign", sidebar.escapeText(inner_path + ": " + sidebar.t("Signed")), 100);
+          if (sidebar.tag) sidebar.updateHtmlTag();
+        } else {
+          sidebar.wrapper.displayProgress("sign", sidebar.escapeText(sidebar.t("Signing failed")), -1);
+          sidebar.notifyError("sign-error", "Signing failed", res);
+        }
+      });
+    };
+
+    Sidebar.prototype.publish = function(inner_path, privatekey, sign) {
+      // The backend reports actual peer acceptance. Do not add a second
+      // success message for its acknowledgement of a queued publish.
+      return this.runAction("#button-sign-publish", "sitePublish", {
+        privatekey: privatekey, inner_path: inner_path, sign: sign !== false, update_changed_files: true
+      }, {error: "Publishing failed"});
+    };
+
+    Sidebar.prototype.withSigningKey = function(inner_path, action) {
+      if (this.signing_key_pending || (this.pending_actions && this.pending_actions["#button-sign-publish"])) return;
+      this.signing_key_pending = true;
+      var sidebar = this;
+      function proceed(key) { sidebar.signing_key_pending = false; action(key); }
+      this.wrapper.ws.cmd("fileRules", {inner_path: inner_path}, function(rules) {
+        if (!rules || !Array.isArray(rules.signers)) {
+          sidebar.signing_key_pending = false;
+          sidebar.notifyError("sign-rules", "Could not read signing rules", rules);
+          return;
+        }
+        if (rules.signers.indexOf(sidebar.wrapper.xite_info.auth_address) >= 0) proceed(null);
+        else if (sidebar.wrapper.xite_info.privatekey) proceed("stored");
+        else {
+          // Closing a wrapper prompt does not invoke its callback. Release
+          // the lookup guard so dismissing it never strands signing.
+          sidebar.signing_key_pending = false;
+          sidebar.wrapper.displayPrompt(sidebar.t("Enter your private key:"), "password", sidebar.t("Sign"), "", function(privatekey) {
+            if (privatekey) action(privatekey);
+          });
+        }
+      });
+    };
+
+    Sidebar.prototype.saveSettings = function() {
+      if (this.pending_actions && this.pending_actions["#button-settings"]) return false;
+      var sidebar = this, submitted = {};
+      ["settings-title", "settings-description", "settings-xid-name"].forEach(function(id) { submitted[id] = sidebar.tag.find("#" + id).val(); });
+      this.setActionBusy("#button-settings", true);
+      this.wrapper.ws.cmd("fileGet", "content.json", function(original) {
+        var data;
+        try {
+          if (typeof original !== "string") throw new Error(original && original.error || "content.json is unavailable");
+          data = JSON.parse(original);
+          if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("content.json must contain an object");
+        } catch (error) {
+          sidebar.setActionBusy("#button-settings", false);
+          sidebar.notifyError("file-write", "Could not read xite settings", {error: error.message});
+          return;
+        }
+        data.title = submitted["settings-title"];
+        data.description = submitted["settings-description"];
+        var name = submitted["settings-xid-name"].trim();
+        if (name) data.domain = name; else delete data.domain;
+        var encoded = btoa(unescape(encodeURIComponent(JSON.stringify(data, null, "\t"))));
+        var signed = !!sidebar.wrapper.xite_info.privatekey;
+        // Root metadata uses fileWrite followed by siteSign. fileWriteSign is
+        // reserved for child data files and cannot sign a root manifest.
+        sidebar.wrapper.ws.cmd("fileWrite", ["content.json", encoded, true], function(response) {
+          if (response !== "ok") {
+            sidebar.setActionBusy("#button-settings", false);
+            sidebar.notifyError("file-write", "Could not save xite settings", response);
+            return;
           }
-        };
-      })(this));
+          function finished(signResult) {
+            sidebar.setActionBusy("#button-settings", false);
+            if (signed && signResult !== "ok") {
+              sidebar.notifyError("file-write", "Settings saved, but signing failed. Sign again before publishing.", signResult);
+              return;
+            }
+            Object.keys(submitted).forEach(function(id) { if (sidebar.property_drafts[id] === submitted[id]) delete sidebar.property_drafts[id]; });
+            sidebar.notify("file-write", "done", signed ? "Xite settings saved and signed." : "Settings saved. Sign and publish to share changes.");
+            if (sidebar.tag) sidebar.updateHtmlTag();
+          }
+          if (signed) sidebar.wrapper.ws.cmd("siteSign", {inner_path: "content.json", privatekey: "stored", update_changed_files: true}, finished);
+          else finished();
+        });
+      });
+      return false;
     };
 
     Sidebar.prototype.handleXiteDeleteClick = function() {
-      var options, question;
-      if (this.wrapper.xite_info.privatekey) {
-        question = "Are you sure?<br>This xite has a saved private key";
-        options = ["Forget private key and delete xite"];
-      } else {
-        question = "Are you sure?";
-        options = ["Delete this xite", "Blacklist"];
-      }
-      return this.wrapper.displayConfirm(question, options, (function(_this) {
-        return function(confirmed) {
-          if (confirmed === 1) {
-            _this.tag.find("#button-delete").addClass("loading");
-            return _this.wrapper.ws.cmd("siteDelete", _this.wrapper.xite_info.address, function() {
-              return document.location = $(".fixbutton-bg").attr("href");
-            });
-          } else if (confirmed === 2) {
-            return _this.wrapper.displayPrompt("Blacklist this xite", "text", "Delete and Blacklist", "Reason", function(reason) {
-              _this.tag.find("#button-delete").addClass("loading");
-              _this.wrapper.ws.cmd("siteblockAdd", [_this.wrapper.xite_info.address, reason]);
-              return _this.wrapper.ws.cmd("siteDelete", _this.wrapper.xite_info.address, function() {
-                return document.location = $(".fixbutton-bg").attr("href");
-              });
-            });
+      var sidebar = this;
+      var hasKey = this.wrapper.xite_info.privatekey;
+      var question = this.escapeText(this.t("Are you sure?"));
+      if (hasKey) question += "<br>" + this.escapeText(this.t("This xite has a saved private key"));
+      var options = hasKey ? [this.t("Forget private key and delete xite")] : [this.t("Delete this xite"), this.t("Blacklist")];
+      function remove() {
+        sidebar.runAction("#button-delete", "siteDelete", sidebar.wrapper.xite_info.address, {
+          refresh: false, error: "Could not delete xite", done: function() {
+            document.location = $(".fixbutton-bg").attr("href");
           }
-        };
-      })(this));
+        });
+      }
+      this.wrapper.displayConfirm(question, options, function(confirmed) {
+        if (confirmed === 1) remove();
+        else if (confirmed === 2) sidebar.wrapper.displayPrompt(sidebar.t("Blacklist this xite"), "text", sidebar.t("Delete and Blacklist"), sidebar.t("Reason"), function(reason) {
+          if (reason === null || reason === false) return;
+          sidebar.runAction("#button-delete", "siteblockAdd", [sidebar.wrapper.xite_info.address, reason], {
+            refresh: false, error: "Could not blacklist xite", done: remove
+          });
+        });
+      });
     };
 
     Sidebar.prototype.addPeer = function() {
@@ -1215,7 +1318,7 @@ window.initScrollable = function (chrome) {
       if (!peer || this.addingPeer) return;
       this.addingPeer = true;
       this.peer_feedback = "";
-      this.tag.find("#form-addpeer button[type=submit]").prop("disabled", true).text("Adding…");
+      this.tag.find("#form-addpeer button[type=submit]").prop("disabled", true).text(this.t("Adding…"));
       this.tag.find("#peer-add-status").text("");
       var sidebar = this;
       this.wrapper.ws.cmd("peerAdd", {
@@ -1223,24 +1326,21 @@ window.initScrollable = function (chrome) {
         site_address: this.wrapper.xite_info.address
       }, function(res) {
         sidebar.addingPeer = false;
-        if (sidebar.tag) sidebar.tag.find("#form-addpeer button[type=submit]").prop("disabled", false).text("Add peer");
+        if (sidebar.tag) sidebar.tag.find("#form-addpeer button[type=submit]").prop("disabled", false).text(sidebar.t("Add peer"));
         if (res === "updated") {
           if (input.val().trim() === peer && (!Object.prototype.hasOwnProperty.call(sidebar.property_drafts, "peer-endpoint") || sidebar.property_drafts["peer-endpoint"].trim() === peer)) {
             input.val("");
             delete sidebar.property_drafts["peer-endpoint"];
           }
-          sidebar.peer_feedback = "Peer added.";
+          sidebar.peer_feedback = sidebar.t("Peer added.");
           if (sidebar.tag) sidebar.tag.find("#peer-add-status").text(sidebar.peer_feedback);
-          sidebar.wrapper.notifications.add("peer-add", "done", "Peer added", 5000);
+          sidebar.notify("peer-add", "done", "Peer added");
           sidebar.updateHtmlTag();
         } else {
-          var detail = res && typeof res.error === "string" ? res.error : "Could not add this peer";
+          var detail = res && typeof res.error === "string" ? res.error : sidebar.t("Could not add this peer");
           sidebar.peer_feedback = detail;
           if (sidebar.tag) sidebar.tag.find("#peer-add-status").text(detail);
-          // Notifications render HTML; the endpoint/error is untrusted text.
-          sidebar.wrapper.notifications.add("peer-add", "error", detail.replace(/[&<>"']/g, function(character) {
-            return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[character];
-          }), 10000);
+          sidebar.notify("peer-add", "error", detail);
         }
       });
     };
@@ -1256,206 +1356,81 @@ window.initScrollable = function (chrome) {
           }), 300);
         };
       })(this));
-      this.tag.find("#button-xitelimit").off("click touchend").on("click", (function(_this) {
-        return function() {
-          var limit = _this.tag.find("#input-xitelimit").val();
-          _this.wrapper.ws.cmd("siteSetLimit", limit, function(res) {
-            if (res === "ok") {
-              if (_this.property_drafts["input-xitelimit"] === limit) delete _this.property_drafts["input-xitelimit"];
-              _this.wrapper.notifications.add("done-xitelimit", "done", "Xite storage limit modified!", 5000);
-            }
-            return _this.updateHtmlTag();
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-autodownload_bigfile_size_limit").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.wrapper.ws.cmd("siteSetAutodownloadBigfileLimit", $("#input-autodownload_bigfile_size_limit").val(), function(res) {
-            if (res === "ok") {
-              _this.wrapper.notifications.add("done-bigfilelimit", "done", "Xite bigfile auto download limit modified!", 5000);
-            }
-            return _this.updateHtmlTag();
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-autodownload_previous").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.wrapper.ws.cmd("siteUpdate", {
-            "address": _this.wrapper.xite_info.address,
-            "check_files": true
-          }, function() {
-            return _this.wrapper.notifications.add("done-download_optional", "done", "Optional files downloaded", 5000);
-          });
-          _this.wrapper.notifications.add("start-download_optional", "info", "Optional files download started", 5000);
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-dbreload").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.wrapper.ws.cmd("dbReload", [], function() {
-            _this.wrapper.notifications.add("done-dbreload", "done", "Database schema reloaded!", 5000);
-            return _this.updateHtmlTag();
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-dbrebuild").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.wrapper.notifications.add("done-dbrebuild", "info", "Database rebuilding....");
-          _this.wrapper.ws.cmd("dbRebuild", [], function() {
-            _this.wrapper.notifications.add("done-dbrebuild", "done", "Database rebuilt!", 5000);
-            return _this.updateHtmlTag();
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-update").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.tag.find("#button-update").addClass("loading");
-          _this.wrapper.ws.cmd("siteUpdate", _this.wrapper.xite_info.address, function() {
-            _this.wrapper.notifications.add("done-updated", "done", "Xite updated!", 5000);
-            return _this.tag.find("#button-update").removeClass("loading");
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-pause").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.tag.find("#button-pause").addClass("hidden");
-          _this.wrapper.ws.cmd("sitePause", _this.wrapper.xite_info.address);
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-resume").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.tag.find("#button-resume").addClass("hidden");
-          _this.wrapper.ws.cmd("siteResume", _this.wrapper.xite_info.address);
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-favourite").off("click touched").on("click", (function(_this) {
-	return function() {
-	  _this.tag.find("#button-favourite").addClass("hidden");
-	  _this.tag.find("#button-unfavourite").removeClass("hidden");
-	  _this.wrapper.ws.cmd("siteFavourite", _this.wrapper.xite_info.address);
-	  return false;
-	};
-      })(this));
-      this.tag.find("#button-unfavourite").off("click touched").on("click", (function(_this) {
-	return function() {
-	  _this.tag.find("#button-favourite").removeClass("hidden");
-	  _this.tag.find("#button-unfavourite").addClass("hidden");
-	  _this.wrapper.ws.cmd("siteUnfavourite", _this.wrapper.xite_info.address);
-	  return false;
-	};
-      })(this));
-      this.tag.find("#button-delete").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.handleXiteDeleteClick();
-          return false;
-        };
-      })(this));
-      this.tag.find("#checkbox-owned").off("click touchend").on("click", (function(_this) {
-        return function() {
-          var owned;
-          owned = _this.tag.find("#checkbox-owned").is(":checked");
-          return _this.wrapper.ws.cmd("siteSetOwned", [owned], function(res_set_owned) {
-            _this.log("Owned", owned);
-            if (owned) {
-              return _this.wrapper.ws.cmd("siteRecoverPrivatekey", [], function(res_recover) {
-                if (res_recover === "ok") {
-                  return _this.wrapper.notifications.add("recover", "done", "Private key recovered from master seed", 5000);
-                } else {
-                  return _this.log("Unable to recover private key: " + res_recover.error);
-                }
-              });
-            }
-          });
-        };
-      })(this));
-      this.tag.find("#checkbox-autodownloadoptional").off("click touchend").on("click", (function(_this) {
-        return function() {
-          var checked = _this.tag.find("#checkbox-autodownloadoptional").is(":checked");
-          if (checked) {
-            // Help distribute implies on-demand downloads; reflect it live.
-            _this.tag.find("#checkbox-downloadoptional").prop("checked", true);
+      var sidebar = this;
+      function bind(selector, command, params, options) {
+        sidebar.tag.find(selector).off("click touchend").on("click", function() {
+          if (sidebar.pending_actions && sidebar.pending_actions[selector]) return false;
+          return sidebar.runAction(selector, command, typeof params === "function" ? params() : params, options);
+        });
+      }
+      this.tag.find("#button-xitelimit").off("click").on("click", function() {
+        var value = sidebar.tag.find("#input-xitelimit").val();
+        return sidebar.runAction("#button-xitelimit", "siteSetLimit", value, {
+          success: "Xite storage limit modified!", error: "Could not save storage limit", done: function() {
+            if (sidebar.property_drafts["input-xitelimit"] === value) delete sidebar.property_drafts["input-xitelimit"];
           }
-          return _this.wrapper.ws.cmd("siteSetAutodownloadoptional", [checked]);
-        };
-      })(this));
-      this.tag.find("#checkbox-downloadoptional").off("click touchend").on("click", (function(_this) {
-        return function() {
-          return _this.wrapper.ws.cmd("siteSetDownloadoptional", [_this.tag.find("#checkbox-downloadoptional").is(":checked")]);
-        };
-      })(this));
-      this.tag.find("#button-identity").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.tag.find("#button-identity").css("pointer-events", "none").css("opacity", "0.6");
-          _this.wrapper.ws.cmd("certXid", {}, function(res) {
-            _this.tag.find("#button-identity").css("pointer-events", "").css("opacity", "");
-            if (res === "ok") {
-              _this.updateHtmlTag();
-            }
+        });
+      });
+      this.tag.find("#button-autodownload_bigfile_size_limit").off("click touchend").on("click", function() {
+        var value = sidebar.tag.find("#input-autodownload_bigfile_size_limit").val();
+        return sidebar.runAction("#button-autodownload_bigfile_size_limit", "siteSetAutodownloadBigfileLimit", {limit: value}, {
+          success: "Automatic download limit saved", error: "Could not save automatic download limit", done: function() {
+            if (sidebar.property_drafts["input-autodownload_bigfile_size_limit"] === value) delete sidebar.property_drafts["input-autodownload_bigfile_size_limit"];
+          }
+        });
+      });
+      bind("#button-autodownload_previous", "siteDownloadOptionalPrevious", {}, {
+        error: "Could not download previous files", type: "info", accept: function(res) { return res && (res.status === "started" || res.status === "complete"); },
+        success: function(res) { return res.status === "complete" ? "All eligible optional files are already downloaded." : "Optional file download started."; }
+      });
+      bind("#button-dbreload", "dbReload", [], {success: "Database schema reloaded!", error: "Could not reload database schema"});
+      bind("#button-dbrebuild", "dbRebuild", [], {pending: "Rebuilding database", success: "Database rebuilt!", error: "Could not rebuild database"});
+      bind("#button-update", "siteUpdate", function() {
+        sidebar.update_requested = true;
+        sidebar.update_request_id = "sidebar-" + Date.now() + "-" + Math.random().toString(36).slice(2);
+        return {address: sidebar.wrapper.xite_info.address, update_request_id: sidebar.update_request_id};
+      }, {
+        refresh: false, type: "info", success: function() { return sidebar.update_requested ? "Checking for updates" : null; }, error: "Could not start update",
+        accept: function(res) { return res === "Updated" || res === "ok"; }, failed: function() { sidebar.update_requested = false; },
+        done: function() { sidebar.setActionBusy("#button-update", sidebar.update_requested); }
+      });
+      [["#button-pause", "sitePause"], ["#button-resume", "siteResume"],
+       ["#button-favourite", "siteFavourite"], ["#button-unfavourite", "siteUnfavourite"]].forEach(function(item) {
+        bind(item[0], item[1], function() { return sidebar.wrapper.xite_info.address; }, {error: "Could not change xite settings"});
+      });
+      this.tag.find("#button-delete").off("click touchend").on("click", function() { sidebar.handleXiteDeleteClick(); return false; });
+      this.tag.find("#checkbox-owned").off("click touchend change").on("change", function() {
+        var owned = this.checked;
+        sidebar.runAction("#checkbox-owned", "siteSetOwned", [owned], {error: "Could not change ownership", done: function() {
+          if (!owned || sidebar.wrapper.xite_info.privatekey) return;
+          sidebar.runAction("#privatekey-add", "siteRecoverPrivatekey", [], {
+            success: "Private key recovered from master seed", error: "Private key could not be recovered. Add a signing key to publish."
           });
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-cert-disconnect").off("click touchend").on("click", (function(_this) {
-        return function(e) {
-          e.preventDefault();
-          _this.wrapper.ws.cmd("certSet", [""], function(res) {
-            if (res === "ok") {
-              _this.wrapper.notifications.add("cert-disconnect", "done", "Certificate disconnected", 5000);
-              _this.updateHtmlTag();
-            }
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#button-settings").off("click touchend").on("click", (function(_this) {
-        return function() {
-          var submitted = {};
-          ["settings-title", "settings-description", "settings-xid-name"].forEach(function(id) { submitted[id] = _this.tag.find("#" + id).val(); });
-          _this.wrapper.ws.cmd("fileGet", "content.json", function(res) {
-            var data, json_raw;
-            data = JSON.parse(res);
-            data["title"] = submitted["settings-title"];
-            data["description"] = submitted["settings-description"];
-            var xid_name = submitted["settings-xid-name"].trim();
-            if (xid_name) {
-              data["domain"] = xid_name;
-            } else {
-              delete data["domain"];
-            }
-            json_raw = unescape(encodeURIComponent(JSON.stringify(data, void 0, '\t')));
-            return _this.wrapper.ws.cmd("fileWrite", ["content.json", btoa(json_raw), true], function(res) {
-              if (res !== "ok") {
-                return _this.wrapper.notifications.add("file-write", "error", "File write error: " + res);
-              } else {
-                Object.keys(submitted).forEach(function(id) { if (_this.property_drafts[id] === submitted[id]) delete _this.property_drafts[id]; });
-                _this.wrapper.notifications.add("file-write", "done", "Xite settings saved!", 5000);
-                if (_this.wrapper.xite_info.privatekey) {
-                  _this.wrapper.ws.cmd("siteSign", {
-                    privatekey: "stored",
-                    inner_path: "content.json",
-                    update_changed_files: true
-                  });
-                }
-                return _this.updateHtmlTag();
-              }
-            });
-          });
-          return false;
-        };
-      })(this));
-      this.tag.find("#link-directory").off("click touchend").on("click", (function(_this) {
-        return function() {
-          _this.wrapper.ws.cmd("serverShowdirectory", ["xite", _this.wrapper.xite_info.address]);
-          return false;
-        };
-      })(this));
+        }});
+        setTimeout(function() { if (sidebar.tag) sidebar.scrollable(); }, 300);
+      });
+      [["#checkbox-autodownloadoptional", "siteSetAutodownloadoptional"], ["#checkbox-downloadoptional", "siteSetDownloadoptional"]].forEach(function(item) {
+        sidebar.tag.find(item[0]).off("click touchend change").on("change", function() {
+          sidebar.runAction(item[0], item[1], [this.checked], {error: "Could not change optional download settings"});
+        });
+      });
+      bind("#button-identity", "certXid", {}, {error: "Could not change identity", accept: function(res) { return res === "ok" || res === "Not changed"; }});
+      bind("#button-cert-disconnect", "certSet", [""], {success: "Certificate disconnected", error: "Could not disconnect identity"});
+      this.tag.find("#privatekey-add").off("click touchend").on("click", function() {
+        sidebar.wrapper.displayPrompt(sidebar.t("Enter your private key:"), "password", sidebar.t("Save"), "", function(key) {
+          if (!key) return;
+          sidebar.runAction("#privatekey-add", "userSetSitePrivatekey", [key], {success: "Private key saved for xite signing", error: "Private key not saved"});
+        });
+        return false;
+      });
+      this.tag.find("#privatekey-forget").off("click touchend").on("click", function() {
+        sidebar.wrapper.displayConfirm(sidebar.t("Remove saved private key for this xite?"), sidebar.t("Forget"), function(confirmed) {
+          if (confirmed) sidebar.runAction("#privatekey-forget", "userSetSitePrivatekey", [""], {success: "Saved private key removed", error: "Could not forget private key"});
+        });
+        return false;
+      });
+      this.tag.find("#button-settings").off("click touchend").on("click", function() { return sidebar.saveSettings(); });
+      bind("#link-directory", "serverShowdirectory", function() { return ["xite", sidebar.wrapper.xite_info.address]; }, {refresh: false, error: "Could not open directory"});
       this.tag.find("#form-addpeer").off("submit").on("submit", (function(_this) {
         return function(e) {
           e.preventDefault();
@@ -1463,21 +1438,29 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#link-copypeers").off("click touchend").on("click", (function(_this) {
-        return function(e) {
-          var copy_text, handler;
-          copy_text = e.currentTarget.href;
-          handler = function(e) {
-            e.clipboardData.setData('text/plain', copy_text);
-            e.preventDefault();
-            _this.wrapper.notifications.add("copy", "done", "Xite address with peers copied to your clipboard", 5000);
-            return document.removeEventListener('copy', handler, true);
-          };
-          document.addEventListener('copy', handler, true);
-          document.execCommand('copy');
-          return false;
-        };
-      })(this));
+      this.tag.find("#link-copypeers").off("click touchend").on("click", function(event) {
+        var text = event.currentTarget.href;
+        var hasPeers = new URL(text).searchParams.get("epixnet_peers");
+        function copied() { sidebar.notify("copy", "done", hasPeers ? "Xite address with peers copied to your clipboard" : "Xite link copied. No shareable peers are available."); }
+        function fallback() {
+          var copiedText = false;
+          function handler(event) {
+            if (!event.clipboardData) return;
+            event.clipboardData.setData("text/plain", text);
+            event.preventDefault();
+            copiedText = true;
+          }
+          document.addEventListener("copy", handler, true);
+          try { document.execCommand("copy"); }
+          catch (error) { copiedText = false; }
+          finally { document.removeEventListener("copy", handler, true); }
+          if (copiedText) copied();
+          else sidebar.notify("copy", "error", "Could not copy the link. Check clipboard permissions.");
+        }
+        if (navigator.clipboard && navigator.clipboard.writeText) navigator.clipboard.writeText(text).then(copied, fallback);
+        else fallback();
+        return false;
+      });
       $(document).off("click.sidebarPublish").on("click.sidebarPublish", (function(_this) {
         return function() {
           var ref, ref1;
@@ -1503,36 +1486,20 @@ window.initScrollable = function (chrome) {
       }
       menu.elem.css("margin-top", "-130px");
       if (!menu.items.length) {
-      menu.addItem("Sign", (function(_this) {
+      menu.addItem(this.t("Sign"), (function(_this) {
         return function() {
           var inner_path;
           inner_path = _this.tag.find("#input-contents").val();
-          _this.wrapper.ws.cmd("fileRules", {
-            inner_path: inner_path
-          }, function(rules) {
-            var ref;
-            if (ref = _this.wrapper.xite_info.auth_address, indexOf.call(rules.signers, ref) >= 0) {
-              return _this.sign(inner_path);
-            } else if (_this.wrapper.xite_info.privatekey) {
-              return _this.sign(inner_path, "stored");
-            } else {
-              return _this.wrapper.displayPrompt("Enter your private key:", "password", "Sign", "", function(privatekey) {
-                return _this.sign(inner_path, privatekey);
-              });
-            }
-          });
+          _this.withSigningKey(inner_path, function(key) { _this.sign(inner_path, key); });
           _this.tag.find(".contents + .flex").removeClass("active");
           return menu.hide();
         };
       })(this));
-      menu.addItem("Publish", (function(_this) {
+      menu.addItem(this.t("Publish"), (function(_this) {
         return function() {
           var inner_path;
           inner_path = _this.tag.find("#input-contents").val();
-          _this.wrapper.ws.cmd("sitePublish", {
-            "inner_path": inner_path,
-            "sign": false
-          });
+          _this.publish(inner_path, null, false);
           _this.tag.find(".contents + .flex").removeClass("active");
           return menu.hide();
         };
@@ -1545,7 +1512,6 @@ window.initScrollable = function (chrome) {
             menu.hide();
           } else {
             _this.tag.find(".contents + .flex").addClass("active");
-            _this.tag.find(".content-wrapper").prop("scrollTop", 10000);
             menu.show();
           }
           return false;
@@ -1562,20 +1528,7 @@ window.initScrollable = function (chrome) {
         return function() {
           var inner_path;
           inner_path = _this.tag.find("#input-contents").val();
-          _this.wrapper.ws.cmd("fileRules", {
-            inner_path: inner_path
-          }, function(rules) {
-            var ref;
-            if (ref = _this.wrapper.xite_info.auth_address, indexOf.call(rules.signers, ref) >= 0) {
-              return _this.publish(inner_path, null);
-            } else if (_this.wrapper.xite_info.privatekey) {
-              return _this.publish(inner_path, "stored");
-            } else {
-              return _this.wrapper.displayPrompt("Enter your private key:", "password", "Sign", "", function(privatekey) {
-                return _this.publish(inner_path, privatekey);
-              });
-            }
-          });
+          _this.withSigningKey(inner_path, function(key) { _this.publish(inner_path, key); });
           return false;
         };
       })(this));

@@ -1529,11 +1529,28 @@ async fn render_wrapper(
     // The loopback host is selected below after resolving the canonical address.
     let site_file_server = if proxy_mode { format!("//{}", content_host_for(&host)) } else { String::new() };
 
+    // Bootstrap endpoints belong to the node, never the publisher's iframe.
+    // Retain all unrelated query bytes so client-side xite routing is unchanged.
+    let (raw_query, bootstrap_peers) = sidebar_peer_query(raw_query.as_deref());
+
     // The path segment may be a `.epix` name (xID) or the bech32 address; the
     // node's identity for a xite is ALWAYS the bech32 address, so translate
     // once here and key everything below (state lookups, wrapper identity,
     // the WS session) by the address.
     let mut address = ctx.state.canonical_key(&requested).await;
+    if !bootstrap_peers.is_empty() && !ctx.state.ui_restrict().await {
+        // Shared links use the canonical address. Register before the resolver
+        // starts so its first fetch can use the supplied peer, without relaxing
+        // NoNewSites or enabling any transport.
+        if !ctx.state.has_xite(&address).await && epix_core::Address::parse(&address).is_ok()
+            && ctx.state.has_on_demand().await && !ctx.state.no_new_xites().await
+        {
+            if let Err(error) = ctx.state.register_for_download(&address).await {
+                ctx.state.log("INFO", format!("Could not register shared xite: {error}")).await;
+            }
+        }
+        ctx.state.import_sidebar_peers(&address, &bootstrap_peers).await;
+    }
     let address_form = epix_core::classify_label(&requested) == epix_core::LabelClass::Address
         || address_alias(&requested).is_some();
     let mut loading = false;
@@ -3198,6 +3215,26 @@ fn strip_wrapper_nonce(q: &str) -> String {
         .filter(|kv| percent_decode(kv.split('=').next().unwrap_or("")) != "wrapper_nonce")
         .collect::<Vec<_>>()
         .join("&")
+}
+
+fn sidebar_peer_query(query: Option<&str>) -> (Option<String>, Vec<String>) {
+    let Some(query) = query else { return (None, Vec::new()); };
+    let mut remaining = Vec::new();
+    let mut peers = Vec::new();
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if percent_decode(key) == "epixnet_peers" {
+            // Bound parsing work independently from the node's validation.
+            if value.len() <= 8192 && peers.len() < 20 {
+                let decoded = percent_decode(value);
+                peers.extend(decoded.split(',').take(20 - peers.len()).map(str::to_string));
+            }
+        } else {
+            remaining.push(pair);
+        }
+    }
+    let remaining = remaining.join("&");
+    ((!remaining.is_empty()).then_some(remaining), peers)
 }
 
 fn render(template: &str, vars: &[(&str, String)]) -> String {

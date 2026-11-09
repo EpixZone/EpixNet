@@ -4,12 +4,15 @@ const path = require('node:path');
 const vm = require('node:vm');
 const {test} = require('node:test');
 const source = fs.readFileSync(path.join(__dirname, '../../crates/epix-plugins/media/sidebar/all.js'), 'utf8');
-const start = source.indexOf('Sidebar.prototype.addPeer = function()');
-const end = source.indexOf('\n    };', start);
-assert.ok(start >= 0 && end > start);
+const methods = ['t', 'escapeText', 'notify', 'addPeer'].map(name => {
+  const start = source.indexOf('Sidebar.prototype.' + name + ' = function(');
+  const end = source.indexOf('\n    };', start);
+  assert.ok(start >= 0 && end > start);
+  return source.slice(start, end + 7);
+}).join('\n');
 function fixture(value) {
   const context = vm.createContext({});
-  vm.runInContext('var Sidebar = function() {};\n' + source.slice(start, end + 7), context);
+  vm.runInContext('var Sidebar = function() {};\n' + methods, context);
   const calls = [], notices = [];
   let callback, refreshes = 0;
   const input = {val(next) { if (next !== undefined) value = next; return value; }};

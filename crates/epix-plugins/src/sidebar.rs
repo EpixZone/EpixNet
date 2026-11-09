@@ -14,6 +14,11 @@ use epix_ui::{WsCommand, WsSession};
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+#[path = "sidebar_details.rs"]
+mod details;
+#[path = "sidebar_i18n.rs"]
+mod i18n;
+
 static ALL_JS: &[u8] = include_bytes!("../media/sidebar/all.js");
 static ALL_CSS: &[u8] = include_bytes!("../media/sidebar/all.css");
 
@@ -60,7 +65,10 @@ impl WsCommand for SidebarGetHtmlTag {
 
     async fn handle(&self, s: &WsSession, _p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        let info = s.state.xite_info(&address).await;
+        let mut info = s.state.xite_info(&address).await;
+        info["sidebar_details"] = s.state.sidebar_details(&address).await;
+        info["sidebar_details"]["peer_share_url"] = json!(s.state.sidebar_peer_share_url(&address).await);
+        info["sidebar_language"] = json!(s.state.ui_language().await);
         let counts = s.state.peer_counts(&address).await;
         let (recv, sent) = s.state.transfer(&address).await;
         let map_open = s.state.global_settings().await["sidebar_peer_map_open"].as_bool().unwrap_or(true);
@@ -121,7 +129,7 @@ impl WsCommand for XiteSetSizeLimit {
             .as_i64()
             .or_else(|| raw.as_str().and_then(|s| s.trim().parse::<i64>().ok()))
             .ok_or("size_limit must be a number")?;
-        s.state.set_size_limit(&address, limit).await;
+        s.state.set_size_limit_checked(&address, limit).await?;
         Ok(Value::String("ok".into()))
     }
 }
@@ -142,7 +150,7 @@ fn esc(s: &str) -> String {
 
 /// Content choices fill the editable signing path. Their pressed state follows
 /// that input in the sidebar JS, including a path entered without a shortcut.
-fn signable_contents(includes: &[String]) -> String {
+fn signable_contents(includes: &[String], language: &str) -> String {
     let mut links = vec![
         "<button type='button' class='contents-content selected' data-content-path='content.json' aria-pressed='true'>content.json</button>".to_string(),
     ];
@@ -152,7 +160,8 @@ fn signable_contents(includes: &[String]) -> String {
             "<button type='button' class='contents-content' data-content-path='{e}' aria-pressed='false'>{e}</button>",
         ));
     }
-    format!("<div class='contents' role='group' aria-label='Content file choices'>{}</div>", links.join(" "))
+    format!("<div class='contents' role='group' aria-label='{}'>{}</div>",
+        esc(i18n::translate(language, "Content file choices")), links.join(" "))
 }
 
 fn pct(part: f64, total: f64) -> String {
@@ -166,7 +175,7 @@ fn pct(part: f64, total: f64) -> String {
 /// each file shows a state icon (spinner/check/dot/x). The list defaults
 /// collapsed; `all.js` toggles the `.expanded` class on `#optional-file-list`
 /// and re-applies it across the morphdom refresh so it survives live updates.
-fn render_optional_progress(progress: &Value) -> String {
+fn render_optional_progress(progress: &Value, language: &str) -> String {
     let obj = match progress.as_object() {
         Some(o) => o,
         None => return String::new(),
@@ -189,7 +198,8 @@ fn render_optional_progress(progress: &Value) -> String {
         phase
     };
     let failed_note = if failed > 0 {
-        format!(" · <span class='opt-failed'>{failed} failed</span>")
+        format!(" · <span class='opt-failed'>{}</span>",
+            esc(&i18n::translate(language, "{count} failed").replace("{count}", &failed.to_string())))
     } else {
         String::new()
     };
@@ -219,14 +229,16 @@ fn render_optional_progress(progress: &Value) -> String {
     // this panel, and the toggles together in one block.
     format!(
         "<div class='optional-progress'>\
-          <label><span class='opt-spinner'></span> Downloading optional files… {done} / {total}{failed_note}</label>\
+          <label><span class='opt-spinner'></span> {downloading} {done} / {total}{failed_note}</label>\
           <ul class='graph graph-stacked'>\
            <li style='width: {bar_w}' class='downloaded back-green'></li>\
           </ul>\
           <div class='opt-status'>{status}</div>\
-          <a href='#OptionalFiles' class='opt-toggle-files' id='optional-files-toggle'>Show files ({total})</a>\
+          <a href='#OptionalFiles' class='opt-toggle-files' id='optional-files-toggle'>{show_files} ({total})</a>\
           <ul class='opt-file-list' id='optional-file-list'>{items}</ul></div>",
         bar_w = format!("{:.0}%", percent.clamp(0.0, 100.0)),
+        downloading = esc(i18n::translate(language, "Downloading optional files…")),
+        show_files = esc(i18n::translate(language, "Show files")),
     )
 }
 
@@ -241,10 +253,79 @@ fn render_sidebar(
     includes: &[String],
     map_open: bool,
 ) -> String {
+    let language = info["sidebar_language"].as_str().unwrap_or("en");
+    let detail = &info["sidebar_details"];
+    let label_xite_properties = esc(i18n::translate(language, "Xite properties"));
+    let label_close_properties = esc(i18n::translate(language, "Close properties"));
+    let label_xite_controls = esc(i18n::translate(language, "Xite controls"));
+    let label_update = esc(i18n::translate(language, "Update"));
+    let label_pause = esc(i18n::translate(language, "Pause"));
+    let label_resume = esc(i18n::translate(language, "Resume"));
+    let label_favourite = esc(i18n::translate(language, "Favourite"));
+    let label_unfavourite = esc(i18n::translate(language, "Unfavourite"));
+    let label_peer_map = esc(i18n::translate(language, "Peer map"));
+    let label_properties_sections = esc(i18n::translate(language, "Properties sections"));
+    let label_overview = esc(i18n::translate(language, "Overview"));
+    let label_files = esc(i18n::translate(language, "Files"));
+    let label_manage = esc(i18n::translate(language, "Manage"));
+    let label_peers = esc(i18n::translate(language, "Peers"));
+    let label_copy_to_clipboard = esc(i18n::translate(language, "Copy to clipboard"));
+    let label_connected_peers = esc(i18n::translate(language, "connected peers"));
+    let label_connectable = esc(i18n::translate(language, "Connectable"));
+    let label_total_peers = esc(i18n::translate(language, "Total peers"));
+    let label_onion = esc(i18n::translate(language, "Onion"));
+    let label_local = esc(i18n::translate(language, "Local"));
+    let label_peer_address = esc(i18n::translate(language, "Peer address"));
+    let label_add_peer = esc(i18n::translate(language, "Add peer"));
+    let label_accepted_address_formats = esc(i18n::translate(language, "Accepted address formats"));
+    let label_ipv4_port_ipv6_port_host_onion_port_an_i2p_host_with_optional_port_or_rns_destination = esc(i18n::translate(language, "IPv4:port, [IPv6]:port, host.onion:port, an I2P host with optional port, or rns:destination."));
+    let label_data_transfer = esc(i18n::translate(language, "Data transfer"));
+    let label_received = esc(i18n::translate(language, "Received"));
+    let label_sent = esc(i18n::translate(language, "Sent"));
+    let label_identity = esc(i18n::translate(language, "Identity"));
+    let label_used_when_you_interact_with_this_xite = esc(i18n::translate(language, "Used when you interact with this xite."));
+    let label_files_storage = esc(i18n::translate(language, "Files & storage"));
+    let label_stored = esc(i18n::translate(language, "Stored"));
+    let label_browse_files = esc(i18n::translate(language, "Browse files"));
+    let label_show_directory = esc(i18n::translate(language, "Show directory"));
+    let label_save_as_zip = esc(i18n::translate(language, "Save as .zip"));
+    let label_storage_limit = esc(i18n::translate(language, "Storage limit"));
+    let label_save_limit = esc(i18n::translate(language, "Save limit"));
+    let label_optional_files = esc(i18n::translate(language, "Optional files"));
+    let label_downloaded = format!("{}:", esc(i18n::translate(language, "Downloaded")));
+    let label_total_optional = format!("{}:", esc(i18n::translate(language, "Total optional")));
+    let label_download_files_i_open = esc(i18n::translate(language, "Download files I open"));
+    let label_fetch_optional_files_when_you_view_them = esc(i18n::translate(language, "Fetch optional files when you view them."));
+    let label_pre_download_everything = esc(i18n::translate(language, "Pre-download everything"));
+    let label_also_fetch_files_you_have_not_opened = esc(i18n::translate(language, "Also fetch files you have not opened."));
+    let label_you_already_share_the_files_you_have_downloaded = esc(i18n::translate(language, "You already share the files you have downloaded."));
+    let label_auto_download_maximum_file_size = esc(i18n::translate(language, "Auto-download maximum file size"));
+    let label_0_means_no_limit_applies_to_automatic_downloads = esc(i18n::translate(language, "0 means no limit. Applies to automatic downloads."));
+    let label_download_previous_files = esc(i18n::translate(language, "Download previous files"));
+    let label_needs_to_be_updated = esc(i18n::translate(language, "Needs to be updated"));
+    let label_this_is_my_xite = esc(i18n::translate(language, "This is my xite"));
+    let label_show_editing_and_publishing_controls = esc(i18n::translate(language, "Show editing and publishing controls."));
+    let label_xite_title = esc(i18n::translate(language, "Xite title"));
+    let label_xite_description = esc(i18n::translate(language, "Xite description"));
+    let label_xid_name = esc(i18n::translate(language, "xID name"));
+    let label_e_g_mysite_epix = esc(i18n::translate(language, "e.g. mysite.epix"));
+    let label_save_xite_settings = esc(i18n::translate(language, "Save xite settings"));
+    let label_content_publishing = esc(i18n::translate(language, "Content publishing"));
+    let label_content_file = esc(i18n::translate(language, "Content file"));
+    let label_sign_and_publish = esc(i18n::translate(language, "Sign and publish"));
+    let label_more_publishing_actions = esc(i18n::translate(language, "More publishing actions"));
+    let label_database = esc(i18n::translate(language, "Database"));
+    let label_reload_the_schema_or_rebuild_the_database_from_xite_files = esc(i18n::translate(language, "Reload the schema or rebuild the database from xite files."));
+    let label_reload_schema = esc(i18n::translate(language, "Reload schema"));
+    let label_rebuild_database = esc(i18n::translate(language, "Rebuild database"));
+    let label_remove_xite = esc(i18n::translate(language, "Remove xite"));
+    let label_remove_this_xite_from_your_node = esc(i18n::translate(language, "Remove this xite from your node."));
+    let label_delete_xite = esc(i18n::translate(language, "Delete xite"));
     let content = &info["content"];
     let title = content.get("title").and_then(|v| v.as_str())
         .filter(|title| !title.trim().is_empty()).unwrap_or(address);
-    let files = content.get("files").and_then(|v| v.as_i64()).unwrap_or(0);
+    let files = detail["storage"]["files"].as_i64()
+        .or_else(|| content.get("files").and_then(|v| v.as_i64())).unwrap_or(0);
     let size_bytes = info["settings"]["size"].as_i64().unwrap_or(0);
     let size_mb = size_bytes as f64 / 1024.0 / 1024.0;
     let size_limit = info["size_limit"].as_i64().unwrap_or(epix_ui::DEFAULT_SIZE_LIMIT_MB);
@@ -265,24 +346,26 @@ fn render_sidebar(
     let sent_mb = sent as f64 / 1024.0 / 1024.0;
 
     let mut b = String::new();
-    b.push_str("<div class='sidebar-properties'>");
+    b.push_str(&format!("<div class='sidebar-properties' lang='{}' dir='{}' data-i18n='{}'>",
+        esc(language), if matches!(language.to_ascii_lowercase().split('-').next(), Some("ar" | "fa")) { "rtl" } else { "ltr" },
+        esc(&serde_json::to_string(i18n::catalog(language)).unwrap())));
     b.push_str(&format!(
         "<header class='sidebar-header'>\
-          <div class='sidebar-heading'><div><p class='sidebar-kicker'>Xite properties</p><h1>{title}</h1></div>\
-           <button type='button' class='close' aria-label='Close properties'>&times;</button></div>\
+          <div class='sidebar-heading'><div><p class='sidebar-kicker'>{label_xite_properties}</p><h1>{title}</h1></div>\
+           <button type='button' class='close' aria-label='{label_close_properties}'>&times;</button></div>\
           <p class='sidebar-address'>{address}</p>\
           <p class='sidebar-serving {serving_class}'><span class='sidebar-status-dot' aria-hidden='true'></span>{serving_label}</p>\
-          <div class='sidebar-actions' role='group' aria-label='Xite controls'>\
-           <a href='#Update' class='button' id='button-update'>Update</a>\
-           <a href='#Pause' class='button {pause_h}' id='button-pause'>Pause</a>\
-           <a href='#Resume' class='button {resume_h}' id='button-resume'>Resume</a>\
-           <a href='#Favourite' class='button {fav_h}' id='button-favourite'>Favourite</a>\
-           <a href='#Unfavourite' class='button {unfav_h}' id='button-unfavourite'>Unfavourite</a>\
+          <div class='sidebar-actions' role='group' aria-label='{label_xite_controls}'>\
+           <a href='#Update' class='button' id='button-update'>{label_update}</a>\
+           <a href='#Pause' class='button {pause_h}' id='button-pause'>{label_pause}</a>\
+           <a href='#Resume' class='button {resume_h}' id='button-resume'>{label_resume}</a>\
+           <a href='#Favourite' class='button {fav_h}' id='button-favourite'>{label_favourite}</a>\
+           <a href='#Unfavourite' class='button {unfav_h}' id='button-unfavourite'>{label_unfavourite}</a>\
           </div></header>",
         title = esc(title),
         address = esc(address),
         serving_class = if serving { "" } else { "is-paused" },
-        serving_label = if serving { "Sharing enabled" } else { "Sharing paused" },
+        serving_label = esc(i18n::translate(language, if serving { "Sharing enabled" } else { "Sharing paused" })),
         pause_h = hidden(!serving),
         resume_h = hidden(serving),
         fav_h = hidden(favorite),
@@ -291,39 +374,37 @@ fn render_sidebar(
     b.push_str(&format!(
         "<section class='sidebar-peer-map' data-open='{map_open}'>\
           <button type='button' id='sidebar-peer-map-toggle' aria-expanded='{map_open}' aria-controls='sidebar-peer-map-panel'>\
-           <span class='sidebar-peer-map-label'>Peer map</span><span class='sidebar-peer-map-state'>{map_action}</span><span class='sidebar-peer-map-chevron' aria-hidden='true'>&#9662;</span></button>\
+           <span class='sidebar-peer-map-label'>{label_peer_map}</span><span class='sidebar-peer-map-state'>{map_action}</span><span class='sidebar-peer-map-chevron' aria-hidden='true'>&#9662;</span></button>\
           <div id='sidebar-peer-map-panel'{map_hidden}>\
            <div class='globe loading'></div></div></section>",
         map_hidden = if map_open { "" } else { " hidden" },
-        map_action = if map_open { "Hide" } else { "Show" },
+        map_action = esc(i18n::translate(language, if map_open { "Hide" } else { "Show" })),
     ));
-    b.push_str(
-        "<div class='sidebar-tabs' role='tablist' aria-label='Properties sections'>\
-          <button type='button' class='sidebar-tab' id='sidebar-tab-overview' data-tab='overview' role='tab' aria-selected='true' aria-controls='sidebar-panel-overview' tabindex='0'>Overview</button>\
-          <button type='button' class='sidebar-tab' id='sidebar-tab-files' data-tab='files' role='tab' aria-selected='false' aria-controls='sidebar-panel-files' tabindex='-1'>Files</button>\
-          <button type='button' class='sidebar-tab' id='sidebar-tab-manage' data-tab='manage' role='tab' aria-selected='false' aria-controls='sidebar-panel-manage' tabindex='-1'>Manage</button>\
+    b.push_str(&format!("<div class='sidebar-tabs' role='tablist' aria-label='{label_properties_sections}'>\
+          <button type='button' class='sidebar-tab' id='sidebar-tab-overview' data-tab='overview' role='tab' aria-selected='true' aria-controls='sidebar-panel-overview' tabindex='0'>{label_overview}</button>\
+          <button type='button' class='sidebar-tab' id='sidebar-tab-files' data-tab='files' role='tab' aria-selected='false' aria-controls='sidebar-panel-files' tabindex='-1'>{label_files}</button>\
+          <button type='button' class='sidebar-tab' id='sidebar-tab-manage' data-tab='manage' role='tab' aria-selected='false' aria-controls='sidebar-panel-manage' tabindex='-1'>{label_manage}</button>\
          </div>\
-         <section class='sidebar-panel' id='sidebar-panel-overview' data-panel='overview' role='tabpanel' aria-labelledby='sidebar-tab-overview'><ul class='fields'>",
-    );
+         <section class='sidebar-panel' id='sidebar-panel-overview' data-panel='overview' role='tabpanel' aria-labelledby='sidebar-tab-overview'><ul class='fields'>"));
 
     // Peer categories overlap, so show independent counts instead of a stack.
     b.push_str(&format!(
-        "<li class='sidebar-section'><div class='sidebar-section-heading'><h2>Peers</h2>\
-          <a href='#Copy' id='link-copypeers' class='link-right'>Copy to clipboard</a></div>\
-         <div class='sidebar-peer-total'><b>{connected}</b><span>connected peers</span></div>\
+        "<li class='sidebar-section'><div class='sidebar-section-heading'><h2>{label_peers}</h2>\
+          <a href='{peer_share_url}' id='link-copypeers' class='link-right'>{label_copy_to_clipboard}</a></div>\
+         <div class='sidebar-peer-total'><b>{connected}</b><span>{label_connected_peers}</span></div>\
          <ul class='graph-legend sidebar-peer-counts'>\
-          <li><span>Connectable</span><b>{connectable}</b></li>\
-          <li><span>Total peers</span><b>{total_n}</b></li>\
-          <li><span>Onion</span><b>{onion}</b></li>\
-          <li><span>Local</span><b>{local}</b></li>\
+          <li><span>{label_connectable}</span><b>{connectable}</b></li>\
+          <li><span>{label_total_peers}</span><b>{total_n}</b></li>\
+          <li><span>{label_onion}</span><b>{onion}</b></li>\
+          <li><span>{label_local}</span><b>{local}</b></li>\
          </ul>\
          <form id='form-addpeer'>\
-          <label for='peer-endpoint'>Peer address</label>\
+          <label for='peer-endpoint'>{label_peer_address}</label>\
           <div class='sidebar-form-row'><input id='peer-endpoint' class='text' type='text' maxlength='128' autocomplete='off' autocapitalize='none' spellcheck='false' \
             placeholder='IP:port or rns:destination' aria-describedby='peer-address-formats peer-add-status'>\
-           <button type='submit' class='button'>Add peer</button></div>\
-          <details class='sidebar-peer-formats'><summary>Accepted address formats</summary>\
-           <p class='sidebar-help' id='peer-address-formats'>IPv4:port, [IPv6]:port, host.onion:port, an I2P host with optional port, or rns:destination.</p></details>\
+           <button type='submit' class='button'>{label_add_peer}</button></div>\
+          <details class='sidebar-peer-formats'><summary>{label_accepted_address_formats}</summary>\
+           <p class='sidebar-help' id='peer-address-formats'>{label_ipv4_port_ipv6_port_host_onion_port_an_i2p_host_with_optional_port_or_rns_destination}</p></details>\
           <p id='peer-add-status' class='sidebar-help' role='status' aria-live='polite'></p>\
          </form></li>",
         connected = counts.connected,
@@ -331,14 +412,15 @@ fn render_sidebar(
         onion = counts.onion,
         local = counts.local,
         total_n = counts.total,
+        peer_share_url = esc(detail["peer_share_url"].as_str().unwrap_or("#Copy")),
     ));
 
     // Data transfer
     b.push_str(&format!(
-        "<li class='sidebar-section'><h2>Data transfer</h2>\
+        "<li class='sidebar-section'><h2>{label_data_transfer}</h2>\
          <ul class='graph-legend sidebar-transfer'>\
-          <li><span>Received</span><b>{recv_mb:.2}MB</b></li>\
-          <li><span>Sent</span><b>{sent_mb:.2}MB</b></li>\
+          <li><span>{label_received}</span><b>{recv_mb:.2}MB</b></li>\
+          <li><span>{label_sent}</span><b>{sent_mb:.2}MB</b></li>\
          </ul></li>",
     ));
 
@@ -346,38 +428,42 @@ fn render_sidebar(
     let (identity, action) = match cert_user_id {
         Some(id) => (esc(id), "Change"),
         None if !auth_address.is_empty() => (esc(auth_address), "Change"),
-        None => ("No identity selected".to_string(), "Select"),
+        None => (esc(i18n::translate(language, "No identity selected")), "Select"),
     };
+    let action = esc(i18n::translate(language, action));
     b.push_str(&format!(
-        "<li class='sidebar-section'><div class='sidebar-section-heading'><h2>Identity</h2>\
+        "<li class='sidebar-section'><div class='sidebar-section-heading'><h2>{label_identity}</h2>\
           <a href='#Change' id='button-identity' class='link-right'>{action}</a></div>\
          <span class='console-address'>{identity}</span>\
-         <p class='sidebar-help'>Used when you interact with this xite.</p></li>\
+         {identity_details}<p class='sidebar-help'>{label_used_when_you_interact_with_this_xite}</p></li>\
          </ul></section>\
          <section class='sidebar-panel' id='sidebar-panel-files' data-panel='files' role='tabpanel' aria-labelledby='sidebar-tab-files' hidden><ul class='fields'>",
+        identity_details = details::identity(info, language),
     ));
 
     // Files
     b.push_str(&format!(
-        "<li class='sidebar-section'><h2>Files &amp; storage</h2>\
+        "<li class='sidebar-section'><h2>{label_files_storage}</h2>\
          <ul class='graph-legend'>\
-          <li><span>Files</span><b>{files}</b></li>\
-          <li><span>Stored</span><b>{size_mb:.2}MB</b></li>\
-         </ul><div class='sidebar-file-actions'>\
-          <a href='/list/{addr}' class='button' id='browse-files'>Browse files</a>\
-          <a href='#Directory' id='link-directory' class='button'>Show directory</a>\
-          <a href='/EpixNet-Internal/Zip?address={addr}' id='link-zip' class='button' download='xite.zip'>Save as .zip</a>\
+          <li><span>{label_files}</span><b>{files}</b></li>\
+          <li><span>{label_stored}</span><b>{size_mb:.2}MB</b></li>\
+         </ul>{storage_breakdown}<div class='sidebar-file-actions'>\
+          <a href='/list/{addr}' class='button' id='browse-files'>{label_browse_files}</a>\
+          <a href='#Directory' id='link-directory' class='button'>{label_show_directory}</a>\
+          <a href='/EpixNet-Internal/Zip?address={addr}' id='link-zip' class='button' download='xite.zip'>{label_save_as_zip}</a>\
          </div></li>",
         addr = esc(address),
+        storage_breakdown = details::storage(detail, language),
     ));
 
     // Size limit
     let percent_used = pct(size_mb, size_limit as f64);
     b.push_str(&format!(
-        "<li class='sidebar-section'><label for='input-xitelimit'>Storage limit <small>({percent_used} used)</small></label>\
+        "<li class='sidebar-section'><label for='input-xitelimit'>{label_storage_limit} <small>({percent_used} used)</small></label>\
          <div class='sidebar-form-row'><div class='sidebar-limit-field'>\
           <input type='text' inputmode='numeric' class='text text-num' value='{size_limit}' id='input-xitelimit' aria-describedby='xitelimit-unit'/><span class='text-post' id='xitelimit-unit'>MB</span></div>\
-          <a href='#Set' class='button' id='button-xitelimit'>Save limit</a></div></li>",
+          <a href='#Set' class='button' id='button-xitelimit'>{label_save_limit}</a></div>{free_space}</li>",
+        free_space = details::free_space(detail, language),
     ));
 
     // Optional files (only when the xite declares any).
@@ -385,32 +471,40 @@ fn render_sidebar(
         let opt_mb = size_optional as f64 / 1024.0 / 1024.0;
         let opt_dl_mb = optional_downloaded as f64 / 1024.0 / 1024.0;
         b.push_str(&format!(
-            "<li class='sidebar-section'><h2>Optional files</h2>\
+            "<li class='sidebar-section'><h2>{label_optional_files}</h2>\
              <ul class='graph graph-stacked'>\
               <li style='width: {dl_w}' class='downloaded back-green' title='Downloaded'></li>\
              </ul>\
              <ul class='graph-legend'>\
-              <li class='color-green'><span>Downloaded:</span><b>{opt_dl_mb:.2}MB</b></li>\
-              <li class='color-black'><span>Total optional:</span><b>{opt_mb:.2}MB</b></li>\
+              <li class='color-green'><span>{label_downloaded}</span><b>{opt_dl_mb:.2}MB</b></li>\
+              <li class='color-black'><span>{label_total_optional}</span><b>{opt_mb:.2}MB</b></li>\
              </ul>\
              {progress}\
              <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-downloadoptional' {dl_checked}/>\
-              <span class='checkbox-skin'></span><span class='sidebar-toggle-copy'><strong>Download files I open</strong><small>Fetch optional files when you view them.</small></span></label>\
+              <span class='checkbox-skin'></span><span class='sidebar-toggle-copy'><strong>{label_download_files_i_open}</strong><small>{label_fetch_optional_files_when_you_view_them}</small></span></label>\
              <label class='checkbox'><input type='checkbox' class='checkbox' id='checkbox-autodownloadoptional' {opt_checked}/>\
-              <span class='checkbox-skin'></span><span class='sidebar-toggle-copy'><strong>Pre-download everything</strong><small>Also fetch files you have not opened.</small></span></label>\
-             <p class='sidebar-help'>You already share the files you have downloaded.</p></li>",
+              <span class='checkbox-skin'></span><span class='sidebar-toggle-copy'><strong>{label_pre_download_everything}</strong><small>{label_also_fetch_files_you_have_not_opened}</small></span></label>\
+             <p class='sidebar-help'>{label_you_already_share_the_files_you_have_downloaded}</p>\
+             <div class='sidebar-optional-limit'><label for='input-autodownload_bigfile_size_limit'>{label_auto_download_maximum_file_size}</label>\
+              <div class='sidebar-form-row'><div class='sidebar-limit-field'>\
+               <input type='text' inputmode='numeric' class='text text-num' value='{bigfile_limit}' id='input-autodownload_bigfile_size_limit' aria-describedby='optional-size-help'/><span class='text-post'>MB</span></div>\
+               <a href='#Set' class='button' id='button-autodownload_bigfile_size_limit'>{label_save_limit}</a></div>\
+              <p class='sidebar-help' id='optional-size-help'>{label_0_means_no_limit_applies_to_automatic_downloads}</p>\
+              <a href='#Download-previous' class='button' id='button-autodownload_previous'>{label_download_previous_files}</a></div></li>",
             dl_w = pct(opt_dl_mb, opt_mb),
-            progress = render_optional_progress(&info["optional_progress"]),
+            progress = render_optional_progress(&info["optional_progress"], language),
             dl_checked = if download_optional { "checked='checked'" } else { "" },
             opt_checked = if autodownload { "checked='checked'" } else { "" },
+            bigfile_limit = info["settings"]["autodownload_bigfile_size_limit"].as_u64().unwrap_or(0),
         ));
     }
 
     // Not-synced files (bad files awaiting retry).
     if bad_files > 0 {
         b.push_str(&format!(
-            "<li class='sidebar-section'><h2>Needs to be updated</h2>\
-             <span class='console-address'>{bad_files} file(s)</span></li>",
+            "<li class='sidebar-section'><h2>{label_needs_to_be_updated}</h2>\
+             <span class='console-address'>{bad_files} file(s)</span>{pending}</li>",
+            pending = details::pending(&info["settings"]["cache"]["bad_files"], language),
         ));
     }
 
@@ -427,44 +521,47 @@ fn render_sidebar(
     let description = content.get("description").and_then(|v| v.as_str()).unwrap_or("");
     let xid_name = content.get("domain").and_then(|v| v.as_str()).unwrap_or("");
     b.push_str(&format!(
-        "<li class='sidebar-section sidebar-ownership'><label class='owned-title' for='checkbox-owned'>This is my xite</label>\
+        "<li class='sidebar-section sidebar-ownership'><label class='owned-title' for='checkbox-owned'>{label_this_is_my_xite}</label>\
          <input type='checkbox' class='checkbox' id='checkbox-owned' {checked}/>\
          <div class='checkbox-skin'></div>\
-         <p class='sidebar-help'>Show editing and publishing controls.</p>\
+         <p class='sidebar-help'>{label_show_editing_and_publishing_controls}</p>\
          <div class='settings-owned'><ul class='fields'>\
-          <li><label for='settings-title'>Xite title</label>\
+          <li><label for='settings-title'>{label_xite_title}</label>\
            <input type='text' class='text' value=\"{title}\" id='settings-title'/></li>\
-          <li><label for='settings-description'>Xite description</label>\
+          <li><label for='settings-description'>{label_xite_description}</label>\
            <input type='text' class='text' value=\"{desc}\" id='settings-description'/></li>\
-          <li><label for='settings-xid-name'>xID name <small class='label-right'>e.g. mysite.epix</small></label>\
+          <li><label for='settings-xid-name'>{label_xid_name} <small class='label-right'>{label_e_g_mysite_epix}</small></label>\
            <input type='text' class='text' value=\"{xid}\" id='settings-xid-name' placeholder='name.epix'/></li>\
-          <li><a href='#Save' class='button' id='button-settings'>Save xite settings</a></li>\
-          <li><h2>Content publishing</h2>\
-           <label for='input-contents'>Content file</label>\
+          <li><a href='#Save' class='button' id='button-settings'>{label_save_xite_settings}</a></li>\
+          <li><h2>{label_content_publishing}</h2>{saved_key}\
+           <label for='input-contents'>{label_content_file}</label>\
             <input type='text' class='text' value='content.json' id='input-contents'/>\
            {contents_list}\
            <div class='flex sidebar-publish-actions'>\
-            <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>Sign and publish</a>\
-            <a href='#Sign-or-Publish' id='menu-sign-publish' role='button' aria-label='More publishing actions' aria-haspopup='menu'>\u{22EE}</a>\
+            <a href='#Sign-and-Publish' id='button-sign-publish' class='button'>{label_sign_and_publish}</a>\
+            <a href='#Sign-or-Publish' id='menu-sign-publish' role='button' aria-label='{label_more_publishing_actions}' aria-haspopup='menu'>\u{22EE}</a>\
            </div></li>\
          </ul></div></li>",
         title = esc(title),
         desc = esc(description),
         xid = esc(xid_name),
-        contents_list = signable_contents(includes),
+        contents_list = signable_contents(includes, language),
+        saved_key = details::saved_key(info, language),
     ));
 
-    b.push_str(
-        "<li class='sidebar-section'><h2>Database</h2>\
-         <p class='sidebar-help'>Reload the schema or rebuild the database from xite files.</p>\
+    b.push_str(&format!(
+        "<li class='sidebar-section'><h2>{label_database}</h2>\
+         {database}\
+         <p class='sidebar-help'>{label_reload_the_schema_or_rebuild_the_database_from_xite_files}</p>\
          <div class='sidebar-file-actions'>\
-          <a href='#DB-Reload' class='button' id='button-dbreload'>Reload schema</a>\
-          <a href='#DB-Rebuild' class='button' id='button-dbrebuild'>Rebuild database</a></div></li>\
-         <li class='sidebar-section sidebar-danger'><h2>Remove xite</h2>\
-          <p class='sidebar-help'>Remove this xite from your node.</p>\
-          <a href='#Delete' class='button' id='button-delete'>Delete xite</a></li>\
+          <a href='#DB-Reload' class='button' id='button-dbreload'>{label_reload_schema}</a>\
+          <a href='#DB-Rebuild' class='button' id='button-dbrebuild'>{label_rebuild_database}</a></div></li>\
+         <li class='sidebar-section sidebar-danger'><h2>{label_remove_xite}</h2>\
+          <p class='sidebar-help'>{label_remove_this_xite_from_your_node}</p>\
+          <a href='#Delete' class='button' id='button-delete'>{label_delete_xite}</a></li>\
          </ul></section></div>",
-    );
+        database = details::database(detail, language),
+    ));
     b.push_str(
         "<div class='menu template'>\
            <a href='#' class='menu-item template'>Template</a>\
@@ -476,6 +573,70 @@ fn render_sidebar(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn restored_details_preserve_actions_and_escape_xite_metadata() {
+        let info = json!({
+            "privatekey": true, "auth_address": "epix1auth", "cert_user_id": "alice@xid.epix",
+            "content": {"title": "Example", "donate": "<script>alert('x')</script>",
+                "donate-btc": "bc1qexampleaddress123", "donate-xmr": "\" onclick=\"bad"},
+            "settings": {"size_optional": 4096, "autodownload_bigfile_size_limit": 25,
+                "cache": {"bad_files": {"data/<unsafe>.json": 3}}},
+            "sidebar_details": {
+                "storage": {"files": 12, "types": [{"name": "User data", "bytes": 2048}]},
+                "free_bytes": 1_048_576,
+                "database": {"path": "cache/example.sqlite", "bytes": 8192, "feeds": 2},
+                "identity_quota": {"used": 1024, "limit": 4096},
+                "peer_share_url": "http://127.0.0.1:42222/example/?epixnet_peers=8.8.8.8%3A42222"
+            }
+        });
+        let html = render_sidebar("example", &info, PeerCounts::default(), 0, 0, &[], true);
+        for value in ["id='privatekey-forget'", "Private key saved.", "id='button-cert-disconnect'",
+            "alice@xid.epix", "epix1auth", "1.00 kB / 4.00 kB", "User data", "2.00 kB",
+            "Available disk space: 1.00 MB", "cache/example.sqlite", "8.00 kB", "Search feeds",
+            "data/&lt;unsafe&gt;.json", "3 tries", "value='25' id='input-autodownload_bigfile_size_limit'",
+            "id='button-autodownload_previous'", "epixnet_peers="] {
+            assert!(html.contains(value), "missing {value}");
+        }
+        assert!(!html.contains("<script>"));
+        assert!(!html.contains("href='monero:"));
+        assert!(!html.contains("bc1qexampleaddress123"), "donation metadata stays out of the sidebar");
+        let mut without_key = info.clone();
+        without_key["privatekey"] = json!(false);
+        let html = render_sidebar("example", &without_key, PeerCounts::default(), 0, 0, &[], false);
+        assert!(html.contains("id='privatekey-add'"));
+        assert!(!html.contains("id='privatekey-forget'"));
+    }
+
+    #[test]
+    fn translates_static_labels_without_translating_xite_content_or_fabricating_stats() {
+        let info = json!({"sidebar_language": "de", "content": {"title": "Files"}, "settings": {}});
+        let html = render_sidebar("example", &info, PeerCounts::default(), 0, 0, &[], true);
+        assert!(html.contains("<h1>Files</h1>"), "user title remains unchanged");
+        assert!(html.contains(">Dateien</button>"), "Files tab uses interface language");
+        assert!(html.contains(">Datenbank</h2>"));
+        assert!(html.contains("data-i18n='{"), "frontend gets the same escaped catalog");
+        assert!(html.contains("lang='de'"));
+        assert!(html.contains("Storage breakdown unavailable"));
+        assert!(html.contains("Database information unavailable"));
+        assert!(!html.contains("Search feeds</span><b>0"));
+    }
+
+    #[test]
+    fn donation_metadata_never_creates_a_sidebar_section_or_link() {
+        let info = json!({"content": {"title": "Example",
+            "donate": "https://example.org/support", "donate-generic": "Donation instructions",
+            "donate-btc": "bc1qexampleaddress123", "donate-xmr": "moneroexampleaddress123",
+            "donate-ada": "addr1exampleaddress123"}});
+        let original = info.clone();
+        let html = render_sidebar("example", &info, PeerCounts::default(), 0, 0, &[], true);
+        for excluded in ["<h2>Donate</h2>", "sidebar-donation", "https://example.org/support", "Donation instructions",
+            "bc1qexampleaddress123", "moneroexampleaddress123", "addr1exampleaddress123",
+            "href='bitcoin:", "href='monero:", "href='web+cardano:"] {
+            assert!(!html.contains(excluded), "donation content is absent: {excluded}");
+        }
+        assert_eq!(info, original, "rendering never changes the stored metadata");
+    }
 
     #[test]
     fn focused_tabs_keep_actions_in_their_sections_and_map_outside_tabs() {
@@ -529,7 +690,7 @@ mod tests {
     #[test]
     fn content_choices_have_one_initial_selection_and_escape_untrusted_paths() {
         let includes = vec!["data/users/content.json".into(), "a'\"<>&/content.json".into()];
-        let html = signable_contents(&includes);
+        let html = signable_contents(&includes, "en");
         assert_eq!(html.matches("aria-pressed='true'").count(), 1);
         assert_eq!(html.matches("aria-pressed='false'").count(), 2);
         assert!(html.contains("data-content-path='content.json' aria-pressed='true'"));
