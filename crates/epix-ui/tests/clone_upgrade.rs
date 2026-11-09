@@ -301,3 +301,213 @@ async fn upgrade_rejects_invalid_target_manifest_before_replacing_files() {
     assert_eq!(storage.read("index.html").unwrap(), b"old code");
     assert_eq!(storage.read("data/data.json").unwrap(), POSTS);
 }
+
+const USER_GOVERNOR_DEFAULT: &[u8] = br#"{
+    "files":{}, "signs":{}, "ignore":".*",
+    "user_contents":{"cert_signers":{},"permissions":{},
+        "permission_rules":{".*":{"files_allowed":"data.json","max_size":200000}}}
+}"#;
+const ADMIN_GOVERNOR_DEFAULT: &[u8] = br#"{"files":{},"signs":{}}"#;
+
+async fn forum_source(state: &Arc<AppState>, root: &tempfile::TempDir) -> (String, XiteStorage) {
+    owned_xite(
+        state,
+        root,
+        json!({
+            "title":"Forum template", "files":{},
+            "includes":{
+                "data/users/content.json":{"signers":[],"signers_required":1},
+                "data/admin/content.json":{"signers":[],"signers_required":1}
+            }
+        }),
+        &[
+            ("index.html", b"forum code"),
+            (
+                "data-default/users/content-default.json",
+                USER_GOVERNOR_DEFAULT,
+            ),
+            (
+                "data-default/admin/content-default.json",
+                ADMIN_GOVERNOR_DEFAULT,
+            ),
+            (
+                "data-default/admin/admin-settings.json",
+                br#"{"mods":[],"pinned_topic_uris":[]}"#,
+            ),
+        ],
+    )
+    .await
+}
+
+fn assert_owned_manifest(storage: &XiteStorage, path: &str, owner: &str) -> Value {
+    let content: Value = serde_json::from_slice(&storage.read(path).unwrap()).unwrap();
+    assert!(
+        epix_content::verify_signer(&content, owner),
+        "{path} must be signed by the clone owner"
+    );
+    assert_eq!(content["address"], owner);
+    assert_eq!(content["inner_path"], path);
+    content
+}
+
+#[tokio::test]
+async fn fresh_clone_signs_default_governors_for_each_generation() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("clone-governors-test", root.path());
+    let (source, _) = forum_source(&state, &root).await;
+    let first = state.clone_xite(&source, "", None).await.unwrap();
+    let second = state.clone_xite(&first, "", None).await.unwrap();
+    for address in [&first, &second] {
+        let storage = XiteStorage::new(root.path().join("data").join(address));
+        assert_owned_manifest(&storage, "data/users/content.json", address);
+        let admin = assert_owned_manifest(&storage, "data/admin/content.json", address);
+        assert_eq!(
+            admin["files"]["admin-settings.json"]["sha512"],
+            XiteStorage::hash_bytes(&storage.read("data/admin/admin-settings.json").unwrap())
+        );
+        assert_eq!(
+            storage
+                .read("data-default/users/content-default.json")
+                .unwrap(),
+            USER_GOVERNOR_DEFAULT
+        );
+    }
+}
+
+#[tokio::test]
+async fn fresh_clone_user_content_signing_has_a_verified_governor() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("clone-user-signing-test", root.path());
+    let (source, _) = forum_source(&state, &root).await;
+    let address = state.clone_xite(&source, "", None).await.unwrap();
+    let storage = XiteStorage::new(root.path().join("data").join(&address));
+    let author_key = epix_crypt::new_seed();
+    let author = epix_crypt::privatekey_to_address(&author_key).unwrap();
+    let child = format!("data/users/{author}/content.json");
+    storage
+        .write(
+            &format!("data/users/{author}/data.json"),
+            br#"{"topic":[]}"#,
+        )
+        .unwrap();
+    state
+        .sign_user_content(&address, &child, Some(author_key), None)
+        .await
+        .expect("a fresh clone must accept user writes through its instantiated governor");
+    let content: Value = serde_json::from_slice(&storage.read(&child).unwrap()).unwrap();
+    assert!(epix_content::verify_signer(&content, &author));
+}
+
+#[tokio::test]
+async fn fresh_clone_initializes_declared_nested_governors_parent_first() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("nested-clone-test", root.path());
+    let (source, _) = owned_xite(&state, &root, json!({
+        "title":"Nested template", "files":{},
+        "includes":{"data/config/content.json":{"signers":[],"signers_required":1}}
+    }), &[
+        ("index.html", b"nested template"),
+        ("data-default/config/content-default.json", br#"{"files":{},"signs":{},"includes":{"nested/content.json":{"signers":[],"signers_required":1}}}"#),
+        ("data-default/config/nested/content-default.json", ADMIN_GOVERNOR_DEFAULT),
+        ("data-default/config/nested/settings.json", br#"{"theme":"default"}"#),
+    ]).await;
+    let address = state.clone_xite(&source, "", None).await.unwrap();
+    let storage = XiteStorage::new(root.path().join("data").join(&address));
+    assert_owned_manifest(&storage, "data/config/content.json", &address);
+    assert_owned_manifest(&storage, "data/config/nested/content.json", &address);
+    assert!(
+        state
+            .edx_read_verified_signed(&address, "data/config/nested/content.json", 100_000)
+            .await
+            .is_some(),
+        "nested manifest must be in the accepted authority chain"
+    );
+}
+
+#[tokio::test]
+async fn upgrade_signs_new_default_governor_and_preserves_existing_governor_bytes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("upgrade-governor-test", root.path());
+    let (source, source_storage) = forum_source(&state, &root).await;
+    let target = state.clone_xite(&source, "", None).await.unwrap();
+    let storage = XiteStorage::new(root.path().join("data").join(&target));
+    let owner_key = state.xite_privatekey(&target).await.unwrap();
+    // Preserve customized target authority, including unpublished owner edits.
+    let custom = br#"{"files":{},"ignore":".*","custom":"keep exact bytes","user_contents":{"permissions":{"carol":false}}}"#;
+    storage.write("data/users/content.json", custom).unwrap();
+    let mut target_root: Value =
+        serde_json::from_slice(&storage.read("content.json").unwrap()).unwrap();
+    target_root["includes"]["data/config/content.json"] =
+        json!({"signers":[],"signers_required":1});
+    source_storage
+        .write(
+            "data-default/config/content-default.json",
+            ADMIN_GOVERNOR_DEFAULT,
+        )
+        .unwrap();
+    source_storage
+        .write("data-default/config/settings.json", br#"{"new":true}"#)
+        .unwrap();
+    // Existing target data must not be overwritten while code is upgraded.
+    storage
+        .write(
+            "data/admin/admin-settings.json",
+            br#"{"mods":["mine.epix"]}"#,
+        )
+        .unwrap();
+    state
+        .sign_user_content(&target, "data/admin/content.json", Some(owner_key), None)
+        .await
+        .unwrap();
+    let existing_admin = storage.read("data/admin/content.json").unwrap();
+    storage
+        .write("content.json", &serde_json::to_vec(&target_root).unwrap())
+        .unwrap();
+    state
+        .clone_xite(&source, "", Some(target.clone()))
+        .await
+        .unwrap();
+    assert_eq!(storage.read("data/users/content.json").unwrap(), custom);
+    assert_eq!(
+        storage.read("data/admin/content.json").unwrap(),
+        existing_admin
+    );
+    assert_eq!(
+        storage.read("data/admin/admin-settings.json").unwrap(),
+        br#"{"mods":["mine.epix"]}"#
+    );
+    assert_owned_manifest(&storage, "data/config/content.json", &target);
+}
+
+#[tokio::test]
+async fn fresh_clone_rejects_a_malformed_instantiated_governor() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("malformed-clone-test", root.path());
+    let (source, storage) = forum_source(&state, &root).await;
+    storage
+        .write("data-default/users/content-default.json", b"{broken")
+        .unwrap();
+    let error = state
+        .clone_xite(&source, "", None)
+        .await
+        .expect_err("clone must report an unusable declared default governor");
+    assert!(error.contains("data/users/content.json"), "{error}");
+}
+
+#[tokio::test]
+async fn upgrade_rejects_a_noncanonical_include_in_a_preserved_manifest() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("preserved-include-test", root.path());
+    let (source, _) = forum_source(&state, &root).await;
+    let target = state.clone_xite(&source, "", None).await.unwrap();
+    let storage = XiteStorage::new(root.path().join("data").join(&target));
+    let preserved =
+        br#"{"files":{},"includes":{"./content.json":{}},"custom":"keep this owner draft"}"#;
+    storage.write("data/users/content.json", preserved).unwrap();
+    let error = state
+        .clone_xite(&source, "", Some(target.clone()))
+        .await
+        .expect_err("a preserved noncanonical include must be rejected before it aliases itself");
+    assert!(error.contains("./content.json"), "{error}");
+    assert_eq!(storage.read("data/users/content.json").unwrap(), preserved);
+}

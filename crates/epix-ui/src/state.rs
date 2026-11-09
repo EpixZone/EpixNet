@@ -10502,6 +10502,7 @@ impl AppState {
                 Some((rel[..end].replace("-default", ""), end < rel.len()))
             })
             .collect();
+        let mut initialized_manifests = std::collections::HashSet::new();
         for inner in &files {
             let Some(rel) = inner.strip_prefix(&prefix) else {
                 continue;
@@ -10531,6 +10532,9 @@ impl AppState {
             dst_storage
                 .write(rel, &bytes)
                 .map_err(|e| format!("Could not copy {inner} to {rel}: {e}"))?;
+            if !is_upgrade && rel.ends_with("/content.json") {
+                initialized_manifests.insert(rel.to_string());
+            }
             if is_default {
                 let target_rel = rel.replace("-default", "");
                 // An evicted optional file still belongs to the owner. Do not
@@ -10544,7 +10548,23 @@ impl AppState {
                     dst_storage
                         .write(&target_rel, &bytes)
                         .map_err(|e| format!("Could not initialize {target_rel}: {e}"))?;
+                    if target_rel.ends_with("/content.json") {
+                        initialized_manifests.insert(target_rel);
+                    }
                 }
+            }
+        }
+        // Default manifests are deliberately unsigned templates. Validate
+        // their JSON before signing the root so a broken template identifies
+        // the affected file instead of failing the database rebuild later.
+        for path in &initialized_manifests {
+            let bytes = dst_storage
+                .read(path)
+                .map_err(|error| format!("Could not read cloned manifest {path}: {error}"))?;
+            let manifest: Value = serde_json::from_slice(&bytes)
+                .map_err(|error| format!("Invalid cloned manifest {path}: {error}"))?;
+            if !manifest.is_object() {
+                return Err(format!("Invalid cloned manifest {path}: expected an object"));
             }
         }
         if !dst_storage.exists("index.html") {
@@ -10561,7 +10581,7 @@ impl AppState {
         self.add_xite(
             &address,
             XiteEntry {
-                storage: dst_storage,
+                storage: dst_storage.clone(),
                 content: Some(content),
             },
         )
@@ -10577,6 +10597,54 @@ impl AppState {
             },
         )
         .await?;
+        // A root signature alone does not authorize writes below an unsigned
+        // user_contents manifest. Initialize declared includes parent-first
+        // with the new owner's key before returning the clone to the page.
+        // Upgrades sign only newly seeded defaults; existing default-backed
+        // manifests keep the owner's exact bytes. Missing includes remain
+        // available for lazy creation; cloning must not invent their contents.
+        let mut pending = std::collections::VecDeque::from(["content.json".to_string()]);
+        let mut visited = std::collections::HashSet::new();
+        while let Some(path) = pending.pop_front() {
+            if !visited.insert(path.clone()) {
+                continue;
+            }
+            if initialized_manifests.contains(&path) {
+                self.sign_user_content(&address, &path, Some(privatekey.clone()), None)
+                    .await
+                    .map_err(|error| format!("Could not initialize cloned manifest {path}: {error}"))?;
+            }
+            let bytes = match dst_storage.read(&path) {
+                Ok(bytes) => bytes,
+                Err(epix_core::Error::Io(error))
+                    if error.kind() == std::io::ErrorKind::NotFound =>
+                {
+                    continue;
+                }
+                Err(error) => return Err(format!("Could not read cloned manifest {path}: {error}")),
+            };
+            // An upgrade can retain an unpublished existing manifest. Do not
+            // replace or sign it just to discover nested defaults.
+            let Ok(manifest) = serde_json::from_slice::<Value>(&bytes) else {
+                continue;
+            };
+            if let Some(includes) = manifest.get("includes").and_then(Value::as_object) {
+                let directory = path
+                    .rsplit_once('/')
+                    .map(|(dir, _)| format!("{dir}/"))
+                    .unwrap_or_default();
+                for relative in includes.keys() {
+                    if !epix_content::verify::is_valid_relative_path(relative) {
+                        return Err(format!("Invalid cloned include {relative} in {path}"));
+                    }
+                    let child = format!("{directory}{relative}");
+                    dst_storage
+                        .path(&child)
+                        .map_err(|error| format!("Invalid cloned include {child}: {error}"))?;
+                    pending.push_back(child);
+                }
+            }
+        }
         self.set_owned(&address, true).await;
         self.log(
             "INFO",
