@@ -37,7 +37,9 @@ jobs:
       # The excluded wrapper has its own test dependencies. Keep its optional
       # session regression covered without enabling that feature in the node.
       - name: Test the patched SQLite wrapper and optional session errors
-        run: cargo test --manifest-path vendor/rusqlite/Cargo.toml --lib --features bundled,hooks,time,session
+        run: |
+          cargo test --manifest-path vendor/rusqlite/Cargo.toml --lib --features bundled,hooks,time,session
+          cargo test --manifest-path vendor/rusqlite/Cargo.toml --doc --features bundled,hooks,time,session session::
 
   android-wallet-staging:
     name: Android shell regressions

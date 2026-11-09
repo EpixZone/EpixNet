@@ -584,10 +584,46 @@ impl Drop for Changegroup {
 
 impl Connection {
     /// Apply a changeset to a database
+    ///
+    /// A conflict item is only valid during the callback and cannot be retained.
+    ///
+    /// ```compile_fail
+    /// use std::cell::RefCell;
+    /// use rusqlite::{Connection, Result, session::{Changeset, ChangesetItem, ConflictAction}};
+    ///
+    /// thread_local! {
+    ///     static RETAINED: RefCell<Option<ChangesetItem>> = const { RefCell::new(None) };
+    /// }
+    ///
+    /// fn retain_item(db: &Connection, changes: &Changeset) -> Result<()> {
+    ///     db.apply(changes, None::<fn(&str) -> bool>, |_, item| {
+    ///         RETAINED.with_borrow_mut(|saved| *saved = Some(item));
+    ///         ConflictAction::SQLITE_CHANGESET_OMIT
+    ///     })
+    /// }
+    /// ```
+    ///
+    /// A borrowed conflict item cannot outlive the callback either.
+    ///
+    /// ```compile_fail
+    /// use std::cell::RefCell;
+    /// use rusqlite::{Connection, Result, session::{Changeset, ChangesetItem, ConflictAction}};
+    ///
+    /// thread_local! {
+    ///     static RETAINED: RefCell<Option<&'static ChangesetItem>> = const { RefCell::new(None) };
+    /// }
+    ///
+    /// fn retain_reference(db: &Connection, changes: &Changeset) -> Result<()> {
+    ///     db.apply(changes, None::<fn(&str) -> bool>, |_, item| {
+    ///         RETAINED.with_borrow_mut(|saved| *saved = Some(item));
+    ///         ConflictAction::SQLITE_CHANGESET_OMIT
+    ///     })
+    /// }
+    /// ```
     pub fn apply<F, C>(&self, cs: &Changeset, filter: Option<F>, conflict: C) -> Result<()>
     where
         F: Fn(&str) -> bool + Send + 'static,
-        C: Fn(ConflictType, ChangesetItem) -> ConflictAction + Send + 'static,
+        C: Fn(ConflictType, &ChangesetItem) -> ConflictAction + Send + 'static,
     {
         let db = self.db.borrow_mut().db;
 
@@ -617,6 +653,24 @@ impl Connection {
     }
 
     /// Apply a changeset to a database
+    ///
+    /// A conflict item is only valid during the callback and cannot be retained.
+    ///
+    /// ```compile_fail
+    /// use std::cell::RefCell;
+    /// use rusqlite::{Connection, Result, session::{ChangesetItem, ConflictAction}};
+    ///
+    /// thread_local! {
+    ///     static RETAINED: RefCell<Option<ChangesetItem>> = const { RefCell::new(None) };
+    /// }
+    ///
+    /// fn retain_item(db: &Connection, input: &mut dyn std::io::Read) -> Result<()> {
+    ///     db.apply_strm(input, None::<fn(&str) -> bool>, |_, item| {
+    ///         RETAINED.with_borrow_mut(|saved| *saved = Some(item));
+    ///         ConflictAction::SQLITE_CHANGESET_OMIT
+    ///     })
+    /// }
+    /// ```
     pub fn apply_strm<F, C>(
         &self,
         input: &mut dyn Read,
@@ -625,7 +679,7 @@ impl Connection {
     ) -> Result<()>
     where
         F: Fn(&str) -> bool + Send + 'static,
-        C: Fn(ConflictType, ChangesetItem) -> ConflictAction + Send + 'static,
+        C: Fn(ConflictType, &ChangesetItem) -> ConflictAction + Send + 'static,
     {
         let input_ref = &input;
         let db = self.db.borrow_mut().db;
@@ -698,7 +752,7 @@ pub enum ConflictAction {
 unsafe extern "C" fn call_filter<F, C>(p_ctx: *mut c_void, tbl_str: *const c_char) -> c_int
 where
     F: Fn(&str) -> bool + Send + 'static,
-    C: Fn(ConflictType, ChangesetItem) -> ConflictAction + Send + 'static,
+    C: Fn(ConflictType, &ChangesetItem) -> ConflictAction + Send + 'static,
 {
     let tbl_name = CStr::from_ptr(tbl_str).to_str();
     c_int::from(
@@ -721,13 +775,13 @@ unsafe extern "C" fn call_conflict<F, C>(
 ) -> c_int
 where
     F: Fn(&str) -> bool + Send + 'static,
-    C: Fn(ConflictType, ChangesetItem) -> ConflictAction + Send + 'static,
+    C: Fn(ConflictType, &ChangesetItem) -> ConflictAction + Send + 'static,
 {
     let conflict_type = ConflictType::from(e_conflict);
     let item = ChangesetItem { it: p };
     if let Ok(action) = catch_unwind(|| {
         let tuple: *mut (Option<F>, C) = p_ctx.cast::<(Option<F>, C)>();
-        (*tuple).1(conflict_type, item)
+        (*tuple).1(conflict_type, &item)
     }) {
         action as c_int
     } else {

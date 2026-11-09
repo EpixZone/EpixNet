@@ -21,16 +21,24 @@ from upstream commit
 [9972b1ecf45706ebe2d7b5592f9c9a709e65c896](https://github.com/rusqlite/rusqlite/commit/9972b1ecf45706ebe2d7b5592f9c9a709e65c896).
 SQLite can return an error from `sqlite3session_diff` without allocating
 an error message. `Session::diff` now returns that error with no message
-instead of dereferencing a null pointer. The existing 0.37 API is retained;
-the upstream commit's API and unrelated test changes are not included.
+instead of dereferencing a null pointer. The existing `diff` API is retained;
+the upstream commit's generic-parameter and unrelated test changes are not included.
 Regressions exercise both a denied query with no message and a schema
 mismatch with allocated error text. The application and fuzz feature graphs
 do not enable this optional module.
 
+The same module backports upstream callback lifetime fix
+[01fd57d1dc115c6b5ab0c4b34e330fef7772aa6d](https://github.com/rusqlite/rusqlite/commit/01fd57d1dc115c6b5ab0c4b34e330fef7772aa6d).
+`Connection::apply` and `apply_strm` now pass a borrowed `ChangesetItem`
+to conflict handlers. This optional API change prevents retaining a raw
+SQLite iterator after the callback ends. Compile-fail tests cover retaining
+an owned item through either API and retaining a borrowed item beyond the
+callback lifetime, alongside the normal session application tests.
+
 An ordinary rusqlite 0.41 upgrade is currently blocked: tor-dirmgr 0.47.0
 and 0.48.0 require rusqlite below 0.41, while the latest r2d2_sqlite 0.35.0
-requires rusqlite 0.40. Keeping the existing wrapper API avoids changing
-those upstream libraries. SQLite's C API supplies the same calls used by
+requires rusqlite 0.40. Keeping the wrapper APIs used by the application
+avoids changing those upstream libraries. SQLite's C API supplies the same calls used by
 this wrapper. The dependency's Rust minimum is 1.88, below this project's
 toolchains.
 
@@ -50,6 +58,7 @@ code. To run the wrapper tests:
 
 ```sh
 cargo test --manifest-path vendor/rusqlite/Cargo.toml --lib --features bundled,hooks,time,session
+cargo test --manifest-path vendor/rusqlite/Cargo.toml --doc --features bundled,hooks,time,session session::
 ```
 
 The optional session test build also needs libclang and its C headers.
