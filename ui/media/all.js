@@ -2791,6 +2791,14 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.actionProgress = function (message) {
+      var body, params;
+      if (Array.isArray(message.params) && message.params[3] === true) {
+        // Plain-text progress preserves publisher-chosen names literally.
+        // Escape once, then add only the line breaks supplied by the sender.
+        body = String(message.params[1]).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;").replace(/'/g, "&apos;").replace(/\r\n|\r|\n/g, "<br>");
+        params = this.toHtmlSafe([message.params[0], message.params[2]]);
+        return this.displayProgress("page-" + params[0], body, params[1]);
+      }
       message.params = this.toHtmlSafe(message.params);
       // The progress type is the notification id: namespaced like every
       // other page-chosen id (displayProgress adds the `notification-` part).
