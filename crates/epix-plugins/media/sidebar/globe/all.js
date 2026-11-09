@@ -114,9 +114,9 @@ DAT.Globe = function(container, opts) {
     'earth' : {
       uniforms: {
         'texture': { type: 't', value: null },
-        'landColor': { type: 'c', value: new THREE.Color(0xB0ACBF) },
-        'waterColor': { type: 'c', value: new THREE.Color(0xECECF2) },
-        'rimColor': { type: 'c', value: new THREE.Color(0x8D81AC) }
+        'landColor': { type: 'c', value: new THREE.Color(0x34383F) },
+        'waterColor': { type: 'c', value: new THREE.Color(0xDCE1E6) },
+        'rimColor': { type: 'c', value: new THREE.Color(0x8B949E) }
       },
       vertexShader: [
         'varying vec3 vNormal;',
@@ -145,7 +145,7 @@ DAT.Globe = function(container, opts) {
     },
     'atmosphere' : {
       uniforms: {
-        'rimColor': { type: 'c', value: new THREE.Color(0x8D81AC) }
+        'rimColor': { type: 'c', value: new THREE.Color(0x8B949E) }
       },
       vertexShader: [
         'varying vec3 vNormal;',
@@ -290,9 +290,9 @@ DAT.Globe = function(container, opts) {
 
   function updateTheme() {
     var style = window.getComputedStyle(container);
-    earthUniforms.landColor.value.setStyle(style.getPropertyValue('--globe-land').trim() || '#B0ACBF');
-    earthUniforms.waterColor.value.setStyle(style.getPropertyValue('--globe-water').trim() || '#ECECF2');
-    earthUniforms.rimColor.value.setStyle(style.getPropertyValue('--globe-rim').trim() || '#8D81AC');
+    earthUniforms.landColor.value.setStyle(style.getPropertyValue('--globe-land').trim() || '#34383F');
+    earthUniforms.waterColor.value.setStyle(style.getPropertyValue('--globe-water').trim() || '#DCE1E6');
+    earthUniforms.rimColor.value.setStyle(style.getPropertyValue('--globe-rim').trim() || '#8B949E');
     atmosphereUniforms.rimColor.value.copy(earthUniforms.rimColor.value);
   }
 
