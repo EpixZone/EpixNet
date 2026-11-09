@@ -114,9 +114,10 @@ DAT.Globe = function(container, opts) {
     'earth' : {
       uniforms: {
         'texture': { type: 't', value: null },
-        'landColor': { type: 'c', value: new THREE.Color(0x34383F) },
-        'waterColor': { type: 'c', value: new THREE.Color(0xDCE1E6) },
-        'rimColor': { type: 'c', value: new THREE.Color(0x8B949E) }
+        'waterScale': { type: 'f', value: 28 },
+        'landColor': { type: 'c', value: new THREE.Color(0x39424C) },
+        'waterColor': { type: 'c', value: new THREE.Color(0xEFF2F5) },
+        'rimColor': { type: 'c', value: new THREE.Color(0xC2CBD4) }
       },
       vertexShader: [
         'varying vec3 vNormal;',
@@ -129,13 +130,15 @@ DAT.Globe = function(container, opts) {
       ].join('\n'),
       fragmentShader: [
         'uniform sampler2D texture;',
+        'uniform float waterScale;',
         'uniform vec3 landColor;',
         'uniform vec3 waterColor;',
         'uniform vec3 rimColor;',
         'varying vec3 vNormal;',
         'varying vec2 vUv;',
         'void main() {',
-          'float water = clamp( texture2D( texture, vUv ).r * 5.0, 0.0, 1.0 );',
+          // Flatten ocean relief in light mode while retaining the darker map texture.
+          'float water = clamp( texture2D( texture, vUv ).r * waterScale, 0.0, 1.0 );',
           'float facing = max( dot( vNormal, vec3( 0.0, 0.0, 1.0 ) ), 0.0 );',
           'vec3 surface = mix( landColor, waterColor, water ) * ( 0.82 + 0.18 * facing );',
           'float rim = pow( 1.0 - facing, 3.0 ) * 0.22;',
@@ -145,7 +148,7 @@ DAT.Globe = function(container, opts) {
     },
     'atmosphere' : {
       uniforms: {
-        'rimColor': { type: 'c', value: new THREE.Color(0x8B949E) }
+        'rimColor': { type: 'c', value: new THREE.Color(0xC2CBD4) }
       },
       vertexShader: [
         'varying vec3 vNormal;',
@@ -290,9 +293,10 @@ DAT.Globe = function(container, opts) {
 
   function updateTheme() {
     var style = window.getComputedStyle(container);
-    earthUniforms.landColor.value.setStyle(style.getPropertyValue('--globe-land').trim() || '#34383F');
-    earthUniforms.waterColor.value.setStyle(style.getPropertyValue('--globe-water').trim() || '#DCE1E6');
-    earthUniforms.rimColor.value.setStyle(style.getPropertyValue('--globe-rim').trim() || '#8B949E');
+    earthUniforms.waterScale.value = parseFloat(style.getPropertyValue('--globe-water-scale')) || 28;
+    earthUniforms.landColor.value.setStyle(style.getPropertyValue('--globe-land').trim() || '#39424C');
+    earthUniforms.waterColor.value.setStyle(style.getPropertyValue('--globe-water').trim() || '#EFF2F5');
+    earthUniforms.rimColor.value.setStyle(style.getPropertyValue('--globe-rim').trim() || '#C2CBD4');
     atmosphereUniforms.rimColor.value.copy(earthUniforms.rimColor.value);
   }
 
