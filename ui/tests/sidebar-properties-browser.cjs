@@ -1,6 +1,7 @@
 // Run: EPIX_BROWSER_TEST_TOOLS=/path/to/node_modules node ui/tests/sidebar-properties-browser.cjs
 // Requires Playwright, ws, Cargo, and cached serde_json dependencies (cargo build is offline).
 // Production wrapper, sidebar renderer, JS, CSS and globe run against local WebSocket fixtures.
+// This verifies browser rendering and command wiring, not backend command execution or disk persistence.
 const fs = require("node:fs");
 const path = require("node:path");
 const os = require("node:os");
@@ -189,6 +190,79 @@ async function noOverflow(page) {
   assert.deepEqual(result.offenders, [], JSON.stringify(result));
 }
 
+async function watchGlobe(page) {
+  await waitFor(page, () => sidebar.globe && sidebar.globe.points && document.querySelector(".globe canvas"));
+  await waitFor(page, () => sidebar.globe.scene.children.some(mesh => {
+    const texture = mesh.material?.uniforms?.texture?.value;
+    return texture?.image?.complete && texture.image.naturalWidth > 0;
+  }));
+  await page.evaluate(() => {
+    const globe = sidebar.globe, render = globe.renderer.render;
+    window.globeFrames = {count: 0, position: null};
+    globe.renderer.render = function(scene, camera) {
+      window.globeFrames.count++;
+      window.globeFrames.position = [camera.position.x, camera.position.y, camera.position.z];
+      return render.apply(this, arguments);
+    };
+  });
+  await waitFor(page, () => window.globeFrames.count > 2);
+  assert.equal(await page.locator("#globe-zoom-in, #globe-zoom-out, #globe-reset, .sidebar-globe-controls").count(), 0);
+  assert.equal((await page.locator("#sidebar-peer-map-panel").innerText()).trim(), "", "The map has no visible instructions or control labels");
+  assert.equal(await page.locator("#sidebar-peer-map-panel button").count(), 0);
+  assert.match(await page.locator(".globe").getAttribute("aria-label"), /arrow keys/);
+  assert.equal(await page.evaluate(() => sidebar.globe.renderer.getClearAlpha()), 0, "The canvas exposes the themed panel background");
+  assert.ok(await page.evaluate(() => sidebar.globe.points.geometry.vertices.length > 0), "Fixture peers render through the production globe");
+}
+
+async function globePalette(page) {
+  return page.evaluate(() => sidebar.globe.scene.children.map(mesh => {
+    const colors = {};
+    for (const [name, uniform] of Object.entries(mesh.material?.uniforms || {})) {
+      const value = uniform.value;
+      if (value && typeof value.r === "number") colors[name] = [value.r, value.g, value.b];
+    }
+    return colors;
+  }).filter(colors => Object.keys(colors).length));
+}
+
+async function waitForGlobePalette(page, expected, differs = false) {
+  const serialized = JSON.stringify(expected), deadline = Date.now() + 5000;
+  while ((JSON.stringify(await globePalette(page)) === serialized) === differs) {
+    if (Date.now() > deadline) throw new Error("Globe palette did not respond to the theme");
+    await page.waitForTimeout(50);
+  }
+}
+
+async function setGlobeTheme(page, theme, previousPalette) {
+  await page.evaluate(theme => {
+    document.body.classList.remove("theme-light", "theme-dark");
+    if (theme !== "system") document.body.classList.add("theme-" + theme);
+  }, theme);
+  if (previousPalette) await waitForGlobePalette(page, previousPalette, true);
+  await page.waitForTimeout(150);
+  const palette = await globePalette(page);
+  assert.ok(palette.length > 0, "The WebGL globe has themed material colors");
+  return palette;
+}
+
+async function globeInteraction(page) {
+  const globe = page.locator(".globe"), box = await globe.boundingBox();
+  const before = await page.evaluate(() => window.globeFrames.position);
+  await page.mouse.move(box.x + box.width / 2, box.y + box.height / 2);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 2 + 65, box.y + box.height / 2 + 20, {steps: 8});
+  await page.mouse.up();
+  await waitFor(page, before => Math.hypot(...window.globeFrames.position.map((v, i) => v - before[i])) > 20, before);
+  const distance = await page.evaluate(() => Math.hypot(...window.globeFrames.position));
+  await page.mouse.wheel(0, -200);
+  await waitFor(page, before => Math.hypot(...window.globeFrames.position) < before - 50, distance);
+  const zoomed = await page.evaluate(() => Math.hypot(...window.globeFrames.position));
+  await globe.focus(); await globe.press("ArrowDown");
+  await waitFor(page, before => Math.hypot(...window.globeFrames.position) > before + 30, zoomed);
+  await page.evaluate(() => sidebar.globe.reset());
+  await page.waitForTimeout(500);
+}
+
 (async () => {
   let browser;
   const results = {provenance, cases: [], errors};
@@ -216,9 +290,21 @@ async function noOverflow(page) {
     await command(page, "userSetGlobalSettings", () => page.locator("#sidebar-peer-map-toggle").press("Enter"));
     await waitFor(page, () => sidebar.globe && sidebar.globe.points && document.querySelector(".globe canvas"));
     assert.equal(await page.locator("#sidebar-peer-map-panel").isVisible(), true);
-    assert.ok(await page.evaluate(() => sidebar.globe.points.geometry.vertices.length > 0));
-    for (const name of ["globe-zoom-in", "globe-zoom-out", "globe-reset"]) await page.locator("#" + name).click();
-    results.cases.push("map default, backend preference, reload, reopen and production WebGL");
+    await watchGlobe(page);
+    await globeInteraction(page);
+    const lightPalette = await setGlobeTheme(page, "light");
+    const lightMap = await page.locator(".globe canvas").screenshot();
+    await page.evaluate(() => {window.themeGlobeCanvas = sidebar.globe.renderer.domElement;});
+    const darkPalette = await setGlobeTheme(page, "dark", lightPalette);
+    const darkMap = await page.locator(".globe canvas").screenshot();
+    assert.notDeepEqual(darkMap, lightMap, "The actual WebGL image changes with the theme");
+    assert.equal(await page.evaluate(() => sidebar.globe.renderer.domElement === window.themeGlobeCanvas), true, "Theme changes preserve the globe instance");
+    assert.deepEqual(await setGlobeTheme(page, "light", darkPalette), lightPalette);
+    await page.emulateMedia({colorScheme: "dark"});
+    assert.deepEqual(await setGlobeTheme(page, "system", lightPalette), darkPalette);
+    await page.emulateMedia({colorScheme: "light"});
+    await waitForGlobePalette(page, lightPalette);
+    results.cases.push("map default, fixture preference reload, reopen, production WebGL, drag/wheel/keyboard, and live light/dark/system themes");
 
     await page.locator("#peer-endpoint").fill("  192.0.2.10:42424  ");
     const added = await command(page, "peerAdd", () => page.locator("#peer-endpoint").press("Enter"));
@@ -327,11 +413,27 @@ async function noOverflow(page) {
     assert.ok(requests.includes("/list/" + address), "Browse files uses the current xite route");
     await page.close();
 
+    reset();
+    const cleanDesktop = await newPage();
+    await watchGlobe(cleanDesktop);
+    for (const theme of ["light", "dark"]) {
+      await setGlobeTheme(cleanDesktop, theme);
+      await cleanDesktop.screenshot({path: path.join(output, `desktop-globe-${theme}.png`)});
+    }
+    await cleanDesktop.close();
     for (const setup of [{width: 320, scale: 1}, {width: 390, scale: 1}, {width: 390, scale: 0.5}]) {
       scale = setup.scale;
       const mobile = await newPage({viewport: {width: setup.width, height: 844}, isMobile: true, hasTouch: true});
       for (const name of ["overview", "files", "manage"]) {await tab(mobile, name); await noOverflow(mobile);}
       await mobile.screenshot({path: path.join(output, `mobile-${setup.width}-scale-${scale}.png`)});
+      if (setup.width === 390 && scale === 1) {
+        await tab(mobile, "overview");
+        await watchGlobe(mobile);
+        for (const theme of ["light", "dark"]) {
+          await setGlobeTheme(mobile, theme);
+          await mobile.screenshot({path: path.join(output, `mobile-globe-${theme}.png`)});
+        }
+      }
       await mobile.close();
     }
     results.cases.push("320px, 390px and reduced author viewport scale fit every tab");

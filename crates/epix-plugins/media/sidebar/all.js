@@ -978,10 +978,6 @@ window.initScrollable = function (chrome) {
         tabs[next].focus();
       }).on("click.properties", "#sidebar-peer-map-toggle", function() {
         sidebar.setPeerMapOpen(!sidebar.peer_map_open, true);
-      }).on("click.properties", "#globe-zoom-in, #globe-zoom-out, #globe-reset", function() {
-        if (!sidebar.globe) return;
-        if (this.id === "globe-reset") sidebar.globe.reset();
-        else sidebar.globe.zoom(this.id === "globe-zoom-in" ? 70 : -70);
       }).on("input.properties", "#peer-endpoint, #input-xitelimit, #input-contents, #settings-title, #settings-description, #settings-xid-name", function() {
         sidebar.property_drafts[this.id] = this.value;
         if (this.id === "peer-endpoint") { sidebar.peer_feedback = ""; sidebar.tag.find("#peer-add-status").text(""); }

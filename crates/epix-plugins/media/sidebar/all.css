@@ -458,6 +458,9 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
     --properties-selected: #F2EDF9;
     --properties-danger: #AC2A40;
     --properties-success: #18776D;
+    --globe-land: #B0ACBF;
+    --globe-water: #ECECF2;
+    --globe-rim: #8D81AC;
     background-color: var(--properties-bg);
     border-left-color: var(--properties-border);
 }
@@ -473,6 +476,9 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
         --properties-selected: #2C2339;
         --properties-danger: #FF9CAF;
         --properties-success: #73D7C9;
+        --globe-land: #5B566B;
+        --globe-water: #292831;
+        --globe-rim: #A897C7;
     }
 }
 body.theme-dark .sidebar {
@@ -486,6 +492,9 @@ body.theme-dark .sidebar {
     --properties-selected: #2C2339;
     --properties-danger: #FF9CAF;
     --properties-success: #73D7C9;
+    --globe-land: #5B566B;
+    --globe-water: #292831;
+    --globe-rim: #A897C7;
 }
 .sidebar .content, .sidebar .sidebar-properties { color: var(--properties-text); }
 .sidebar .sidebar-properties * { box-sizing: border-box; }
@@ -577,15 +586,13 @@ body.theme-dark .sidebar {
 .sidebar #sidebar-peer-map-toggle[aria-expanded='false'] .sidebar-peer-map-chevron { transform: rotate(-90deg); }
 .sidebar .sidebar-properties .globe {
     position: relative; width: min(280px, 100%); height: auto; aspect-ratio: 1;
-    margin: 0 auto; border-radius: 10px; overflow: hidden; background-color: #212121;
+    margin: 0 auto; border-radius: 10px; overflow: hidden; background-color: transparent;
 }
 .sidebar .sidebar-properties .globe canvas { position: absolute !important; inset: 0; display: block; width: 100% !important; height: 100% !important; }
 .sidebar .sidebar-properties .globe.error {
     display: flex; align-items: center; justify-content: center;
-    padding: 20px; color: #DCDCE3; font-family: inherit; line-height: 1.5;
+    padding: 20px; color: var(--properties-muted); font-family: inherit; line-height: 1.5;
 }
-.sidebar .sidebar-globe-controls { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 6px; margin-top: 8px; }
-.sidebar .sidebar-globe-controls .button { min-width: 44px; min-height: 44px; }
 .sidebar .sidebar-tabs { display: flex; gap: 20px; border-bottom: 1px solid var(--properties-border); }
 .sidebar .sidebar-tab {
     flex: 1; min-width: 0; min-height: 48px; padding: 12px 0;

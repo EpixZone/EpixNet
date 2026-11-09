@@ -293,12 +293,7 @@ fn render_sidebar(
           <button type='button' id='sidebar-peer-map-toggle' aria-expanded='{map_open}' aria-controls='sidebar-peer-map-panel'>\
            <span class='sidebar-peer-map-label'>Peer map</span><span class='sidebar-peer-map-state'>{map_action}</span><span class='sidebar-peer-map-chevron' aria-hidden='true'>&#9662;</span></button>\
           <div id='sidebar-peer-map-panel'{map_hidden}>\
-           <div class='globe loading'></div>\
-           <div class='sidebar-globe-controls' role='group' aria-label='Peer map controls'>\
-            <button type='button' class='button' id='globe-zoom-in' aria-label='Zoom in on peer map'>+</button>\
-            <button type='button' class='button' id='globe-zoom-out' aria-label='Zoom out of peer map'>&minus;</button>\
-            <button type='button' class='button' id='globe-reset'>Reset view</button>\
-           </div><p class='sidebar-help'>Drag to rotate. Pinch or use the controls to zoom.</p></div></section>",
+           <div class='globe loading'></div></div></section>",
         map_hidden = if map_open { "" } else { " hidden" },
         map_action = if map_open { "Hide" } else { "Show" },
     ));
@@ -496,7 +491,7 @@ mod tests {
         let overview = &html[overview_start..files_start];
         let files = &html[files_start..manage_start];
         let manage = &html[manage_start..];
-        for id in ["button-update", "button-pause", "button-resume", "button-favourite", "button-unfavourite", "sidebar-peer-map-panel", "globe-zoom-in", "globe-zoom-out", "globe-reset"] {
+        for id in ["button-update", "button-pause", "button-resume", "button-favourite", "button-unfavourite", "sidebar-peer-map-panel"] {
             assert!(header.contains(&format!("id='{id}'")), "shared control {id}");
         }
         for id in ["link-copypeers", "form-addpeer", "peer-endpoint", "button-identity"] {
