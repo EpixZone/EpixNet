@@ -2,6 +2,8 @@
 //! settings + stats), the local user identity, and node metadata.
 
 mod xite_export;
+mod xite_removal_progress;
+mod xite_removal_transaction;
 mod merger_index;
 pub(crate) mod addon_install;
 pub(crate) mod avatar_cache;
@@ -22,6 +24,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
+use xite_removal_progress::{XiteRemovalOutcome, XiteRemovalProgress};
 
 /// Default per-xite size limit, in MB. The Epix python client raised its
 /// `--size-limit` default from EpixNet's 10 to 1000; a growing xite stops
@@ -1389,10 +1392,18 @@ fn sync_parent_directory(path: &Path) -> Result<(), String> {
     sync_directory(parent)
 }
 
+mod xite_removal;
+use xite_removal::{remove_xite_directories_with_progress, XiteRemovalFileProgress};
+
+fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
+    remove_xite_directory_durable_with_progress(path, &mut || {})
+}
+
 #[cfg(unix)]
 fn remove_xite_directory_contents_at(
     directory: &std::fs::File,
     visited: &mut usize,
+    on_removed: &mut dyn FnMut(),
 ) -> Result<(), String> {
     use rustix::fs::{AtFlags, Dir, Mode, OFlags};
 
@@ -1419,7 +1430,7 @@ fn remove_xite_directory_contents_at(
         ) {
             Ok(child) => {
                 let child = std::fs::File::from(child);
-                remove_xite_directory_contents_at(&child, visited)?;
+                remove_xite_directory_contents_at(&child, visited, on_removed)?;
                 rustix::fs::unlinkat(directory, name, AtFlags::REMOVEDIR)
                     .map_err(std::io::Error::from)
                     .map_err(|error| format!("could not remove directory entry: {error}"))?;
@@ -1432,6 +1443,7 @@ fn remove_xite_directory_contents_at(
                 rustix::fs::unlinkat(directory, name, AtFlags::empty())
                     .map_err(std::io::Error::from)
                     .map_err(|error| format!("could not remove file entry: {error}"))?;
+                on_removed();
             }
         }
     }
@@ -1439,7 +1451,10 @@ fn remove_xite_directory_contents_at(
 }
 
 #[cfg(unix)]
-fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
+fn remove_xite_directory_durable_with_progress(
+    path: &Path,
+    on_removed: &mut dyn FnMut(),
+) -> Result<(), String> {
     use rustix::fs::{AtFlags, Mode, OFlags};
 
     let Some(parent_path) = path.parent() else {
@@ -1480,6 +1495,7 @@ fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
                         path.display()
                     )
                 })?;
+            on_removed();
             parent
                 .sync_all()
                 .map_err(|sync_error| format!("could not sync {}: {sync_error}", parent_path.display()))?;
@@ -1487,7 +1503,7 @@ fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
         }
     };
     let mut visited = 1usize;
-    remove_xite_directory_contents_at(&root, &mut visited)?;
+    remove_xite_directory_contents_at(&root, &mut visited, on_removed)?;
     rustix::fs::unlinkat(&parent, name, AtFlags::REMOVEDIR)
         .map_err(std::io::Error::from)
         .map_err(|error| format!("could not remove {}: {error}", path.display()))?;
@@ -1497,12 +1513,35 @@ fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(not(unix))]
-fn remove_xite_directory_tree_path(path: &Path) -> Result<(), String> {
+fn remove_xite_directory_tree_path(
+    path: &Path,
+    on_removed: &mut dyn FnMut(),
+) -> Result<(), String> {
     const MAX_REMOVAL_ENTRIES: usize = 1_000_000;
 
-    let mut stack = vec![(path.to_path_buf(), false)];
+    enum Frame {
+        Entry(PathBuf),
+        Children(PathBuf, std::fs::ReadDir),
+    }
+    // Retain one iterator per depth instead of queueing every file in a
+    // large directory before any of them can be removed.
+    let mut stack = vec![Frame::Entry(path.to_path_buf())];
     let mut visited = 0usize;
-    while let Some((current, children_visited)) = stack.pop() {
+    while let Some(frame) = stack.pop() {
+        let (current, children_visited) = match frame {
+            Frame::Entry(path) => (path, false),
+            Frame::Children(path, mut entries) => match entries.next() {
+                Some(entry) => {
+                    let entry = entry.map_err(|error| {
+                        format!("could not list {}: {error}", path.display())
+                    })?;
+                    stack.push(Frame::Children(path, entries));
+                    stack.push(Frame::Entry(entry.path()));
+                    continue;
+                }
+                None => (path, true),
+            },
+        };
         let metadata = match std::fs::symlink_metadata(&current) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -1526,20 +1565,15 @@ fn remove_xite_directory_tree_path(path: &Path) -> Result<(), String> {
             result.map_err(|error| {
                 format!("could not remove link endpoint {}: {error}", current.display())
             })?;
+            on_removed();
             continue;
         }
         if metadata.is_dir() {
             if !children_visited {
-                stack.push((current.clone(), true));
                 let entries = std::fs::read_dir(&current).map_err(|error| {
                     format!("could not list {}: {error}", current.display())
                 })?;
-                for entry in entries {
-                    let entry = entry.map_err(|error| {
-                        format!("could not list {}: {error}", current.display())
-                    })?;
-                    stack.push((entry.path(), false));
-                }
+                stack.push(Frame::Children(current, entries));
             } else if let Err(error) = std::fs::remove_dir(&current) {
                 #[cfg(windows)]
                 {
@@ -1568,9 +1602,11 @@ fn remove_xite_directory_tree_path(path: &Path) -> Result<(), String> {
         } else if metadata.is_file() {
             remove_internal_recovery_file(&current)
                 .map_err(|error| format!("could not remove {}: {error}", current.display()))?;
+            on_removed();
         } else {
             std::fs::remove_file(&current)
                 .map_err(|error| format!("could not remove {}: {error}", current.display()))?;
+            on_removed();
         }
     }
     sync_parent_directory(path)
@@ -1578,7 +1614,10 @@ fn remove_xite_directory_tree_path(path: &Path) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
+fn remove_xite_directory_durable_with_progress(
+    path: &Path,
+    on_removed: &mut dyn FnMut(),
+) -> Result<(), String> {
     let parent = path
         .parent()
         .ok_or_else(|| format!("xite root has no parent: {}", path.display()))?;
@@ -1593,7 +1632,7 @@ fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
     // removes the served path first, so later path walking cannot be raced by
     // xite APIs that only have authority inside that old root.
     if std::fs::symlink_metadata(&quarantine).is_ok() {
-        remove_xite_directory_tree_path(&quarantine)?;
+        remove_xite_directory_tree_path(&quarantine, on_removed)?;
     }
     match std::fs::symlink_metadata(path) {
         Ok(_) => {}
@@ -1615,13 +1654,13 @@ fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
     let mut delay = std::time::Duration::from_millis(25);
     for attempt in 0..8 {
         match rename_recovery_path_windows(path, &quarantine) {
-            Ok(()) => return remove_xite_directory_tree_path(&quarantine),
+            Ok(()) => return remove_xite_directory_tree_path(&quarantine, on_removed),
             Err(error) if attempt + 1 < 8 && rename_refused_by_open_handle(&error) => {
                 std::thread::sleep(delay);
                 delay = (delay * 2).min(std::time::Duration::from_millis(200));
             }
             Err(error) => {
-                return remove_xite_directory_tree_path(path).map_err(|in_place| {
+                return remove_xite_directory_tree_path(path, on_removed).map_err(|in_place| {
                     format!(
                         "could not restore {} to {}: {error}; in-place removal failed too: {in_place}",
                         path.display(),
@@ -1657,8 +1696,11 @@ fn rename_refused_by_open_handle(error: &std::io::Error) -> bool {
 }
 
 #[cfg(not(any(unix, windows)))]
-fn remove_xite_directory_durable(path: &Path) -> Result<(), String> {
-    remove_xite_directory_tree_path(path)
+fn remove_xite_directory_durable_with_progress(
+    path: &Path,
+    on_removed: &mut dyn FnMut(),
+) -> Result<(), String> {
+    remove_xite_directory_tree_path(path, on_removed)
 }
 
 fn sync_rollback_manifest_parent(path: &Path) -> Result<(), String> {
@@ -32921,8 +32963,36 @@ impl AppState {
     /// `Ok(false)` means no membership or pending receipt exists. `Ok(true)`
     /// retains the existing accepted-removal contract: cleanup may be pending.
     pub async fn try_remove_xite(&self, address: &str) -> Result<bool, String> {
+        self.try_remove_xite_inner(address, None).await
+    }
+
+    pub(crate) async fn try_remove_xite_from(
+        &self,
+        address: &str,
+        origin: u64,
+    ) -> Result<bool, String> {
+        self.try_remove_xite_inner(address, Some(origin)).await
+    }
+
+    async fn try_remove_xite_inner(
+        &self,
+        address: &str,
+        origin: Option<u64>,
+    ) -> Result<bool, String> {
         let canonical = self.canonical_key(address).await;
         let address = canonical.as_str();
+        let title = {
+            let xites = self.xites.read().await;
+            self.resolve_xite(&xites, address)
+                .and_then(|xite| xite.content.as_ref())
+                .and_then(|content| content.get("title"))
+                .and_then(Value::as_str)
+                .filter(|title| !title.is_empty())
+                .unwrap_or(address)
+                .to_string()
+        };
+        let progress = XiteRemovalProgress::new(self.owned_state(), address, &title, origin);
+        progress.report("Preparing to delete files...", 0);
         // Removal takes visible time (locks, durable intent, directory
         // deletion, Store ownership handover) and can only be reported while
         // the row still exists: phase first, so every dashboard shows
@@ -32937,541 +33007,33 @@ impl AppState {
         self.push_xite_info_event(address, UPDATE_PHASE_DELETING).await;
         let state = self.owned_state();
         let owned_address = address.to_string();
-        let removed =
-            match tokio::spawn(async move { state.remove_xite_owned(&owned_address).await }).await
-            {
-                Ok(removed) => removed,
-                Err(error) => {
-                    self.log("ERROR", format!("Xite removal completion failed: {error}"))
-                        .await;
-                    Err(format!("Xite removal completion failed: {error}"))
-                }
-            };
-        self.end_xite_update(address);
-        if !matches!(&removed, Ok(true)) {
-            // The row survives a failed removal: retire its pill quietly (the
-            // caller's command reply carries the error) so it does not read
-            // as deleting forever.
-            self.push_update_result(address, UpdateOutcome::NoChange).await;
-        }
-        removed
-    }
-
-    async fn remove_xite_owned(&self, address: &str) -> Result<bool, String> {
-        // Stop the detached download before waiting for its activation and
-        // manifest guards. No old task may recreate progress after cleanup.
-        let canonical = self.canonical_key(address).await;
-        if let Some(resolver) = self.on_demand.read().await.clone() {
-            resolver.cancel(&canonical).await;
-        }
-        let _activation = self.acquire_activation_write().await;
-        let registry = self.xite_registry_lock.lock().await;
-        let target = {
-            let xites = self.xites.read().await;
-            if let Some(xite) = self.resolve_xite(&xites, address) {
-                let canonical = canonical_address(xite.content.as_ref(), address);
-                let keys = xites
-                    .iter()
-                    .filter(|(key, xite)| {
-                        canonical_address(xite.content.as_ref(), key) == canonical
-                    })
-                    .map(|(key, _)| key.clone())
-                    .collect::<Vec<_>>();
-                let mut cache_keys = vec![canonical.clone()];
-                for key in &keys {
-                    if !cache_keys.contains(key) {
-                        cache_keys.push(key.clone());
-                    }
-                    if let Some(display) = xites.get(key).and_then(|xite| xite.display.clone()) {
-                        if !cache_keys.contains(&display) {
-                            cache_keys.push(display);
-                        }
-                    }
-                }
-                let mut roots = Vec::new();
-                for key in &keys {
-                    let Some(xite) = xites.get(key) else { continue };
-                    let root = if xite.storage.root().is_absolute() {
-                        xite.storage.root().to_path_buf()
-                    } else {
-                        match std::env::current_dir() {
-                            Ok(current) => current.join(xite.storage.root()),
-                            Err(_) => xite.storage.root().to_path_buf(),
-                        }
-                    };
-                    if !roots.contains(&root) {
-                        roots.push(root);
-                    }
-                }
-                Some((canonical, keys, cache_keys, roots))
-            } else {
-                None
+        let task_progress = progress.clone();
+        match tokio::spawn(async move {
+            let removed = state
+                .remove_xite_owned(&owned_address, &task_progress)
+                .await;
+            state.end_xite_update(&owned_address);
+            if matches!(&removed, Ok(XiteRemovalOutcome::Unknown) | Err(_)) {
+                state
+                    .push_update_result(&owned_address, UpdateOutcome::NoChange)
+                    .await;
             }
-        };
-        let Some((canonical, keys, cache_keys, roots)) = target else {
-            let pending = self
-                .read_xite_removal_intents()
-                .map_err(|error| format!("Could not inspect pending xite removal: {error}"))?
-                .into_iter().find_map(|(canonical, intent)| {
-                    (canonical == address || intent.keys.iter().any(|key| key == address))
-                        .then_some(canonical)
-                });
-            drop(registry);
-            drop(_activation);
-            let Some(canonical) = pending else { return Ok(false) };
-            self.schedule_xite_removal_retry(&canonical);
-            let _ = self.retry_pending_xite_removal_once(&canonical).await;
-            return Ok(true);
-        };
-        if self.removal_root_is_reused(&canonical, &roots).await {
-            self.log(
-                "ERROR",
-                format!(
-                    "Refusing to remove {canonical}: its storage root is shared by another served xite"
-                ),
-            )
-            .await;
-            return Err(format!("Refusing to remove {canonical}: its storage root is shared by another served xite"));
-        }
-        let _manifest = match self
-            .acquire_manifest_mutex(&canonical, "content.json")
-            .await
+            // The detached task owns completion, even if the requesting
+            // socket closes while the filesystem worker is running.
+            task_progress.finish(&removed);
+            removed.map(|outcome| !matches!(outcome, XiteRemovalOutcome::Unknown))
+        })
+        .await
         {
-            Ok(guard) => guard,
+            Ok(removed) => removed,
             Err(error) => {
-                self.log("ERROR", format!("Could not lock {canonical} for deletion: {error}"))
+                self.end_xite_update(address);
+                self.log("ERROR", format!("Xite removal completion failed: {error}"))
                     .await;
-                return Err(format!("Could not lock {canonical} for deletion: {error}"));
-            }
-        };
-        let tree = self.tree_mutation_lock(&canonical).lock_owned().await;
-        let store = self.edx_store().await;
-        let dormant_store = store.is_none() && self.dormant_edx_store_may_exist();
-        // Release derived-feed Store ownership before the destructive part of
-        // deletion. Cancellation here leaves an intact xite whose cache simply
-        // rebuilds on demand.
-        let mut feed_cleanup_complete = true;
-        for key in &cache_keys {
-            feed_cleanup_complete &= self.clear_feed_cache(key).await;
-        }
-
-        // The durable intent is the commit record. Once it exists, startup
-        // refuses to restore this canonical even if xites.json or directory
-        // cleanup is interrupted. No destructive mutation happens before it.
-        let mut intent_persisted = false;
-        if self.xites_path.is_some() {
-            let mut intents = match self.read_xite_removal_intents() {
-                Ok(intents) => intents,
-                Err(error) => {
-                    drop(tree);
-                    drop(_manifest);
-                    self.log("ERROR", format!("Could not start xite removal: {error}"))
-                        .await;
-                    return Err(format!("Could not start xite removal: {error}"));
-                }
-            };
-            let store_root = if let Some(store) = store.as_deref() {
-                match Self::store_receipt_root(store) {
-                    Ok(root) => Some(root),
-                    Err(error) => {
-                        drop(tree);
-                        drop(_manifest);
-                        self.log("ERROR", format!("Could not start xite removal: {error}"))
-                            .await;
-                        return Err(format!("Could not start xite removal: {error}"));
-                    }
-                }
-            } else if dormant_store {
-                let Some(data_root) = self.data_root.as_ref() else {
-                    drop(tree);
-                    drop(_manifest);
-                    return Err("Could not bind dormant Store removal: no data root".to_string());
-                };
-                match tokio::fs::canonicalize(data_root.join("edx-store")).await {
-                    Ok(root) => Some(root),
-                    Err(error) => {
-                        drop(tree);
-                        drop(_manifest);
-                        self.log(
-                            "ERROR",
-                            format!("Could not bind dormant Store removal: {error}"),
-                        )
-                        .await;
-                        return Err(format!("Could not bind dormant Store removal: {error}"));
-                    }
-                }
-            } else {
-                None
-            };
-            let owner_cleanup_required = store_root.is_some();
-            let intent = XiteRemovalIntent {
-                keys: cache_keys.clone(),
-                roots: roots.clone(),
-                store_root,
-                store_cleanup_required: store.is_some() || dormant_store,
-                owner_cleanup_required,
-                rehome_ids: Vec::new(),
-            };
-            if let Err(error) = self.validated_removal_roots(&canonical, &intent) {
-                drop(tree);
-                drop(_manifest);
-                self.log("ERROR", format!("Could not start xite removal: {error}"))
-                    .await;
-                return Err(format!("Could not start xite removal: {error}"));
-            }
-            intents.insert(canonical.clone(), intent);
-            if let Err(error) = self.write_xite_removal_intents(&intents) {
-                // A durable atomic writer can report a parent-sync error
-                // after the new file was renamed into place. In that case
-                // the removal is already armed and returning false would let
-                // startup unexpectedly honor an intent that this process
-                // claimed did not exist. Continue only when the exact intent
-                // generation is visibly installed. Later registry and tree
-                // writes either complete the accepted removal or leave this
-                // intent as its retry receipt.
-                let installed = self
-                    .read_xite_removal_intents()
-                    .is_ok_and(|actual| actual == intents);
-                if !installed {
-                    drop(tree);
-                    drop(_manifest);
-                    self.log("ERROR", format!("Could not start xite removal: {error}"))
-                        .await;
-                    return Err(format!("Could not start xite removal: {error}"));
-                }
-                self.log(
-                    "WARN",
-                    format!(
-                        "Xite removal intent was installed but its durability check failed; retrying before removal: {error}"
-                    ),
-                )
-                .await;
-                let Some(path) = self.xite_removals_path() else {
-                    drop(tree);
-                    drop(_manifest);
-                    return Err("Could not confirm xite removal: journal path disappeared".to_string());
-                };
-                if sync_parent_directory(&path).is_err() {
-                    // Do not hold the global activation writer through a
-                    // persistent filesystem failure. The visible intent
-                    // keeps same-process re-adds blocked. No membership or
-                    // tree mutation has happened yet, so losing the unsynced
-                    // entry in a crash safely rolls this attempt back. Wait
-                    // without authority, then restart the full removal only
-                    // after the parent becomes syncable.
-                    drop(tree);
-                    drop(_manifest);
-                    drop(registry);
-                    drop(_activation);
-                    self.schedule_xite_removal_retry(&canonical);
-                    return Ok(true);
-                }
-            }
-            intent_persisted = true;
-        }
-
-        // Session-scoped capabilities and prompt decisions belong to this
-        // exact served membership. Invalidate them before membership can be
-        // re-added under the same address.
-        self.bigfile_uploads
-            .lock()
-            .unwrap()
-            .retain(|_, upload| upload.canonical != canonical);
-        {
-            let remove = cache_keys.iter().collect::<std::collections::HashSet<_>>();
-            self.retention_consents
-                .lock()
-                .unwrap()
-                .retain(|key| !remove.contains(key));
-            self.optional_prompts
-                .lock()
-                .unwrap()
-                .retain(|key| !remove.contains(key));
-            self.clone_statuses.lock().unwrap().retain(|key, _| !remove.contains(key));
-            self.clone_retry_wakes.lock().unwrap().retain(|key, _| !remove.contains(key));
-            self.clone_retry_dirty.lock().unwrap().retain(|key| !remove.contains(key));
-            self.xite_update_requests.lock().unwrap().retain(|key, _| !remove.contains(key));
-            self.clones_in_flight.lock().unwrap().retain(|key| !remove.contains(key));
-        }
-
-        let mut registry_persisted = true;
-        if self.xites_path.is_some() {
-            let excluded = std::collections::HashSet::from([canonical.clone()]);
-            let bytes = {
-                let xites = self.xites.read().await;
-                Self::xite_registry_bytes(&xites, &excluded)
-            };
-            if let Err(error) = bytes.and_then(|bytes| self.write_xite_registry_bytes(&bytes)) {
-                registry_persisted = false;
-                self.log(
-                    "WARN",
-                    format!(
-                        "Could not compact xites.json while deleting {canonical}; the durable removal intent remains: {error}"
-                    ),
-                )
-                .await;
+                progress.report("Site deletion failed; check the node log.", -1);
+                Err(format!("Xite removal completion failed: {error}"))
             }
         }
-
-        // The intent now excludes this membership durably. Release its
-        // accepted declarations before preserving Extern rows: an object
-        // with no surviving owner can be retired without an object-sized
-        // copy. Independent references and shared declarations remain in
-        // Store's typed ownership ledger and are preserved below.
-        let mut removed_keys = Vec::new();
-        {
-            let mut xites = self.xites.write().await;
-            for key in &keys {
-                if let Some(xite) = xites.remove(key) {
-                    if let Some(display) = xite.display {
-                        removed_keys.push(display);
-                    }
-                    removed_keys.push(key.clone());
-                }
-            }
-        }
-        self.replace_verified_object_paths(&canonical, Vec::new());
-        self.replace_verified_manifest_chains(&canonical, HashMap::new());
-        self.replace_verified_manifest_contents(&canonical, &[]);
-        let mut ownership_warnings = if feed_cleanup_complete {
-            Vec::new()
-        } else {
-            vec![format!(
-                "could not release all feed ownership for removed xite {canonical}"
-            )]
-        };
-        ownership_warnings.extend(store
-            .as_deref()
-            .map(|store| self.reconcile_manifest_object_owners(store))
-            .unwrap_or_default());
-
-        // Preserve every surviving Store object before the tree disappears.
-        // This walks Store's authenticated extern index, not raw child
-        // manifests. A stale rejected child therefore cannot name and delete
-        // an unrelated object, and bundles/shards follow their typed owner
-        // ledger rather than an incomplete declaration scan.
-        let mut internalized = 0usize;
-        let mut retired = Vec::new();
-        let mut store_cleanup_complete = !dormant_store;
-        let mut store_cleanup_warnings = Vec::new();
-        if dormant_store {
-            store_cleanup_warnings.push(format!(
-                "persistent Store is not active; retaining {canonical} until Store activation"
-            ));
-        }
-        if let Some(store) = store.as_ref() {
-            let entries = match store.extern_entries() {
-                Ok(entries) => entries,
-                Err(error) => {
-                    store_cleanup_complete = false;
-                    store_cleanup_warnings.push(format!(
-                        "could not enumerate Store rows for {canonical}: {error}"
-                    ));
-                    Vec::new()
-                }
-            };
-            for entry in entries
-                .into_iter()
-                .filter(|entry| Self::removal_entry_is_under_roots(&entry.path, &roots))
-            {
-                match store.internalize_extern_at(entry.id, &entry.path) {
-                    Ok(epix_blob::store::ExternInternalization::Internalized) => {
-                        internalized = internalized.saturating_add(1);
-                        if self
-                            .edx_paths
-                            .read()
-                            .expect("edx_paths")
-                            .get(&entry.id)
-                            .is_some_and(|entries| {
-                                entries.iter().any(|candidate| {
-                                    candidate.canonical != canonical
-                                        && Self::declaration_is_rehomeable(candidate)
-                                })
-                            })
-                        {
-                            retired.push(entry.id);
-                        }
-                    }
-                    Ok(epix_blob::store::ExternInternalization::CanonicalElsewhere) => {}
-                    Err(error) => {
-                        // A locally edited or missing canonical Extern cannot
-                        // be preserved under its old object id. Revalidation
-                        // safely retires that invalid mapping. Only keep the
-                        // tree when the Store still reports the object after
-                        // the repair attempt.
-                        let invalid_owner_retired = store.revalidate(entry.id).is_ok()
-                            && !store.contains(entry.id).unwrap_or(true);
-                        if invalid_owner_retired {
-                            if self
-                                .edx_paths
-                                .read()
-                                .expect("edx_paths")
-                                .get(&entry.id)
-                                .is_some_and(|entries| {
-                                    entries.iter().any(|candidate| {
-                                        candidate.canonical != canonical
-                                            && Self::declaration_is_rehomeable(candidate)
-                                    })
-                                })
-                            {
-                                retired.push(entry.id);
-                            }
-                            continue;
-                        }
-                        // Operational copy/sync failures are not proof that
-                        // the source bytes are bad. Keep the root and durable
-                        // intent so Store activation can retry without losing
-                        // another manifest or feed owner's only copy.
-                        store_cleanup_complete = false;
-                        store_cleanup_warnings.push(format!(
-                            "could not preserve {} while deleting {canonical}: {error}",
-                            entry.id,
-                        ));
-                    }
-                }
-            }
-        }
-
-        // Store preservation is a durable removal phase. Once every exact
-        // Extern has been internalized, persist the phase before deleting the
-        // root. A later filesystem failure can then finish during startup even
-        // when no Store is active.
-        if store_cleanup_complete && intent_persisted && store.is_some() {
-            let phase = self
-                .read_xite_removal_intents()
-                .and_then(|mut intents| {
-                    if let Some(intent) = intents.get_mut(&canonical) {
-                        intent.store_cleanup_required = false;
-                        intent.owner_cleanup_required = true;
-                        intent.rehome_ids = retired.iter().map(ToString::to_string).collect();
-                    }
-                    self.write_xite_removal_intents(&intents)
-                });
-            if let Err(error) = phase {
-                store_cleanup_complete = false;
-                store_cleanup_warnings.push(format!(
-                    "could not persist Store cleanup for {canonical}: {error}"
-                ));
-            }
-        }
-
-        let mut roots_removed = store_cleanup_complete;
-        if store_cleanup_complete {
-            for root in &roots {
-                if let Err(error) = remove_xite_directory_durable(root) {
-                    roots_removed = false;
-                    self.log("WARN", format!("Pending xite removal: {error}"))
-                        .await;
-                }
-            }
-        }
-        drop(tree);
-        drop(_manifest);
-        for warning in &store_cleanup_warnings {
-            self.log("WARN", format!("Xite deletion Store retry: {warning}"))
-                .await;
-        }
-        let rehome_warnings = self
-            .rehome_retired_objects(store.clone(), retired, None)
-            .await;
-        if intent_persisted
-            && store.is_some()
-            && ownership_warnings.is_empty()
-            && rehome_warnings.is_empty()
-        {
-            if let Err(error) =
-                self.persist_xite_removal_owner_phase(&canonical, false, &[])
-            {
-                ownership_warnings.push(format!(
-                    "could not persist owner cleanup for {canonical}: {error}"
-                ));
-            }
-        }
-        for warning in &ownership_warnings {
-            self.log("WARN", format!("Xite deletion ownership retry: {warning}"))
-                .await;
-        }
-        for warning in &rehome_warnings {
-            self.log("WARN", format!("Xite deletion rehome retry: {warning}"))
-                .await;
-        }
-        if internalized > 0 {
-            self.log(
-                "INFO",
-                format!(
-                    "Preserved {internalized} Store object(s) before deleting {canonical}"
-                ),
-            )
-            .await;
-        }
-        // The removed canonical may have contributed rows to one or more
-        // version-3 merger databases. Rebuild before returning so no live
-        // query can keep observing revoked source rows.
-        self.rebuild_merger_dbs().await;
-        // User-derived state is part of the durable removal transaction. Keep
-        // the intent until users.json has accepted the deletion so a restart
-        // can retry instead of resurrecting auth/cert/feed state.
-        let user_cleanup = self.delete_user_xite_data(&cache_keys).await;
-        if let Err(error) = &user_cleanup {
-            self.log(
-                "WARN",
-                format!("Could not persist user cleanup for {canonical}: {error}"),
-            )
-            .await;
-        }
-        let metadata_cleanup = self
-            .delete_xite_persisted_metadata(&canonical, &cache_keys)
-            .await;
-        if let Err(error) = &metadata_cleanup {
-            self.log(
-                "WARN",
-                format!("Could not persist metadata cleanup for {canonical}: {error}"),
-            )
-            .await;
-        }
-        // Retire the intent only after the durable registry and filesystem
-        // cleanup both converge. A Store-owner warning keeps it as a startup
-        // retry receipt even though the served membership is already gone.
-        if intent_persisted
-            && registry_persisted
-            && roots_removed
-            && store_cleanup_warnings.is_empty()
-            && ownership_warnings.is_empty()
-            && rehome_warnings.is_empty()
-            && user_cleanup.is_ok()
-            && metadata_cleanup.is_ok()
-        {
-            match self.read_xite_removal_intents() {
-                Ok(mut intents) => {
-                    intents.remove(&canonical);
-                    if let Err(error) = self.write_xite_removal_intents(&intents) {
-                        self.log(
-                            "WARN",
-                            format!("Could not retire xite-removal intent: {error}"),
-                        )
-                        .await;
-                    }
-                }
-                Err(error) => {
-                    self.log(
-                        "WARN",
-                        format!("Could not retire xite-removal intent: {error}"),
-                    )
-                    .await;
-                }
-            }
-        }
-        let _ = removed_keys;
-        let intent_remaining = intent_persisted
-            && self
-                .read_xite_removal_intents()
-                .is_ok_and(|intents| intents.contains_key(&canonical));
-        drop(registry);
-        drop(_activation);
-        if intent_remaining {
-            self.schedule_xite_removal_retry(&canonical);
-        }
-        Ok(true)
     }
 
     /// Drop the per-xite user data (derived auth keys, cert binding, feed
