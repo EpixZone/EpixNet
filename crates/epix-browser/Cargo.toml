@@ -9,6 +9,7 @@ name = "epix-browser"
 path = "src/main.rs"
 
 [dependencies]
+epix-core = { path = "../epix-core" }
 epix-i2p = { path = "../epix-i2p" }
 epix-node = { path = "../epix-node" }
 epix-ui = { path = "../epix-ui" }

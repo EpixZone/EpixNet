@@ -7,6 +7,7 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		E000000000000000000000A1 /* RefusingTorProxy.swift in Sources */ = {isa = PBXBuildFile; fileRef = E000000000000000000000A0 /* RefusingTorProxy.swift */; };
 		E00000000000000000000029 /* PrivacyInfo.xcprivacy in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000017 /* PrivacyInfo.xcprivacy */; };
 		E00000000000000000000020 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000010 /* AppDelegate.swift */; };
 		E00000000000000000000023 /* epix-icon.png in Resources */ = {isa = PBXBuildFile; fileRef = E00000000000000000000015 /* epix-icon.png */; };
@@ -18,6 +19,7 @@
 /* End PBXBuildFile section */
 
 /* Begin PBXFileReference section */
+		E000000000000000000000A0 /* RefusingTorProxy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = RefusingTorProxy.swift; path = "../../shells/ios/EpixBrowser/RefusingTorProxy.swift"; sourceTree = "<group>"; };
 		E00000000000000000000017 /* PrivacyInfo.xcprivacy */ = {isa = PBXFileReference; lastKnownFileType = text.xml; path = PrivacyInfo.xcprivacy; sourceTree = "<group>"; };
 		E00000000000000000000010 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = "../../shells/ios/EpixBrowser/AppDelegate.swift"; sourceTree = "<group>"; };
 		E00000000000000000000015 /* epix-icon.png */ = {isa = PBXFileReference; lastKnownFileType = image.png; name = "epix-icon.png"; path = "../../shells/ios/EpixBrowser/epix-icon.png"; sourceTree = "<group>"; };
@@ -44,6 +46,7 @@
 			isa = PBXGroup;
 			children = (
 				E00000000000000000000010 /* AppDelegate.swift */,
+				E000000000000000000000A0 /* RefusingTorProxy.swift */,
 				E00000000000000000000015 /* epix-icon.png */,
 				E00000000000000000000025 /* epix-mark-white.png */,
 				E00000000000000000000027 /* epix-badge-white.png */,
@@ -165,6 +168,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				E00000000000000000000020 /* AppDelegate.swift in Sources */,
+				E000000000000000000000A1 /* RefusingTorProxy.swift in Sources */,
 				E00000000000000000000021 /* epix_ffi.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

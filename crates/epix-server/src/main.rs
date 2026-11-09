@@ -143,7 +143,10 @@ async fn main() {
     let opts = NodeOptions {
         data_root: root.clone(),
         target,
-        ui_addr: epix_node::ui_bind(),
+        ui_addr: epix_node::ui_bind(&root).unwrap_or_else(|error| {
+            eprintln!("Epix node failed: {error}");
+            std::process::exit(1);
+        }),
         tor_mode,
         open_browser: browser == Some(launch::Browser::System),
         geoip_gz: Some(GEOIP_CITY_GZ.to_vec()),

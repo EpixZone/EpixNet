@@ -98,8 +98,10 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
     var dappRequest: (id: UUID, reply: (Any?, String?) -> Void)?
 
 
-    // The node's local Tor SOCKS listener (epix-node boot: 43111).
-    static let socksPort: UInt16 = 43111
+    // The preboot listener remains owned while any web view may still use it.
+    private static let unavailableTorProxy = Result { try RefusingTorProxy() }
+    private var prebootSocksPort: UInt16?
+    private var nativeSocksPort: UInt16?
     static let prefTorClearnet = "torClearnet"
     static let prefClearnetAllow = "clearnetAllow"
 
@@ -122,6 +124,19 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
 
         let window = UIWindow(frame: UIScreen.main.bounds)
         let controller = UIViewController()
+        do {
+            prebootSocksPort = try Self.unavailableTorProxy.get().port
+        } catch {
+            let message = UILabel(frame: UIScreen.main.bounds)
+            message.text = "The private browser connection could not start. Close EpixNet and try again."
+            message.numberOfLines = 0
+            message.textAlignment = .center
+            controller.view = message
+            window.rootViewController = controller
+            window.makeKeyAndVisible()
+            self.window = window
+            return true
+        }
         controller.view = buildBrowserChrome()
         window.rootViewController = controller
         window.makeKeyAndVisible()
@@ -636,12 +651,15 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                     guard text.contains("bind") else { throw error }
                     try self.node.start(config: config("127.0.0.1:0"))
                 }
-                if let ui = self.node.uiUrl(), let u = URL(string: ui),
-                    let host = u.host, let port = u.port
-                {
-                    self.nodeBase = "http://\(host):\(port)"
+                guard let base = Self.trustedNodeBase(self.node.uiUrl()),
+                    let socks = self.node.torSocksPort(), socks > 0 else {
+                    throw NSError(domain: "EpixBrowser", code: 1, userInfo: [
+                        NSLocalizedDescriptionKey: "The built-in node did not report its owned local endpoints."
+                    ])
                 }
                 DispatchQueue.main.async {
+                    self.nodeBase = base
+                    self.nativeSocksPort = socks
                     self.browserProxy = self.node.browserProxy()
                     self.applyClearnetRouting()
                     // The first active callback can precede node startup.
@@ -1060,6 +1078,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             }
             let port = URL(string: nodeBase)?.port ?? 42222
             let torClearnet = self.torClearnet
+            let socksPort = self.nativeSocksPort
             URLSession.shared.dataTask(with: url) { data, _, _ in
                 var out: [String: Any] = ["serving": false]
                 if let data = data,
@@ -1070,6 +1089,7 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
                     out = obj.filter { !($0.value is NSNull) }
                 }
                 out["ui_port"] = port
+                out["tor_socks_port"] = socksPort
                 out["tor_clearnet"] = torClearnet
                 reply(out)
             }.resume()
@@ -1243,6 +1263,14 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
         torBadge?.backgroundColor = on ? Self.torRouted : Self.torReady
     }
 
+    private static func trustedNodeBase(_ url: String?) -> String? {
+        guard let url, let parts = URLComponents(string: url),
+            parts.scheme?.lowercased() == "http", parts.host == "127.0.0.1",
+            parts.user == nil, parts.password == nil,
+            let port = parts.port, (1...65535).contains(port) else { return nil }
+        return "http://127.0.0.1:\(port)"
+    }
+
     /// Separate TLS origins for xites; optionally route ordinary web traffic
     /// through Tor. Neither route falls back to a direct network connection.
     private func applyClearnetRouting() {
@@ -1256,7 +1284,12 @@ class AppDelegate: UIResponder, UIApplicationDelegate, UITextFieldDelegate,
             proxies.append(local)
         }
         if torClearnet {
-            let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.socksPort)!)
+            // This invariant is established before any web view is created.
+            guard let selected = nativeSocksPort ?? prebootSocksPort,
+                let port = NWEndpoint.Port(rawValue: selected) else {
+                preconditionFailure("Browser started without an owned refusal endpoint")
+            }
+            let endpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: port)
             var tor = ProxyConfiguration(socksv5Proxy: endpoint)
             tor.excludedDomains = ["epix", "127.0.0.1", "localhost"]
             tor.allowFailover = false

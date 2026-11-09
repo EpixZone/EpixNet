@@ -28,6 +28,7 @@ use crate::state::DEFAULT_VOLUNTEER_QUOTA;
 ///     for keys whose backend (Tor transport, SOCKS proxy) isn't built yet.
 pub const CONFIG_SCHEMA: &[(&str, &str, &str, &str, &str)] = &[
     // --- Web Interface
+    ("Web Interface", "ui_port", "Desktop dashboard port (restart to apply; default increments when occupied)", "42222", "text"),
     ("Web Interface", "open_browser", "Open browser on standalone node startup (applies on next launch)", "true", "bool"),
     (
         "Web Interface",
@@ -298,6 +299,7 @@ pub fn is_config_action(kind: &str) -> bool {
 /// on the next start. The Config page offers a restart when one of these has
 /// changed since boot (`data_dir` is tracked separately off epixnet.conf).
 pub const CONFIG_RESTART_KEYS: &[&str] = &[
+    "ui_port",
     "offline",
     "fileserver_ip_type",
     "fileserver_port",
@@ -310,6 +312,15 @@ pub const CONFIG_RESTART_KEYS: &[&str] = &[
     "mesh_listen",
     "trackers",
 ];
+
+/// Accept both the Config page's text values and JSON integer values.
+pub fn ui_port(value: &serde_json::Value) -> Option<u16> {
+    let port = match value {
+        serde_json::Value::String(text) => text.trim().parse::<u16>().ok(),
+        _ => value.as_u64().and_then(|port| u16::try_from(port).ok()),
+    }?;
+    (port != 0).then_some(port)
+}
 
 #[cfg(test)]
 mod tests {

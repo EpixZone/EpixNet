@@ -95,6 +95,7 @@ final class Node {
     }
     func lastError() -> String? { "failed" }
     func uiUrl() -> String? { "http://127.0.0.1:42222/dashboard.epix/" }
+    func torSocksPort() -> UInt16? { 42322 }
     func browserProxy() -> String? { "proxy" }
 }
 final class Shell {
@@ -103,6 +104,8 @@ final class Shell {
     var bootTarget = "dashboard.epix"
     var startupCompleted = 0
     var nodeBase = "http://127.0.0.1:42222"
+    var nativeSocksPort: UInt16?
+    static func trustedNodeBase(_ url: String?) -> String? { url == nil ? nil : "http://127.0.0.1:42222" }
     var browserProxy: String?
     var nodePageRequested = false
     var splashStatus: Label? = Label()

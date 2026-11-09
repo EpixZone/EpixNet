@@ -195,7 +195,11 @@ Set these before you start EpixNet to change how it runs:
 | `EPIX_TOR` | Node Tor mode: `enable`, `disable`, or `always`. `always` requires Tor for node peer traffic; browser and wallet routing have separate controls. | `enable` |
 | `EPIX_DATA_DIR` | Where EpixNet keeps its data (xites, keys, settings). | see below |
 
-If dashboard port `42222` is already taken, EpixNet tries each next port in order until one is available. A non-default port set through `EPIX_UI_ADDR` must be available or startup fails. The selected dashboard port is saved in `ui_port` inside your data folder.
+If dashboard port `42222` is already taken, EpixNet tries each next port in order until one is available. The selected dashboard port is saved in `ui_port` inside your data folder. For simultaneous standalone nodes, use `EPIX_HEADLESS=1` or `--browser system` and a separate `EPIX_DATA_DIR` per instance. The managed EpixNet Browser retains its single active profile policy.
+
+To choose a desktop dashboard port, set `"ui_port": 44990` in `<data folder>/private/config.json`, or change **Desktop dashboard port** on the Config page, then restart. Numeric strings such as `"44990"` also work; `uiport` is not a setting. `EPIX_UI_ADDR` overrides this setting, which overrides the legacy `epixnet.conf` port. A non-default dashboard port must be available or startup fails.
+
+The local Tor SOCKS proxy starts at `42322`. The desktop EpixNet Browser's xite HTTP proxy starts at `42422`, and its I2P HTTP proxy starts at `42522`. Each holds the first available loopback port from its starting point, so another node or application can keep its existing listener. Automatic dashboard and proxy selection skips `43110` through `43113`. Clients use the actual selected endpoints; do not configure them to use fixed proxy ports. The SOCKS endpoint remains reserved while Tor is starting, disabled, or recovering, and rejects traffic until Tor is ready.
 
 The file server also tries each next port if its configured `fileserver_port` is taken, starting at `26552` by default. Setting `fileserver_port` to `0` still disables seeding. Use the selected file-server port from the node log for port forwarding.
 

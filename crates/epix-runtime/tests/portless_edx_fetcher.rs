@@ -30,7 +30,7 @@ async fn portless_node_installs_the_edx_fetcher() {
             ..Default::default()
         },
     );
-    runtime.start().await;
+    runtime.start().await.unwrap();
 
     // The store install is the visible half of the same call that installs the
     // fetcher, and it runs on its own task, so wait for it.

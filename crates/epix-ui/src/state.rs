@@ -4380,6 +4380,7 @@ pub struct AppState {
     /// publishes. Set by the runtime's Tor loop; read by `serverInfo`.
     tor_enabled: RwLock<bool>,
     tor_status: RwLock<String>,
+    tor_socks_port: RwLock<Option<u16>>,
     onion_address: RwLock<Option<String>>,
     /// Signer for tracker onion-ownership challenges (`onion_sign_this`),
     /// set once the onion service is up. Included in every self-advert.
@@ -5745,6 +5746,7 @@ impl AppState {
             ip_external: RwLock::new(None),
             tor_enabled: RwLock::new(false),
             tor_status: RwLock::new("Disabled".to_string()),
+            tor_socks_port: RwLock::new(None),
             onion_address: RwLock::new(None),
             onion_signer: RwLock::new(None),
             i2p_address: RwLock::new(None),
@@ -10231,6 +10233,16 @@ impl AppState {
     pub async fn tor_status(&self) -> (bool, String) {
         (*self.tor_enabled.read().await, self.tor_status.read().await.clone(),
         )
+    }
+
+    /// The loopback SOCKS socket actually owned by this runtime. Availability
+    /// means reserved, not bootstrapped; unavailable Tor rejects connections.
+    pub async fn tor_socks_port(&self) -> Option<u16> {
+        *self.tor_socks_port.read().await
+    }
+
+    pub async fn set_tor_socks_port(&self, port: Option<u16>) {
+        *self.tor_socks_port.write().await = port;
     }
 
     /// Our onion address (no suffix), if the onion service has published one.

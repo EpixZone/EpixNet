@@ -122,7 +122,7 @@ async fn runtime_resyncs_a_published_update() {
         }
     });
 
-    runtime.start().await;
+    runtime.start().await.unwrap();
 
     // The loop should fetch the newer content.json over EDX, verify it, and
     // download the file. Wait for both the applied content and the file.
@@ -274,7 +274,7 @@ async fn prompt_resync(trigger: &str) {
         tor_mode: epix_runtime::TorMode::Disable,
         ..Default::default()
     });
-    runtime.start().await;
+    runtime.start().await.unwrap();
     if trigger == "foreground" {
         let first_pass = timeout(Duration::from_secs(10), async {
             while let Ok(event) = events.recv().await {

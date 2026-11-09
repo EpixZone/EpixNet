@@ -331,7 +331,7 @@ pub fn set_chain_route(socks: Option<String>, require_tor: bool) {
     }
 }
 
-/// Route all chain RPC through `socks` (e.g. `socks5h://127.0.0.1:43111`), or
+/// Route all chain RPC through the node's selected `socks` endpoint, or
 /// `None` for direct. Set by the node in Tor-always mode so the chain server
 /// never sees the node's real IP or which `.epix` names it resolves (`socks5h`
 /// resolves the hostname through Tor too, so DNS doesn't leak). Clients rebuild

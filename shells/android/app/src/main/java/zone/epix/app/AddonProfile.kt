@@ -24,6 +24,23 @@ internal class AddonProfile private constructor(val directory: File, val profile
     data class Ledger(val confirmed: List<Receipt>, val pending: Receipt?)
     val configFile: File get() = File(directory, CONFIG_FILE)
 
+    /** Keep the verified extension policy and initial routing active before Gecko starts. */
+    fun browserRuntimeConfig(socksPort: Int, routeTor: Boolean): File {
+        require(socksPort in 1..65535)
+        checkActivation()
+        val routing = "  network.proxy.type: ${if (routeTor) 1 else 0}\n" +
+            "  network.proxy.socks: '127.0.0.1'\n" +
+            "  network.proxy.socks_port: $socksPort\n" +
+            "  network.proxy.socks_version: 5\n" +
+            "  network.proxy.socks_remote_dns: true\n" +
+            "  network.proxy.failover_direct: false\n" +
+            "  network.proxy.allow_hijacking_localhost: false\n" +
+            "  network.proxy.no_proxies_on: 'localhost, 127.0.0.1, .epix.zone'\n"
+        return File(directory, "epix-browser-runtime.yaml").also {
+            atomicWrite(it, (CONFIG + routing).toByteArray())
+        }
+    }
+
     fun ledger(): Ledger {
         val file = File(directory, LEDGER_FILE)
         check(file.exists()) { "Extension ownership receipts are missing" }

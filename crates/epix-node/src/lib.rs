@@ -17,7 +17,7 @@ use std::sync::Arc;
 /// direct `epix-ui` dependency.
 pub use epix_ui::{
     new_nmh_nonce, nmh_request_mac, nmh_request_mac_valid, nmh_response_mac,
-    nmh_response_mac_valid, AppState, NMH_RESOLVE_PATH,
+    nmh_response_mac_valid, AppState, NMH_RESOLVE_PATH, NMH_STATUS_PATH,
 };
 
 /// The default Epix bootstrap announcers (re-exported from epix-core; the
@@ -800,13 +800,34 @@ fn migrate_legacy_conf(data_root: &std::path::Path) {
     }
 }
 
-/// The requested UI listener for desktop launchers. An explicit environment
-/// address takes precedence over an imported Python configuration.
-pub fn ui_bind() -> String {
+/// The requested desktop UI listener. Environment overrides the selected data
+/// root's JSON port, which overrides the legacy configuration and defaults.
+pub fn ui_bind(data_root: &std::path::Path) -> Result<String, String> {
     if let Some(addr) = std::env::var("EPIX_UI_ADDR").ok().filter(|s| !s.is_empty()) {
-        return addr;
+        return Ok(addr);
     }
-    legacy_ui_bind().unwrap_or_else(|| DEFAULT_UI_ADDR.to_string())
+    let legacy = legacy_ui_bind().unwrap_or_else(|| DEFAULT_UI_ADDR.to_string());
+    configured_ui_bind(data_root, &legacy)
+}
+
+fn configured_ui_bind(data_root: &std::path::Path, fallback: &str) -> Result<String, String> {
+    let path = data_root.join("private/config.json");
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(fallback.into()),
+        Err(error) => return Err(format!("cannot read node config {}: {error}", path.display())),
+    };
+    let config: serde_json::Value = serde_json::from_slice(&bytes)
+        .map_err(|error| format!("invalid node config {}: {error}", path.display()))?;
+    let object = config.as_object()
+        .ok_or_else(|| format!("invalid node config {}: expected a JSON object", path.display()))?;
+    let Some(value) = object.get("ui_port") else { return Ok(fallback.into()) };
+    let port = epix_ui::config_schema::ui_port(value)
+        .ok_or_else(|| format!("invalid node config {}: ui_port must be an integer from 1 to 65535", path.display()))?;
+    let mut addr: std::net::SocketAddr = fallback.parse()
+        .map_err(|_| format!("invalid UI address '{fallback}'"))?;
+    addr.set_port(port);
+    Ok(addr.to_string())
 }
 
 /// The UI bind address a Python client's `epixnet.conf` asks for (`ui_ip` /
@@ -969,6 +990,9 @@ fn bind_ui_listener_with<T>(
 ) -> std::io::Result<T> {
     let mut candidate = requested;
     loop {
+        if requested.port() == default_port && (43110..=43113).contains(&candidate.port()) {
+            candidate.set_port(43114);
+        }
         match bind(candidate) {
             Ok(listener) => return Ok(listener),
             Err(error)
@@ -1007,8 +1031,8 @@ fn bind_and_publish_ui_endpoint_with<T>(
     Ok((listener, bind, published))
 }
 
-/// Publish the selected UI port before rotating the bearer token. If the port
-/// file cannot be updated, retaining the old token fails native messaging
+/// Publish the selected UI port and address before rotating the secret. If
+/// either file cannot be updated, retaining the old secret fails native messaging
 /// closed instead of sending the new token to a stale, attacker-owned port.
 fn publish_nmh_endpoint(
     data_root: &std::path::Path,
@@ -1021,6 +1045,14 @@ fn publish_nmh_endpoint(
         warnings.push(format!(
             "cannot publish native-messaging UI port {}: {error}; refusing to publish the current token",
             port_path.display()
+        ));
+        return warnings;
+    }
+    let address_path = data_root.join("ui_addr");
+    if let Err(error) = std::fs::write(&address_path, bind.to_string()) {
+        warnings.push(format!(
+            "cannot publish native-messaging UI address {}: {error}; refusing to publish the current token",
+            address_path.display()
         ));
         return warnings;
     }
@@ -4990,13 +5022,33 @@ async fn serve(
     #[cfg(feature = "bridges")]
     let tor_use_bridges = !offline && state.config_bool("tor_use_bridges", false).await;
 
+    // Reserve UI before starting network tasks, so a rejected explicit bind
+    // cannot leave a failed boot's proxies or background runtime behind.
+    let requested: std::net::SocketAddr = opts
+        .ui_addr
+        .parse()
+        .map_err(|_| format!("invalid ui_addr '{}'", opts.ui_addr))?;
+    let (ui_listener, bind, nmh_warnings) =
+        bind_and_publish_ui_endpoint_with(requested, DEFAULT_UI_PORT, |bind| {
+            publish_nmh_endpoint(&opts.data_root, bind, state.nmh_token())
+        })
+        .map_err(|error| format!("bind UI endpoint: {error}"))?;
+    if bind.port() != requested.port() {
+        state
+            .log("INFO", format!("UI port {} in use; using {}", requested.port(), bind.port()))
+            .await;
+    }
+    state.set_ui_port(bind.port()).await;
+    for warning in nmh_warnings {
+        state.log("WARN", warning).await;
+    }
+
     let runtime_config = epix_runtime::RuntimeConfig {
         fileserver_port: if offline { None } else { fileserver_port },
         offline,
         #[cfg(feature = "tor")]
         tor_mode,
-        #[cfg(feature = "tor")]
-        tor_socks_port: Some(43111),
+        tor_socks_port: Some(epix_core::ports::DEFAULT_TOR_SOCKS_PORT),
         #[cfg(feature = "bridges")]
         tor_use_bridges,
         #[cfg(feature = "i2p")]
@@ -5019,28 +5071,29 @@ async fn serve(
     {
         runtime = runtime.with_data_dir(opts.data_root.clone());
     }
-    runtime.start().await;
+    runtime.start().await.map_err(|error| format!("start node runtime: {error}"))?;
+    let socks_port = state.tor_socks_port().await
+        .ok_or_else(|| "node runtime did not reserve its SOCKS endpoint".to_string())?;
+    state.log("INFO", format!("Local Tor SOCKS endpoint: 127.0.0.1:{socks_port}")).await;
 
-    // Tor-always: once the Arti SOCKS listener is up (tor_status == "Always"),
+    // Tor-always: once Arti can route SOCKS traffic (tor_status == "Always"),
     // route all chain RPC through it, so name resolution never exposes the
     // node's IP or which `.epix` names it looks up. Peer/tracker traffic already
     // rides Tor via the always-mode transport.
     //
-    // Cold-start gap: Tor takes ~10-40s to bootstrap. Any chain RPC that runs
-    // before this fires (e.g. resolving the xite named on the command line at
-    // startup) goes direct. Steady-state resolves - on-demand navigation, the
-    // native host, re-verification - all wait until the proxy is set and route
-    // through Tor.
+    // Startup policy blocks chain requests until this proxy is installed.
+    // The endpoint stays owned during recovery and rejects requests until
+    // the next Tor generation is ready.
     #[cfg(feature = "tor")]
     if tor_mode == epix_runtime::TorMode::Always {
         let state = state.clone();
         tokio::spawn(async move {
             loop {
                 if state.tor_status().await.1 == "Always" {
-                    epix_chain::set_chain_socks(Some("socks5h://127.0.0.1:43111".into()));
+                    epix_chain::set_chain_socks(Some(format!("socks5h://127.0.0.1:{socks_port}")));
                     // Route BT web-seed / .torrent fetches through the same proxy.
                     #[cfg(feature = "bittorrent")]
-                    epix_bt::http::set_socks(Some("socks5h://127.0.0.1:43111".into()));
+                    epix_bt::http::set_socks(Some(format!("socks5h://127.0.0.1:{socks_port}")));
                     state.log("INFO", "Chain RPC now routed through Tor".to_string()).await;
                     // Chain egress just opened. Every xite whose user content
                     // could not be xID-verified during the Tor-bootstrap
@@ -5070,7 +5123,7 @@ async fn serve(
         tokio::spawn(async move {
             loop {
                 if state.tor_status().await.0 {
-                    epix_bt::http::set_peer_socks(Some("127.0.0.1:43111".into()));
+                    epix_bt::http::set_peer_socks(Some(format!("127.0.0.1:{socks_port}")));
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
@@ -5105,24 +5158,6 @@ async fn serve(
     state.set_plugins(plugin_names).await;
     plugins.start_all(&state);
 
-    let requested: std::net::SocketAddr = opts
-        .ui_addr
-        .parse()
-        .map_err(|_| format!("invalid ui_addr '{}'", opts.ui_addr))?;
-    let (ui_listener, bind, nmh_warnings) =
-        bind_and_publish_ui_endpoint_with(requested, DEFAULT_UI_PORT, |bind| {
-            publish_nmh_endpoint(&opts.data_root, bind, state.nmh_token())
-        })
-        .map_err(|error| format!("bind UI endpoint: {error}"))?;
-    if bind.port() != requested.port() {
-        state
-            .log("INFO", format!("UI port {} in use; using {}", requested.port(), bind.port()))
-            .await;
-    }
-    state.set_ui_port(bind.port()).await;
-    for warning in nmh_warnings {
-        state.log("WARN", warning).await;
-    }
     state.log("INFO", format!("Serving {display}")).await;
 
     if opts.open_browser {
@@ -6319,6 +6354,40 @@ mod tests {
     }
 
     #[test]
+    fn configured_ui_port_is_validated_and_preserves_bind_host() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("private")).unwrap();
+        let path = dir.path().join("private/config.json");
+        assert_eq!(configured_ui_bind(dir.path(), DEFAULT_UI_ADDR).unwrap(), DEFAULT_UI_ADDR);
+        for value in [serde_json::json!(44990), serde_json::json!("44990")] {
+            std::fs::write(&path, serde_json::json!({"ui_port":value}).to_string()).unwrap();
+            assert_eq!(configured_ui_bind(dir.path(), DEFAULT_UI_ADDR).unwrap(), "127.0.0.1:44990");
+            assert_eq!(configured_ui_bind(dir.path(), "[::1]:42222").unwrap(), "[::1]:44990");
+        }
+        for value in [serde_json::json!(0), serde_json::json!(65536), serde_json::json!(-1), serde_json::json!(true), serde_json::json!("customnumberhere"), serde_json::json!(null)] {
+            std::fs::write(&path, serde_json::json!({"ui_port":value}).to_string()).unwrap();
+            assert!(configured_ui_bind(dir.path(), DEFAULT_UI_ADDR).unwrap_err().contains("ui_port"));
+        }
+        std::fs::write(&path, "[]").unwrap();
+        assert!(configured_ui_bind(dir.path(), DEFAULT_UI_ADDR).is_err());
+        std::fs::write(&path, "{").unwrap();
+        assert!(configured_ui_bind(dir.path(), DEFAULT_UI_ADDR).is_err());
+    }
+
+    #[test]
+    fn default_ui_scan_skips_legacy_service_ports() {
+        let requested = "127.0.0.1:43109".parse().unwrap();
+        let mut ports = Vec::new();
+        let selected = bind_ui_listener_with(requested, 43109, |address| {
+            ports.push(address.port());
+            if address.port() == 43109 { Err(std::io::Error::from(std::io::ErrorKind::AddrInUse)) }
+            else { Ok(address) }
+        }).unwrap();
+        assert_eq!(ports, [43109, 43114]);
+        assert_eq!(selected.port(), 43114);
+    }
+
+    #[test]
     fn ui_bind_uses_first_available_port_without_skipping() {
         for ip in [std::net::Ipv4Addr::LOCALHOST.into(), std::net::Ipv6Addr::LOCALHOST.into()] {
             for occupied in [0, 1, 9] {
@@ -6445,12 +6514,31 @@ mod tests {
             std::fs::read_to_string(dir.path().join("ui_port")).unwrap(),
             bound.port().to_string()
         );
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("ui_addr")).unwrap(),
+            bound.to_string()
+        );
         assert_eq!(read_nmh_auth_token(dir.path()).unwrap(), token);
         assert!(
             std::net::TcpListener::bind(bound).is_err(),
             "UiServer must receive a retained listener, not a probe result"
         );
         drop(listener);
+    }
+
+    #[test]
+    fn failed_endpoint_metadata_does_not_rotate_native_messaging_secret() {
+        for field in ["ui_port", "ui_addr"] {
+            let dir = tempfile::tempdir().unwrap();
+            let token = "11".repeat(32);
+            write_nmh_auth_token(dir.path(), &token).unwrap();
+            std::fs::create_dir(dir.path().join(field)).unwrap();
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let warnings = publish_nmh_endpoint(dir.path(), listener.local_addr().unwrap(), &"22".repeat(32));
+            assert_eq!(warnings.len(), 1);
+            assert!(warnings[0].contains("refusing to publish"));
+            assert_eq!(read_nmh_auth_token(dir.path()).unwrap(), token);
+        }
     }
 
     #[test]

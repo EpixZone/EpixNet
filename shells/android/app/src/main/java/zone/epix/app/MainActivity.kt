@@ -90,6 +90,9 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     private var addonDialogContent: LinearLayout? = null
     private val addonPopups = mutableMapOf<String, AlertDialog>()
     private var bootResult: BootResult? = null
+    private var nodeBase = "http://127.0.0.1:$UI_PORT"
+    private var restoredNodeBase = nodeBase
+    private var nativeSocksPort: Int? = null
     private var bootJob: Job? = null
     private var pendingTarget = "dashboard.epix"
     private var restoredUrls: List<String>? = null
@@ -226,6 +229,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         setContentView(container)
         watchConnectivity()
 
+        restoredNodeBase = trustedNodeBase(savedInstanceState?.getString("browser.nodeBase")) ?: nodeBase
         restoredUrls = savedInstanceState?.getStringArrayList("browser.urls")
             ?.filter(::restorableUrl)?.takeIf { it.isNotEmpty() }
         restoredSelection = savedInstanceState?.getInt("browser.selected", 0) ?: 0
@@ -237,7 +241,11 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             try {
                 val profile = VerifiedAddonManager.prepareProfile(filesDir)
                 if (disposed) return@launch
-                runtime = EmbeddedBrowserHost.runtime(applicationContext, profile.directory.absolutePath, profile.configFile.absolutePath)
+                val runtimeConfig = withContext(Dispatchers.IO) {
+                    profile.browserRuntimeConfig(UnavailableTorProxy.port, torClearnet)
+                }
+                if (disposed) return@launch
+                runtime = EmbeddedBrowserHost.runtime(applicationContext, profile.directory.absolutePath, runtimeConfig.absolutePath)
                 runtime.settings.consoleOutputEnabled = true
                 runtime.settings.remoteDebuggingEnabled = BuildConfig.DEBUG
                 // Honor PDF attachment headers. Gecko's inline-attachment
@@ -289,6 +297,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         outState.putStringArrayList("browser.urls", ArrayList(urls))
         outState.putInt("browser.selected", selection.coerceIn(0, (urls.size - 1).coerceAtLeast(0)))
         outState.putString("browser.target", pendingTarget)
+        outState.putString("browser.nodeBase", if (restoredUrls != null) restoredNodeBase else nodeBase)
         outState.putBoolean("wallet.engaged", walletUserEngaged)
         outState.putBoolean("download.picker", downloadPickerOutstanding)
     }
@@ -468,7 +477,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 request: GeckoSession.NavigationDelegate.LoadRequest,
             ): GeckoResult<org.mozilla.geckoview.AllowOrDeny>? {
                 if (!ownsSession(session)) return GeckoResult.deny()
-                if (request.uri.startsWith("$NODE_BASE/") && !localUiReady) return GeckoResult.deny()
+                if (request.uri.startsWith("$nodeBase/") && !localUiReady) return GeckoResult.deny()
                 // The error page's "Try again": boot the node again in-process.
                 if (request.uri == RETRY_URI) {
                     retryBoot()
@@ -521,7 +530,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 // (its UI still coming up) used to read as a blank app. Wait
                 // for the port and retry; only if the node stays unreachable
                 // show a real error page.
-                if (!ownsSession(session) || uri == null || !uri.startsWith(NODE_BASE)) return null
+                if (!ownsSession(session) || uri == null || (uri != nodeBase && !uri.startsWith("$nodeBase/"))) return null
                 if (nodeLoadRetries < MAX_NODE_LOAD_RETRIES) {
                     nodeLoadRetries++
                     val generation = startupGeneration
@@ -666,7 +675,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     }
 
     private fun tabEntries(): List<TabSwitcherEntry> = tabs.map { tab ->
-        val label = tabLabel(tab.title, tab.url, NODE_BASE)
+        val label = tabLabel(tab.title, tab.url, nodeBase)
         TabSwitcherEntry(tab, label.title, label.subtitle, tab === currentTab)
     }
 
@@ -1638,7 +1647,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             t.startsWith("http://") || t.startsWith("https://") -> t
             t.startsWith("epix://", ignoreCase = true) -> {
                 val rewritten = xiteRewrite(t) ?: return
-                currentDisplay = rewritten.removePrefix("$NODE_BASE/")
+                currentDisplay = rewritten.removePrefix("$nodeBase/")
                 rewritten
             }
             // Explicit xite addresses go to the node: epix1... or something.epix.
@@ -1659,8 +1668,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             // Everything else - phrases - searches DuckDuckGo.
             else -> searchUrl(t)
         }
-        if (url.startsWith("$NODE_BASE/") && !localUiReady) {
-            pendingTarget = url.removePrefix("$NODE_BASE/")
+        if (url.startsWith("$nodeBase/") && !localUiReady) {
+            pendingTarget = url.removePrefix("$nodeBase/")
             restoredUrls = null
         } else {
             currentTab.session.loadUri(url)
@@ -1679,7 +1688,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         // The shell's own inline pages (the error page) are data: URLs: a
         // base64 blob in the address bar means nothing to anyone.
         if (url.startsWith("data:")) return ""
-        val prefix = "$NODE_BASE/"
+        val prefix = "$nodeBase/"
         if (!url.startsWith(prefix)) return url
         val rest = url.removePrefix(prefix).trimEnd('/')
         val xite = rest.substringBefore('/').substringBefore('?').substringBefore('#')
@@ -1713,7 +1722,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         val path = parsed.encodedPath.orEmpty().ifEmpty { "/" }
         val query = parsed.encodedQuery?.let { "?$it" }.orEmpty()
         val fragment = parsed.encodedFragment?.let { "#$it" }.orEmpty()
-        return "$NODE_BASE/$host$path$query$fragment"
+        return "$nodeBase/$host$path$query$fragment"
     }
 
     /**
@@ -1775,6 +1784,10 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 loadStartupPage(currentTab.session, errorPage(result.error))
                 return@launch
             }
+            nodeBase = checkNotNull(result.uiBase)
+            nativeSocksPort = withContext(Dispatchers.IO) { node?.torSocksPort()?.toInt()?.takeIf { it in 1..65535 } }
+            if (disposed || generation != startupGeneration) return@launch
+            applyClearnetRouting()
             VerifiedAddonManager.refresh()
             acquireMulticastLockIfDiscovering()
             wakeNodeForForeground()
@@ -1783,7 +1796,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             if (disposed || generation != startupGeneration) return@launch
             if (ready) {
                 updateSplash(SplashStage.OPENING)
-                val urls = restoredUrls
+                val urls = restoredUrls?.map { restoreNodeUrl(it, restoredNodeBase, nodeBase) }
                 restoredUrls = null
                 if (urls != null) {
                     urls.drop(1).forEach { _ ->
@@ -1815,7 +1828,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         repeat(60) {
             val up = runCatching {
                 java.net.Socket().use {
-                    it.connect(java.net.InetSocketAddress("127.0.0.1", UI_PORT), 250)
+                    it.connect(java.net.InetSocketAddress("127.0.0.1", java.net.URI(nodeBase).port), 250)
                 }
             }.isSuccess
             if (up) return@withContext true
@@ -2218,7 +2231,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         return when (req.optString("cmd")) {
             "status" -> (if (!localUiReady) JSONObject().put("serving", false) else withContext(Dispatchers.IO) {
                 try {
-                    val text = java.net.URL("$NODE_BASE/EpixNet-Internal/Status")
+                    val text = java.net.URL("$nodeBase/EpixNet-Internal/Status")
                         .openConnection()
                         .apply { connectTimeout = 2_000; readTimeout = 2_000 }
                         .getInputStream()
@@ -2228,7 +2241,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 } catch (e: Exception) {
                     JSONObject().put("serving", false)
                 }
-            }).put("ui_port", UI_PORT).put("tor_clearnet", torClearnet)
+            }).put("ui_port", java.net.URI(nodeBase).port)
+                .put("tor_socks_port", nativeSocksPort ?: JSONObject.NULL).put("tor_clearnet", torClearnet)
             "getTorClearnet" -> JSONObject().put("on", torClearnet)
             "setTorClearnet" -> {
                 val on = req.optBoolean("on", false)
@@ -2254,7 +2268,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 withContext(Dispatchers.Main) {
                     walletDialog?.dismiss()
                     currentDisplay = "Config"
-                    currentTab.session.loadUri("$NODE_BASE/Config")
+                    currentTab.session.loadUri("$nodeBase/Config")
                 }
                 JSONObject().put("ok", true)
             }
@@ -2589,9 +2603,10 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         if (torClearnet) {
             GeckoPreferenceController.setGeckoPref("network.proxy.type", 1, user)
             GeckoPreferenceController.setGeckoPref("network.proxy.socks", "127.0.0.1", user)
-            GeckoPreferenceController.setGeckoPref("network.proxy.socks_port", SOCKS_PORT, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.socks_port", nativeSocksPort ?: UnavailableTorProxy.port, user)
             GeckoPreferenceController.setGeckoPref("network.proxy.socks_version", 5, user)
             GeckoPreferenceController.setGeckoPref("network.proxy.socks_remote_dns", true, user)
+            GeckoPreferenceController.setGeckoPref("network.proxy.failover_direct", false, user)
             GeckoPreferenceController.setGeckoPref(
                 "network.proxy.allow_hijacking_localhost", false, user,
             )
@@ -2612,7 +2627,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         }
     }
 
-    private fun nodeUrl(name: String): String = xiteRewrite("epix://$name") ?: "$NODE_BASE/"
+    private fun nodeUrl(name: String): String = xiteRewrite("epix://$name") ?: "$nodeBase/"
 
     private fun dp(v: Int): Int = (v * resources.displayMetrics.density).toInt()
 
@@ -2620,19 +2635,17 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     private fun intentTarget(intent: Intent?): String? {
         val data: Uri = intent?.data ?: return null
         if (!data.scheme.equals("epix", ignoreCase = true)) return null
-        return xiteRewrite(data.toString())?.removePrefix("$NODE_BASE/")
+        return xiteRewrite(data.toString())?.removePrefix("$nodeBase/")
     }
 
     companion object {
-        // The node's local Tor SOCKS listener (epix-node boot: 43111).
-        private const val SOCKS_PORT = 43111
         private const val PREF_TOR_CLEARNET = "torClearnet"
         private const val PREF_CLEARNET_ALLOW = "clearnetAllow"
         private const val PREF_BROWSER_CONTROLS_POSITION = "browserControlsPosition"
 
         // The embedded node's UI server (StartupRequest.uiPort): the EpixNet
-        // default port. The app boots the node itself, so unlike the desktop
-        // native host there is no discovery/legacy-port fallback to do here.
+        // requested default. Startup uses the endpoint returned by its owned
+        // native node, including a different port selected after a collision.
         private const val UI_PORT = 42222
         private const val DOWNLOAD_REQUEST_CODE = 0x3000
         // Do not let a late picker/permission answer settle a newer request.
@@ -2641,7 +2654,6 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             externalRequestCode = if (externalRequestCode == 0x7fff) 0x4000 else externalRequestCode + 1
             return externalRequestCode
         }
-        private const val NODE_BASE = "http://127.0.0.1:$UI_PORT"
         // The error page's "Try again" and "Reset settings" links; intercepted
         // in onLoadRequest.
         private const val RETRY_URI = "epixshell://retry"

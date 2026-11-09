@@ -105,6 +105,11 @@ jobs:
     permissions:
       contents: read
     env:
+      # Bound artifact size across feature graphs after runner disk exhaustion.
+      # Debug assertions and overflow checks remain enabled.
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
       # The full browser suite checks the packaged wallet too. Allow build.rs
       # to stage the release pinned by wallet-ext.rev and verify its SHA-256.
       # Treat warnings as errors so the build stays warning-free. cargo caps
@@ -299,6 +304,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - run: python3 shells/ios/tests/run-regressions.py
+      - name: Test selected UI and Tor proxy ports
+        run: node shells/ios/tests/run-port-regressions.cjs
 
   evx-sandbox:
     name: EVX sandbox (macOS)

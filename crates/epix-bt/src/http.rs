@@ -21,7 +21,7 @@ static REQUIRE_TOR: AtomicBool = AtomicBool::new(false);
 static PEER_SOCKS: RwLock<Option<String>> = RwLock::new(None);
 
 /// Route all BitTorrent HTTP fetches through `socks` (e.g.
-/// `socks5h://127.0.0.1:43111`), or clearnet when `None`. Set by the node as
+/// `socks5h://127.0.0.1:<selected-port>`), or clearnet when `None`. Set by the node as
 /// its Tor state changes.
 pub fn set_socks(socks: Option<String>) {
     if let Ok(mut w) = BT_SOCKS.write() {

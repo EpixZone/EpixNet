@@ -208,12 +208,18 @@ private suspend fun servingEndpointFailureNeverRestarts() = fixture { f ->
     val config = File(f.directory, "private/config.json")
     config.parentFile.mkdirs()
     config.writeText("keep serving settings")
-    f.fake.url = "http://127.0.0.1:42223/dashboard.epix/"
+    f.fake.url = "http://localhost:42223/dashboard.epix/"
     val first = f.coordinator.ensureStarted(f.request)
     check(!first.succeeded && first.state == NodeState.SERVING && first.error != null)
     check(f.coordinator.ensureStarted(f.request, first.attemptId, resetConfig = true) == first)
     check(config.readText() == "keep serving settings" && f.starts.get() == 1)
     check(f.coordinator.ensureStarted(f.request.copy(uiPort = 42223, target = "new.epix")) == first)
+}
+
+private suspend fun incrementedEndpointIsAccepted() = fixture { f ->
+    f.fake.url = "http://127.0.0.1:42223/dashboard.epix/"
+    val result = f.coordinator.ensureStarted(f.request)
+    check(result.succeeded && result.uiBase == "http://127.0.0.1:42223") { "the node-owned incremented UI listener was rejected" }
 }
 
 private suspend fun failedFactoryIsNotRecreated() = fixture { f ->
@@ -273,20 +279,31 @@ private suspend fun failedStartingStateCannotRetryOrReset() = fixture { f ->
 }
 
 private fun parsedOriginValidation() {
-    for (url in listOf(
-        "http://127.0.0.1:42222/dashboard.epix/", "HTTP://127.0.0.1:42222/a?b=c#d",
-    )) check(matchesUiOrigin(url, 42222)) { "valid origin rejected: $url" }
-    for (url in listOf(
-        null, "", "not a URL", "http://127.0.0.1:42223/", "http://127.0.0.1/",
-        "https://127.0.0.1:42222/", "http://127.0.0.1.evil:42222/",
+    for (port in listOf(1, 42222, 42223, 65535)) {
+        check(trustedNodeBase("http://127.0.0.1:$port/dashboard.epix/?a=b#c") == "http://127.0.0.1:$port")
+    }
+    for (url in listOf(null, "", "not a URL", "http://127.0.0.1/", "http://127.0.0.1:0/",
+        "http://127.0.0.1:65536/", "https://127.0.0.1:42222/", "http://127.0.0.1.evil:42222/",
         "http://127.0.0.1:42222@elsewhere/", "http://user@127.0.0.1:42222/",
-        "http://localhost:42222/", "//127.0.0.1:42222/",
-    )) check(!matchesUiOrigin(url, 42222)) { "invalid origin accepted: $url" }
-    check(matchesUiOrigin("http://127.0.0.1/path", 80))
+        "http://localhost:42222/", "http://[::1]:42222/", "//127.0.0.1:42222/")) {
+        check(trustedNodeBase(url) == null) { "invalid endpoint accepted: $url" }
+    }
+    val old = "http://127.0.0.1:42222"
+    val current = "http://127.0.0.1:42225"
+    for (host in listOf("127.0.0.1", "epix-epix1abc123.localhost")) {
+        val suffix = "/talk.epix/a%2Fb?q=a%2Fb#part%20two"
+        check(restoreNodeUrl("http://$host:42222$suffix", old, current) == "http://$host:42225$suffix")
+    }
+    for (url in listOf("https://example.com/path", "http://127.0.0.1:42223/other",
+        "http://127.0.0.1.evil:42222/", "http://user@127.0.0.1:42222/",
+        "http://epix-epix1abc.localhost.evil:42222/", "http://localhost:42222/")) {
+        check(restoreNodeUrl(url, old, current) == url)
+    }
 }
 
 fun main() = runBlocking {
     withTimeout(30_000) {
+        incrementedEndpointIsAccepted()
         canceledWaiterSharesBoot()
         failedRetryIsFenced()
         resetOnlyTheSelectedFailure()
@@ -297,5 +314,5 @@ fun main() = runBlocking {
         failedStartingStateCannotRetryOrReset()
         parsedOriginValidation()
     }
-    println("PASS: 9 Android node-host regression groups (real coroutines)")
+    println("PASS: 10 Android node-host regression groups (real coroutines)")
 }

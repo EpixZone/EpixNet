@@ -222,9 +222,16 @@ amber connecting, purple ready, green when clearnet is routed through Tor),
 polling `torStatus()` / `onionAddress()` on the FFI every 5 seconds. Hardware
 back navigates page history. The iOS shell has the same chrome.
 
+The mobile shells use the actual UI endpoint returned by `uiUrl()` after
+startup, including when the default dashboard port is occupied. Android
+restores saved node tabs onto that endpoint while retaining their encoded
+paths, queries, and fragments. Ordinary web tabs keep their original URLs.
+
 The "Route clearnet through Tor" switch (default on, opt-out, like the desktop
 extension) points the web engine's proxy at the node's Tor SOCKS listener
-(127.0.0.1:43111, the same one the desktop launcher's PAC uses). The node's own
+(the owned loopback port returned by `torSocksPort()`). The shell keeps an
+owned, refusing loopback listener before startup; it never guesses a SOCKS
+port or falls back to direct traffic when Tor is unavailable. The node's own
 loopback is excluded, so the UI and every `.epix` page (served from 127.0.0.1)
 load directly while clearnet requests exit through Tor. Android sets
 GeckoView's `network.proxy.*` prefs live; iOS 17+ sets

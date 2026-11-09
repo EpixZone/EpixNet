@@ -49,10 +49,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-const PROXY_ADDR: &str = "127.0.0.1:43112";
-const SOCKS_ADDR: &str = "127.0.0.1:43111";
-/// The `.i2p` (eepsite) HTTP proxy the PAC routes `*.i2p` hosts to.
-const EEPSITE_PROXY_ADDR: &str = "127.0.0.1:43113";
+use epix_core::ports::{bind_loopback_listener, DEFAULT_BROWSER_PROXY_PORT, DEFAULT_I2P_PROXY_PORT};
 
 /// The "route clearnet through Tor" setting (persisted by the native host in
 /// `<data_root>/browser-settings.json`), read at launch to build the file PAC.
@@ -256,10 +253,6 @@ async fn boot(
     progress: startup::Progress,
     window_size: Option<browser_process::BrowserWindowSize>,
 ) -> Result<(Ready, Option<std::process::Child>), String> {
-    // The native add-on broker requires loopback. Validate before acquiring
-    // the data directory or starting a listener, including inherited settings
-    // when epix-server hands startup to this executable.
-    let requested_ui_addr = browser_ui_addr(&epix_node::ui_bind())?;
     let target = epix_node::parse_target(raw_arg);
     progress.report(startup::Stage::Preparing);
 
@@ -267,6 +260,8 @@ async fn boot(
     let data_lease = tokio::task::spawn_blocking(epix_node::prepare_data_root)
         .await.map_err(|e| format!("Cannot prepare the data folder: {e}"))??;
     let data_root = data_lease.root().to_path_buf();
+    // Use the final data root after relocation, before starting any listener.
+    let requested_ui_addr = browser_ui_addr(&epix_node::ui_bind(&data_root)?)?;
     ipc::confirm_data_root(&data_root)?;
 
     let firefox = find_firefox().ok_or_else(|| {
@@ -319,13 +314,18 @@ async fn boot(
         let _ = server.serve(ui_addr).await;
     });
 
-    let proxy_addr: SocketAddr = PROXY_ADDR.parse().unwrap();
+    // Reserve the actual sockets before publishing addresses into the profile.
+    // An occupied port belongs to another service, never to this browser.
+    let proxy_listener = reserve_proxy(DEFAULT_BROWSER_PROXY_PORT)?;
+    let proxy_addr = proxy_listener.local_addr().map_err(|error| error.to_string())?;
+    let eepsite_listener = reserve_proxy(DEFAULT_I2P_PROXY_PORT)?;
+    let eepsite_addr = eepsite_listener.local_addr().map_err(|error| error.to_string())?;
     // Flipped true once setup_profile confirms the CA is trusted; the proxy then
     // upgrades plain-http xite loads to https. Firefox launches only after that,
     // so the flag is already correct by the time real requests arrive.
     let proxy_secure = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    spawn_browser_proxy(proxy_addr, proxy_app, ca.clone(), proxy_secure.clone());
-    spawn_eepsite_proxy(running.state.clone(), data_root.join("i2p").join("eepsite-hosts.json"));
+    spawn_browser_proxy(proxy_listener, proxy_app, ca.clone(), proxy_secure.clone());
+    spawn_eepsite_proxy(eepsite_listener, running.state.clone(), data_root.join("i2p").join("eepsite-hosts.json"));
 
     if !wait_for_port(ui_addr, Duration::from_secs(30)).await
         || !wait_for_port(proxy_addr, Duration::from_secs(10)).await
@@ -339,11 +339,12 @@ async fn boot(
     // Firefox enforces signing, so the extension silently won't load there.
     let ext_capable = firefox_allows_unsigned(&firefox);
 
-    let socks_addr: SocketAddr = SOCKS_ADDR.parse().unwrap();
+    let socks_port = running.state.tor_socks_port().await
+        .ok_or_else(|| "The local node did not reserve its Tor proxy.".to_string())?;
+    let socks_addr = SocketAddr::from(([127, 0, 0, 1], socks_port));
     // The effective Tor mode the node booted with: the EPIX_TOR override when
     // set, else the Config page's persisted choice (default enable). Must match
-    // the node's resolution, or the PAC would route clearnet at a SOCKS
-    // listener that never binds.
+    // the node's resolution so disabling Tor keeps explicit direct browsing.
     let tor_mode = if tor_mode.is_empty() {
         running
             .state
@@ -355,8 +356,8 @@ async fn boot(
         tor_mode
     };
     // Route clearnet through Tor by default (opt-out), but only when Tor is on -
-    // otherwise there is no SOCKS listener and clearnet would break. An explicit
-    // saved setting overrides the default.
+    // The owned SOCKS listener refuses traffic when Tor is off. An explicit
+    // saved setting overrides the clearnet preference default.
     let tor_on = tor_mode != "disable";
     let tor_clearnet = tor_on && tor_clearnet_setting(&data_root).unwrap_or(true);
     if tor_clearnet {
@@ -372,7 +373,7 @@ async fn boot(
     // install the theme + wallet extension into it.
     progress.report(startup::Stage::Profile);
     let (profile, secure, addon_credentials) = setup_profile(
-        &data_root, proxy_addr, socks_addr, &display, tor_clearnet, ext_capable, &firefox, &ca, &addon_broker, ui_addr,
+        &data_root, proxy_addr, socks_addr, eepsite_addr, &display, tor_clearnet, ext_capable, &firefox, &ca, &addon_broker, ui_addr,
     ).await?;
     ensure_search_policy(&firefox);
     progress.report(startup::Stage::Wallet);
@@ -482,12 +483,18 @@ async fn wait_for_browser_window(
     result
 }
 
-/// Serve the browser proxy on `proxy_addr` in the background: TLS-terminated
+fn reserve_proxy(start: u16) -> Result<tokio::net::TcpListener, String> {
+    bind_loopback_listener(start)
+        .and_then(tokio::net::TcpListener::from_std)
+        .map_err(|error| format!("Could not reserve local browser proxy from port {start}: {error}"))
+}
+
+/// Serve the retained browser proxy in the background: TLS-terminated
 /// CONNECT plus plain http, both feeding `app` (the node's router with the
 /// transparent-proxy host rewrite). `secure` flips true once the CA is
 /// confirmed trusted; the proxy then upgrades plain-http xite loads to https.
 fn spawn_browser_proxy<S>(
-    proxy_addr: SocketAddr,
+    listener: tokio::net::TcpListener,
     app: S,
     ca: Arc<LocalCa>,
     secure: Arc<std::sync::atomic::AtomicBool>,
@@ -502,27 +509,17 @@ fn spawn_browser_proxy<S>(
     S::Future: Send,
 {
     tokio::spawn(async move {
-        match tokio::net::TcpListener::bind(proxy_addr).await {
-            Ok(listener) => {
-                let _ = proxy::serve(listener, app, ca, secure).await;
-            }
-            Err(e) => eprintln!("browser proxy bind on {proxy_addr} failed: {e}"),
-        }
+        let _ = proxy::serve(listener, app, ca, secure).await;
     });
 }
 
-/// Serve the eepsite proxy on [`EEPSITE_PROXY_ADDR`] in the background: the
+/// Serve the retained eepsite proxy in the background: the
 /// PAC routes every `*.i2p` host here, and requests ride SAM streams through
 /// the node's I2P router. Serves friendly status pages while I2P is disabled
 /// or still starting, so `.i2p` never dead-ends on a closed port.
-fn spawn_eepsite_proxy(state: Arc<epix_ui::AppState>, book_path: PathBuf) {
+fn spawn_eepsite_proxy(listener: tokio::net::TcpListener, state: Arc<epix_ui::AppState>, book_path: PathBuf) {
     tokio::spawn(async move {
-        match tokio::net::TcpListener::bind(EEPSITE_PROXY_ADDR).await {
-            Ok(listener) => {
-                let _ = eepsite::serve(listener, state, book_path).await;
-            }
-            Err(e) => eprintln!("eepsite proxy bind on {EEPSITE_PROXY_ADDR} failed: {e}"),
-        }
+        let _ = eepsite::serve(listener, state, book_path).await;
     });
 }
 
@@ -535,6 +532,7 @@ async fn setup_profile(
     data_root: &Path,
     proxy_addr: SocketAddr,
     socks_addr: SocketAddr,
+    eepsite_addr: SocketAddr,
     display: &str,
     tor_clearnet: bool,
     ext_capable: bool,
@@ -545,7 +543,7 @@ async fn setup_profile(
 ) -> Result<(PathBuf, bool, epix_ui::addon_broker::AddonLaunchCredentials), String> {
     let profile = data_root.join("firefox-profile");
     if let Err(e) =
-        write_profile(&profile, proxy_addr, socks_addr, display, true, tor_clearnet, ext_capable)
+        write_profile(&profile, proxy_addr, socks_addr, eepsite_addr, display, true, tor_clearnet, ext_capable)
     {
         return Err(format!("Could not prepare the browser profile: {e}"));
     }
@@ -560,7 +558,7 @@ async fn setup_profile(
     };
     if !secure {
         let _ =
-            write_profile(&profile, proxy_addr, socks_addr, display, false, tor_clearnet, ext_capable);
+            write_profile(&profile, proxy_addr, socks_addr, eepsite_addr, display, false, tor_clearnet, ext_capable);
     }
     Ok((profile, secure, credentials))
 }
@@ -1199,6 +1197,7 @@ fn write_profile(
     profile: &Path,
     proxy_addr: SocketAddr,
     socks_addr: SocketAddr,
+    eepsite_addr: SocketAddr,
     display: &str,
     secure: bool,
     tor_clearnet: bool,
@@ -1226,10 +1225,14 @@ fn write_profile(
          \x20 if (shExpMatch(host, \"epix1*\") && dnsDomainLevels(host) === 0) {{ return \"PROXY {proxy_addr}\"; }}\n\
          \x20 // Eepsites: the node carries `.i2p` hosts over its I2P router via a\n\
          \x20 // dedicated local HTTP proxy (jump links and b32 addresses included).\n\
-         \x20 if (shExpMatch(host, \"*.i2p\")) {{ return \"PROXY {EEPSITE_PROXY_ADDR}\"; }}\n\
+         \x20 if (shExpMatch(host, \"*.i2p\")) {{ return \"PROXY {eepsite_addr}\"; }}\n\
          \x20 // Onion services always need Tor, independently of clearnet routing.\n\
          \x20 if (shExpMatch(host, \"*.onion\")) {{ return \"SOCKS5 {socks_addr}\"; }}\n\
-         \x20 if (host === \"127.0.0.1\" || host === \"localhost\") {{ return \"DIRECT\"; }}\n\
+         \x20 // Reserved loopback names keep their distinct origins and never use Tor.\n\
+         \x20 // Classify literal IPv4 locally; DNS lookups here would bypass Tor.\n\
+         \x20 var octets = host.split(\".\");\n\
+         \x20 var loopbackV4 = octets.length === 4 && octets[0] === \"127\" && octets.every(function(part) {{ return /^[0-9]{{1,3}}$/.test(part) && Number(part) <= 255; }});\n\
+         \x20 if (loopbackV4 || host === \"::1\" || host === \"[::1]\" || /(^|\\.)localhost\\.?$/i.test(host)) {{ return \"DIRECT\"; }}\n\
          \x20 // The EPIX chain's own infrastructure (rpc/api/evmrpc.epix.zone) always\n\
          \x20 // goes direct: it is the wallet's essential backend, and the endpoints\n\
          \x20 // refuse Tor exits, so routing chain RPC through Tor would break the\n\
@@ -1250,7 +1253,7 @@ fn write_profile(
     let proxy_prefs = format!(
         "user_pref(\"network.proxy.type\", 2);\n\
          user_pref(\"network.proxy.autoconfig_url\", \"{pac_url}\");\n\
-         user_pref(\"network.proxy.allow_hijacking_localhost\", true);\n\
+         user_pref(\"network.proxy.allow_hijacking_localhost\", false);\n\
          user_pref(\"network.proxy.socks_remote_dns\", true);\n\
          user_pref(\"network.proxy.failover_direct\", false);\n\
          user_pref(\"network.proxy.failover_timeout\", 10);\n\

@@ -18,6 +18,7 @@ use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 pub mod ledger;
+mod endpoint;
 
 /// Per-browser settings persisted next to the node data. `tor_clearnet` selects
 /// direct or Tor transport for general clearnet. `clearnet_allow` is retained
@@ -101,26 +102,17 @@ impl Settings {
 
 /// Handle one request, returning the response value. `resolve` is async, so
 /// this returns a future.
-/// Query a loopback node endpoint with a hard timeout. Without one, a wrong or
-/// half-open listener on the UI port - e.g. a stray standalone node holding the
-/// default port - makes the request hang forever. The host would then never
-/// return to read stdin, never see Firefox close the pipe, and never exit; so
-/// Firefox spawns a fresh host on every poll and they pile up (we have seen
-/// 100+). The timeout makes the query fail fast so the host answers best-effort
-/// and exits cleanly.
-async fn node_get(url: &str) -> reqwest::Result<reqwest::Response> {
-    reqwest::Client::new()
-        .get(url)
-        .timeout(std::time::Duration::from_secs(4))
-        .send()
-        .await
-}
+mod status;
 
-async fn node_resolve(ui_port: u16, token: &str, name: &str) -> Result<String, String> {
-    let url = format!("http://127.0.0.1:{ui_port}{}", epix_node::NMH_RESOLVE_PATH);
+async fn node_resolve(endpoint: std::net::SocketAddr, token: &str, name: &str) -> Result<String, String> {
+    let url = format!("http://{endpoint}{}", epix_node::NMH_RESOLVE_PATH);
     let nonce = epix_node::new_nmh_nonce()?;
     let request_mac = epix_node::nmh_request_mac(token, &nonce, name)?;
-    let mut response = reqwest::Client::new()
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::none())
+        .build().map_err(|error| error.to_string())?;
+    let mut response = client
         .post(url)
         .json(&json!({
             "name": name,
@@ -192,25 +184,7 @@ async fn node_resolve(ui_port: u16, token: &str, name: &str) -> Result<String, S
 pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
     let cmd = req.get("cmd").and_then(|v| v.as_str()).unwrap_or("");
     match cmd {
-        "status" => {
-            // Fetch the node's status (Tor state + onion) over loopback; fall
-            // back to a plain connect check if it isn't answering yet.
-            let url = format!("http://127.0.0.1:{ui_port}/EpixNet-Internal/Status");
-            match node_get(&url).await.and_then(|r| r.error_for_status()) {
-                Ok(resp) => match resp.json::<Value>().await {
-                    Ok(mut v) => {
-                        v["ui_port"] = json!(ui_port);
-                        v["tor_clearnet"] = json!(settings.tor_clearnet());
-                        v
-                    }
-                    Err(_) => json!({ "serving": true, "ui_port": ui_port }),
-                },
-                Err(_) => {
-                    let serving = std::net::TcpStream::connect(("127.0.0.1", ui_port)).is_ok();
-                    json!({ "serving": serving, "ui_port": ui_port })
-                }
-            }
-        }
+        "status" => status::handle(settings, ui_port).await,
         "getTorClearnet" => json!({ "on": settings.tor_clearnet() }),
         "setTorClearnet" => {
             let on = req.get("on").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -240,7 +214,7 @@ pub async fn handle(req: &Value, settings: &Settings, ui_port: u16) -> Value {
                 Ok(token) => token,
                 Err(error) => return json!({ "error": error }),
             };
-            match node_resolve(ui_port, &token, &full).await {
+            match node_resolve(settings.ui_endpoint(ui_port), &token, &full).await {
                 Ok(address) => json!({ "address": address }),
                 Err(error) => json!({ "error": format!("resolve {full}: {error}") }),
             }
@@ -321,7 +295,7 @@ mod tests {
         content_len.is_some_and(|len| request.len() >= header_end + 4 + len)
     }
 
-    fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    pub(super) fn read_http_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
         stream
             .set_read_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
@@ -352,7 +326,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(2),
-            node_resolve(port, &token, "talk.epix"),
+            node_resolve(([127, 0, 0, 1], port).into(), &token, "talk.epix"),
         )
         .await;
         let _ = release_tx.send(());
@@ -515,7 +489,7 @@ mod tests {
             request_tx.send(request).unwrap();
         });
 
-        let error = node_resolve(port, &token, "talk.epix").await.unwrap_err();
+        let error = node_resolve(([127, 0, 0, 1], port).into(), &token, "talk.epix").await.unwrap_err();
         assert!(error.contains("response authentication failed"));
         let request = request_rx.recv().unwrap();
         assert!(
