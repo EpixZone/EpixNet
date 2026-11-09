@@ -211,6 +211,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: filesystem-transactions
+      - name: Install protoc for the UI mesh dependency
+        run: choco install protoc -y --no-progress
       # This excluded vendored crate has a standalone dependency graph. Avoid
       # building or caching the full workspace to exercise Windows clock limits.
       - name: Test Windows clock limits and coarse-clock progress
@@ -262,6 +264,8 @@ jobs:
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           key: filesystem-transactions
+      - name: Install protoc for the UI mesh dependency
+        run: brew install protobuf
       - name: Test native directory ownership, recovery and PAC paths
         run: |
           python3 scripts/test_data_relocation.py
