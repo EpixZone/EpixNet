@@ -511,3 +511,69 @@ async fn upgrade_rejects_a_noncanonical_include_in_a_preserved_manifest() {
     assert!(error.contains("./content.json"), "{error}");
     assert_eq!(storage.read("data/users/content.json").unwrap(), preserved);
 }
+
+#[tokio::test]
+async fn fresh_clone_keeps_a_malformed_manifest_outside_declared_includes() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("orphan-clone-test", root.path());
+    let malformed = b"{broken";
+    let (source, _) = owned_xite(
+        &state,
+        &root,
+        json!({"title":"Template with an orphan", "files":{}}),
+        &[
+            ("index.html", b"template code"),
+            ("archive/content.json", malformed),
+        ],
+    )
+    .await;
+    let address = state
+        .clone_xite(&source, "", None)
+        .await
+        .expect("a manifest outside the declared authority chain must not prevent cloning");
+    let storage = XiteStorage::new(root.path().join("data").join(&address));
+    assert_eq!(storage.read("archive/content.json").unwrap(), malformed);
+    assert!(state
+        .edx_read_verified_signed(&address, "archive/content.json", 100_000)
+        .await
+        .is_none());
+}
+
+#[tokio::test]
+async fn fresh_clone_does_not_validate_or_sign_dynamic_author_manifests() {
+    let root = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("author-clone-test", root.path());
+    let malformed = b"{broken";
+    let author = epix_crypt::privatekey_to_address(&epix_crypt::new_seed()).unwrap();
+    let author_path = format!("data/users/{author}/content.json");
+    let (source, _) = owned_xite(
+        &state,
+        &root,
+        json!({
+            "title":"Template with author data", "files":{},
+            "includes":{"data/users/content.json":{"signers":[],"signers_required":1}}
+        }),
+        &[
+            ("index.html", b"template code"),
+            ("data/users/content.json", USER_GOVERNOR_DEFAULT),
+            (author_path.as_str(), malformed),
+        ],
+    )
+    .await;
+    let key = state.xite_privatekey(&source).await.unwrap();
+    state
+        .sign_user_content(&source, "data/users/content.json", Some(key), None)
+        .await
+        .unwrap();
+    let address = state
+        .clone_xite(&source, "", None)
+        .await
+        .expect("dynamic author manifests must not be initialized as owner manifests");
+    let storage = XiteStorage::new(root.path().join("data").join(&address));
+    assert_owned_manifest(&storage, "data/users/content.json", &address);
+    assert_eq!(storage.read(&author_path).unwrap(), malformed);
+    assert!(state
+        .edx_read_verified_signed(&address, &author_path, 100_000)
+        .await
+        .is_none());
+}
