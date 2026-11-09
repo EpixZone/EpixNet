@@ -22,7 +22,7 @@ function sidebar(url) {
       return this.href;
     },
   };
-  const control = { off() { return this; }, on() { return this; } };
+  const control = { off() { return this; }, on() { return this; }, scrollTop() { return 0; } };
   const context = vm.createContext({
     document: { location: new URL(url) },
     morphdom(element, html) {
@@ -39,6 +39,7 @@ function sidebar(url) {
     container: { addClass() {} },
     when_loaded: { resolve() {} },
     updateOptionalProgress() {},
+    applyProperties() {},
     tag: {
       find(selector) {
         if (selector === "#browse-files") return browse;

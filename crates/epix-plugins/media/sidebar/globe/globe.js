@@ -72,17 +72,18 @@ DAT.Globe = function(container, opts) {
   var mesh, atmosphere, point, running;
 
   var overRenderer;
-  var running = true;
+  var running = false, animationFrame = null, resizeObserver = null;
+  var keyboardScope = opts.controls || container;
 
   var curZoomSpeed = 0;
   var zoomSpeed = 50;
 
   var mouse = { x: 0, y: 0 }, mouseOnDown = { x: 0, y: 0 };
-  var rotation = { x: 0, y: 0 },
+  var rotation = { x: Math.PI*3/2, y: Math.PI / 6.0 },
       target = { x: Math.PI*3/2, y: Math.PI / 6.0 },
       targetOnDown = { x: 0, y: 0 };
 
-  var distance = 100000, distanceTarget = 100000;
+  var distance = 855, distanceTarget = 855;
   var padding = 10;
   var PI_HALF = Math.PI / 2;
 
@@ -93,6 +94,9 @@ DAT.Globe = function(container, opts) {
 
     container.style.color = '#fff';
     container.style.font = '13px/20px Arial, sans-serif';
+    container.tabIndex = 0;
+    container.setAttribute('role', 'img');
+    container.setAttribute('aria-label', 'Peer map. Drag to rotate; pinch, scroll or use the zoom controls to zoom.');
 
     var shader, uniforms, material;
     w = container.offsetWidth || window.innerWidth;
@@ -165,6 +169,10 @@ DAT.Globe = function(container, opts) {
     document.addEventListener('keydown', onDocumentKeyDown, false);
 
     window.addEventListener('resize', onWindowResize, false);
+    if (window.ResizeObserver) {
+      resizeObserver = new ResizeObserver(onWindowResize);
+      resizeObserver.observe(container);
+    }
 
     container.addEventListener('mouseover', function() {
       overRenderer = true;
@@ -284,6 +292,7 @@ DAT.Globe = function(container, opts) {
 
   function onMouseDown(event) {
     event.preventDefault();
+    container.focus({preventScroll: true});
 
     container.addEventListener('mousemove', onMouseMove, false);
     container.addEventListener('mouseup', onMouseUp, false);
@@ -391,7 +400,7 @@ DAT.Globe = function(container, opts) {
   }
 
   function onMouseWheel(event) {
-    if (container.style.cursor != "move") return false;
+    if (!running || !container.offsetWidth || !container.offsetHeight) return false;
     event.preventDefault();
     if (overRenderer) {
       if (event.deltaY) {
@@ -404,6 +413,7 @@ DAT.Globe = function(container, opts) {
   }
 
   function onDocumentKeyDown(event) {
+    if (!running || !keyboardScope.contains(document.activeElement)) return;
     switch (event.keyCode) {
       case 38:
         zoom(100);
@@ -417,6 +427,7 @@ DAT.Globe = function(container, opts) {
   }
 
   function onWindowResize( event ) {
+    if (!container.offsetWidth || !container.offsetHeight) return;
     camera.aspect = container.offsetWidth / container.offsetHeight;
     camera.updateProjectionMatrix();
     renderer.setSize( container.offsetWidth, container.offsetHeight );
@@ -429,9 +440,29 @@ DAT.Globe = function(container, opts) {
   }
 
   function animate() {
-    if (!running) return
-    requestAnimationFrame(animate);
+    if (!running) return;
+    animationFrame = requestAnimationFrame(animate);
     render();
+  }
+
+  function resume() {
+    if (running) return;
+    running = true;
+    onWindowResize();
+    animate();
+  }
+
+  function pause() {
+    running = false;
+    if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+    onMouseUp();
+  }
+
+  function reset() {
+    target.x = Math.PI * 3 / 2;
+    target.y = Math.PI / 6;
+    distanceTarget = 855;
   }
 
   function render() {
@@ -451,7 +482,8 @@ DAT.Globe = function(container, opts) {
   }
 
   function unload() {
-    running = false
+    pause();
+    if (resizeObserver) resizeObserver.disconnect();
     container.removeEventListener('mousedown', onMouseDown, false);
     container.removeEventListener('touchstart', onTouchStart, { passive: false });
     container.removeEventListener('touchmove', onTouchMove, { passive: false });
@@ -464,11 +496,25 @@ DAT.Globe = function(container, opts) {
     }
     document.removeEventListener('keydown', onDocumentKeyDown, false);
     window.removeEventListener('resize', onWindowResize, false);
+    scene.traverse(function(object) {
+      if (object.geometry) object.geometry.dispose();
+      if (object.material) {
+        if (object.material.uniforms && object.material.uniforms.texture) object.material.uniforms.texture.value.dispose();
+        object.material.dispose();
+      }
+    });
+    if (renderer.dispose) renderer.dispose();
+    if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
 
   }
 
   init();
-  this.animate = animate;
+  this.animate = resume;
+  this.resume = resume;
+  this.pause = pause;
+  this.resize = onWindowResize;
+  this.zoom = zoom;
+  this.reset = reset;
   this.unload = unload;
 
 

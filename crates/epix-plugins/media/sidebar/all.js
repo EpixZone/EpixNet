@@ -643,6 +643,13 @@ window.initScrollable = function (chrome) {
       this.preload_html = null;
       this.optional_expanded = false;
       this.optional_poll = null;
+      this.properties_tab = "overview";
+      this.properties_scroll = {};
+      this.property_drafts = {};
+      this.peer_feedback = "";
+      this.peer_map_open = null;
+      this.peer_map_saving = false;
+      this.sign_publish_menu = null;
       this.original_set_xite_info = this.wrapper.setXiteInfo;
       if (window.top.location.hash === "#EpixNet:OpenSidebar") {
         this.startDrag();
@@ -703,6 +710,7 @@ window.initScrollable = function (chrome) {
       if (this.tag) this.tag.css("transform", "translateX(-" + (this.opened ? this.width : 0) + "px)");
       if (this.console.tag) this.console.tag.css("transform", "translateY(" + (this.console.opened ? this.fixbutton_targety - this.fixbutton_inity : 0) + "px)");
       if (this.scrollable && this.container) this.scrollable();
+      if (this.globe && this.peer_map_open) this.globe.resize();
       if (window.visible_menu) window.visible_menu.hide();
     };
 
@@ -818,15 +826,20 @@ window.initScrollable = function (chrome) {
     };
 
     Sidebar.prototype.setHtmlTag = function(res) {
+      if (!this.tag) return;
+      var firstRender = this.tag.find(".content").children().length === 0;
+      var scroll = this.tag.find(".content-wrapper").scrollTop();
+      var focused = document.activeElement;
+      var focusedId = focused && this.tag[0].contains(focused) ? focused.id : null;
+      var selection = focusedId && typeof focused.selectionStart === "number" ? [focused.selectionStart, focused.selectionEnd] : null;
       if (this.tag.find(".content").children().length === 0) {
         this.log("Creating content");
         this.container.addClass("loaded");
         morphdom(this.tag.find(".content")[0], '<div class="content">' + res + '</div>');
-        this.when_loaded.resolve();
       } else {
         morphdom(this.tag.find(".content")[0], '<div class="content">' + res + '</div>', {
           onBeforeMorphEl: function(from_el, to_el) {
-            if (from_el.className === "globe" || from_el.className.indexOf("noupdate") >= 0) {
+            if (from_el.classList.contains("globe") || from_el.className.indexOf("noupdate") >= 0) {
               return false;
             } else {
               return true;
@@ -866,7 +879,114 @@ window.initScrollable = function (chrome) {
       // Keep the server's current-xite URL. On a .epix origin the address
       // lives in the hostname, so rebuilding this link from pathname loses it.
       this.updateOptionalProgress();
+      this.applyProperties();
+      if (this.opened) this.onOpened();
+      if (focusedId) {
+        var restored = this.tag[0].querySelector("#" + focusedId);
+        if (restored && !restored.closest("[hidden]")) {
+          if (document.activeElement !== restored) restored.focus({preventScroll: true});
+          if (selection) restored.setSelectionRange(selection[0], selection[1]);
+        }
+      }
+      this.tag.find(".content-wrapper").scrollTop(scroll || 0);
+      if (firstRender) this.when_loaded.resolve();
       return this.tag.find("#browse-files");
+    };
+
+    Sidebar.prototype.updateContentSelection = function() {
+      var path = this.tag.find("#input-contents").val();
+      this.tag.find(".contents-content").each(function() {
+        var selected = this.getAttribute("data-content-path") === path;
+        this.setAttribute("aria-pressed", String(selected));
+        this.classList.toggle("selected", selected);
+      });
+    };
+
+    Sidebar.prototype.selectPropertiesTab = function(tab, rememberScroll) {
+      if (["overview", "files", "manage"].indexOf(tab) < 0) tab = "overview";
+      var scroll = this.tag.find(".content-wrapper");
+      if (rememberScroll) this.properties_scroll[this.properties_tab] = scroll.scrollTop();
+      this.properties_tab = tab;
+      this.tag.find(".sidebar-tab").each(function() {
+        var selected = this.getAttribute("data-tab") === tab;
+        this.setAttribute("aria-selected", String(selected));
+        this.tabIndex = selected ? 0 : -1;
+      });
+      this.tag.find(".sidebar-panel").each(function() {
+        this.hidden = this.getAttribute("data-panel") !== tab;
+      });
+      if (rememberScroll) scroll.scrollTop(this.properties_scroll[tab] || 0);
+      if (this.scrollable) this.scrollable();
+      if (rememberScroll && window.visible_menu) window.visible_menu.hide();
+    };
+
+    Sidebar.prototype.savePeerMapPreference = function() {
+      if (this.peer_map_saving) return;
+      this.peer_map_saving = true;
+      var sidebar = this, value = this.peer_map_open;
+      this.wrapper.ws.cmd("userSetGlobalSettings", [{sidebar_peer_map_open: value}], function(result) {
+        sidebar.peer_map_saving = false;
+        if (sidebar.peer_map_open !== value) {
+          sidebar.savePeerMapPreference();
+        } else if (result !== "ok") {
+          sidebar.wrapper.notifications.add("peer-map-setting", "error", "Could not save the peer map preference. Try again.", 5000);
+        }
+      });
+    };
+
+    Sidebar.prototype.setPeerMapOpen = function(open, save) {
+      var changed = this.peer_map_open !== open;
+      this.peer_map_open = open;
+      if (this.tag) {
+        this.tag.find("#sidebar-peer-map-toggle").attr("aria-expanded", String(open));
+        this.tag.find(".sidebar-peer-map-state").text(open ? "Hide" : "Show");
+        this.tag.find("#sidebar-peer-map-panel").prop("hidden", !open);
+        if (this.scrollable) this.scrollable();
+      }
+      if (this.globe) {
+        if (open) { this.globe.resize(); this.globe.resume(); if (changed && this.opened) this.displayGlobe(); }
+        else this.globe.pause();
+      } else if (open && this.opened) {
+        this.loadGlobe();
+      }
+      if (save) this.savePeerMapPreference();
+    };
+
+    Sidebar.prototype.applyProperties = function() {
+      var sidebar = this;
+      if (this.peer_map_open === null) this.peer_map_open = this.tag.find(".sidebar-peer-map").attr("data-open") !== "false";
+      this.property_drafts = this.property_drafts || {};
+      Object.keys(this.property_drafts).forEach(function(id) {
+        sidebar.tag.find("#" + id).val(sidebar.property_drafts[id]);
+      });
+      this.selectPropertiesTab(this.properties_tab || "overview", false);
+      this.setPeerMapOpen(this.peer_map_open, false);
+      this.updateContentSelection();
+      this.tag.find("#form-addpeer button[type=submit]").prop("disabled", !!this.addingPeer).text(this.addingPeer ? "Adding…" : "Add peer");
+      this.tag.find("#peer-add-status").text(this.peer_feedback || "");
+      this.tag.off(".properties").on("click.properties", ".sidebar-tab", function() {
+        sidebar.selectPropertiesTab(this.getAttribute("data-tab"), true);
+      }).on("keydown.properties", ".sidebar-tab", function(event) {
+        var tabs = sidebar.tag.find(".sidebar-tab"), index = tabs.index(this), next;
+        if (event.key === "ArrowRight") next = (index + 1) % tabs.length;
+        else if (event.key === "ArrowLeft") next = (index + tabs.length - 1) % tabs.length;
+        else if (event.key === "Home") next = 0;
+        else if (event.key === "End") next = tabs.length - 1;
+        else return;
+        event.preventDefault();
+        sidebar.selectPropertiesTab(tabs[next].getAttribute("data-tab"), true);
+        tabs[next].focus();
+      }).on("click.properties", "#sidebar-peer-map-toggle", function() {
+        sidebar.setPeerMapOpen(!sidebar.peer_map_open, true);
+      }).on("click.properties", "#globe-zoom-in, #globe-zoom-out, #globe-reset", function() {
+        if (!sidebar.globe) return;
+        if (this.id === "globe-reset") sidebar.globe.reset();
+        else sidebar.globe.zoom(this.id === "globe-zoom-in" ? 70 : -70);
+      }).on("input.properties", "#peer-endpoint, #input-xitelimit, #input-contents, #settings-title, #settings-description, #settings-xid-name", function() {
+        sidebar.property_drafts[this.id] = this.value;
+        if (this.id === "peer-endpoint") { sidebar.peer_feedback = ""; sidebar.tag.find("#peer-add-status").text(""); }
+        if (this.id === "input-contents") sidebar.updateContentSelection();
+      });
     };
 
     // Live optional-download panel: keep the collapsible file list's expanded
@@ -1098,18 +1218,29 @@ window.initScrollable = function (chrome) {
       var peer = input.val().trim();
       if (!peer || this.addingPeer) return;
       this.addingPeer = true;
+      this.peer_feedback = "";
+      this.tag.find("#form-addpeer button[type=submit]").prop("disabled", true).text("Adding…");
+      this.tag.find("#peer-add-status").text("");
       var sidebar = this;
       this.wrapper.ws.cmd("peerAdd", {
         peer: peer,
         site_address: this.wrapper.xite_info.address
       }, function(res) {
         sidebar.addingPeer = false;
+        if (sidebar.tag) sidebar.tag.find("#form-addpeer button[type=submit]").prop("disabled", false).text("Add peer");
         if (res === "updated") {
-          input.val("");
+          if (input.val().trim() === peer && (!Object.prototype.hasOwnProperty.call(sidebar.property_drafts, "peer-endpoint") || sidebar.property_drafts["peer-endpoint"].trim() === peer)) {
+            input.val("");
+            delete sidebar.property_drafts["peer-endpoint"];
+          }
+          sidebar.peer_feedback = "Peer added.";
+          if (sidebar.tag) sidebar.tag.find("#peer-add-status").text(sidebar.peer_feedback);
           sidebar.wrapper.notifications.add("peer-add", "done", "Peer added", 5000);
           sidebar.updateHtmlTag();
         } else {
           var detail = res && typeof res.error === "string" ? res.error : "Could not add this peer";
+          sidebar.peer_feedback = detail;
+          if (sidebar.tag) sidebar.tag.find("#peer-add-status").text(detail);
           // Notifications render HTML; the endpoint/error is untrusted text.
           sidebar.wrapper.notifications.add("peer-add", "error", detail.replace(/[&<>"']/g, function(character) {
             return {"&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;"}[character];
@@ -1122,17 +1253,19 @@ window.initScrollable = function (chrome) {
       var menu;
       this.log("Opened");
       this.scrollable();
-      this.tag.find("#checkbox-owned, #checkbox-autodownloadoptional").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#checkbox-owned, #checkbox-autodownloadoptional").off("click touchend").on("click", (function(_this) {
         return function() {
           return setTimeout((function() {
             return _this.scrollable();
           }), 300);
         };
       })(this));
-      this.tag.find("#button-xitelimit").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-xitelimit").off("click touchend").on("click", (function(_this) {
         return function() {
-          _this.wrapper.ws.cmd("siteSetLimit", $("#input-xitelimit").val(), function(res) {
+          var limit = _this.tag.find("#input-xitelimit").val();
+          _this.wrapper.ws.cmd("siteSetLimit", limit, function(res) {
             if (res === "ok") {
+              if (_this.property_drafts["input-xitelimit"] === limit) delete _this.property_drafts["input-xitelimit"];
               _this.wrapper.notifications.add("done-xitelimit", "done", "Xite storage limit modified!", 5000);
             }
             return _this.updateHtmlTag();
@@ -1140,7 +1273,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-autodownload_bigfile_size_limit").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-autodownload_bigfile_size_limit").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.wrapper.ws.cmd("siteSetAutodownloadBigfileLimit", $("#input-autodownload_bigfile_size_limit").val(), function(res) {
             if (res === "ok") {
@@ -1151,7 +1284,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-autodownload_previous").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-autodownload_previous").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.wrapper.ws.cmd("siteUpdate", {
             "address": _this.wrapper.xite_info.address,
@@ -1163,7 +1296,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-dbreload").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-dbreload").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.wrapper.ws.cmd("dbReload", [], function() {
             _this.wrapper.notifications.add("done-dbreload", "done", "Database schema reloaded!", 5000);
@@ -1172,7 +1305,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-dbrebuild").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-dbrebuild").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.wrapper.notifications.add("done-dbrebuild", "info", "Database rebuilding....");
           _this.wrapper.ws.cmd("dbRebuild", [], function() {
@@ -1182,7 +1315,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-update").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-update").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.tag.find("#button-update").addClass("loading");
           _this.wrapper.ws.cmd("siteUpdate", _this.wrapper.xite_info.address, function() {
@@ -1192,21 +1325,21 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-pause").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-pause").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.tag.find("#button-pause").addClass("hidden");
           _this.wrapper.ws.cmd("sitePause", _this.wrapper.xite_info.address);
           return false;
         };
       })(this));
-      this.tag.find("#button-resume").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-resume").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.tag.find("#button-resume").addClass("hidden");
           _this.wrapper.ws.cmd("siteResume", _this.wrapper.xite_info.address);
           return false;
         };
       })(this));
-      this.tag.find("#button-favourite").off("click touched").on("click touched", (function(_this) {
+      this.tag.find("#button-favourite").off("click touched").on("click", (function(_this) {
 	return function() {
 	  _this.tag.find("#button-favourite").addClass("hidden");
 	  _this.tag.find("#button-unfavourite").removeClass("hidden");
@@ -1214,7 +1347,7 @@ window.initScrollable = function (chrome) {
 	  return false;
 	};
       })(this));
-      this.tag.find("#button-unfavourite").off("click touched").on("click touched", (function(_this) {
+      this.tag.find("#button-unfavourite").off("click touched").on("click", (function(_this) {
 	return function() {
 	  _this.tag.find("#button-favourite").removeClass("hidden");
 	  _this.tag.find("#button-unfavourite").addClass("hidden");
@@ -1222,13 +1355,13 @@ window.initScrollable = function (chrome) {
 	  return false;
 	};
       })(this));
-      this.tag.find("#button-delete").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-delete").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.handleXiteDeleteClick();
           return false;
         };
       })(this));
-      this.tag.find("#checkbox-owned").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#checkbox-owned").off("click touchend").on("click", (function(_this) {
         return function() {
           var owned;
           owned = _this.tag.find("#checkbox-owned").is(":checked");
@@ -1246,7 +1379,7 @@ window.initScrollable = function (chrome) {
           });
         };
       })(this));
-      this.tag.find("#checkbox-autodownloadoptional").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#checkbox-autodownloadoptional").off("click touchend").on("click", (function(_this) {
         return function() {
           var checked = _this.tag.find("#checkbox-autodownloadoptional").is(":checked");
           if (checked) {
@@ -1256,12 +1389,12 @@ window.initScrollable = function (chrome) {
           return _this.wrapper.ws.cmd("siteSetAutodownloadoptional", [checked]);
         };
       })(this));
-      this.tag.find("#checkbox-downloadoptional").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#checkbox-downloadoptional").off("click touchend").on("click", (function(_this) {
         return function() {
           return _this.wrapper.ws.cmd("siteSetDownloadoptional", [_this.tag.find("#checkbox-downloadoptional").is(":checked")]);
         };
       })(this));
-      this.tag.find("#button-identity").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-identity").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.tag.find("#button-identity").css("pointer-events", "none").css("opacity", "0.6");
           _this.wrapper.ws.cmd("certXid", {}, function(res) {
@@ -1273,7 +1406,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-cert-disconnect").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-cert-disconnect").off("click touchend").on("click", (function(_this) {
         return function(e) {
           e.preventDefault();
           _this.wrapper.ws.cmd("certSet", [""], function(res) {
@@ -1285,14 +1418,16 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#button-settings").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-settings").off("click touchend").on("click", (function(_this) {
         return function() {
+          var submitted = {};
+          ["settings-title", "settings-description", "settings-xid-name"].forEach(function(id) { submitted[id] = _this.tag.find("#" + id).val(); });
           _this.wrapper.ws.cmd("fileGet", "content.json", function(res) {
             var data, json_raw;
             data = JSON.parse(res);
-            data["title"] = $("#settings-title").val();
-            data["description"] = $("#settings-description").val();
-            var xid_name = $("#settings-xid-name").val().trim();
+            data["title"] = submitted["settings-title"];
+            data["description"] = submitted["settings-description"];
+            var xid_name = submitted["settings-xid-name"].trim();
             if (xid_name) {
               data["domain"] = xid_name;
             } else {
@@ -1303,6 +1438,7 @@ window.initScrollable = function (chrome) {
               if (res !== "ok") {
                 return _this.wrapper.notifications.add("file-write", "error", "File write error: " + res);
               } else {
+                Object.keys(submitted).forEach(function(id) { if (_this.property_drafts[id] === submitted[id]) delete _this.property_drafts[id]; });
                 _this.wrapper.notifications.add("file-write", "done", "Xite settings saved!", 5000);
                 if (_this.wrapper.xite_info.privatekey) {
                   _this.wrapper.ws.cmd("siteSign", {
@@ -1318,7 +1454,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#link-directory").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#link-directory").off("click touchend").on("click", (function(_this) {
         return function() {
           _this.wrapper.ws.cmd("serverShowdirectory", ["xite", _this.wrapper.xite_info.address]);
           return false;
@@ -1331,7 +1467,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find("#link-copypeers").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#link-copypeers").off("click touchend").on("click", (function(_this) {
         return function(e) {
           var copy_text, handler;
           copy_text = e.currentTarget.href;
@@ -1346,7 +1482,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      $(document).on("click touchend", (function(_this) {
+      $(document).off("click.sidebarPublish").on("click.sidebarPublish", (function(_this) {
         return function() {
           var ref, ref1;
           if ((ref = _this.tag) != null) {
@@ -1355,14 +1491,22 @@ window.initScrollable = function (chrome) {
           return (ref1 = _this.tag) != null ? ref1.find(".contents + .flex").removeClass("sign-publish-flex") : void 0;
         };
       })(this));
-      this.tag.find(".contents-content").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find(".contents-content").off("click touchend").on("click", (function(_this) {
         return function(e) {
-          $("#input-contents").val(e.currentTarget.innerText);
+          var path = e.currentTarget.getAttribute("data-content-path") || e.currentTarget.textContent;
+          _this.tag.find("#input-contents").val(path);
+          _this.property_drafts["input-contents"] = path;
+          _this.updateContentSelection();
           return false;
         };
       })(this));
-      menu = new Menu(this.tag.find("#menu-sign-publish"), this.wrapper.chrome);
+      menu = this.sign_publish_menu;
+      if (!menu || menu.button[0] !== this.tag.find("#menu-sign-publish")[0]) {
+        if (menu) { menu.hide(); menu.elem.remove(); }
+        menu = this.sign_publish_menu = new Menu(this.tag.find("#menu-sign-publish"), this.wrapper.chrome);
+      }
       menu.elem.css("margin-top", "-130px");
+      if (!menu.items.length) {
       menu.addItem("Sign", (function(_this) {
         return function() {
           var inner_path;
@@ -1397,7 +1541,8 @@ window.initScrollable = function (chrome) {
           return menu.hide();
         };
       })(this));
-      this.tag.find("#menu-sign-publish").off("click touchend").on("click touchend", (function(_this) {
+      }
+      this.tag.find("#menu-sign-publish").off("click touchend").on("click", (function(_this) {
         return function() {
           if (window.visible_menu === menu) {
             _this.tag.find(".contents + .flex").removeClass("active");
@@ -1410,14 +1555,14 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      $("body").on("click", (function(_this) {
+      $("body").off("click.sidebarPublish").on("click.sidebarPublish", (function(_this) {
         return function() {
           if (_this.tag) {
             return _this.tag.find(".contents + .flex").removeClass("active");
           }
         };
       })(this));
-      this.tag.find("#button-sign-publish").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find("#button-sign-publish").off("click touchend").on("click", (function(_this) {
         return function() {
           var inner_path;
           inner_path = _this.tag.find("#input-contents").val();
@@ -1438,7 +1583,7 @@ window.initScrollable = function (chrome) {
           return false;
         };
       })(this));
-      this.tag.find(".close").off("click touchend").on("click touchend", (function(_this) {
+      this.tag.find(".close").off("click touchend").on("click", (function(_this) {
         return function(e) {
           _this.close();
           return false;
@@ -1454,6 +1599,13 @@ window.initScrollable = function (chrome) {
     };
 
     Sidebar.prototype.onClosed = function() {
+      if (this.sign_publish_menu) {
+        this.sign_publish_menu.hide();
+        this.sign_publish_menu.elem.remove();
+        this.sign_publish_menu = null;
+      }
+      $(document).off(".sidebarPublish");
+      $("body").off(".sidebarPublish");
       $(document.body).css("transition", "0.6s ease-in-out").removeClass("body-sidebar").on(transitionEnd, (function(_this) {
         return function(e) {
           if (e.target === document.body && !$(document.body).hasClass("body-sidebar") && !$(document.body).hasClass("body-console")) {
@@ -1466,15 +1618,23 @@ window.initScrollable = function (chrome) {
     };
 
     Sidebar.prototype.loadGlobe = function() {
-      if (this.tag.find(".globe").hasClass("loading")) {
+      if (!this.tag || !this.peer_map_open || !this.tag.find(".globe").length) return;
+      if (this.globe) { this.globe.resize(); this.globe.resume(); return; }
+      if (!this.globe_script_loading) {
         return setTimeout(((function(_this) {
           return function() {
             var script_tag;
+            if (!_this.tag || !_this.opened || !_this.peer_map_open || _this.globe_script_loading) return;
             if (typeof DAT === "undefined") {
+              _this.globe_script_loading = true;
               script_tag = $("<script>");
               script_tag.attr("nonce", _this.wrapper.script_nonce);
               script_tag.attr("src", "/uimedia/globe/all.js");
-              script_tag.on("load", _this.displayGlobe);
+              script_tag.on("load", function() { _this.globe_script_loading = false; _this.displayGlobe(); });
+              script_tag.on("error", function() {
+                _this.globe_script_loading = false;
+                if (_this.tag) _this.tag.find(".globe").removeClass("loading").addClass("error").text("The peer map could not be loaded.");
+              });
               return document.head.appendChild(script_tag[0]);
             } else {
               return _this.displayGlobe();
@@ -1486,6 +1646,7 @@ window.initScrollable = function (chrome) {
 
     Sidebar.prototype.displayGlobe = function() {
       var _this = this;
+      if (!this.tag || !this.opened || !this.peer_map_open) return;
       // Draw the sphere first, then drop peer points in when they arrive, so the
       // globe appears immediately instead of waiting on the sidebarGetPeers round
       // trip. The texture (world.jpg) is loaded once, by three.js, not twice.
@@ -1498,6 +1659,9 @@ window.initScrollable = function (chrome) {
           try {
             if (_this.globe.points) {
               _this.globe.scene.remove(_this.globe.points);
+              _this.globe.points.geometry.dispose();
+              _this.globe.points.material.dispose();
+              _this.globe._baseGeometry = null;
             }
             _this.globe.addData(globe_data, {
               format: 'magnitude',
@@ -1519,7 +1683,8 @@ window.initScrollable = function (chrome) {
       }
       try {
         this.globe = new DAT.Globe(this.tag.find(".globe")[0], {
-          "imgDir": "/uimedia/globe/"
+          "imgDir": "/uimedia/globe/",
+          "controls": this.tag.find(".sidebar-peer-map")[0]
         });
         this.globe.animate();
       } catch (error) {
