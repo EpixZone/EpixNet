@@ -16,6 +16,29 @@ on:
 permissions: {}
 
 jobs:
+  sqlite-wrapper-regressions:
+    name: SQLite wrapper regressions
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    env:
+      CARGO_BUILD_JOBS: "2"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+      - name: Install session binding prerequisites
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT \
+            python3 scripts/ci_install_apt_deps.py clang libclang-dev
+      # The excluded wrapper has its own test dependencies. Keep its optional
+      # session regression covered without enabling that feature in the node.
+      - name: Test the patched SQLite wrapper and optional session errors
+        run: cargo test --manifest-path vendor/rusqlite/Cargo.toml --lib --features bundled,hooks,time,session
+
   android-wallet-staging:
     name: Android shell regressions
     runs-on: ubuntu-latest

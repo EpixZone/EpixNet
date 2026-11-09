@@ -150,14 +150,18 @@ impl Session<'_> {
         let table = table.as_cstr()?;
         let table = table.as_ptr();
         unsafe {
-            let mut errmsg = ptr::null_mut();
+            let mut errmsg = ptr::null_mut::<c_char>();
             let r =
                 ffi::sqlite3session_diff(self.s, from.as_ptr(), table, &mut errmsg as *mut *mut _);
             if r != ffi::SQLITE_OK {
-                let errmsg: *mut c_char = errmsg;
-                let message = errmsg_to_string(&*errmsg);
-                ffi::sqlite3_free(errmsg as *mut c_void);
-                return Err(error_from_sqlite_code(r, Some(message)));
+                let message = if errmsg.is_null() {
+                    None
+                } else {
+                    let message = errmsg_to_string(errmsg);
+                    ffi::sqlite3_free(errmsg as *mut c_void);
+                    Some(message)
+                };
+                return Err(error_from_sqlite_code(r, message));
             }
         }
         Ok(())
@@ -811,6 +815,47 @@ mod test {
         let mut output = Vec::new();
         session.changeset_strm(&mut output)?;
         Ok(output)
+    }
+
+    #[test]
+    fn test_diff_error_without_message() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE foo(id INTEGER PRIMARY KEY, value TEXT);
+             ATTACH DATABASE ':memory:' AS source;
+             CREATE TABLE source.foo(id INTEGER PRIMARY KEY, value TEXT);",
+        )?;
+        let mut session = Session::new(&db)?;
+        db.authorizer(Some(|_: crate::hooks::AuthContext<'_>| {
+            crate::hooks::Authorization::Deny
+        }));
+
+        let error = session.diff::<&str, _>("source", "foo").unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::SqliteFailure(error, None)
+                if error.extended_code == crate::ffi::SQLITE_AUTH
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn test_diff_error_with_message() -> Result<()> {
+        let db = Connection::open_in_memory()?;
+        db.execute_batch(
+            "CREATE TABLE foo(id INTEGER PRIMARY KEY, value TEXT);
+             ATTACH DATABASE ':memory:' AS source;
+             CREATE TABLE source.foo(id INTEGER PRIMARY KEY, other TEXT);",
+        )?;
+        let mut session = Session::new(&db)?;
+        let error = session.diff::<&str, _>("source", "foo").unwrap_err();
+        assert!(matches!(
+            error,
+            crate::Error::SqliteFailure(error, Some(message))
+                if error.extended_code == crate::ffi::SQLITE_SCHEMA
+                    && message == "table schemas do not match"
+        ));
+        Ok(())
     }
 
     #[test]
