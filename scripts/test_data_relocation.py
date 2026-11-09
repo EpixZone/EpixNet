@@ -42,7 +42,7 @@ def main():
                   f'windows-sys={{version={quoted(version("windows-sys", "0.61."))},features=["Win32_Storage_FileSystem","Win32_Foundation","Win32_Security","Win32_Security_Authorization","Win32_System_Threading", "Win32_System_SystemServices"]}}',
                   "[dev-dependencies]",
                   f'tempfile={quoted(version("tempfile", "3."))}',
-                  f'rusqlite={{version={quoted(version("rusqlite", "0.37."))},features=["bundled"]}}']
+                  f'rusqlite={{version={quoted(version("rusqlite", "0.37."))},path={quoted(root / "vendor/rusqlite")},features=["bundled"]}}']
         (harness / "Cargo.toml").write_text("\n".join(lines) + "\n", encoding="utf-8")
         # Reuse the repository's checksummed transitive resolutions. Cargo adds
         # only this tiny harness package; the repository lock is never changed.
