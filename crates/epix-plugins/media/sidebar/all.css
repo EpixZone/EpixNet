@@ -458,9 +458,9 @@ body.theme-dark .menu-item-separator { border-top-color: #404045; }
     --properties-selected: #F2EDF9;
     --properties-danger: #AC2A40;
     --properties-success: #18776D;
-    --globe-land: #39424C;
-    --globe-water: #EFF2F5;
-    --globe-rim: #C2CBD4;
+    --globe-land: #59636E;
+    --globe-water: #B8C3CE;
+    --globe-rim: #AAB5C0;
     --globe-water-scale: 28;
     background-color: var(--properties-bg);
     border-left-color: var(--properties-border);
