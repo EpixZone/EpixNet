@@ -113,7 +113,11 @@ DAT.Globe = function(container, opts) {
   var Shaders = {
     'earth' : {
       uniforms: {
-        'texture': { type: 't', value: null }
+        'texture': { type: 't', value: null },
+        'waterScale': { type: 'f', value: 28 },
+        'landColor': { type: 'c', value: new THREE.Color(0x59636E) },
+        'waterColor': { type: 'c', value: new THREE.Color(0xB8C3CE) },
+        'rimColor': { type: 'c', value: new THREE.Color(0xAAB5C0) }
       },
       vertexShader: [
         'varying vec3 vNormal;',
@@ -126,18 +130,26 @@ DAT.Globe = function(container, opts) {
       ].join('\n'),
       fragmentShader: [
         'uniform sampler2D texture;',
+        'uniform float waterScale;',
+        'uniform vec3 landColor;',
+        'uniform vec3 waterColor;',
+        'uniform vec3 rimColor;',
         'varying vec3 vNormal;',
         'varying vec2 vUv;',
         'void main() {',
-          'vec3 diffuse = texture2D( texture, vUv ).xyz;',
-          'float intensity = 1.05 - dot( vNormal, vec3( 0.0, 0.0, 1.0 ) );',
-          'vec3 atmosphere = vec3( 1.0, 1.0, 1.0 ) * pow( intensity, 3.0 );',
-          'gl_FragColor = vec4( diffuse + atmosphere, 1.0 );',
+          // Flatten ocean relief in light mode while retaining the darker map texture.
+          'float water = clamp( texture2D( texture, vUv ).r * waterScale, 0.0, 1.0 );',
+          'float facing = max( dot( vNormal, vec3( 0.0, 0.0, 1.0 ) ), 0.0 );',
+          'vec3 surface = mix( landColor, waterColor, water ) * ( 0.82 + 0.18 * facing );',
+          'float rim = pow( 1.0 - facing, 3.0 ) * 0.22;',
+          'gl_FragColor = vec4( mix( surface, rimColor, rim ), 1.0 );',
         '}'
       ].join('\n')
     },
     'atmosphere' : {
-      uniforms: {},
+      uniforms: {
+        'rimColor': { type: 'c', value: new THREE.Color(0xAAB5C0) }
+      },
       vertexShader: [
         'varying vec3 vNormal;',
         'void main() {',
@@ -146,30 +158,33 @@ DAT.Globe = function(container, opts) {
         '}'
       ].join('\n'),
       fragmentShader: [
+        'uniform vec3 rimColor;',
         'varying vec3 vNormal;',
         'void main() {',
-          'float intensity = pow( 0.8 - dot( vNormal, vec3( 0, 0, 1.0 ) ), 12.0 );',
-          'gl_FragColor = vec4( 1.0, 1.0, 1.0, 1.0 ) * intensity;',
+          'float intensity = pow( max( 0.0, 0.8 - dot( vNormal, vec3( 0.0, 0.0, 1.0 ) ) ), 12.0 );',
+          'gl_FragColor = vec4( rimColor, min( intensity * 0.18, 0.24 ) );',
         '}'
       ].join('\n')
     }
   };
 
   var camera, scene, renderer, w, h;
-  var mesh, atmosphere, point, running;
+  var mesh, point;
 
   var overRenderer;
-  var running = true;
+  var running = false, animationFrame = null, resizeObserver = null;
+  var earthUniforms, atmosphereUniforms, themeObserver = null, themeMedia = null;
+  var keyboardScope = opts.controls || container;
 
   var curZoomSpeed = 0;
   var zoomSpeed = 50;
 
   var mouse = { x: 0, y: 0 }, mouseOnDown = { x: 0, y: 0 };
-  var rotation = { x: 0, y: 0 },
+  var rotation = { x: Math.PI*3/2, y: Math.PI / 6.0 },
       target = { x: Math.PI*3/2, y: Math.PI / 6.0 },
       targetOnDown = { x: 0, y: 0 };
 
-  var distance = 100000, distanceTarget = 100000;
+  var distance = 855, distanceTarget = 855;
   var padding = 10;
   var PI_HALF = Math.PI / 2;
 
@@ -178,8 +193,9 @@ DAT.Globe = function(container, opts) {
 
   function init() {
 
-    container.style.color = '#fff';
-    container.style.font = '13px/20px Arial, sans-serif';
+    container.tabIndex = 0;
+    container.setAttribute('role', 'img');
+    container.setAttribute('aria-label', 'Peer map. Drag to rotate; pinch, scroll or use the up and down arrow keys to zoom.');
 
     var shader, uniforms, material;
     w = container.offsetWidth || window.innerWidth;
@@ -193,7 +209,7 @@ DAT.Globe = function(container, opts) {
     var geometry = new THREE.SphereGeometry(200, 40, 30);
 
     shader = Shaders['earth'];
-    uniforms = THREE.UniformsUtils.clone(shader.uniforms);
+    earthUniforms = uniforms = THREE.UniformsUtils.clone(shader.uniforms);
 
     uniforms['texture'].value = THREE.ImageUtils.loadTexture(imgDir+'world.jpg');
 
@@ -210,7 +226,7 @@ DAT.Globe = function(container, opts) {
     scene.add(mesh);
 
     shader = Shaders['atmosphere'];
-    uniforms = THREE.UniformsUtils.clone(shader.uniforms);
+    atmosphereUniforms = uniforms = THREE.UniformsUtils.clone(shader.uniforms);
 
     material = new THREE.ShaderMaterial({
 
@@ -218,7 +234,7 @@ DAT.Globe = function(container, opts) {
           vertexShader: shader.vertexShader,
           fragmentShader: shader.fragmentShader,
           side: THREE.BackSide,
-          blending: THREE.AdditiveBlending,
+          depthWrite: false,
           transparent: true
 
         });
@@ -232,13 +248,20 @@ DAT.Globe = function(container, opts) {
 
     point = new THREE.Mesh(geometry);
 
-    renderer = new THREE.WebGLRenderer({antialias: true});
-    renderer.setSize(w, h);
-    renderer.setClearColor( 0x212121, 1 );
-
-    renderer.domElement.style.position = 'relative';
+    renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
+    renderer.setSize(w, h, false);
+    renderer.setClearColor( 0x000000, 0 );
 
     container.appendChild(renderer.domElement);
+    updateTheme();
+    if (window.MutationObserver) {
+      themeObserver = new MutationObserver(updateTheme);
+      themeObserver.observe(document.body, { attributes: true, attributeFilter: ['class'] });
+    }
+    if (window.matchMedia) {
+      themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
+      themeMedia.addEventListener('change', updateTheme);
+    }
 
     container.addEventListener('mousedown', onMouseDown, false);
     container.addEventListener('touchstart', onTouchStart, { passive: false });
@@ -252,6 +275,10 @@ DAT.Globe = function(container, opts) {
     document.addEventListener('keydown', onDocumentKeyDown, false);
 
     window.addEventListener('resize', onWindowResize, false);
+    if (window.ResizeObserver) {
+      resizeObserver = new ResizeObserver(onWindowResize);
+      resizeObserver.observe(container);
+    }
 
     container.addEventListener('mouseover', function() {
       overRenderer = true;
@@ -260,6 +287,15 @@ DAT.Globe = function(container, opts) {
     container.addEventListener('mouseout', function() {
       overRenderer = false;
     }, false);
+  }
+
+  function updateTheme() {
+    var style = window.getComputedStyle(container);
+    earthUniforms.waterScale.value = Number.parseFloat(style.getPropertyValue('--globe-water-scale')) || 28;
+    earthUniforms.landColor.value.setStyle(style.getPropertyValue('--globe-land').trim() || '#59636E');
+    earthUniforms.waterColor.value.setStyle(style.getPropertyValue('--globe-water').trim() || '#B8C3CE');
+    earthUniforms.rimColor.value.setStyle(style.getPropertyValue('--globe-rim').trim() || '#AAB5C0');
+    atmosphereUniforms.rimColor.value.copy(earthUniforms.rimColor.value);
   }
 
   function addData(data, opts) {
@@ -371,6 +407,7 @@ DAT.Globe = function(container, opts) {
 
   function onMouseDown(event) {
     event.preventDefault();
+    container.focus({preventScroll: true});
 
     container.addEventListener('mousemove', onMouseMove, false);
     container.addEventListener('mouseup', onMouseUp, false);
@@ -478,7 +515,7 @@ DAT.Globe = function(container, opts) {
   }
 
   function onMouseWheel(event) {
-    if (container.style.cursor != "move") return false;
+    if (!running || !container.offsetWidth || !container.offsetHeight) return false;
     event.preventDefault();
     if (overRenderer) {
       if (event.deltaY) {
@@ -491,6 +528,7 @@ DAT.Globe = function(container, opts) {
   }
 
   function onDocumentKeyDown(event) {
+    if (!running || !keyboardScope.contains(document.activeElement)) return;
     switch (event.keyCode) {
       case 38:
         zoom(100);
@@ -504,9 +542,10 @@ DAT.Globe = function(container, opts) {
   }
 
   function onWindowResize( event ) {
+    if (!container.offsetWidth || !container.offsetHeight) return;
     camera.aspect = container.offsetWidth / container.offsetHeight;
     camera.updateProjectionMatrix();
-    renderer.setSize( container.offsetWidth, container.offsetHeight );
+    renderer.setSize( container.offsetWidth, container.offsetHeight, false );
   }
 
   function zoom(delta) {
@@ -516,9 +555,29 @@ DAT.Globe = function(container, opts) {
   }
 
   function animate() {
-    if (!running) return
-    requestAnimationFrame(animate);
+    if (!running) return;
+    animationFrame = requestAnimationFrame(animate);
     render();
+  }
+
+  function resume() {
+    if (running) return;
+    running = true;
+    onWindowResize();
+    animate();
+  }
+
+  function pause() {
+    running = false;
+    if (animationFrame !== null) cancelAnimationFrame(animationFrame);
+    animationFrame = null;
+    onMouseUp();
+  }
+
+  function reset() {
+    target.x = Math.PI * 3 / 2;
+    target.y = Math.PI / 6;
+    distanceTarget = 855;
   }
 
   function render() {
@@ -538,7 +597,10 @@ DAT.Globe = function(container, opts) {
   }
 
   function unload() {
-    running = false
+    pause();
+    if (resizeObserver) resizeObserver.disconnect();
+    if (themeObserver) themeObserver.disconnect();
+    if (themeMedia) themeMedia.removeEventListener('change', updateTheme);
     container.removeEventListener('mousedown', onMouseDown, false);
     container.removeEventListener('touchstart', onTouchStart, { passive: false });
     container.removeEventListener('touchmove', onTouchMove, { passive: false });
@@ -551,11 +613,25 @@ DAT.Globe = function(container, opts) {
     }
     document.removeEventListener('keydown', onDocumentKeyDown, false);
     window.removeEventListener('resize', onWindowResize, false);
+    scene.traverse(function(object) {
+      if (object.geometry) object.geometry.dispose();
+      if (object.material) {
+        object.material.uniforms?.texture?.value?.dispose();
+        object.material.dispose();
+      }
+    });
+    if (renderer.dispose) renderer.dispose();
+    if (renderer.domElement.parentNode === container) renderer.domElement.remove();
 
   }
 
   init();
-  this.animate = animate;
+  this.animate = resume;
+  this.resume = resume;
+  this.pause = pause;
+  this.resize = onWindowResize;
+  this.zoom = zoom;
+  this.reset = reset;
   this.unload = unload;
 
 
@@ -595,6 +671,7 @@ DAT.Globe = function(container, opts) {
   return this;
 
 };
+
 
 /* ---- plugins/Sidebar/media_globe/three.min.js ---- */
 

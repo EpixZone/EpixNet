@@ -4,6 +4,9 @@
 mod xite_export;
 mod xite_removal_progress;
 mod xite_removal_transaction;
+mod sidebar_mutations;
+mod sidebar_details;
+mod sidebar_peers;
 mod merger_index;
 pub(crate) mod addon_install;
 pub(crate) mod avatar_cache;
@@ -4600,6 +4603,8 @@ pub struct AppState {
     /// ([`Self::download_optional_files`]), so overlapping triggers (the
     /// sidebar toggle plus a resync tick) don't walk the same xite twice.
     optional_downloads_in_flight: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Explicit one-shot requests, separate from standing optional consent.
+    optional_one_shots: std::sync::Mutex<std::collections::HashSet<String>>,
     /// Addresses whose optional-file state may have changed (new content
     /// landed, a toggle flipped): the background retry loop clears their
     /// schedule entry on its next tick so they get re-checked immediately
@@ -5861,6 +5866,7 @@ impl AppState {
             clone_retry_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
             download_retry_wake: tokio::sync::Notify::new(),
             optional_downloads_in_flight: std::sync::Mutex::new(std::collections::HashSet::new()),
+            optional_one_shots: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_dirty: std::sync::Mutex::new(std::collections::HashSet::new()),
             optional_prompts: std::sync::Mutex::new(std::collections::HashSet::new()),
             retention_consents: std::sync::Mutex::new(std::collections::HashSet::new()),
@@ -7019,13 +7025,9 @@ impl AppState {
     /// (rather than replacing) keeps node-managed keys like
     /// `next_identity_index` even if the dashboard sends only theme fields.
     pub async fn set_global_settings(&self, value: Value) {
-        if let Value::Object(incoming) = value {
-            let mut user = self.user.write().await;
-            for (k, v) in incoming {
-                user.settings.insert(k, v);
-            }
+        if let Err(error) = self.set_global_settings_checked(value).await {
+            self.log("ERROR", error).await;
         }
-        self.save_user().await;
     }
 
     /// Register a served xite, deriving its settings + stats from content.json.
@@ -7199,7 +7201,8 @@ impl AppState {
                 settings.serving = prev.serving;
                 settings.size_limit = prev.size_limit;
                 settings.download_optional = prev.download_optional;
-                settings.autodownloadoptional = prev.autodownloadoptional;
+                settings.autodownloadoptional = prev.autodownloadoptional && prev.download_optional;
+                settings.autodownload_bigfile_size_limit = prev.autodownload_bigfile_size_limit;
                 settings.optional_help = prev.optional_help;
                 settings.modified_files_notification = prev.modified_files_notification;
                 settings.favorite = prev.favorite;
@@ -8645,7 +8648,8 @@ impl AppState {
         x.settings.own = saved.own;
         x.settings.serving = saved.serving;
         x.settings.size_limit = saved.size_limit;
-        x.settings.autodownloadoptional = saved.autodownloadoptional;
+        x.settings.autodownloadoptional = saved.autodownloadoptional && saved.download_optional;
+        x.settings.autodownload_bigfile_size_limit = saved.autodownload_bigfile_size_limit;
         x.settings.download_optional = saved.download_optional;
         x.settings.optional_help = saved.optional_help;
         x.settings.modified_files_notification = saved.modified_files_notification;
@@ -15064,9 +15068,8 @@ impl AppState {
     /// default, `Some("")` browses anonymously, `Some(addr)` uses that held
     /// identity. Persists and notifies the xite on change.
     pub async fn identity_select(&self, xite: &str, choice: Option<&str>) -> Result<bool, String> {
-        let changed = self.user.write().await.select_identity(xite, choice)?;
+        let changed = self.change_sidebar_user(|user| user.select_identity(xite, choice)).await?;
         if changed {
-            self.save_user().await;
             self.push_identity_changed(IdentityChangeScope::Xite(xite.to_string())).await;
         }
         Ok(changed)
@@ -15074,9 +15077,8 @@ impl AppState {
 
     /// Set (or clear) the node-wide default identity (`identitySetDefault`).
     pub async fn identity_set_default(&self, auth_address: Option<&str>) -> Result<bool, String> {
-        let changed = self.user.write().await.set_default_identity(auth_address)?;
+        let changed = self.change_sidebar_user(|user| user.set_default_identity(auth_address)).await?;
         if changed {
-            self.save_user().await;
             self.push_identity_changed(IdentityChangeScope::Default).await;
         }
         Ok(changed)
@@ -15180,21 +15182,13 @@ impl AppState {
         &self,
         linked_on_chain: &std::collections::HashSet<String>,
     ) -> Result<String, String> {
-        let (addr, minted) = {
-            let mut user = self.user.write().await;
-            match user
-                .unlinked_identity_addresses()
-                .into_iter()
-                .find(|a| !linked_on_chain.contains(a))
-            {
-                Some(a) => (a, false),
-                None => (user.generate_new_identity_address()?.0, true),
+        self.change_sidebar_user(|user| {
+            match user.unlinked_identity_addresses().into_iter()
+                .find(|address| !linked_on_chain.contains(address)) {
+                Some(address) => Ok(address),
+                None => user.generate_new_identity_address().map(|(address, _)| address),
             }
-        };
-        if minted {
-            self.save_user().await;
-        }
-        Ok(addr)
+        }).await
     }
 
     /// Begin linking a new identity (`identityLinkStart`): pick (or mint) a
@@ -15321,8 +15315,7 @@ impl AppState {
         cert_sign: &str,
         select_for: Option<&str>,
     ) -> Result<(bool, bool), String> {
-        let result = {
-            let mut user = self.user.write().await;
+        let result = self.change_sidebar_user(|user| {
             let added = user.add_identity(label, auth_address, cert_sign, None)?;
             let became_default = user.default_identity.as_deref() == Some(auth_address);
             if let Some(xite) = select_for {
@@ -15332,9 +15325,8 @@ impl AppState {
                 let choice = if became_default { None } else { Some(auth_address) };
                 user.select_identity(xite, choice)?;
             }
-            (added, became_default)
-        };
-        self.save_user().await;
+            Ok((added, became_default))
+        }).await?;
         let mut pending = self.pending_link.lock().unwrap();
         if pending.as_ref().is_some_and(|p| p.auth_address == auth_address) {
             *pending = None;
@@ -16367,10 +16359,16 @@ impl AppState {
         background: bool,
         on_fetched: Option<EdxFetchedHook>,
     ) -> Result<bool, String> {
-        let (entry, _, _optional) = self
+        let (entry, _, optional) = self
             .declared_entry(address, inner_path)
             .await
             .ok_or("file not declared in content.json")?;
+        if background && optional {
+            let size = entry.get("size").and_then(Value::as_u64).unwrap_or(0);
+            if self.optional_file_limit_bytes(address).await.is_some_and(|limit| size > limit) {
+                return Err("This optional file exceeds the xite's automatic file download limit".into());
+            }
+        }
         let sha512 = entry.get("sha512").and_then(|v| v.as_str()).unwrap_or("").to_string();
         // A multi-piece big file's declared sha512 is a merkle root over its
         // pieces - a whole-file flat hash never matches it, so skip the on-disk
@@ -17636,31 +17634,6 @@ impl AppState {
         out
     }
 
-    /// `sidebarGetPeers` - peer positions for the sidebar's WebGL globe, as a
-    /// flat `[lat, lon, height, …]` array (the globe's `magnitude` format).
-    /// Height is derived from ping (log-scaled around the average), matching
-    /// EpixNet: connected peers rise with latency, unpinged peers sit slightly
-    /// below the surface.
-    pub async fn peer_globe_data(&self, address: &str) -> Vec<f64> {
-        let locs = self.xite_peer_locations(address).await;
-        let pings: Vec<f64> =
-            locs.iter().filter_map(|l| l["ping"].as_f64()).filter(|p| *p > 0.0).collect();
-        let ping_avg =
-            if pings.is_empty() { 0.0 } else { pings.iter().sum::<f64>() / pings.len() as f64 };
-        let mut out = Vec::new();
-        for l in &locs {
-            let lat = l["lat"].as_f64().unwrap_or(0.0);
-            let lon = l["lon"].as_f64().unwrap_or(0.0);
-            let height = match l["ping"].as_f64() {
-                Some(p) if p == 0.0 => -0.135, // self
-                Some(p) if p > 0.0 && ping_avg > 0.0 => (1.0 + p / ping_avg).log(300.0).min(0.20),
-                _ => -0.03, // known peer, no live ping
-            };
-            out.extend_from_slice(&[lat, lon, height]);
-        }
-        out
-    }
-
     /// Keep the warm connection pool topped up and pinged, and reflect its
     /// membership onto each xite's peer `connected` flags. Called periodically
     /// by the runtime so connection stats stay live.
@@ -18486,8 +18459,19 @@ impl AppState {
     /// `content_updated: false` marker the "Update failed"/"No peers" error
     /// pill reads. A plain eventless push would leave the old pill on screen.
     pub async fn push_update_result(&self, address: &str, outcome: UpdateOutcome) {
+        self.push_update_result_for_request(address, outcome, None).await;
+    }
+
+    /// Echo an optional caller token only on the completion of that manual
+    /// request. Other background update events cannot finish its UI action.
+    pub async fn push_update_result_for_request(
+        &self, address: &str, outcome: UpdateOutcome, update_request_id: Option<&str>,
+    ) {
         let mut info = self.xite_info(address).await;
         if let Value::Object(m) = &mut info {
+            if let Some(request) = update_request_id {
+                m.insert("update_request_id".into(), json!(request));
+            }
             m.insert("event".to_string(), json!(["updated", true]));
             m.insert("update_applied".to_string(), json!(outcome == UpdateOutcome::Applied),
             );
@@ -22075,15 +22059,9 @@ impl AppState {
 
     /// Mark a xite owned/not (`siteSetOwned`). Signing still requires the key.
     pub async fn set_owned(&self, address: &str, owned: bool) {
-        if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.own = owned;
+        if let Err(error) = self.set_owned_checked(address, owned).await {
+            self.log("ERROR", error).await;
         }
-        self.persist_xites().await;
-        // Push the change so the wrapper/sidebar reflect it at once (reveal the
-        // owner panel, re-check the box) instead of the toggle appearing to
-        // revert on the next re-render - and so the wrapper can raise the
-        // "modified files - sign them" panel the moment you claim the xite.
-        self.push_xite_info(address).await;
     }
 
     /// Try to recover a xite's private key from the user's master seed via its
@@ -22105,10 +22083,10 @@ impl AppState {
         };
         match epix_crypt::privatekey_to_address(&privatekey) {
             Ok(derived) if derived == address => {
-                let _ = self.user.write().await.set_xite_privatekey(address, &privatekey);
-                self.save_user().await;
-                self.set_owned(address, true).await;
-                json!("ok")
+                match self.set_xite_privatekey(address, &privatekey).await {
+                    Ok(()) => json!("ok"),
+                    Err(error) => json!({"error": error}),
+                }
             }
             _ => {
                 json!({ "error": "Unable to deliver private key for this xite from current user's master_seed" })
@@ -22134,17 +22112,16 @@ impl AppState {
                 ));
             }
         }
-        self.user.write().await.set_xite_privatekey(address, privatekey)?;
-        // Persist it - `recover_privatekey` saves, this path never did, so a key
-        // added from the sidebar was silently lost on restart.
-        self.save_user().await;
+        self.change_sidebar_user(|user| user.set_xite_privatekey(address, privatekey)).await?;
         if privatekey.is_empty() {
             // Forgetting a key says nothing about ownership (a xite whose key
             // is recoverable from the master seed is still owned), so only
             // re-render rather than going through set_owned.
             self.push_xite_info(address).await;
         } else {
-            self.set_owned(address, true).await;
+            self.set_owned_checked(address, true).await.map_err(|error| {
+                format!("Private key saved, but ownership could not be saved: {error}")
+            })?;
         }
         Ok(())
     }
@@ -30578,18 +30555,8 @@ impl AppState {
 
     /// Override the per-xite size limit (MB).
     pub async fn set_size_limit(&self, address: &str, size_limit_mb: i64) {
-        let changed = {
-            let mut xites = self.xites.write().await;
-            match xites.get_mut(address) {
-                Some(x) => {
-                    x.settings.size_limit = Some(size_limit_mb);
-                    true
-                }
-                None => false,
-            }
-        };
-        if changed {
-            self.persist_xites().await;
+        if let Err(error) = self.set_size_limit_checked(address, size_limit_mb).await {
+            self.log("ERROR", error).await;
         }
     }
 
@@ -30609,16 +30576,7 @@ impl AppState {
     /// Pause/resume a xite (`sitePause`/`siteResume`). A paused xite is skipped
     /// by the re-sync loop. Returns false if the xite isn't served here.
     pub async fn set_serving(&self, address: &str, serving: bool) -> bool {
-        let ok = if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.serving = serving;
-            true
-        } else {
-            false
-        };
-        if ok {
-            self.push_xite_info(address).await;
-        }
-        ok
+        self.set_serving_checked(address, serving).await.is_ok()
     }
 
     /// Whether a xite is currently serving (not paused).
@@ -30628,16 +30586,7 @@ impl AppState {
 
     /// Toggle a xite's favourite flag (`siteFavourite`/`siteUnfavourite`).
     pub async fn set_favorite(&self, address: &str, favorite: bool) -> bool {
-        let ok = if let Some(x) = self.xites.write().await.get_mut(address) {
-            x.settings.favorite = favorite;
-            true
-        } else {
-            false
-        };
-        if ok {
-            self.push_xite_info(address).await;
-        }
-        ok
+        self.set_favorite_checked(address, favorite).await.is_ok()
     }
 
     /// Mark a directory of optional files for distribution help
@@ -30735,34 +30684,12 @@ impl AppState {
     /// the kick-off it only took effect for files published later, which read
     /// as "stuck" (the flag wasn't even persisted, so a restart lost it too).
     pub async fn set_autodownloadoptional(self: &Arc<Self>, address: &str, on: bool) -> bool {
-        let found = match self.xites.write().await.get_mut(address) {
-            Some(x) => {
-                x.settings.autodownloadoptional = on;
-                true
-            }
-            None => false,
-        };
-        if found {
-            self.persist_xites().await;
-            // The promise just changed, and with it how many files this node
-            // owes - which is what the dashboard row counts down. Recount here
-            // so the row reacts to the toggle instead of to the retry tick.
-            self.refresh_optional_owed(address).await;
-            if on {
-                self.spawn_optional_download(address, None);
-            } else {
-                // The bulk mandate is BOTH toggles, so switching this one off
-                // withdraws it: the in-flight pass (if any) aborts at its next
-                // check; drop the lingering waiting panel now.
-                self.set_optional_progress(address, None).await;
-                self.push_xite_info(address).await;
-            }
-        }
-        found
+        self.set_autodownloadoptional_checked(address, on).await.is_ok()
     }
 
-    /// Whether optional files may be fetched for this xite: either toggle -
-    /// "Download optional files" or "Help distribute all files" - grants it.
+    /// Whether optional files may be fetched on demand for this xite.
+    /// Enabling predownload also enables this stored permission; disabling
+    /// on-demand downloads clears both flags.
     ///
     /// This is the ON-DEMAND permission: it answers "may I fetch the optional
     /// file this page just asked for". It is NOT consent to fetch a whole
@@ -30772,7 +30699,7 @@ impl AppState {
             .read()
             .await
             .get(address)
-            .map(|x| x.settings.download_optional || x.settings.autodownloadoptional)
+            .map(|x| x.settings.download_optional)
             .unwrap_or(false)
     }
 
@@ -30793,7 +30720,7 @@ impl AppState {
     /// Consent for a whole-xite download has to be the broad toggle or a
     /// deliberate yes:
     /// - "Pre-download everything" (`autodownloadoptional`) is exactly that
-    ///   promise, so it stands on its own; or
+    ///   promise, paired with on-demand downloads still being enabled; or
     /// - the user accepted this xite's completion prompt, which records
     ///   [`Self::retention_consents`] - and that consent is paired with
     ///   "Download files I open" still being on, so unticking EITHER box
@@ -30812,7 +30739,7 @@ impl AppState {
         else {
             return false;
         };
-        auto || (on_demand && self.retention_consents.lock().unwrap().contains(address))
+        on_demand && (auto || self.retention_consents.lock().unwrap().contains(address))
     }
 
     /// Whether the xite's own content.json sets `autodownloadoptional_default:
@@ -30851,52 +30778,14 @@ impl AppState {
         !auto && self.author_opts_out_of_prefetch(address).await
     }
 
-    /// Set a xite's optional-downloads flag (`siteSetDownloadoptional`, the
-    /// sidebar's "Download optional files" toggle - also granted by the wrapper
-    /// prompt). When `trigger_download` is set (the explicit toggle), enabling
-    /// it kicks off a one-time bulk fetch of the currently-missing optional
-    /// files, with the sidebar's live progress panel. Unlike
-    /// [`Self::set_autodownloadoptional`] it does NOT keep pulling optional
-    /// files that later versions declare, nor commit to seeding - that's what
-    /// "Help distribute all files" adds. The prompt path passes
-    /// `trigger_download = false`: it fetches only the one file that raised the
-    /// prompt, not everything.
+    /// Set the on-demand optional-file permission. Enabling this permission
+    /// does not fetch unopened files; `trigger_download` only resumes an
+    /// already-enabled predownload promise. The separate one-shot command
+    /// downloads the currently missing optional files without a standing grant.
     pub async fn set_download_optional(
-        self: &Arc<Self>,
-        address: &str,
-        on: bool,
-        trigger_download: bool,
+        self: &Arc<Self>, address: &str, on: bool, trigger_download: bool,
     ) -> bool {
-        let found = match self.xites.write().await.get_mut(address) {
-            Some(x) => {
-                x.settings.download_optional = on;
-                true
-            }
-            None => false,
-        };
-        if found {
-            self.persist_xites().await;
-            if on {
-                if trigger_download {
-                    self.spawn_optional_download(address, None);
-                }
-            } else {
-                // Re-arm the one-per-session prompt: switching the toggle off
-                // means a later page request should get to ask again.
-                self.optional_prompts.lock().unwrap().remove(address);
-                // Switching off REVOKES a completion consent rather than
-                // parking it: without this, turning the toggle back on later
-                // would silently revive a multi-gigabyte yes from earlier in
-                // the session instead of asking again.
-                self.retention_consents.lock().unwrap().remove(address);
-                // The bulk mandate is BOTH toggles, so this withdraws it: any
-                // in-flight pass aborts at its next between-files check; drop
-                // the lingering waiting panel now.
-                self.set_optional_progress(address, None).await;
-                self.push_xite_info(address).await;
-            }
-        }
-        found
+        self.set_download_optional_checked(address, on, trigger_download).await.is_ok()
     }
 
     /// A page asked for an optional file while downloads are off: ask the user
@@ -31051,7 +30940,7 @@ impl AppState {
     }
 
     /// The xites the background optional-retry loop watches, with the scope
-    /// of each one's promise: `None` = whole-xite (either sidebar toggle on),
+    /// of each one's promise: `None` = whole-xite (both sidebar toggles on),
     /// `Some(dirs)` = only the `optionalHelp` directories. Paused xites are
     /// left alone.
     async fn optional_retry_flagged(&self) -> Vec<(String, Option<Vec<String>>)> {
@@ -31678,8 +31567,8 @@ impl AppState {
 
     /// Whether a running bulk optional pass still has the user's mandate:
     /// the xite exists, is being served (not paused), and the grant that
-    /// started the pass still holds (either toggle for a whole-xite pass; the
-    /// helped directory for an `optionalHelp` pass). Checked between files
+    /// started the pass still holds (both toggles or an explicit one-shot
+    /// request for a whole-xite pass; the helped `optionalHelp` directory). Checked between files
     /// and rounds so toggling off / pausing / deleting a xite ACTUALLY stops
     /// an in-flight multi-GB download instead of letting it run to the end.
     async fn optional_pass_should_continue(&self, address: &str, directory: Option<&str>) -> bool {
@@ -31696,7 +31585,8 @@ impl AppState {
             // was still set - the user turned the thing off and it kept going,
             // with no obvious way to stop it. Either switch is now an off
             // switch, checked between files so it takes effect immediately.
-            None => x.settings.download_optional && x.settings.autodownloadoptional,
+            None => (x.settings.download_optional && x.settings.autodownloadoptional)
+                || self.optional_one_shots.lock().unwrap().contains(address),
         }
     }
 
@@ -32017,8 +31907,7 @@ impl AppState {
             self.log(
                 "INFO",
                 format!(
-                    "No peers found for {address} after announcing; \
-                     pass over, background retry continues"
+                    "No peers found for {address} after announcing; this download pass has ended"
                 ),
             )
             .await;
@@ -32052,7 +31941,7 @@ impl AppState {
                 ),
             )
             .await;
-        } else if failed > 0 {
+        } else if failed > 0 && !self.optional_one_shots.lock().unwrap().contains(address) {
             self.set_optional_phase(address, "Waiting for peers - retrying in background…")
                 .await;
         } else {
@@ -32081,32 +31970,42 @@ impl AppState {
         address: &str,
         directory: Option<&str>,
     ) -> (usize, usize) {
-        if self.transport.read().await.is_none() {
-            return (0, 0); // offline state (CLI actions): nothing to dial
+        let (fetched, failed, _) = self.download_optional_files_inner(address, directory, false).await;
+        (fetched, failed)
+    }
+
+    async fn download_optional_files_inner(
+        self: &Arc<Self>, address: &str, directory: Option<&str>, reserved: bool,
+    ) -> (usize, usize, bool) {
+        if !reserved && self.transport.read().await.is_none() {
+            return (0, 0, false); // offline state (CLI actions): nothing to dial
         }
         // One bulk pass per xite at a time: a resync tick landing mid-download
         // must not start a second walk. (file_need would dedupe the fetches;
         // the walk itself is what this skips.)
-        if !self.optional_downloads_in_flight.lock().unwrap().insert(address.to_string()) {
-            return (0, 0);
+        if !reserved && !self.optional_downloads_in_flight.lock().unwrap().insert(address.to_string()) {
+            return (0, 0, false);
         }
         struct Cleanup<'a> {
             set: &'a std::sync::Mutex<std::collections::HashSet<String>>,
+            one_shots: &'a std::sync::Mutex<std::collections::HashSet<String>>,
             key: String,
         }
         impl Drop for Cleanup<'_> {
             fn drop(&mut self) {
                 self.set.lock().unwrap().remove(&self.key);
+                self.one_shots.lock().unwrap().remove(&self.key);
             }
         }
         let _cleanup = Cleanup {
             set: &self.optional_downloads_in_flight,
+            one_shots: &self.optional_one_shots,
             key: address.to_string(),
         };
 
         let todo = self.missing_optional_files(address, directory).await;
         if todo.is_empty() {
-            return (0, 0);
+            return (0, 0, false);
         }
         let total = todo.len();
         self.log("INFO", format!("Downloading {total} optional file(s) for {address}"),
@@ -32173,8 +32072,9 @@ impl AppState {
         // dashboard row counts down during the pass; if they hit zero while the
         // owed count is still stale, the row sees "nothing left" for an instant
         // and flashes "Updated!" for a pass that fetched nothing.
-        let remaining = self.missing_optional_files(address, directory).await.len();
-        self.set_optional_owed(address, remaining).await;
+        // A one-shot pass creates no retry promise. Recount the commitments
+        // that still exist, so its failures do not leave a false pending count.
+        self.refresh_optional_owed(address).await;
         self.set_worker_stats(address, 0, 0, 0).await;
         self.finish_optional_pass(address, cancelled, fetched, failed).await;
         self.log(
@@ -32182,7 +32082,7 @@ impl AppState {
             format!("Optional download for {address}: {fetched} fetched, {failed} failed"),
         )
         .await;
-        (fetched, failed)
+        (fetched, failed, cancelled)
     }
 
     /// EDX-first bulk pass: dial the seed peers ONCE and pull every optional
@@ -32221,8 +32121,12 @@ impl AppState {
             if !self.optional_pass_should_continue(address, directory).await {
                 return;
             }
+            let file_limit = self.optional_file_limit_bytes(address).await;
             let want: Vec<EdxWant> = chunk
                 .iter()
+                .filter(|path| file_limit.is_none_or(|limit| {
+                    todo.iter().find(|(p, _)| p == *path).is_some_and(|(_, size)| *size <= limit)
+                }))
                 .map(|p| EdxWant {
                     inner_path: p.clone(),
                     id: None,
@@ -32230,6 +32134,7 @@ impl AppState {
                     authority: None,
                 })
                 .collect();
+            if want.is_empty() { continue; }
             let Some(batch) =
                 self.edx_fetch_files(address, want, peers.clone(), None, None).await
             else {
@@ -32314,8 +32219,10 @@ impl AppState {
         else {
             return Vec::new();
         };
+        let file_limit = self.optional_file_limit_bytes(address).await;
         declared_optional_files(&storage, content.as_ref())
             .into_iter()
+            .filter(|f| file_limit.is_none_or(|limit| f.size.max(0) as u64 <= limit))
             .filter(|f| {
                 directory.map(|p| f.inner_path.starts_with(p)).unwrap_or(true)
             })
@@ -32406,11 +32313,14 @@ impl AppState {
                 missing.push((f.inner_path, size));
             }
         }
+        let file_limit = self.optional_file_limit_bytes(address).await;
         for f in declared_files_under(&storage, Some(&content), "files_optional") {
             let size = f.size.max(0) as u64;
             if optional_file_present(&storage, &stats, &f.inner_path, f.size, f.bigfile) {
+                // Already-held files still consume the storage budget, even
+                // when a newly lowered automatic limit would not fetch them.
                 present = present.saturating_add(size);
-            } else {
+            } else if file_limit.is_none_or(|limit| size <= limit) {
                 missing.push((f.inner_path, size));
             }
         }
@@ -32833,6 +32743,10 @@ impl AppState {
                 .as_ref()
                 .map(|snapshot| snapshot.values.as_slice()),
         );
+        if built.is_none() && accepted_db_paths.iter().any(|path| path == "dbschema.json") {
+            self.log("ERROR", format!("Database build failed for {address}; existing database kept")).await;
+            return false;
+        }
         let is_merger = built
             .as_ref()
             .is_some_and(|(_, schema)| schema.version == 3);
@@ -33767,7 +33681,9 @@ impl AppState {
 
     /// Persist the user identity if this node has a data dir.
     pub async fn save_user(&self) {
-        let _ = self.save_user_strict().await;
+        if let Err(error) = self.save_user_strict().await {
+            self.log("ERROR", format!("Could not save user: {error}")).await;
+        }
     }
 
     async fn save_user_strict(&self) -> Result<(), String> {
@@ -33777,7 +33693,7 @@ impl AppState {
         // Multiuser: keep the active identity's full state mirrored in the store,
         // so its certs/follows are not lost when the operator switches identity.
         #[cfg(feature = "multiuser")]
-        self.multiuser_sync_active().await;
+        self.multiuser_sync_active_checked().await?;
         Ok(())
     }
 

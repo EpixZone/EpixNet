@@ -1,0 +1,13 @@
+{
+  "name": "epix-ui-coverage-tools",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Pinned browser coverage tooling for the production sidebar globe",
+  "devDependencies": {
+    "istanbul-lib-coverage": "3.2.2",
+    "istanbul-lib-report": "3.0.1",
+    "istanbul-reports": "3.2.0",
+    "playwright": "1.63.0",
+    "v8-to-istanbul": "9.3.0"
+  }
+}

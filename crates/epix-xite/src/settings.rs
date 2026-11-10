@@ -85,11 +85,16 @@ pub struct XiteSettings {
     /// (`siteSetSettingsValue`, the one key EpixNet lets a page toggle).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub modified_files_notification: Option<bool>,
-    /// Per-xite size limit override (bytes); falls back to the global default.
+    /// Per-xite size limit override (MB); falls back to the global default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub size_limit: Option<i64>,
     #[serde(default)]
     pub autodownloadoptional: bool,
+    /// Maximum size of one optional file fetched automatically, in MB.
+    /// Missing or zero keeps the historical unlimited behavior. Opening a
+    /// larger file explicitly is still allowed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autodownload_bigfile_size_limit: Option<i64>,
     /// Optional files may be fetched on demand for this xite (the sidebar's
     /// "Download optional files" toggle, also granted through the wrapper
     /// prompt the first time a page asks for one). `autodownloadoptional`
@@ -134,6 +139,7 @@ impl XiteSettings {
             modified_files_notification: None,
             size_limit: None,
             autodownloadoptional: false,
+            autodownload_bigfile_size_limit: None,
             download_optional: false,
             optional_help: Map::new(),
             favorite: false,

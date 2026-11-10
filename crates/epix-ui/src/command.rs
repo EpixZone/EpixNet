@@ -108,6 +108,7 @@ const ADMIN_COMMANDS: &[&str] = &[
     "siteReload",
     "siteResume",
     "siteSetAutodownloadBigfileLimit",
+    "siteDownloadOptionalPrevious",
     "siteSetAutodownloadoptional",
     "siteSetDownloadoptional",
     "siteSetLimit",
@@ -709,7 +710,8 @@ fn default_commands() -> Vec<Arc<dyn WsCommand>> {
         Arc::new(OptionalHelpList { cmd: "OptionalHelpList" }),
         Arc::new(OptionalHelpAll { cmd: "optionalHelpAll" }),
         Arc::new(OptionalHelpAll { cmd: "OptionalHelpAll" }),
-        Arc::new(DbRebuild { cmd: "dbReload" }),
+        Arc::new(DbReload),
+        Arc::new(XiteDownloadOptionalPrevious),
         Arc::new(DbRebuild { cmd: "dbRebuild" }),
         Arc::new(XiteFavourite { cmd: "siteFavourite", favorite: true }),
         Arc::new(XiteFavourite { cmd: "siteUnfavourite", favorite: false }),
@@ -857,9 +859,7 @@ impl WsCommand for UserSetGlobalSettings {
             .and_then(|a| a.first())
             .cloned()
             .unwrap_or_else(|| p.clone());
-        if settings.is_object() {
-            s.state.set_global_settings(settings).await;
-        }
+        s.state.set_global_settings_checked(settings).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -2138,7 +2138,7 @@ impl WsCommand for XiteSetOwned {
             .as_bool()
             .or_else(|| p.as_array().and_then(|a| a.first()).and_then(|v| v.as_bool()))
             .unwrap_or(true);
-        s.state.set_owned(&address, owned).await;
+        s.state.set_owned_checked(&address, owned).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -2265,6 +2265,13 @@ impl WsCommand for XiteUpdate {
             Some(a) => require_address(a)?,
             None => s.address()?.to_string(),
         };
+        if !s.state.has_xite(&address).await {
+            return Err(format!("Unknown xite: {address}"));
+        }
+        let update_request_id = p.get("update_request_id").map(|value| {
+            value.as_str().filter(|id| !id.is_empty() && id.len() <= 128)
+                .map(str::to_string).ok_or("update_request_id must be a nonempty string of at most 128 bytes")
+        }).transpose()?;
         // Run in the background (like EpixNet's updateThread) so this returns
         // immediately. Progress shows inline on the dashboard's xite row via
         // setSiteInfo events (`updating` -> spinner, `updated` -> done), not a
@@ -2325,9 +2332,10 @@ impl WsCommand for XiteUpdate {
             // A panicked task lost its outcome; report the failure rather than
             // leaving the pill up forever.
             state
-                .push_update_result(
+                .push_update_result_for_request(
                     &address,
                     joined.unwrap_or(crate::state::UpdateOutcome::Failed),
+                    update_request_id.as_deref(),
                 )
                 .await;
         });
@@ -3907,11 +3915,8 @@ impl WsCommand for XiteServing {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = target_address(s, p)?;
-        if s.state.set_serving(&address, self.serving).await {
-            Ok(Value::from("ok"))
-        } else {
-            Err(format!("Unknown xite: {address}"))
-        }
+        s.state.set_serving_checked(&address, self.serving).await?;
+        Ok(Value::from("ok"))
     }
 }
 
@@ -4049,7 +4054,7 @@ impl WsCommand for OptionalHelpAll {
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        s.state.set_autodownloadoptional(&address, value).await;
+        s.state.set_autodownloadoptional_checked(&address, value).await?;
         Ok(Value::from(value))
     }
 }
@@ -4067,9 +4072,9 @@ impl WsCommand for XiteSetDownloadoptional {
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        // Explicit toggle: enabling it downloads the currently-missing optional
-        // files now (with the sidebar progress panel).
-        s.state.set_download_optional(&address, on, true).await;
+        // This grants on-demand fetching. Bulk downloading still requires
+        // the separate predownload toggle or explicit one-shot action.
+        s.state.set_download_optional_checked(&address, on, true).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -4091,12 +4096,12 @@ impl WsCommand for XiteSetAutodownloadoptional {
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
-        s.state.set_autodownloadoptional(&address, on).await;
+        s.state.set_autodownloadoptional_checked(&address, on).await?;
         Ok(Value::from("ok"))
     }
 }
 
-/// `dbReload`/`dbRebuild` - rebuild the xite's database from its files.
+/// `dbRebuild` - verify and rebuild the xite's database from its files.
 ///
 /// Forced: the operator asked for a rebuild because the database looks
 /// wrong, and the usual cause is an installed verified index that withheld
@@ -4113,11 +4118,29 @@ impl WsCommand for DbRebuild {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = target_address(s, p)?;
-        if s.state.rebuild_xite_db_reverify(&address).await {
-            Ok(Value::from("ok"))
-        } else {
-            Err(format!("Unknown xite: {address}"))
-        }
+        s.state.rebuild_xite_db_checked(&address).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+struct DbReload;
+#[async_trait]
+impl WsCommand for DbReload {
+    fn name(&self) -> &'static str { "dbReload" }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = target_address(s, p)?;
+        s.state.reload_xite_db_schema(&address).await?;
+        Ok(Value::from("ok"))
+    }
+}
+
+struct XiteDownloadOptionalPrevious;
+#[async_trait]
+impl WsCommand for XiteDownloadOptionalPrevious {
+    fn name(&self) -> &'static str { "siteDownloadOptionalPrevious" }
+    async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
+        let address = target_address(s, p)?;
+        s.state.download_previous_optional(&address).await
     }
 }
 
@@ -4133,11 +4156,8 @@ impl WsCommand for XiteFavourite {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = target_address(s, p)?;
-        if s.state.set_favorite(&address, self.favorite).await {
-            Ok(Value::from("ok"))
-        } else {
-            Err(format!("Unknown xite: {address}"))
-        }
+        s.state.set_favorite_checked(&address, self.favorite).await?;
+        Ok(Value::from("ok"))
     }
 }
 
@@ -4189,20 +4209,54 @@ impl WsCommand for ServerShowdirectory {
             };
             s.state.xite_root(&address).await.ok_or_else(|| format!("Unknown xite: {address}"))?
         };
-        open_path(&path);
+        open_path(&path).await?;
         Ok(Value::from("ok"))
     }
 }
 
-/// Open a filesystem path in the OS file manager (best effort).
-fn open_path(path: &std::path::Path) {
+/// Request an OS file manager and report known launch/exit failures.
+async fn open_path(path: &std::path::Path) -> Result<(), String> {
+    if !tokio::fs::metadata(path).await.is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(format!("Directory does not exist: {}", path.display()));
+    }
     #[cfg(target_os = "macos")]
     let program = "open";
     #[cfg(target_os = "windows")]
     let program = "explorer";
     #[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
     let program = "xdg-open";
-    let _ = std::process::Command::new(program).arg(path).spawn();
+    launch_directory_opener(program, path).await
+}
+
+async fn launch_directory_opener(program: &str, path: &std::path::Path) -> Result<(), String> {
+    let program = program.to_string();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || launch_directory_opener_blocking(&program, &path))
+        .await
+        .map_err(|error| format!("Could not observe the file manager launch: {error}"))?
+}
+
+fn launch_directory_opener_blocking(program: &str, path: &std::path::Path) -> Result<(), String> {
+    let mut child = std::process::Command::new(program).arg(path)
+        .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
+        .spawn().map_err(|error| format!("Could not launch the file manager: {error}"))?;
+    // Some managers stay attached to their window. Observe immediate launch
+    // errors, but do not wait for the user to close a successfully opened app.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(status) = child.try_wait().map_err(|error| format!("Could not check file manager launch: {error}"))? {
+            if status.success() { return Ok(()); }
+            let output = child.wait_with_output().map_err(|error| error.to_string())?;
+            let detail = String::from_utf8_lossy(&output.stderr);
+            return Err(format!("The file manager could not open the directory ({}): {}", status, detail.trim().chars().take(500).collect::<String>()));
+        }
+        if std::time::Instant::now() >= deadline {
+            // Reap it when it eventually exits, without blocking this command.
+            std::thread::spawn(move || { let _ = child.wait_with_output(); });
+            return Ok(());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
 }
 
 /// `xidClearCache` - clear every xID resolution cache (the on-disk resolve
@@ -4229,7 +4283,7 @@ impl WsCommand for SiteblockIgnoreAddXite {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = arg_str(p, "site_address", 0).ok_or("site_address required")?;
-        s.state.siteblock_remove(address).await;
+        s.state.siteblock_remove_checked(address).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -4516,7 +4570,7 @@ impl WsCommand for BigfileUploadInit {
 }
 
 /// `siteSetAutodownloadBigfileLimit {limit}` - the max big-file size (MB) to
-/// auto-download; persisted in config. Admin.
+/// auto-download; persisted with this xite's settings. Zero is unlimited. Admin.
 struct XiteSetAutodownloadBigfileLimit;
 #[async_trait]
 impl WsCommand for XiteSetAutodownloadBigfileLimit {
@@ -4524,12 +4578,12 @@ impl WsCommand for XiteSetAutodownloadBigfileLimit {
         "siteSetAutodownloadBigfileLimit"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let limit = p
-            .get("limit")
-            .or_else(|| p.as_array().and_then(|a| a.first()))
-            .and_then(|v| v.as_i64())
-            .ok_or("limit required")?;
-        s.state.config_set("autodownload_bigfile_size_limit", json!(limit)).await;
+        let raw = p.get("limit")
+            .or_else(|| p.as_array().and_then(|a| a.first())).unwrap_or(p);
+        let limit = raw.as_i64().or_else(|| raw.as_str().and_then(|s| s.trim().parse().ok()))
+            .ok_or("Automatic file limit must be a whole number of MB")?;
+        let address = s.address()?.to_string();
+        s.state.set_optional_file_limit(&address, limit).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -4673,7 +4727,7 @@ impl WsCommand for SiteblockAdd {
         let xite = arg_str(p, "site_address", 0).ok_or("siteblockAdd: site_address required")?;
         let xite = require_address(xite)?;
         let reason = arg_str(p, "reason", 1).unwrap_or("");
-        s.state.siteblock_add(&xite, reason).await;
+        s.state.siteblock_add_checked(&xite, reason).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -4687,7 +4741,7 @@ impl WsCommand for SiteblockRemove {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let xite = arg_str(p, "site_address", 0).ok_or("siteblockRemove: site_address required")?;
         let xite = require_address(xite)?;
-        s.state.siteblock_remove(&xite).await;
+        s.state.siteblock_remove_checked(&xite).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -6258,3 +6312,7 @@ mod tests {
         assert_eq!(rows[0]["feed_name"], "posts");
     }
 }
+
+#[cfg(test)]
+#[path = "command/tests/sidebar_maintenance.rs"]
+mod sidebar_maintenance_tests;
