@@ -102,7 +102,11 @@ impl AppState {
             user.settings.extend(incoming);
             Ok(())
         })
-        .await
+        .await?;
+        // Broadcast the confirmed settings after persistence and user-lock
+        // release so every subscribed wrapper can update its theme live.
+        self.push_server_info().await;
+        Ok(())
     }
 
     pub async fn set_owned_checked(&self, address: &str, owned: bool) -> Result<(), String> {

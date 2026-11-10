@@ -44,6 +44,59 @@ async fn dispatch(state: &Arc<AppState>, command: &str, params: Value) -> Result
 }
 
 #[tokio::test]
+async fn sidebar_theme_change_broadcasts_durable_merged_settings() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fixture(dir.path()).await;
+    state
+        .set_global_settings_checked(json!({
+            "theme": "light", "use_system_theme": false, "sidebar_peer_map_open": false
+        }))
+        .await
+        .unwrap();
+    let mut events = state.subscribe_events();
+
+    assert_eq!(
+        dispatch(&state, "userSetGlobalSettings", json!([{"theme": "dark"}]))
+            .await
+            .unwrap(),
+        "ok"
+    );
+    let event = events.try_recv().expect("confirmed settings are broadcast before acknowledgement");
+    assert_eq!(event.channel.as_deref(), Some("serverChanged"));
+    assert_eq!(event.target, None);
+    assert_eq!(event.only, None);
+    let payload: Value = serde_json::from_str(&event.payload).unwrap();
+    assert_eq!(payload["cmd"], "setServerInfo");
+    let expected = json!({
+        "theme": "dark", "use_system_theme": false, "sidebar_peer_map_open": false
+    });
+    assert_eq!(payload["params"]["user_settings"], expected);
+    let restored = AppState::with_data_dir("sidebar-theme-restart-test", dir.path());
+    assert_eq!(restored.global_settings().await, expected);
+}
+
+#[tokio::test]
+async fn sidebar_theme_write_failure_does_not_broadcast_a_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let state = fixture(dir.path()).await;
+    let before = json!({"theme": "light", "use_system_theme": false});
+    state.set_global_settings_checked(before.clone()).await.unwrap();
+    let users = dir.path().join("private/users.json");
+    std::fs::remove_file(&users).unwrap();
+    std::fs::create_dir(&users).unwrap();
+    let mut events = state.subscribe_events();
+
+    assert!(dispatch(&state, "userSetGlobalSettings", json!({"theme": "dark"}))
+        .await
+        .is_err());
+    assert_eq!(state.global_settings().await, before);
+    assert!(matches!(
+        events.try_recv(),
+        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+    ));
+}
+
+#[tokio::test]
 async fn sidebar_update_token_only_marks_its_own_final_event() {
     let dir = tempfile::tempdir().unwrap();
     let state = fixture(dir.path()).await;

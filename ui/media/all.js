@@ -1724,6 +1724,9 @@ if (window.getComputedStyle(document.body).transform) {
           this.setXiteInfo(message.params);
         }
         return this.updateProgress(message.params);
+      } else if (cmd === "setServerInfo") {
+        this.setServerInfo(message.params);
+        return this.sendInner(message);
       } else if (cmd === "setAnnouncerInfo") {
         this.sendInner(message);
         if (message.params.address === (this.address || window.address)) {
@@ -3022,12 +3025,12 @@ if (window.getComputedStyle(document.body).transform) {
         });
       }
       this.announceWebsocket();
+      this.ws.cmd("serverInfo", [], (function (_this) {
+        return function (server_info) {
+          return _this.setServerInfo(server_info);
+        };
+      })(this));
       if (window.show_loadingscreen) {
-        this.ws.cmd("serverInfo", [], (function (_this) {
-          return function (server_info) {
-            return _this.server_info = server_info;
-          };
-        })(this));
         this.ws.cmd("announcerInfo", [], (function (_this) {
           return function (announcer_info) {
             return _this.setAnnouncerInfo(announcer_info);
@@ -3054,6 +3057,38 @@ if (window.getComputedStyle(document.body).transform) {
           }
         };
       })(this)), 2000);
+    };
+
+    Wrapper.prototype.setServerInfo = function (server_info) {
+      if (!server_info || typeof server_info !== "object" || Array.isArray(server_info) || server_info.error) {
+        return;
+      }
+      this.server_info = server_info;
+      return this.updateTheme();
+    };
+
+    Wrapper.prototype.updateTheme = function () {
+      var settings = this.server_info && this.server_info.user_settings;
+      if (!settings || (settings.theme !== "light" && settings.theme !== "dark") || !document.body) {
+        return;
+      }
+      if (!this.theme_media && window.matchMedia) {
+        this.theme_media = window.matchMedia("(prefers-color-scheme: dark)");
+        var _this = this;
+        var onThemeChange = function () { _this.updateTheme(); };
+        if (this.theme_media.addEventListener) {
+          this.theme_media.addEventListener("change", onThemeChange);
+        } else {
+          this.theme_media.addListener(onThemeChange);
+        }
+      }
+      var theme = settings.theme === "dark" ? "dark" : "light";
+      if (settings.use_system_theme !== false && this.theme_media) {
+        theme = this.theme_media.matches ? "dark" : "light";
+      }
+      // Preserve open panels, drafts and the live globe while repainting chrome.
+      document.body.classList.toggle("theme-light", theme === "light");
+      document.body.classList.toggle("theme-dark", theme === "dark");
     };
 
     Wrapper.prototype.onCloseWebsocket = function (e) {
