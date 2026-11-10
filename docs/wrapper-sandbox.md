@@ -291,3 +291,28 @@ Background-color hints cannot add CSS declarations. The wrapper sends
 from overlaying its consent controls. WebSocket origin matching includes the
 port, since another local server is a different origin. Expired grants are
 shown as expired rather than enabled in both the inspection page and dialog.
+
+## Troubleshooting a wrapper CSP warning
+
+The wrapper's `script-src` policy requires its scripts to carry the nonce
+generated for that page response. `wasm-unsafe-eval` permits WebAssembly
+compilation, not JavaScript `eval` or inline scripts without that nonce.
+An extension that inserts a script into the page without the nonce can
+therefore produce a CSP warning while the wrapper itself works normally.
+
+A Firefox console source such as `sandbox eval code` is a clue, not proof
+that an extension caused the warning. If it appears in an ordinary window
+but not a private window, compare the enabled extensions: Firefox disables
+extensions in private windows unless the user permits them there. See
+[Mozilla's private browsing extension guidance](https://support.mozilla.org/en-US/kb/extensions-private-browsing).
+Private browsing also changes browser state, so this comparison alone does
+not identify the cause or a particular extension.
+
+Retest the same URL in a fresh Firefox profile or temporary
+[Troubleshoot Mode](https://support.mozilla.org/en-US/kb/troubleshoot-firefox-issues-using-safe-mode).
+If an extension is responsible, identify it by enabling extensions one at
+a time. Where that extension supports site exclusions, exclude the local
+node URL from its page injection. Keep EpixNet's CSP enabled. If the warning
+persists in a clean profile, report the Firefox version, URL, console source
+location, and whether the page works, so a first-party script failure can
+be investigated.
