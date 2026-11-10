@@ -4216,7 +4216,9 @@ impl WsCommand for ServerShowdirectory {
 
 /// Request an OS file manager and report known launch/exit failures.
 async fn open_path(path: &std::path::Path) -> Result<(), String> {
-    if !path.is_dir() { return Err(format!("Directory does not exist: {}", path.display())); }
+    if !tokio::fs::metadata(path).await.is_ok_and(|metadata| metadata.is_dir()) {
+        return Err(format!("Directory does not exist: {}", path.display()));
+    }
     #[cfg(target_os = "macos")]
     let program = "open";
     #[cfg(target_os = "windows")]
@@ -4227,12 +4229,20 @@ async fn open_path(path: &std::path::Path) -> Result<(), String> {
 }
 
 async fn launch_directory_opener(program: &str, path: &std::path::Path) -> Result<(), String> {
+    let program = program.to_string();
+    let path = path.to_path_buf();
+    tokio::task::spawn_blocking(move || launch_directory_opener_blocking(&program, &path))
+        .await
+        .map_err(|error| format!("Could not observe the file manager launch: {error}"))?
+}
+
+fn launch_directory_opener_blocking(program: &str, path: &std::path::Path) -> Result<(), String> {
     let mut child = std::process::Command::new(program).arg(path)
         .stdout(std::process::Stdio::null()).stderr(std::process::Stdio::piped())
         .spawn().map_err(|error| format!("Could not launch the file manager: {error}"))?;
     // Some managers stay attached to their window. Observe immediate launch
     // errors, but do not wait for the user to close a successfully opened app.
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
     loop {
         if let Some(status) = child.try_wait().map_err(|error| format!("Could not check file manager launch: {error}"))? {
             if status.success() { return Ok(()); }
@@ -4240,12 +4250,12 @@ async fn launch_directory_opener(program: &str, path: &std::path::Path) -> Resul
             let detail = String::from_utf8_lossy(&output.stderr);
             return Err(format!("The file manager could not open the directory ({}): {}", status, detail.trim().chars().take(500).collect::<String>()));
         }
-        if tokio::time::Instant::now() >= deadline {
+        if std::time::Instant::now() >= deadline {
             // Reap it when it eventually exits, without blocking this command.
             std::thread::spawn(move || { let _ = child.wait_with_output(); });
             return Ok(());
         }
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        std::thread::sleep(std::time::Duration::from_millis(50));
     }
 }
 

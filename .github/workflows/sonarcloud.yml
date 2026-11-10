@@ -26,8 +26,29 @@ jobs:
           path: coverage/evx-apple.xml
           if-no-files-found: error
 
+  browser-coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install pinned browser coverage tools
+        run: npm ci --prefix ui/tests/coverage-tools --ignore-scripts --no-audit --no-fund
+      - name: Install Chromium and its system dependencies
+        run: node ui/tests/coverage-tools/node_modules/playwright/cli.js install --with-deps chromium
+      - name: Test wrapper behavior and coverage mapping
+        run: node --test ui/tests/*.test.cjs
+      - name: Exercise the shipped globe and measure its editable source
+        run: node ui/tests/globe-browser.cjs --coverage coverage
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: sidebar-globe-coverage
+          path: coverage/globe-*
+          if-no-files-found: error
+
   sonarcloud:
-    needs: native-coverage
+    needs: [native-coverage, browser-coverage]
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -38,6 +59,10 @@ jobs:
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
         with:
           name: evx-native-coverage
+          path: coverage
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: sidebar-globe-coverage
           path: coverage
       - uses: SonarSource/sonarqube-scan-action@d209202bc7d53ff1cc128f7f907dac145c9d6ae9 # v8.3.0
         env:

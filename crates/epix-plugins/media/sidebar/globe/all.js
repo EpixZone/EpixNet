@@ -169,7 +169,7 @@ DAT.Globe = function(container, opts) {
   };
 
   var camera, scene, renderer, w, h;
-  var mesh, atmosphere, point, running;
+  var mesh, atmosphere, point;
 
   var overRenderer;
   var running = false, animationFrame = null, resizeObserver = null;
@@ -249,10 +249,8 @@ DAT.Globe = function(container, opts) {
     point = new THREE.Mesh(geometry);
 
     renderer = new THREE.WebGLRenderer({antialias: true, alpha: true});
-    renderer.setSize(w, h);
+    renderer.setSize(w, h, false);
     renderer.setClearColor( 0x000000, 0 );
-
-    renderer.domElement.style.position = 'relative';
 
     container.appendChild(renderer.domElement);
     updateTheme();
@@ -262,7 +260,7 @@ DAT.Globe = function(container, opts) {
     }
     if (window.matchMedia) {
       themeMedia = window.matchMedia('(prefers-color-scheme: dark)');
-      themeMedia.addListener(updateTheme);
+      themeMedia.addEventListener('change', updateTheme);
     }
 
     container.addEventListener('mousedown', onMouseDown, false);
@@ -293,7 +291,7 @@ DAT.Globe = function(container, opts) {
 
   function updateTheme() {
     var style = window.getComputedStyle(container);
-    earthUniforms.waterScale.value = parseFloat(style.getPropertyValue('--globe-water-scale')) || 28;
+    earthUniforms.waterScale.value = Number.parseFloat(style.getPropertyValue('--globe-water-scale')) || 28;
     earthUniforms.landColor.value.setStyle(style.getPropertyValue('--globe-land').trim() || '#59636E');
     earthUniforms.waterColor.value.setStyle(style.getPropertyValue('--globe-water').trim() || '#B8C3CE');
     earthUniforms.rimColor.value.setStyle(style.getPropertyValue('--globe-rim').trim() || '#AAB5C0');
@@ -547,7 +545,7 @@ DAT.Globe = function(container, opts) {
     if (!container.offsetWidth || !container.offsetHeight) return;
     camera.aspect = container.offsetWidth / container.offsetHeight;
     camera.updateProjectionMatrix();
-    renderer.setSize( container.offsetWidth, container.offsetHeight );
+    renderer.setSize( container.offsetWidth, container.offsetHeight, false );
   }
 
   function zoom(delta) {
@@ -602,7 +600,7 @@ DAT.Globe = function(container, opts) {
     pause();
     if (resizeObserver) resizeObserver.disconnect();
     if (themeObserver) themeObserver.disconnect();
-    if (themeMedia) themeMedia.removeListener(updateTheme);
+    if (themeMedia) themeMedia.removeEventListener('change', updateTheme);
     container.removeEventListener('mousedown', onMouseDown, false);
     container.removeEventListener('touchstart', onTouchStart, { passive: false });
     container.removeEventListener('touchmove', onTouchMove, { passive: false });
@@ -618,12 +616,12 @@ DAT.Globe = function(container, opts) {
     scene.traverse(function(object) {
       if (object.geometry) object.geometry.dispose();
       if (object.material) {
-        if (object.material.uniforms && object.material.uniforms.texture) object.material.uniforms.texture.value.dispose();
+        object.material.uniforms?.texture?.value?.dispose();
         object.material.dispose();
       }
     });
     if (renderer.dispose) renderer.dispose();
-    if (renderer.domElement.parentNode === container) container.removeChild(renderer.domElement);
+    if (renderer.domElement.parentNode === container) renderer.domElement.remove();
 
   }
 

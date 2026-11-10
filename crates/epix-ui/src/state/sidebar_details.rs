@@ -1,5 +1,8 @@
 //! Read-only sidebar summaries from accepted manifests and the active database.
-use super::*;
+use super::{canonical_address, AppState, VerifiedManifestUnit};
+use epix_db::{Database, DbSchema};
+use epix_xite::XiteStorage;
+use serde_json::{json, Value};
 use std::collections::{BTreeMap, HashSet};
 
 impl AppState {
@@ -256,7 +259,13 @@ fn disk_free_bytes(path: &std::path::Path) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    #[cfg(unix)]
+    use super::manifest_size;
+    use super::{summarize_database, summarize_storage};
+    use crate::state::{AppState, VerifiedManifestUnit, XiteEntry};
+    use epix_db::{Database, DbSchema};
+    use epix_xite::XiteStorage;
+    use serde_json::json;
 
     #[tokio::test]
     async fn summary_reads_a_registered_xites_accepted_manifest() {

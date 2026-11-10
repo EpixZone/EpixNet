@@ -1,6 +1,8 @@
 //! Sidebar peer sharing and map projection. Share links contain only dialable,
 //! public endpoints; importing a link never enables a transport or changes policy.
-use super::*;
+use super::AppState;
+use epix_core::PeerAddr;
+use epix_peer::Peer;
 use std::collections::HashSet;
 use std::net::{IpAddr, SocketAddr};
 
@@ -227,7 +229,9 @@ fn project_points(mut points: Vec<MapPoint>) -> Vec<f64> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{project_points, shareable, MapPoint};
+    use epix_core::PeerAddr;
+    use std::collections::HashSet;
 
     #[test]
     fn share_endpoints_exclude_private_special_and_invalid_addresses() {
@@ -302,7 +306,7 @@ mod tests {
                     let chord = 200.0 * (2.0 - 2.0 * dot.clamp(-1.0, 1.0)).sqrt();
                     assert!(
                         chord > 2.75,
-                        "map bars overlap at latitude {latitude}: {chord}"
+                        "map bars overlap"
                     );
                 }
             }

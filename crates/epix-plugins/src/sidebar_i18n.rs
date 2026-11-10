@@ -4,7 +4,7 @@ use serde_json::{Map, Value};
 use std::{collections::HashMap, sync::OnceLock};
 
 pub fn catalog(language: &str) -> &'static Map<String, Value> {
-    static CATALOGS: OnceLock<HashMap<&'static str, Map<String, Value>>> = OnceLock::new();
+    static CATALOGS: OnceLock<HashMap<&str, Map<String, Value>>> = OnceLock::new();
     let catalogs = CATALOGS.get_or_init(|| {
         let mut catalogs = HashMap::new();
         macro_rules! add {

@@ -69,3 +69,6 @@ ios/**/project.xcworkspace/
 # Python validation scripts
 __pycache__/
 *.py[cod]
+
+# Generated test coverage reports
+/coverage/

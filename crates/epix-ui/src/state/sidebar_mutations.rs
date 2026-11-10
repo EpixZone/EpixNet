@@ -1,6 +1,14 @@
 //! Durable sidebar settings and maintenance actions.
 
-use super::*;
+use super::{
+    build_xite_db, canonical_address, now_secs, read_regular_xite_file_bounded, AppState,
+    MAX_DB_SCHEMA_BYTES,
+};
+use epix_db::{Database, DbSchema};
+use epix_user::User;
+use epix_xite::XiteSettings;
+use serde_json::{json, Value};
+use std::sync::Arc;
 
 const MB: i64 = 1024 * 1024;
 
