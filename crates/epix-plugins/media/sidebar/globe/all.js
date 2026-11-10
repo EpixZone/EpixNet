@@ -169,7 +169,7 @@ DAT.Globe = function(container, opts) {
   };
 
   var camera, scene, renderer, w, h;
-  var mesh, atmosphere, point;
+  var mesh, point;
 
   var overRenderer;
   var running = false, animationFrame = null, resizeObserver = null;
