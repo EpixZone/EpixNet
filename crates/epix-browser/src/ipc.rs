@@ -88,14 +88,17 @@ fn init_at(
     state: SharedScope,
 ) -> Result<Role, String> {
     validate_target(arg)?;
-    if forward_at(address, arg, open, requested)? {
-        return Ok(Role::Secondary);
-    }
+    // Claim first, probe second. A free port proves that no instance is
+    // running, at no cost. Probing first cannot tell a closed port from a
+    // stalled one on Windows: its loopback stack retries a refused connect for
+    // about two seconds, so the short connect timeout expired before the
+    // refusal arrived and every cold start was rejected as a timeout.
     match TcpListener::bind(address) {
         Ok(listener) => Ok(Role::Primary(spawn_listener(listener, state))),
         Err(error) => {
-            // A simultaneous launcher may have won the listener. It must
-            // still confirm the selected root before receiving this target.
+            // The port is owned: by a running instance, or by a simultaneous
+            // launcher that won the listener. Either must still confirm the
+            // selected root before receiving this target.
             if forward_at(address, arg, open, requested)? {
                 Ok(Role::Secondary)
             } else {
