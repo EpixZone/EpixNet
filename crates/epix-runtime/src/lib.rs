@@ -270,14 +270,14 @@ impl NodeRuntime {
             i2p: None,
             rns: None,
         });
-        self.handles.push(tokio::spawn(announce_loop(
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, announce_loop(
             self.state.clone(),
             self.trackers.clone(),
             tor_always,
             self.shutdown.clone(),
             self.config.announce_interval,
         )));
-        self.handles.push(tokio::spawn(resync_loop(
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, resync_loop(
             self.state.clone(),
             tor_always,
             self.shutdown.clone(),
@@ -286,13 +286,13 @@ impl NodeRuntime {
         // Client half of store-and-forward propagation: poll peers for update
         // hints and resync the hinted xites right away, so a published post
         // appears in seconds instead of waiting for the full resync tick.
-        self.handles.push(tokio::spawn(propagation_loop(
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, propagation_loop(
             self.state.clone(),
             tor_always,
             self.shutdown.clone(),
             self.config.propagation_interval,
         )));
-        self.handles.push(tokio::spawn(connection_loop(
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, connection_loop(
             self.state.clone(),
             tor_always,
             self.shutdown.clone(),
@@ -301,7 +301,7 @@ impl NodeRuntime {
         // Health prober: re-check benched (backed-off) peers off the streaming
         // path, so a temporarily-down peer is reinstated the moment it answers
         // instead of waiting out a full dial backoff. See peer_probe_loop.
-        self.handles.push(tokio::spawn(peer_probe_loop(
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, peer_probe_loop(
             self.state.clone(),
             tor_always,
             self.shutdown.clone(),
@@ -316,7 +316,7 @@ impl NodeRuntime {
         // only its onion address - so it never leaves from (or claims) the real
         // IP. Outside Always mode the DHT runs over clearnet as before. See
         // dht_loop. (`tor_always` is computed above, shared with the peer loops.)
-        self.handles.push(tokio::spawn(dht_loop(
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, dht_loop(
             self.state.clone(),
             self.dht.clone(),
             fileserver_port,
@@ -343,7 +343,7 @@ impl NodeRuntime {
         // loop, so leaving the install to one would leave it with no peer I/O
         // at all. Inbound serving stays gated on the port below; the cell keeps
         // this idempotent for the seed/tor/i2p/mesh callers.
-        self.handles.push(tokio::spawn({
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, {
             let cell = edx_cell.clone();
             let state = self.state.clone();
             async move {
@@ -362,7 +362,7 @@ impl NodeRuntime {
             // deliberately closed - don't report a public port in that mode,
             // whether from a public interface IP or an inbound peer.
             let clearnet_seeding = !tor_always;
-            self.handles.push(tokio::spawn(seed_loop(
+            self.handles.push(spawn_after_startup_hold(&self.shutdown, seed_loop(
                 self.state.clone(),
                 listener,
                 bound,
@@ -370,7 +370,7 @@ impl NodeRuntime {
                 edx_cell.clone(),
                 self.shutdown.clone(),
             )));
-            self.handles.push(tokio::spawn(upnp_loop(
+            self.handles.push(spawn_after_startup_hold(&self.shutdown, upnp_loop(
                 self.state.clone(),
                 bound.port(),
                 clearnet_seeding,
@@ -384,7 +384,7 @@ impl NodeRuntime {
         #[cfg(feature = "i2p")]
         if epix_i2p::I2pMode::parse(&self.config.i2p_mode) != epix_i2p::I2pMode::Disable {
             if let Some(dir) = self.data_dir.clone() {
-                self.handles.push(tokio::spawn(i2p_loop(
+                self.handles.push(spawn_after_startup_hold(&self.shutdown, i2p_loop(
                     self.state.clone(),
                     dir.join("i2p"),
                     self.config.i2p_mode.clone(),
@@ -402,7 +402,7 @@ impl NodeRuntime {
         {
             let identity_path =
                 self.data_dir.clone().map(|d| d.join("mesh").join("identity"));
-            self.handles.push(tokio::spawn(native_mesh::supervise(
+            self.handles.push(spawn_after_startup_hold(&self.shutdown, native_mesh::supervise(
                 self.state.clone(),
                 identity_path,
                 self.config.mesh_peers.clone(),
@@ -418,7 +418,7 @@ impl NodeRuntime {
         #[cfg(feature = "tor")]
         if self.config.tor_mode != epix_tor::TorMode::Disable {
             if let Some(dir) = self.data_dir.clone() {
-                self.handles.push(tokio::spawn(tor_loop(
+                self.handles.push(spawn_after_startup_hold(&self.shutdown, tor_loop(
                     self.state.clone(),
                     dir,
                     self.config.tor_mode,
@@ -442,7 +442,7 @@ impl NodeRuntime {
         // Wakeup watcher: detect a wall-clock jump (the machine slept) and
         // force a fresh announce + connection sweep on resume, like EpixNet's
         // FileServer.wakeupWatcher. Cheap: a 30s self-check.
-        self.handles.push(tokio::spawn(wakeup_loop(
+        self.handles.push(spawn_after_startup_hold(&self.shutdown, wakeup_loop(
             self.state.clone(),
             tor_always,
             self.shutdown.clone(),
@@ -455,7 +455,7 @@ impl NodeRuntime {
         // xites we serve.
         #[cfg(feature = "local-discovery")]
         if self.config.local_discovery {
-            self.handles.push(tokio::spawn(local::local_discovery_loop(
+            self.handles.push(spawn_after_startup_hold(&self.shutdown, local::local_discovery_loop(
                 self.state.clone(),
                 tcp_port.unwrap_or(0),
                 self.shutdown.clone(),
@@ -487,6 +487,27 @@ impl NodeRuntime {
             }
         }
     }
+}
+
+/// Spawn a network task that starts once any shell's startup hold is over.
+///
+/// A desktop launch opens its browser at the moment the node is prepared.
+/// Starting Tor, I2P, the object store and every peer loop at that same
+/// moment doubled the time the browser needed to show its window. Shells that
+/// open no window never ask for a hold, so their tasks start at once. A
+/// shutdown during the hold ends the task before it starts.
+fn spawn_after_startup_hold<F>(shutdown: &Arc<Notify>, task: F) -> JoinHandle<()>
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let shutdown = shutdown.clone();
+    tokio::spawn(async move {
+        tokio::select! {
+            _ = epix_ui::startup_hold::released() => {}
+            _ = shutdown.notified() => return,
+        }
+        task.await
+    })
 }
 
 /// Re-announce every xite to the trackers (recording per-tracker stats).

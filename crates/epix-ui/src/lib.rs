@@ -29,6 +29,7 @@ mod nmh_auth;
 mod nmh_status;
 pub mod paths;
 pub mod pool;
+pub mod startup_hold;
 pub mod state;
 mod timestamp;
 mod loopback_content;

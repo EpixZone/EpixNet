@@ -4426,6 +4426,11 @@ pub struct AppState {
     /// Path to the persisted peer database (`peers.json`), so known peers survive
     /// restarts (the PeerDb plugin). None for in-memory nodes.
     peers_path: Option<PathBuf>,
+    /// `peers.json` parsed once for the boot restore pass. Every restored
+    /// xite reads its own entry, and re-parsing the whole file per xite cost
+    /// most of a second on a node with a few dozen xites. Set only while
+    /// [`Self::restore_xites`] runs; `None` means read the file.
+    boot_peers: std::sync::Mutex<Option<serde_json::Map<String, Value>>>,
     /// Path to the persisted optional-file pins (`pins.json`), so a pinned file
     /// stays pinned across restarts (OptionalManager). None for in-memory nodes.
     pins_path: Option<PathBuf>,
@@ -5814,6 +5819,7 @@ impl AppState {
             logs: RwLock::new(std::collections::VecDeque::new()),
             log_streams: RwLock::new(Vec::new()),
             peers_path: persist.peers_path,
+            boot_peers: std::sync::Mutex::new(None),
             fileserver_port: RwLock::new(0),
             clearnet_listener: RwLock::new(None),
             port_opened: RwLock::new(false),
@@ -7273,6 +7279,17 @@ impl AppState {
             // can't push content for xites we never voluntarily fetched.
             settings.downloaded = Some(now_secs());
         }
+        // The optional-file inventory is a disk walk that needs nothing from
+        // the verified index, and nothing below changes the files it reads.
+        // Start it now so it overlaps the index and database work.
+        let optional_state = {
+            let storage = entry.storage.clone();
+            let content = entry.content.clone();
+            let stats = settings.cache.optional_stats.clone();
+            tokio::task::spawn_blocking(move || {
+                compute_optional_state(&storage, content.as_ref(), &stats)
+            })
+        };
         if entry.content.is_some() {
             self.replay_verified_archives(&canonical, &entry.storage).await;
         }
@@ -7358,11 +7375,14 @@ impl AppState {
         // the sidebar's "Downloaded" figure heals itself instead of trusting
         // a stale xites.json. (Piecewise-partial bigfiles re-count on their
         // next fetch pass; whole files are the common case.)
-        let (hashfield, optional_on_disk, optional_declared) = compute_optional_state(
-            &entry.storage,
-            entry.content.as_ref(),
-            &settings.cache.optional_stats,
-        );
+        let (hashfield, optional_on_disk, optional_declared) = match optional_state.await {
+            Ok(state) => state,
+            Err(_) => compute_optional_state(
+                &entry.storage,
+                entry.content.as_ref(),
+                &settings.cache.optional_stats,
+            ),
+        };
         let mut settings = settings;
         settings.optional_downloaded = optional_on_disk;
         // Include per-user (child content.json) optional files in the total -
@@ -8167,7 +8187,9 @@ impl AppState {
         // UI can serve): the registry write gate belongs to the pass itself,
         // whoever runs it.
         self.set_boot_restore_pending(true);
+        *self.boot_peers.lock().unwrap() = Some(self.read_persisted_peers());
         let (restored, registry_readable) = self.restore_xites_inner().await;
+        *self.boot_peers.lock().unwrap() = None;
         // Whatever happened (registry missing, parse error, full restore),
         // boot restore is now SETTLED: gated aggregates may answer.
         self.set_boot_restore_pending(false);
@@ -8215,12 +8237,24 @@ impl AppState {
             }
         }
         let mut restored = 0;
+        // Each restored xite's newest-content walk is disk work independent
+        // of the next xite's restore. Let them overlap, and settle them all
+        // before the pass ends so the registry write sees the same dates.
+        let mut newest_walks = tokio::task::JoinSet::new();
         for (canonical, entry) in map {
             if self.has_any_alias(&canonical).await {
                 continue;
             }
-            if self.restore_one_xite(&root, &canonical, &entry).await {
+            if self
+                .restore_one_xite(&root, &canonical, &entry, &mut newest_walks)
+                .await
+            {
                 restored += 1;
+            }
+        }
+        while let Some(walk) = newest_walks.join_next().await {
+            if let Ok((canonical, newest)) = walk {
+                self.bump_modified(&canonical, newest).await;
             }
         }
         (restored, true)
@@ -8551,7 +8585,13 @@ impl AppState {
 
     /// Restore a single `xites.json` entry (see [`Self::restore_xites`]).
     /// Returns whether the xite was registered.
-    async fn restore_one_xite(&self, root: &Path, canonical: &str, entry: &Value) -> bool {
+    async fn restore_one_xite(
+        &self,
+        root: &Path,
+        canonical: &str,
+        entry: &Value,
+        newest_walks: &mut tokio::task::JoinSet<(String, f64)>,
+    ) -> bool {
         let dir = root.join(canonical);
         let storage = XiteStorage::new(&dir);
         // Load the on-disk content.json under the canonical address. Prefer
@@ -8582,22 +8622,8 @@ impl AppState {
             ).await;
             return true;
         }
-        // Legacy persisted-ahead state: older builds wrote content.json to
-        // disk before its files, so a crash or failed sync could leave a
-        // stored content.json whose files are missing. New code commits
-        // content.json only after its files (staged adopt), so this only
-        // flags dirs written by older builds; the resync loop heals them.
-        let missing = xite.files_needed().len();
-        if missing > 0 {
-            self.log(
-                "INFO",
-                format!(
-                    "{canonical}: stored content.json declares {missing} file(s) not on disk; resync will fetch them"
-                ),
-            )
-            .await;
-        }
         let content = xite.content.clone();
+        self.spawn_missing_file_report(canonical.to_string(), xite);
         // Settings live flat in the entry (EpixNet schema); accept the old
         // nested `{"settings": {…}}` form too.
         let settings_src = entry.get("settings").cloned().unwrap_or_else(|| entry.clone());
@@ -8610,21 +8636,20 @@ impl AppState {
         // settings.modified folded it in would show the root's old date
         // until the next post arrives): take the newest content.json
         // anywhere in the tree, once, at restore. New arrivals keep it
-        // fresh incrementally from here.
-        let newest = {
+        // fresh incrementally from here. The caller applies the result.
+        {
             let dir = dir.to_path_buf();
-            tokio::task::spawn_blocking(move || {
-                walk_content_json(&dir)
+            let canonical = canonical.to_string();
+            newest_walks.spawn_blocking(move || {
+                let newest = walk_content_json(&dir)
                     .into_iter()
                     .filter_map(|p| std::fs::read(dir.join(&p)).ok())
                     .filter_map(|b| serde_json::from_slice::<Value>(&b).ok())
                     .filter_map(|c| c.get("modified").and_then(|v| v.as_f64()))
-                    .fold(0.0_f64, f64::max)
-            })
-            .await
-            .unwrap_or(0.0)
-        };
-        self.bump_modified(canonical, newest).await;
+                    .fold(0.0_f64, f64::max);
+                (canonical, newest)
+            });
+        }
         // The `.epix` name is display metadata, not a second serving key.
         if let Some(display) = entry.get("display").and_then(|v| v.as_str()) {
             if display != canonical {
@@ -8636,6 +8661,49 @@ impl AppState {
             }
         }
         true
+    }
+
+    /// Report a restored xite whose stored content.json declares required
+    /// files that are missing or fail their hash.
+    ///
+    /// Legacy persisted-ahead state: older builds wrote content.json to disk
+    /// before its files, so a crash or failed sync could leave a stored
+    /// content.json whose files are missing. New code commits content.json
+    /// only after its files (staged adopt), so this only flags dirs written
+    /// by older builds; the resync loop heals them.
+    ///
+    /// The check hashes every required file and feeds nothing but this log
+    /// line. Run inline it was the largest single cost of a desktop start
+    /// (a third of the restore pass, and it grows with the data on disk), so
+    /// it runs once the restore pass and any shell window are out of the
+    /// way, one xite at a time.
+    fn spawn_missing_file_report(&self, canonical: String, xite: Xite) {
+        static ONE_AT_A_TIME: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+        let state = self.owned_state();
+        tokio::spawn(async move {
+            while state.boot_restore_pending() {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            crate::startup_hold::released().await;
+            let Ok(_turn) = ONE_AT_A_TIME.acquire().await else {
+                return;
+            };
+            let Ok(missing) =
+                tokio::task::spawn_blocking(move || xite.files_needed().len()).await
+            else {
+                return;
+            };
+            if missing > 0 {
+                state
+                    .log(
+                        "INFO",
+                        format!(
+                            "{canonical}: stored content.json declares {missing} file(s) not on disk; resync will fetch them"
+                        ),
+                    )
+                    .await;
+            }
+        });
     }
 
     /// Reapply the persisted user-facing settings (ownership, serving, size
@@ -9348,18 +9416,27 @@ impl AppState {
     /// boot restore bypasses [`Self::add_peers`]' ingest filter, so junk that
     /// predates the filter would otherwise survive on disk forever.
     fn load_persisted_peers(&self, canonical: &str) -> Vec<Peer> {
-        let Some(path) = &self.peers_path else { return Vec::new();
-        };
-        let map: serde_json::Map<String, Value> = std::fs::read(path)
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
         let now = now_secs();
-        map.get(canonical)
-            .and_then(|v| v.as_array())
-            .map(|a| {
-                a.iter().filter_map(|entry| Self::restore_peer(entry, now)).collect()
-            })
+        let restore = |map: &serde_json::Map<String, Value>| -> Vec<Peer> {
+            map.get(canonical)
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter().filter_map(|entry| Self::restore_peer(entry, now)).collect()
+                })
+                .unwrap_or_default()
+        };
+        if let Some(map) = self.boot_peers.lock().unwrap().as_ref() {
+            return restore(map);
+        }
+        restore(&self.read_persisted_peers())
+    }
+
+    /// The whole persisted peer table. Unreadable or malformed reads as empty.
+    fn read_persisted_peers(&self) -> serde_json::Map<String, Value> {
+        self.peers_path
+            .as_ref()
+            .and_then(|path| std::fs::read(path).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())
             .unwrap_or_default()
     }
 

@@ -85,6 +85,8 @@ fn main() {
     // console; adopt the parent's (dev runs from a terminal) or log to a file.
     #[cfg(windows)]
     attach_console_or_log(&epix_node::data_root());
+    // Start the clock the startup log lines are stamped against.
+    startup::since_launch();
 
     // `--background`: bring up the node + tray but no browser window (the
     // "open at login" mode). The user opens the browser from the tray. Any
@@ -255,6 +257,9 @@ async fn boot(
 ) -> Result<(Ready, Option<std::process::Child>), String> {
     let target = epix_node::parse_target(raw_arg);
     progress.report(startup::Stage::Preparing);
+    // Armed before the node starts its network loops. It ends once the first
+    // page has connected, or at once if this start fails.
+    let network_hold = startup::NetworkHold::begin(!background);
 
     // Finish queued moves before CA/profile files or node databases open.
     let data_lease = tokio::task::spawn_blocking(epix_node::prepare_data_root)
@@ -406,6 +411,9 @@ async fn boot(
         wait_for_native_browser_window(&mut child, Duration::from_secs(60)).await?;
         // Apply branding before handing the browser to the tray loop.
         icon::stamp_firefox_windows(&firefox);
+    }
+    if let Some(hold) = network_hold {
+        hold.window_is_up(running.state.clone(), running.address.clone());
     }
     progress.report(startup::Stage::Ready);
 
@@ -1323,6 +1331,11 @@ user_pref("browser.startup.page", 1);
 // tab, which would then show as "Not Secure" even after the CA is trusted.
 user_pref("browser.sessionstore.resume_from_crash", false);
 user_pref("browser.sessionstore.max_resumed_crashes", 0);
+// Quitting EpixNet ends the browser's process tree, which Firefox records as a
+// crash. A few of those shortly after a start make it offer Troubleshoot Mode
+// instead of opening, and the launch then fails with "closed during startup".
+// -1 turns that prompt off.
+user_pref("toolkit.startup.max_resumed_crashes", -1);
 user_pref("browser.aboutwelcome.enabled", false);
 user_pref("browser.shell.checkDefaultBrowser", false);
 user_pref("datareporting.policy.dataSubmissionEnabled", false);
