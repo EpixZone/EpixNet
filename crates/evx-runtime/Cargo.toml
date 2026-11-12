@@ -8,7 +8,7 @@ description = "EVX validator, engine configuration, compilation and execution on
 evx-api = { path = "../evx-api" }
 # Keep every target on the same Wasmtime release. Default features are off:
 # no WASI, no component model, no GC, no threads, no cache, no profiling.
-wasmtime = { version = "=49.0.5", default-features = false, features = ["runtime", "std"] }
+wasmtime = { version = "=50.0.1", default-features = false, features = ["runtime", "std"] }
 # Same wasmparser line Wasmtime 49 uses, so the validator and the engine never
 # disagree about the feature set.
 wasmparser = { version = "0.258", default-features = false, features = ["std", "validate", "features"] }
