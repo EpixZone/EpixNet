@@ -21,6 +21,29 @@ fn unknown_lines_are_neither_forwarded_nor_acknowledged() {
     assert_eq!(parse("EPIX-QUIT now"), (None, false));
 }
 
+#[test]
+fn cold_start_claims_a_free_control_port() {
+    let root = tempfile::tempdir().unwrap();
+    let requested = root_scope(root.path()).unwrap();
+    // Reserve a port, then release it: nothing listens there any more.
+    let address = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap();
+    let started = Instant::now();
+    let role = init_at(
+        address,
+        "dashboard.epix",
+        true,
+        &requested,
+        ready_scope(root.path()),
+    );
+    // Windows refuses a loopback connect only after about two seconds. A
+    // probe of the closed port must not fail the launch or delay it.
+    assert!(matches!(role, Ok(Role::Primary(_))), "{:?}", role.err());
+    assert!(started.elapsed() < Duration::from_millis(250));
+}
+
 fn ready_scope(root: &Path) -> SharedScope {
     Arc::new(Mutex::new(ScopeState::Ready(root_scope(root).unwrap())))
 }

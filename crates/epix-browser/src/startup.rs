@@ -94,7 +94,87 @@ impl Progress {
         if let Some(sender) = &self.sender {
             let _ = sender.send(stage);
         }
-        println!("· startup: {}", stage.label());
+        // The offset is when the stage began, so the gap to the next line is
+        // what the stage cost. A slow start then names its own slow stage.
+        println!("· startup: {} (+{:.1}s)", stage.label(), since_launch().as_secs_f32());
+    }
+}
+
+/// Time since the launcher first asked, which `main` does before any work.
+pub fn since_launch() -> Duration {
+    static LAUNCHED: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    LAUNCHED.get_or_init(Instant::now).elapsed()
+}
+
+/// Holds the node's network work back while the browser window comes up, so
+/// the two do not compete for the machine. See [`epix_ui::startup_hold`].
+/// Dropping it releases the hold, which covers every failed start.
+pub struct NetworkHold {
+    page_limit: Duration,
+}
+
+impl NetworkHold {
+    /// Covers a slow restore of a large data directory and a first-run
+    /// browser warm-up. The hold normally ends long before this.
+    const LIMIT: Duration = Duration::from_secs(120);
+    /// Longest the work stays held once the window is visible, waiting for
+    /// the first page to connect.
+    const PAGE_LIMIT: Duration = Duration::from_secs(15);
+    /// A page that has connected still has its own files and feeds to load.
+    const AFTER_PAGE: Duration = Duration::from_secs(2);
+
+    /// `None` for a launch that opens no window, and when
+    /// `EPIX_STARTUP_HOLD_MS=0` turns the hold off for a comparison run. Any
+    /// other value replaces the longest wait for the first page.
+    pub fn begin(foreground: bool) -> Option<Self> {
+        let page_limit = match std::env::var("EPIX_STARTUP_HOLD_MS")
+            .ok()
+            .and_then(|value| value.trim().parse::<u64>().ok())
+        {
+            Some(0) => return None,
+            Some(millis) => Duration::from_millis(millis.min(60_000)),
+            None => Self::PAGE_LIMIT,
+        };
+        if !foreground {
+            return None;
+        }
+        epix_ui::startup_hold::hold_for(Self::LIMIT);
+        Some(Self { page_limit })
+    }
+
+    /// The window is visible. Keep the hold until the launch xite's page has
+    /// connected to the node, which is when the user sees it, then let the
+    /// network start. `address` is empty when the xite is not known yet.
+    pub fn window_is_up(self, state: std::sync::Arc<epix_ui::AppState>, address: String) {
+        epix_ui::startup_hold::hold_for(self.page_limit + Self::AFTER_PAGE);
+        tokio::spawn(async move {
+            // Own the whole hold, not just the field read below: dropping it
+            // is what releases the network.
+            let hold = self;
+            let until = tokio::time::Instant::now() + hold.page_limit;
+            let mut connected = false;
+            while !address.is_empty() && tokio::time::Instant::now() < until {
+                if state.has_bound_conn(&address) {
+                    connected = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+            if connected {
+                println!(
+                    "· startup: first page connected (+{:.1}s)",
+                    since_launch().as_secs_f32()
+                );
+                tokio::time::sleep(Self::AFTER_PAGE).await;
+            }
+            drop(hold);
+        });
+    }
+}
+
+impl Drop for NetworkHold {
+    fn drop(&mut self) {
+        epix_ui::startup_hold::release();
     }
 }
 
@@ -416,6 +496,18 @@ mod tests {
         assert_eq!(state.presentation.stage, Stage::Profile);
         assert!(state.presentation.text().1.contains("Press Esc to exit."));
         assert!(state.finish().unwrap_err().contains("stopped unexpectedly"));
+    }
+
+    #[tokio::test]
+    async fn a_launch_without_a_window_never_holds_the_network() {
+        assert!(super::NetworkHold::begin(false).is_none());
+        // Nothing armed the hold, so gated work starts at once.
+        tokio::time::timeout(
+            std::time::Duration::from_millis(50),
+            epix_ui::startup_hold::released(),
+        )
+        .await
+        .expect("a background launch must not delay the node's network");
     }
 
     #[test]
