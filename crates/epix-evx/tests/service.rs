@@ -53,8 +53,8 @@ async fn failed_activation_checkpoint_persistence_prevents_guest_execution() {
 /// executable while the parent suite is launching it.
 const TEST_WORKER: &str = "EVX_TEST_WORKER";
 
-/// Build and locate `evx-worker` relative to this test binary's target
-/// directory, exactly as the `evx-host` suite does.
+/// Build `evx-worker` and locate it from Cargo's own report, exactly as the
+/// `evx-host` suite does.
 #[cfg(any(target_os = "macos", target_os = "linux", windows))]
 fn worker_binary() -> PathBuf {
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
@@ -72,12 +72,28 @@ fn worker_binary() -> PathBuf {
         if !cfg!(debug_assertions) {
             command.arg("--release");
         }
-        assert!(command.status().expect("cargo build -p evx-worker").success());
-        let exe = std::env::current_exe().unwrap();
-        let profile_dir = exe.parent().and_then(std::path::Path::parent).unwrap();
-        private_worker_copy(&profile_dir.join(format!("evx-worker{}", std::env::consts::EXE_SUFFIX)))
+        private_worker_copy(&built_executable(command, "evx-worker"))
     })
     .clone()
+}
+
+/// Run a nested `cargo build` and return the executable it reports for
+/// `name`. Since Rust 1.100 test binaries no longer live in
+/// `target/<profile>/deps`, so the path cannot be derived from this one.
+#[cfg(any(target_os = "macos", target_os = "linux", windows))]
+fn built_executable(mut command: std::process::Command, name: &str) -> PathBuf {
+    let output = command
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
+    assert!(output.status.success(), "building {name} failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact" && message["target"]["name"] == name)
+        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| panic!("cargo build reported no executable for {name}"))
 }
 
 /// Cargo hard-links the uplifted worker to its `deps/` copy, and the Windows
