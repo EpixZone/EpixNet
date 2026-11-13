@@ -33,16 +33,16 @@ pub fn terminated_by_host(code: i32) -> bool {
     }
 }
 
-/// Build and locate `evx-worker`. The target directory is derived from this
-/// test binary's own location, so `CARGO_TARGET_DIR`, `--release` and
-/// `--target` all resolve correctly, and the build is always requested so an
-/// edit to the worker can never be tested against a stale binary (cargo makes
-/// it a no-op when fresh).
+/// Build and locate `evx-worker`. Cargo reports where it put the executable,
+/// so `CARGO_TARGET_DIR`, `--release` and the build directory layout all
+/// resolve correctly, and the build is always requested so an edit to the
+/// worker can never be tested against a stale binary (cargo makes it a no-op
+/// when fresh).
 pub fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
         handed_down(TEST_WORKER)
-            .unwrap_or_else(|| pinned(build_target("evx-worker", &["-p", "evx-worker"], "")))
+            .unwrap_or_else(|| pinned(build_target("evx-worker", &["-p", "evx-worker"])))
     })
     .clone()
 }
@@ -55,7 +55,6 @@ pub fn hostile_peer_binary() -> PathBuf {
             pinned(build_target(
                 "hostile_peer",
                 &["-p", "evx-supervisor", "--example", "hostile_peer"],
-                "examples",
             ))
         })
     })
@@ -70,16 +69,9 @@ fn handed_down(variable: &str) -> Option<PathBuf> {
     )
 }
 
-/// target/<profile>/deps/<test-binary> -> target/<profile>
-fn profile_dir() -> PathBuf {
-    let exe = std::env::current_exe().expect("test binary path");
-    exe.parent()
-        .and_then(Path::parent)
-        .expect("target profile directory")
-        .to_path_buf()
-}
-
-fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {
+/// Since Rust 1.100 test binaries no longer live in `target/<profile>/deps`,
+/// so the executable's path cannot be derived from this one. Ask Cargo.
+fn build_target(name: &str, args: &[&str]) -> PathBuf {
     let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let mut command = std::process::Command::new(cargo);
@@ -96,29 +88,35 @@ fn build_target(name: &str, args: &[&str], subdir: &str) -> PathBuf {
     if !cfg!(debug_assertions) {
         command.arg("--release");
     }
-    let status = command
-        .status()
+    let output = command
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(std::process::Stdio::inherit())
+        .output()
         .unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
-    assert!(status.success(), "building {name} failed");
-    let file = format!("{name}{}", std::env::consts::EXE_SUFFIX);
-    let profile_dir = profile_dir();
-    let path = if subdir.is_empty() {
-        profile_dir.join(file)
-    } else {
-        profile_dir.join(subdir).join(file)
-    };
+    assert!(output.status.success(), "building {name} failed");
+    let path = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| {
+            message["reason"] == "compiler-artifact" && message["target"]["name"] == name
+        })
+        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| panic!("cargo build reported no executable for {name}"));
     std::fs::canonicalize(&path)
         .unwrap_or_else(|e| panic!("{name} not found at {}: {e}", path.display()))
 }
 
 /// The Windows backend pins a worker as a regular file with exactly one
 /// link, but Cargo's uplifted `target/<profile>/<name>.exe` is a hard link
-/// to the copy under `deps`. Tests therefore run a private copy under
-/// `target/<profile>/evx-test-images`, refreshed whenever the build output
+/// to the copy under `deps`. Tests therefore run a private copy in an
+/// `evx-test-images` folder next to the build output, refreshed whenever it
 /// changes and kept while another test process still has it pinned.
 #[cfg(windows)]
 fn pinned(built: PathBuf) -> PathBuf {
-    let images = profile_dir().join("evx-test-images");
+    let images = built
+        .parent()
+        .expect("build output directory")
+        .join("evx-test-images");
     std::fs::create_dir_all(&images).expect("test image directory");
     let name = built.file_name().expect("image name");
     let bytes = std::fs::read(&built).expect("read built image");
