@@ -1716,8 +1716,79 @@ async fn bind_seed_listener(
     port: u16,
     clearnet: bool,
 ) -> std::io::Result<tokio::net::TcpListener> {
-    let host = if clearnet { "0.0.0.0" } else { "127.0.0.1" };
-    bind_seed_port(port, |port| tokio::net::TcpListener::bind((host, port))).await
+    let host = if clearnet { std::net::Ipv4Addr::UNSPECIFIED } else { std::net::Ipv4Addr::LOCALHOST };
+    bind_seed_port(port, |port| {
+        std::future::ready(bind_owned_listener(std::net::SocketAddrV4::new(host, port).into()))
+    })
+    .await
+}
+
+/// Bind a listener that owns its port outright.
+///
+/// Windows lets a wildcard bind share a port that another process holds on
+/// one address. With WSL running, its relay holds `127.0.0.1:26552`, and a
+/// plain `0.0.0.0:26552` bind still succeeds: two nodes then serve one port,
+/// and local dials reach the other one. `SO_EXCLUSIVEADDRUSE` makes that bind
+/// fail with `AddrInUse`, so `bind_seed_port` moves on to the next port. It
+/// also stops another process from claiming one address on our port later.
+/// A restart still gets its port back while the last run's connections sit
+/// in TIME_WAIT (checked on Windows 11).
+///
+/// Elsewhere this matches `TcpListener::bind`: `SO_REUSEADDR`, so a restart
+/// can rebind past TIME_WAIT.
+#[cfg(feature = "inbound-seeding")]
+fn bind_owned_listener(addr: std::net::SocketAddr) -> std::io::Result<tokio::net::TcpListener> {
+    let socket = tokio::net::TcpSocket::new_v4()?;
+    #[cfg(windows)]
+    set_exclusive_address_use(&socket)?;
+    #[cfg(not(windows))]
+    socket.set_reuseaddr(true)?;
+    #[cfg(windows)]
+    socket.bind(addr).map_err(taken_port_is_in_use)?;
+    #[cfg(not(windows))]
+    socket.bind(addr)?;
+    socket.listen(1024)
+}
+
+/// Windows refuses a bind with WSAEACCES, not WSAEADDRINUSE, when another
+/// socket holds the port exclusively (a second node bound to `0.0.0.0` while
+/// we want `127.0.0.1`), or when the port sits in a range Windows reserved
+/// (Hyper-V and WSL reserve ranges). Either way the port is taken, so report
+/// it as in use and let `bind_seed_port` try the next one.
+#[cfg(all(windows, feature = "inbound-seeding"))]
+fn taken_port_is_in_use(error: std::io::Error) -> std::io::Error {
+    if error.raw_os_error() == Some(windows_sys::Win32::Networking::WinSock::WSAEACCES) {
+        std::io::Error::new(std::io::ErrorKind::AddrInUse, error)
+    } else {
+        error
+    }
+}
+
+#[cfg(all(windows, feature = "inbound-seeding"))]
+fn set_exclusive_address_use(socket: &tokio::net::TcpSocket) -> std::io::Result<()> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        setsockopt, WSAGetLastError, SOCKET, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+    };
+    let enable: i32 = 1;
+    // SAFETY: the socket handle stays open for the call, and the option value
+    // is a 4-byte BOOL that outlives it.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    let result = unsafe {
+        setsockopt(
+            socket.as_raw_socket() as SOCKET,
+            SOL_SOCKET,
+            SO_EXCLUSIVEADDRUSE,
+            (&enable as *const i32).cast(),
+            std::mem::size_of::<i32>() as i32,
+        )
+    };
+    if result == 0 {
+        return Ok(());
+    }
+    // SAFETY: reads this thread's last Winsock error; no arguments.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    Err(std::io::Error::from_raw_os_error(unsafe { WSAGetLastError() }))
 }
 
 #[cfg(feature = "inbound-seeding")]
@@ -1816,15 +1887,18 @@ mod seed_binding_tests {
     use super::*;
 
     async fn reserve_consecutive_ports(count: u16, clearnet: bool) -> Vec<tokio::net::TcpListener> {
-        let host = if clearnet { "0.0.0.0" } else { "127.0.0.1" };
+        let host = if clearnet { std::net::Ipv4Addr::UNSPECIFIED } else { std::net::Ipv4Addr::LOCALHOST };
+        // Reserve the way the node binds. A plain bind on Windows would let a
+        // parallel test take the same port on another address.
+        let reserve = |port| bind_owned_listener(std::net::SocketAddrV4::new(host, port).into());
         for _ in 0..100 {
-            let first = tokio::net::TcpListener::bind((host, 0)).await.unwrap();
+            let first = reserve(0).unwrap();
             let base = first.local_addr().unwrap().port();
             let Some(end) = base.checked_add(count - 1) else { continue };
             if base <= 43113 && end >= 43110 { continue; }
             let mut listeners = vec![first];
             for port in base + 1..=end {
-                match tokio::net::TcpListener::bind((host, port)).await {
+                match reserve(port) {
                     Ok(listener) => listeners.push(listener),
                     Err(_) => break,
                 }
@@ -1849,6 +1923,54 @@ mod seed_binding_tests {
     async fn clearnet_seed_listener_accepts_external_interfaces() {
         let listener = bind_seed_listener(0, true).await.unwrap();
         assert!(listener.local_addr().unwrap().ip().is_unspecified());
+    }
+
+    /// Another process holding our port on loopback only (WSL's relay holds
+    /// `127.0.0.1:<port>`) means the port is taken. Windows let the wildcard
+    /// bind share it until the listener asked for exclusive use. macOS is
+    /// left out: BSD `SO_REUSEADDR` rules still allow the shared bind there.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn clearnet_seed_listener_skips_a_port_held_on_loopback() {
+        // Plain loopback-only listener, like WSL's relay. The OS picks the
+        // port, so no other test can be holding it. The node may land on any
+        // later port (parallel tests take ports too), never on this one.
+        let holder = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let held = holder.local_addr().unwrap().port();
+        let listener = bind_seed_listener(held, true).await.unwrap();
+        assert!(listener.local_addr().unwrap().port() > held, "shared the held port {held}");
+    }
+
+    /// Two nodes on one machine: a clearnet node owns the port on every
+    /// interface, and a Tor-Always node then binds loopback. Windows refuses
+    /// that bind with WSAEACCES, which must still move it to a later port
+    /// instead of failing the file server.
+    #[cfg(any(windows, target_os = "linux"))]
+    #[tokio::test]
+    async fn loopback_seed_listener_skips_a_port_owned_on_every_interface() {
+        let clearnet_node = bind_seed_listener(0, true).await.unwrap();
+        let owned = clearnet_node.local_addr().unwrap().port();
+        let listener = bind_seed_listener(owned, false).await.unwrap();
+        assert!(listener.local_addr().unwrap().port() > owned, "shared the owned port {owned}");
+    }
+
+    /// A restart must get its port back while the last run's connections sit
+    /// in TIME_WAIT. Otherwise every restart would move up one port.
+    #[tokio::test]
+    async fn seed_listener_rebinds_its_port_after_serving_a_connection() {
+        let first = bind_seed_listener(0, true).await.unwrap();
+        let port = first.local_addr().unwrap().port();
+        let client = tokio::net::TcpStream::connect(("127.0.0.1", port)).await.unwrap();
+        let (served, _) = first.accept().await.unwrap();
+        // The server side closes first, so it is the side left in TIME_WAIT.
+        // Let the close settle while the listener still holds the port, then
+        // rebind at once so no parallel test can take it in between.
+        drop(served);
+        drop(client);
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        drop(first);
+        let again = bind_seed_listener(port, true).await.unwrap();
+        assert_eq!(again.local_addr().unwrap().port(), port);
     }
 
     #[tokio::test]
@@ -1930,7 +2052,7 @@ mod seed_binding_tests {
     async fn startup_publishes_the_bound_port_before_returning() {
         let mut reserved = reserve_consecutive_ports(2, true).await;
         let occupied_port = reserved[0].local_addr().unwrap().port();
-        drop(reserved.pop());
+        let mut next_port = reserved.pop();
         for requested in [occupied_port, 0] {
             let data = tempfile::tempdir().unwrap();
             let state = AppState::with_data_dir("seed-port-test", data.path());
@@ -1944,6 +2066,10 @@ mod seed_binding_tests {
                     ..Default::default()
                 },
             );
+            // Free the next port only now. Tests run in parallel, and Windows
+            // hands out ephemeral ports nearly in order, so a port freed
+            // earlier often goes to another test before the runtime binds.
+            drop(next_port.take());
             runtime.start().await.unwrap();
             let actual = state.fileserver_port().await;
             assert_ne!(actual, 0);
@@ -1952,7 +2078,13 @@ mod seed_binding_tests {
             }
             assert_eq!(state.self_advert().await.port, actual);
             let conflict = tokio::net::TcpListener::bind(("127.0.0.1", actual)).await;
-            assert_eq!(conflict.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+            // Windows refuses a bind on an exclusively held port with WSAEACCES.
+            let refused = if cfg!(windows) {
+                std::io::ErrorKind::PermissionDenied
+            } else {
+                std::io::ErrorKind::AddrInUse
+            };
+            assert_eq!(conflict.unwrap_err().kind(), refused);
             // These assertions need no peer or router traffic. Stop tasks
             // before yielding to their network setup on the test runtime.
             for handle in &runtime.handles {
