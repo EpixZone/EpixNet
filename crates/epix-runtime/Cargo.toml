@@ -38,6 +38,10 @@ igd-next = { version = "0.18", features = ["aio_tokio"], optional = true }
 # Dial-back port checking (the Python client's PeerPortchecker services).
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "socks"], optional = true }
 
+[target.'cfg(windows)'.dependencies]
+# SO_EXCLUSIVEADDRUSE for the file-server listener (socket2 has no setter).
+windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
+
 [features]
 default = ["local-discovery", "inbound-seeding"]
 # LAN peer discovery over UDP broadcast (AnnounceLocal). Compiled into every
