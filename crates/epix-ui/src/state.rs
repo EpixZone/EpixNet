@@ -4440,16 +4440,18 @@ pub struct AppState {
     /// Actual bound TCP listener, independent of the overlay virtual port.
     /// Absent on download-only/mobile nodes and until the accept loop is ready.
     clearnet_listener: RwLock<Option<std::net::SocketAddr>>,
-    /// UPnP: whether the fileserver port is currently open to the internet, and
-    /// the node's external IP if known. Set by the runtime's UPnP loop; read by
-    /// `serverInfo`. Default closed / unknown.
-    port_opened: RwLock<bool>,
-    ip_external: RwLock<Option<String>>,
-    /// Tor: whether the in-process Arti client is up, its status string
-    /// (`OK`/`Always`/`Disabled`), and our onion address once the service
-    /// publishes. Set by the runtime's Tor loop; read by `serverInfo`.
-    tor_enabled: RwLock<bool>,
-    tor_status: RwLock<String>,
+    /// UPnP: `(port_opened, ip_external)`. Whether the fileserver port is
+    /// currently open to the internet, and the node's external IP if known.
+    /// Set by the runtime's UPnP loop; read by `serverInfo`. Default closed /
+    /// unknown. One lock, so a reader never sees half of an update.
+    port_reachability: RwLock<(bool, Option<String>)>,
+    /// Tor: `(enabled, status)`. Whether the in-process Arti client is up and
+    /// its status string (`OK`/`Always`/`Disabled`). Set by the runtime's Tor
+    /// loop; read by `serverInfo`. Keep this ONE lock: as two locks, the
+    /// reader and the writer took them in opposite orders, and an overlapping
+    /// read and write deadlocked every later reader, `serverInfo` included.
+    tor_state: RwLock<(bool, String)>,
+    /// Our onion address and the local SOCKS port, once the runtime has them.
     tor_socks_port: RwLock<Option<u16>>,
     onion_address: RwLock<Option<String>>,
     /// Signer for tracker onion-ownership challenges (`onion_sign_this`),
@@ -5822,10 +5824,8 @@ impl AppState {
             boot_peers: std::sync::Mutex::new(None),
             fileserver_port: RwLock::new(0),
             clearnet_listener: RwLock::new(None),
-            port_opened: RwLock::new(false),
-            ip_external: RwLock::new(None),
-            tor_enabled: RwLock::new(false),
-            tor_status: RwLock::new("Disabled".to_string()),
+            port_reachability: RwLock::new((false, None)),
+            tor_state: RwLock::new((false, "Disabled".to_string())),
             tor_socks_port: RwLock::new(None),
             onion_address: RwLock::new(None),
             onion_signer: RwLock::new(None),
@@ -10327,12 +10327,11 @@ impl AppState {
     /// the internet and the node's external IP, if known.
     pub async fn set_port_status(&self, opened: bool, ip_external: Option<String>) {
         let changed = {
-            let mut cur = self.port_opened.write().await;
-            let was = *cur;
-            *cur = opened;
+            let mut cur = self.port_reachability.write().await;
+            let was = cur.0;
+            *cur = (opened, ip_external);
             was != opened
         };
-        *self.ip_external.write().await = ip_external;
         // Outbound handshakes advertise clearnet reachability (Phase 6); keep
         // the advert in sync with every confirmation path (inbound peer,
         // port check, UPnP, ip_external config) - and with regressions.
@@ -10345,19 +10344,16 @@ impl AppState {
 
     /// The fileserver's reachability for `serverInfo`: `(port_opened, ip_external)`.
     pub async fn port_status(&self) -> (bool, Option<String>) {
-        (*self.port_opened.read().await, self.ip_external.read().await.clone(),
-        )
+        self.port_reachability.read().await.clone()
     }
 
     /// Record the in-process Tor client's state, for `serverInfo`. `status` is
     /// the human string EpixNet shows (`OK`/`Always`/`Disabled`).
     pub async fn set_tor_status(&self, enabled: bool, status: &str) {
         let changed = {
-            let mut cur = self.tor_status.write().await;
-            let was = cur.clone();
-            *self.tor_enabled.write().await = enabled;
-            *cur = status.to_string();
-            was != status
+            let mut cur = self.tor_state.write().await;
+            let was = std::mem::replace(&mut *cur, (enabled, status.to_string()));
+            was.1 != status
         };
         // The dashboard shows the Tor state live (serverChanged).
         if changed {
@@ -10385,8 +10381,7 @@ impl AppState {
 
     /// Tor state for `serverInfo`: `(enabled, status)`.
     pub async fn tor_status(&self) -> (bool, String) {
-        (*self.tor_enabled.read().await, self.tor_status.read().await.clone(),
-        )
+        self.tor_state.read().await.clone()
     }
 
     /// The loopback SOCKS socket actually owned by this runtime. Availability
@@ -51436,6 +51431,47 @@ mod tests {
         let payload: Value = serde_json::from_str(&ev.payload).unwrap();
         assert_eq!(payload["cmd"], "setServerInfo");
         assert!(payload["params"]["version"].is_string());
+    }
+
+    /// Reading the Tor state while the runtime writes it must never wedge.
+    /// The state used to sit in two locks that `tor_status()` and
+    /// `set_tor_status` took in opposite orders. A read that overlapped a
+    /// write could block both forever, and every later reader (`serverInfo`,
+    /// the announce loop, `/EpixNet-Internal/Status`) queued behind them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tor_status_reads_never_deadlock_against_writes() {
+        const ROUNDS: usize = 20_000;
+        let s = AppState::new("test");
+        s.set_tor_status(false, "OK").await;
+        // The status stays "OK", so no write triggers the serverInfo push.
+        // Every write still takes the lock(s), as fast as the loop can go.
+        let writer = {
+            let s = s.clone();
+            tokio::spawn(async move {
+                for round in 0..ROUNDS {
+                    s.set_tor_status(round % 2 == 0, "OK").await;
+                }
+            })
+        };
+        let readers: Vec<_> = (0..3)
+            .map(|_| {
+                let s = s.clone();
+                tokio::spawn(async move {
+                    for _ in 0..ROUNDS {
+                        assert_eq!(s.tor_status().await.1, "OK");
+                    }
+                })
+            })
+            .collect();
+        let finished = async {
+            writer.await.unwrap();
+            for reader in readers {
+                reader.await.unwrap();
+            }
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), finished)
+            .await
+            .expect("Tor state reads and writes deadlocked");
     }
 
     #[tokio::test]
