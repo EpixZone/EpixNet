@@ -40,10 +40,25 @@ fn build_worker_binary() -> PathBuf {
     if !cfg!(debug_assertions) {
         command.arg("--release");
     }
-    assert!(command.status().expect("cargo build -p evx-worker").success());
-    let exe = std::env::current_exe().unwrap();
-    let built = exe.parent().unwrap().parent().unwrap().join(format!("evx-worker{}", std::env::consts::EXE_SUFFIX));
-    private_worker_copy(&built)
+    private_worker_copy(&built_executable(command, "evx-worker"))
+}
+
+/// Run a nested `cargo build` and return the executable it reports for
+/// `name`. Since Rust 1.100 test binaries no longer live in
+/// `target/<profile>/deps`, so the path cannot be derived from this one.
+fn built_executable(mut command: std::process::Command, name: &str) -> PathBuf {
+    let output = command
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
+    assert!(output.status.success(), "building {name} failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| message["reason"] == "compiler-artifact" && message["target"]["name"] == name)
+        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| panic!("cargo build reported no executable for {name}"))
 }
 
 /// Cargo hard-links the uplifted worker to its `deps/` copy, and the Windows

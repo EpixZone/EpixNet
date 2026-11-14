@@ -31,7 +31,7 @@ CARGO_NET_OFFLINE=true cargo +nightly-2026-10-03 fuzz run lifecycle_metadata --f
 
 `cargo-fuzz 0.13.2` has no `run --locked` option. The locked fetch verifies the separate fuzz lockfile before an offline run. AddressSanitizer, debug assertions and overflow checks are enabled by cargo-fuzz by default. `CARGO_BUILD_JOBS=2` was used for the recorded builds. Fuzz time bounds exclude compilation time. For a smaller CI smoke run, also pass `-runs=10000`; that stops at the first reached run or time limit.
 
-This directory is a separate Cargo workspace. Its lockfile pins dependencies without altering the application's workspace configuration. Wasmtime is pinned by `evx-runtime` to `48.0.8`; the validator uses wasmparser `0.254.2`.
+This directory is a separate Cargo workspace. Its lockfile pins dependencies without altering the application's workspace configuration. Wasmtime is pinned by `evx-runtime` to `50.0.1`; the validator uses wasmparser `0.261.0`.
 The current lockfile aligns shared package versions, sources and checksums
 with the application lockfile. `python3 scripts/check-evx-fuzz-lock.py` checks
 that identity in CI; it does not claim identical feature selection. CI preserves

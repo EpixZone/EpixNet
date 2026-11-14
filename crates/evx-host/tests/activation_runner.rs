@@ -20,8 +20,8 @@ const QUARANTINE_WORKER: &str = "EVX_COMPILER_QUARANTINE_FIXTURE";
 
 const CALC: &str = r#"(module (memory (export "memory") 1) (func (export "run") (result i32) i32.const 19 i32.const 23 i32.add))"#;
 
-/// Build and locate `evx-worker` relative to this test binary's target dir;
-/// the build is a no-op when fresh and never serves a stale worker.
+/// Build `evx-worker` and locate it from Cargo's own report; the build is a
+/// no-op when fresh and never serves a stale worker.
 fn worker_binary() -> PathBuf {
     static PATH: OnceLock<PathBuf> = OnceLock::new();
     PATH.get_or_init(|| {
@@ -43,15 +43,29 @@ fn worker_binary() -> PathBuf {
         if !cfg!(debug_assertions) {
             command.arg("--release");
         }
-        assert!(command
-            .status()
-            .expect("cargo build -p evx-worker")
-            .success());
-        let exe = std::env::current_exe().unwrap();
-        let profile_dir = exe.parent().and_then(std::path::Path::parent).unwrap();
-        std::fs::canonicalize(profile_dir.join("evx-worker")).unwrap()
+        std::fs::canonicalize(built_executable(command, "evx-worker")).unwrap()
     })
     .clone()
+}
+
+/// Run a nested `cargo build` and return the executable it reports for
+/// `name`. Since Rust 1.100 test binaries no longer live in
+/// `target/<profile>/deps`, so the path cannot be derived from this one.
+fn built_executable(mut command: std::process::Command, name: &str) -> PathBuf {
+    let output = command
+        .arg("--message-format=json-render-diagnostics")
+        .stderr(std::process::Stdio::inherit())
+        .output()
+        .unwrap_or_else(|e| panic!("cargo build {name}: {e}"));
+    assert!(output.status.success(), "building {name} failed");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|message| {
+            message["reason"] == "compiler-artifact" && message["target"]["name"] == name
+        })
+        .find_map(|message| message["executable"].as_str().map(PathBuf::from))
+        .unwrap_or_else(|| panic!("cargo build reported no executable for {name}"))
 }
 
 fn call_wat(request: serde_json::Value) -> String {
@@ -402,19 +416,11 @@ fn text_parsing_is_deferred_to_the_confined_compiler() {
 fn revocation_cancels_an_active_compiler() {
     let mut h = Harness::new();
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
-    assert!(std::process::Command::new(cargo)
+    let mut command = std::process::Command::new(cargo);
+    command
         .args(["build", "-p", "evx-supervisor", "--example", "hostile_peer"])
-        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."))
-        .status()
-        .unwrap()
-        .success());
-    let exe = std::env::current_exe().unwrap();
-    h.config.worker_binary = exe
-        .parent()
-        .unwrap()
-        .parent()
-        .unwrap()
-        .join("examples/hostile_peer");
+        .current_dir(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../.."));
+    h.config.worker_binary = built_executable(command, "hostile_peer");
     h.config.worker_args = vec!["unread_init".into()];
     let changed = std::sync::Mutex::new(None);
     let outcome = std::thread::scope(|scope| {

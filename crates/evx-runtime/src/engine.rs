@@ -13,7 +13,7 @@ use crate::features;
 /// Identity of the engine an artifact is bound to. Change `CONFIG_REVISION`
 /// whenever [`engine_config`] changes in a way that affects compiled output.
 const CONFIG_REVISION: u32 = 2;
-const WASMTIME_VERSION: &str = "49.0.5";
+const WASMTIME_VERSION: &str = "50.0.1";
 
 /// Stable key for artifact caches and for the worker's refusal to load an
 /// artifact produced under a different engine or configuration.
