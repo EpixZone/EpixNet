@@ -61,6 +61,44 @@ fn tor_clearnet_setting(data_root: &Path) -> Option<bool> {
         .and_then(|v| v.get("tor_clearnet").and_then(|t| t.as_bool()))
 }
 
+/// What `write_profile` needs to write the managed profile again. The tray
+/// keeps it so a browser reopened without a node restart starts on the current
+/// clearnet route.
+#[derive(Clone)]
+pub struct ProfileRoutes {
+    data_root: PathBuf,
+    proxy_addr: SocketAddr,
+    socks_addr: SocketAddr,
+    eepsite_addr: SocketAddr,
+    display: String,
+    secure: bool,
+    tor_on: bool,
+    ext_capable: bool,
+}
+
+impl ProfileRoutes {
+    /// Rewrite the PAC and prefs with the saved "route clearnet through Tor"
+    /// choice. Firefox reads the file PAC when it starts, and the wallet's live
+    /// routing takes over only once its background page has started. Without
+    /// this, a browser reopened after the user turned Tor routing on would send
+    /// its first clearnet requests on the route chosen when the node booted.
+    pub fn refresh(&self, profile: &Path) {
+        let tor_clearnet = self.tor_on && tor_clearnet_setting(&self.data_root).unwrap_or(true);
+        if let Err(e) = write_profile(
+            profile,
+            self.proxy_addr,
+            self.socks_addr,
+            self.eepsite_addr,
+            &self.display,
+            self.secure,
+            tor_clearnet,
+            self.ext_capable,
+        ) {
+            eprintln!("· could not refresh the browser profile routes: {e}");
+        }
+    }
+}
+
 /// Everything the tray needs once the node is up and the browser has launched.
 pub struct Ready {
     pub state: Arc<epix_ui::AppState>,
@@ -68,6 +106,8 @@ pub struct Ready {
     pub display: String,
     pub firefox: PathBuf,
     pub profile: PathBuf,
+    /// Rewrites the profile's routes before the tray opens a fresh browser.
+    pub routes: ProfileRoutes,
     pub addon_credentials: epix_ui::addon_broker::AddonLaunchCredentials,
     pub start_url: String,
     /// The scheme the managed browser uses (`https` with a trusted CA, else
@@ -436,6 +476,16 @@ async fn boot(
 
     let ready = Ready {
         state: running.state.clone(),
+        routes: ProfileRoutes {
+            data_root,
+            proxy_addr,
+            socks_addr,
+            eepsite_addr,
+            display: display.clone(),
+            secure,
+            tor_on,
+            ext_capable,
+        },
         display,
         firefox,
         profile,
@@ -1403,6 +1453,47 @@ async fn wait_for_port(addr: SocketAddr, timeout: Duration) -> bool {
 #[cfg(test)]
 mod startup_tests {
     use super::*;
+
+    #[test]
+    fn reopening_the_browser_rewrites_the_clearnet_route() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = root.path().join("firefox-profile");
+        let routes = ProfileRoutes {
+            data_root: root.path().to_path_buf(),
+            proxy_addr: "127.0.0.1:43112".parse().unwrap(),
+            socks_addr: "127.0.0.1:43111".parse().unwrap(),
+            eepsite_addr: "127.0.0.1:43113".parse().unwrap(),
+            display: "dashboard.epix".into(),
+            secure: true,
+            tor_on: true,
+            ext_capable: true,
+        };
+        let save = |on: bool| {
+            std::fs::write(root.path().join("browser-settings.json"), format!("{{\"tor_clearnet\":{on}}}")).unwrap()
+        };
+        // The PAC's last rule is the general clearnet route.
+        let clearnet = || {
+            let pac = std::fs::read_to_string(profile.join("epix.pac")).unwrap();
+            pac.lines().map(str::trim).rfind(|line| line.starts_with("return")).unwrap().to_string()
+        };
+
+        // The node booted with clearnet going direct.
+        save(false);
+        routes.refresh(&profile);
+        assert_eq!(clearnet(), "return \"DIRECT\";");
+
+        // The user turns Tor routing on in the wallet, closes the window and
+        // reopens it from the tray. The new browser must start on Tor.
+        save(true);
+        routes.refresh(&profile);
+        assert_eq!(clearnet(), "return \"SOCKS5 127.0.0.1:43111\";");
+        assert!(profile.join("user.js").exists());
+
+        // With Tor off for this run the SOCKS listener refuses traffic, so the
+        // saved choice must not select it.
+        ProfileRoutes { tor_on: false, ..routes.clone() }.refresh(&profile);
+        assert_eq!(clearnet(), "return \"DIRECT\";");
+    }
 
     #[cfg(unix)]
     #[tokio::test]

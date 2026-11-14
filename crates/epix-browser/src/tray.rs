@@ -98,6 +98,7 @@ pub(crate) struct Session {
     child: Option<Child>,
     firefox: PathBuf,
     profile: PathBuf,
+    routes: crate::ProfileRoutes,
     addon_credentials: epix_ui::addon_broker::AddonLaunchCredentials,
     start_url: String,
     scheme: String,
@@ -141,6 +142,7 @@ impl Session {
             child: ctx.child,
             firefox: ctx.ready.firefox,
             profile: ctx.ready.profile,
+            routes: ctx.ready.routes,
             addon_credentials: ctx.ready.addon_credentials,
             start_url: ctx.ready.start_url,
             scheme: ctx.ready.scheme,
@@ -169,7 +171,7 @@ impl Session {
             match request {
                 crate::ipc::Request::Open(arg) => {
                     let url = target_url(&self.scheme, &arg);
-                    reopen_browser(&mut self.child, &self.firefox, &self.profile, &url, &self.addon_credentials, &self.handles.open_item);
+                    reopen_browser(&mut self.child, &self.firefox, &self.profile, &self.routes, &url, &self.addon_credentials, &self.handles.open_item);
                 }
                 // `epix-browser --quit` (the installer, a script): the same
                 // exit as the tray's Quit item, browser first.
@@ -188,6 +190,7 @@ impl Session {
                 &mut self.child,
                 &self.firefox,
                 &self.profile,
+                &self.routes,
                 &self.start_url,
                 &self.addon_credentials,
             ) {
@@ -309,6 +312,7 @@ fn on_menu_event(
     child: &mut Option<Child>,
     firefox: &Path,
     profile: &Path,
+    routes: &crate::ProfileRoutes,
     start_url: &str,
     credentials: &epix_ui::addon_broker::AddonLaunchCredentials,
 ) -> bool {
@@ -319,7 +323,7 @@ fn on_menu_event(
         return true;
     }
     if ev.id == handles.open {
-        reopen_browser(child, firefox, profile, start_url, credentials, &handles.open_item);
+        reopen_browser(child, firefox, profile, routes, start_url, credentials, &handles.open_item);
     } else if ev.id == handles.autostart {
         // Toggle "open at login", then reflect the real state back onto the
         // checkbox (a failed write leaves it where it was).
@@ -532,7 +536,7 @@ fn target_url(scheme: &str, arg: &str) -> String {
 /// Reopen the browser from the tray. Starts a fresh managed instance when there
 /// is no window (background mode, or the previous one was closed); if one is
 /// still running, asks Firefox (remote) to raise it - best-effort.
-fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url: &str, credentials: &epix_ui::addon_broker::AddonLaunchCredentials, open_item: &MenuItem) {
+fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, routes: &crate::ProfileRoutes, url: &str, credentials: &epix_ui::addon_broker::AddonLaunchCredentials, open_item: &MenuItem) {
     if let Err(error) = crate::addons::preflight(firefox, profile, credentials.profile_id()) {
         eprintln!("Could not reopen Epix Browser: {error}");
         open_item.set_text(format!("Browser blocked: {error}"));
@@ -540,6 +544,8 @@ fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, url
     }
     open_item.set_text("Open EpixNet");
     let spawn_fresh = |child: &mut Option<Child>| {
+        // The clearnet route may have changed since the node booted.
+        routes.refresh(profile);
         // Query again on the tray thread: Gamescope's resolution can change while closed.
         let window_size = crate::browser_process::gamescope_window_size();
         let mut cmd = crate::browser_process::browser_command(firefox, profile, window_size);

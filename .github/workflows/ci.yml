@@ -177,6 +177,7 @@ jobs:
           python3 scripts/test_android_native.py
           python3 scripts/test_mobile_wallet.py
           node --test crates/epix-browser/tests/pac-routing.test.cjs
+          node --test crates/epix-browser/tests/urlbar.test.cjs
           node --test packaging/firefox-addons/tests/*.test.mjs
           node --test ui/tests/*.test.cjs
       # Run the deterministic crypto vectors (sslcrypto + Python interop), so a
