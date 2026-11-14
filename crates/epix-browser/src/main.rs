@@ -254,7 +254,7 @@ async fn boot(
     background: bool,
     progress: startup::Progress,
     window_size: Option<browser_process::BrowserWindowSize>,
-) -> Result<(Ready, Option<std::process::Child>), String> {
+) -> Result<(Ready, Option<browser_process::BrowserChild>), String> {
     let target = epix_node::parse_target(raw_arg);
     progress.report(startup::Stage::Preparing);
     // Armed before the node starts its network loops. It ends once the first
@@ -453,7 +453,7 @@ async fn boot(
 /// not confirm its window. Slow starts can continue with the node and tray up.
 #[cfg(windows)]
 async fn wait_for_native_browser_window(
-    child: &mut Option<std::process::Child>,
+    child: &mut Option<browser_process::BrowserChild>,
     deadline: Duration,
 ) -> Result<(), String> {
     let child = child.as_mut().ok_or("Epix Browser did not start.")?;
@@ -476,7 +476,7 @@ async fn wait_for_native_browser_window(
 
 async fn wait_for_browser_window(
     handoff: &mut startup_handoff::BrowserHandoff,
-    child: &mut Option<std::process::Child>,
+    child: &mut Option<browser_process::BrowserChild>,
     deadline: Duration,
 ) -> Result<(), String> {
     let result = tokio::time::timeout(deadline, handoff.wait())
@@ -621,7 +621,8 @@ fn ensure_ca_imported(profile: &Path, firefox: &Path, ca: &LocalCa, credentials:
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn();
-        let Ok(mut child) = child else { break };
+        let Ok(child) = child else { break };
+        let mut child = browser_process::BrowserChild::spawned(child, profile);
         // Bounded wait: a screenshot run exits by itself in a few seconds; a
         // wedged one is killed so boot can't hang here.
         let deadline = std::time::Instant::now() + Duration::from_secs(45);
@@ -714,7 +715,7 @@ fn launch_browser(
     start_url: &str,
     window_size: Option<browser_process::BrowserWindowSize>,
     credentials: &epix_ui::addon_broker::AddonLaunchCredentials,
-) -> Result<Option<std::process::Child>, String> {
+) -> Result<Option<browser_process::BrowserChild>, String> {
     if background {
         println!("· background mode: node + tray up, no browser window");
         return Ok(None);
@@ -724,12 +725,17 @@ fn launch_browser(
     let mut cmd = browser_process::browser_command(firefox, profile, window_size);
     credentials.configure_command(&mut cmd);
     match cmd.arg(start_url).spawn() {
-        Ok(mut child) => {
+        Ok(child) => {
+            let mut child = browser_process::BrowserChild::spawned(child, profile);
             // `--no-remote --new-instance` on a profile another Firefox already
             // holds exits at once (no window). Catch that quick exit so it is a
             // clear log line instead of a tray with no browser - the usual
             // cause is a previous EpixNet that was force-killed, orphaning its
             // Firefox, which still locks the profile.
+            //
+            // A Firefox that exits to apply an update is not that case:
+            // `try_wait` keeps reporting it as running, and follows it to the
+            // Firefox its updater starts.
             std::thread::sleep(Duration::from_millis(700));
             if let Ok(Some(status)) = child.try_wait() {
                 return Err(early_exit_message(firefox, status));
@@ -1410,7 +1416,10 @@ mod startup_tests {
         let mut handoff = startup_handoff::BrowserHandoff::start("http://dashboard.epix/".into())
             .await
             .unwrap();
-        let mut child = Some(Command::new("/bin/sleep").arg("30").spawn().unwrap());
+        let mut child = Some(browser_process::BrowserChild::spawned(
+            Command::new("/bin/sleep").arg("30").spawn().unwrap(),
+            Path::new("profile"),
+        ));
         let result = wait_for_browser_window(&mut handoff, &mut child, Duration::from_millis(30)).await;
         let reaped = child.as_mut().unwrap().try_wait().unwrap().is_some();
         // Clean up the fixture even when the regression assertion fails.
@@ -1427,8 +1436,11 @@ mod startup_tests {
         let profile = tempfile::tempdir().unwrap();
         std::fs::write(profile.path().join("user.js"),
             "user_pref(\"browser.aboutwelcome.enabled\", false);\nuser_pref(\"browser.shell.checkDefaultBrowser\", false);\n").unwrap();
-        let mut child = Some(browser_process::browser_command(&firefox, profile.path(), None)
-            .arg("about:blank").spawn().unwrap());
+        let mut child = Some(browser_process::BrowserChild::spawned(
+            browser_process::browser_command(&firefox, profile.path(), None)
+                .arg("about:blank").spawn().unwrap(),
+            profile.path(),
+        ));
         let result = wait_for_native_browser_window(&mut child, Duration::from_secs(20)).await;
         let visible = !browser_process::visible_windows(child.as_mut().unwrap()).is_empty();
         // Firefox can expose its window before it services icon messages.
@@ -1491,7 +1503,7 @@ mod startup_tests {
         let mut process = Command::new("cmd.exe").args(["/C", "exit", "7"])
             .creation_flags(0x08000000).spawn().unwrap();
         process.wait().unwrap();
-        let mut child = Some(process);
+        let mut child = Some(browser_process::BrowserChild::spawned(process, Path::new("profile")));
         let result = wait_for_native_browser_window(&mut child, Duration::from_secs(1)).await;
         assert!(result.unwrap_err().contains("closed during startup"));
     }
@@ -1500,10 +1512,13 @@ mod startup_tests {
     #[tokio::test]
     async fn native_detection_timeout_preserves_a_live_owned_process() {
         use std::os::windows::process::CommandExt;
-        let mut child = Some(Command::new("ping.exe")
-            .args(["-n", "30", "127.0.0.1"])
-            .creation_flags(0x08000000)
-            .stdout(std::process::Stdio::null()).spawn().unwrap());
+        let mut child = Some(browser_process::BrowserChild::spawned(
+            Command::new("ping.exe")
+                .args(["-n", "30", "127.0.0.1"])
+                .creation_flags(0x08000000)
+                .stdout(std::process::Stdio::null()).spawn().unwrap(),
+            Path::new("profile"),
+        ));
         let result = wait_for_native_browser_window(&mut child, Duration::ZERO).await;
         let alive = child.as_mut().unwrap().try_wait().unwrap().is_none();
         tray::close_browser(&mut child);
