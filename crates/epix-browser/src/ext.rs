@@ -44,8 +44,8 @@ static WALLET_TOOLBAR_48: &[u8] = include_bytes!("../assets/wallet-toolbar-48.pn
 /// transform, JS patches) but the wallet build itself does not. Folded into the
 /// version stamp so an otherwise-unchanged wallet still repacks and reloads once,
 /// picking up the new packing.
-// Version 13 restores URL-bar integration in minified wallet background pages.
-const WALLET_PACK_VERSION: u32 = 13;
+// Version 14 adds the URL-bar listener after the background page has started.
+const WALLET_PACK_VERSION: u32 = 14;
 
 /// The extension id (must match the wallet `manifest.json`'s Firefox gecko id).
 pub const EXT_ID: &str = "wallet@epix.zone";
@@ -384,38 +384,12 @@ fn patch_wallet_js(contents: &[u8]) -> Vec<u8> {
 /// the address. A second branch rewrites main-frame navigations whose HOST is
 /// a bare address (a clicked `https://epix1…/…` link, or a hand-typed URL) to
 /// the same alias, preserving path and query.
-const EPIX_URLBAR_JS: &[u8] = concat!(
-    "// Managed by epix-browser (added at pack time).\n",
-    "(() => {\n",
-    "  const api = globalThis.browser || globalThis.chrome;\n",
-    "  if (!api || !api.webRequest) return;\n",
-    "  const ADDR = /^epix1[a-z0-9]{20,80}$/;\n",
-    "  // Search-term query keys: q (DuckDuckGo/Google/Bing/Brave/Ecosia/Startpage),\n",
-    "  // p (Yahoo), query (some engines), wd (Baidu), text (Yandex), eq/kw (misc).\n",
-    "  const KEYS = [\"q\", \"query\", \"p\", \"text\", \"wd\", \"eq\", \"kw\"];\n",
-    "  api.webRequest.onBeforeRequest.addListener(\n",
-    "    (details) => {\n",
-    "      try {\n",
-    "        const u = new URL(details.url);\n",
-    "        // A bare-address HOST navigates to its dotted alias, keeping\n",
-    "        // path + query (clicked links, typed https://epix1.../ URLs).\n",
-    "        if (ADDR.test(u.hostname)) {\n",
-    "          return { redirectUrl: \"https://\" + u.hostname + \".epix\" + u.pathname + u.search };\n",
-    "        }\n",
-    "        // A search whose term is a bare address goes to the xite.\n",
-    "        for (const k of KEYS) {\n",
-    "          const v = (u.searchParams.get(k) || \"\").trim();\n",
-    "          if (ADDR.test(v)) return { redirectUrl: \"https://\" + v + \".epix/\" };\n",
-    "        }\n",
-    "      } catch (_) {}\n",
-    "      return {};\n",
-    "    },\n",
-    "    { urls: [\"*://*/*\"], types: [\"main_frame\"] },\n",
-    "    [\"blocking\"]\n",
-    "  );\n",
-    "})();\n",
-)
-.as_bytes();
+///
+/// The listener is added once the background page has started, not while it
+/// loads. Firefox records a blocking listener added during the load and, at the
+/// next browser start, holds every request it matches until the page has
+/// loaded again. For a main-frame filter that is the first page itself.
+const EPIX_URLBAR_JS: &[u8] = include_bytes!("../assets/epix-urlbar.js");
 
 /// Add the URL-bar script to the wallet's background page, right after the
 /// polyfill so it registers before the wallet's own bundles. Accept the quoted
@@ -1177,6 +1151,9 @@ mod tests {
         assert!(js.contains("^epix1[a-z0-9]{20,80}$"), "exact bech32 match");
         assert!(js.contains(".epix/"), "search terms go to the dotted alias, never a dotless host");
         assert!(js.contains("u.hostname + \".epix\""), "bare-address hosts rewrite to the alias");
+        // Behavior, including when the listener is added, is covered by
+        // tests/urlbar.test.cjs.
+        assert!(js.contains("onStartup"), "the listener waits for the background page to start");
     }
 
     #[test]
