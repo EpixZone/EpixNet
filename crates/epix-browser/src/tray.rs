@@ -184,16 +184,18 @@ impl Session {
         }
 
         while let Ok(ev) = MenuEvent::receiver().try_recv() {
-            if on_menu_event(
-                &ev,
-                &self.handles,
-                &mut self.child,
-                &self.firefox,
-                &self.profile,
-                &self.routes,
-                &self.start_url,
-                &self.addon_credentials,
-            ) {
+            let reopen = |child: &mut Option<Child>| {
+                reopen_browser(
+                    child,
+                    &self.firefox,
+                    &self.profile,
+                    &self.routes,
+                    &self.start_url,
+                    &self.addon_credentials,
+                    &self.handles.open_item,
+                )
+            };
+            if on_menu_event(&ev, &self.handles, &mut self.child, reopen) {
                 return true;
             }
         }
@@ -306,15 +308,12 @@ fn refresh_menu_stats(handles: &Handles, snap: &Mutex<Snapshot>) {
 
 /// Handle one tray menu click. Returns `true` only for Quit, so the caller
 /// exits the event loop (after the browser has been taken down here).
+/// `reopen` opens or raises the managed browser.
 fn on_menu_event(
     ev: &MenuEvent,
     handles: &Handles,
     child: &mut Option<Child>,
-    firefox: &Path,
-    profile: &Path,
-    routes: &crate::ProfileRoutes,
-    start_url: &str,
-    credentials: &epix_ui::addon_broker::AddonLaunchCredentials,
+    reopen: impl FnOnce(&mut Option<Child>),
 ) -> bool {
     if ev.id == handles.quit {
         // Take the managed browser down with the node - without the node every
@@ -323,7 +322,7 @@ fn on_menu_event(
         return true;
     }
     if ev.id == handles.open {
-        reopen_browser(child, firefox, profile, routes, start_url, credentials, &handles.open_item);
+        reopen(child);
     } else if ev.id == handles.autostart {
         // Toggle "open at login", then reflect the real state back onto the
         // checkbox (a failed write leaves it where it was).

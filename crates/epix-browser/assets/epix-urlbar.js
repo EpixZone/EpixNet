@@ -1,7 +1,7 @@
 // Managed by epix-browser (added at pack time).
 (() => {
   const api = globalThis.browser || globalThis.chrome;
-  if (!api || !api.webRequest) return;
+  if (!api?.webRequest) return;
   const ADDR = /^epix1[a-z0-9]{20,80}$/;
   // Search-term query keys: q (DuckDuckGo/Google/Bing/Brave/Ecosia/Startpage),
   // p (Yahoo), query (some engines), wd (Baidu), text (Yandex), eq/kw (misc).
@@ -19,7 +19,9 @@
         const v = (u.searchParams.get(k) || "").trim();
         if (ADDR.test(v)) return { redirectUrl: "https://" + v + ".epix/" };
       }
-    } catch (_) {}
+    } catch (_) {
+      // Not a URL this script can read: leave the navigation alone.
+    }
     return {};
   };
   // Firefox records a blocking listener that is added while the background
@@ -40,7 +42,7 @@
   };
   // onStartup fires right after Firefox marks the page started. It does not
   // fire after an install, an update or a re-enable: the timer covers those.
-  if (api.runtime && api.runtime.onStartup) api.runtime.onStartup.addListener(add);
+  api.runtime?.onStartup?.addListener(add);
   const arm = () => setTimeout(add, 1000);
   if (globalThis.document && globalThis.document.readyState !== "complete") {
     globalThis.addEventListener("load", arm, { once: true });

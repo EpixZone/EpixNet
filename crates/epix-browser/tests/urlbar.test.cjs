@@ -5,8 +5,10 @@ const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
 const { test } = require("node:test");
+const { pathToFileURL } = require("node:url");
 
-const source = fs.readFileSync(path.join(__dirname, "../assets/epix-urlbar.js"), "utf8");
+const script = path.join(__dirname, "../assets/epix-urlbar.js");
+const source = fs.readFileSync(script, "utf8");
 const ADDRESS = "epix1" + "q".repeat(38);
 // The script runs in its own realm, so its objects have another Object
 // prototype. Copy them into this one before a strict comparison.
@@ -30,7 +32,8 @@ function page({ readyState = "loading", onStartup = true } = {}) {
     setTimeout: (run, delay) => timers.push({ run, delay }),
   };
   context.globalThis = context;
-  vm.runInNewContext(source, context);
+  // Named as the real file, so a coverage run attributes the lines to it.
+  vm.runInNewContext(source, context, { filename: pathToFileURL(script).href });
   return { added, startup, events, timers };
 }
 
