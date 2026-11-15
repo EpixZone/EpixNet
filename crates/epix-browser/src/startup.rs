@@ -266,7 +266,7 @@ impl<T> StartupState<T> {
 pub enum Outcome {
     Finished,
     WithoutTray {
-        child: Option<std::process::Child>,
+        child: Option<crate::browser_process::BrowserChild>,
         firefox: std::path::PathBuf,
     },
 }

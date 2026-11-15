@@ -15,7 +15,9 @@
 //! launcher must never fail to start because a tray icon could not appear.
 
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+// The managed browser, followed across Firefox's own restarts.
+use crate::browser_process::BrowserChild as Child;
+use std::process::Command;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -550,7 +552,7 @@ fn reopen_browser(child: &mut Option<Child>, firefox: &Path, profile: &Path, rou
         let mut cmd = crate::browser_process::browser_command(firefox, profile, window_size);
         credentials.configure_command(&mut cmd);
         if let Ok(c) = cmd.arg(url).spawn() {
-            *child = Some(c);
+            *child = Some(Child::spawned(c, profile));
         }
     };
     match child {
