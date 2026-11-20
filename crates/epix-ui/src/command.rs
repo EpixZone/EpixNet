@@ -46,9 +46,21 @@ pub fn validate_grantable_permission(permission: &str) -> Result<(), String> {
     match permission {
         "ADMIN" | "NOSANDBOX" | "CHANNELS" | "LOCAL_PROFILE" => Ok(()),
         p if p.starts_with("Merger:") && suffix_ok(&p["Merger:".len()..]) => Ok(()),
-        p if p.starts_with("Channels:") && suffix_ok(&p["Channels:".len()..]) => Ok(()),
+        p if p.starts_with("Channels:") && valid_channel_app_name(&p["Channels:".len()..]) => Ok(()),
         _ => Err(format!("Unknown or malformed permission: {}", permission.chars().take(64).filter(|c| !c.is_control()).collect::<String>())),
     }
+}
+
+/// A channel app name: the suffix of a `Channels:<app>` grant and the `app`
+/// the channel commands accept. Short lowercase tokens, since they travel
+/// inside every sealed body. Grant validation and the channel commands share
+/// this one rule, so a grant can never name an app the commands refuse.
+pub fn valid_channel_app_name(app: &str) -> bool {
+    !app.is_empty()
+        && app.len() <= 32
+        && app
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Commands that require the ADMIN permission, mirroring EpixNet's
@@ -5674,15 +5686,27 @@ mod tests {
 
     #[tokio::test]
     async fn only_known_well_formed_permissions_can_be_granted() {
-        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "LOCAL_PROFILE", "Merger:EpixPost", "Channels:talk", "Channels:a.b-c_1"] {
+        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "LOCAL_PROFILE", "Merger:EpixPost", "Merger:a.b-c_1", "Channels:talk", "Channels:dm_2-x"] {
             assert!(validate_grantable_permission(ok).is_ok(), "{ok}");
         }
         let long = format!("Merger:{}", "x".repeat(129));
         for bad in [
             "", "admin", "ADMIN ", "ADMIN\n", "Merger:", "Channels:", "Channels:<img src=x>",
-            "Merger:../x", "Cors:1Target", "EVX", "Merger:a b", long.as_str(), "Channels:-x",
+            "Merger:../x", "Cors:1Target", "EVX", "Merger:a b", long.as_str(),
+            // App names the channel commands refuse: uppercase, dots, > 32.
+            "Channels:Talk", "Channels:a.b", "Channels:a.b-c_1",
         ] {
             assert!(validate_grantable_permission(bad).is_err(), "accepted {bad:?}");
+        }
+        // A Channels grant is accepted exactly when its app name is one the
+        // channel commands accept.
+        let (max_app, long_app) = ("x".repeat(32), "x".repeat(33));
+        for app in ["talk", "dm_2-x", "-x", "Talk", "a.b", "", "a b", max_app.as_str(), long_app.as_str()] {
+            assert_eq!(
+                validate_grantable_permission(&format!("Channels:{app}")).is_ok(),
+                valid_channel_app_name(app),
+                "{app:?}"
+            );
         }
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");

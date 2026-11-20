@@ -368,13 +368,10 @@ pub(crate) fn resolve_send_app(
 }
 
 /// App names are short lowercase tokens: they travel inside every sealed body
-/// and name a permission (`Channels:<app>`).
+/// and name a permission (`Channels:<app>`). The rule lives with the grant
+/// validation so the two can never disagree.
 fn valid_app_name(app: &str) -> bool {
-    !app.is_empty()
-        && app.len() <= 32
-        && app
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    epix_ui::command::valid_channel_app_name(app)
 }
 
 /// A scoped client may only touch conversations of its own app. A conversation
