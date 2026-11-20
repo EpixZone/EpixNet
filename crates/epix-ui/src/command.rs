@@ -2290,6 +2290,17 @@ impl WsCommand for XiteUpdate {
         if !s.state.has_xite(&address).await {
             return Err(format!("Unknown xite: {address}"));
         }
+        // A page updates its own xite; any other needs ADMIN (EpixNet's
+        // actionSiteUpdate answered "Unknown site" otherwise).
+        let own = match s.xite.as_deref() {
+            Some(bound) => {
+                s.state.canonical_key(bound).await == s.state.canonical_key(&address).await
+            }
+            None => false,
+        };
+        if !own && !caller_has_admin(s).await {
+            return Err(format!("Unknown xite: {address}"));
+        }
         let update_request_id = p.get("update_request_id").map(|value| {
             value.as_str().filter(|id| !id.is_empty() && id.len() <= 128)
                 .map(str::to_string).ok_or("update_request_id must be a nonempty string of at most 128 bytes")
@@ -5886,6 +5897,29 @@ mod tests {
         let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
         assert_eq!(registry.dispatch(&trusted, "muteAdd", &json!(["1Author", "", ""]), 6).await.unwrap(), "ok");
         assert!(state.mute_list().await.get("1Author").is_some());
+    }
+
+    #[tokio::test]
+    async fn site_update_reaches_another_xite_only_with_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        for addr in ["1Own", "1Other"] {
+            state
+                .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path().join(addr)), content: None })
+                .await;
+        }
+        let page = WsSession::new(state.clone(), Some("1Own".into()));
+        // Its own xite, by default or by name.
+        assert!(XiteUpdate.handle(&page, &json!([])).await.is_ok());
+        assert!(XiteUpdate.handle(&page, &json!({ "address": "1Own" })).await.is_ok());
+        // Another xite is out of reach, and answers like an unknown one.
+        let denied = XiteUpdate.handle(&page, &json!({ "address": "1Other" })).await;
+        assert_eq!(denied.unwrap_err(), "Unknown xite: 1Other");
+        // ADMIN (the dashboard) and the operator socket may update any xite.
+        let operator = WsSession::new_trusted(state.clone(), None);
+        assert!(XiteUpdate.handle(&operator, &json!({ "address": "1Other" })).await.is_ok());
+        state.add_permission("1Own", "ADMIN").await;
+        assert!(XiteUpdate.handle(&page, &json!({ "address": "1Other" })).await.is_ok());
     }
 
     #[test]
