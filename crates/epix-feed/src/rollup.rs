@@ -128,10 +128,10 @@ mod tests {
     #[test]
     fn tombstoned_comment_is_not_counted() {
         let (items, mut records) = gallery();
-        // Moderate comment c1. The tombstone has the shape the adapter
-        // emits: target = its own id, author = the item's author (a
-        // moderation tombstone keeps the original author too, only its
-        // signature comes from the moderator).
+        // u1 deletes comment c1. The tombstone has the shape the adapter
+        // emits for a self-delete: target = its own id, author = the item's
+        // author. (A moderation delete never reaches the rollup as a
+        // tombstone on c1: the adapter drops the moderated comment itself.)
         records.push(test_record("c1", "u1", "c1", 20, Kind::Tombstone));
         let roll = Rollup::compute(&items, &records);
         assert_eq!(roll.get("gif1").unwrap().comment_count, 1, "tombstoned comment excluded");

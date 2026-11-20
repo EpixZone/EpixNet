@@ -27108,15 +27108,9 @@ impl AppState {
         let Some(records) = container.get(&desc.record_key).and_then(|v| v.as_array()) else {
             return;
         };
-        for record in records {
-            if epix_content::verify_record(record, &signers, now).is_err() {
-                continue;
-            }
-            let canonical = epix_content::dumps_sorted(record).into_bytes();
-            if let Ok(r) = epix_feed::adapter::record_from_value(desc, record, canonical) {
-                out.push(r);
-            }
-        }
+        // Verify each record and apply the merge-file fold to this file, so a
+        // moderation tombstone hides its item here exactly as in the database.
+        out.extend(epix_feed::adapter::records_from_container(desc, records, &signers, now));
     }
 
     async fn read_verified_merge_file(

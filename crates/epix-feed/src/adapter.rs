@@ -7,12 +7,16 @@
 //! the canonical bytes the caller already derived, and never mutates or
 //! re-signs anything.
 //!
-//! Trust boundary: the caller MUST have run `verify_record` on the record
-//! first (so `author` is the recovered, authorized signer) and MUST pass the
-//! exact signed bytes (`dumps_sorted(record)`) as `canonical_bytes`. A record
-//! that fails verification is never handed here. A record that verifies but is
-//! missing a mapped field is skipped for THAT record only (`Err(Skip)`), never
-//! failing the whole feed.
+//! Trust boundary: [`records_from_container`] is the entry point for a whole
+//! merge file. It verifies every record and applies the merge-file fold, so
+//! the feed shows what the database shows. [`record_from_value`] converts a
+//! single record: its caller MUST have run `verify_record` on the record first
+//! (so `author` is the recovered, authorized signer) and MUST pass the exact
+//! signed bytes (`dumps_sorted(record)`) as `canonical_bytes`. A record that
+//! verifies but is missing a mapped field is skipped for THAT record only
+//! (`Err(Skip)`), never failing the whole feed.
+
+use std::collections::BTreeMap;
 
 use serde_json::Value;
 
@@ -209,9 +213,11 @@ pub fn record_from_value(
     let deleted = obj.get(&desc.deleted_field).and_then(|v| v.as_bool()).unwrap_or(false);
 
     // Precedence: a delete is a sticky tombstone on the record's OWN id (so
-    // `checkpoint::tombstoned_ids` collects it and every version of that id
-    // drops out); this covers self-delete and cross-author moderation alike
-    // (verify already authorized the signer). Only a live record consults the
+    // `checkpoint::tombstoned_ids` collects it and every version of that
+    // (author, id) drops out), which is how a self-delete hides an item. A
+    // cross-author moderation tombstone carries the moderator as `author`, so
+    // it hides nothing here; `records_from_container` drops the moderated
+    // item's content by `post_id` instead. Only a live record consults the
     // reaction/default kind.
     let (kind, target) = if deleted {
         (Kind::Tombstone, id.clone())
@@ -239,6 +245,73 @@ pub fn record_from_value(
     };
 
     Ok(Record { canonical: canonical_bytes, id, author, target, clock, kind })
+}
+
+/// Convert ONE merge file's records into feed records, keeping only what the
+/// merge-file fold shows.
+///
+/// Each record is verified with `verify_record` against `valid_signers` (the
+/// authorized signer set of the unit that declared this merge file) and
+/// dropped if it fails. The survivors are grouped by `post_id` and each group
+/// is decided by [`epix_content::merge::display_winner`], the same rule
+/// `epix_content::live_records` (and so the database) uses:
+///
+/// - a group whose winner is a tombstone is hidden: none of its content
+///   versions enter the feed. This is what makes a moderation delete work. A
+///   moderator's tombstone is signed by `recordSign`, which sets `author` to
+///   the SIGNER, so it carries the moderator's address and often not even the
+///   app's id field; it can never match the victim by `(author, id)` the way
+///   a self-delete does. The fold instead matches it by `post_id`, inside the
+///   directory it was written to, where only signers authorized for that
+///   directory could have put it.
+/// - a live group contributes only the content versions of the winner's
+///   author (the post's creator), so another signer's reuse of the id is not
+///   shown here either. With no winner (an ambiguous creator) no content is
+///   shown.
+///
+/// Tombstones themselves are always passed through, as before, so a
+/// self-delete still becomes a sticky `(author, id)` tombstone.
+///
+/// The decision is per merge file, like the fold: a tombstone hides only the
+/// versions in its own file. Feeding every merge file's output into one record
+/// set therefore cannot let a user hide another user's post by placing a
+/// tombstone (or a copy of the post plus a tombstone) in her own file.
+pub fn records_from_container(
+    desc: &FeedDescriptor,
+    records: &[Value],
+    valid_signers: &[String],
+    now_ms: i64,
+) -> Vec<Record> {
+    let is_deleted = |r: &Value| r.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
+    let author_of = |r: &Value| r.get("author").and_then(|v| v.as_str()).map(str::to_string);
+
+    let mut groups: BTreeMap<i64, Vec<&Value>> = BTreeMap::new();
+    for r in records {
+        if epix_content::verify_record(r, valid_signers, now_ms).is_err() {
+            continue;
+        }
+        // verify_record requires an integer post_id, so every survivor groups.
+        if let Some(pid) = r.get("post_id").and_then(|v| v.as_i64()) {
+            groups.entry(pid).or_default().push(r);
+        }
+    }
+
+    let mut out = Vec::new();
+    for versions in groups.values() {
+        let winner = epix_content::merge::display_winner(versions);
+        let shown_author = winner.filter(|w| !is_deleted(w)).and_then(author_of);
+        for r in versions {
+            let keep = is_deleted(r) || (shown_author.is_some() && author_of(r) == shown_author);
+            if !keep {
+                continue;
+            }
+            let canonical = epix_content::dumps_sorted(r).into_bytes();
+            if let Ok(rec) = record_from_value(desc, r, canonical) {
+                out.push(rec);
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -46,7 +46,7 @@ fn corpus() -> Vec<Record> {
     v.push(mk("ac0", "author", "post0", 6, Kind::Comment));
     v.push(mk("ac1", "author", "post0", 7, Kind::Comment));
     v.push(mk("ac0", "author", "post0", 56, Kind::Comment)); // edit of ac0
-    // The moderated comment's tombstone. The adapter emits it with the
+    // A deleted comment's tombstone, as the adapter emits a self-delete: the
     // victim id in the target and the item's own author, so one author
     // cannot tombstone another author's item.
     v.push(mk("c0_1", "u1", "c0_1", 500, Kind::Tombstone));

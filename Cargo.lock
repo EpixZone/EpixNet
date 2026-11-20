@@ -2973,6 +2973,8 @@ name = "epix-feed"
 version = "0.1.0"
 dependencies = [
  "epix-blob",
+ "epix-content",
+ "epix-crypt",
  "serde",
  "serde_json",
 ]
