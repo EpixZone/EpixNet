@@ -10539,8 +10539,9 @@ impl AppState {
             // same - a clone root like `template-new/` holds only page files
             // (index.html), never its own content.json, so keying off the sub-path
             // there fails with "Source has no content.json".
-            let template = src_storage
-                .read(&format!("{prefix}content.json-default"))
+            let template_default = src_storage.read(&format!("{prefix}content.json-default"));
+            let borrowed_root = template_default.is_err();
+            let template = template_default
                 .or_else(|_| src_storage.read("content.json"))
                 .map_err(|_| "Source has no content.json".to_string())?;
             let mut content: Value =
@@ -10570,6 +10571,33 @@ impl AppState {
                     .unwrap_or("New Epix Xite");
                 format!("My {title}")
             };
+            if borrowed_root && root.starts_with("template-") {
+                // A blank starter borrowing the source's OWN root manifest
+                // (no `<root>/content.json-default`) must not inherit what
+                // describes or tunes the source: its description and favicon,
+                // a load order naming files the starter does not have, its
+                // distribution and postMessage policies, and its ignore,
+                // optional and shard patterns. Structural fields (includes,
+                // user_contents, merged_type, signers) are kept.
+                for key in [
+                    "description",
+                    "favicon",
+                    "background-color",
+                    "background-color-light",
+                    "background-color-dark",
+                    "viewport",
+                    "ignore",
+                    "optional",
+                    "shard",
+                ] {
+                    if map.contains_key(key) {
+                        map.insert(key.into(), json!(""));
+                    }
+                }
+                for key in ["order_policy", "distribution", "postmessage_nonce_security"] {
+                    map.remove(key);
+                }
+            }
             map.insert("title".into(), json!(new_title));
             map.insert("cloned_from".into(), json!(source));
             if !root.is_empty() {

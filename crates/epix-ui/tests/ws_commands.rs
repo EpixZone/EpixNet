@@ -306,6 +306,58 @@ async fn xite_clone_from_template_root_uses_root_content() {
     assert!(epix_content::verify_signer(&content, &new_address), "signature verifies");
 }
 
+/// A `template-new` clone borrows the source's ROOT content.json, which for
+/// the dashboard describes the dashboard itself. The starter must not inherit
+/// its description, favicon, load order or policies.
+#[tokio::test]
+async fn xite_clone_from_template_root_drops_the_sources_own_metadata() {
+    let (state, root, address, key) = state_with_xite().await;
+    let src_dir = root.path().join("data").join(&address);
+    let src_storage = XiteStorage::new(&src_dir);
+    src_storage
+        .write("template-new/index.html", b"<h1>blank starter</h1>")
+        .unwrap();
+    src_storage.write("img/favicon.ico", b"icon").unwrap();
+    // Give the source dashboard-like metadata, then re-sign it.
+    let mut content: Value =
+        serde_json::from_slice(&src_storage.read("content.json").unwrap()).unwrap();
+    for (field, value) in [
+        ("description", json!("Epix Dashboard")),
+        ("favicon", json!("img/favicon.ico")),
+        ("ignore", json!("(js/all\\.js|\\.git)")),
+        ("order_policy", json!({ "first_paint": ["index.html", "css/all.css", "js/all.js"] })),
+        ("distribution", json!({ "default": { "retention": "complete", "unit": "package" } })),
+        ("postmessage_nonce_security", json!(true)),
+        ("user_contents", json!({ "permissions": {} })),
+    ] {
+        content[field] = value;
+    }
+    src_storage
+        .write("content.json", epix_content::dumps_content(&content).as_bytes())
+        .unwrap();
+    state.add_xite(&address, XiteEntry { storage: src_storage, content: Some(content) }).await;
+    state.sign_xite(&address, &key).await.unwrap();
+
+    let cloned = state.clone_xite(&address, "template-new", None).await.unwrap();
+    let content = state.content(&cloned).await.unwrap();
+    assert_eq!(content["title"], "My New Epix Xite");
+    assert_eq!(content["description"], "");
+    assert_eq!(content["favicon"], "");
+    assert_eq!(content["ignore"], "");
+    for field in ["order_policy", "distribution", "postmessage_nonce_security"] {
+        assert!(content.get(field).is_none(), "{field} inherited: {content}");
+    }
+    // Structural fields survive.
+    assert_eq!(content["user_contents"], json!({ "permissions": {} }));
+    assert!(epix_content::verify_signer(&content, &cloned));
+
+    // A whole-xite clone (not a template root) still copies its metadata.
+    let copy = state.clone_xite(&address, "", None).await.unwrap();
+    let content = state.content(&copy).await.unwrap();
+    assert_eq!(content["description"], "Epix Dashboard");
+    assert!(content.get("order_policy").is_some());
+}
+
 #[tokio::test]
 async fn xite_clone_with_blank_title_uses_default_title() {
     let (state, root, address, _key) = state_with_xite().await;
