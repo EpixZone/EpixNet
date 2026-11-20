@@ -176,7 +176,11 @@ impl UiServer {
             .route(addon_broker::PATH, axum::routing::post(addon_broker::serve)
                 .layer(axum::extract::DefaultBodyLimit::max(addon_broker::MAX_REQUEST_BYTES)))
             .route("/EpixNet-Internal/Websocket", get(ws_upgrade))
-            .route(BIGFILE_UPLOAD_PATH, axum::routing::post(bigfile_upload))
+            // The upload body is bounded per request by the size declared in
+            // `bigfileUploadInit` (see `bigfile_upload`), not by the global
+            // 2 MB default, so big files can actually be uploaded.
+            .route(BIGFILE_UPLOAD_PATH, axum::routing::post(bigfile_upload)
+                .layer(axum::extract::DefaultBodyLimit::disable()))
             .route("/uimedia/{*path}", get(serve_uimedia))
             .route("/Plugins", get(serve_plugins_page).post(serve_plugins_post))
             .route("/Config", get(serve_config_page).post(serve_config_post))
@@ -666,6 +670,9 @@ fn strip_port(host: &str) -> &str {
 /// `POST /EpixNet-Internal/BigfileUpload?upload_nonce=…`, the one write a
 /// xite page makes over HTTP.
 const BIGFILE_UPLOAD_PATH: &str = "/EpixNet-Internal/BigfileUpload";
+/// Room for a multipart upload's part headers and boundaries on top of the
+/// declared file size.
+const BIGFILE_MULTIPART_OVERHEAD: u64 = 64 * 1024;
 
 /// Whether a request carrying `Origin: null` may read or opaquely load a file.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -3722,7 +3729,7 @@ async fn bigfile_upload(
     State(ctx): State<Ctx>,
     Query(q): Query<UploadQuery>,
     headers: axum::http::HeaderMap,
-    body: axum::body::Bytes,
+    body: axum::body::Body,
 ) -> Response {
     if !ctx.state.bigfile_enabled().await {
         return (StatusCode::FORBIDDEN, "Bigfile plugin is disabled").into_response();
@@ -3730,8 +3737,42 @@ async fn bigfile_upload(
     let Some(nonce) = q.upload_nonce else {
         return (StatusCode::BAD_REQUEST, "missing upload_nonce").into_response();
     };
-    // If multipart/form-data, extract the single file part's bytes.
+    let upload_error = |status: StatusCode, error: String| {
+        (status, [(header::CONTENT_TYPE, "application/json")], json!({ "error": error }).to_string())
+            .into_response()
+    };
+    // The body may be as large as the size declared at `bigfileUploadInit`
+    // (plus the multipart framing), and no larger. A refused body leaves the
+    // nonce valid; the finish step checks the exact length.
+    let Some(declared) = ctx.state.bigfile_upload_declared_size(&nonce) else {
+        return upload_error(StatusCode::BAD_REQUEST, "Unknown or expired upload nonce".into());
+    };
     let content_type = headers.get(header::CONTENT_TYPE).and_then(|v| v.to_str().ok()).unwrap_or("");
+    let overhead = if content_type.starts_with("multipart/form-data") {
+        BIGFILE_MULTIPART_OVERHEAD
+    } else {
+        0
+    };
+    let limit = declared.saturating_add(overhead);
+    let mut stream = body.into_data_stream();
+    let mut received = Vec::new();
+    while let Some(chunk) = futures_util::StreamExt::next(&mut stream).await {
+        let chunk = match chunk {
+            Ok(chunk) => chunk,
+            Err(error) => {
+                return upload_error(StatusCode::BAD_REQUEST, format!("Could not read upload body: {error}"));
+            }
+        };
+        if (received.len() + chunk.len()) as u64 > limit {
+            return upload_error(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!("Upload body exceeds the declared size of {declared} bytes"),
+            );
+        }
+        received.extend_from_slice(&chunk);
+    }
+    let body = received;
+    // If multipart/form-data, extract the single file part's bytes.
     let data: &[u8] = if content_type.starts_with("multipart/form-data") {
         match extract_multipart_file(&body) {
             Some(slice) => slice,

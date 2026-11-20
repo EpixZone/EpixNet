@@ -1281,6 +1281,45 @@ async fn content_uploads_keep_the_existing_body_limit_without_consuming_the_toke
     );
 }
 
+#[tokio::test]
+async fn content_uploads_accept_bodies_up_to_the_declared_size() {
+    let fixture = Fixture::new().await;
+    fixture.state.set_owned(&fixture.a, true).await;
+    // Larger than axum's 2 MB default body limit, and more than one piece.
+    let body: Vec<u8> = (0..3 * 1024 * 1024 + 17).map(|i| (i % 251) as u8).collect();
+    let (token, _, _) = fixture
+        .state
+        .bigfile_upload_init(&fixture.a, "uploads/large.bin", body.len() as u64)
+        .await
+        .unwrap();
+    let host = fixture.content_host();
+    let origin = format!("http://{host}");
+    let short = fixture
+        .upload(&host, &token, Some(&origin), None, body[..body.len() - 1].to_vec())
+        .await;
+    assert_eq!(
+        short.status(),
+        StatusCode::BAD_REQUEST,
+        "a body shorter than the declared size is refused"
+    );
+    let response = fixture
+        .upload(&host, &token, Some(&origin), None, body.clone())
+        .await;
+    assert_eq!(response.status(), StatusCode::OK, "{}", text(response).await);
+    assert_eq!(
+        std::fs::read(
+            fixture
+                ._directory
+                .path()
+                .join("data")
+                .join(&fixture.a)
+                .join("uploads/large.bin")
+        )
+        .unwrap(),
+        body
+    );
+}
+
 #[cfg(feature = "ui-password")]
 #[tokio::test]
 async fn a_valid_upload_token_does_not_bypass_the_node_password() {

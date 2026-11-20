@@ -16888,6 +16888,13 @@ impl AppState {
         self.bigfile_upload_finish_scoped(upload_token, body, None).await
     }
 
+    /// The file size declared at `bigfileUploadInit` for a pending upload, or
+    /// `None` for an unknown or consumed token. The HTTP route bounds the body
+    /// it reads by this.
+    pub(crate) fn bigfile_upload_declared_size(&self, upload_token: &str) -> Option<u64> {
+        self.bigfile_uploads.lock().unwrap().get(upload_token).map(|upload| upload.size)
+    }
+
     pub(crate) fn bigfile_upload_belongs_to(&self, upload_token: &str, xite: &str) -> bool {
         self.bigfile_uploads.lock().unwrap().get(upload_token)
             .is_some_and(|upload| upload.canonical == xite)
@@ -16914,6 +16921,15 @@ impl AppState {
             if xite.is_some_and(|xite| pending.canonical != xite) {
                 // A request on B must neither use nor invalidate A's upload.
                 return Err("Upload nonce belongs to another xite".into());
+            }
+            if body.len() as u64 != pending.size {
+                // Like EpixNet, the upload is exactly the declared size. A
+                // short or long body leaves the token usable for a retry.
+                return Err(format!(
+                    "Upload is {} bytes but {} bytes were declared",
+                    body.len(),
+                    pending.size
+                ));
             }
             uploads.remove(upload_token).unwrap()
         };
