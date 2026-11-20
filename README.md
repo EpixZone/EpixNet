@@ -17,7 +17,9 @@ EpixNet supports **Tor** and **I2P** in builds that include those features. Rout
 
 ## Get started
 
-EpixNet is built from its source code. Pick your system below. Each guide starts from a brand new machine with nothing installed yet and walks you through every step.
+The quickest way in is a ready-made package from [EpixNet releases](https://github.com/EpixZone/EpixNet/releases/latest). Each release ships a Windows installer (`Epix-Setup-<version>.exe`), a macOS disk image (`Epix-<version>.dmg`), Linux `.deb`, `.rpm`, AppImage and `.tar.gz` packages, and an Android APK, with a `SHA256SUMS` file to check the downloads. There is no iOS release download; iOS is built from source.
+
+You can also build EpixNet from its source code. Pick your system below. Each guide starts from a brand new machine with nothing installed yet and walks you through every step.
 
 - [Windows](docs/install/windows.md)
 - [Linux](docs/install/linux.md)
@@ -28,7 +30,7 @@ EpixNet is built from its source code. Pick your system below. Each guide starts
 
 ## Ways to run it (desktop)
 
-Once it is built, there are three ways to start it:
+From a source build, there are three ways to start it:
 
 Use EpixNet Browser for the full desktop experience. On Linux, follow the [desktop setup](docs/install/linux.md#the-full-desktop-app-managed-firefox) once. The source launcher prepares and reuses a matching Firefox ESR. Other platforms can use a prepared runtime as described in the [extension adapter setup](docs/xite-extensions.md#local-desktop-builds).
 
@@ -161,27 +163,55 @@ The same binary doubles as the authoring and diagnostics CLI, with the
 action name as the first argument (the EpixNet CLI shape):
 
 ```sh
+# authoring
 epix-server siteCreate                          # new xite: address + private key
-epix-server siteSign <address> [privatekey]     # re-sign after editing files
+epix-server siteSign <address> [privatekey] [inner_path] [--full] [--keep-missing]
+epix-server sitePublish <address> [inner_path]  # push the signed content.json to peers
 epix-server siteVerify <address>                # check files against the signed content.json
 epix-server dbRebuild <address>                 # rebuild the xite's sql cache
 epix-server dbQuery <address> "<sql>"           # query the xite db, JSON out
 epix-server importBundle <bundle.zip>           # import xites from a zip
 
+# xite admin
+epix-server siteList
+epix-server siteDelete <address>
+epix-server siteDownload <address>              # add a xite and download it
+epix-server siteSignMessage <address> [message] # sign a message as the xite
+
+# key operations (no node or data dir involved)
 epix-server cryptSign <message> <privatekey>
 epix-server cryptVerify <message> <sign> <address>
 epix-server cryptGetPrivatekey <master_seed> [index]
 epix-server cryptPrivatekeyToAddress <privatekey>
 
-epix-server peerPing <ip> <port>                # wire-protocol ping
-epix-server peerGetFile <ip> <port> <site> <inner_path>
-epix-server peerCmd <ip> <port> <cmd> '<json params>'
+# diagnostics
+epix-server peerPing <ip> <port>                # EDX link round-trip to a peer
+epix-server siteCmd <address> <command> [json-params]   # any node API command, running node only
 ```
 
-The authoring actions work against the data dir directly (no running
-node needed). `siteSign` uses the key saved at `siteCreate` when you
-don't pass one. Anything that is not an action name is treated as a
-xite to open, as before.
+How an action reaches your data depends on whether a node is running:
+
+- **`siteSign`, `sitePublish`, `siteList`, `siteDelete`, `siteDownload` and
+  `siteSignMessage`** first try the running node through its admin socket
+  (`admin.sock` in the data folder); most of them mark their output `[live]`
+  when the node handled the request. The running node does the work, so its
+  peers and storage see the change straight away. When no node is running
+  they fall back to working on the data folder directly (`siteDownload` then
+  only queues the xite for the next start).
+- **`siteCmd`** needs the running node; it has no offline form.
+- **`siteCreate`, `siteVerify`, `dbRebuild`, `dbQuery` and `importBundle`**
+  always open the data folder directly, as do the fallbacks above. They need
+  the data folder to themselves: while a node is running they stop with an
+  error containing `Another EpixNet process owns <data folder>`. Quit the
+  node first.
+- Windows has no admin socket, so there the actions that use the data folder
+  always take the offline path and need the node to be stopped, and `siteCmd`
+  is unavailable. The key operations and `peerPing` work anywhere.
+
+`siteSign` uses the key saved at `siteCreate` when you don't pass one. On its
+own, `sitePublish` publishes the content.json as already signed; run `siteSign`
+first. Anything that is not an action name is treated as a xite to open, as
+before. `epix-server --help` lists the actions.
 
 ## Settings you can change
 
@@ -211,7 +241,15 @@ Your data folder by default:
 
 ## Checking which version you are running
 
-Open the dashboard, then **Settings**. It shows the version and the exact code the build was made from, for example `0.3.0 (rev1a2b3c4)`. You can match that `rev` against the commits in this repository to confirm what you are running.
+Open the dashboard and its **☰** Settings panel: the version shows at the bottom, for example `EpixNet v0.6.8`. From a terminal, `epix-server --version` prints the same version.
+
+The node also reports the exact commit it was built from: the `serverInfo` command returns `version` and `rev` (the short git commit hash). With the node running on Linux or macOS, you can read it with:
+
+```sh
+epix-server siteCmd epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g serverInfo
+```
+
+You can match that `rev` against the commits in this repository to confirm what you are running.
 
 ## Under the hood (for the curious)
 
