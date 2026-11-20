@@ -61,9 +61,10 @@ The routing invariant is already in the code: in `TorMode::Always`,
 What remains is the live checkpoint from the plan: boot with `tor always`, run a
 full clone + seed cycle, and confirm zero direct-IP peer connections (e.g. by
 watching the socket table). That needs a bootstrapped Tor circuit (~45s) and a
-reachable peer, so it is an integration test against real infrastructure, in the
-same bucket as "a Python peer reaches our onion inbound" - both are verification
-runs that need a Tor-connected environment, not new code. The unit-level proof
+reachable peer, so it is an integration test against real infrastructure: a
+verification run that needs a Tor-connected environment, not new code. (A
+"Python peer reaches our onion inbound" check was once listed alongside it; it
+no longer applies, because the peer protocol is EDX only.) The unit-level proof
 (the `route_all` dial arm) is in place and covered by the Tor transport's own
 tests.
 
