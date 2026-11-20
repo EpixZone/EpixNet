@@ -70,12 +70,19 @@ default for loopback binds). For the opaque frame:
 | `Origin: null` otherwise | blocked, and never given a CORS grant even with the gate off |
 | A real foreign origin | blocked, as before |
 
-The frame library (`epixframe.js`) asks the wrapper for the `ajax_key` and
-appends it to the page's XHR and fetch URLs once the page calls
-`monkeyPatchAjax()`; that is what makes a xite's own `fetch("data.json")`
-work from the opaque origin. A page that fetches its own files without the
-key does not get them in path mode (the shipped dashboard's translation
-loader does this today and must enable the patch). The key never reads the
+Once the page calls `monkeyPatchAjax()`, the frame library (`epixframe.js`)
+asks the wrapper for the `ajax_key` (`wrapperGetAjaxKey`) and appends it to
+the URL of every XHR the page opens; await the call before the first request
+so the key is in place. That is what lets a xite's own
+`XMLHttpRequest` for `data.json` work from the opaque origin. For `fetch`,
+read the file with the `fileGet` command instead, or append
+`ajax_key=<key>` from `wrapperGetAjaxKey` to the URL yourself: EpixFrame
+releases before its fetch fix install a `fetch` patch that never adds the key
+(the patched function changes its own `url` parameter but forwards the
+original `arguments`, which strict mode does not link to it). A page that
+fetches its own files without the key does not get them in path mode (the
+shipped dashboard's XHR translation loader does this today and must enable
+the patch). The key never reads the
 wrapper document itself, which carries the xite's secrets. The one write a page makes
 over HTTP, the Bigfile upload POST, is accepted from a null origin because
 its one-time `upload_nonce` authorises it.
