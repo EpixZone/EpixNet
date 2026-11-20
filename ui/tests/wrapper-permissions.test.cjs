@@ -57,7 +57,7 @@ function wrapper(windowOverrides) {
       noteProgress() {}, printLine() {}, setStage() {},
     },
     noteContentSync() {},
-    displayConfirm(message, label, accept) { prompts.push({ message, label, accept }); },
+    displayConfirm(message, label, accept, id, dismiss) { prompts.push({ message, label, accept, dismiss }); },
     ws: {
       cmd(command, params, callback) { commands.push({ command, params }); callback("ok"); },
       send(message) { forwarded.push(message); },
@@ -168,6 +168,47 @@ test("a grant the operator already made on a gateway keeps the silent contract",
   assert.equal(prompts.length, 0);
   assert.equal(commands.length, 0);
   assert.equal(replies.length, 0, "already granted: no answer, as on a normal node");
+});
+
+// EpixFrame's requestPermission sends [permission] and awaits the answer.
+test("an array request for a granted permission is answered ok without a prompt", () => {
+  const { instance, prompts, commands, replies } = wrapper();
+  instance.setXiteInfo(fullInfo(["ADMIN"]));
+  instance.handleMessage({ cmd: "wrapperPermissionAdd", params: ["ADMIN"], id: 7 });
+  assert.equal(prompts.length, 0, "already granted: no re-prompt");
+  assert.equal(commands.length, 0);
+  assert.deepEqual(replies.map(r => [r.to, r.result]), [[7, "ok"]]);
+});
+
+test("a raw permissionAdd for a granted permission is answered ok", () => {
+  const { instance, prompts, commands, replies } = wrapper();
+  instance.setXiteInfo(fullInfo(["ADMIN"]));
+  instance.handleMessage({ cmd: "permissionAdd", params: "ADMIN", id: 8 });
+  assert.equal(prompts.length, 0);
+  assert.equal(commands.length, 0);
+  assert.deepEqual(replies.map(r => [r.to, r.result]), [[8, "ok"]]);
+});
+
+test("an array request that is not granted prompts for the single permission", () => {
+  const { instance, prompts, commands, replies } = wrapper();
+  instance.setXiteInfo(fullInfo([]));
+  instance.handleMessage({ cmd: "wrapperPermissionAdd", params: ["ADMIN"], id: 9 });
+  assert.equal(prompts.length, 1);
+  prompts[0].accept();
+  assert.deepEqual(commands, [{ command: "permissionAdd", params: "ADMIN" }]);
+  assert.deepEqual(replies.map(r => [r.to, r.result]), [[9, "ok"]]);
+});
+
+test("closing the permission prompt answers the page and grants nothing", () => {
+  const { instance, prompts, commands, replies } = wrapper();
+  instance.setXiteInfo(fullInfo([]));
+  instance.actionPermissionAdd({ id: 10, params: "ADMIN" });
+  assert.equal(prompts.length, 1);
+  assert.equal(typeof prompts[0].dismiss, "function", "the prompt reports dismissal");
+  prompts[0].dismiss();
+  prompts[0].dismiss();
+  assert.equal(commands.length, 0, "nothing is sent to the node");
+  assert.equal(JSON.stringify(replies.map(r => [r.to, r.result])), JSON.stringify([[10, { error: "cancelled" }]]));
 });
 
 test("a page cannot read or supply trusted shared-cache entries directly", () => {
