@@ -1,6 +1,6 @@
 # Install EpixNet on macOS
 
-This guide starts from a fresh Mac with nothing installed. Follow the steps in order. You only do steps 1 to 3 once; after that, building again is just step 5.
+This guide starts from a fresh Mac with nothing installed. Follow the steps in order. You only do steps 1 to 3 once; after that, rebuilding and running are just steps 4 and 5.
 
 You will type the commands into the **Terminal** app (press `Cmd + Space`, type `Terminal`, press Enter).
 
@@ -8,7 +8,7 @@ For the full desktop, complete steps 1 to 3 and follow
 [the EpixNet Browser setup](#the-full-desktop-app-managed-firefox). Steps 4 and
 5 build the standalone node and explicitly use your system browser.
 
-## 1. Install the Apple build tools
+## 1. Install the Apple build tools and protoc
 
 These give you `git` (to download the code) and a C compiler (to build it). Run:
 
@@ -17,6 +17,20 @@ xcode-select --install
 ```
 
 A window pops up. Click **Install** and wait for it to finish.
+
+The build also needs the protobuf compiler, `protoc`, for the offline mesh transport. Install it with [Homebrew](https://brew.sh). If you do not have Homebrew yet, install it first with the command from its website:
+
+```sh
+/bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+```
+
+Follow the instructions it prints at the end to add `brew` to your shell, then run:
+
+```sh
+brew install protobuf
+```
+
+Check it worked with `protoc --version`, which should print a version number.
 
 ## 2. Install Rust
 
@@ -115,5 +129,6 @@ EpixNet keeps your sites, keys, and settings in:
 ## If something goes wrong
 
 - **`xcrun: error` or `cc` not found:** step 1 did not finish. Run `xcode-select --install` again.
+- **An error mentioning `protoc` or "Could not find `protoc`":** the protobuf compiler from step 1 is missing. Run `brew install protobuf`, check `protoc --version`, then build again.
 - **`cargo: command not found`:** close and reopen Terminal, or run `source "$HOME/.cargo/env"`.
 - **Port already in use:** If dashboard port `42222` is taken, EpixNet tries `42223`, `42224`, and so on until one is available. The selected port is saved in `ui_port` inside your data folder. The file server does the same from its configured port, `26552` by default; use the selected port from the node log for port forwarding. You can also pick your own with `EPIX_UI_ADDR=127.0.0.1:9000 ./target/release/epix-server --browser system`. A non-default dashboard port must be available or startup fails.
