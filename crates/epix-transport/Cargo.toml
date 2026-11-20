@@ -2,7 +2,7 @@
 name = "epix-transport"
 version = "0.1.0"
 edition = "2021"
-description = "Transport abstraction (Transport trait + PeerStream) with a TCP impl. Tor/Reticulum slot in here later."
+description = "Transport abstraction (Transport trait + PeerStream) with the TCP impl; the Tor, I2P and Reticulum transports implement it in their own crates."
 
 [dependencies]
 epix-core = { path = "../epix-core" }

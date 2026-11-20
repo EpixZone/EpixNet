@@ -1,8 +1,9 @@
 //! `epix-transport` - the byte-stream abstraction beneath the wire protocol.
 //!
 //! `epix-protocol`'s connection runs over a [`PeerStream`], so the same
-//! EDX logic works over TCP today and Tor / Reticulum mesh
-//! later - each is just another [`Transport`] that yields a `PeerStream`.
+//! EDX logic works over TCP, Tor, I2P and the Reticulum mesh - each is just
+//! another [`Transport`] that yields a `PeerStream` (TCP lives here; the others
+//! live in `epix-tor`, `epix-i2p` and `epix-reticulum`).
 
 use async_trait::async_trait;
 use epix_core::{Error, PeerAddr, Result};
