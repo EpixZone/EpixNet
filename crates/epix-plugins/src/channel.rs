@@ -297,6 +297,13 @@ async fn channel_client_ok(s: &WsSession) -> Result<(), String> {
     if s.trusted {
         return Ok(());
     }
+    // A public gateway serves its pages to every visitor, so a page there
+    // would read and send as the gateway node's own identities. Channels are
+    // reachable only from the operator socket on such a node, like local
+    // profiles.
+    if s.state.ui_restrict().await {
+        return Err("Channels are unavailable on public gateways".to_string());
+    }
     let xite = s.address().map_err(|_| "channels: no xite bound".to_string())?;
     if xite == EPIX_MAIL_XITE {
         return Ok(());
@@ -1100,8 +1107,13 @@ async fn index_batch(
 pub(crate) async fn deliver_channel_event(state: &Arc<AppState>, ms: &ChannelState, ev: Value) {
     let auth = ev.get("auth").and_then(Value::as_str).filter(|a| !a.is_empty()).map(str::to_string);
     let app = ev.get("app").and_then(Value::as_str).filter(|a| !a.is_empty()).map(str::to_string);
-    let clients: Vec<(String, Option<String>)> =
-        ms.clients.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // A public gateway's pages belong to its visitors, so the node's own
+    // messages are never pushed to them (the commands refuse them too).
+    let clients: Vec<(String, Option<String>)> = if state.ui_restrict().await {
+        Vec::new()
+    } else {
+        ms.clients.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
     for (xite, scope) in clients {
         if let (Some(scope), Some(app)) = (&scope, &app) {
             if scope != app {
@@ -3928,6 +3940,34 @@ mod client_xite_tests {
         assert_eq!(client_xite_for_app(&clients, Some("mail")), EPIX_MAIL_XITE);
         assert_eq!(client_xite_for_app(&clients, Some("forum")), EPIX_MAIL_XITE);
         assert_eq!(client_xite_for_app(&clients, None), EPIX_MAIL_XITE);
+    }
+
+    /// On a public gateway the node's channel events never reach a page.
+    #[tokio::test]
+    async fn a_gateway_pushes_no_channel_events_to_pages() {
+        use super::{deliver_channel_event, ChannelState};
+        use epix_channel::ChannelDb;
+        use epix_envelope::FakeEngine;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let state = epix_ui::state::AppState::new("test");
+        let db = Arc::new(ChannelDb::memory().unwrap());
+        let ms = ChannelState::for_test(db, Arc::new(FakeEngine), "epix1hub".into());
+        let mut events = state.subscribe_events();
+        let channel_events = |events: &mut tokio::sync::broadcast::Receiver<epix_ui::state::UiEvent>| {
+            std::iter::from_fn(|| events.try_recv().ok())
+                .filter(|ev| ev.payload.contains("\"channelEvent\""))
+                .count()
+        };
+        let ev = json!({ "type": "setup", "xid": "a.epix", "state": "published" });
+
+        deliver_channel_event(&state, &ms, ev.clone()).await;
+        assert_eq!(channel_events(&mut events), 1, "Mail gets it on a normal node");
+
+        state.config_set("ui_restrict", json!(true)).await;
+        deliver_channel_event(&state, &ms, ev).await;
+        assert_eq!(channel_events(&mut events), 0, "no page gets it on a gateway");
     }
 }
 

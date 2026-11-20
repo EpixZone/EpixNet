@@ -310,4 +310,16 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
     // the default (alice) again.
     let info = info_cmd.handle(&mail, &json!([{}])).await.unwrap();
     assert_eq!(info["identity"]["xid"], "alice.epix");
+
+    // On a public gateway every page is refused, Epix Mail included, so no
+    // visitor acts as the gateway node's identity; the operator socket is not.
+    state.config_set("ui_restrict", json!(true)).await;
+    let mail_page = WsSession::new(state.clone(), Some(EPIX_MAIL_XITE.to_string()));
+    for (session, who) in [(&mail_page, "mail"), (&dm, "talk")] {
+        let err = info_cmd.handle(session, &json!([{}])).await.unwrap_err();
+        assert!(err.contains("public gateways"), "{who}: {err}");
+        let err = threads.handle(session, &json!([{}])).await.unwrap_err();
+        assert!(err.contains("public gateways"), "{who}: {err}");
+    }
+    assert!(info_cmd.handle(&mail, &json!([{}])).await.is_ok());
 }
