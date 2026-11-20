@@ -396,9 +396,28 @@ pub fn populate_xite_prefixed(
     populate_xite_filtered(conn, schema, db_dir, xite, &[], path_prefix)
 }
 
-/// Like [`populate_xite`], but skips any data file whose path contains one of
-/// `exclude` - the ContentFilter mute enforcement point (muted authors'
-/// `data/<auth_address>/…` files are left out of the database).
+/// Whether `path` (a data file path, possibly prefixed by a merged hub) lies
+/// under a directory named by one of `exclude` - the ContentFilter mute
+/// match. An entry matches whole directory segments only, so muting
+/// `bob.epix` leaves out `data/users/bob.epix/…` (or `<hub>/data/bob.epix/…`)
+/// but not `data/users/bigbob.epix/…`. An entry with slashes
+/// (`data/blocked/`) matches that run of consecutive segments. The file name
+/// itself and empty entries never match.
+pub fn path_is_excluded(path: &str, exclude: &[String]) -> bool {
+    let Some((dir, _file)) = path.rsplit_once('/') else {
+        return false;
+    };
+    let haystack = format!("/{dir}/");
+    exclude.iter().any(|entry| {
+        let entry = entry.trim_matches('/');
+        !entry.is_empty() && haystack.contains(&format!("/{entry}/"))
+    })
+}
+
+/// Like [`populate_xite`], but skips any data file under a directory named by
+/// one of `exclude` (see [`path_is_excluded`]) - the ContentFilter mute
+/// enforcement point (muted authors' `data/<auth_address>/…` files are left
+/// out of the database).
 pub fn populate_xite_filtered(
     conn: &Connection,
     schema: &DbSchema,
@@ -431,7 +450,7 @@ pub fn populate_xite_filtered(
             } else {
                 format!("{path_prefix}/{rel_body}")
             };
-            if !exclude.is_empty() && exclude.iter().any(|e| rel_str.contains(e.as_str())) {
+            if path_is_excluded(&rel_str, exclude) {
                 continue;
             }
             let Ok(bytes) = std::fs::read(&path) else {
@@ -603,11 +622,7 @@ pub fn populate_xite_paths_filtered(
         } else {
             format!("{path_prefix}/{rel_path}")
         };
-        if !exclude.is_empty()
-            && exclude
-                .iter()
-                .any(|entry| matched_path.contains(entry.as_str()))
-        {
+        if path_is_excluded(&matched_path, exclude) {
             continue;
         }
         let Some(bytes) =
@@ -654,11 +669,7 @@ pub fn populate_values_filtered(
         } else {
             format!("{path_prefix}/{rel_path}")
         };
-        if !exclude.is_empty()
-            && exclude
-                .iter()
-                .any(|entry| matched_path.contains(entry.as_str()))
-        {
+        if path_is_excluded(&matched_path, exclude) {
             continue;
         }
         if update_json(conn, schema, &matched_path, data, xite)? {

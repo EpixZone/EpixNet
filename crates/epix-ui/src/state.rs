@@ -21889,7 +21889,7 @@ impl AppState {
         let filter_epoch = self.db_filter_epoch();
         let muted = self.muted_authors().await;
         if self.db_filter_epoch() != filter_epoch
-            || muted.iter().any(|entry| inner_path.contains(entry.as_str()))
+            || epix_db::path_is_excluded(inner_path, &muted)
         {
             return;
         }
