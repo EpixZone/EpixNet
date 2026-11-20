@@ -2157,7 +2157,13 @@ impl WsCommand for ChannelContacts {
         let Some(ctx) = resolve_identity(s, &ms, p).await? else {
             return Ok(json!([]));
         };
-        let threads = ms.db.threads(ctx.identity_id, "all", 0, 500).map_err(|e| e.to_string())?;
+        // Scoped like `channelThreads`: a `Channels:<app>` client learns only
+        // the peers of its own app.
+        let app = resolve_app_filter(client_app_scope(s).await, requested_app(first_param_object(p)))?;
+        let threads = ms
+            .db
+            .threads_in_app(ctx.identity_id, app.as_deref(), "all", 0, 500)
+            .map_err(|e| e.to_string())?;
         let mut seen = std::collections::BTreeSet::new();
         for t in threads {
             if let Some(p) = t.get("peer_xid").and_then(|v| v.as_str()) {

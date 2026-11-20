@@ -257,6 +257,16 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
     assert!(err.contains("belongs to app talk"), "{err}");
     let opened = cmd("channelConversation").handle(&dm, &json!([{ "conv_id": conv }])).await.unwrap();
     assert_eq!(opened["messages"].as_array().unwrap().len(), 1, "{opened}");
+    // Contacts are app-scoped like threads: the talk client sees its peer, a
+    // client scoped to another app sees nobody, and the full grant sees all.
+    let contacts = cmd("channelContacts");
+    let talk_contacts = contacts.handle(&dm, &json!([{}])).await.unwrap();
+    assert_eq!(talk_contacts.as_array().unwrap().len(), 1, "{talk_contacts}");
+    assert_eq!(contacts.handle(&other, &json!([{}])).await.unwrap(), json!([]));
+    let err = contacts.handle(&dm, &json!([{ "app": "mail" }])).await.unwrap_err();
+    assert!(err.contains("scoped to app talk"), "{err}");
+    let all_contacts = contacts.handle(&alice_mail, &json!([{ "xid": "alice.epix" }])).await.unwrap();
+    assert_eq!(all_contacts, talk_contacts);
 
     // Bob (Mail's current identity) receives it on this same node: the tag came
     // out of the sealed body, so his copy is a talk thread too, badged for the
