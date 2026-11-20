@@ -646,6 +646,9 @@ mod tests {
 
     #[tokio::test]
     async fn reverse_identity_lookup_uses_the_resolver_endpoints_with_failover() {
+        // The lookup consults the global chain route (the Tor egress check),
+        // which other tests switch while holding this guard.
+        let _route_guard = crate::chain_route_test_guard().await;
         use std::io::{Read as _, Write as _};
         // An endpoint that refuses connections, then a live one.
         let dead = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
