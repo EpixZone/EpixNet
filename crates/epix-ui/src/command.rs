@@ -2085,9 +2085,13 @@ impl WsCommand for FileWrite {
         // writes into its merged xites, e.g. starring a repo in the index).
         let (target, inner) = s.resolve_target(inner_path).await?;
         s.state.write_file(&target, &inner, &bytes).await?;
-        // Ingest written data files into the xite's database right away (like
-        // EpixNet's storage.onUpdated), so the page's dbQuery sees the change
-        // before the sign/publish round-trip. The writing connection is
+        // Offer written data files to the xite's database ingest (like
+        // EpixNet's storage.onUpdated). Indexing is gated on accepted input:
+        // on a xite with an accepted (signed) db authority a file is indexed
+        // only as its signed manifests declare it, so an unsigned write to a
+        // hash-declared file reaches dbQuery after siteSign / fileWriteSign,
+        // not before. Only an owned xite with no accepted authority yet
+        // indexes its draft paths straight away. The writing connection is
         // excluded from the file_done echo (EpixNet notifies `ws != self`).
         if inner.ends_with(".json") && !inner.ends_with("content.json") {
             s.state.ingest_file_from(&target, &inner, Some(s.id)).await;
