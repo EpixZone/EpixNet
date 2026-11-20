@@ -966,4 +966,34 @@ mod merge_tests {
             "post 3 tombstoned (absent), post 2 folded to the edit, both joined to alice"
         );
     }
+
+    #[test]
+    fn crdt_fold_ignores_another_authors_version_of_a_post() {
+        let conn = Connection::open_in_memory().unwrap();
+        let schema = epixpost_schema();
+        apply(&conn, &schema).unwrap();
+        let xite = "epix1hub";
+        let (alice, moderator) = ("epix1alice", "epix1moderator");
+        let edited = epix_content::derive_post_id(alice, "n1", 1);
+        let modded = epix_content::derive_post_id(alice, "n2", 1);
+        // The fold reads already verified records, so signatures are omitted.
+        let rec = |pid: i64, author: &str, nonce: &str, clock: i64, sup: i64, deleted: bool, body: &str| {
+            json!({"post_id": pid, "author": author, "nonce": nonce, "date_added": 1,
+                   "clock": clock, "supersedes": sup, "deleted": deleted, "body": body,
+                   "sign": format!("{author}-{pid}-{clock}")})
+        };
+        let posts = json!({ "record_format":"epix-orset-1", "post":[
+            // Alice's post with a newer version from another signer: ignored.
+            rec(edited, alice, "n1", 1, 0, false, "alice wrote this"),
+            rec(edited, moderator, "n1", 9, 1, false, "replaced"),
+            // A moderation tombstone from another signer still hides a post.
+            rec(modded, alice, "n2", 1, 0, false, "spam"),
+            rec(modded, moderator, "n2", 9, 1, true, "")
+        ]});
+        update_json(&conn, &schema, "epix1hub/data/users/u/posts.json", &posts, xite).unwrap();
+        assert_eq!(
+            query(&conn, "SELECT post_id, body FROM post", &[]).unwrap(),
+            vec![json!({"post_id": edited, "body": "alice wrote this"})]
+        );
+    }
 }

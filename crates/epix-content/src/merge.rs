@@ -8,14 +8,16 @@
 //! The live view for feeds/DB is computed at read time by [`live_records`],
 //! which folds each `post_id`'s versions to a single deterministic display
 //! winner (tombstones hide the post; concurrent edits are retained on disk but
-//! only the winner is shown).
+//! only the winner is shown). Only the author who created a `post_id` can
+//! publish its content: another authorized signer's version of that id is
+//! retained but ignored unless it is a tombstone (see [`content_author`]).
 //!
 //! `watermark` compaction is deferred (see the plan §0): all versions are
 //! retained, so a losing concurrent version simply stays on disk (recoverable).
 
-use crate::record::verify_record;
+use crate::record::{derive_post_id, derive_post_id_keyed, verify_record};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The container `record_format` marker (untrusted; unknown values still parse).
 pub const RECORD_FORMAT: &str = "epix-orset-1";
@@ -55,6 +57,61 @@ fn supersedes_of(r: &Value) -> i64 {
 }
 fn is_deleted(r: &Value) -> bool {
     r.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false)
+}
+fn author_of(r: &Value) -> &str {
+    r.get("author").and_then(|v| v.as_str()).unwrap_or("")
+}
+
+/// Whether `r`'s `post_id` is derived from its own `author` (the `key` form or
+/// the `nonce` + `date_added` form `recordSign` mints at creation), which binds
+/// the id to the author who created it: another author cannot produce a
+/// version whose own fields derive the same id.
+fn post_id_bound_to_author(r: &Value) -> bool {
+    let (Some(pid), Some(author)) = (post_id_of(r), r.get("author").and_then(|v| v.as_str()))
+    else {
+        return false;
+    };
+    if let Some(key) = r.get("key").and_then(|v| v.as_str()) {
+        if derive_post_id_keyed(author, key) == pid {
+            return true;
+        }
+    }
+    match (
+        r.get("nonce").and_then(|v| v.as_str()),
+        r.get("date_added").and_then(|v| v.as_i64()),
+    ) {
+        (Some(nonce), Some(date_added)) => derive_post_id(author, nonce, date_added) == pid,
+        _ => false,
+    }
+}
+
+/// The one author allowed to publish content (non-tombstone versions) for a
+/// `post_id`: its creator. Computed from the SET of versions, never from their
+/// order, so the fold stays a CRDT.
+///
+/// The creator is the author the id is derived from ([`post_id_bound_to_author`]).
+/// A legacy migrated id is not derived from anything, and record clocks are
+/// author-chosen (a lower clock proves nothing), so for such an id the creator
+/// is known only when exactly one author has content versions. Any ambiguity
+/// (two derivation-bound authors, or two content authors of a legacy id)
+/// yields `None`: no content version is shown, so a conflict can hide a post
+/// but never swap in another author's content.
+fn content_author<'a>(versions: &[&'a Value]) -> Option<&'a str> {
+    let bound: BTreeSet<&str> = versions
+        .iter()
+        .filter(|r| post_id_bound_to_author(r))
+        .map(|r| author_of(r))
+        .collect();
+    let candidates: BTreeSet<&str> = if bound.is_empty() {
+        versions.iter().filter(|r| !is_deleted(r)).map(|r| author_of(r)).collect()
+    } else {
+        bound
+    };
+    if candidates.len() == 1 {
+        candidates.into_iter().next()
+    } else {
+        None
+    }
 }
 
 /// Deterministic on-disk order: `(post_id, clock, sign)`. Makes merge output
@@ -126,11 +183,20 @@ fn frontier<'a>(versions: &[&'a Value]) -> Vec<&'a Value> {
 }
 
 /// The single deterministic display winner among a `post_id`'s versions.
-/// Delete-wins (a tombstone in the frontier beats a concurrent live edit, for
+/// Only tombstones (from any authorized signer, e.g. a moderator) and the
+/// creator's own content versions ([`content_author`]) take part, so another
+/// signer cannot replace an author's post by reusing its id. Among those:
+/// delete-wins (a tombstone in the frontier beats a concurrent live edit, for
 /// privacy - no zombie post), then highest clock, then lexicographically
-/// greater signature. Returns `None` only for an empty input.
+/// greater signature. Returns `None` when no version takes part.
 pub fn display_winner<'a>(versions: &[&'a Value]) -> Option<&'a Value> {
-    frontier(versions).into_iter().max_by(|a, b| {
+    let owner = content_author(versions);
+    let accepted: Vec<&Value> = versions
+        .iter()
+        .copied()
+        .filter(|r| is_deleted(r) || Some(author_of(r)) == owner)
+        .collect();
+    frontier(&accepted).into_iter().max_by(|a, b| {
         is_deleted(a)
             .cmp(&is_deleted(b))
             .then(clock_of(a).cmp(&clock_of(b)))
@@ -318,6 +384,147 @@ mod tests {
             10_000_000,
         );
         assert!(bodies(&merged).is_empty(), "forged record never enters the set");
+    }
+
+    // A second authorized signer of the directory (a moderator or the hub
+    // owner), generated at runtime like the author key.
+    fn mod_key() -> &'static (String, String) {
+        static K: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+        K.get_or_init(|| {
+            let pk = epix_crypt::new_seed();
+            let addr = epix_crypt::privatekey_to_address(&pk).unwrap();
+            (pk, addr)
+        })
+    }
+
+    fn signers_with_mod() -> Vec<String> {
+        vec![author(), mod_key().1.clone()]
+    }
+
+    /// A version of `orig`'s post (same post_id, nonce and date_added) signed
+    /// by `key` with its own address as `author`, the way `recordSign` signs
+    /// any record for whoever holds the key.
+    fn foreign_ver(
+        orig: &Value,
+        key: &(String, String),
+        clock: i64,
+        supersedes: i64,
+        deleted: bool,
+        moderated: bool,
+        body: &str,
+    ) -> Value {
+        let mut rec = json!({
+            "post_id": orig["post_id"], "nonce": orig["nonce"], "author": key.1,
+            "clock": clock, "supersedes": supersedes, "deleted": deleted,
+            "body": body, "date_added": orig["date_added"],
+        });
+        if moderated {
+            rec["moderated"] = json!(true);
+        }
+        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), &key.0).unwrap());
+        rec
+    }
+
+    /// An author-signed version with an explicit (legacy, non-derived) post_id,
+    /// like the records a legacy data.json migration signs.
+    fn legacy_ver(key: &(String, String), post_id: i64, clock: i64, supersedes: i64, body: &str) -> Value {
+        let mut rec = json!({
+            "post_id": post_id, "nonce": epix_crypt::new_seed(), "author": key.1,
+            "clock": clock, "supersedes": supersedes, "deleted": false,
+            "body": body, "date_added": 1737331200_i64,
+        });
+        rec["sign"] = json!(epix_crypt::sign(&record_signed_data(&rec), &key.0).unwrap());
+        rec
+    }
+
+    fn merge_all(records: &[Value], signers: &[String]) -> Value {
+        merge_orset(&make_container(vec![]), &make_container(records.to_vec()), signers, 10_000_000)
+    }
+
+    #[test]
+    fn another_signer_cannot_replace_an_authors_post() {
+        let orig = ver("victim", 1, 0, false, "original");
+        // Valid record (authorized author, signature recovers to it) that
+        // reuses the victim's post_id with a higher clock and a supersedes
+        // that dominates the original.
+        let replacement = foreign_ver(&orig, mod_key(), 5, 1, false, false, "replaced");
+        let merged = merge_all(&[orig, replacement], &signers_with_mod());
+        assert_eq!(records_of(&merged).len(), 2, "both versions verify and are retained");
+        assert_eq!(bodies(&merged), vec!["original"], "the foreign version is not shown");
+        // The `moderated` flag gives an edit no extra power either.
+        let orig = ver("victim-m", 1, 0, false, "original");
+        let flagged = foreign_ver(&orig, mod_key(), 5, 1, false, true, "replaced");
+        let merged = merge_all(&[orig, flagged], &signers_with_mod());
+        assert_eq!(bodies(&merged), vec!["original"]);
+    }
+
+    #[test]
+    fn a_moderator_tombstone_still_hides_the_post() {
+        let orig = ver("modded", 1, 0, false, "spam");
+        let tomb = foreign_ver(&orig, mod_key(), 5, 1, true, true, "");
+        let merged = merge_all(&[orig, tomb], &signers_with_mod());
+        assert!(bodies(&merged).is_empty(), "moderation tombstone hides the post");
+    }
+
+    #[test]
+    fn the_author_can_still_edit_their_own_post() {
+        let orig = ver("own", 1, 0, false, "v1");
+        let edit = ver("own", 5, 1, false, "v2");
+        // A foreign replacement attempt in the same set does not block the edit.
+        let replacement = foreign_ver(&orig, mod_key(), 3, 1, false, false, "replaced");
+        let merged = merge_all(&[orig, edit, replacement], &signers_with_mod());
+        assert_eq!(bodies(&merged), vec!["v2"]);
+    }
+
+    #[test]
+    fn a_legacy_id_with_a_foreign_version_is_never_replaced() {
+        // A legacy migrated id is not derived from the author, so the creator
+        // cannot be proven; a lower clock must not let another signer claim it.
+        let owner = test_key();
+        let orig = legacy_ver(owner, 7, 1, 0, "original");
+        let undercut = legacy_ver(mod_key(), 7, 0, 0, "replaced-low");
+        let over = legacy_ver(mod_key(), 7, 9, 1, "replaced-high");
+        let merged = merge_all(&[orig.clone(), undercut, over], &signers_with_mod());
+        // The creator is ambiguous, so the post is hidden (fail closed), which
+        // a moderation tombstone could do anyway; foreign content never shows.
+        assert!(bodies(&merged).is_empty(), "no content is shown: {:?}", bodies(&merged));
+        // Without a foreign version the legacy post and its edits show as before.
+        let edit = legacy_ver(owner, 7, 5, 1, "edited");
+        assert_eq!(bodies(&merge_all(&[orig, edit], &signers())), vec!["edited"]);
+    }
+
+    #[test]
+    fn author_binding_is_order_independent() {
+        let orig = ver("shuffle", 1, 0, false, "v1");
+        let recs = vec![
+            orig.clone(),
+            ver("shuffle", 5, 1, false, "v2"),
+            foreign_ver(&orig, mod_key(), 6, 5, false, false, "replaced"),
+            foreign_ver(&orig, mod_key(), 2, 1, false, false, "replaced-early"),
+            ver("other", 1, 0, false, "other"),
+            foreign_ver(&ver("other", 1, 0, false, "other"), mod_key(), 4, 1, true, true, ""),
+        ];
+        let orders: [[usize; 6]; 5] = [
+            [0, 1, 2, 3, 4, 5],
+            [5, 4, 3, 2, 1, 0],
+            [2, 0, 5, 1, 3, 4],
+            [3, 2, 1, 4, 0, 5],
+            [4, 5, 2, 3, 0, 1],
+        ];
+        let mut outcomes = Vec::new();
+        for order in orders {
+            // Raw container order (no merge sort) and incremental merges.
+            let raw: Vec<Value> = order.iter().map(|&i| recs[i].clone()).collect();
+            outcomes.push(live_records(&make_container(raw)));
+            let mut c = make_container(vec![]);
+            for i in order {
+                c = merge_orset(&c, &make_container(vec![recs[i].clone()]), &signers_with_mod(), 10_000_000);
+            }
+            outcomes.push(live_records(&c));
+        }
+        assert_eq!(outcomes[0].len(), 1);
+        assert_eq!(outcomes[0][0]["body"], "v2");
+        assert!(outcomes.iter().all(|o| *o == outcomes[0]), "every order converges");
     }
 
     #[test]
