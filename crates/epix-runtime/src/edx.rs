@@ -6059,6 +6059,38 @@ impl epix_dht_net::KadSender for EdxKadSender {
     }
 }
 
+/// Activate the EDX object store under `data_dir/edx-store` on `state` WITHOUT
+/// a fetcher, for one-shot offline actions (`siteCreate`, offline `siteSign`)
+/// that commit a root manifest. Once a data dir has a persistent Store, a root
+/// promotion is refused until that Store is active, so these actions must open
+/// it the way the node does. Returns `Ok(false)` when the data dir has no Store
+/// yet (nothing to activate: the promotion proceeds without one).
+pub async fn activate_existing_store(
+    state: &Arc<AppState>,
+    data_dir: &std::path::Path,
+) -> Result<bool, String> {
+    let path = data_dir.join("edx-store");
+    match std::fs::symlink_metadata(path.join("index.redb")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        _ => {}
+    }
+    let cfg = epix_blob::store::StoreConfig {
+        xite_root: Some(data_dir.join("data")),
+        ..Default::default()
+    };
+    let store = Store::open_with(&path, cfg).map_err(|error| {
+        format!(
+            "could not open the EDX store {}: {error} (is another node instance running?)",
+            path.display()
+        )
+    })?;
+    state
+        .set_edx_store(Arc::new(store))
+        .await
+        .map_err(|error| format!("EDX Store activation failed: {error}"))?;
+    Ok(true)
+}
+
 /// Open the EDX object store under `data_dir/edx-store` and install it plus
 /// the verified-streaming fetcher on the node, using `privatekey` as the
 /// node's EDX identity. Registers the already-loaded xites so serving does

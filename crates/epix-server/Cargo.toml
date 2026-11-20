@@ -22,6 +22,7 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 libc = "0.2"
 
 [dev-dependencies]
+epix-blob = { path = "../epix-blob" }
 tempfile = "3"
 
 [features]

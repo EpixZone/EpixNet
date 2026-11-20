@@ -90,7 +90,7 @@ async fn dispatch(
     match action {
         // --- authoring (offline, against the data dir) --------------------
         "siteCreate" => {
-            let state = open_state(version).await?;
+            let state = open_authoring_state(version).await?;
             let (address, privatekey) = state.create_xite().await?;
             println!("----------------------------------------------------------------------");
             println!("Xite private key: {privatekey}");
@@ -130,7 +130,7 @@ async fn dispatch(
                 println!("{inner_path} signed via the running node [live]");
                 return Ok(());
             }
-            let state = open_state(version).await?;
+            let state = open_authoring_state(version).await?;
             if !state.has_any_alias(address).await {
                 return Err(format!("Xite not found: {address}"));
             }
@@ -536,6 +536,23 @@ async fn open_state(version: &str) -> Result<Arc<AppState>, String> {
     open_prepared_state(version, epix_node::prepare_data_root()?).await
 }
 
+/// [`open_state`] for offline actions that commit a signed root manifest: a
+/// data dir the node has run on holds a persistent EDX Store, and a root
+/// promotion is refused until it is active (the CLI otherwise leaves a stub
+/// xite with an unsigned content.json behind).
+async fn open_authoring_state(version: &str) -> Result<Arc<AppState>, String> {
+    let state = open_state(version).await?;
+    activate_store(&state).await?;
+    Ok(state)
+}
+
+async fn activate_store(state: &Arc<AppState>) -> Result<(), String> {
+    if let Some(dir) = state.data_root_path() {
+        epix_runtime::edx::activate_existing_store(state, &dir).await?;
+    }
+    Ok(())
+}
+
 async fn open_prepared_state(
     version: &str,
     lease: Arc<epix_ui::data_relocation::DataRootLease>,
@@ -593,6 +610,38 @@ mod tests {
         drop(state);
         let state2 = open_fixture_state(root.path()).await.unwrap();
         assert!(state2.has_xite(&address).await, "registry persisted");
+    }
+
+    /// A data dir the node has run on holds a persistent EDX Store. An
+    /// offline siteCreate there used to leave a stub xite with an unsigned
+    /// content.json ("Persistent Store must finish activation before a root
+    /// promotion"); the authoring state activates the Store first.
+    #[tokio::test]
+    async fn create_signs_the_root_in_a_data_dir_with_a_store() {
+        let root = tempfile::tempdir().unwrap();
+        let cfg = epix_blob::store::StoreConfig {
+            xite_root: Some(root.path().join("data")),
+            ..Default::default()
+        };
+        drop(epix_blob::store::Store::open_with(&root.path().join("edx-store"), cfg).unwrap());
+        assert!(root.path().join("edx-store/index.redb").is_file());
+
+        // Without activation the root promotion is refused.
+        let state = open_fixture_state(root.path()).await.unwrap();
+        assert!(state.create_xite().await.is_err(), "the dormant Store gates the commit");
+        drop(state);
+
+        let state = open_fixture_state(root.path()).await.unwrap();
+        activate_store(&state).await.unwrap();
+        let (address, _privatekey) = state.create_xite().await.unwrap();
+        let bytes = std::fs::read(state.xite_dir(&address).unwrap().join("content.json")).unwrap();
+        let content: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(epix_content_signed(&content, &address), "{content}");
+        assert!(state.list_modified_files(&address).await.is_empty(), "fresh xite verifies");
+    }
+
+    fn epix_content_signed(content: &serde_json::Value, address: &str) -> bool {
+        content.get("signs").and_then(|signs| signs.get(address)).is_some()
     }
 
     #[cfg(not(target_os = "macos"))]

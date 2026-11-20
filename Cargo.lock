@@ -3277,6 +3277,7 @@ dependencies = [
 name = "epix-server"
 version = "0.3.0"
 dependencies = [
+ "epix-blob",
  "epix-build",
  "epix-core",
  "epix-crypt",
