@@ -3785,7 +3785,10 @@ impl WsCommand for MergerXiteAdd {
     }
 }
 
-/// `mergerSiteDelete(address)` - remove a merged xite from the node.
+/// `mergerSiteDelete(address)` - remove a merged xite from the node. Only a
+/// xite whose content.json declares a `merged_type` this merger holds a
+/// `Merger:<type>` permission for may be removed (EpixNet's
+/// actionMergerSiteDelete check); any other xite needs `siteDelete`.
 struct MergerXiteDelete;
 #[async_trait]
 impl WsCommand for MergerXiteDelete {
@@ -3794,11 +3797,27 @@ impl WsCommand for MergerXiteDelete {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        if s.state.merger_types(&address).await.is_empty() {
+        let merger_types = s.state.merger_types(&address).await;
+        if merger_types.is_empty() {
             return Err("Not a merger xite".into());
         }
+        // Check every target before removing any, so a refused address in a
+        // batch never leaves the earlier ones half-applied.
+        let mut targets = Vec::new();
         for target in arg_addresses(p) {
-            s.state.try_remove_xite_from(&require_address(&target)?, s.id).await?;
+            let target = require_address(&target)?;
+            let key = s.state.canonical_key(&target).await;
+            let merged_type = s.state.xite_merged_type(&key).await;
+            if !merged_type.as_ref().is_some_and(|t| merger_types.contains(t)) {
+                return Err(format!(
+                    "Merged type ({}) of {target} not in {merger_types:?}",
+                    merged_type.as_deref().unwrap_or("none")
+                ));
+            }
+            targets.push(key);
+        }
+        for target in targets {
+            s.state.try_remove_xite_from(&target, s.id).await?;
         }
         s.state.rebuild_merger_dbs().await;
         Ok(Value::from("ok"))
@@ -5803,6 +5822,42 @@ mod tests {
         // A non-merger xite can't list.
         let s2 = WsSession::new(state, Some(merged.into()));
         assert!(MergerXiteList.handle(&s2, &json!([false])).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn merger_site_delete_only_removes_xites_of_the_mergers_own_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let registry = CommandRegistry::with_defaults();
+        let merger = "1Merger";
+        state.add_xite(merger, XiteEntry { storage: XiteStorage::new(dir.path().join("m")), content: None }).await;
+        state.add_permission(merger, "Merger:EpixPost").await;
+        state
+            .add_xite("1Merged", XiteEntry { storage: XiteStorage::new(dir.path().join("d")), content: Some(json!({ "merged_type": "EpixPost" })) })
+            .await;
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path().join("o")), content: Some(json!({ "merged_type": "OtherApp" })) })
+            .await;
+        state
+            .add_xite("1Plain", XiteEntry { storage: XiteStorage::new(dir.path().join("p")), content: Some(json!({ "title": "Plain" })) })
+            .await;
+        let session = WsSession::new(state.clone(), Some(merger.into()));
+
+        // A xite of another merged type, a xite with no merged type, and the
+        // merger itself are all out of reach.
+        for target in ["1Other", "1Plain", merger] {
+            let denied = registry.dispatch(&session, "mergerSiteDelete", &json!([target]), 3).await;
+            assert!(denied.unwrap_err().contains("not in"), "{target} was deletable");
+            assert!(state.has_xite(target).await, "{target} survived");
+        }
+        // A refused address in a batch removes nothing.
+        let denied = registry.dispatch(&session, "mergerSiteDelete", &json!([["1Merged", "1Other"]]), 4).await;
+        assert!(denied.is_err());
+        assert!(state.has_xite("1Merged").await, "batch refused before any removal");
+
+        // The merger's own type is still removable.
+        registry.dispatch(&session, "mergerSiteDelete", &json!(["1Merged"]), 5).await.unwrap();
+        assert!(!state.has_xite("1Merged").await);
     }
 
     #[tokio::test]
