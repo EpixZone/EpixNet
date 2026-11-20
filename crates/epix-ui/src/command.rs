@@ -6082,16 +6082,20 @@ mod tests {
     async fn content_filter_mutes_and_siteblocks() {
         let state = AppState::new("test");
         let session = WsSession::new(state.clone(), Some("1site".into()));
+        // The operator socket changes the mute list without a dialog; a
+        // page's confirmation is covered by
+        // mute_changes_from_a_page_wait_for_the_users_confirmation.
+        let operator = WsSession::new_trusted(state.clone(), Some("1site".into()));
 
         MuteAdd
-            .handle(&session, &json!(["1AuthorAddr", "bob@xid.epix", "spam"]))
+            .handle(&operator, &json!(["1AuthorAddr", "bob@xid.epix", "spam"]))
             .await
             .unwrap();
         let list = MuteList.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(list["1AuthorAddr"]["cert_user_id"], "bob@xid.epix");
         assert_eq!(list["1AuthorAddr"]["reason"], "spam");
 
-        MuteRemove.handle(&session, &json!(["1AuthorAddr"])).await.unwrap();
+        MuteRemove.handle(&operator, &json!(["1AuthorAddr"])).await.unwrap();
         assert!(MuteList.handle(&session, &Value::Null).await.unwrap().as_object().unwrap().is_empty());
 
         SiteblockAdd.handle(&session, &json!(["1BadSite", "malware"])).await.unwrap();
