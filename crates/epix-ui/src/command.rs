@@ -2766,7 +2766,8 @@ impl WsCommand for EcdsaSign {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let data = arg_str(p, "data", 0).ok_or("ecdsaSign: data required")?;
-        let privatekey = match arg_str(p, "privatekey", 1) {
+        // A bare string is the data alone: it must never double as the key.
+        let privatekey = match arg_str_at(p, "privatekey", 1) {
             Some(pk) => pk.to_string(),
             None => {
                 let address = s.address()?.to_string();
@@ -2853,7 +2854,10 @@ impl WsCommand for VrfGetBeacon {
         "vrfGetBeacon"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let height = arg_u64(p, "height", 0).ok_or("vrfGetBeacon: height required")?;
+        // A bare number (or numeric string) is the height.
+        let height = arg_u64(p, "height", 0)
+            .or_else(|| p.as_u64().or_else(|| p.as_str().and_then(|s| s.trim().parse().ok())))
+            .ok_or("vrfGetBeacon: height required")?;
         let vrf = epix_chain::Vrf::new_multi(s.state.chain_rpc_urls().await);
         match vrf.beacon(height).await {
             Ok(b) => Ok(beacon_json(&b)),
@@ -2937,7 +2941,9 @@ impl WsCommand for XidResolveName {
         let raw = arg_str(p, "name", 0)
             .or_else(|| arg_str(p, "xid_name", 0))
             .ok_or("xidResolveName: name required")?;
-        let (name, tld) = match arg_str(p, "tld", 1) {
+        // A bare "name.tld" string is the name alone; its tld comes from the
+        // suffix, never from the same string.
+        let (name, tld) = match arg_str_at(p, "tld", 1) {
             Some(tld) => (raw, tld),
             None => raw.rsplit_once('.').unwrap_or((raw, "epix")),
         };
@@ -4350,6 +4356,16 @@ fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
         .or_else(|| p.as_str())
 }
 
+/// Like [`arg_str`], but a bare string parameter stands only for the FIRST
+/// positional argument (`idx == 0`), so `cmd("x", "value")` cannot fill a
+/// second parameter with the same value.
+fn arg_str_at<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
+    p.get(key)
+        .or_else(|| p.as_array().and_then(|a| a.get(idx)))
+        .and_then(|v| v.as_str())
+        .or_else(|| if idx == 0 { p.as_str() } else { None })
+}
+
 /// The legacy `certList` row shape over the identity model: every linked
 /// identity as an `xid.epix` cert, `selected` for the one this xite acts as.
 async fn legacy_cert_rows(state: &AppState, address: &str) -> Vec<Value> {
@@ -4394,9 +4410,12 @@ impl WsCommand for IdentitySelect {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
+        // A bare string is the auth_address, not "no choice": treating it as
+        // absent would silently reset the xite to the default identity.
         let raw = p
             .get("auth_address")
-            .or_else(|| p.as_array().and_then(|a| a.first()));
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .or_else(|| p.is_string().then_some(p));
         let choice = match raw {
             None | Some(Value::Null) => None,
             Some(v) => Some(
@@ -4456,7 +4475,8 @@ impl WsCommand for IdentityLinkComplete {
         let address = s.address()?.to_string();
         let auth_address = arg_str(p, "auth_address", 0)
             .ok_or("identityLinkComplete: auth_address required")?;
-        let name = arg_str(p, "name", 1).filter(|n| !n.is_empty());
+        // A bare string is the auth_address alone, never also the name.
+        let name = arg_str_at(p, "name", 1).filter(|n| !n.is_empty());
         s.state.identity_link_complete(auth_address, name, Some(&address)).await
     }
 }
@@ -6564,3 +6584,7 @@ mod tests {
 #[cfg(test)]
 #[path = "command/tests/sidebar_maintenance.rs"]
 mod sidebar_maintenance_tests;
+
+#[cfg(test)]
+#[path = "command/tests/bare_params.rs"]
+mod bare_params_tests;
