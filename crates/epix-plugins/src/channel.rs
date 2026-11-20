@@ -428,20 +428,29 @@ pub(crate) async fn resolve_identity(
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty())
     });
+    let bound = s.state.identity_for(s.address().unwrap_or("")).await;
     let identity = match explicit {
         Some(key) => {
             let key = key.trim().to_lowercase();
             let bare = key.strip_suffix(".epix").unwrap_or(&key).to_string();
-            Some(
-                s.state
-                    .identities()
-                    .await
-                    .into_iter()
-                    .find(|i| i.auth_address == key || i.name == bare)
-                    .ok_or_else(|| format!("unknown identity {key}"))?,
-            )
+            let named = s
+                .state
+                .identities()
+                .await
+                .into_iter()
+                .find(|i| i.auth_address == key || i.name == bare)
+                .ok_or_else(|| format!("unknown identity {key}"))?;
+            // A `Channels:<app>` client acts only as the identity its own xite
+            // uses (its selection, else the node default); it cannot name
+            // another persona the node holds. Full grants may switch.
+            if client_app_scope(s).await.is_some()
+                && bound.as_ref().map(|b| b.auth_address.as_str()) != Some(named.auth_address.as_str())
+            {
+                return Err(format!("channels: this xite cannot act as identity {key}"));
+            }
+            Some(named)
         }
-        None => s.state.identity_for(s.address().unwrap_or("")).await,
+        None => bound,
     };
     match identity {
         Some(identity) => identity_ctx_for(&s.state, ms, &identity).await.map(Some),

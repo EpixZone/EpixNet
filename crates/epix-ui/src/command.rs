@@ -59,6 +59,9 @@ const ADMIN_COMMANDS: &[&str] = &[
     "announcerStats",
     "certList",
     "certSet",
+    // Turns channels on or off for any identity the node holds: an operator
+    // action (the Config page), never a page's, even a channel client's.
+    "channelIdentitySetEnabled",
     "channelJoinAllsite",
     "identityRemove",
     "identitySetDefault",
