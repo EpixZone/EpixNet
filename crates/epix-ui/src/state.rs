@@ -5516,7 +5516,7 @@ fn tracker_gated(
 
 /// Escape a string for safe interpolation into dialog HTML (cert names,
 /// addresses shown in the certXid picker).
-fn html_escape(s: &str) -> String {
+pub(crate) fn html_escape(s: &str) -> String {
     s.replace('&', "&amp;")
         .replace('<', "&lt;")
         .replace('>', "&gt;")
