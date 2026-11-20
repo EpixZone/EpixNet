@@ -480,6 +480,14 @@ impl XidResolver {
         }))
     }
 
+    /// The chain's UNVERIFIED reverse lookup for an identity address
+    /// (`/xid/v1/reverse_identity/<address>`), through the same endpoint list
+    /// and failover as forward resolves. It only names a candidate domain;
+    /// callers must confirm it with a forward resolve.
+    pub(crate) async fn reverse_identity_record(&self, address: &str) -> Result<Value> {
+        self.get_json(&format!("/xid/v1/reverse_identity/{address}")).await
+    }
+
     /// GET `path` (endpoint-relative, starting with `/`) as JSON, rotating
     /// across the configured endpoints on failure.
     async fn get_json(&self, path: &str) -> Result<Value> {
@@ -634,6 +642,48 @@ mod tests {
             },
         )]);
         crate::finality::PinnedSet::new(validators, CHAIN, 1, 1).unwrap()
+    }
+
+    #[tokio::test]
+    async fn reverse_identity_lookup_uses_the_resolver_endpoints_with_failover() {
+        use std::io::{Read as _, Write as _};
+        // An endpoint that refuses connections, then a live one.
+        let dead = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let dead_url = format!("http://{}", dead.local_addr().unwrap());
+        drop(dead);
+        let live = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let live_url = format!("http://{}", live.local_addr().unwrap());
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = live.accept().unwrap();
+            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut request = Vec::new();
+            let mut chunk = [0u8; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut chunk).unwrap();
+                if read == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..read]);
+            }
+            let body = br#"{"name_record":{"name":"alice","tld":"epix"}}"#;
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .unwrap();
+            stream.write_all(body).unwrap();
+            String::from_utf8(request).unwrap()
+        });
+        let resolver = XidResolver::new_multi(vec![dead_url, live_url.clone()]);
+        let record = resolver.reverse_identity_record("epix1linked").await.unwrap();
+        assert_eq!(record["name_record"]["name"], "alice");
+        let request = server.join().unwrap();
+        assert!(
+            request.starts_with("GET /xid/v1/reverse_identity/epix1linked "),
+            "{request}"
+        );
+        assert_eq!(resolver.preferred_endpoint(), live_url, "failover is remembered");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
