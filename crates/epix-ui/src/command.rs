@@ -3586,7 +3586,7 @@ impl WsCommand for OptionalLimitStats {
 }
 
 /// `optionalLimitSet(limit)` - set the optional-files cap (`"10%"` or a GB
-/// number).
+/// number). Anything else is refused with an error.
 struct OptionalLimitSet;
 #[async_trait]
 impl WsCommand for OptionalLimitSet {
@@ -3595,7 +3595,7 @@ impl WsCommand for OptionalLimitSet {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let limit = arg_str(p, "limit", 0).ok_or("optionalLimitSet: limit required")?;
-        s.state.set_optional_limit(limit).await;
+        s.state.set_optional_limit(limit).await?;
         Ok(Value::from("ok"))
     }
 }

@@ -5986,7 +5986,7 @@ impl AppState {
         let optional_limit = std::fs::read_to_string(&optional_limit_path)
             .map(|s| s.trim().to_string())
             .ok()
-            .filter(|s| !s.is_empty())
+            .filter(|s| parse_optional_limit(s).is_ok())
             .unwrap_or_else(|| "10%".to_string());
         let config_path = dir.join("config.json");
         // A missing config.json is a normal first run (defaults are correct). But
@@ -17386,13 +17386,19 @@ impl AppState {
         })
     }
 
-    /// Set the optional-files cap (`optionalLimitSet`), persisted.
-    pub async fn set_optional_limit(&self, limit: &str) {
+    /// Set the optional-files cap (`optionalLimitSet`), persisted. Accepts
+    /// what the Dashboard sends: a plain number of gigabytes (`"5"`,
+    /// `"0.48828125"`) or a percentage of free disk (`"10%"`). Anything else
+    /// (a unit suffix such as `"500M"`, a negative or non-finite number) is
+    /// refused rather than misread.
+    pub async fn set_optional_limit(&self, limit: &str) -> Result<(), String> {
         let limit = limit.trim().to_string();
+        parse_optional_limit(&limit)?;
         if let Some(path) = &self.optional_limit_path {
             let _ = std::fs::write(path, &limit);
         }
         *self.optional_limit.write().await = limit;
+        Ok(())
     }
 
     /// The optional-files cap in bytes: a `%` value is that fraction of free
@@ -17400,12 +17406,11 @@ impl AppState {
     /// `getOptionalLimitBytes`).
     pub async fn optional_limit_bytes(&self) -> i64 {
         let limit = self.optional_limit.read().await.clone();
-        let digits: String = limit.chars().filter(|c| c.is_ascii_digit() || *c == '.').collect();
-        let n: f64 = digits.parse().unwrap_or(0.0);
-        if limit.trim_end().ends_with('%') {
-            (free_space(self.optional_limit_path.as_deref()) as f64 * (n / 100.0)) as i64
-        } else {
-            (n * 1024.0 * 1024.0 * 1024.0) as i64
+        match parse_optional_limit(&limit).unwrap_or(OptionalLimit::Percent(10.0)) {
+            OptionalLimit::Percent(n) => {
+                (free_space(self.optional_limit_path.as_deref()) as f64 * (n / 100.0)) as i64
+            }
+            OptionalLimit::Gigabytes(n) => (n * 1024.0 * 1024.0 * 1024.0) as i64,
         }
     }
 
@@ -34215,6 +34220,48 @@ fn read_from_archive(archive_path: &str, bytes: &[u8], within: &str) -> Option<V
 /// Free disk space (bytes) on the filesystem holding `path`'s directory (or the
 /// current directory). Uses `statvfs` on unix and `GetDiskFreeSpaceExW` on
 /// Windows; elsewhere it is unknown (0), which disables percentage caps.
+/// A parsed optional-files cap (see [`AppState::set_optional_limit`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum OptionalLimit {
+    Percent(f64),
+    Gigabytes(f64),
+}
+
+fn parse_optional_limit(limit: &str) -> Result<OptionalLimit, String> {
+    let invalid = || {
+        format!(
+            "Invalid optional files limit {limit:?}: use a number of gigabytes (e.g. \"5\" or \"0.5\") or a percentage of free space (e.g. \"10%\")"
+        )
+    };
+    let limit = limit.trim();
+    let (number, percent) = match limit.strip_suffix('%') {
+        Some(number) => (number.trim_end(), true),
+        None => (limit, false),
+    };
+    // Digits, a decimal point and (for what JavaScript's toString prints for
+    // tiny values, e.g. "9.765625e-8") an exponent. No signs, words or units.
+    if number.is_empty()
+        || !number.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | 'e' | 'E' | '-' | '+'))
+        || number.starts_with(['-', '+'])
+    {
+        return Err(invalid());
+    }
+    let value: f64 = number.parse().map_err(|_| invalid())?;
+    if !value.is_finite() || value < 0.0 {
+        return Err(invalid());
+    }
+    if percent {
+        if value > 100.0 {
+            return Err(format!(
+                "Invalid optional files limit {limit:?}: a percentage must be between 0 and 100"
+            ));
+        }
+        Ok(OptionalLimit::Percent(value))
+    } else {
+        Ok(OptionalLimit::Gigabytes(value))
+    }
+}
+
 fn free_space(path: Option<&std::path::Path>) -> i64 {
     #[cfg(unix)]
     {
@@ -43535,7 +43582,7 @@ mod tests {
         state.set_pin(&addr, "a.bin", true).await;
 
         // ~2791-byte cap: 3000 downloaded > cap, so eviction runs.
-        state.set_optional_limit("0.0000026").await;
+        state.set_optional_limit("0.0000026").await.unwrap();
         let limit = state.optional_limit_bytes().await;
         assert!(limit > 1000 && limit < 3000, "limit was {limit}");
 
@@ -43563,7 +43610,7 @@ mod tests {
         let (state, _addr) = optional_cache_xite(dir.path(), "complete").await;
 
         // The same cap that evicted two files above.
-        state.set_optional_limit("0.0000026").await;
+        state.set_optional_limit("0.0000026").await.unwrap();
         assert!(state.optional_limit_bytes().await < 3000);
 
         assert_eq!(state.enforce_optional_limit().await, 0, "committed content is not cache");
@@ -43581,7 +43628,7 @@ mod tests {
         let (state, _addr) = optional_cache_xite(dir.path(), "partial").await;
         state.config_set("full_retention", Value::from("true")).await;
 
-        state.set_optional_limit("0.0000026").await;
+        state.set_optional_limit("0.0000026").await.unwrap();
         assert_eq!(state.enforce_optional_limit().await, 0, "the reader chose to hold these");
         for name in ["a.bin", "b.bin", "c.bin"] {
             assert!(dir.path().join(name).exists());
@@ -46448,12 +46495,36 @@ mod tests {
             assert_eq!(s.optional_limit_stats().await["limit"], "10%");
             // A percentage cap is a fraction of real free disk space (non-zero).
             assert!(s.optional_limit_bytes().await > 0);
-            s.set_optional_limit("5").await; // 5 GB
+            s.set_optional_limit("5").await.unwrap(); // 5 GB
             assert_eq!(s.optional_limit_bytes().await, 5 * 1024 * 1024 * 1024);
         }
         // The new cap is restored on restart.
         let s = AppState::with_data_dir("test", dir.path());
         assert_eq!(s.optional_limit_stats().await["limit"], "5");
+    }
+
+    #[tokio::test]
+    async fn optional_limit_accepts_dashboard_formats_and_refuses_the_rest() {
+        let dir = tempdir().unwrap();
+        let s = AppState::with_data_dir("test", dir.path());
+        // What the Dashboard's PageFiles sends: GB numbers (a "500M" entry is
+        // converted to 500/1024 GB there), JS exponent output, percentages.
+        for ok in ["5", "0.48828125", "9.765625e-8", "10%", "0%", "100%", " 2.5 "] {
+            s.set_optional_limit(ok).await.unwrap_or_else(|e| panic!("{ok}: {e}"));
+        }
+        assert_eq!(s.optional_limit_stats().await["limit"], "2.5");
+        for bad in ["500M", "500MB", "1G", "", "%", "-1", "+1", "NaN", "NaN%", "inf", "1e999", "150%", "10 %x", "abc"] {
+            let error = s.set_optional_limit(bad).await.unwrap_err();
+            assert!(error.contains("optional files limit"), "{bad}: {error}");
+        }
+        // Refused values change nothing, in memory or on disk.
+        assert_eq!(s.optional_limit_stats().await["limit"], "2.5");
+        assert_eq!(s.optional_limit_bytes().await, (2.5 * 1024.0 * 1024.0 * 1024.0) as i64);
+        drop(s);
+        // A bad value already on disk (from an older build) loads as the default.
+        std::fs::write(dir.path().join("private").join("optional_limit"), "500M").unwrap();
+        let s = AppState::with_data_dir("test", dir.path());
+        assert_eq!(s.optional_limit_stats().await["limit"], "10%");
     }
 
     #[tokio::test]
