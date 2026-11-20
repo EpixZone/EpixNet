@@ -1236,7 +1236,7 @@ impl WsCommand for ConsoleLogStream {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let filter = console_log_filter(p);
-        Ok(json!({ "stream_id": s.state.console_log_stream_open(filter).await }))
+        Ok(json!({ "stream_id": s.state.console_log_stream_open(filter, s.id).await }))
     }
 }
 
@@ -1253,7 +1253,7 @@ impl WsCommand for ConsoleLogStreamRemove {
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_i64())
             .ok_or("consoleLogStreamRemove: stream_id required")?;
-        s.state.console_log_stream_remove(id).await;
+        s.state.console_log_stream_remove(id, s.id).await;
         Ok(Value::from("ok"))
     }
 }

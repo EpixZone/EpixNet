@@ -4420,9 +4420,10 @@ pub struct AppState {
     /// `[date_added, level, message]`, newest last, capped.
     logs: RwLock<std::collections::VecDeque<Value>>,
     /// Open sidebar-console log streams (`consoleLogStream`) as `(stream_id,
-    /// level_filter)`; new log lines are pushed to each as `logLineAdd` events,
-    /// but only when the line passes that stream's filter.
-    log_streams: RwLock<Vec<(i64, String)>>,
+    /// level_filter, connection_id)`; new log lines are pushed as `logLineAdd`
+    /// events only to the connection that opened the stream, and only when the
+    /// line passes that stream's filter. A stream ends with its connection.
+    log_streams: RwLock<Vec<(i64, String, u64)>>,
     /// Path to the persisted peer database (`peers.json`), so known peers survive
     /// restarts (the PeerDb plugin). None for in-memory nodes.
     peers_path: Option<PathBuf>,
@@ -18196,15 +18197,19 @@ impl AppState {
         let streams = self.log_streams.read().await;
         if !streams.is_empty() {
             let formatted = format_log_line(&line);
-            for (id, filter) in streams.iter() {
+            for (id, filter, conn) in streams.iter() {
                 if !log_line_matches(&line, filter) {
                     continue;
                 }
-                self.push_event(
+                // Only the console that asked: every other open page, of any
+                // xite, must never see the node's log.
+                self.push_event_routed(
                     "logLineAdd",
                     json!({ "stream_id": id, "lines": [formatted] }),
                     None,
                     None,
+                    None,
+                    Some(*conn),
                 );
             }
         }
@@ -18243,18 +18248,32 @@ impl AppState {
         json!({ "lines": lines, "pos_start": 0, "pos_end": n * 80, "num_found": n })
     }
 
-    /// `consoleLogStream` - open a live log stream; returns its id. New lines
-    /// arrive as `logLineAdd` events tagged with this id, filtered to `filter`
-    /// (the active tab's level, or empty for All).
-    pub async fn console_log_stream_open(&self, filter: &str) -> i64 {
+    /// `consoleLogStream` - open a live log stream for connection `conn`;
+    /// returns its id. New lines arrive on that connection only, as
+    /// `logLineAdd` events tagged with this id, filtered to `filter` (the
+    /// active tab's level, or empty for All).
+    pub async fn console_log_stream_open(&self, filter: &str, conn: u64) -> i64 {
         let id = self.nonce_counter.fetch_add(1, Ordering::Relaxed) as i64;
-        self.log_streams.write().await.push((id, filter.to_string()));
+        self.log_streams.write().await.push((id, filter.to_string(), conn));
         id
     }
 
-    /// `consoleLogStreamRemove` - stop a live log stream.
-    pub async fn console_log_stream_remove(&self, id: i64) {
-        self.log_streams.write().await.retain(|s| s.0 != id);
+    /// `consoleLogStreamRemove` - stop one of connection `conn`'s live log
+    /// streams (EpixNet kept them per websocket, so one console cannot end
+    /// another's).
+    pub async fn console_log_stream_remove(&self, id: i64, conn: u64) {
+        self.log_streams.write().await.retain(|s| !(s.0 == id && s.2 == conn));
+    }
+
+    /// End every log stream connection `conn` opened (it closed).
+    pub async fn console_log_streams_close(&self, conn: u64) {
+        self.log_streams.write().await.retain(|s| s.2 != conn);
+    }
+
+    /// How many live log streams are open (tests).
+    #[cfg(test)]
+    pub(crate) async fn console_log_stream_count(&self) -> usize {
+        self.log_streams.read().await.len()
     }
 
     /// Subscribe to server-pushed UI events (one receiver per WS connection).
@@ -43643,7 +43662,7 @@ mod tests {
         let path = dir.path().join("debug.log");
         let state = AppState::new("test");
         state.set_log_file(&path);
-        state.console_log_stream_open("INFO").await;
+        state.console_log_stream_open("INFO", 1).await;
         let mut events = state.subscribe_events();
         let mut tasks = Vec::new();
         for index in 0..16 {
@@ -43720,7 +43739,7 @@ mod tests {
     async fn console_stream_only_pushes_matching_levels() {
         let state = AppState::new("test");
         // Open a WARNING-filtered stream.
-        let sid = state.console_log_stream_open("WARNING").await;
+        let sid = state.console_log_stream_open("WARNING", 1).await;
         let mut events = state.subscribe_events();
 
         // An INFO line must not be streamed to a WARNING tab.
@@ -45329,7 +45348,7 @@ mod tests {
     async fn console_stream_returns_id_and_pushes_loglineadd() {
         let state = AppState::new("test");
         // Opening a stream returns a real id (was null before -> UI crash).
-        let sid = state.console_log_stream_open("").await;
+        let sid = state.console_log_stream_open("", 1).await;
         let mut events = state.subscribe_events();
 
         // A new log line streams as logLineAdd with the matching stream_id.
@@ -45347,8 +45366,20 @@ mod tests {
         assert_eq!(read["num_found"], 1);
         assert!(read["lines"][0].as_str().unwrap().contains("hello world"));
 
+        // The line went to the opening connection only.
+        assert_eq!(ev.only, Some(1));
+
+        // Another connection cannot end this stream; closing one connection
+        // ends only its own streams.
+        state.console_log_stream_remove(sid, 2).await;
+        let other = state.console_log_stream_open("", 2).await;
+        assert_eq!(state.console_log_stream_count().await, 2);
+        state.console_log_streams_close(2).await;
+        assert_eq!(state.console_log_stream_count().await, 1);
+        assert_ne!(other, sid);
+
         // After removing the stream, no more logLineAdd is pushed.
-        state.console_log_stream_remove(sid).await;
+        state.console_log_stream_remove(sid, 1).await;
         while events.try_recv().is_ok() {}
         state.log("INFO", "after removal").await;
         assert!(events.try_recv().is_err());

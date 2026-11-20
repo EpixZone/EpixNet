@@ -4225,6 +4225,9 @@ async fn handle_ws(socket: WebSocket, ctx: Ctx, xite: Option<String>, wrapper: b
     if let Some(addr) = &session.xite {
         ctx.state.unregister_bound_conn(addr, session.id);
     }
+    // A console's log stream ends with its connection (EpixNet's streamer
+    // stopped once its websocket closed).
+    ctx.state.console_log_streams_close(session.id).await;
     pump.abort();
 }
 
@@ -4710,5 +4713,86 @@ mod identities_page_tests {
         let empty = render_identities_item("Linked xIDs", &[]);
         assert!(empty.contains("No identities linked yet"));
         assert!(!empty.contains("<table"));
+    }
+}
+
+/// Live log lines are the node's own log: they reach only the console that
+/// opened the stream, never another open page, and the stream ends when that
+/// console's connection closes.
+#[cfg(test)]
+mod log_stream_routing_tests {
+    use crate::state::{AppState, XiteEntry};
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{json, Value};
+    use tokio_tungstenite::tungstenite::Message;
+
+    type Ws = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// The next text frame as JSON, or None after `ms` of silence.
+    async fn next_json(ws: &mut Ws, ms: u64) -> Option<Value> {
+        loop {
+            match tokio::time::timeout(std::time::Duration::from_millis(ms), ws.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => return Some(serde_json::from_str(&text).unwrap()),
+                Ok(Some(Ok(_))) => continue,
+                _ => return None,
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn log_lines_reach_only_the_console_that_opened_the_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let state = AppState::with_data_dir("log-stream-test", root.path());
+        for addr in ["1Dashboard", "1Page"] {
+            let storage = epix_xite::XiteStorage::new(root.path().join("data").join(addr));
+            state
+                .add_xite(addr, XiteEntry { storage, content: Some(json!({ "address": addr })) })
+                .await;
+        }
+        let (key, _) = state.wrapper_keys("1Dashboard").await;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let router = crate::UiServer::new(state.clone()).router();
+        let server = tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+        let url = |k: &str| format!("ws://{addr}/EpixNet-Internal/Websocket?wrapper_key={k}");
+        let (mut console, _) = tokio_tungstenite::connect_async(url(&key)).await.unwrap();
+        let (mut page, _) = tokio_tungstenite::connect_async(url("1Page")).await.unwrap();
+
+        let open = json!({ "cmd": "consoleLogStream", "params": { "filter": "" }, "id": 1_000_001 });
+        console.send(Message::Text(open.to_string().into())).await.unwrap();
+        let stream_id = loop {
+            let msg = next_json(&mut console, 2000).await.expect("stream opened");
+            if msg["cmd"] == "response" && msg["to"] == 1_000_001 {
+                break msg["result"]["stream_id"].as_i64().expect("a stream id");
+            }
+        };
+        assert_eq!(state.console_log_stream_count().await, 1);
+
+        state.log("INFO", "node log line").await;
+        loop {
+            let msg = next_json(&mut console, 2000).await.expect("the console gets the line");
+            if msg["cmd"] == "logLineAdd" {
+                assert_eq!(msg["params"]["stream_id"], stream_id);
+                break;
+            }
+        }
+        while let Some(msg) = next_json(&mut page, 300).await {
+            assert_ne!(msg["cmd"], "logLineAdd", "another page received a log line: {msg}");
+        }
+
+        // The console goes away: its stream ends with it.
+        console.close(None).await.unwrap();
+        for _ in 0..100 {
+            if state.console_log_stream_count().await == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert_eq!(state.console_log_stream_count().await, 0);
+        server.abort();
     }
 }
