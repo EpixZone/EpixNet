@@ -257,17 +257,6 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
     assert!(err.contains("belongs to app talk"), "{err}");
     let opened = cmd("channelConversation").handle(&dm, &json!([{ "conv_id": conv }])).await.unwrap();
     assert_eq!(opened["messages"].as_array().unwrap().len(), 1, "{opened}");
-    // Contacts are app-scoped like threads: the talk client sees its peer, a
-    // client scoped to another app sees nobody, and the full grant sees all.
-    let contacts = cmd("channelContacts");
-    let talk_contacts = contacts.handle(&dm, &json!([{}])).await.unwrap();
-    assert_eq!(talk_contacts.as_array().unwrap().len(), 1, "{talk_contacts}");
-    assert_eq!(contacts.handle(&other, &json!([{}])).await.unwrap(), json!([]));
-    let err = contacts.handle(&dm, &json!([{ "app": "mail" }])).await.unwrap_err();
-    assert!(err.contains("scoped to app talk"), "{err}");
-    let all_contacts = contacts.handle(&alice_mail, &json!([{ "xid": "alice.epix" }])).await.unwrap();
-    assert_eq!(all_contacts, talk_contacts);
-
     // Bob (Mail's current identity) receives it on this same node: the tag came
     // out of the sealed body, so his copy is a talk thread too, badged for the
     // subscribed talk xite rather than for Mail.
@@ -276,6 +265,21 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
         view["threads"].as_array().unwrap().iter().any(|t| t["conv_id"] == conv && t["app"] == "talk")
     })
     .await;
+    // Contacts are app-scoped like threads. Bob's inbound talk thread names
+    // alice as its peer: the full grant sees her, a talk client acting as bob
+    // sees her, and a client scoped to another app acting as bob sees nobody.
+    let contacts = cmd("channelContacts");
+    let all_contacts = contacts.handle(&mail, &json!([{}])).await.unwrap();
+    assert_eq!(all_contacts, json!([{ "xid": "alice.epix" }]));
+    assert_eq!(contacts.handle(&mail, &json!([{ "app": "mail" }])).await.unwrap(), json!([]));
+    state.identity_select("epix1dm", Some(&bob)).await.unwrap();
+    state.identity_select("epix1other", Some(&bob)).await.unwrap();
+    assert_eq!(contacts.handle(&dm, &json!([{}])).await.unwrap(), all_contacts);
+    assert_eq!(contacts.handle(&other, &json!([{}])).await.unwrap(), json!([]));
+    let err = contacts.handle(&dm, &json!([{ "app": "mail" }])).await.unwrap_err();
+    assert!(err.contains("scoped to app talk"), "{err}");
+    state.identity_select("epix1dm", None).await.unwrap();
+    state.identity_select("epix1other", None).await.unwrap();
     let bob_mail = threads.handle(&mail, &json!([{ "app": "mail" }])).await.unwrap();
     assert!(bob_mail["threads"].as_array().unwrap().is_empty(), "{bob_mail}");
     let info = info_cmd.handle(&mail, &json!([{ "app": "mail" }])).await.unwrap();
