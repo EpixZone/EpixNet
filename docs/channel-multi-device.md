@@ -42,9 +42,10 @@ After a device links or upgrades, an online node that still holds original
 outgoing mail checks the active sibling's published bundle and queues missing
 copies in small batches. Each copy goes through the normal pool outbox with the
 current pool epoch and carries its original send time inside the encrypted
-body. Per-device progress survives a restart. A private message ID lets a
-receiver discard duplicate copies after a retry. Only locally authored rows
-are eligible for this transfer.
+body. The sending node records which copies it has queued for each device and
+resumes after a restart. The receiving node can catch up while those records
+are retained in the pool. A private message ID keeps retried copies from
+appearing twice. Only locally authored rows are eligible for this transfer.
 
 Both devices need a node version supporting sent copies. Historical recovery
 requires the original sending device to come online with the message still in
