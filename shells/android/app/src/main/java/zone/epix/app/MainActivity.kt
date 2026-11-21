@@ -165,6 +165,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     /// Route clearnet browsing through the node's Tor SOCKS listener. Default
     /// on (opt-out), like the desktop extension. Persisted across launches.
     private var torClearnet = true
+    private var hideFixbuttonOnScroll = false
+    private val fixbuttonScroll = FixbuttonScrollBridge()
     /// The embedded Epix Wallet (the desktop browser's extension, installed
     /// built-in); tapping the Epix button opens its popup document.
     private var wallet: WebExtension? = null
@@ -217,6 +219,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         downloadPickerOutstanding = savedInstanceState?.getBoolean("download.picker") ?: false
 
         torClearnet = getPreferences(Context.MODE_PRIVATE).getBoolean(PREF_TOR_CLEARNET, true)
+        hideFixbuttonOnScroll = getPreferences(Context.MODE_PRIVATE).getBoolean(PREF_HIDE_FIXBUTTON_ON_SCROLL, false)
+        fixbuttonScroll.setEnabled(hideFixbuttonOnScroll)
         EmbeddedNodeHost.updateBrowserSettings(filesDir.absolutePath, torClearnet)
         browserControlsPosition = BrowserControlsPosition.fromStored(
             getPreferences(Context.MODE_PRIVATE).getString(PREF_BROWSER_CONTROLS_POSITION, null),
@@ -262,6 +266,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 addonAttachment = VerifiedAddonManager.attach(this@MainActivity)
                 browserAttachment = EmbeddedBrowserHost.attach(this@MainActivity)
                 installWallet()
+                fixbuttonScroll.install(runtime)
+                if (disposed) return@launch
                 newTab(GeckoSession().apply { open(runtime) })
                 onBackPressedDispatcher.addCallback(this@MainActivity, browserBackCallback)
                 geckoView.requestFocus()
@@ -322,6 +328,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         }
         connectivityRegistration = null
         activityJob.cancel()
+        fixbuttonScroll.close()
         pendingOperations.cancelAll()
         promptOperations.clear()
         dismissFilePrompt()
@@ -374,6 +381,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         session.promptDelegate = null
         session.permissionDelegate = null
         VerifiedAddonManager.unbindSession(session)
+        fixbuttonScroll.unbindSession(session)
         wallet?.let { session.webExtensionController.setTabDelegate(it, null) }
         session.close()
     }
@@ -443,6 +451,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         ownedSessions.add(session)
         val tab = Tab(session)
         VerifiedAddonManager.bindSession(session)
+        fixbuttonScroll.bindSession(session)
         session.navigationDelegate = object : GeckoSession.NavigationDelegate {
             override fun onLocationChange(
                 session: GeckoSession,
@@ -457,6 +466,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 if (url == "about:blank" && !tab.hasNonBlankLocation && restorableUrl(tab.url)) return
                 if (url != "about:blank") tab.hasNonBlankLocation = true
                 tab.url = url
+                fixbuttonScroll.onLocationChanged(session, url)
                 if (tab === currentTab && !addressBar.hasFocus()) {
                     addressBar.setText(friendlyUrl(url))
                 }
@@ -650,6 +660,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
         forwardButton.alpha = if (tab.canGoForward) 1f else DISABLED_ALPHA
         refreshTabControls()
         VerifiedAddonManager.selectSession(tab.session)
+        fixbuttonScroll.selectSession(tab.session)
     }
 
     /** Close tab `index`. The browser always keeps at least one tab. */
@@ -1082,6 +1093,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     private fun setChromeHidden(hidden: Boolean) {
         if (chromeHidden == hidden) return
         chromeHidden = hidden
+        fixbuttonScroll.setChromeHidden(hidden)
         // Surface resize can expose Gecko's clear color beneath the fading
         // controls. Match the chrome without changing the page's theme.
         geckoView.session?.compositorController?.setClearColor(COLOR_CHROME_BG)
@@ -1788,6 +1800,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 return@launch
             }
             nodeBase = checkNotNull(result.uiBase)
+            fixbuttonScroll.setNodeBase(nodeBase)
             nativeSocksPort = withContext(Dispatchers.IO) { node?.torSocksPort()?.toInt()?.takeIf { it in 1..65535 } }
             if (disposed || generation != startupGeneration) return@launch
             applyClearnetRouting()
@@ -1931,6 +1944,8 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                     .create()
                 showOwnedDialog(controlsDialog)
             }
+            layout.addToggle(R.drawable.ic_panel_controls, "Hide fixbutton on scroll",
+                "Scroll up to show the button again", hideFixbuttonOnScroll, ::setHideFixbuttonOnScroll)
             layout.addAction(R.drawable.ic_nearby, "Nearby mesh", "Bluetooth and Wi-Fi connections") {
                 nearbyUi.show()
             }
@@ -1956,6 +1971,13 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 .create()
             showOwnedDialog(panel)
         }
+    }
+
+    private fun setHideFixbuttonOnScroll(enabled: Boolean) {
+        hideFixbuttonOnScroll = enabled
+        getPreferences(Context.MODE_PRIVATE).edit()
+            .putBoolean(PREF_HIDE_FIXBUTTON_ON_SCROLL, enabled).apply()
+        fixbuttonScroll.setEnabled(enabled)
     }
 
     private fun setBrowserControlsEnabled(enabled: Boolean) {
@@ -2624,6 +2646,7 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
     }
 
     companion object {
+        private const val PREF_HIDE_FIXBUTTON_ON_SCROLL = "hideFixbuttonOnScroll"
         private const val PREF_TOR_CLEARNET = "torClearnet"
         private const val PREF_CLEARNET_ALLOW = "clearnetAllow"
         private const val PREF_BROWSER_CONTROLS_POSITION = "browserControlsPosition"

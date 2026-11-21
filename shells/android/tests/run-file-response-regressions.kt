@@ -137,6 +137,8 @@ internal open class Activity {
 }
 internal class Shell(val applicationContext: Context) : Activity() {
     private var disposed = false
+    // Bridge cleanup is exercised by the lifecycle and fixbutton regressions.
+    private val fixbuttonScroll = object { fun close() {} }
     private val owned = mutableSetOf<GeckoSession>()
     private var pendingGeckoPermission: GeckoSession.PermissionDelegate.Callback? = null
     private var permissionSession: GeckoSession? = null

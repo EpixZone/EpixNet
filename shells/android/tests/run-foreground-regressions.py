@@ -189,7 +189,12 @@ open class Activity {
     var currentIntent: Intent? = null
     fun setIntent(intent: Intent) { currentIntent = intent }
 }
+class FixbuttonScrollDouble {
+    fun setNodeBase(base: String) {}
+    fun onLocationChanged(session: GeckoSession, url: String) {}
+}
 class Shell : Activity() {
+    val fixbuttonScroll = FixbuttonScrollDouble()
     val node get() = EmbeddedNodeHost.node
     val activityJob = SupervisorJob()
     val scope = CoroutineScope(activityJob + Scheduler.main)

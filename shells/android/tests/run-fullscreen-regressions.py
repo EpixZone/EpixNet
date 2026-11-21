@@ -92,7 +92,14 @@ open class Activity {
     open fun onWindowFocusChanged(hasFocus: Boolean) { focusChanges++ }
     open fun dispatchTouchEvent(ev: android.view.MotionEvent) = false
 }
+class FixbuttonScrollDouble {
+    val hidden = mutableListOf<Boolean>()
+    var selected: GeckoSession? = null
+    fun setChromeHidden(value: Boolean) { hidden.add(value) }
+    fun selectSession(session: GeckoSession) { selected = session }
+}
 class Shell : Activity() {
+    val fixbuttonScroll = FixbuttonScrollDouble()
     var disposed = false
     private val pendingOperations = PendingOperations()
     val ownedSessions = mutableSetOf<GeckoSession>()
@@ -154,6 +161,7 @@ fun main() {
     fun verify(value: Boolean, message: String) { checks++; check(value) { message } }
     val shell=Shell()
     shell.setChromeHidden(true);shell.setChromeHidden(false)
+    check(shell.fixbuttonScroll.hidden == listOf(true, false))
     verify(!shell.chromeHidden,"chrome can resize before a session is attached")
     val first=shell.add();val second=shell.add();shell.showTab(0)
     verify(shell.tabCountView.text=="2" && shell.tabButton.contentDescription=="Tabs, 2 open","tab count and accessible opener stay synchronized")

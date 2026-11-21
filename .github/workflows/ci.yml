@@ -92,6 +92,8 @@ jobs:
           python3 shells/android/tests/run-startup-regressions.py
           python3 shells/android/tests/run-toolbar-regressions.py
           python3 shells/android/tests/run-fullscreen-regressions.py
+          python3 shells/android/tests/run-fixbutton-scroll-regressions.py
+          node --test shells/android/tests/fixbutton-scroll.test.cjs
           python3 shells/android/tests/run-window-insets-regressions.py
           node shells/android/tests/run-tab-label-regressions.cjs
           node shells/android/tests/run-ble-mesh-regressions.cjs
