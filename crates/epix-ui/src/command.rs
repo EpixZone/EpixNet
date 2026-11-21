@@ -5386,7 +5386,9 @@ mod tests {
     async fn multiuser_commands_follow_the_plugin_toggle() {
         let state = AppState::new("test");
         let registry = CommandRegistry::with_defaults();
-        let session = WsSession::new(state.clone(), Some("1Wrapper".into()));
+        // userList is an ADMIN command, so the elevated ids below only carry
+        // authority on a real wrapper socket.
+        let session = WsSession::new_wrapper(state.clone(), Some("1Wrapper".into()));
 
         // Plugin off (the default): the command behaves as if unregistered.
         let off = registry.dispatch(&session, "userList", &json!([]), 1_000_001).await;
