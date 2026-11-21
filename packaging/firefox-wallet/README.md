@@ -41,7 +41,20 @@ wallet build metadata, unsets analytics credentials, and enables the upstream
 store-build validation. `BUILD.txt` includes commands to verify every rebuilt
 upstream file and final transformed payload against the submission. A complete
 independent rebuild must pass those comparisons before publishing; source recipe
-validation alone is not proof of reproducibility. See Mozilla's
+validation alone is not proof of reproducibility.
+
+Wallet revision `88a545a37c95` was rebuilt independently from the extracted source
+bundle: all 108 upstream files matched the release byte for byte. That build
+used Node 22.22.1, Yarn 3.4.1 and the complete protoc 3.21.3 distribution. The
+[original release run](https://github.com/EpixZone/epix-wallet/actions/runs/42530606913)
+used Node 22.23.4 and protoc 23.4. Install the compiler together with its standard
+`include/google/protobuf` headers, including `descriptor.proto`, and preserve
+the distribution's `bin`/`include` layout. A system compiler without these headers
+fails before generating the wallet libraries. On Debian/Ubuntu, the headers are
+provided by `libprotobuf-dev`. Keep the original release tool versions in the
+source review record when updating the wallet pin.
+
+See Mozilla's
 [signing guide](https://extensionworkshop.com/documentation/develop/getting-started-with-web-ext/)
 and [source submission requirements](https://extensionworkshop.com/documentation/publish/source-code-submission/).
 

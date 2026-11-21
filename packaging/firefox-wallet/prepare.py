@@ -133,7 +133,10 @@ def source_bundle(output, repositories, version, environment, raw_entries, final
         + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in environment.items())).encode()
     entries["BUILD.txt"] = (
         f"Submitted release version: {version}\n"
-        "Use Linux, Node 22, the included Yarn 3.4.1, Python 3, Git, protoc, Rust and EpixNet desktop build dependencies.\n"
+        "Use Linux, Node 22, the included Yarn 3.4.1, Python 3, Git, Rust and EpixNet desktop build dependencies.\n"
+        "Install a complete Protobuf compiler distribution, including include/google/protobuf/descriptor.proto; a compiler binary alone is insufficient.\n"
+        "For wallet 88a545a37c95, the original release used Node 22.23.4 and protoc 23.4; independent byte equality was also verified with Node 22.22.1 and protoc 3.21.3. Verify the release tool versions again for later wallet pins.\n"
+        "Keep the compiler distribution's bin and include directories together, and add its bin directory to PATH before building.\n"
         "From this extracted bundle, restore exact detached Git metadata (no synthetic commits):\n"
         "  python3 rebuild.py restore\n"
         "  . ./wallet-build-env.sh\n"
