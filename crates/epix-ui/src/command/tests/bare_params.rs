@@ -1,9 +1,10 @@
 //! A bare positional parameter (`cmd("x", "value")`) fills the FIRST
 //! parameter only. It must never also fill a second one (ecdsaSign's key,
-//! identityLinkComplete's name, xidResolveName's tld), nor be ignored
-//! (identitySelect), and vrfGetBeacon takes a bare height.
+//! identityLinkComplete's name, xidResolveName's tld, an optional target
+//! address, vrfDeriveRandom's seed), nor be ignored (identitySelect), and
+//! vrfGetBeacon takes a bare height.
 
-use super::{arg_str_at, CommandRegistry, WsSession};
+use super::{arg_str, CommandRegistry, WsSession};
 use crate::state::{AppState, XiteEntry};
 use serde_json::{json, Value};
 
@@ -27,14 +28,14 @@ async fn session_with_xite() -> (WsSession, tempfile::TempDir) {
 #[test]
 fn a_bare_string_fills_only_the_first_parameter() {
     let bare = json!("alice.epix");
-    assert_eq!(arg_str_at(&bare, "name", 0), Some("alice.epix"));
-    assert_eq!(arg_str_at(&bare, "tld", 1), None);
+    assert_eq!(arg_str(&bare, "name", 0), Some("alice.epix"));
+    assert_eq!(arg_str(&bare, "tld", 1), None);
     let listed = json!(["epix1auth", "alice.epix"]);
-    assert_eq!(arg_str_at(&listed, "auth_address", 0), Some("epix1auth"));
-    assert_eq!(arg_str_at(&listed, "name", 1), Some("alice.epix"));
+    assert_eq!(arg_str(&listed, "auth_address", 0), Some("epix1auth"));
+    assert_eq!(arg_str(&listed, "name", 1), Some("alice.epix"));
     let keyed = json!({ "name": "alice.epix" });
-    assert_eq!(arg_str_at(&keyed, "name", 1), Some("alice.epix"));
-    assert_eq!(arg_str_at(&keyed, "auth_address", 0), None);
+    assert_eq!(arg_str(&keyed, "name", 1), Some("alice.epix"));
+    assert_eq!(arg_str(&keyed, "auth_address", 0), None);
 }
 
 #[tokio::test]
@@ -140,4 +141,26 @@ async fn vrf_get_beacon_accepts_a_bare_height() {
     assert_eq!(result["beacon"], "ab");
     let request = server.join().unwrap();
     assert!(request.starts_with("GET /vrf/v1/beacon/424242 "), "{request}");
+}
+
+#[tokio::test]
+async fn optional_file_pin_reads_a_bare_path_for_the_own_xite() {
+    let (session, _dir) = session_with_xite().await;
+    let registry = CommandRegistry::with_defaults();
+    // The bare path was also read as the optional target address, so the
+    // permission check for "another xite" refused it.
+    for cmd in ["optionalFilePin", "optionalFileUnpin"] {
+        let result = registry.dispatch(&session, cmd, &json!("data/movie.mp4"), 1).await;
+        assert_eq!(result, Ok(Value::from("ok")), "{cmd}");
+    }
+}
+
+#[tokio::test]
+async fn vrf_derive_random_does_not_reuse_a_bare_beacon_as_the_seed() {
+    let (session, _dir) = session_with_xite().await;
+    let registry = CommandRegistry::with_defaults();
+    let beacon = "ab".repeat(32);
+    let bare = registry.dispatch(&session, "vrfDeriveRandom", &json!(beacon), 1).await.unwrap();
+    assert_eq!(bare, json!(epix_chain::derive_random(&beacon, "", 1)));
+    assert_ne!(bare, json!(epix_chain::derive_random(&beacon, &beacon, 1)));
 }

@@ -2771,7 +2771,7 @@ impl WsCommand for EcdsaSign {
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let data = arg_str(p, "data", 0).ok_or("ecdsaSign: data required")?;
         // A bare string is the data alone: it must never double as the key.
-        let privatekey = match arg_str_at(p, "privatekey", 1) {
+        let privatekey = match arg_str(p, "privatekey", 1) {
             Some(pk) => pk.to_string(),
             None => {
                 let address = s.address()?.to_string();
@@ -2947,7 +2947,7 @@ impl WsCommand for XidResolveName {
             .ok_or("xidResolveName: name required")?;
         // A bare "name.tld" string is the name alone; its tld comes from the
         // suffix, never from the same string.
-        let (name, tld) = match arg_str_at(p, "tld", 1) {
+        let (name, tld) = match arg_str(p, "tld", 1) {
             Some(tld) => (raw, tld),
             None => raw.rsplit_once('.').unwrap_or((raw, "epix")),
         };
@@ -4352,18 +4352,11 @@ impl WsCommand for SiteblockIgnoreAddXite {
 
 // ---- ContentFilter: mute + siteblock lists ---------------------------------
 
-/// Read a positional-or-named string arg from the command params.
+/// Read a positional-or-named string arg from the command params. A bare
+/// string parameter (`cmd("x", "value")`) stands only for the FIRST
+/// positional argument (`idx == 0`), so it can never also fill a later
+/// parameter such as an optional target address, key, seed or title.
 fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
-    p.get(key)
-        .or_else(|| p.as_array().and_then(|a| a.get(idx)))
-        .and_then(|v| v.as_str())
-        .or_else(|| p.as_str())
-}
-
-/// Like [`arg_str`], but a bare string parameter stands only for the FIRST
-/// positional argument (`idx == 0`), so `cmd("x", "value")` cannot fill a
-/// second parameter with the same value.
-fn arg_str_at<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
     p.get(key)
         .or_else(|| p.as_array().and_then(|a| a.get(idx)))
         .and_then(|v| v.as_str())
@@ -4480,7 +4473,7 @@ impl WsCommand for IdentityLinkComplete {
         let auth_address = arg_str(p, "auth_address", 0)
             .ok_or("identityLinkComplete: auth_address required")?;
         // A bare string is the auth_address alone, never also the name.
-        let name = arg_str_at(p, "name", 1).filter(|n| !n.is_empty());
+        let name = arg_str(p, "name", 1).filter(|n| !n.is_empty());
         s.state.identity_link_complete(auth_address, name, Some(&address)).await
     }
 }
