@@ -148,7 +148,9 @@ pub fn verify_record(
     // the author), not just the author - so a moderator can hide another
     // user's item. It can only DELETE (tombstone), never edit content. Every
     // other record obeys author-continuity: the signature MUST recover to the
-    // record's own `author`, so no one can supersede another author's item.
+    // record's own `author`, so no one can sign as another author. Reusing
+    // another author's `post_id` under one's own `author` still verifies, so
+    // the fold (`merge::display_winner`) ignores such a non-tombstone version.
     let moderated = obj.get("moderated").and_then(|v| v.as_bool()).unwrap_or(false);
     let deleted = obj.get("deleted").and_then(|v| v.as_bool()).unwrap_or(false);
     let ok = if moderated && deleted {
