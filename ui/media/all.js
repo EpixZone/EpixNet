@@ -703,7 +703,7 @@ if (window.getComputedStyle(document.body).transform) {
     this.left = viewport.left;
     this.top = viewport.top;
     var offsetLeft = this.left - window.pageXOffset, offsetTop = this.top - window.pageYOffset;
-    var signature = [this.width, this.height, this.left, this.top, offsetLeft, offsetTop, this.baseline].join(",");
+    var signature = [this.width, this.height, this.left, this.top, offsetLeft, offsetTop, this.baseline, this.fixbuttonScale].join(",");
     if (signature === this.signature) return;
     this.signature = signature;
     var style = this.element.style;

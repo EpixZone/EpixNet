@@ -74,6 +74,12 @@ test('maximum pinch keeps the handle in screen coordinates in both orientations'
   }
 });
 
+test('a scale-only viewport change still updates the handle transform', () => {
+  const f = fixture();
+  f.viewport({scale: 2});
+  assert.equal(f.element.style['--fixbutton-scale'], 0.5);
+});
+
 test('an ignored desktop viewport edit preserves an existing pinch', () => {
   const f = fixture();
   f.viewport({scale: 2, width: 180, height: 400});
