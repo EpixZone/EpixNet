@@ -409,6 +409,15 @@ mod tests {
             app: "mail".into(),
             source_id: Some("a".repeat(64)),
         });
+        db.set_identity_enabled(id, false).unwrap();
+        assert!(db.commit_outbound_batch(&chunks).is_err());
+        db.set_identity_enabled(id, true).unwrap();
+        db.upsert_identity("renamed.epix", "laptop", 0, None)
+            .unwrap();
+        assert!(db.commit_outbound_batch(&chunks).is_err());
+        assert!(db.pending_outbound(10).unwrap().is_empty());
+        assert!(db.messages(id, "conversation").unwrap().is_empty());
+        db.upsert_identity(ME, "laptop", 0, None).unwrap();
         db.db
             .execute_batch(
                 "CREATE TRIGGER fail_receipt BEFORE INSERT ON mail_sync_staged
