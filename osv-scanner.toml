@@ -18,6 +18,14 @@ reason = "paste unmaintained (proc-macro, low risk)."
 id = "RUSTSEC-2026-0387"
 reason = "crypto-bigint timing variability. Our k256 stack is on the patched 0.7 line; the remaining copy is crypto-bigint 0.5.5 via emissary-core -> p256 0.13 (no patched 0.5), used only to verify other routers' public RouterInfo signatures, so no secret reaches the affected operations. Drop when emissary moves to p256 0.14."
 
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0543"
+reason = "chrono unmaintained (no vulnerability); used only by epix-mirror to read and compare RFC 3339 / RFC 2822 timestamps. Revisit by moving epix-mirror to the time crate."
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0542"
+reason = "humantime unmaintained (no vulnerability), declared together with chrono; pulled by arti-client / tor-* (humantime-serde) and env_logger in the vendored Reticulum stack. Drop when those move off it."
+
 # arkworks zk stack (RLN anti-spam via the vendored rln crate).
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0388"
