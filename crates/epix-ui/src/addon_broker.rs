@@ -741,7 +741,9 @@ pub(crate) async fn serve(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    if !peer.ip().is_loopback() {
+    // Keep the bound visible at the deserialization boundary as well as in
+    // the router and authenticator, including direct handler callers.
+    if !peer.ip().is_loopback() || body.len() > MAX_REQUEST_BYTES {
         return (StatusCode::FORBIDDEN, "Native addon authentication failed").into_response();
     }
     let Some((client, auth)) = ctx.addon_broker.authenticate(&headers, &body, now_ms()) else {
