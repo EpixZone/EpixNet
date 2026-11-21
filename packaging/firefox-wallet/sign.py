@@ -36,15 +36,33 @@ def verify_returned_content(candidate, expected):
     # Firefox signature validation is still required before runtime adoption.
 
 
+def pinned_cli():
+    cli = ROOT / "node_modules/web-ext/bin/web-ext.js"
+    package = json.loads((ROOT / "node_modules/web-ext/package.json").read_text())
+    if package.get("version") != "10.8.0":
+        raise ValueError("Install the pinned signing tools with npm ci --ignore-scripts")
+    return cli
+
+
+def lint_preparation(prepared):
+    checked_preparation(prepared)
+    result = subprocess.run(["node", str(pinned_cli()), "lint", "--warnings-as-errors", "--output=json",
+                             "--source-dir", str(prepared / "extension")], capture_output=True, text=True, check=False)
+    report = json.loads(result.stdout)
+    (prepared / "lint.json").write_text(json.dumps(report, indent=2) + "\n")
+    summary = report.get("summary", {})
+    if result.returncode or summary.get("errors", 1) or summary.get("warnings", 1):
+        raise ValueError("Mozilla lint requires publisher/upstream review; see retained lint.json. Submission was not attempted.")
+    return summary
+
+
 def sign(prepared, output):
     for name in ("WEB_EXT_API_KEY", "WEB_EXT_API_SECRET"):
         if not os.environ.get(name):
             raise ValueError(f"Configure publisher-owned {name} in the signing environment")
     expected = checked_preparation(prepared)
-    cli = ROOT / "node_modules/web-ext/bin/web-ext.js"
-    package = json.loads((ROOT / "node_modules/web-ext/package.json").read_text())
-    if package.get("version") != "10.8.0":
-        raise ValueError("Install the pinned signing tools with npm ci --ignore-scripts")
+    lint_preparation(prepared)
+    cli = pinned_cli()
     output.mkdir(parents=True, exist_ok=False)
     subprocess.run(["node", str(cli), "sign", "--channel=unlisted",
                     "--source-dir", str(prepared / "extension"),
@@ -65,9 +83,15 @@ def sign(prepared, output):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prepared", type=Path)
-    parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--lint-only", action="store_true")
     args = parser.parse_args()
-    print(json.dumps(sign(args.prepared.resolve(), args.output.resolve()), indent=2))
+    if args.lint_only:
+        print(json.dumps(lint_preparation(args.prepared.resolve()), indent=2))
+    elif args.output is None:
+        parser.error("submission requires --output")
+    else:
+        print(json.dumps(sign(args.prepared.resolve(), args.output.resolve()), indent=2))
 
 
 if __name__ == "__main__":

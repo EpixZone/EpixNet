@@ -6,6 +6,7 @@ import json
 from pathlib import Path, PurePosixPath
 import re
 import struct
+import shlex
 import subprocess
 import tempfile
 import zipfile
@@ -78,23 +79,81 @@ def write_archive(path, entries):
             archive.writestr(entry, content)
 
 
-def source_bundle(output, repositories, version):
+def wallet_build_environment(entries, revision):
+    metadata = json.loads(entries["epix-mobile-build.json"])
+    if (metadata.get("revision") != revision or metadata.get("modifiedSource") is not False
+            or metadata.get("analyticsConfigured") is not False):
+        raise ValueError("Pinned wallet build metadata is not a clean, analytics-free source build")
+    environment = {"EPIX_MOBILE_STORE_BUILD": "1"}
+    for key, field in (("EPIX_TERMS_URL", "termsURL"), ("EPIX_PRIVACY_URL", "privacyURL")):
+        value = metadata.get(field)
+        if not isinstance(value, str) or not value.startswith("https://"):
+            raise ValueError("Pinned wallet build metadata lacks a public HTTPS policy URL")
+        environment[key] = value
+    return environment
+
+
+def source_snapshot(repository, entries):
+    revision = repository_revision(repository)
+    tree = subprocess.check_output(["git", "-C", str(repository), "ls-tree", "-rz", "HEAD"])
+    files = []
+    for item in tree.rstrip(b"\0").split(b"\0"):
+        header, name = item.split(b"\t", 1)
+        mode, kind, blob = header.decode().split()
+        name = name.decode()
+        if kind != "blob" or mode not in ("100644", "100755") or name not in entries:
+            raise ValueError("Source snapshot contains unsupported or omitted Git entries")
+        content = entries[name]
+        # Git blob identity, not a security digest. SHA-256 protects the bundle.
+        identity = hashlib.sha1(f"blob {len(content)}\0".encode() + content, usedforsecurity=False).hexdigest()
+        if identity != blob:
+            raise ValueError("Archived source differs from its committed Git content")
+        files.append({"path": name, "mode": mode, "blob": blob})
+    commit = subprocess.check_output(["git", "-C", str(repository), "cat-file", "commit", revision]).decode()
+    return {"revision": revision, "commit": commit, "files": files}
+
+
+def source_bundle(output, repositories, version, environment, raw_entries, final_entries):
     entries = {}
+    snapshots = {}
     with tempfile.TemporaryDirectory(prefix="wallet-source-") as temporary:
         for name, repository in repositories.items():
             archive = Path(temporary) / f"{name}.zip"
             subprocess.run(["git", "-C", str(repository), "archive", "--format=zip", "HEAD", "-o", str(archive)], check=True)
-            entries.update({f"{name}/{key}": value for key, value in read_archive(archive).items()})
+            files = read_archive(archive)
+            snapshots[name] = source_snapshot(repository, files)
+            entries.update({f"{name}/{key}": value for key, value in files.items()})
+    metadata = {"repositories": snapshots, "version": version, "environment": environment,
+                "wallet_files": {name: sha256(content) for name, content in raw_entries.items()},
+                "final_files": {name: sha256(content) for name, content in final_entries.items()}}
+    entries["SOURCE.json"] = (json.dumps(metadata, indent=2) + "\n").encode()
+    entries["rebuild.py"] = (ROOT / "packaging/firefox-wallet/rebuild.py").read_bytes()
+    entries["wallet-build-env.sh"] = ("unset KEPLR_EXT_AMPLITUDE_API_KEY KEPLR_EXT_ANALYTICS_API_URL "
+        "KEPLR_EXT_ANALYTICS_API_AUTH_TOKEN KEPLR_EXT_GOOGLE_MEASUREMENT_ID KEPLR_EXT_GOOGLE_API_KEY_FOR_MEASUREMENT\n"
+        + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in environment.items())).encode()
     entries["BUILD.txt"] = (
         f"Submitted release version: {version}\n"
-        "Build the epix-wallet source with the pinned yarn.lock: corepack enable; "
-        "yarn install --immutable; yarn build:libs; yarn workspace @keplr-wallet/extension build.\n"
-        "Then build EpixNet with EPIX_WALLET_DIST pointing at that build/firefox directory: "
-        "cargo build --release --locked -p epix-browser.\n"
-        "Run epix-browser --export-wallet runtime-export.xpi. The exported archive includes "
-        "EpixNet's icon, background script, host permission and manifest transformations.\n"
-        "Only the manifest version is then replaced with the release version recorded in provenance.json.\n"
-        "See EpixNet/packaging/firefox-wallet/README.md for tools and complete preparation/signing steps.\n"
+        "Use Linux, Node 22, the included Yarn 3.4.1, Python 3, Git, protoc, Rust and EpixNet desktop build dependencies.\n"
+        "From this extracted bundle, restore exact detached Git metadata (no synthetic commits):\n"
+        "  python3 rebuild.py restore\n"
+        "  . ./wallet-build-env.sh\n"
+        "The policy URLs come from the checksum-verified original build metadata. Analytics credentials are unset. "
+        "EPIX_MOBILE_STORE_BUILD=1 enables the upstream policy/analytics validation; it does not change emitted code.\n"
+        "  cd epix-wallet\n"
+        "  corepack enable\n"
+        "  yarn install --immutable\n"
+        "  yarn build:libs\n"
+        "  yarn workspace @keplr-wallet/extension build\n"
+        "  cd ..\n"
+        "  python3 rebuild.py verify-wallet epix-wallet/apps/extension/build/firefox\n"
+        "This must match every file of the pinned upstream archive before continuing.\n"
+        "  cd EpixNet\n"
+        "  EPIX_WALLET_DIST=\"$PWD/../epix-wallet/apps/extension/build/firefox\" cargo build --locked -p epix-browser --no-default-features\n"
+        "  target/debug/epix-browser --export-wallet ../rebuilt.xpi\n"
+        "  cd ..\n"
+        "  python3 rebuild.py verify-final rebuilt.xpi\n"
+        "The final comparison normalizes only manifest.version to the submitted version. All other payload bytes must match.\n"
+        "See EpixNet/packaging/firefox-wallet/README.md for signing and remaining publisher requirements.\n"
     ).encode()
     write_archive(output, entries)
 
@@ -111,6 +170,7 @@ def prepare(args, root=ROOT):
     if sha256(original) != expected:
         raise ValueError("Wallet archive does not match the pinned SHA-256")
     raw_entries = read_archive(args.wallet_archive)
+    environment = wallet_build_environment(raw_entries, wallet_revision)
     args.output.mkdir(parents=True, exist_ok=False)
     exported = args.output / "runtime-export.xpi"
     result = subprocess.run([str(args.browser), "--export-wallet", str(exported)], capture_output=True, text=True, check=True)
@@ -143,7 +203,7 @@ def prepare(args, root=ROOT):
     unsigned = args.output / "unsigned.xpi"
     write_archive(unsigned, entries)
     source = args.output / "source.zip"
-    source_bundle(source, {"EpixNet": root, "epix-wallet": args.wallet_source}, version)
+    source_bundle(source, {"EpixNet": root, "epix-wallet": args.wallet_source}, version, environment, raw_entries, entries)
     provenance = {"schema": 1, "extension_id": WALLET_ID, "version": version,
                   "runtime_version": runtime_version, "epixnet_revision": revision,
                   "wallet_revision": wallet_revision, "wallet_archive_sha256": expected,

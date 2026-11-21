@@ -14,6 +14,7 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import prepare
 import sign
+import rebuild
 
 
 class SigningTests(unittest.TestCase):
@@ -33,7 +34,9 @@ class SigningTests(unittest.TestCase):
         self.archive = self.root / "wallet.zip"
         self.entries = {"manifest.json": json.dumps({"manifest_version": 2, "version": "1.0.0",
             "applications": {"gecko": {"id": prepare.WALLET_ID}}, "incognito": "spanning"}).encode(),
-            "background.js": b"// final wallet code"}
+            "background.js": b"// final wallet code",
+            "epix-mobile-build.json": json.dumps({"revision": self.wallet_revision, "modifiedSource": False,
+                "analyticsConfigured": False, "termsURL": "https://example.com/terms/", "privacyURL": "https://example.com/privacy/"}).encode()}
         prepare.write_archive(self.archive, self.entries)
         (self.repo / "shells/wallet-ext.sha256").write_text(prepare.sha256(self.archive.read_bytes()) + " wallet.zip\n")
         self.revision = self.commit(self.repo)
@@ -66,6 +69,37 @@ class SigningTests(unittest.TestCase):
         self.assertIn(b"1.0.0.1", source["BUILD.txt"])
         with self.assertRaises(FileExistsError):
             prepare.prepare(self.args, self.repo)
+
+    def test_source_bundle_restores_exact_clean_git_metadata(self):
+        prepare.prepare(self.args, self.repo)
+        unpacked = self.root / "source"
+        with zipfile.ZipFile(self.args.output / "source.zip") as archive:
+            archive.extractall(unpacked)
+        metadata = json.loads((unpacked / "SOURCE.json").read_text())
+        rebuild.restore(unpacked, metadata)
+        for name, revision in (("EpixNet", self.revision), ("epix-wallet", self.wallet_revision)):
+            self.assertEqual(rebuild.git(unpacked / name, "rev-parse", "HEAD"), revision)
+            self.assertEqual(rebuild.git(unpacked / name, "status", "--porcelain"), "")
+        self.assertEqual(metadata["environment"]["EPIX_TERMS_URL"], "https://example.com/terms/")
+        self.assertIn(b"EPIX_MOBILE_STORE_BUILD=1", (unpacked / "wallet-build-env.sh").read_bytes())
+        rebuild.verify(self.entries, metadata["wallet_files"])
+        with self.assertRaisesRegex(ValueError, "differs"):
+            rebuild.verify({**self.entries, "background.js": b"changed"}, metadata["wallet_files"])
+        with self.assertRaisesRegex(ValueError, "newly extracted"):
+            rebuild.restore(unpacked, metadata)
+
+    def test_lint_warnings_block_submission_and_are_retained(self):
+        prepare.prepare(self.args, self.repo)
+        report = {"summary": {"errors": 0, "warnings": 1}, "warnings": [{"code": "DANGEROUS_EVAL"}]}
+        completed = SimpleNamespace(stdout=json.dumps(report), returncode=1)
+        with patch.object(sign, "pinned_cli", return_value="web-ext"), \
+                patch.object(sign.subprocess, "run", return_value=completed) as command, \
+                patch.dict(os.environ, {"WEB_EXT_API_KEY": "fixture", "WEB_EXT_API_SECRET": "fixture"}):
+            with self.assertRaisesRegex(ValueError, "Submission was not attempted"):
+                sign.sign(self.args.output, self.root / "returned")
+        command.assert_called_once()
+        self.assertEqual(json.loads((self.args.output / "lint.json").read_text()), report)
+        self.assertFalse((self.root / "returned").exists())
 
     def test_dirty_source_and_changed_pinned_archive_stop_preparation(self):
         (self.wallet / "source.js").write_text("changed")
@@ -109,7 +143,10 @@ class SigningTests(unittest.TestCase):
         output = self.root / "returned"
         expected = sign.checked_preparation(self.args.output)
 
-        def service(command, check):
+        def service(command, check, **kwargs):
+            if "lint" in command:
+                self.assertIn("--warnings-as-errors", command)
+                return SimpleNamespace(stdout=json.dumps({"summary": {"errors": 0, "warnings": 0}}), returncode=0)
             self.assertTrue(check)
             self.assertIn("--channel=unlisted", command)
             self.assertNotIn("fixture-issuer", command)

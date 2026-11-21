@@ -59,6 +59,8 @@ jobs:
           cargo build --locked -p epix-browser --no-default-features
           python3 packaging/firefox-wallet/test-signing.py
           python3 packaging/firefox-wallet/prepare.py --browser "$PWD/target/debug/epix-browser" --wallet-source "$PWD/signing-wallet-source" --wallet-archive "$RUNNER_TEMP/wallet-input/epix-wallet-firefox.zip" --version "$WALLET_VERSION" --output "$RUNNER_TEMP/wallet-prepared"
+      - name: Check Mozilla submission requirements and retain the lint report
+        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --lint-only
       - name: Submit to Mozilla for self-distribution
         if: ${{ inputs.submit_to_mozilla }}
         env:
