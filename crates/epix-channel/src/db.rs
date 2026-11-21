@@ -20,6 +20,10 @@ use epix_envelope::{
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
+#[path = "sent_history.rs"]
+mod sent_history;
+pub use sent_history::SentHistoryRow;
+
 const SCHEMA: &str = "\
 CREATE TABLE IF NOT EXISTS identity (
     identity_id   INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
@@ -451,7 +455,8 @@ impl ChannelDb {
     /// v4 = retain the peer device's linked-identity address for revocation.
     /// v5/v6 = durable outbox recovery and per-leg ordering. v7 = per-identity
     /// setup columns, `outbound.identity_id`, `thread.app`.
-    const SCHEMA_VERSION: i64 = 7;
+    /// v8 = stable sent-message IDs and per-device mail delivery progress.
+    const SCHEMA_VERSION: i64 = 8;
 
     fn open_inner(db: Database, enc_key: Option<[u8; 32]>) -> Result<Self> {
         let me = Self { db, enc_key };
@@ -474,6 +479,9 @@ impl ChannelDb {
         }
         if prior < 7 {
             me.migrate_to_v7()?; // per-identity setup, outbound identity, thread app
+        }
+        if prior < 8 {
+            me.migrate_sent_history()?;
         }
         // Each migration advances user_version in the same transaction as its
         // schema mutation. This final assignment is only a no-op for current
@@ -1482,12 +1490,7 @@ impl ChannelDb {
     /// optional own-message copy, and retain that exact record in the outbox.
     /// The transport acknowledges the row only after a successful pool append.
     pub fn commit_outbound(&self, commit: &OutboundCommit) -> Result<(i64, i64)> {
-        Self::validate_outbound_batch(std::slice::from_ref(commit))?;
-        let mut conn = self.db.conn()?;
-        let tx = conn.transaction().map_err(db_err)?;
-        let result = self.commit_outbound_tx(&tx, commit)?;
-        tx.commit().map_err(db_err)?;
-        Ok(result)
+        Ok(self.commit_outbound_batch(std::slice::from_ref(commit))?[0])
     }
 
     /// Atomically stage every chunk of one logical message. No earlier chunk is
@@ -1503,6 +1506,7 @@ impl ChannelDb {
         for commit in commits {
             results.push(self.commit_outbound_tx(&tx, commit)?);
         }
+        sent_history::record_live_sibling_slots(&tx, commits, &results)?;
         tx.commit().map_err(db_err)?;
         Ok(results)
     }
