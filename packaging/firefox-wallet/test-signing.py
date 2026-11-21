@@ -62,6 +62,8 @@ class SigningTests(unittest.TestCase):
         manifest = json.loads(entries["manifest.json"])
         self.assertEqual(manifest["version"], self.args.version)
         self.assertEqual(manifest["incognito"], "spanning")
+        self.assertNotIn("applications", manifest)
+        self.assertEqual(manifest["browser_specific_settings"], json.loads(self.entries["manifest.json"])["applications"])
         self.assertEqual(receipt["epixnet_revision"], self.revision)
         self.assertEqual(receipt["wallet_revision"], self.wallet_revision)
         source = prepare.read_archive(self.args.output / "source.zip")
@@ -83,10 +85,20 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(metadata["environment"]["EPIX_TERMS_URL"], "https://example.com/terms/")
         self.assertIn(b"EPIX_MOBILE_STORE_BUILD=1", (unpacked / "wallet-build-env.sh").read_bytes())
         rebuild.verify(self.entries, metadata["wallet_files"])
+        subprocess.run([sys.executable, unpacked / "rebuild.py", "verify-final", self.archive], check=True)
         with self.assertRaisesRegex(ValueError, "differs"):
             rebuild.verify({**self.entries, "background.js": b"changed"}, metadata["wallet_files"])
         with self.assertRaisesRegex(ValueError, "newly extracted"):
             rebuild.restore(unpacked, metadata)
+
+    def test_submission_preserves_all_browser_settings_and_rejects_conflicting_aliases(self):
+        settings = {"gecko": {"id": prepare.WALLET_ID, "strict_min_version": "102.0"}, "gecko_android": {}}
+        expected = {"browser_specific_settings": settings, "version": "2"}
+        for manifest in ({"applications": settings}, {"browser_specific_settings": settings},
+                         {"applications": settings, "browser_specific_settings": settings}):
+            self.assertEqual(json.loads(rebuild.submission_manifest(manifest, "2")), expected)
+        with self.assertRaisesRegex(ValueError, "conflicting browser settings"):
+            rebuild.submission_manifest({"applications": settings, "browser_specific_settings": {}}, "2")
 
     def test_lint_warnings_block_submission_and_are_retained(self):
         prepare.prepare(self.args, self.repo)

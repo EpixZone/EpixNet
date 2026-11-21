@@ -9,29 +9,42 @@ The launcher currently changes the wallet's manifest, version, toolbar icons,
 background HTML and JavaScript. Signing the upstream ZIP and then applying these
 changes would invalidate its signature. `epix-browser --export-wallet` uses the
 same packing code as the current installer and exports its final bytes without
-opening a browser or touching a profile. Preparation changes only the manifest
-version to the explicitly selected AMO release version.
+opening a browser or touching a profile. Preparation sets the selected AMO release version. For older wallet builds it
+renames the Firefox manifest key `applications` to `browser_specific_settings`,
+keeping the same extension ID, minimum version and private-window settings.
 
 ## Publisher prerequisites
 
-The publisher needs an AMO developer account authorized to submit the existing
-`wallet@epix.zone` identity, the required Mozilla developer agreements, and AMO
-API credentials. Configure repository secrets `AMO_JWT_ISSUER` and
-`AMO_JWT_SECRET` through GitHub's secret settings. Do not paste credentials into
-issues, pull requests or chat. The signing process reads them through
-`WEB_EXT_API_KEY` and `WEB_EXT_API_SECRET`; no credentials go in artifacts.
+1. Sign in to the [AMO Developer Hub](https://addons.mozilla.org/developers/) with
+   the publisher account, enable two-factor authentication and accept the Firefox
+   Add-on Distribution Agreement. Confirm the account can create or update
+   `wallet@epix.zone`. If it already exists, check its latest submitted version.
+2. Generate a [JWT issuer and secret](https://addons.mozilla.org/developers/addon/api/key/).
+   In [EpixNet Actions secrets](https://github.com/EpixZone/EpixNet/settings/secrets/actions),
+   save the issuer as `AMO_JWT_ISSUER` and the secret as `AMO_JWT_SECRET`.
+   The workflow maps those secrets to the two environment variables used by
+   `web-ext`. Keep their values in the secret store.
+3. Choose an unused numeric version higher than both the installed wallet and
+   the highest version submitted to AMO. The developer can check the former
+   in the preparation receipt. Only the publisher can confirm unlisted AMO history.
+4. Confirm which data the signed build transmits, why, to whom, and which
+   transmissions users can decline. Wallet addresses and signed transactions
+   go to network services. The EVM broadcast code also sends the requesting
+   site's origin in a header. Review `financialAndPaymentInfo` and
+   `browsingActivity` against the complete build, including native messaging.
+   Check the [published privacy policy](https://techsonix.com/epixnet/privacy/)
+   against those disclosures. Built-in consent requires Firefox 140 on desktop
+   and 142 on Android. Supporting earlier versions requires a consent path for
+   them or disabling the transmissions on those versions.
+   [Mozilla data consent guidance](https://extensionworkshop.com/documentation/develop/firefox-builtin-data-consent/)
 
-Mozilla can require review, supporting information, or changes before returning
-an artifact. The current pinned wallet also needs publisher and upstream review
-before submission. With `web-ext` 10.8.0, the prepared artifact has zero errors
-and 66 warnings: deprecated `applications` metadata (1), missing Firefox
-`data_collection_permissions` (1), `DANGEROUS_EVAL` (32),
-`UNSAFE_VAR_ASSIGNMENT` (9), unsupported APIs (5), and desktop/Android API
-compatibility (9 each). These are linter findings, not 66 confirmed
-vulnerabilities. The publisher must supply truthful data collection declarations;
-the wallet maintainers must review the code patterns and supported API versions.
-This tooling does not invent declarations or waive findings. It retains
-`lint.json` and stops submission when any lint error or warning remains.
+The project requires zero lint errors and warnings before the workflow submits.
+With wallet `88a545a37c95` and `web-ext` 10.8.0, migrating the manifest key
+removes one of the original 66 warnings. The 65 remaining warnings cover the
+missing data declaration (1), dynamic evaluation (32), unsafe assignments or
+imports (9), unsupported APIs (5) and API compatibility on desktop and Android
+(9 each). See the retained `lint.json` for each location. Mozilla performs its
+own validation and can request further changes or information.
 
 The source upload includes committed EpixNet and wallet source, lockfiles and
 build instructions. It preserves original commit objects and tracked file modes
