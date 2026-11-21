@@ -19,7 +19,6 @@ import android.widget.FrameLayout
 import android.widget.ImageButton
 import android.widget.LinearLayout
 import android.widget.ProgressBar
-import android.widget.Switch
 import android.widget.TextView
 import androidx.activity.OnBackPressedCallback
 import androidx.appcompat.app.AppCompatActivity
@@ -1915,68 +1914,45 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
                 else -> "Tor: off"
             }
 
-            val pad = dp(20)
-            val layout = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.VERTICAL
-                setPadding(pad, dp(12), pad, 0)
+            val builder = AlertDialog.Builder(this@MainActivity).setTitle("Epix settings")
+            val layout = EpixPanelView(builder.context)
+            layout.addSection("Browser")
+            layout.addAction(R.drawable.ic_panel_controls, "Browser controls", browserControlsPosition.label) { row ->
+                val positions = BrowserControlsPosition.entries
+                val labels = arrayOf("Automatic (bottom in portrait, top in landscape)", "Top", "Bottom")
+                val controlsDialog = AlertDialog.Builder(this@MainActivity)
+                    .setTitle("Browser controls")
+                    .setSingleChoiceItems(labels, positions.indexOf(browserControlsPosition)) { dialog, selected ->
+                        setBrowserControlsPosition(positions[selected])
+                        row.updateSummary(browserControlsPosition.label)
+                        dialog.dismiss()
+                    }
+                    .setNegativeButton("Cancel", null)
+                    .create()
+                showOwnedDialog(controlsDialog)
             }
+            layout.addAction(R.drawable.ic_nearby, "Nearby mesh", "Bluetooth and Wi-Fi connections") {
+                nearbyUi.show()
+            }
+            layout.addAction(R.drawable.ic_panel_extensions, "Extensions", "Manage installed extensions") {
+                showAddonManager()
+            }
+
+            layout.addSection("Connection")
             if (currentDisplay.isNotEmpty()) {
-                layout.addView(label("Xite: $currentDisplay"))
+                layout.addInfo(R.drawable.ic_panel_globe, "Current xite", currentDisplay)
             }
-            layout.addView(label(torLine))
+            layout.addInfo(R.drawable.ic_panel_shield, "Tor", torLine.removePrefix("Tor: "),
+                tint = st?.let(::colorFor) ?: COLOR_OFF)
             if (onion != null) {
-                layout.addView(label("\nYour onion address:\n$onion.onion"))
+                layout.addInfo(R.drawable.ic_panel_link, "Your onion address", "$onion.onion", selectable = true)
             }
-            val row = LinearLayout(this@MainActivity).apply {
-                orientation = LinearLayout.HORIZONTAL
-                gravity = Gravity.CENTER_VERTICAL
-                setPadding(0, dp(14), 0, 0)
-            }
-            row.addView(
-                label("Route clearnet through Tor"),
-                LinearLayout.LayoutParams(0, -2, 1f),
-            )
-            val toggle = Switch(this@MainActivity).apply {
-                isChecked = torClearnet
-                setOnCheckedChangeListener { _, checked -> setTorClearnet(checked) }
-            }
-            row.addView(toggle)
-            layout.addView(row)
+            layout.addToggle(R.drawable.ic_panel_shield, "Route clearnet through Tor",
+                "Use Tor for websites outside EpixNet", torClearnet, ::setTorClearnet)
 
-            val controlsPosition = android.widget.Button(this@MainActivity).apply {
-                isAllCaps = false
-                text = "Browser controls: ${browserControlsPosition.label}"
-                setOnClickListener {
-                    val positions = BrowserControlsPosition.entries
-                    val labels = arrayOf("Automatic (bottom in portrait, top in landscape)", "Top", "Bottom")
-                    val controlsDialog = AlertDialog.Builder(this@MainActivity)
-                        .setTitle("Browser controls")
-                        .setSingleChoiceItems(labels, positions.indexOf(browserControlsPosition)) { dialog, selected ->
-                            setBrowserControlsPosition(positions[selected])
-                            text = "Browser controls: ${browserControlsPosition.label}"
-                            dialog.dismiss()
-                        }
-                        .setNegativeButton("Cancel", null)
-                        .create()
-                    showOwnedDialog(controlsDialog)
-                }
-            }
-            layout.addView(controlsPosition, LinearLayout.LayoutParams(-1, -2))
-            layout.addView(android.widget.Button(this@MainActivity).apply {
-                text = "Nearby mesh"
-                isAllCaps = false
-                setOnClickListener { nearbyUi.show() }
-            }, LinearLayout.LayoutParams(-1, -2))
-            layout.addView(android.widget.Button(this@MainActivity).apply {
-                text = "Extensions"
-                isAllCaps = false
-                setOnClickListener { showAddonManager() }
-            }, LinearLayout.LayoutParams(-1, -2))
-
-            val panel = AlertDialog.Builder(this@MainActivity)
-                .setTitle("Epix")
-                .setView(android.widget.ScrollView(this@MainActivity).apply { addView(layout) })
-                .setPositiveButton("OK", null)
+            val panel = builder
+                .setView(android.widget.ScrollView(builder.context).apply { addView(layout) })
+                .setPositiveButton("Done", null)
                 .create()
             showOwnedDialog(panel)
         }
