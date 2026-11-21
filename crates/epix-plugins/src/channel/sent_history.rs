@@ -28,6 +28,9 @@ pub(super) async fn run(state: Arc<AppState>, ms: Arc<ChannelState>) {
 }
 
 pub(crate) async fn reconcile_sent_history(state: &Arc<AppState>, ms: &Arc<ChannelState>) {
+    if !state.config_bool("channel_enabled", true).await {
+        return;
+    }
     for identity in state.identities().await {
         if let Err(error) = sync_identity(state, ms, &identity).await {
             state
@@ -62,20 +65,7 @@ async fn sync_identity(
         auth: ctx.auth,
         secret: ctx.secret,
     };
-    let mut published = PublishedBundles::default();
-    let mut revoked = Vec::new();
-    let sessions = SessionPeerMap::new();
-    let sources = PublishedBundleSources {
-        state,
-        engine: ms.engine.as_ref(),
-        db: &ms.db,
-        sessions_by_name: &sessions,
-    };
-    classify_published_name(&sources, name, candidates, &mut published, &mut revoked).await?;
-    ms.db
-        .remember_revoked_devices(&revoked, now_ms())
-        .map_err(|e| e.to_string())?;
-    for sibling in published.verified_siblings(&sender) {
+    for sibling in candidates {
         if let Err(error) = sync_sibling(state, ms, &sender, &sibling).await {
             state
                 .log(
@@ -99,6 +89,7 @@ async fn pending_siblings(
 ) -> Result<Vec<Value>, String> {
     let directory = format!("data/users/{name}");
     let mut candidates = Vec::new();
+    let mut seen = std::collections::HashSet::new();
     for entry in state
         .list_dir(&ms.xite, &directory)
         .await
@@ -116,7 +107,9 @@ async fn pending_siblings(
         let Some(ik) = ms.engine.sender_ik(&bundle) else {
             continue;
         };
-        if bundle["auth"].as_str() != Some(auth)
+        if bundle["v"] == 3
+            && bundle["auth"].as_str() != Some(auth)
+            && seen.insert(ik.to_vec())
             && ms
                 .db
                 .has_pending_sent_history(identity_id, &hex::encode(ik))
@@ -146,6 +139,30 @@ async fn sync_sibling(
     if queued >= MAX_QUEUED {
         return Ok(());
     }
+    let name = norm_xid(&sender.xid);
+    let mut published = PublishedBundles::default();
+    let mut revoked = Vec::new();
+    let sessions = SessionPeerMap::new();
+    let sources = PublishedBundleSources {
+        state,
+        engine: ms.engine.as_ref(),
+        db: &ms.db,
+        sessions_by_name: &sessions,
+    };
+    classify_published_name(
+        &sources,
+        name,
+        vec![sibling.clone()],
+        &mut published,
+        &mut revoked,
+    )
+    .await?;
+    ms.db
+        .remember_revoked_devices(&revoked, now_ms())
+        .map_err(|e| e.to_string())?;
+    if published.verified_siblings(sender).is_empty() {
+        return Ok(());
+    }
     let limit = PAGE_SIZE.min((MAX_QUEUED - queued) as usize);
     let page = ms
         .db
@@ -162,53 +179,77 @@ async fn sync_sibling(
         .next()
         .ok_or("missing channel pool")?;
     let rln = channel_rln_send_context(state, ms, &rule, &sender.auth).await?;
-    let jitter = send_jitter_max_secs(state).await;
     for row in page {
-        if norm_xid(&row.sender_xid) != norm_xid(&sender.xid) {
-            return Err("sent row belongs to another identity".into());
+        if !state.config_bool("channel_enabled", true).await {
+            return Ok(());
         }
         let msg_id = row.msg_id;
-        let conv = hex::decode(&row.conv_id)
-            .ok()
-            .and_then(|bytes| bytes.try_into().ok())
-            .ok_or("invalid conversation ID in sent history")?;
-        let SentHistoryRow {
-            members,
-            subject,
-            body,
-            sent_ms,
-            source_id,
-            ..
-        } = row;
-        let request = ChannelSendRequest {
-            recipients: Vec::new(),
-            subject,
-            body,
-            app: "mail".into(),
-            conv_hint: Some(conv),
-        };
-        let delay = Duration::from_secs(rand_u64_below(jitter.saturating_add(1)));
-        let scheduled =
-            now_ms().saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
-        prepare_outbound_records(
-            state,
-            ms,
-            sender.clone(),
-            &request,
-            members,
-            std::slice::from_ref(sibling),
-            conv,
-            rule.clone(),
-            rln.clone(),
-            0,
-            scheduled,
-            Some(epix_envelope::MailOrigin { source_id, sent_ms }),
-            false,
-        )
-        .await?;
+        if let Err(error) =
+            stage_history_row(state, ms, sender, sibling, &rule, rln.clone(), row).await
+        {
+            // One unsuccessful seal per sibling per sweep bounds PoW and RLN
+            // work during an outage. A later sweep can still stage smaller mail.
+            ms.db
+                .defer_sent_history(sender.identity_id, &sender.xid, &peer_ik, msg_id)
+                .map_err(|e| e.to_string())?;
+            return Err(error);
+        }
         ms.db
             .mark_sent_history_staged(sender.identity_id, &peer_ik, msg_id)
             .map_err(|e| e.to_string())?;
     }
+    Ok(())
+}
+
+async fn stage_history_row(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+    sender: &LocalChannelSender,
+    sibling: &Value,
+    rule: &epix_content::pool::PoolRule,
+    rln: Option<super::ChannelRlnSendContext>,
+    row: SentHistoryRow,
+) -> Result<(), String> {
+    if norm_xid(&row.sender_xid) != norm_xid(&sender.xid) {
+        return Err("sent row belongs to another identity".into());
+    }
+    let conv = hex::decode(&row.conv_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or("invalid conversation ID in sent history")?;
+    let SentHistoryRow {
+        members,
+        subject,
+        body,
+        sent_ms,
+        source_id,
+        ..
+    } = row;
+    let request = ChannelSendRequest {
+        recipients: Vec::new(),
+        subject,
+        body,
+        app: "mail".into(),
+        conv_hint: Some(conv),
+    };
+    let jitter = send_jitter_max_secs(state).await;
+    let delay = Duration::from_secs(rand_u64_below(jitter.saturating_add(1)));
+    let scheduled = now_ms().saturating_add(i64::try_from(delay.as_millis()).unwrap_or(i64::MAX));
+    prepare_outbound_records(
+        state,
+        ms,
+        sender.clone(),
+        &request,
+        members,
+        std::slice::from_ref(sibling),
+        conv,
+        rule.clone(),
+        rln,
+        0,
+        scheduled,
+        Some(epix_envelope::MailOrigin { source_id, sent_ms }),
+        false,
+    )
+    .await?;
     Ok(())
 }

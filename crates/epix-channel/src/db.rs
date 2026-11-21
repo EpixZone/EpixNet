@@ -44,6 +44,13 @@ CREATE TABLE IF NOT EXISTS identity (
     published_peers INTEGER NOT NULL DEFAULT 0,
     UNIQUE(auth_address, derive_index));
 
+-- When one historical copy cannot be staged, the next sweep starts after it
+-- and wraps. This position never acknowledges or discards an original.
+CREATE TABLE IF NOT EXISTS mail_sync_retry_position (
+    identity_id INTEGER NOT NULL REFERENCES identity(identity_id) ON DELETE CASCADE,
+    xid TEXT NOT NULL, peer_ik TEXT NOT NULL, after_msg_id INTEGER NOT NULL,
+    PRIMARY KEY(identity_id, xid, peer_ik));
+
 CREATE TABLE IF NOT EXISTS session (
     session_id    INTEGER PRIMARY KEY AUTOINCREMENT NOT NULL,
     identity_id   INTEGER NOT NULL REFERENCES identity(identity_id),

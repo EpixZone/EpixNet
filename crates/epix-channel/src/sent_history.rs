@@ -58,20 +58,53 @@ fn history_cursor(
     Ok(Some((xid, cursor)))
 }
 
+fn pending_after(conn: &Connection, id: i64, xid: &str, after: i64, peer: &str) -> Result<bool> {
+    conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 {PENDING})"),
+        params![id, xid, after, peer],
+        |row| row.get(0),
+    )
+    .map_err(db_err)
+}
+
+fn page_start(conn: &Connection, id: i64, xid: &str, cursor: i64, peer: &str) -> Result<i64> {
+    let failed: Option<i64> = conn.query_row(
+        "SELECT after_msg_id FROM mail_sync_retry_position WHERE identity_id=? AND xid=? AND peer_ik=?",
+        params![id,xid,peer], |r| r.get(0)
+    ).optional().map_err(db_err)?;
+    if let Some(after) = failed.filter(|&n| n > cursor) {
+        if pending_after(conn, id, xid, after, peer)? {
+            return Ok(after);
+        }
+    }
+    Ok(cursor)
+}
+
 pub(super) fn record_live_sibling_slots(
     tx: &Transaction<'_>,
     commits: &[epix_envelope::OutboundCommit],
     results: &[(i64, i64)],
 ) -> Result<()> {
-    let Some((_, msg_id)) = results.iter().find(|(_, id)| *id != 0) else {
-        return Ok(());
-    };
+    let own = results.iter().find(|(_, id)| *id != 0);
     for session in commits
         .iter()
         .flat_map(|c| &c.sessions)
         .filter(|s| s.sent_copy)
     {
-        record_delivery(tx, session.identity_id, &session.peer_ik, *msg_id)?;
+        // A disable, rebind or revocation may have landed while the worker
+        // sealed the page. Recheck in the actual outbox transaction.
+        let (source, _) =
+            history_cursor(tx, session.identity_id, &session.peer_ik)?.ok_or_else(|| {
+                Error::Db("sent copy source or destination is no longer active".into())
+            })?;
+        if session.peer_xid.as_deref() != Some(&source) {
+            return Err(Error::Db(
+                "sent copy device belongs to a different identity".into(),
+            ));
+        }
+        if let Some((_, msg_id)) = own {
+            record_delivery(tx, session.identity_id, &session.peer_ik, *msg_id)?;
+        }
     }
     Ok(())
 }
@@ -109,12 +142,7 @@ impl ChannelDb {
         let Some((xid, cursor)) = history_cursor(&conn, identity_id, peer_ik)? else {
             return Ok(false);
         };
-        conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 {PENDING})"),
-            params![identity_id, xid, cursor, peer_ik],
-            |row| row.get(0),
-        )
-        .map_err(db_err)
+        pending_after(&conn, identity_id, &xid, cursor, peer_ik)
     }
 
     /// Read a bounded page for one sibling. The caller resolves and authenticates
@@ -134,6 +162,7 @@ impl ChannelDb {
         let Some((xid, cursor)) = history_cursor(&tx, identity_id, peer_ik)? else {
             return Ok(Vec::new());
         };
+        let after = page_start(&tx, identity_id, &xid, cursor, peer_ik)?;
         let mut stmt = tx.prepare(&format!(
             "SELECT m.msg_id, m.conv_id, t.members, t.peer_xid, m.subject, m.body, m.sent_ms, m.enc, m.source_id
              {PENDING} ORDER BY m.msg_id LIMIT ?5",
@@ -142,7 +171,7 @@ impl ChannelDb {
             .query(params![
                 identity_id,
                 xid,
-                cursor,
+                after,
                 peer_ik,
                 limit.min(MAX_PAGE) as i64
             ])
@@ -183,6 +212,24 @@ impl ChannelDb {
         }
         tx.commit().map_err(db_err)?;
         Ok(page)
+    }
+
+    /// A failed attempt yields to later originals on the next sweep. Keep the
+    /// delivery cursor untouched so this row is retried after wrapping around.
+    pub fn defer_sent_history(
+        &self,
+        identity_id: i64,
+        xid: &str,
+        peer_ik: &str,
+        msg_id: i64,
+    ) -> Result<()> {
+        self.db.conn()?.execute(
+            "INSERT INTO mail_sync_retry_position(identity_id,xid,peer_ik,after_msg_id)
+             SELECT identity_id,xid,?3,?4 FROM identity WHERE identity_id=?1 AND xid=?2 AND enabled=1
+             ON CONFLICT(identity_id,xid,peer_ik) DO UPDATE SET after_msg_id=excluded.after_msg_id",
+             params![identity_id,xid,peer_ik,msg_id],
+        ).map_err(db_err)?;
+        Ok(())
     }
 
     /// Call only after the durable outbox accepted this item for this device.
@@ -447,6 +494,41 @@ mod tests {
             db.next_sent_history(id, "tablet", 1).unwrap()[0].source_id,
             first_source
         );
+    }
+
+    #[test]
+    fn failed_rows_yield_to_later_mail_and_retry_after_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("channels.db");
+        let db = ChannelDb::open(&path).unwrap();
+        let id = db.upsert_identity(ME, "laptop", 0, None).unwrap();
+        let first = add_original(&db, id, "large reply");
+        let second = add_original(&db, id, "second large reply");
+        let third = add_original(&db, id, "short reply");
+        db.defer_sent_history(id, ME, "phone", first).unwrap();
+        drop(db);
+        let db = ChannelDb::open(&path).unwrap();
+        assert_eq!(
+            db.next_sent_history(id, "phone", 1).unwrap()[0].msg_id,
+            second
+        );
+        db.defer_sent_history(id, ME, "phone", second).unwrap();
+        assert_eq!(
+            db.next_sent_history(id, "phone", 1).unwrap()[0].msg_id,
+            third
+        );
+        db.mark_sent_history_staged(id, "phone", third).unwrap();
+        let pending = db.next_sent_history(id, "phone", 4).unwrap();
+        assert_eq!(
+            pending.iter().map(|r| r.msg_id).collect::<Vec<_>>(),
+            [first, second]
+        );
+        for row in pending {
+            db.mark_sent_history_staged(id, "phone", row.msg_id)
+                .unwrap();
+        }
+        assert!(!db.has_pending_sent_history(id, "phone").unwrap());
+        assert_eq!(db.next_sent_history(id, "tablet", 5).unwrap().len(), 3);
     }
 
     #[test]
