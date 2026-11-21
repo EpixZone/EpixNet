@@ -6070,7 +6070,7 @@ pub async fn activate_existing_store(
     data_dir: &std::path::Path,
 ) -> Result<bool, String> {
     let path = data_dir.join("edx-store");
-    match std::fs::symlink_metadata(path.join("index.redb")) {
+    match tokio::fs::symlink_metadata(path.join("index.redb")).await {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         _ => {}
     }
