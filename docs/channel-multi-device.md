@@ -30,6 +30,26 @@ resolved only that one bundle.
 - **Receive already handles multiplicity.** The indexer trial-decrypts against
   every local identity, so a device opens its own leg with no change.
 
+## Sent Mail and older replies
+
+Mail stores an outgoing reply on its originating device and delivers encrypted
+sent copies to the sender's other verified active devices. The conversation's
+member list stays the same. A sibling displays the reply in the original
+conversation and in Sent, using its original timestamp. These copies do not
+raise an unread badge or a new-message notification.
+
+After a device links or upgrades, an online node that still holds original
+outgoing mail checks the active sibling's published bundle and queues missing
+copies in small batches. Each copy goes through the normal pool outbox with the
+current pool epoch and carries its original send time inside the encrypted
+body. Per-device progress survives a restart. A private message ID lets a
+receiver discard duplicate copies after a retry. Only locally authored rows
+are eligible for this transfer.
+
+Both devices need a node version supporting sent copies. Historical recovery
+requires an original sending device that still has the message in its private
+index. No manual export is needed.
+
 ## Bundle storage (cutover-safe)
 
 User directories are **name-keyed by cert** (`data/users/<name>.epix/`, cert
