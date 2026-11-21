@@ -49,9 +49,9 @@ appearing twice. Only locally authored rows are eligible for this transfer.
 
 Both devices need a node version supporting sent copies. Historical recovery
 requires the original sending device to come online with the message still in
-its private channel index. This includes outgoing channel messages saved before
-the upgrade. For messages from the earlier `messages.json` mail format, the
-existing `channelMigrateLegacy` command can import retained files locally.
+its private channel index. Older channel rows store membership on the thread,
+so recovery uses the thread's saved members. The existing `channelMigrateLegacy`
+command can import retained files from the earlier `messages.json` format locally.
 
 ## Bundle storage (cutover-safe)
 
