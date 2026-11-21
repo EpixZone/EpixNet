@@ -23,6 +23,16 @@ struct Fixture {
 
 impl Fixture {
     async fn new(title: &str) -> Self {
+        Self::build(title, None).await
+    }
+
+    /// A xite that declares `merged_type`, so a merger holding
+    /// `Merger:<merged_type>` may remove it.
+    async fn merged(title: &str, merged_type: &str) -> Self {
+        Self::build(title, Some(merged_type)).await
+    }
+
+    async fn build(title: &str, merged_type: Option<&str>) -> Self {
         let root = tempfile::tempdir().unwrap();
         let state = AppState::with_data_dir("deletion-progress-test", root.path());
         let key = epix_crypt::new_seed();
@@ -53,6 +63,9 @@ impl Fixture {
                 "media/not-downloaded.bin": record,
             },
         });
+        if let Some(merged_type) = merged_type {
+            content["merged_type"] = json!(merged_type);
+        }
         epix_content::sign(&mut content, &key).unwrap();
         storage
             .write("content.json", &serde_json::to_vec(&content).unwrap())
@@ -248,7 +261,7 @@ async fn an_unknown_xite_closes_the_progress_notification_with_an_error() {
 
 #[tokio::test]
 async fn merger_deletion_reports_progress_to_the_merger_connection() {
-    let f = Fixture::new("Merged files").await;
+    let f = Fixture::merged("Merged files", "ProgressTest").await;
     let key = epix_crypt::new_seed();
     let merger = epix_crypt::privatekey_to_address(&key).unwrap();
     let storage = XiteStorage::new(f.root.path().join("data").join(&merger));

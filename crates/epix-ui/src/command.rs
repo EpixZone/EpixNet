@@ -46,9 +46,21 @@ pub fn validate_grantable_permission(permission: &str) -> Result<(), String> {
     match permission {
         "ADMIN" | "NOSANDBOX" | "CHANNELS" | "LOCAL_PROFILE" => Ok(()),
         p if p.starts_with("Merger:") && suffix_ok(&p["Merger:".len()..]) => Ok(()),
-        p if p.starts_with("Channels:") && suffix_ok(&p["Channels:".len()..]) => Ok(()),
+        p if p.starts_with("Channels:") && valid_channel_app_name(&p["Channels:".len()..]) => Ok(()),
         _ => Err(format!("Unknown or malformed permission: {}", permission.chars().take(64).filter(|c| !c.is_control()).collect::<String>())),
     }
+}
+
+/// A channel app name: the suffix of a `Channels:<app>` grant and the `app`
+/// the channel commands accept. Short lowercase tokens, since they travel
+/// inside every sealed body. Grant validation and the channel commands share
+/// this one rule, so a grant can never name an app the commands refuse.
+pub fn valid_channel_app_name(app: &str) -> bool {
+    !app.is_empty()
+        && app.len() <= 32
+        && app
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
 /// Commands that require the ADMIN permission, mirroring EpixNet's
@@ -59,6 +71,9 @@ const ADMIN_COMMANDS: &[&str] = &[
     "announcerStats",
     "certList",
     "certSet",
+    // Turns channels on or off for any identity the node holds: an operator
+    // action (the Config page), never a page's, even a channel client's.
+    "channelIdentitySetEnabled",
     "channelJoinAllsite",
     "identityRemove",
     "identitySetDefault",
@@ -472,6 +487,13 @@ impl CommandRegistry {
         // inside its handler. On a public gateway every visitor could send an
         // elevated id, so neither is honoured there except from the operator
         // socket.
+        // muteAdd / muteRemove change a node-wide list and rebuild every
+        // xite's database; non-ADMIN callers confirm in the wrapper (inside
+        // the handlers). A gateway shows no such dialog to its visitors, so
+        // only the operator socket may change the list there.
+        if restrict && matches!(cmd, "muteAdd" | "muteRemove") {
+            return Err(format!("{cmd} is disabled on this gateway"));
+        }
         if cmd == "permissionAdd" || cmd == "corsPermission" {
             if restrict {
                 return Err(format!("{cmd} is disabled on this gateway"));
@@ -1214,7 +1236,7 @@ impl WsCommand for ConsoleLogStream {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let filter = console_log_filter(p);
-        Ok(json!({ "stream_id": s.state.console_log_stream_open(filter).await }))
+        Ok(json!({ "stream_id": s.state.console_log_stream_open(filter, s.id).await }))
     }
 }
 
@@ -1231,7 +1253,7 @@ impl WsCommand for ConsoleLogStreamRemove {
             .or_else(|| p.as_array().and_then(|a| a.first()))
             .and_then(|v| v.as_i64())
             .ok_or("consoleLogStreamRemove: stream_id required")?;
-        s.state.console_log_stream_remove(id).await;
+        s.state.console_log_stream_remove(id, s.id).await;
         Ok(Value::from("ok"))
     }
 }
@@ -2266,6 +2288,17 @@ impl WsCommand for XiteUpdate {
             None => s.address()?.to_string(),
         };
         if !s.state.has_xite(&address).await {
+            return Err(format!("Unknown xite: {address}"));
+        }
+        // A page updates its own xite; any other needs ADMIN (EpixNet's
+        // actionSiteUpdate answered "Unknown site" otherwise).
+        let own = match s.xite.as_deref() {
+            Some(bound) => {
+                s.state.canonical_key(bound).await == s.state.canonical_key(&address).await
+            }
+            None => false,
+        };
+        if !own && !caller_has_admin(s).await {
             return Err(format!("Unknown xite: {address}"));
         }
         let update_request_id = p.get("update_request_id").map(|value| {
@@ -3785,7 +3818,10 @@ impl WsCommand for MergerXiteAdd {
     }
 }
 
-/// `mergerSiteDelete(address)` - remove a merged xite from the node.
+/// `mergerSiteDelete(address)` - remove a merged xite from the node. Only a
+/// xite whose content.json declares a `merged_type` this merger holds a
+/// `Merger:<type>` permission for may be removed (EpixNet's
+/// actionMergerSiteDelete check); any other xite needs `siteDelete`.
 struct MergerXiteDelete;
 #[async_trait]
 impl WsCommand for MergerXiteDelete {
@@ -3794,11 +3830,27 @@ impl WsCommand for MergerXiteDelete {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
-        if s.state.merger_types(&address).await.is_empty() {
+        let merger_types = s.state.merger_types(&address).await;
+        if merger_types.is_empty() {
             return Err("Not a merger xite".into());
         }
+        // Check every target before removing any, so a refused address in a
+        // batch never leaves the earlier ones half-applied.
+        let mut targets = Vec::new();
         for target in arg_addresses(p) {
-            s.state.try_remove_xite_from(&require_address(&target)?, s.id).await?;
+            let target = require_address(&target)?;
+            let key = s.state.canonical_key(&target).await;
+            let merged_type = s.state.xite_merged_type(&key).await;
+            if !merged_type.as_ref().is_some_and(|t| merger_types.contains(t)) {
+                return Err(format!(
+                    "Merged type ({}) of {target} not in {merger_types:?}",
+                    merged_type.as_deref().unwrap_or("none")
+                ));
+            }
+            targets.push(key);
+        }
+        for target in targets {
+            s.state.try_remove_xite_from(&target, s.id).await?;
         }
         s.state.rebuild_merger_dbs().await;
         Ok(Value::from("ok"))
@@ -4678,6 +4730,33 @@ impl WsCommand for GetTrackers {
     }
 }
 
+/// Whether the caller may change node-wide state without the user's
+/// confirmation: the operator socket, a session rebound through `as` by an
+/// ADMIN xite, or a bound xite that holds ADMIN.
+async fn caller_has_admin(s: &WsSession) -> bool {
+    s.trusted
+        || s.admin
+        || match s.xite.as_deref() {
+            Some(address) => s.state.xite_has_admin(address).await,
+            None => false,
+        }
+}
+
+/// Ask the user, through the bound xite's wrapper, before a non-ADMIN caller
+/// changes the node-wide mute list (EpixNet's ContentFilter asked too). A
+/// dismissal or timeout changes nothing.
+async fn confirm_mute_change(s: &WsSession, body: &str, button: &str) -> Result<(), String> {
+    if caller_has_admin(s).await {
+        return Ok(());
+    }
+    let xite = s.address()?;
+    if s.state.confirm(xite, body, button).await {
+        Ok(())
+    } else {
+        Err("The mute list was not changed".into())
+    }
+}
+
 struct MuteAdd;
 #[async_trait]
 impl WsCommand for MuteAdd {
@@ -4688,6 +4767,12 @@ impl WsCommand for MuteAdd {
         let auth = arg_str(p, "auth_address", 0).ok_or("muteAdd: auth_address required")?;
         let cert = arg_str(p, "cert_user_id", 1).unwrap_or("");
         let reason = arg_str(p, "reason", 2).unwrap_or("");
+        let who = if cert.is_empty() { auth } else { cert };
+        let body = format!(
+            "Remove all content from <b>{}</b>?",
+            crate::state::html_escape(who)
+        );
+        confirm_mute_change(s, &body, "Mute").await?;
         s.state.mute_add(auth, cert, reason).await;
         Ok(Value::from("ok"))
     }
@@ -4701,6 +4786,13 @@ impl WsCommand for MuteRemove {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let auth = arg_str(p, "auth_address", 0).ok_or("muteRemove: auth_address required")?;
+        let cert = s.state.mute_list().await[auth]["cert_user_id"]
+            .as_str()
+            .filter(|c| !c.is_empty())
+            .unwrap_or(auth)
+            .to_string();
+        let body = format!("Unmute <b>{}</b>?", crate::state::html_escape(&cert));
+        confirm_mute_change(s, &body, "Unmute").await?;
         s.state.mute_remove(auth).await;
         Ok(Value::from("ok"))
     }
@@ -5652,15 +5744,27 @@ mod tests {
 
     #[tokio::test]
     async fn only_known_well_formed_permissions_can_be_granted() {
-        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "LOCAL_PROFILE", "Merger:EpixPost", "Channels:talk", "Channels:a.b-c_1"] {
+        for ok in ["ADMIN", "NOSANDBOX", "CHANNELS", "LOCAL_PROFILE", "Merger:EpixPost", "Merger:a.b-c_1", "Channels:talk", "Channels:dm_2-x"] {
             assert!(validate_grantable_permission(ok).is_ok(), "{ok}");
         }
         let long = format!("Merger:{}", "x".repeat(129));
         for bad in [
             "", "admin", "ADMIN ", "ADMIN\n", "Merger:", "Channels:", "Channels:<img src=x>",
-            "Merger:../x", "Cors:1Target", "EVX", "Merger:a b", long.as_str(), "Channels:-x",
+            "Merger:../x", "Cors:1Target", "EVX", "Merger:a b", long.as_str(),
+            // App names the channel commands refuse: uppercase, dots, > 32.
+            "Channels:Talk", "Channels:a.b", "Channels:a.b-c_1",
         ] {
             assert!(validate_grantable_permission(bad).is_err(), "accepted {bad:?}");
+        }
+        // A Channels grant is accepted exactly when its app name is one the
+        // channel commands accept.
+        let (max_app, long_app) = ("x".repeat(32), "x".repeat(33));
+        for app in ["talk", "dm_2-x", "-x", "Talk", "a.b", "", "a b", max_app.as_str(), long_app.as_str()] {
+            assert_eq!(
+                validate_grantable_permission(&format!("Channels:{app}")).is_ok(),
+                valid_channel_app_name(app),
+                "{app:?}"
+            );
         }
         let dir = tempfile::tempdir().unwrap();
         let state = AppState::new("test");
@@ -5714,6 +5818,108 @@ mod tests {
         let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
         assert_eq!(CorsPermission.handle(&trusted, &json!("1Target")).await.unwrap(), "ok");
         assert!(state.xite_permissions(addr).await.iter().any(|p| p == "Cors:1Target"));
+    }
+
+    #[tokio::test]
+    async fn mute_changes_from_a_page_wait_for_the_users_confirmation() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let addr = "1Forum";
+        state
+            .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path()), content: None })
+            .await;
+        let registry = Arc::new(CommandRegistry::with_defaults());
+        let mut events = state.subscribe_events();
+        state.register_bound_conn(addr, 1);
+        let ask = |cmd: &'static str, params: Value| {
+            let (state, registry) = (state.clone(), registry.clone());
+            tokio::spawn(async move {
+                let session = WsSession::new(state, Some(addr.into()));
+                registry.dispatch(&session, cmd, &params, 3).await
+            })
+        };
+        async fn next_confirm(events: &mut tokio::sync::broadcast::Receiver<crate::state::UiEvent>) -> Value {
+            loop {
+                let ev = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+                    .await
+                    .expect("a pushed confirm")
+                    .unwrap();
+                let payload: Value = serde_json::from_str(&ev.payload).unwrap();
+                if payload["cmd"] == "confirm" {
+                    return payload;
+                }
+            }
+        }
+
+        // A page's muteAdd asks first; declining changes nothing.
+        let pending = ask("muteAdd", json!(["1Author", "<b>al</b>@xid.epix", "spam"]));
+        let payload = next_confirm(&mut events).await;
+        assert!(payload["params"][0].as_str().unwrap().contains("&lt;b&gt;al&lt;/b&gt;@xid.epix"));
+        assert_eq!(state.mute_list().await, json!({}), "nothing muted before the answer");
+        assert!(state.resolve_callback(payload["id"].as_i64().unwrap(), json!(false)));
+        assert!(pending.await.unwrap().is_err());
+        assert_eq!(state.mute_list().await, json!({}));
+
+        // Accepting applies it.
+        let pending = ask("muteAdd", json!(["1Author", "al@xid.epix", "spam"]));
+        let payload = next_confirm(&mut events).await;
+        assert!(state.resolve_callback(payload["id"].as_i64().unwrap(), json!(true)));
+        assert_eq!(pending.await.unwrap().unwrap(), "ok");
+        assert!(state.mute_list().await.get("1Author").is_some());
+
+        // muteRemove from a page asks too, naming the muted user.
+        let pending = ask("muteRemove", json!(["1Author"]));
+        let payload = next_confirm(&mut events).await;
+        assert!(payload["params"][0].as_str().unwrap().contains("al@xid.epix"));
+        assert!(state.resolve_callback(payload["id"].as_i64().unwrap(), json!(false)));
+        assert!(pending.await.unwrap().is_err());
+        assert!(state.mute_list().await.get("1Author").is_some(), "still muted");
+
+        // An ADMIN xite changes the list without a dialog.
+        state.add_permission(addr, "ADMIN").await;
+        while events.try_recv().is_ok() {}
+        let session = WsSession::new(state.clone(), Some(addr.into()));
+        assert_eq!(registry.dispatch(&session, "muteRemove", &json!(["1Author"]), 4).await.unwrap(), "ok");
+        assert_eq!(state.mute_list().await, json!({}));
+        let pushed: Vec<Value> = std::iter::from_fn(|| events.try_recv().ok())
+            .map(|ev| serde_json::from_str(&ev.payload).unwrap())
+            .collect();
+        assert!(pushed.iter().all(|p| p["cmd"] != "confirm"), "no dialog for ADMIN");
+
+        // A public gateway refuses both for any page, ADMIN or not; the
+        // operator socket still can.
+        state.config_set("ui_restrict", json!(true)).await;
+        for cmd in ["muteAdd", "muteRemove"] {
+            let denied = registry.dispatch(&session, cmd, &json!(["1Author", "", ""]), 5).await;
+            assert!(denied.unwrap_err().contains("gateway"), "{cmd}");
+        }
+        assert_eq!(state.mute_list().await, json!({}));
+        let trusted = WsSession::new_trusted(state.clone(), Some(addr.into()));
+        assert_eq!(registry.dispatch(&trusted, "muteAdd", &json!(["1Author", "", ""]), 6).await.unwrap(), "ok");
+        assert!(state.mute_list().await.get("1Author").is_some());
+    }
+
+    #[tokio::test]
+    async fn site_update_reaches_another_xite_only_with_admin() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        for addr in ["1Own", "1Other"] {
+            state
+                .add_xite(addr, XiteEntry { storage: XiteStorage::new(dir.path().join(addr)), content: None })
+                .await;
+        }
+        let page = WsSession::new(state.clone(), Some("1Own".into()));
+        // Its own xite, by default or by name.
+        assert!(XiteUpdate.handle(&page, &json!([])).await.is_ok());
+        assert!(XiteUpdate.handle(&page, &json!({ "address": "1Own" })).await.is_ok());
+        // Another xite is out of reach, and answers like an unknown one.
+        let denied = XiteUpdate.handle(&page, &json!({ "address": "1Other" })).await;
+        assert_eq!(denied.unwrap_err(), "Unknown xite: 1Other");
+        // ADMIN (the dashboard) and the operator socket may update any xite.
+        let operator = WsSession::new_trusted(state.clone(), None);
+        assert!(XiteUpdate.handle(&operator, &json!({ "address": "1Other" })).await.is_ok());
+        state.add_permission("1Own", "ADMIN").await;
+        assert!(XiteUpdate.handle(&page, &json!({ "address": "1Other" })).await.is_ok());
     }
 
     #[test]
@@ -5806,6 +6012,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn merger_site_delete_only_removes_xites_of_the_mergers_own_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = AppState::new("test");
+        let registry = CommandRegistry::with_defaults();
+        let merger = "1Merger";
+        state.add_xite(merger, XiteEntry { storage: XiteStorage::new(dir.path().join("m")), content: None }).await;
+        state.add_permission(merger, "Merger:EpixPost").await;
+        state
+            .add_xite("1Merged", XiteEntry { storage: XiteStorage::new(dir.path().join("d")), content: Some(json!({ "merged_type": "EpixPost" })) })
+            .await;
+        state
+            .add_xite("1Other", XiteEntry { storage: XiteStorage::new(dir.path().join("o")), content: Some(json!({ "merged_type": "OtherApp" })) })
+            .await;
+        state
+            .add_xite("1Plain", XiteEntry { storage: XiteStorage::new(dir.path().join("p")), content: Some(json!({ "title": "Plain" })) })
+            .await;
+        let session = WsSession::new(state.clone(), Some(merger.into()));
+
+        // A xite of another merged type, a xite with no merged type, and the
+        // merger itself are all out of reach.
+        for target in ["1Other", "1Plain", merger] {
+            let denied = registry.dispatch(&session, "mergerSiteDelete", &json!([target]), 3).await;
+            assert!(denied.unwrap_err().contains("not in"), "{target} was deletable");
+            assert!(state.has_xite(target).await, "{target} survived");
+        }
+        // A refused address in a batch removes nothing.
+        let denied = registry.dispatch(&session, "mergerSiteDelete", &json!([["1Merged", "1Other"]]), 4).await;
+        assert!(denied.is_err());
+        assert!(state.has_xite("1Merged").await, "batch refused before any removal");
+
+        // The merger's own type is still removable.
+        registry.dispatch(&session, "mergerSiteDelete", &json!(["1Merged"]), 5).await.unwrap();
+        assert!(!state.has_xite("1Merged").await);
+    }
+
+    #[tokio::test]
     async fn cryptmessage_commands_round_trip() {
         let state = AppState::new("test");
         let addr = "1CryptSite";
@@ -5840,16 +6082,20 @@ mod tests {
     async fn content_filter_mutes_and_siteblocks() {
         let state = AppState::new("test");
         let session = WsSession::new(state.clone(), Some("1site".into()));
+        // The operator socket changes the mute list without a dialog; a
+        // page's confirmation is covered by
+        // mute_changes_from_a_page_wait_for_the_users_confirmation.
+        let operator = WsSession::new_trusted(state.clone(), Some("1site".into()));
 
         MuteAdd
-            .handle(&session, &json!(["1AuthorAddr", "bob@xid.epix", "spam"]))
+            .handle(&operator, &json!(["1AuthorAddr", "bob@xid.epix", "spam"]))
             .await
             .unwrap();
         let list = MuteList.handle(&session, &Value::Null).await.unwrap();
         assert_eq!(list["1AuthorAddr"]["cert_user_id"], "bob@xid.epix");
         assert_eq!(list["1AuthorAddr"]["reason"], "spam");
 
-        MuteRemove.handle(&session, &json!(["1AuthorAddr"])).await.unwrap();
+        MuteRemove.handle(&operator, &json!(["1AuthorAddr"])).await.unwrap();
         assert!(MuteList.handle(&session, &Value::Null).await.unwrap().as_object().unwrap().is_empty());
 
         SiteblockAdd.handle(&session, &json!(["1BadSite", "malware"])).await.unwrap();

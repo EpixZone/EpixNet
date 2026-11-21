@@ -297,6 +297,13 @@ async fn channel_client_ok(s: &WsSession) -> Result<(), String> {
     if s.trusted {
         return Ok(());
     }
+    // A public gateway serves its pages to every visitor, so a page there
+    // would read and send as the gateway node's own identities. Channels are
+    // reachable only from the operator socket on such a node, like local
+    // profiles.
+    if s.state.ui_restrict().await {
+        return Err("Channels are unavailable on public gateways".to_string());
+    }
     let xite = s.address().map_err(|_| "channels: no xite bound".to_string())?;
     if xite == EPIX_MAIL_XITE {
         return Ok(());
@@ -361,13 +368,10 @@ pub(crate) fn resolve_send_app(
 }
 
 /// App names are short lowercase tokens: they travel inside every sealed body
-/// and name a permission (`Channels:<app>`).
+/// and name a permission (`Channels:<app>`). The rule lives with the grant
+/// validation so the two can never disagree.
 fn valid_app_name(app: &str) -> bool {
-    !app.is_empty()
-        && app.len() <= 32
-        && app
-            .chars()
-            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
+    epix_ui::command::valid_channel_app_name(app)
 }
 
 /// A scoped client may only touch conversations of its own app. A conversation
@@ -421,20 +425,29 @@ pub(crate) async fn resolve_identity(
             .and_then(Value::as_str)
             .filter(|v| !v.is_empty())
     });
+    let bound = s.state.identity_for(s.address().unwrap_or("")).await;
     let identity = match explicit {
         Some(key) => {
             let key = key.trim().to_lowercase();
             let bare = key.strip_suffix(".epix").unwrap_or(&key).to_string();
-            Some(
-                s.state
-                    .identities()
-                    .await
-                    .into_iter()
-                    .find(|i| i.auth_address == key || i.name == bare)
-                    .ok_or_else(|| format!("unknown identity {key}"))?,
-            )
+            let named = s
+                .state
+                .identities()
+                .await
+                .into_iter()
+                .find(|i| i.auth_address == key || i.name == bare)
+                .ok_or_else(|| format!("unknown identity {key}"))?;
+            // A `Channels:<app>` client acts only as the identity its own xite
+            // uses (its selection, else the node default); it cannot name
+            // another persona the node holds. Full grants may switch.
+            if client_app_scope(s).await.is_some()
+                && bound.as_ref().map(|b| b.auth_address.as_str()) != Some(named.auth_address.as_str())
+            {
+                return Err(format!("channels: this xite cannot act as identity {key}"));
+            }
+            Some(named)
         }
-        None => s.state.identity_for(s.address().unwrap_or("")).await,
+        None => bound,
     };
     match identity {
         Some(identity) => identity_ctx_for(&s.state, ms, &identity).await.map(Some),
@@ -1100,8 +1113,13 @@ async fn index_batch(
 pub(crate) async fn deliver_channel_event(state: &Arc<AppState>, ms: &ChannelState, ev: Value) {
     let auth = ev.get("auth").and_then(Value::as_str).filter(|a| !a.is_empty()).map(str::to_string);
     let app = ev.get("app").and_then(Value::as_str).filter(|a| !a.is_empty()).map(str::to_string);
-    let clients: Vec<(String, Option<String>)> =
-        ms.clients.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    // A public gateway's pages belong to its visitors, so the node's own
+    // messages are never pushed to them (the commands refuse them too).
+    let clients: Vec<(String, Option<String>)> = if state.ui_restrict().await {
+        Vec::new()
+    } else {
+        ms.clients.read().await.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    };
     for (xite, scope) in clients {
         if let (Some(scope), Some(app)) = (&scope, &app) {
             if scope != app {
@@ -2136,7 +2154,13 @@ impl WsCommand for ChannelContacts {
         let Some(ctx) = resolve_identity(s, &ms, p).await? else {
             return Ok(json!([]));
         };
-        let threads = ms.db.threads(ctx.identity_id, "all", 0, 500).map_err(|e| e.to_string())?;
+        // Scoped like `channelThreads`: a `Channels:<app>` client learns only
+        // the peers of its own app.
+        let app = resolve_app_filter(client_app_scope(s).await, requested_app(first_param_object(p)))?;
+        let threads = ms
+            .db
+            .threads_in_app(ctx.identity_id, app.as_deref(), "all", 0, 500)
+            .map_err(|e| e.to_string())?;
         let mut seen = std::collections::BTreeSet::new();
         for t in threads {
             if let Some(p) = t.get("peer_xid").and_then(|v| v.as_str()) {
@@ -3928,6 +3952,34 @@ mod client_xite_tests {
         assert_eq!(client_xite_for_app(&clients, Some("mail")), EPIX_MAIL_XITE);
         assert_eq!(client_xite_for_app(&clients, Some("forum")), EPIX_MAIL_XITE);
         assert_eq!(client_xite_for_app(&clients, None), EPIX_MAIL_XITE);
+    }
+
+    /// On a public gateway the node's channel events never reach a page.
+    #[tokio::test]
+    async fn a_gateway_pushes_no_channel_events_to_pages() {
+        use super::{deliver_channel_event, ChannelState};
+        use epix_channel::ChannelDb;
+        use epix_envelope::FakeEngine;
+        use serde_json::json;
+        use std::sync::Arc;
+
+        let state = epix_ui::state::AppState::new("test");
+        let db = Arc::new(ChannelDb::memory().unwrap());
+        let ms = ChannelState::for_test(db, Arc::new(FakeEngine), "epix1hub".into());
+        let mut events = state.subscribe_events();
+        let channel_events = |events: &mut tokio::sync::broadcast::Receiver<epix_ui::state::UiEvent>| {
+            std::iter::from_fn(|| events.try_recv().ok())
+                .filter(|ev| ev.payload.contains("\"channelEvent\""))
+                .count()
+        };
+        let ev = json!({ "type": "setup", "xid": "a.epix", "state": "published" });
+
+        deliver_channel_event(&state, &ms, ev.clone()).await;
+        assert_eq!(channel_events(&mut events), 1, "Mail gets it on a normal node");
+
+        state.config_set("ui_restrict", json!(true)).await;
+        deliver_channel_event(&state, &ms, ev).await;
+        assert_eq!(channel_events(&mut events), 0, "no page gets it on a gateway");
     }
 }
 

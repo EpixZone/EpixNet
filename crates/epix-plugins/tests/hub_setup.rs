@@ -8,6 +8,7 @@
 use epix_plugin::Plugin;
 use epix_plugins::channel::{ChannelPlugin, EPIX_MAIL_XITE};
 use epix_ui::state::{AppState, XiteEntry};
+use epix_ui::command::CommandRegistry;
 use epix_ui::{WsCommand, WsSession};
 use epix_xite::XiteStorage;
 use serde_json::{json, Value};
@@ -199,6 +200,13 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
     let err = threads.handle(&dm, &json!([{ "app": "mail" }])).await.unwrap_err();
     assert!(err.contains("scoped to app talk"), "{err}");
     assert_eq!(threads.handle(&dm, &json!([{}])).await.unwrap(), json!({ "threads": [] }));
+    // A scoped client acts only as its own xite's identity (here the node
+    // default, alice): naming another identity the node holds is refused.
+    let err = threads.handle(&dm, &json!([{ "xid": "bob.epix" }])).await.unwrap_err();
+    assert!(err.contains("cannot act as identity"), "{err}");
+    let err = info_cmd.handle(&dm, &json!([{ "auth_address": bob }])).await.unwrap_err();
+    assert!(err.contains("cannot act as identity"), "{err}");
+    assert!(threads.handle(&dm, &json!([{ "xid": "alice.epix" }])).await.is_ok());
     let send = cmd("channelSend");
     let err = send
         .handle(&dm, &json!([["bob.epix"], "hi", "body", { "app": "mail" }]))
@@ -249,7 +257,6 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
     assert!(err.contains("belongs to app talk"), "{err}");
     let opened = cmd("channelConversation").handle(&dm, &json!([{ "conv_id": conv }])).await.unwrap();
     assert_eq!(opened["messages"].as_array().unwrap().len(), 1, "{opened}");
-
     // Bob (Mail's current identity) receives it on this same node: the tag came
     // out of the sealed body, so his copy is a talk thread too, badged for the
     // subscribed talk xite rather than for Mail.
@@ -258,6 +265,21 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
         view["threads"].as_array().unwrap().iter().any(|t| t["conv_id"] == conv && t["app"] == "talk")
     })
     .await;
+    // Contacts are app-scoped like threads. Bob's inbound talk thread names
+    // alice as its peer: the full grant sees her, a talk client acting as bob
+    // sees her, and a client scoped to another app acting as bob sees nobody.
+    let contacts = cmd("channelContacts");
+    let all_contacts = contacts.handle(&mail, &json!([{}])).await.unwrap();
+    assert_eq!(all_contacts, json!([{ "xid": "alice.epix" }]));
+    assert_eq!(contacts.handle(&mail, &json!([{ "app": "mail" }])).await.unwrap(), json!([]));
+    state.identity_select("epix1dm", Some(&bob)).await.unwrap();
+    state.identity_select("epix1other", Some(&bob)).await.unwrap();
+    assert_eq!(contacts.handle(&dm, &json!([{}])).await.unwrap(), all_contacts);
+    assert_eq!(contacts.handle(&other, &json!([{}])).await.unwrap(), json!([]));
+    let err = contacts.handle(&dm, &json!([{ "app": "mail" }])).await.unwrap_err();
+    assert!(err.contains("scoped to app talk"), "{err}");
+    state.identity_select("epix1dm", None).await.unwrap();
+    state.identity_select("epix1other", None).await.unwrap();
     let bob_mail = threads.handle(&mail, &json!([{ "app": "mail" }])).await.unwrap();
     assert!(bob_mail["threads"].as_array().unwrap().is_empty(), "{bob_mail}");
     let info = info_cmd.handle(&mail, &json!([{ "app": "mail" }])).await.unwrap();
@@ -276,6 +298,23 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
         "mail badges do not count talk: {badges:?}"
     );
 
+    // Turning channels on or off is an operator action: a page without ADMIN
+    // (Mail included) is refused at dispatch.
+    let mut registry = CommandRegistry::empty();
+    for c in ChannelPlugin.ws_commands() {
+        registry.register(c);
+    }
+    let mail_page = WsSession::new(state.clone(), Some(EPIX_MAIL_XITE.to_string()));
+    let err = registry
+        .dispatch(&mail_page, "channelIdentitySetEnabled", &json!([bob, false]), 7)
+        .await
+        .unwrap_err();
+    assert!(err.contains("permission"), "{err}");
+    let err = registry
+        .dispatch(&dm, "channelIdentitySetEnabled", &json!([bob, false]), 8)
+        .await
+        .unwrap_err();
+    assert!(err.contains("permission"), "{err}");
     // Turning channels off for an identity stops indexing it (state "off");
     // turning them back on schedules the setup again.
     let off = cmd("channelIdentitySetEnabled")
@@ -310,4 +349,16 @@ async fn linked_identities_get_their_bundles_published_to_the_hub() {
     // the default (alice) again.
     let info = info_cmd.handle(&mail, &json!([{}])).await.unwrap();
     assert_eq!(info["identity"]["xid"], "alice.epix");
+
+    // On a public gateway every page is refused, Epix Mail included, so no
+    // visitor acts as the gateway node's identity; the operator socket is not.
+    state.config_set("ui_restrict", json!(true)).await;
+    let mail_page = WsSession::new(state.clone(), Some(EPIX_MAIL_XITE.to_string()));
+    for (session, who) in [(&mail_page, "mail"), (&dm, "talk")] {
+        let err = info_cmd.handle(session, &json!([{}])).await.unwrap_err();
+        assert!(err.contains("public gateways"), "{who}: {err}");
+        let err = threads.handle(session, &json!([{}])).await.unwrap_err();
+        assert!(err.contains("public gateways"), "{who}: {err}");
+    }
+    assert!(info_cmd.handle(&mail, &json!([{}])).await.is_ok());
 }
