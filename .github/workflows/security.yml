@@ -201,3 +201,19 @@ jobs:
           sudo tar -xzf "$archive" -C /usr/local/bin gitleaks
       - name: Scan working tree
         run: gitleaks dir . --config .gitleaks.toml --redact --verbose
+
+  wallet-signing-tools:
+    name: Wallet signing dependency audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+      - name: Install locked signing tools and reject dependency advisories
+        run: |
+          npm ci --prefix packaging/firefox-wallet --ignore-scripts --no-fund --no-audit
+          npm audit --prefix packaging/firefox-wallet --audit-level=low
