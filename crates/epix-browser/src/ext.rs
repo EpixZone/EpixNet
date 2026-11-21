@@ -209,9 +209,9 @@ fn hex_digest(bytes: &[u8]) -> String {
 
 fn wallet_source_fingerprint() -> String {
     use sha2::{Digest, Sha256};
-    fn collect<'a>(dir: &'a Dir<'_>, files: &mut Vec<(&'a str, &'a [u8])>) {
+    fn collect<'a>(dir: &'a Dir<'_>, files: &mut Vec<(String, &'a [u8])>) {
         for file in dir.files() {
-            let name = file.path().to_str().expect("wallet paths are UTF-8");
+            let name = file.path().to_str().expect("wallet paths are UTF-8").replace('\\', "/");
             // The checkout's staging instructions are not part of the wallet build.
             if name != "README.md" { files.push((name, file.contents())); }
         }
@@ -219,7 +219,7 @@ fn wallet_source_fingerprint() -> String {
     }
     let mut files = Vec::new();
     collect(&EXT, &mut files);
-    files.sort_unstable_by_key(|(name, _)| *name);
+    files.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
     let mut digest = Sha256::new();
     for (name, bytes) in files {
         digest.update((name.len() as u64).to_le_bytes());
