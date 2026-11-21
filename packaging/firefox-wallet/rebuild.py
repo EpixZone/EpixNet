@@ -50,6 +50,16 @@ def restore(root, metadata):
         print(f"Restored {name} at {identity}")
 
 
+def submission_manifest(manifest, version):
+    if "applications" in manifest:
+        legacy = manifest.pop("applications")
+        if "browser_specific_settings" in manifest and manifest["browser_specific_settings"] != legacy:
+            raise ValueError("Firefox manifest contains conflicting browser settings")
+        manifest["browser_specific_settings"] = legacy
+    manifest["version"] = version
+    return (json.dumps(manifest, indent=2) + "\n").encode()
+
+
 def verify(entries, expected):
     actual = {name: hashlib.sha256(content).hexdigest() for name, content in entries.items()}
     different = sorted(name for name in actual.keys() | expected.keys() if actual.get(name) != expected.get(name))
@@ -79,8 +89,7 @@ def main():
         with zipfile.ZipFile(args.artifact) as archive:
             entries = {name: archive.read(name) for name in archive.namelist() if not name.endswith("/")}
         manifest = json.loads(entries["manifest.json"])
-        manifest["version"] = metadata["version"]
-        entries["manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
+        entries["manifest.json"] = submission_manifest(manifest, metadata["version"])
         verify(entries, metadata["final_files"])
 
 

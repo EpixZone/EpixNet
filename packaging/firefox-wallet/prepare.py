@@ -11,6 +11,8 @@ import subprocess
 import tempfile
 import zipfile
 
+from rebuild import submission_manifest
+
 ROOT = Path(__file__).resolve().parents[2]
 WALLET_ID = "wallet@epix.zone"
 MAX_CONTENT = 512 * 1024 * 1024
@@ -155,7 +157,7 @@ def source_bundle(output, repositories, version, environment, raw_entries, final
         "  target/debug/epix-browser --export-wallet ../rebuilt.xpi\n"
         "  cd ..\n"
         "  python3 rebuild.py verify-final rebuilt.xpi\n"
-        "The final comparison normalizes only manifest.version to the submitted version. All other payload bytes must match.\n"
+        "The final comparison sets the submitted version and migrates the legacy applications manifest key to browser_specific_settings. All other payload bytes must match.\n"
         "See EpixNet/packaging/firefox-wallet/README.md for signing and remaining publisher requirements.\n"
     ).encode()
     write_archive(output, entries)
@@ -199,8 +201,7 @@ def prepare(args, root=ROOT):
     submitted = tuple(int(part) for part in version.split("."))
     if submitted + (0,) * (4 - len(submitted)) <= installed + (0,) * (4 - len(installed)):
         raise ValueError("Submitted version must be newer than the installed wallet version")
-    manifest["version"] = version
-    entries["manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
+    entries["manifest.json"] = submission_manifest(manifest, version)
     extension = args.output / "extension"
     extension.mkdir()
     for name, content in entries.items():
