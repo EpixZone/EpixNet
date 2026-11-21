@@ -18,6 +18,8 @@
 //! the deliberately-insecure [`epix_envelope::FakeEngine`] (NO confidentiality —
 //! for pipeline testing only).
 
+mod sent_history;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use epix_channel::{ChannelDb, RevokedDevice};
@@ -676,6 +678,24 @@ async fn load_published_bundles(
     Ok(out)
 }
 
+async fn read_device_bundle(
+    state: &AppState,
+    xite: &str,
+    path: &str,
+    engine: &dyn Engine,
+) -> Option<(String, Value)> {
+    let (dir, file) = bundle_path_parts(path)?;
+    let name = norm_xid(dir);
+    let bytes = state.read_xite_file(xite, path).await?;
+    let bundle = serde_json::from_slice(&bytes).ok()?;
+    // The directory supplies the name, and the signed device address must
+    // also match its secondary filename when it uses one.
+    (bundle_xid_matches_directory(&bundle, &name)
+        && engine.verify_bundle(&bundle)
+        && bundle_filename_matches_auth(file, &bundle))
+        .then_some((name, bundle))
+}
+
 async fn read_published_bundle_files(
     state: &Arc<AppState>,
     xites: &[String],
@@ -684,26 +704,9 @@ async fn read_published_bundle_files(
     let mut by_name = PublishedBundleMap::new();
     for xite in xites {
         for path in state.list_xite_files(xite).await {
-            let Some((dir, file)) = bundle_path_parts(&path) else {
-                continue;
-            };
-            let Some(bytes) = state.read_xite_file(xite, &path).await else {
-                continue;
-            };
-            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
-                continue;
-            };
-            // Attribute the bundle to the cert-gated directory it lives in.
-            // Drop a bundle whose declared xID disagrees with that
-            // authenticated directory.
-            let key = norm_xid(dir);
-            if !bundle_xid_matches_directory(&v, &key) {
-                continue;
+            if let Some((name, bundle)) = read_device_bundle(state, xite, &path, engine).await {
+                by_name.entry(name).or_default().push(bundle);
             }
-            if !engine.verify_bundle(&v) || !bundle_filename_matches_auth(file, &v) {
-                continue;
-            }
-            by_name.entry(key).or_default().push(v);
         }
     }
     by_name
@@ -1828,6 +1831,7 @@ async fn run_channel_plugin(state: Arc<AppState>) {
     // publish or be acknowledged. The exact record and ratchet advance already
     // committed together, so retry remains idempotent.
     spawn_channel_outbox_worker(state.clone(), ms.clone());
+    tokio::spawn(sent_history::run(state.clone(), ms.clone()));
 
     // A shard can have committed durably just before a crash, after its delta
     // was emitted but before the private index consumed it. No new delta is
