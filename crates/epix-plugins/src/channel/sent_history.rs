@@ -132,13 +132,6 @@ async fn sync_sibling(
             .sender_ik(sibling)
             .ok_or("missing sibling device key")?,
     );
-    // Hold the same staging guard as a live send while selecting the page,
-    // committing its outbox records and advancing this device's cursor.
-    let _guard = channel_staging_guard(ms).await?;
-    let (queued, _) = ms.db.outbox_status(None).map_err(|e| e.to_string())?;
-    if queued >= MAX_QUEUED {
-        return Ok(());
-    }
     let name = norm_xid(&sender.xid);
     let mut published = PublishedBundles::default();
     let mut revoked = Vec::new();
@@ -161,6 +154,13 @@ async fn sync_sibling(
         .remember_revoked_devices(&revoked, now_ms())
         .map_err(|e| e.to_string())?;
     if published.verified_siblings(sender).is_empty() {
+        return Ok(());
+    }
+    // Hold the same staging guard as a live send while selecting the page,
+    // committing its outbox records and advancing this device's cursor.
+    let _guard = channel_staging_guard(ms).await?;
+    let (queued, _) = ms.db.outbox_status(None).map_err(|e| e.to_string())?;
+    if queued >= MAX_QUEUED {
         return Ok(());
     }
     let limit = PAGE_SIZE.min((MAX_QUEUED - queued) as usize);
