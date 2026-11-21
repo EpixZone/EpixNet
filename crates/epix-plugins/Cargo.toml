@@ -37,6 +37,7 @@ sha2 = "0.11"
 windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
+ed25519-dalek = { version = "3", default-features = false }
 epix-xite = { path = "../epix-xite" }
 epix-ui = { path = "../epix-ui", features = ["test-support"] }
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
