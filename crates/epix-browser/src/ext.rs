@@ -169,10 +169,7 @@ pub fn install_extension(profile: &Path) -> Result<(), String> {
     // Fold the substitute toolbar icons into the version stamp, so changing them
     // (or the wallet build) bumps the add-on version and forces Firefox to
     // reload - otherwise a same-version XPI keeps serving the cached old icon.
-    let extra = bytes_hash(WALLET_TOOLBAR_16)
-        .wrapping_add(bytes_hash(WALLET_TOOLBAR_48))
-        .wrapping_add(bytes_hash(EPIX_URLBAR_JS))
-        .wrapping_add(WALLET_PACK_VERSION);
+    let extra = wallet_extra_stamp();
     // The wallet renders its (status-overlaid) toolbar icon only at the sizes in
     // its `M=[16,48]` list, and its own small canvas render is softer than
     // Firefox downscaling a large image. `write_dir_to_zip` patches the list to
@@ -181,6 +178,56 @@ pub fn install_extension(profile: &Path) -> Result<(), String> {
     // `default_icon` to only 48px so the icon Firefox shows BEFORE the script
     // runs is a crisp downscale too, not a fuzzy 16px upscale.
     install_addon_xpi(profile, &EXT, EXT_ID, extra, &[("epix-urlbar.js", EPIX_URLBAR_JS)])
+}
+
+fn wallet_extra_stamp() -> u32 {
+    bytes_hash(WALLET_TOOLBAR_16)
+        .wrapping_add(bytes_hash(WALLET_TOOLBAR_48))
+        .wrapping_add(bytes_hash(EPIX_URLBAR_JS))
+        .wrapping_add(WALLET_PACK_VERSION)
+}
+
+/// Export exactly the archive the existing profile installer packs. This does
+/// not install it, sign it, or change any browser preferences or wallet data.
+pub fn export_wallet(path: &Path) -> Result<serde_json::Value, String> {
+    use sha2::{Digest, Sha256};
+    let stamp = (ext_content_hash(&EXT).wrapping_add(wallet_extra_stamp())) % 1_000_000;
+    let file = std::fs::OpenOptions::new().write(true).create_new(true).open(path)
+        .map_err(|error| format!("Create wallet export: {error}"))?;
+    write_addon_archive(file, &EXT, stamp, &[("epix-urlbar.js", EPIX_URLBAR_JS)])?;
+    let bytes = std::fs::read(path).map_err(|error| format!("Read wallet export: {error}"))?;
+    Ok(serde_json::json!({
+        "archive_sha256": hex_digest(&Sha256::digest(&bytes)),
+        "wallet_revision": include_str!("../../../shells/wallet-ext.rev").trim(),
+        "wallet_source_sha256": wallet_source_fingerprint(),
+    }))
+}
+
+fn hex_digest(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn wallet_source_fingerprint() -> String {
+    use sha2::{Digest, Sha256};
+    fn collect<'a>(dir: &'a Dir<'_>, files: &mut Vec<(&'a str, &'a [u8])>) {
+        for file in dir.files() {
+            let name = file.path().to_str().expect("wallet paths are UTF-8");
+            // The checkout's staging instructions are not part of the wallet build.
+            if name != "README.md" { files.push((name, file.contents())); }
+        }
+        for sub in dir.dirs() { collect(sub, files); }
+    }
+    let mut files = Vec::new();
+    collect(&EXT, &mut files);
+    files.sort_unstable_by_key(|(name, _)| *name);
+    let mut digest = Sha256::new();
+    for (name, bytes) in files {
+        digest.update((name.len() as u64).to_le_bytes());
+        digest.update(name.as_bytes());
+        digest.update((bytes.len() as u64).to_le_bytes());
+        digest.update(bytes);
+    }
+    hex_digest(&digest.finalize())
 }
 
 /// Zip an embedded add-on dir into `<profile>/extensions/<id>.xpi`, stamping its
@@ -215,15 +262,7 @@ fn install_addon_xpi(
     }
 
     let file = std::fs::File::create(&xpi_path).map_err(|e| format!("create xpi: {e}"))?;
-    let mut zip = zip::ZipWriter::new(file);
-    let opts =
-        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
-    write_dir_to_zip(&mut zip, dir, "", &opts, stamp)?;
-    for (name, bytes) in extra_files {
-        zip.start_file(*name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
-        zip.write_all(bytes).map_err(|e| format!("zip write {name}: {e}"))?;
-    }
-    zip.finish().map_err(|e| format!("finish xpi: {e}"))?;
+    write_addon_archive(file, dir, stamp, extra_files)?;
     // Firefox's certificate warmup may already have cached this profile before
     // the wallet existed. A later sideload can appear active in extensions.json
     // without registering its content scripts: unchanged Firefox builds skip
@@ -236,6 +275,24 @@ fn install_addon_xpi(
         Err(e) => return Err(format!("invalidate add-on startup cache: {e}")),
     }
     let _ = std::fs::write(&marker, &stamp_str);
+    Ok(())
+}
+
+fn write_addon_archive(
+    file: std::fs::File,
+    dir: &Dir,
+    stamp: u32,
+    extra_files: &[(&str, &[u8])],
+) -> Result<(), String> {
+    let mut zip = zip::ZipWriter::new(file);
+    let opts =
+        zip::write::SimpleFileOptions::default().compression_method(zip::CompressionMethod::Deflated);
+    write_dir_to_zip(&mut zip, dir, "", &opts, stamp)?;
+    for (name, bytes) in extra_files {
+        zip.start_file(*name, opts).map_err(|e| format!("zip entry {name}: {e}"))?;
+        zip.write_all(bytes).map_err(|e| format!("zip write {name}: {e}"))?;
+    }
+    zip.finish().map_err(|e| format!("finish xpi: {e}"))?;
     Ok(())
 }
 
@@ -1000,6 +1057,23 @@ mod tests {
         let mv3 = br#"{"manifest_version":3,"version":"1.0.0","permissions":["webRequest"]}"#;
         let m3: serde_json::Value = serde_json::from_slice(&transform_manifest(mv3, 1)).unwrap();
         assert_eq!(m3["permissions"].as_array().unwrap().len(), 1, "MV3 permissions untouched");
+    }
+
+    #[test]
+    fn signing_export_matches_installed_bytes_without_changing_the_profile() {
+        use sha2::{Digest, Sha256};
+        let profile = TmpProfile::new();
+        install_extension(&profile.0).unwrap();
+        let installed = std::fs::read(profile.0.join("extensions").join(format!("{EXT_ID}.xpi"))).unwrap();
+        let output = profile.0.join("signing-input.xpi");
+        let metadata = export_wallet(&output).unwrap();
+        let exported = std::fs::read(&output).unwrap();
+        assert_eq!(exported, installed);
+        assert_eq!(metadata["archive_sha256"], hex_digest(&Sha256::digest(&exported)));
+        assert_eq!(metadata["wallet_source_sha256"].as_str().unwrap().len(), 64);
+        assert_eq!(metadata["wallet_revision"], include_str!("../../../shells/wallet-ext.rev").trim());
+        assert!(export_wallet(&output).is_err(), "existing artifacts must never be overwritten");
+        assert_eq!(std::fs::read(output).unwrap(), installed);
     }
 
     #[test]

@@ -1,0 +1,77 @@
+name: Prepare Firefox wallet signing
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Unique AMO version, newer than the last submitted version
+        required: true
+        type: string
+      submit_to_mozilla:
+        description: Submit to Mozilla using configured publisher credentials
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_INCREMENTAL: "0"
+      CARGO_BUILD_JOBS: "2"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: "22"
+      - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: stable
+      - name: Validate the requested version and resolve pinned source
+        id: source
+        env:
+          WALLET_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 -c 'import os,sys; sys.path.insert(0,"packaging/firefox-wallet"); from prepare import release_version; release_version(os.environ["WALLET_VERSION"])'
+          PIN=$(python3 -c 'import pathlib,re; p=pathlib.Path("shells/wallet-ext.rev").read_text().strip(); assert re.fullmatch("[0-9a-f]{12}",p); print(p)')
+          REV=$(gh api "repos/EpixZone/epix-wallet/commits/$PIN" --jq .sha)
+          echo "revision=$REV" >> "$GITHUB_OUTPUT"
+          gh release download "wallet-$PIN" --repo EpixZone/epix-wallet --pattern epix-wallet-firefox.zip --dir "$RUNNER_TEMP/wallet-input"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: EpixZone/epix-wallet
+          ref: ${{ steps.source.outputs.revision }}
+          path: signing-wallet-source
+      - name: Install build and signing tools
+        run: |
+          sudo --preserve-env=GITHUB_ACTIONS,RUNNER_ENVIRONMENT python3 scripts/ci_install_apt_deps.py protobuf-compiler libudev-dev pkg-config libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+          npm ci --prefix packaging/firefox-wallet --ignore-scripts --no-fund
+          npm audit --prefix packaging/firefox-wallet --audit-level=low
+      - name: Build and prepare the final extension and readable source
+        env:
+          WALLET_VERSION: ${{ inputs.version }}
+        run: |
+          cargo build --locked -p epix-browser --no-default-features
+          python3 packaging/firefox-wallet/test-signing.py
+          python3 packaging/firefox-wallet/prepare.py --browser "$PWD/target/debug/epix-browser" --wallet-source "$PWD/signing-wallet-source" --wallet-archive "$RUNNER_TEMP/wallet-input/epix-wallet-firefox.zip" --version "$WALLET_VERSION" --output "$RUNNER_TEMP/wallet-prepared"
+      - name: Submit to Mozilla for self-distribution
+        if: ${{ inputs.submit_to_mozilla }}
+        env:
+          WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
+          WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
+        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --output "$RUNNER_TEMP/wallet-returned"
+      - name: Retain prepared inputs and any returned XPI for verification
+        if: ${{ always() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: firefox-wallet-signing-${{ github.run_id }}
+          path: |
+            ${{ runner.temp }}/wallet-prepared/
+            ${{ runner.temp }}/wallet-returned/
+          if-no-files-found: ignore
+          retention-days: 14

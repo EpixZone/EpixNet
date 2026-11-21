@@ -1,0 +1,8 @@
+{
+  "name": "epix-wallet-signing-tools",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "web-ext": "10.8.0"
+  }
+}

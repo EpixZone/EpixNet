@@ -121,6 +121,24 @@ pub struct Ready {
 }
 
 fn main() {
+    // Keep export stdout available to packaging tools, including on Windows.
+    let args: Vec<String> =
+        std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    if args.first().is_some_and(|arg| arg == "--export-wallet") {
+        let result = if args.len() == 2 {
+            ext::export_wallet(Path::new(&args[1]))
+        } else {
+            Err("Usage: epix-browser --export-wallet <new-output.xpi>".into())
+        };
+        match result {
+            Ok(mut metadata) => {
+                metadata["source_revision"] = serde_json::json!(env!("EPIX_GIT_REV"));
+                println!("{metadata}");
+            }
+            Err(error) => { eprintln!("{error}"); std::process::exit(1); }
+        }
+        return;
+    }
     // Must run before anything prints: as a windows-subsystem app we have no
     // console; adopt the parent's (dev runs from a terminal) or log to a file.
     #[cfg(windows)]
@@ -135,8 +153,6 @@ fn main() {
     // decision; argv[0] is skipped. args_os + lossy, not args(): args() PANICS
     // on a non-Unicode argument (e.g. raw bytes through a .desktop `%u`
     // handoff), whereas a mangled target just falls back to the dashboard.
-    let args: Vec<String> =
-        std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     let background = args.iter().any(|a| a == "--background");
     // `--quit`: ask a running EpixNet to close its browser and shut its node
     // down, wait for it, and exit. The Windows installer runs this before it

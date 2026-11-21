@@ -51,3 +51,7 @@ source cleanliness, provider assets, policy URLs, and analytics declaration.
 Android stages the same release automatically; iOS uses this directory and
 validates it before a Release build. A local development override is not an
 immutable release artifact.
+
+Mozilla signing preparation is documented in
+[`packaging/firefox-wallet/README.md`](../../packaging/firefox-wallet/README.md).
+The preparation tools do not change the wallet currently installed by the launcher.
