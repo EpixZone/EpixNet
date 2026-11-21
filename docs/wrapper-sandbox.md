@@ -72,15 +72,14 @@ default for loopback binds). For the opaque frame:
 
 Once the page calls `monkeyPatchAjax()`, the frame library (`epixframe.js`)
 asks the wrapper for the `ajax_key` (`wrapperGetAjaxKey`) and appends it to
-the URL of every XHR the page opens; await the call before the first request
-so the key is in place. That is what lets a xite's own
-`XMLHttpRequest` for `data.json` work from the opaque origin. For `fetch`,
-read the file with the `fileGet` command instead, or append
-`ajax_key=<key>` from `wrapperGetAjaxKey` to the URL yourself: EpixFrame
-releases before its fetch fix install a `fetch` patch that never adds the key
-(the patched function changes its own `url` parameter but forwards the
-original `arguments`, which strict mode does not link to it). A page that
-fetches its own files without the key does not get them in path mode (the
+same-host XHR and `fetch` URLs; await the call before the first request so
+the key is in place. That is what lets a xite's own `fetch("data.json")` work
+from the opaque origin. EpixFrame 1.0.x keys XHR only: its `fetch` patch
+changes its own `url` parameter but forwards the original `arguments`, which
+strict mode does not link to it, so the key never reaches the request. Xites
+still vendoring 1.0.x should update to 1.1.0, or read the file with the
+`fileGet` command, or append `ajax_key=<key>` to the URL themselves. A page
+that fetches its own files without the key does not get them in path mode (the
 shipped dashboard's XHR translation loader does this today and must enable
 the patch). The key never reads the
 wrapper document itself, which carries the xite's secrets. The one write a page makes
