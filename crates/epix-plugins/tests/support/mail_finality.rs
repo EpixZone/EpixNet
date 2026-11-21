@@ -6,6 +6,8 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpListener;
@@ -36,7 +38,36 @@ fn attestation(key: &SigningKey, root: &str, now: i64) -> Value {
     })
 }
 
-pub async fn serve(checkpoint: &Path, alice: &[&str], bob: &[&str]) {
+#[derive(Default)]
+pub struct Attestations {
+    unavailable: AtomicBool,
+    failures: AtomicUsize,
+}
+
+impl Attestations {
+    pub async fn pause(&self) {
+        self.unavailable.store(true, Ordering::Release);
+        epix_chain::clear_xid_caches().await;
+    }
+
+    pub fn resume(&self) {
+        self.unavailable.store(false, Ordering::Release);
+    }
+
+    pub fn failures(&self) -> usize {
+        self.failures.load(Ordering::Acquire)
+    }
+
+    fn rejects(&self, path: &str) -> bool {
+        if path.starts_with("/xid/v1/attestations?") && self.unavailable.load(Ordering::Acquire) {
+            self.failures.fetch_add(1, Ordering::AcqRel);
+            return true;
+        }
+        false
+    }
+}
+
+pub async fn serve(checkpoint: &Path, alice: &[&str], bob: &[&str]) -> Arc<Attestations> {
     let leaves = [("alice", alice), ("bob", bob)].map(|(name, addresses)| {
         let identities: Vec<_> = addresses
             .iter()
@@ -82,6 +113,8 @@ pub async fn serve(checkpoint: &Path, alice: &[&str], bob: &[&str]) {
     );
     let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
     epix_chain::set_chain_rpc_urls(&[format!("http://{}", listener.local_addr().unwrap())]);
+    let control = Arc::new(Attestations::default());
+    let attestations = control.clone();
     tokio::spawn(async move {
         while let Ok((mut connection, _)) = listener.accept().await {
             let mut input = BufReader::new(&mut connection);
@@ -96,11 +129,17 @@ pub async fn serve(checkpoint: &Path, alice: &[&str], bob: &[&str]) {
                     break;
                 }
             }
-            let body = serde_json::to_vec(replies.get(&path).unwrap_or(&Value::Null)).unwrap();
-            let header = format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+            let (status, value) = if attestations.rejects(&path) {
+                ("503 Service Unavailable", &Value::Null)
+            } else {
+                ("200 OK", replies.get(&path).unwrap_or(&Value::Null))
+            };
+            let body = serde_json::to_vec(value).unwrap();
+            let header = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
             if connection.write_all(header.as_bytes()).await.is_ok() {
                 let _ = connection.write_all(&body).await;
             }
         }
     });
+    control
 }

@@ -1,11 +1,15 @@
 //! Three independent private stores connected by the public hub's signed bundles
 //! and pool shard transport. Only the chain and peers are local fixtures.
+#[path = "support/mail_fair_history.rs"]
+mod mail_fair_history;
 #[path = "support/mail_finality.rs"]
 mod mail_finality;
 
 use epix_channel::ChannelDb;
+use epix_core::PeerAddr;
 use epix_plugin::Plugin;
 use epix_plugins::channel::{ChannelPlugin, EPIX_MAIL_XITE};
+use epix_runtime::edx::{edx_hook, enable_serving, ControlHandles};
 use epix_ui::command::CommandRegistry;
 use epix_ui::state::{AppState, XiteEntry};
 use epix_ui::WsSession;
@@ -46,6 +50,53 @@ impl Hub {
             users,
         }
     }
+
+    async fn install(&self, state: &Arc<AppState>, home: &Path) -> XiteStorage {
+        let files = XiteStorage::new(home.join("data").join(&self.address));
+        files
+            .write("content.json", &serde_json::to_vec(&self.root).unwrap())
+            .unwrap();
+        files
+            .write(
+                "data/users/content.json",
+                &serde_json::to_vec(&self.users).unwrap(),
+            )
+            .unwrap();
+        state
+            .add_xite(
+                &self.address,
+                XiteEntry {
+                    storage: files.clone(),
+                    content: Some(self.root.clone()),
+                },
+            )
+            .await;
+        files
+    }
+
+    async fn start_relay(&self, home: &Path) -> PeerAddr {
+        let state = AppState::with_data_dir("public-relay", home);
+        self.install(&state, home).await;
+        let key = epix_crypt::new_seed();
+        let store = enable_serving(&state, home, key.clone(), None)
+            .await
+            .unwrap();
+        let server = epix_protocol::PeerServer::new(edx_hook(
+            state,
+            store,
+            key,
+            None,
+            ControlHandles::detached(),
+            false,
+            None,
+        ));
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let address = PeerAddr::Ip(listener.local_addr().unwrap());
+        tokio::spawn(server.serve(listener));
+        address
+    }
 }
 
 struct Device {
@@ -60,25 +111,7 @@ struct Device {
 impl Device {
     async fn new(home: &Path, hub: &Hub, name: &str) -> Self {
         let state = AppState::with_data_dir("mail-test", home);
-        let files = XiteStorage::new(home.join("data").join(&hub.address));
-        files
-            .write("content.json", &serde_json::to_vec(&hub.root).unwrap())
-            .unwrap();
-        files
-            .write(
-                "data/users/content.json",
-                &serde_json::to_vec(&hub.users).unwrap(),
-            )
-            .unwrap();
-        state
-            .add_xite(
-                &hub.address,
-                XiteEntry {
-                    storage: files.clone(),
-                    content: Some(hub.root.clone()),
-                },
-            )
-            .await;
+        let files = hub.install(&state, home).await;
         state.config_set("channel_xite", json!(hub.address)).await;
         state.config_set("channel_legacy_xites", json!("")).await;
         state
@@ -101,6 +134,16 @@ impl Device {
             auth,
             xid: format!("{name}.epix"),
         }
+    }
+
+    async fn connect_relay(&self, home: &Path, hub: &Hub, relay: PeerAddr) {
+        self.state
+            .set_transport(Arc::new(epix_transport::TcpTransport))
+            .await;
+        enable_serving(&self.state, home, epix_crypt::new_seed(), None)
+            .await
+            .unwrap();
+        self.state.add_peers(&hub.address, [relay]).await;
     }
 
     async fn start(&self) {
@@ -132,6 +175,31 @@ impl Device {
             json!([[recipient], "Wallet Testing", body, CONVERSATION]),
         )
         .await
+    }
+
+    async fn wait_for_delivery(&self) {
+        let deadline = Instant::now() + Duration::from_secs(25);
+        loop {
+            let info = self.command("channelSessionInfo", json!([])).await;
+            assert_eq!(info["identity"]["auth"], self.auth);
+            if info["outbox_pending"] == 0 {
+                return;
+            }
+            assert!(Instant::now() < deadline, "outbox did not deliver: {info}");
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    }
+
+    async fn retained_ids(
+        &self,
+        hub: &Hub,
+    ) -> std::collections::BTreeSet<epix_ui::pool::PoolRecordId> {
+        self.state
+            .pool_all_records(&hub.address)
+            .await
+            .iter()
+            .map(|record| epix_ui::pool::pool_record_id(record).unwrap())
+            .collect()
     }
 
     async fn messages(&self) -> Vec<Value> {
@@ -177,6 +245,61 @@ impl Device {
     }
 }
 
+async fn check_retained_recovery(
+    laptop: &Device,
+    phone: &Device,
+    bob: &Device,
+    hub: &Hub,
+    attestations: &mail_finality::Attestations,
+) {
+    let body = "reply awaiting finalized device proof";
+    laptop.wait_for_delivery().await;
+    let before = phone.retained_ids(hub).await;
+    assert_eq!(laptop.send(&bob.xid, body).await["recipients"], 1);
+    laptop.wait_for_delivery().await;
+    let sent = laptop
+        .messages()
+        .await
+        .into_iter()
+        .find(|r| r["body"] == body)
+        .unwrap();
+    let denied = attestations.failures();
+    attestations.pause().await;
+    // Deliver once while the validator attestation is unavailable. The stored
+    // ciphertext must later be retried without another shard, send or restart.
+    laptop.relay(hub, &[phone]).await;
+    let retained = phone.retained_ids(hub).await;
+    assert!(before.is_subset(&retained) && before.len() < retained.len());
+    tokio::time::timeout(Duration::from_secs(15), async {
+        while attestations.failures() == denied {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("receiver did not request the unavailable validator attestation");
+    assert!(phone.messages().await.iter().all(|r| r["body"] != body));
+
+    attestations.resume();
+    let deadline = Instant::now() + Duration::from_secs(25);
+    loop {
+        let rows = phone.messages().await;
+        let recovered: Vec<_> = rows.iter().filter(|r| r["body"] == body).collect();
+        if let Some(row) = recovered.first() {
+            assert_eq!(recovered.len(), 1);
+            assert_eq!(row["sent_ms"], sent["sent_ms"]);
+            assert_eq!(row["dir"], "out");
+            assert_eq!(row["read"], 1);
+            assert_eq!(phone.retained_ids(hub).await, retained);
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "retained copy never recovered after finality returned"
+        );
+        tokio::time::sleep(Duration::from_millis(150)).await;
+    }
+}
+
 fn headers(rows: &[Value]) -> Vec<(&str, &str, i64)> {
     rows.iter()
         .map(|r| {
@@ -197,7 +320,7 @@ async fn linked_devices_receive_live_and_preupgrade_sent_mail() {
     let laptop = Device::new(&laptop_home, &hub, "alice").await;
     let phone = Device::new(&tmp.path().join("phone"), &hub, "alice").await;
     let bob = Device::new(&tmp.path().join("bob"), &hub, "bob").await;
-    mail_finality::serve(
+    let attestations = mail_finality::serve(
         &tmp.path().join("checkpoint.json"),
         &[&laptop.auth, &phone.auth],
         &[&bob.auth],
@@ -242,6 +365,14 @@ async fn linked_devices_receive_live_and_preupgrade_sent_mail() {
     phone.start().await;
     phone.deliver_bundle(&laptop);
     phone.deliver_bundle(&bob);
+    // Both publishers need a genuine encrypted peer receipt before a later
+    // record on the same ratchet can leave the durable outbox.
+    let public_relay = hub.start_relay(&tmp.path().join("public-relay")).await;
+    laptop
+        .connect_relay(&laptop_home, &hub, public_relay.clone())
+        .await;
+    bob.connect_relay(&tmp.path().join("bob"), &hub, public_relay)
+        .await;
     let sent = laptop.send(&bob.xid, "new reply").await;
     assert_eq!(sent["ok"], true);
     assert_eq!(
@@ -324,4 +455,6 @@ async fn linked_devices_receive_live_and_preupgrade_sent_mail() {
             members
         );
     }
+    check_retained_recovery(&laptop, &phone, &bob, &hub, &attestations).await;
+    mail_fair_history::check(&laptop, &phone, &hub, &laptop_home).await;
 }
