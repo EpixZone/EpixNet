@@ -48,10 +48,11 @@ pub struct Checkpoint {
 /// `Record::identity()` uses: verification authorizes a signer for a
 /// DIRECTORY, not over another author's item, so any authorized user could
 /// otherwise self-sign a tombstone carrying someone else's id and delete
-/// it everywhere. A legitimate cross-author moderation tombstone still
-/// matches its victim: `verify_record` requires such a record's `author`
-/// field to be the ORIGINAL author (only the signature comes from the
-/// moderator).
+/// it everywhere. This key only covers a self-delete: a cross-author
+/// moderation tombstone carries the moderator as `author` (`recordSign` sets
+/// `author` to the signer), so it never matches its victim here. Moderation
+/// is applied before records reach this crate: `adapter::records_from_container`
+/// runs the merge-file fold per file and drops the moderated item's content.
 pub(crate) fn tombstoned_ids(records: &[Record]) -> BTreeSet<(String, String)> {
     records
         .iter()
@@ -323,10 +324,9 @@ mod tests {
     #[test]
     fn tombstone_is_sticky_and_removes_the_item() {
         let mut recs = records();
-        // A tombstone as the adapter emits one: target = its own id, author
-        // = the item's author. A moderation tombstone has this same shape,
-        // since verify_record makes a moderator sign a record whose `author`
-        // is still the original author.
+        // A self-delete as the adapter emits one: target = its own id, author
+        // = the item's author. (A moderation tombstone carries the moderator
+        // as author; the adapter applies it by dropping the item instead.)
         recs.push(test_record("c1", "u2", "c1", 20, Kind::Tombstone));
         // ...and the author tries to resurrect it with a higher clock.
         recs.push(test_record("c1", "u2", "p1", 30, Kind::Comment));

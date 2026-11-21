@@ -140,9 +140,10 @@ pub fn verify_record(
     // signed through the node's `recordSign` always names its SIGNER here
     // (the node overwrites `author` with the signing key's address), so a
     // moderation tombstone made that way names the moderator, not the
-    // original author; it still hides the item because versions group by
-    // `post_id`. A tombstone built elsewhere may keep the original author,
-    // and the moderation relaxation below accepts either.
+    // original author: it names its victim only by `post_id`, and the fold
+    // (`merge::display_winner`) applies it to that id's versions in this file.
+    // A tombstone built elsewhere may keep the original author, and the
+    // moderation relaxation below accepts either.
     if !valid_signers.iter().any(|s| s == author) {
         return Err(RecordError::UnauthorizedAuthor);
     }
