@@ -53,9 +53,10 @@ code.
   Windows/Linux installers need those machines. See `shells/README.md`.
 - **Onion sign-proof to a challenging tracker** - blocked on Arti exposing the
   hidden-service key. See `tor-tail.md`.
-- **Live checkpoints that need infrastructure**: a Python peer reaching our
-  onion inbound, the `--tor always` zero-direct-IP clone, and real Ledger /
-  Keystone / BLE-mesh device tests. All are verification runs needing a
+- **Live checkpoints that need infrastructure**: the `--tor always`
+  zero-direct-IP clone, and real Ledger / Keystone / BLE-mesh device tests.
+  (The former "Python peer reaching our onion inbound" checkpoint no longer
+  applies: the peer protocol is EDX only, so Python peers cannot connect.) All are verification runs needing a
   connected environment or hardware, not new code.
 - **iOS dApp provider injection** (window.keplr into browsed pages) - deferred
   in the wallet plan; needs a persistent background bridge and a dApp to verify

@@ -1,8 +1,10 @@
 //! Authoring + diagnostics CLI actions, the EpixNet `epixnet.py <action>`
-//! surface: siteCreate / siteSign / siteVerify / dbRebuild / dbQuery /
-//! importBundle work offline against the data dir; crypt* are pure key
-//! operations; peerPing measures an EDX link's round-trip to a running node;
-//! siteCmd runs any WS command against a running node's admin socket.
+//! surface: siteCreate / siteVerify / dbRebuild / dbQuery / importBundle work
+//! offline against the data dir; siteSign / sitePublish and the xite-admin
+//! actions go to a running node's admin socket first and fall back to the
+//! data dir when none is up; crypt* are pure key operations; peerPing
+//! measures an EDX link's round-trip to a running node; siteCmd runs any WS
+//! command against a running node's admin socket.
 //!
 //! Kept clap-free on purpose: the action name is the first argument, exactly
 //! like the Python CLI, and everything else stays positional.

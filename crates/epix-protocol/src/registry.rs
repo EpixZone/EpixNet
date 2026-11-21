@@ -285,8 +285,8 @@ pub fn totals() -> ConnTotals {
 }
 
 /// A pass-through stream that counts raw bytes into a [`ConnEntry`], so the
-/// per-connection in/out columns cover everything on the wire (framing,
-/// handshakes, `streamFile` raw tails), like the Python client's counters.
+/// per-connection in/out columns cover everything on the wire (EDX framing
+/// and handshakes included), not just payload bytes.
 struct CountingStream {
     inner: PeerStream,
     entry: Arc<ConnEntry>,

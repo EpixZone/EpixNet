@@ -2,7 +2,7 @@
 name = "epix-worker"
 version = "0.1.0"
 edition = "2021"
-description = "Parallel download manager: pull a xite's files from peers, verify hashes, and store them."
+description = "Peer-outcome reputation types (PeerOutcome) that every fetch path reports so the peer registry can reward good seeders and back off dead ones."
 
 [dependencies]
 epix-core = { path = "../epix-core" }

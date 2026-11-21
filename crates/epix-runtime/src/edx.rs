@@ -548,11 +548,13 @@ fn decode_update_inline(
 
 /// A shared upload governor for reciprocity choking (seed -> faster
 /// service): the serve side consults it, the fetch side credits peers that
-/// serve us. Opt-in via EPIX_EDX_RECIPROCITY.
+/// serve us. On by default; `EPIX_EDX_RECIPROCITY=0` turns it off (see
+/// [`make_choker`]).
 pub type SharedChoker = Arc<Mutex<Choker>>;
 
-/// Global upload cap (bytes/sec) for reciprocity-governed serving. Generous
-/// by default; reciprocity is opt-in and this only bites when it is on.
+/// Global upload cap (bytes/sec) for reciprocity-governed serving, also the
+/// bulk-lane pacer rate. Generous on purpose: reciprocity is on by default,
+/// so this applies unless `EPIX_EDX_RECIPROCITY=0` turns governing off.
 const EDX_UPLOAD_CAP_BPS: u64 = 8_000_000;
 
 /// Default object-store byte quota. Own (pinned) content is exempt; cached
