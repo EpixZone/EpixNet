@@ -127,3 +127,60 @@ async fn path_wrapper_declares_a_loadable_touch_icon() {
 async fn proxy_wrapper_declares_a_loadable_touch_icon() {
     wrapper_touch_icon("talk.epix", "/").await;
 }
+
+#[tokio::test]
+async fn browser_root_touch_icon_probes_redirect_to_public_media() {
+    let directory = tempfile::tempdir().unwrap();
+    let state = AppState::with_data_dir("root-icon-test", directory.path());
+    state.config_set("ui_check_cors", json!(true)).await;
+    let router = UiServer::new(state).router();
+    for host in ["127.0.0.1:42222", "talk.epix"] {
+        for path in ["/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"] {
+            let response = router
+                .clone()
+                .oneshot(rewrite_proxy_host(
+                    Request::builder()
+                        .uri(path)
+                        .header("host", host)
+                        .header(
+                            "referer",
+                            format!("http://{host}/epix1xauthduuyn63k6kj54jzgp4l8nnjlhrsyaku8c/"),
+                        )
+                        .header("sec-fetch-mode", "no-cors")
+                        .header("sec-fetch-dest", "image")
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::PERMANENT_REDIRECT,
+                "{host}{path}"
+            );
+            assert_eq!(
+                response.headers()["location"],
+                "/uimedia/img/apple-touch-icon.png"
+            );
+            let image = router
+                .clone()
+                .oneshot(rewrite_proxy_host(
+                    Request::builder()
+                        .uri("/uimedia/img/apple-touch-icon.png")
+                        .header("host", host)
+                        .header("sec-fetch-mode", "no-cors")
+                        .header("sec-fetch-dest", "image")
+                        .body(Body::empty())
+                        .unwrap(),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(image.status(), StatusCode::OK);
+            assert_eq!(image.headers()["content-type"], "image/png");
+            assert!(to_bytes(image.into_body(), 1 << 20)
+                .await
+                .unwrap()
+                .starts_with(b"\x89PNG\r\n\x1a\n"));
+        }
+    }
+}
