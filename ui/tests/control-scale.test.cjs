@@ -35,6 +35,7 @@ for (const scale of [0.5, 1, 2]) test('initial scale ' + scale + ' keeps control
   const f = fixture(scale);
   assert.equal(f.chrome.baseline, scale);
   assert.equal(f.chrome.width, 360);
+  assert.equal(f.chrome.fixbuttonScale, 1);
   assert.equal(f.chrome.height, 800);
   assert.ok(f.classes.has('controls-narrow'));
   assert.equal(f.element.style.transform, `translate(0px,0px) scale(${1 / scale})`);
@@ -45,6 +46,8 @@ test('pinch and pan preserve magnification and use viewport-local pointer coordi
   f.viewport({scale: 1, width: 360, height: 800, pageLeft: 25, pageTop: 60});
   assert.equal(f.chrome.baseline, 0.5);
   assert.equal(f.chrome.width, 180);
+  assert.equal(f.chrome.fixbuttonScale, 0.5);
+  assert.equal(f.element.style['--fixbutton-scale'], 0.5);
   assert.equal(f.chrome.point(125, 160).left, 50);
   assert.equal(f.chrome.point(125, 160).top, 50);
   const eventCount = f.events();
@@ -58,6 +61,17 @@ test('a keyboard height change does not adopt current user zoom', () => {
   f.viewport({height: 200});
   assert.equal(f.chrome.baseline, 1);
   assert.equal(f.chrome.height, 200);
+});
+
+test('maximum pinch keeps the handle in screen coordinates in both orientations', () => {
+  const f = fixture(0.5);
+  for (const [width, height] of [[90, 200], [200, 90]]) {
+    f.viewport({scale: 4, width, height});
+    const magnification = f.chrome.scale / f.chrome.baseline;
+    assert.equal(f.chrome.fixbuttonScale * magnification, 1);
+    assert.equal(f.element.style['--fixbutton-scale'], 0.125);
+    assert.equal(f.chrome.width, width * 0.5, 'panel text retains user magnification');
+  }
 });
 
 test('an ignored desktop viewport edit preserves an existing pinch', () => {

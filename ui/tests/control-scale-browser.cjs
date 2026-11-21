@@ -383,7 +383,7 @@ wss.on("connection", (ws) => {
       await settle(page); record.zoomed = await measure(page);
       assert.ok(record.zoomed.viewport.scale > 1.5, 'trusted pinch changes browser page scale');
       assert.ok(record.zoomed.viewport.offsetLeft > 0 && record.zoomed.viewport.offsetTop > 0, 'trusted pinch moves visual viewport origin');
-      near('trusted pinch magnifies button', record.zoomed.button.width, 48 * record.zoomed.viewport.scale);
+      near('trusted pinch keeps button size', record.zoomed.button.width, 48);
       near('trusted pinch keeps button visible', record.zoomed.button.visibleWidth, record.zoomed.button.width);
       // Pan through the page below the controls. The open drawer would consume
       // scrolling, so exercise the closed wrapper before opening it again.
@@ -405,6 +405,27 @@ wss.on("connection", (ws) => {
       near('panned close button remains vertically visible', record.open.close.visibleHeight, record.open.close.height);
       equal('trusted pinch and pan preserve raw viewport', record.open.tags, record.before.tags);
       await closeButton(page);
+      await cdp.detach();
+    });
+    await scenario('maximum-pinch-rotation', {scale: 0.5}, async (page, record) => {
+      record.before = await measure(page);
+      const cdp = await page.context().newCDPSession(page);
+      for (const [name, viewport] of [['portrait', {width: 360, height: 800}], ['landscape', {width: 800, height: 360}]]) {
+        await page.setViewportSize(viewport);
+        await cdp.send('Emulation.setPageScaleFactor', {pageScaleFactor: 4});
+        await settle(page);
+        const measured = await measure(page); record[name] = measured;
+        near(name + ' page remains zoomed', measured.viewport.scale, 4, 0.02);
+        near(name + ' maximum-zoom button width', measured.button.width, 48);
+        near(name + ' maximum-zoom button fully visible horizontally', measured.button.visibleWidth, 48);
+        near(name + ' maximum-zoom button fully visible vertically', measured.button.visibleHeight, 48);
+        near(name + ' button stays at original right inset', viewport.width - measured.button.x - measured.button.width, 31);
+        near(name + ' button stays at original top inset', measured.button.y, 11);
+        await drag(page, 'touch', 'open');
+        await closeButton(page);
+        near(name + ' button returns to its resting size', (await measure(page)).button.width, 48);
+      }
+      equal('maximum pinch preserves viewport directives', record.landscape.tags, record.before.tags);
       await cdp.detach();
     });
     await scenario('delayed-viewport', {rendered: null, manifest: null}, async (page, record) => {

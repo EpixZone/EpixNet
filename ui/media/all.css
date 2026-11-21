@@ -274,9 +274,11 @@ a {
 
 .fixbutton {
 	position: absolute;
-	right: 35px;
-	top: 15px;
+	right: calc(75px * var(--fixbutton-scale, 1) - 40px);
+	top: calc(15px * var(--fixbutton-scale, 1));
 	width: 40px;
+	transform: scale(var(--fixbutton-scale, 1));
+	transform-origin: 0 0;
 	z-index: 999;
 	text-align: center;
 	color: var(--epix-neutral-0);

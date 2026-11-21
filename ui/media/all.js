@@ -694,6 +694,9 @@ if (window.getComputedStyle(document.body).transform) {
       this.baseline *= viewport.scale / this.scale;
     }
     this.scale = viewport.scale;
+    // The navigation handle stays finger-sized even when panel text and the
+    // xite are magnified. Its offsets use this same local coordinate scale.
+    this.fixbuttonScale = this.baseline / this.scale;
     this.physicalWidth = physicalWidth;
     this.width = viewport.width * this.baseline;
     this.height = viewport.height * this.baseline;
@@ -709,6 +712,7 @@ if (window.getComputedStyle(document.body).transform) {
     style.transform = "translate(" + offsetLeft + "px," + offsetTop + "px) scale(" + (1 / this.baseline) + ")";
     style.setProperty("--controls-width", this.width + "px");
     style.setProperty("--controls-height", this.height + "px");
+    style.setProperty("--fixbutton-scale", this.fixbuttonScale);
     this.element.classList.toggle("controls-narrow", this.width <= 640);
     this.element.classList.toggle("controls-compact-menu", this.width <= 800);
     window.dispatchEvent(new Event("epixchromechange"));
