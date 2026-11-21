@@ -153,8 +153,9 @@ A second client therefore needs `wrapperPermissionAdd("Channels:talk")`, then
 ## Guarantees & residuals
 
 - **Sender anonymity**: each pool record is posted under a fresh throwaway
-  keypair; the sender's own copy is never posted (written straight to the private
-  index). Nothing in a record ties it to its author.
+  keypair. The sending device writes its own copy to the private index.
+  Mail also encrypts sent copies for the sender's other verified active
+  devices. The public record carries no cleartext author or device list.
 - **Recipient anonymity**: detection is local trial-decryption; fetching any
   shard signals nothing (full replication, exhaustively enumerable paths).
 - **Content**: X3DH + Double Ratchet → forward secrecy and post-compromise

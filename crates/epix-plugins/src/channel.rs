@@ -18,6 +18,8 @@
 //! the deliberately-insecure [`epix_envelope::FakeEngine`] (NO confidentiality —
 //! for pipeline testing only).
 
+mod sent_history;
+
 use async_trait::async_trait;
 use base64::Engine as _;
 use epix_channel::{ChannelDb, RevokedDevice};
@@ -624,8 +626,79 @@ fn bundle_filename_matches_auth(file: &str, bundle: &Value) -> bool {
 struct PublishedBundles {
     active: std::collections::HashMap<String, Vec<Value>>,
     revoked_names: std::collections::HashSet<String>,
+    /// Present only when this pass obtained a finalized snapshot for the name.
+    confirmed_auths: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    confirmed_keys: std::collections::HashSet<(String, String)>,
     /// `(normalized xid, hex identity key)` for a definitely revoked device.
     revoked_devices: std::collections::HashSet<(String, String)>,
+}
+
+impl PublishedBundles {
+    fn confirm_mail_devices(
+        &mut self,
+        db: &ChannelDb,
+        engine: &dyn Engine,
+        name: &str,
+        snapshot: &epix_chain::XidIdentitySnapshot,
+        retained: &[Value],
+    ) -> Result<(), String> {
+        use epix_chain::XidIdentityStatus::Active;
+        if !engine.supports_sent_copies() || snapshot.finality.is_none() {
+            return Ok(());
+        }
+        let mut auths = std::collections::HashSet::new();
+        for signer in &snapshot.identities {
+            if snapshot.status_for(&signer.auth_address) == Some(Active)
+                && !db
+                    .is_device_revoked(name, Some(&signer.auth_address), "")
+                    .map_err(|e| e.to_string())?
+            {
+                auths.insert(signer.auth_address.clone());
+            }
+        }
+        for bundle in retained {
+            if bundle["auth"]
+                .as_str()
+                .is_some_and(|auth| auths.contains(auth))
+            {
+                if let Some(ik) = engine.sender_ik(bundle) {
+                    self.confirmed_keys
+                        .insert((name.to_string(), hex::encode(ik)));
+                }
+            }
+        }
+        self.confirmed_auths.insert(name.to_string(), auths);
+        Ok(())
+    }
+
+    fn verified_siblings(&self, sender: &LocalChannelSender) -> Vec<Value> {
+        let name = norm_xid(&sender.xid);
+        let Some(confirmed) = self.confirmed_auths.get(&name) else {
+            return Vec::new();
+        };
+        if !confirmed.contains(&sender.auth) {
+            return Vec::new();
+        }
+        self.active
+            .get(&name)
+            .into_iter()
+            .flatten()
+            .filter(|bundle| {
+                bundle["auth"].as_str().is_some_and(|auth| {
+                    bundle["v"] == 3
+                        && auth != sender.auth
+                        && confirmed.contains(auth)
+                        && epix_pairwise_engine::PairwiseEngine
+                            .sender_ik(bundle)
+                            .is_some_and(|ik| {
+                                self.confirmed_keys
+                                    .contains(&(name.clone(), hex::encode(ik)))
+                            })
+                })
+            })
+            .cloned()
+            .collect()
+    }
 }
 
 type PublishedBundleMap = std::collections::HashMap<String, Vec<Value>>;
@@ -676,6 +749,24 @@ async fn load_published_bundles(
     Ok(out)
 }
 
+async fn read_device_bundle(
+    state: &AppState,
+    xite: &str,
+    path: &str,
+    engine: &dyn Engine,
+) -> Option<(String, Value)> {
+    let (dir, file) = bundle_path_parts(path)?;
+    let name = norm_xid(dir);
+    let bytes = state.read_xite_file(xite, path).await?;
+    let bundle = serde_json::from_slice(&bytes).ok()?;
+    // The directory supplies the name, and the signed device address must
+    // also match its secondary filename when it uses one.
+    (bundle_xid_matches_directory(&bundle, &name)
+        && engine.verify_bundle(&bundle)
+        && bundle_filename_matches_auth(file, &bundle))
+        .then_some((name, bundle))
+}
+
 async fn read_published_bundle_files(
     state: &Arc<AppState>,
     xites: &[String],
@@ -684,26 +775,9 @@ async fn read_published_bundle_files(
     let mut by_name = PublishedBundleMap::new();
     for xite in xites {
         for path in state.list_xite_files(xite).await {
-            let Some((dir, file)) = bundle_path_parts(&path) else {
-                continue;
-            };
-            let Some(bytes) = state.read_xite_file(xite, &path).await else {
-                continue;
-            };
-            let Ok(v) = serde_json::from_slice::<Value>(&bytes) else {
-                continue;
-            };
-            // Attribute the bundle to the cert-gated directory it lives in.
-            // Drop a bundle whose declared xID disagrees with that
-            // authenticated directory.
-            let key = norm_xid(dir);
-            if !bundle_xid_matches_directory(&v, &key) {
-                continue;
+            if let Some((name, bundle)) = read_device_bundle(state, xite, &path, engine).await {
+                by_name.entry(name).or_default().push(bundle);
             }
-            if !engine.verify_bundle(&v) || !bundle_filename_matches_auth(file, &v) {
-                continue;
-            }
-            by_name.entry(key).or_default().push(v);
         }
     }
     by_name
@@ -942,6 +1016,9 @@ async fn classify_published_name(
         out,
         newly_revoked,
     )?;
+    if let Some(snapshot) = snapshot.as_ref() {
+        out.confirm_mail_devices(sources.db, sources.engine, &name, snapshot, &retained)?;
+    }
     if !retained.is_empty() {
         out.active.insert(name, retained);
     }
@@ -982,7 +1059,7 @@ fn indexed_event(
     meta: &std::collections::HashMap<i64, (String, String)>,
 ) -> Option<Value> {
     let ProcessOutcome::Indexed {
-        identity_id, conv_id, sender_xid, subject, snippet, app, unread, first_contact, pending, ..
+        identity_id, conv_id, sender_xid, subject, snippet, app, unread, first_contact, sent_copy, pending, ..
     } = outcome
     else {
         return None;
@@ -992,7 +1069,7 @@ fn indexed_event(
     }
     let (xid, auth) = meta.get(&identity_id).cloned().unwrap_or_default();
     Some(json!({
-        "type": "new_message",
+        "type": if sent_copy { "sent_copy" } else { "new_message" },
         // The identity the message landed in, so a client shows it in the
         // right inbox (routing already filters by the xite's identity).
         "identity_id": identity_id,
@@ -1010,6 +1087,12 @@ fn indexed_event(
     }))
 }
 
+#[derive(Default)]
+struct IndexProgress {
+    new_session: bool,
+    deferred_sent_copy: bool,
+}
+
 /// Trial-decrypt a batch of records into the private index (the blocking core of
 /// [`index_batch`]); collect a `channelEvent` per newly-indexed message and whether
 /// a NEW session formed. One record can deliver to SEVERAL local identities (one
@@ -1022,7 +1105,7 @@ fn process_batch_blocking(
     now: i64,
     bundles: &PublishedBundles,
     meta: &std::collections::HashMap<i64, (String, String)>,
-) -> Result<(Vec<Value>, bool), String> {
+) -> Result<(Vec<Value>, IndexProgress), String> {
     let resolve = |xid: &str| -> Vec<Value> {
         bundles
             .active
@@ -1035,15 +1118,17 @@ fn process_batch_blocking(
         if bundles.revoked_names.contains(&xid)
             || bundles
                 .revoked_devices
-                .contains(&(xid, peer_ik.to_string()))
+                .contains(&(xid.clone(), peer_ik.to_string()))
         {
             Some(false)
+        } else if bundles.confirmed_keys.contains(&(xid, peer_ik.to_string())) {
+            Some(true)
         } else {
             None
         }
     };
     let mut events: Vec<Value> = Vec::new();
-    let mut new_session = false;
+    let mut progress = IndexProgress::default();
     for rec in records {
         let outcomes = epix_envelope::process_record_with_peer_status(
             db,
@@ -1056,22 +1141,24 @@ fn process_batch_blocking(
         )
         .map_err(|error| error.to_string())?;
         for outcome in outcomes {
-            if let Some(ev) = indexed_event(outcome, &mut new_session, meta) {
+            if matches!(outcome, ProcessOutcome::DeferredSentCopy) {
+                progress.deferred_sent_copy = true;
+            } else if let Some(ev) = indexed_event(outcome, &mut progress.new_session, meta) {
                 events.push(ev);
             }
         }
     }
-    Ok((events, new_session))
+    Ok((events, progress))
 }
 
 async fn index_batch(
     state: &Arc<AppState>,
     ms: &Arc<ChannelState>,
     records: Vec<Value>,
-) -> Result<bool, String> {
+) -> Result<IndexProgress, String> {
     let LocalIdentities { keys: identities, meta } = build_identities(state, &ms.db).await;
     if identities.is_empty() || records.is_empty() {
-        return Ok(false);
+        return Ok(IndexProgress::default());
     }
     let db = (*ms.db).clone();
     let engine = ms.engine.clone();
@@ -1090,7 +1177,7 @@ async fn index_batch(
     // shared lock a send could persist a ratchet computed from stale state over an
     // inbound advance (or vice versa), desyncing the ratchet and expected-tag
     // table. The send handler holds this same lock across its seal→persist section.
-    let (events, new_session) = {
+    let (events, progress) = {
         let _guard = ms.send_lock.lock().await;
         tokio::task::spawn_blocking(move || {
             process_batch_blocking(&db, engine.as_ref(), &identities, &records, now, &bundles, &meta)
@@ -1102,7 +1189,7 @@ async fn index_batch(
     for ev in events {
         deliver_channel_event(state, ms, ev).await;
     }
-    Ok(new_session)
+    Ok(progress)
 }
 
 /// Push a `channelEvent` to every client xite whose effective identity is the
@@ -1205,16 +1292,8 @@ async fn retry_index_records(state: Arc<AppState>, ms: Arc<ChannelState>) {
                     return true;
                 }
                 let all = state.pool_all_records(&ms.xite).await;
-                let result = match index_batch(&state, &ms, all).await {
-                    Ok(true) => {
-                        let all = state.pool_all_records(&ms.xite).await;
-                        index_batch(&state, &ms, all).await.map(|_| ())
-                    }
-                    Ok(false) => Ok(()),
-                    Err(error) => Err(error),
-                };
-                match result {
-                    Ok(()) => true,
+                match index_with_rescan(&state, &ms, all).await {
+                    Ok(progress) => !progress.deferred_sent_copy,
                     Err(error) => {
                         state
                             .log(
@@ -1236,31 +1315,29 @@ async fn retry_index_records(state: Arc<AppState>, ms: Arc<ChannelState>) {
     }
 }
 
-/// Process a delta, then re-scan once if a new session formed (a record that
-/// arrived before its session existed becomes matchable).
-async fn index_records(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec<Value>) {
-    match index_batch(state, ms, records).await {
-        Ok(true) => {
-        let all = state.pool_all_records(&ms.xite).await;
-            // Idempotent: the processed-set skips already-indexed records.
-            if let Err(error) = index_batch(state, ms, all).await {
-                state
-                    .log("ERROR", &format!("channel index rescan failed: {error}"))
-                    .await;
-                ms.index_retry.notify_one();
-            }
-        }
-        Ok(false) => {}
-        Err(error) => {
-            state
-                .log("ERROR", &format!("channel index failed: {error}"))
-                .await;
-            // The exact record remains in a verified local pool shard. The
-            // persistent coalesced worker retries until it succeeds even if no
-            // new network delta is emitted.
-            ms.index_retry.notify_one();
-        }
+/// Discover earlier arrivals that become decryptable once the opener is indexed.
+async fn index_with_rescan(
+    state: &Arc<AppState>,
+    ms: &Arc<ChannelState>,
+    records: Vec<Value>,
+) -> Result<IndexProgress, String> {
+    let progress = index_batch(state, ms, records).await?;
+    if progress.new_session {
+        let retained = state.pool_all_records(&ms.xite).await;
+        return index_batch(state, ms, retained).await;
     }
+    Ok(progress)
+}
+
+async fn index_records(state: &Arc<AppState>, ms: &Arc<ChannelState>, records: Vec<Value>) {
+    match index_with_rescan(state, ms, records).await {
+        Ok(progress) if !progress.deferred_sent_copy => return,
+        Ok(_) => {}
+        Err(error) => state.log("ERROR", &format!("channel index failed: {error}")).await,
+    }
+    // The verified record is already on disk. Retry with backoff when another
+    // device's bundle or finality proof becomes available, even without a delta.
+    ms.index_retry.notify_one();
 }
 
 /// Choose the channel engine: the real X3DH + Double Ratchet engine by default;
@@ -1828,6 +1905,7 @@ async fn run_channel_plugin(state: Arc<AppState>) {
     // publish or be acknowledged. The exact record and ratchet advance already
     // committed together, so retry remains idempotent.
     spawn_channel_outbox_worker(state.clone(), ms.clone());
+    tokio::spawn(sent_history::run(state.clone(), ms.clone()));
 
     // A shard can have committed durably just before a crash, after its delta
     // was emitted but before the private index consumed it. No new delta is
@@ -2171,17 +2249,29 @@ impl WsCommand for ChannelContacts {
     }
 }
 
+// A user who explicitly addresses their own name requested ordinary delivery.
+// The saved sent row remains eligible for a separate verified history copy.
+fn extend_send_to_siblings(request: &ChannelSendRequest, sender: &LocalChannelSender) -> bool {
+    request.app == epix_envelope::DEFAULT_APP && !request.recipients.contains(&norm_xid(&sender.xid))
+}
+
 /// Resolve every recipient name to its active, verified device bundles, flattened
 /// into one destination list (one slot per device). Errors if a recipient is
 /// revoked on chain, or has published no usable channel keys. Touches no ratchet
 /// state, so the caller runs it BEFORE taking the send lock.
 async fn resolve_destinations(
     ms: &ChannelState,
-    recipients: &[String],
+    request: &ChannelSendRequest,
+    sender: &LocalChannelSender,
     published: &PublishedBundles,
 ) -> Result<Vec<Value>, String> {
     let mut groups: Vec<(String, Vec<Value>)> = Vec::new();
-    for recip in recipients {
+    let siblings = if extend_send_to_siblings(request, sender) {
+        published.verified_siblings(sender)
+    } else {
+        Vec::new()
+    };
+    for recip in &request.recipients {
         if published.revoked_names.contains(recip) {
             return Err(format!("{recip}'s identity has been revoked"));
         }
@@ -2198,7 +2288,15 @@ async fn resolve_destinations(
         }
         groups.push((recip.clone(), devices));
     }
-    unique_destination_devices(ms.engine.as_ref(), groups)
+    let mut destinations = unique_destination_devices(ms.engine.as_ref(), groups)?;
+    // Use spare slots in the last record. Extra siblings are served by history
+    // delivery, so adding a device cannot exhaust the recipients' RLN budget.
+    let spare = destinations.len().next_multiple_of(epix_envelope::SLOTS) - destinations.len();
+    let existing: std::collections::HashSet<_> = destinations.iter().filter_map(|b| ms.engine.sender_ik(b)).collect();
+    destinations.extend(siblings.into_iter()
+        .filter(|bundle| ms.engine.sender_ik(bundle).is_some_and(|ik| !existing.contains(&ik)))
+        .take(spare));
+    Ok(destinations)
 }
 
 /// Flatten recipient bundles while enforcing global identity-key ownership.
@@ -2708,6 +2806,7 @@ struct ChannelSendRequest {
     app: String,
 }
 
+#[derive(Clone)]
 struct LocalChannelSender {
     identity_id: i64,
     secret: IdentitySecret,
@@ -2724,6 +2823,7 @@ struct ChannelRlnSendContext {
 
 #[derive(Clone)]
 struct ChannelSealContext {
+    mail_origin: Option<epix_envelope::MailOrigin>,
     db: Arc<ChannelDb>,
     engine: Arc<dyn Engine>,
     identity_id: i64,
@@ -2871,11 +2971,12 @@ async fn channel_rln_send_context(
     }))
 }
 
-fn seal_channel_chunk_without_rln(
+fn prepare_channel_seal(
     input: &ChannelChunkSeal,
+    prover: Option<&epix_envelope::multislot::RlnProver<'_>>,
 ) -> Result<epix_envelope::PreparedSend, String> {
     let context = &input.context;
-    epix_envelope::prepare_multi_scheduled(
+    epix_envelope::prepare_multi_with_origin(
         context.db.as_ref(),
         context.engine.as_ref(),
         context.identity_id,
@@ -2891,6 +2992,8 @@ fn seal_channel_chunk_without_rln(
         input.scheduled_ms,
         &context.rule,
         input.record_own,
+        context.mail_origin.as_ref(),
+        prover,
     )
     .map_err(|error| error.to_string())
 }
@@ -2927,25 +3030,7 @@ fn seal_channel_chunk_with_rln(
                 reservation: Some(reserved.reservation),
             })
     };
-    epix_envelope::prepare_multi_with_rln_reserved_scheduled(
-        context.db.as_ref(),
-        context.engine.as_ref(),
-        context.identity_id,
-        &context.secret,
-        &context.sender_xid,
-        &context.members,
-        &input.destinations,
-        context.conv,
-        &context.subject,
-        &context.body,
-        &context.app,
-        input.now_ms,
-        input.scheduled_ms,
-        &context.rule,
-        input.record_own,
-        &prover,
-    )
-    .map_err(|error| error.to_string())
+    prepare_channel_seal(input, Some(&prover))
 }
 
 fn seal_channel_chunk_blocking(
@@ -2959,7 +3044,7 @@ fn seal_channel_chunk_blocking(
             .ok_or("missing RLN reservation batch")?;
         seal_channel_chunk_with_rln(&input, rln, batch)
     } else {
-        seal_channel_chunk_without_rln(&input)
+        prepare_channel_seal(&input, None)
     }
 }
 
@@ -3076,6 +3161,8 @@ async fn prepare_outbound_records(
     rln: Option<ChannelRlnSendContext>,
     burst_jitter: u64,
     mut next_attempt_ms: i64,
+    mail_origin: Option<epix_envelope::MailOrigin>,
+    record_own: bool,
 ) -> Result<Vec<PendingOutbound>, String> {
     let _send_guard = ms.send_lock.lock().await;
     let rln_batch = match &rln {
@@ -3083,6 +3170,7 @@ async fn prepare_outbound_records(
         None => None,
     };
     let context = ChannelSealContext {
+        mail_origin,
         db: ms.db.clone(),
         engine: ms.engine.clone(),
         identity_id: sender.identity_id,
@@ -3108,7 +3196,7 @@ async fn prepare_outbound_records(
             prepare_channel_chunk(
                 context.clone(),
                 chunk,
-                chunk_index == 0,
+                record_own && chunk_index == 0,
                 next_attempt_ms,
             )
             .await?,
@@ -3137,12 +3225,18 @@ async fn execute_channel_send(s: &WsSession, p: &Value) -> Result<Value, String>
     let request = parse_channel_send_request(p, client_app_scope(s).await)?;
     let ctx = require_identity(s, &ms, p).await?;
     let sender = validated_local_sender(&s.state, &ms, ctx).await?;
+    if let Some(conv) = request.conv_hint {
+        let app = ms.db.thread_app(sender.identity_id, &hex::encode(conv)).map_err(|e| e.to_string())?;
+        if app.as_ref().is_some_and(|app| app != &request.app) {
+            return Err("channels: conversation belongs to another app".into());
+        }
+    }
     let conv = request.conv_hint.unwrap_or_else(epix_envelope::new_conv_id);
     let members = channel_conversation_members(&request.recipients, &sender.xid);
     // Destinations come from the hub only: that is where every send lands.
     let published =
         load_published_bundles(&s.state, &[ms.xite.clone()], ms.engine.as_ref(), &ms.db).await?;
-    let destinations = resolve_destinations(&ms, &request.recipients, &published).await?;
+    let destinations = resolve_destinations(&ms, &request, &sender, &published).await?;
 
     let _staging_outbox_guard = channel_staging_guard(&ms).await?;
     let _rule_transaction = s.state.pool_rule_transaction(&ms.xite).await;
@@ -3162,6 +3256,11 @@ async fn execute_channel_send(s: &WsSession, p: &Value) -> Result<Value, String>
         rand_u64_below(send_jitter + 1)
     };
     let next_attempt_ms = now_ms() + origin_delay.saturating_mul(1000) as i64;
+    let mail_origin = (extend_send_to_siblings(&request, &sender) && ms.engine.supports_sent_copies())
+        .then(|| epix_envelope::MailOrigin {
+            source_id: epix_crypt::new_seed(),
+            sent_ms: now_ms(),
+        });
     let records = prepare_outbound_records(
         &s.state,
         &ms,
@@ -3174,6 +3273,8 @@ async fn execute_channel_send(s: &WsSession, p: &Value) -> Result<Value, String>
         rln,
         burst_jitter,
         next_attempt_ms,
+        mail_origin,
+        true,
     )
     .await?;
     drop(_rule_transaction);
@@ -3609,6 +3710,71 @@ mod multi_device_tests {
         let out = refine_device_bundles(devs, &[]);
         assert_eq!(out.len(), 1, "duplicate IK collapsed");
         assert_eq!(out[0]["spk_idx"], 5, "freshest prekey wins");
+    }
+
+    #[test]
+    fn sent_copies_require_finalized_active_devices_and_the_pairwise_engine() {
+        use epix_chain::{
+            XidFinalityBinding, XidIdentityAuth, XidIdentitySnapshot, XidIdentityStatus,
+        };
+        use XidIdentityStatus::{Active, Revoked};
+        let db = epix_channel::ChannelDb::memory().unwrap();
+        let engine = epix_pairwise_engine::PairwiseEngine;
+        let auth = |a: &str, status| XidIdentityAuth {
+            auth_address: a.into(),
+            status,
+            revoked_at: 0,
+            revoked_at_time: 0,
+        };
+        let name = "alice.epix";
+        let sender = super::LocalChannelSender {
+            identity_id: 1,
+            xid: name.into(),
+            auth: "laptop".into(),
+            secret: epix_envelope::IdentitySecret::new([5; 32]),
+        };
+        use epix_envelope::Engine;
+        let key = epix_crypt::new_seed();
+        let phone_auth = epix_crypt::privatekey_to_address(&key).unwrap();
+        let mut phone = engine.publish_bundle(&epix_envelope::IdentitySecret::new([6; 32]), name);
+        phone["auth"] = json!(phone_auth);
+        let payload = epix_pairwise_engine::keys::bundle_auth_payload(&phone).unwrap();
+        phone["auth_sig"] = json!(epix_crypt::sign_keccak(&payload, &key).unwrap());
+        assert!(engine.verify_bundle(&phone));
+        let devices = vec![phone.clone(), json!({"v": 3, "auth": phone_auth})];
+        let mut request = super::ChannelSendRequest {
+            recipients: vec!["bob.epix".into()], subject: String::new(), body: String::new(),
+            app: epix_envelope::DEFAULT_APP.into(), conv_hint: None,
+        };
+        assert!(super::extend_send_to_siblings(&request, &sender));
+        request.recipients.push(name.into());
+        assert!(!super::extend_send_to_siblings(&request, &sender));
+        let mut snapshot = XidIdentitySnapshot {
+            canonical_name: name.into(),
+            identities: vec![auth("laptop", Active), auth(&phone_auth, Active)],
+            finality: None,
+        };
+        let siblings = |engine: &dyn epix_envelope::Engine, snapshot: &XidIdentitySnapshot| {
+            let mut bundles = super::PublishedBundles::default();
+            bundles.active.insert(name.into(), devices.clone());
+            bundles
+                .confirm_mail_devices(&db, engine, name, snapshot, &devices)
+                .unwrap();
+            bundles.verified_siblings(&sender)
+        };
+        assert!(siblings(&engine, &snapshot).is_empty());
+        snapshot.finality = Some(XidFinalityBinding {
+            height: 4,
+            digest: [7; 32],
+        });
+        assert!(siblings(&epix_envelope::FakeEngine, &snapshot).is_empty());
+        assert_eq!(siblings(&engine, &snapshot), vec![phone]);
+        snapshot.identities.push(auth(&phone_auth, Revoked));
+        assert!(siblings(&engine, &snapshot).is_empty());
+        snapshot.identities.pop();
+        db.remember_revoked_device(name, Some("laptop"), "", 12)
+            .unwrap();
+        assert!(siblings(&engine, &snapshot).is_empty());
     }
 
     #[test]

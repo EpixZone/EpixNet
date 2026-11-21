@@ -44,6 +44,10 @@ fn parse_payload(payload: &[u8]) -> Option<([u8; 16], Vec<String>, String, Strin
 }
 
 impl Engine for PairwiseEngine {
+    fn supports_sent_copies(&self) -> bool {
+        true
+    }
+
     fn publish_bundle(&self, id: &IdentitySecret, xid: &str) -> Value {
         keys::build_bundle(&id.seed, xid)
     }

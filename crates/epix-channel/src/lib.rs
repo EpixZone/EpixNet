@@ -14,4 +14,4 @@ pub mod db;
 pub mod enc;
 pub mod legacy;
 
-pub use db::{ChannelDb, IdentityRow, IdentitySetup, RevokedDevice, SessionPeer};
+pub use db::{ChannelDb, IdentityRow, IdentitySetup, RevokedDevice, SentHistoryRow, SessionPeer};

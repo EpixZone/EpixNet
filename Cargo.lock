@@ -3150,6 +3150,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "base64 0.23.1",
+ "ed25519-dalek 3.0.0",
  "epix-chain",
  "epix-channel",
  "epix-content",
@@ -3160,7 +3161,10 @@ dependencies = [
  "epix-pairwise-engine",
  "epix-peer",
  "epix-plugin",
+ "epix-protocol",
  "epix-rln",
+ "epix-runtime",
+ "epix-transport",
  "epix-ui",
  "epix-user",
  "epix-xite",

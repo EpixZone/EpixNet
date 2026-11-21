@@ -166,3 +166,102 @@ async fn three_identities_send_mail_to_each_other() {
 
     println!("=== all 3 messages delivered end-to-end encrypted; pool shards leaked no plaintext ===\n");
 }
+
+#[test]
+fn simultaneous_sibling_sends_and_resealed_history_share_one_conversation() {
+    use epix_envelope::{
+        prepare_multi_with_origin, process_record_with_peer_status, Dest, MailOrigin,
+    };
+    let engine = PairwiseEngine;
+    let rules = epix_content::pool::pool_rules_of(&pool_descriptor());
+    let rule = &rules[0];
+    let laptop = mk(&engine, 11, "alice.epix");
+    let phone = mk(&engine, 12, "alice.epix");
+    let members = [laptop.xid.clone(), "bob.epix".into()];
+    let conv = [7; 16];
+    let now = 1_780_000_000_000;
+    let seal = |from: &Identity, to: &Identity, n: u8, record_own| {
+        let origin = MailOrigin {
+            source_id: hex::encode([n; 32]),
+            sent_ms: now + i64::from(n),
+        };
+        let prepared = prepare_multi_with_origin(
+            &from.db,
+            &engine,
+            from.id,
+            &from.seed,
+            &from.xid,
+            &members,
+            &[Dest {
+                bundle: to.bundle.clone(),
+            }],
+            conv,
+            "Wallet Testing",
+            &format!("Reply {n}"),
+            "mail",
+            now + 1000,
+            now + 1000,
+            rule,
+            record_own,
+            Some(&origin),
+            None,
+        )
+        .unwrap();
+        from.db.commit_outbound(&prepared.commit).unwrap();
+        prepared.commit.record
+    };
+    let receive = |device: &Identity, record: &Value, confirmed_target| {
+        let local_ik = hex::encode(engine.sender_ik(&device.bundle).unwrap());
+        process_record_with_peer_status(
+            &device.db,
+            &engine,
+            &[(device.id, device.seed.clone(), device.xid.clone())],
+            record,
+            now + 2000,
+            |_| vec![laptop.bundle.clone(), phone.bundle.clone()],
+            |_, ik| {
+                if ik != local_ik || confirmed_target {
+                    Some(true)
+                } else {
+                    None
+                }
+            },
+        )
+        .unwrap()
+    };
+
+    // Both devices send before either has received the other's first-contact copy.
+    let one = seal(&laptop, &phone, 1, true);
+    let two = seal(&phone, &laptop, 2, true);
+    assert_eq!(
+        receive(&phone, &one, false),
+        vec![ProcessOutcome::DeferredSentCopy]
+    );
+    for outcomes in [receive(&phone, &one, true), receive(&laptop, &two, true)] {
+        assert!(matches!(
+            outcomes.as_slice(),
+            [ProcessOutcome::Indexed {
+                sent_copy: true,
+                unread: 0,
+                ..
+            }]
+        ));
+    }
+
+    let retry = seal(&laptop, &phone, 1, false);
+    receive(&phone, &retry, true);
+    let three = seal(&laptop, &phone, 3, true);
+    receive(&phone, &three, true);
+    receive(&phone, &three, true);
+    for d in [&laptop, &phone] {
+        let msgs = d.db.messages(d.id, &hex::encode(conv)).unwrap();
+        assert_eq!(msgs.len(), 3);
+        for (index, m) in msgs.iter().enumerate() {
+            assert_eq!(m["body"], format!("Reply {}", index + 1));
+            assert_eq!(m["dir"], "out");
+            assert_eq!(m["read"], 1);
+            assert_eq!(m["sent_ms"], now + index as i64 + 1);
+        }
+        assert_eq!(d.db.unread_count(d.id).unwrap(), 0);
+    }
+}

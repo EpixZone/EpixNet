@@ -18,6 +18,11 @@ use serde_json::Value;
 /// mail, the first channel surface. Every other app names itself in the body.
 pub const DEFAULT_APP: &str = "mail";
 
+/// Sibling copies flow independently in each direction. A recipient can already
+/// have initiated its own copy before the sender's first-contact slot arrives.
+pub const SENT_COPY_IN: &str = "mail-copy-in:";
+pub const SENT_COPY_OUT: &str = "mail-copy-out:";
+
 /// Number of expected-tag lookahead slots kept per session per direction — a
 /// received record consumes its tag and the window is topped back up to K, so
 /// out-of-order / lost pool records within a window of K still match in O(1).
@@ -48,6 +53,8 @@ pub struct SessionMatch {
 /// / `body` are opaque payload strings — the app decides what they mean.
 #[derive(Debug, Clone)]
 pub struct InboundCommit {
+    /// Set only for a positively verified sibling sent-copy slot.
+    pub sent_copy_id: Option<String>,
     pub identity_id: i64,
     /// Existing matched session. `None` means this is a first-contact opener and
     /// `new_session` must be inserted in the same transaction as the message.
@@ -101,6 +108,8 @@ pub struct NewSession<'a> {
 /// leaving a durable record that can be retried.
 #[derive(Debug, Clone)]
 pub struct OutboundSession {
+    /// This sealed slot carries an outgoing copy for a linked sibling.
+    pub sent_copy: bool,
     /// Existing session to advance. `None` means this is a new initiator leg.
     pub session_id: Option<i64>,
     pub identity_id: i64,
@@ -123,6 +132,8 @@ pub struct OutboundSession {
 /// record. It is never put in the anonymous pool.
 #[derive(Debug, Clone)]
 pub struct OutboundMessage {
+    /// Stable across live and historical delivery to the author's devices.
+    pub source_id: Option<String>,
     pub identity_id: i64,
     pub conv_id: String,
     pub peer_xid: Option<String>,

@@ -272,8 +272,17 @@ focus:** confirm using `DH2` for both `SK` (inside a 3-DH KDF) and `fc_key`
   idempotently — marking it processed so it is not re-probed — instead of forking a
   second ratchet and double-indexing the opener.
 
-Sent messages are recorded to the sender's private index directly and **never**
-posted encrypted-to-self.
+The sending device records its own Mail row in its private index. A Mail send
+can also carry a slot for each other verified active device of the sender's
+xID. These slots use the existing pairwise encryption and padding. A versioned
+field inside the encrypted slot carries the private source message ID. The
+ordinary recipient slot and the public pool record format remain compatible.
+
+A receiver accepts a sent copy only from an authenticated, active sibling
+device of its own xID. It indexes the original conversation, body and send time
+as outgoing and read. A repeated copy advances the receive ratchet while
+preserving a single message row. Ordinary recipients continue to index an
+incoming message.
 
 ---
 

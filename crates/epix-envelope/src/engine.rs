@@ -98,6 +98,11 @@ pub struct Opened {
 /// The crypto engine. All methods are pure w.r.t. the passed-in state — the node
 /// owns persistence — so an engine can be swapped without touching the indexer.
 pub trait Engine: Send + Sync {
+    /// Opt in only for engines with authenticated device bundles and private keyslots.
+    fn supports_sent_copies(&self) -> bool {
+        false
+    }
+
     /// Build the publishable key bundle for an identity (goes into the user's
     /// `data/users/<xid>/data.json`). Contains only public key material.
     fn publish_bundle(&self, id: &IdentitySecret, xid: &str) -> Value;
