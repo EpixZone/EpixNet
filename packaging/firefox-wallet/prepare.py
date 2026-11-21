@@ -190,6 +190,12 @@ def prepare(args, root=ROOT):
     if identity.get("gecko", {}).get("id") != WALLET_ID:
         raise ValueError("Signing input is not the Epix Wallet extension")
     runtime_version = manifest["version"]
+    if not re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", runtime_version):
+        raise ValueError("Cannot compare the installed wallet version for a safe in-place update")
+    installed = tuple(int(part) for part in runtime_version.split("."))
+    submitted = tuple(int(part) for part in version.split("."))
+    if submitted + (0,) * (4 - len(submitted)) <= installed + (0,) * (4 - len(installed)):
+        raise ValueError("Submitted version must be newer than the installed wallet version")
     manifest["version"] = version
     entries["manifest.json"] = (json.dumps(manifest, indent=2) + "\n").encode()
     extension = args.output / "extension"

@@ -48,7 +48,7 @@ and [source submission requirements](https://extensionworkshop.com/documentation
 ## Manual workflow
 
 Run **Prepare Firefox wallet signing** from Actions with a unique numeric
-version newer than the last submitted version. Its default prepares inputs
+version newer than both the last submitted version and the installed wallet. Its default prepares inputs
 without contacting Mozilla and runs strict lint. A lint failure marks the run
 failed but retains the inputs and report for review. Select **Submit to Mozilla**
 only when lint passes and the publisher credentials, account and source review
@@ -68,12 +68,14 @@ python3 packaging/firefox-wallet/prepare.py \
   --browser /absolute/path/to/EpixNet/target/debug/epix-browser \
   --wallet-source /absolute/path/to/pinned-epix-wallet \
   --wallet-archive /absolute/path/to/epix-wallet-firefox.zip \
-  --version 0.13.40.1 \
+  --version 0.13.41.1 \
   --output /absolute/path/to/new-wallet-submission
 ```
 
 Choose the release version for the actual publisher account; the example is not
-a reserved version. A stale launcher, dirty tracked source, mismatched wallet
+a reserved version. The current install has a content-stamped fourth version
+component, so use a higher earlier component to ensure the signed release can
+upgrade it. Preparation rejects equal or lower versions. A stale launcher, dirty tracked source, mismatched wallet
 revision, modified release archive, or locally overridden wallet build is
 rejected. The export receipt binds the embedded wallet files to the pinned
 archive. The output includes the original export, prepared extension,

@@ -101,6 +101,11 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(json.loads((self.args.output / "lint.json").read_text()), report)
         self.assertFalse((self.root / "returned").exists())
 
+    def test_submission_version_must_upgrade_the_installed_wallet(self):
+        self.args.version = "1.0.0"
+        with self.assertRaisesRegex(ValueError, "newer than the installed"):
+            prepare.prepare(self.args, self.repo)
+
     def test_dirty_source_and_changed_pinned_archive_stop_preparation(self):
         (self.wallet / "source.js").write_text("changed")
         with self.assertRaisesRegex(ValueError, "uncommitted"):

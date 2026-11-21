@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Unique AMO version, newer than the last submitted version
+        description: Unique AMO version, newer than installed and last submitted versions
         required: true
         type: string
       submit_to_mozilla:
