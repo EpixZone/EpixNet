@@ -172,7 +172,14 @@ internal open class Activity {
     open fun onDestroy() { baseDestroyCalls++ }
 }
 
+internal class FixbuttonScrollDouble {
+    var closed = false
+    fun close() { closed = true }
+    fun unbindSession(session: GeckoSession) {}
+}
+
 internal class Shell(private val manager: ConnectivityManager?) : Activity() {
+    private val fixbuttonScroll = FixbuttonScrollDouble()
     private fun leaveFullScreen(session: GeckoSession) {}
     val node = Node()
     private var disposed = false
@@ -304,6 +311,7 @@ internal class Shell(private val manager: ConnectivityManager?) : Activity() {
     fun lateRegistration(): PendingOperations.Operation = pendingOperations.register { replyCancellations++ }
     fun assertClean(verify: (Boolean, String) -> Unit) {
         verify(disposed && connectivityRegistration == null && browserAttachment == null && addonAttachment == null, "destroy drops registrations and attachment")
+        verify(fixbuttonScroll.closed, "destroy releases the native fixbutton bridge")
         verify(addonDialogContent == null && addonDialog == null && addonPopups.isEmpty(), "extension UI references are cleared")
         verify(activityJob.isCompleted && activityJob.children.none(), "real Activity job is completed without children")
         verify(ownedSessions.isEmpty() && popupViews.isEmpty() && tabs.isEmpty(), "all Activity session collections are empty")

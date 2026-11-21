@@ -1,0 +1,8 @@
+/* The wrapper owns loading and interaction states. Keep its handle available
+   while an open panel, drag, or keyboard focus needs it. Preserve its layout. */
+html[data-epix-native-chrome-hidden="true"] body:not(.body-sidebar):not(.body-console)
+#wrapper-controls .fixbutton:not(.dragging):not(:focus-within):not(:active) {
+    opacity: 0;
+    visibility: hidden;
+    pointer-events: none;
+}

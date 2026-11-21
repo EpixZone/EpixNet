@@ -1,0 +1,14 @@
+{
+  "manifest_version": 2,
+  "name": "Epix browser controls",
+  "version": "1.0",
+  "browser_specific_settings": { "gecko": { "id": "browser-ext@epix.zone" } },
+  "permissions": ["geckoViewAddons", "nativeMessaging", "nativeMessagingFromContent"],
+  "content_scripts": [{
+    "matches": ["http://127.0.0.1/*"],
+    "all_frames": false,
+    "run_at": "document_idle",
+    "js": ["scroll.js"],
+    "css": ["scroll.css"]
+  }]
+}
