@@ -218,6 +218,16 @@ impl UiServer {
                 "/favicon.ico",
                 get(|| async { Redirect::permanent("/uimedia/img/favicon.ico") }),
             )
+            // Cached wrapper metadata and browser probes may still request
+            // touch icons at the origin root instead of the declared URL.
+            .route(
+                "/apple-touch-icon.png",
+                get(|| async { Redirect::permanent("/uimedia/img/apple-touch-icon.png") }),
+            )
+            .route(
+                "/apple-touch-icon-precomposed.png",
+                get(|| async { Redirect::permanent("/uimedia/img/apple-touch-icon.png") }),
+            )
             // EpixNet's /raw/<xite>/<path>: the file without the wrapper,
             // under the restrictive noscript CSP.
             .route("/raw/{address}/{*path}", get(serve_raw))
@@ -917,6 +927,8 @@ fn is_global_path(path: &str) -> bool {
         || path == "/Login"
         || path == "/Logout"
         || path == "/favicon.ico"
+        || path == "/apple-touch-icon.png"
+        || path == "/apple-touch-icon-precomposed.png"
 }
 
 /// True if `host` (no port) is a transparent-proxy xite host - a `.epix` name
