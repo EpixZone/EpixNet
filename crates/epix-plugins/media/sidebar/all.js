@@ -278,7 +278,7 @@
     Console.prototype.open = function() {
       this.sidebar.startDrag();
       this.sidebar.moved("y");
-      this.sidebar.fixbutton_targety = this.sidebar.page_height - this.sidebar.fixbutton_inity - 50;
+      this.sidebar.fixbutton_targety = this.sidebar.page_height - this.sidebar.fixbutton_inity - this.sidebar.fixbutton_bottom;
       return this.sidebar.stopDrag();
     };
 
@@ -703,12 +703,15 @@ window.initScrollable = function (chrome) {
       this.page_width = this.wrapper.chrome.width;
       this.page_height = this.wrapper.chrome.height;
       this.width = this.page_width <= 640 ? this.page_width : 420;
-      this.fixbutton_initx = this.page_width - 75;
+      var buttonScale = this.wrapper.chrome.fixbuttonScale || 1;
+      this.fixbutton_initx = this.page_width - 75 * buttonScale;
+      this.fixbutton_inity = 15 * buttonScale;
+      this.fixbutton_bottom = 50 * buttonScale;
       // A resize can change both the responsive drawer width and the current
       // console height. Keep the panel translation and handle in the same space.
       if (this.fixbutton.hasClass("dragging")) this.stopDrag();
       this.fixbutton_targetx = this.opened ? this.fixbutton_initx - this.width : this.fixbutton_initx;
-      this.fixbutton_targety = this.console.opened ? this.page_height - this.fixbutton_inity - 50 : this.fixbutton_inity;
+      this.fixbutton_targety = this.console.opened ? this.page_height - this.fixbutton_inity - this.fixbutton_bottom : this.fixbutton_inity;
       this.fixbutton.stop().css({left: this.fixbutton_targetx, top: this.fixbutton_targety});
       if (this.tag) this.tag.css("transform", "translateX(-" + (this.opened ? this.width : 0) + "px)");
       if (this.console.tag) this.console.tag.css("transform", "translateY(" + (this.console.opened ? this.fixbutton_targety - this.fixbutton_inity : 0) + "px)");
@@ -1057,7 +1060,7 @@ window.initScrollable = function (chrome) {
         this.fixbutton_targetx = this.fixbutton_initx;
       }
       if ((!this.console.opened && 0 - targety > this.page_height / 10) || (this.console.opened && 0 - targety > this.page_height * 0.8)) {
-        return this.fixbutton_targety = this.page_height - this.fixbutton_inity - 50;
+        return this.fixbutton_targety = this.page_height - this.fixbutton_inity - this.fixbutton_bottom;
       } else {
         return this.fixbutton_targety = this.fixbutton_inity;
       }

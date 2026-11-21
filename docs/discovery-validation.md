@@ -139,7 +139,8 @@ EPIX_BROWSER_TEST_TOOLS=/tmp/epix-browser-tools/node_modules \
 It exercises the production drawer and button at author scales 0.5, 1, and 2,
 rotation, mouse and touch drags, delayed viewport metadata, and user zoom.
 Author viewport strings must remain unchanged, and user zoom must still enlarge
-the controls. Browser zoom emulation establishes geometry and input behavior;
+panel text. The fixbutton keeps its screen size and edge spacing, including at
+maximum pinch in portrait and landscape. Browser zoom emulation establishes geometry and input behavior;
 it does not replace physical-device pinch or Android keyboard testing.
 
 ### Compiled macOS browser
