@@ -19,6 +19,8 @@ use serde_json::Value;
 /// The outcome of trial-processing one pool record.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProcessOutcome {
+    /// A same-name sent-copy slot awaits its published bundles or positive finality.
+    DeferredSentCopy,
     /// The record's signature was already indexed (idempotent replay / rescan).
     AlreadyProcessed,
     /// Malformed, or not addressed to any local identity.
@@ -35,6 +37,8 @@ pub enum ProcessOutcome {
         app: String,
         unread: i64,
         first_contact: bool,
+        /// A previously authored message indexed on another linked device.
+        sent_copy: bool,
         /// Outstanding skipped messages after this open (a delivery-gap hint).
         pending: u32,
     },
@@ -193,12 +197,13 @@ where
         &h,
         epoch,
         now_ms,
+        identities,
         &peer_active,
         &mut outcomes,
         &mut delivered,
     )?;
     scan_first_contact(
-        store, engine, identities, &unpacked, &h, epoch, now_ms, &resolve_bundle, &mut outcomes,
+        store, engine, identities, &unpacked, &h, epoch, now_ms, &resolve_bundle, &peer_active, &mut outcomes,
         &mut delivered,
     )?;
 
@@ -219,6 +224,7 @@ fn scan_established<E: Engine + ?Sized, S: EnvelopeStore, A>(
     h: &[u8],
     epoch: i64,
     now_ms: i64,
+    identities: &[(i64, IdentitySecret, String)],
     peer_active: &A,
     outcomes: &mut Vec<ProcessOutcome>,
     delivered: &mut std::collections::HashSet<i64>,
@@ -232,11 +238,8 @@ where
         if delivered.contains(&sm.identity_id) || store.is_processed(h, sm.identity_id)? {
             continue;
         }
-        if sm
-            .peer_xid
-            .as_deref()
-            .is_some_and(|xid| peer_active(xid, &sm.peer_ik) == Some(false))
-        {
+        let status = sm.peer_xid.as_deref().and_then(|xid| peer_active(xid, &sm.peer_ik));
+        if status == Some(false) {
             // This hidden expected tag proves the record targets the revoked
             // session. Drop it permanently without consuming or advancing the
             // ratchet. Indeterminate status never reaches this branch.
@@ -244,11 +247,22 @@ where
             delivered.insert(sm.identity_id);
             continue;
         }
+        let sibling_status = || {
+            let Some((_, secret, xid)) = identities.iter().find(|(id, _, _)| *id == sm.identity_id) else {
+                return Some(false);
+            };
+            if sm.peer_xid.as_ref() != Some(xid) {
+                return Some(false);
+            }
+            linked_device_status(engine, secret, xid, status, peer_active)
+        };
         if let Some(out) = open_established(
             store, engine, &sm, tag, &tag_vec, &unpacked.keyslots[j], &unpacked.body_ct, h, epoch,
-            now_ms,
+            now_ms, sibling_status,
         )? {
-            delivered.insert(sm.identity_id);
+            if out != ProcessOutcome::DeferredSentCopy {
+                delivered.insert(sm.identity_id);
+            }
             outcomes.push(out);
         }
     }
@@ -260,7 +274,7 @@ where
 /// skipped cheaply; the anti-spoof defers by returning `None`, which lets the scan
 /// continue to other slots rather than aborting the record.
 #[allow(clippy::too_many_arguments)]
-fn scan_first_contact<E, S, R>(
+fn scan_first_contact<E, S, R, A>(
     store: &S,
     engine: &E,
     identities: &[(i64, IdentitySecret, String)],
@@ -269,6 +283,7 @@ fn scan_first_contact<E, S, R>(
     epoch: i64,
     now_ms: i64,
     resolve_bundle: &R,
+    peer_active: &A,
     outcomes: &mut Vec<ProcessOutcome>,
     delivered: &mut std::collections::HashSet<i64>,
 ) -> Result<()>
@@ -276,16 +291,21 @@ where
     E: Engine + ?Sized,
     S: EnvelopeStore,
     R: Fn(&str) -> Vec<Value>,
+    A: Fn(&str, &str) -> Option<bool>,
 {
-    for (identity_id, secret, _my_xid) in identities {
+    for (identity_id, secret, my_xid) in identities {
         if delivered.contains(identity_id) || store.is_processed(h, *identity_id)? {
             continue;
         }
         for (j, tag) in unpacked.tags.iter().enumerate() {
             if let Some(out) = open_first_contact(
                 store, engine, *identity_id, secret, tag, &unpacked.keyslots[j], &unpacked.body_ct,
-                h, epoch, now_ms, resolve_bundle,
+                h, epoch, now_ms, resolve_bundle, my_xid, peer_active,
             )? {
+                if out == ProcessOutcome::DeferredSentCopy {
+                    outcomes.push(out);
+                    continue;
+                }
                 delivered.insert(*identity_id);
                 outcomes.push(out);
                 break; // one slot per identity
@@ -333,15 +353,26 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
     h: &[u8],
     epoch: i64,
     now_ms: i64,
+    sibling_status: impl FnOnce() -> Option<bool>,
 ) -> Result<Option<ProcessOutcome>> {
     // The keyslot opens to `K_msg ‖ H(body)`; the message itself is the ONE shared
     // body decrypted under K_msg (bound by the hash, so no substituted body).
     let Ok(op) = engine.open(&sm.ratchet, sm.n, tag, keyslot) else { return Ok(None) };
-    let Some((k_msg, body_hash)) = crate::multislot::parse_keyslot_plain(&op.body) else {
+    let Some((bp, sent_copy_id)) = crate::multislot::open_keyslot_body(&op.body, body_ct) else {
         return Ok(None);
     };
-    let Some(bp) = crate::multislot::open_shared_body(&k_msg, &body_hash, body_ct) else {
-        return Ok(None);
+    if sent_copy_id.is_some() {
+        match (bp.app.as_str(), sibling_status()) {
+            (crate::store::DEFAULT_APP, Some(true)) => {}
+            (crate::store::DEFAULT_APP, None) => return Ok(Some(ProcessOutcome::DeferredSentCopy)),
+            _ => return Ok(None),
+        }
+    }
+    let sent_copy = sent_copy_id.is_some();
+    let conv_id = match (sent_copy, sm.conv_id.strip_prefix(crate::store::SENT_COPY_IN)) {
+        (true, Some(original)) => original,
+        (false, None) if !sm.conv_id.starts_with(crate::store::SENT_COPY_OUT) => &sm.conv_id,
+        _ => return Ok(None),
     };
     // Established sender is the cryptographically-verified session peer. A matched
     // tag + successful ratchet open prove this record came from that peer, so the
@@ -350,10 +381,11 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
     // the sender unattributed rather than trust the body.
     let sender = sm.peer_xid.clone();
     let commit = InboundCommit {
+        sent_copy_id,
         identity_id: sm.identity_id,
         session_id: Some(sm.session_id),
         new_session: None,
-        conv_id: sm.conv_id.clone(),
+        conv_id: conv_id.to_string(),
         peer_xid: sm.peer_xid.clone(),
         sender_xid: sender.clone(),
         members: bp.members.clone(),
@@ -375,13 +407,14 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
     Ok(Some(ProcessOutcome::Indexed {
         msg_id,
         identity_id: sm.identity_id,
-        conv_id: sm.conv_id.clone(),
+        conv_id: conv_id.to_string(),
         sender_xid: sender,
         subject: bp.subject,
         snippet: snippet_of(&bp.body),
         app: bp.app,
         unread,
         first_contact: false,
+        sent_copy,
         pending: op.pending,
     }))
 }
@@ -390,7 +423,7 @@ fn open_established<E: Engine + ?Sized, S: EnvelopeStore>(
 /// `Ok(None)` = not for this identity (try the next); `Ok(Some(_))` = this
 /// identity handled it (indexed, already-processed, or rejected/deferred).
 #[allow(clippy::too_many_arguments)]
-fn open_first_contact<E, S, R>(
+fn open_first_contact<E, S, R, A>(
     store: &S,
     engine: &E,
     identity_id: i64,
@@ -402,11 +435,14 @@ fn open_first_contact<E, S, R>(
     epoch: i64,
     now_ms: i64,
     resolve_bundle: &R,
+    my_xid: &str,
+    peer_active: &A,
 ) -> Result<Option<ProcessOutcome>>
 where
     E: Engine + ?Sized,
     S: EnvelopeStore,
     R: Fn(&str) -> Vec<Value>,
+    A: Fn(&str, &str) -> Option<bool>,
 {
     if !engine.first_contact_candidate(secret, tag, keyslot) {
         return Ok(None);
@@ -414,10 +450,7 @@ where
     let Ok(op) = engine.open_first(secret, tag, keyslot) else { return Ok(None) };
     // The keyslot yields `K_msg ‖ H(body)` + the transcript-bound `ik_a`; the
     // message (incl. the claimed sender) is the shared body decrypted under K_msg.
-    let Some((k_msg, body_hash)) = crate::multislot::parse_keyslot_plain(&op.body) else {
-        return Ok(None);
-    };
-    let Some(bp) = crate::multislot::open_shared_body(&k_msg, &body_hash, body_ct) else {
+    let Some((bp, sent_copy_id)) = crate::multislot::open_keyslot_body(&op.body, body_ct) else {
         return Ok(None);
     };
 
@@ -431,6 +464,18 @@ where
     };
     // Authentic iff the transcript key matches ANY of the sender's published
     // device bundles (a multi-device sender may seal from any linked key).
+    let peer_ik = hex::encode(ik_a);
+    let sent_copy = sent_copy_id.is_some();
+    if sent_copy {
+        if bp.app != crate::store::DEFAULT_APP || bp.sender_xid != my_xid {
+            return Ok(None);
+        }
+        match linked_device_status(engine, secret, my_xid, peer_active(my_xid, &peer_ik), peer_active) {
+            Some(true) => {}
+            Some(false) => return Ok(None),
+            None => return Ok(Some(ProcessOutcome::DeferredSentCopy)),
+        }
+    }
     let bundles = resolve_bundle(&bp.sender_xid);
     let matched_bundle = bundles
         .iter()
@@ -445,7 +490,7 @@ where
         // indexable once that device's bundle syncs, while a forgery is simply
         // re-probed (a bounded, PoW-gated cost) and never trusted. The IK never
         // matches for a forgery, so it can never be indexed.
-        return Ok(None);
+        return Ok(sent_copy.then_some(ProcessOutcome::DeferredSentCopy));
     };
     let peer_auth = matched_bundle.get("auth").and_then(|a| a.as_str());
 
@@ -462,7 +507,15 @@ where
     let conv_hex = hex::encode(op.conv_id);
     // Leg key: the sender DEVICE's transcript-bound identity key, so two devices
     // of one human sender get separate ratchets and never collide on the name.
-    let peer_ik = hex::encode(ik_a);
+    if sent_copy && sender.as_deref() != Some(my_xid) {
+        return Ok(None);
+    }
+
+    let session_conv = if sent_copy {
+        format!("{}{conv_hex}", crate::store::SENT_COPY_IN)
+    } else {
+        conv_hex.clone()
+    };
 
     // Re-wrap dedup: a first-contact-openable record for a conversation leg that
     // ALREADY has a session is a re-opener — a send retry, or a second opener that
@@ -471,19 +524,21 @@ where
     // session here would fork the ratchet and double-index the opener. Drop it
     // idempotently: mark it processed for this identity so it is not re-probed on
     // every rescan, and report no new message.
-    if store.session_id_for_leg(identity_id, &conv_hex, &peer_ik)?.is_some() {
+    if store.session_id_for_leg(identity_id, &session_conv, &peer_ik)?.is_some() {
         store.mark_processed(h, identity_id)?;
         return Ok(Some(ProcessOutcome::AlreadyProcessed));
     }
 
     let recv = to_tag_vecs(&op.next_recv_tags);
     let commit = InboundCommit {
+        sent_copy_id,
         identity_id,
         session_id: None,
         new_session: Some(crate::store::OutboundSession {
+            sent_copy,
             session_id: None,
             identity_id,
-            conv_id: conv_hex.clone(),
+            conv_id: session_conv,
             peer_xid: sender.clone(),
             peer_ik,
             peer_auth: peer_auth.map(String::from),
@@ -522,8 +577,28 @@ where
         app: bp.app,
         unread,
         first_contact: true,
+        sent_copy,
         pending: op.pending,
     }))
+}
+
+fn linked_device_status<E: Engine + ?Sized>(
+    engine: &E,
+    secret: &IdentitySecret,
+    xid: &str,
+    sender_status: Option<bool>,
+    peer_active: &impl Fn(&str, &str) -> Option<bool>,
+) -> Option<bool> {
+    if !engine.supports_sent_copies() || sender_status == Some(false) {
+        return Some(false);
+    }
+    let public = engine.publish_bundle(secret, xid);
+    let local_ik = engine.sender_ik(&public)?;
+    match (sender_status, peer_active(xid, &hex::encode(local_ik))) {
+        (_, Some(false)) => Some(false),
+        (Some(true), Some(true)) => Some(true),
+        _ => None,
+    }
 }
 
 fn snippet_of(body: &str) -> String {

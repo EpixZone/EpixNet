@@ -297,6 +297,20 @@ fn decode_rln_reservation(
     }))
 }
 
+fn conversation_in_other_app(
+    tx: &rusqlite::Transaction<'_>,
+    identity: i64,
+    conv: &str,
+    app: &str,
+) -> Result<bool> {
+    tx.query_row(
+        "SELECT EXISTS(SELECT 1 FROM thread WHERE identity_id=?1 AND conv_id=?2 AND app<>?3)",
+        rusqlite::params![identity, conv, app],
+        |row| row.get(0),
+    )
+    .map_err(db_err)
+}
+
 fn outbound_dependency_keys(commit: &OutboundCommit) -> Result<std::collections::BTreeSet<String>> {
     let mut keys = std::collections::BTreeSet::new();
     let mut scopes = std::collections::BTreeSet::new();
@@ -304,7 +318,13 @@ fn outbound_dependency_keys(commit: &OutboundCommit) -> Result<std::collections:
         scopes.insert((sent.identity_id, sent.conv_id.clone()));
     }
     for session in &commit.sessions {
-        scopes.insert((session.identity_id, session.conv_id.clone()));
+        let conversation = if session.sent_copy {
+            session.conv_id.strip_prefix(epix_envelope::store::SENT_COPY_OUT)
+                .ok_or_else(|| Error::Db("invalid sent-copy session conversation".into()))?
+        } else {
+            &session.conv_id
+        };
+        scopes.insert((session.identity_id, conversation.to_string()));
         keys.insert(serde_json::to_string(&(
             "leg",
             session.identity_id,
@@ -1761,6 +1781,9 @@ impl ChannelDb {
         let Some(sent) = sent else {
             return Ok(0);
         };
+        if conversation_in_other_app(tx, sent.identity_id, &sent.conv_id, &sent.app)? {
+            return Err(Error::Db("conversation belongs to another app".into()));
+        }
         let members_json = if sent.members.is_empty() {
             None
         } else {
@@ -1781,12 +1804,13 @@ impl ChannelDb {
             0,
             1,
             &sent.app,
+            false,
         )?;
         tx.execute(
             "INSERT INTO msg
                 (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
-                 sent_ms, received_ms, epoch, read, sign_h)
-             VALUES (?1, ?2, ?3, 'out', ?4, ?5, ?6, ?7, ?8, ?8, 0, 1, NULL)",
+                 sent_ms, received_ms, epoch, read, sign_h, source_id)
+             VALUES (?1, ?2, ?3, 'out', ?4, ?5, ?6, ?7, ?8, ?8, 0, 1, NULL, ?9)",
             rusqlite::params![
                 sent.identity_id,
                 thread_id,
@@ -1796,6 +1820,7 @@ impl ChannelDb {
                 body_stored,
                 enc,
                 sent.sent_ms,
+                sent.source_id,
             ],
         )
         .map_err(db_err)?;
@@ -2195,7 +2220,12 @@ impl ChannelDb {
             let session = c.new_session.as_ref().ok_or_else(|| {
                 Error::Db("first-contact inbound commit is missing its staged session".into())
             })?;
-            if session.identity_id != c.identity_id || session.conv_id != c.conv_id {
+            let original_conv = if c.sent_copy_id.is_some() {
+                session.conv_id.strip_prefix(epix_envelope::store::SENT_COPY_IN)
+            } else {
+                Some(session.conv_id.as_str())
+            };
+            if session.identity_id != c.identity_id || original_conv != Some(c.conv_id.as_str()) {
                 return Err(Error::Db(
                     "first-contact session does not match its inbound message".into(),
                 ));
@@ -2233,51 +2263,7 @@ impl ChannelDb {
             Self::insert_outbound_session_tx(&tx, session, ratchet_stored, enc)?
         };
 
-        let members_json = if c.members.is_empty() {
-            None
-        } else {
-            serde_json::to_string(&c.members).ok()
-        };
-        let (subject_stored, body_stored, snippet_stored, enc) =
-            self.seal_content(&c.subject, &c.body);
-        let thread_id = upsert_thread_tx(
-            &tx,
-            c.identity_id,
-            &c.conv_id,
-            c.peer_xid.as_deref(),
-            members_json.as_deref(),
-            &subject_stored,
-            &snippet_stored,
-            enc,
-            c.sent_ms,
-            /*incr_unread=*/ 1,
-            /*incr_count=*/ 1,
-            &c.app,
-        )?;
-
-        let msg_id: i64 = {
-            tx.execute(
-                "INSERT INTO msg
-                    (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
-                     sent_ms, received_ms, epoch, read, sign_h)
-                 VALUES (?1, ?2, ?3, 'in', ?4, ?5, ?6, ?7, ?8, ?9, ?10, 0, ?11)",
-                rusqlite::params![
-                    c.identity_id,
-                    thread_id,
-                    c.conv_id,
-                    c.sender_xid,
-                    subject_stored,
-                    body_stored,
-                    enc,
-                    c.sent_ms,
-                    c.received_ms,
-                    c.epoch,
-                    c.sign_h,
-                ],
-            )
-            .map_err(db_err)?;
-            tx.last_insert_rowid()
-        };
+        let msg_id = self.insert_received_message_tx(&tx, c)?;
 
         let (ratchet_stored, renc) = self.enc_blob(&c.ratchet_after);
         tx.execute(
@@ -2306,6 +2292,86 @@ impl ChannelDb {
         .map_err(db_err)?;
 
         tx.commit().map_err(db_err)?;
+        Ok(msg_id)
+    }
+
+    fn insert_received_message_tx(
+        &self,
+        tx: &rusqlite::Transaction<'_>,
+        c: &InboundCommit,
+    ) -> Result<Option<i64>> {
+        let sent_copy = c.sent_copy_id.is_some();
+        if let Some(source_id) = &c.sent_copy_id {
+            if c.app != epix_envelope::DEFAULT_APP
+                || conversation_in_other_app(tx, c.identity_id, &c.conv_id, &c.app)?
+            {
+                return Ok(None);
+            }
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM msg WHERE identity_id=?1 AND dir='out' AND source_id=?2)",
+                rusqlite::params![c.identity_id, source_id],
+                |row| row.get(0),
+            ).map_err(db_err)?;
+            if exists {
+                // A separately sealed retry still owns a ratchet advance. Skip
+                // just the logical row and continue its caller's transaction.
+                return Ok(None);
+            }
+        }
+        let members_json = if c.members.is_empty() {
+            None
+        } else {
+            serde_json::to_string(&c.members).ok()
+        };
+        let (subject_stored, body_stored, snippet_stored, enc) =
+            self.seal_content(&c.subject, &c.body);
+        let thread_id = upsert_thread_tx(
+            tx,
+            c.identity_id,
+            &c.conv_id,
+            if sent_copy {
+                None
+            } else {
+                c.peer_xid.as_deref()
+            },
+            members_json.as_deref(),
+            &subject_stored,
+            &snippet_stored,
+            enc,
+            c.sent_ms,
+            i64::from(!sent_copy),
+            /*incr_count=*/ 1,
+            &c.app,
+            sent_copy,
+        )?;
+
+        let msg_id: i64 = {
+            tx.execute(
+                "INSERT INTO msg
+                    (identity_id, thread_id, conv_id, dir, sender_xid, subject, body, enc,
+                     sent_ms, received_ms, epoch, read, sign_h, source_id)
+                 VALUES (?1, ?2, ?3, ?12, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?13, ?11, ?14)",
+                rusqlite::params![
+                    c.identity_id,
+                    thread_id,
+                    c.conv_id,
+                    c.sender_xid,
+                    subject_stored,
+                    body_stored,
+                    enc,
+                    c.sent_ms,
+                    c.received_ms,
+                    c.epoch,
+                    c.sign_h,
+                    if sent_copy { "out" } else { "in" },
+                    sent_copy,
+                    c.sent_copy_id,
+                ],
+            )
+            .map_err(db_err)?;
+            tx.last_insert_rowid()
+        };
+
         Ok(Some(msg_id))
     }
 
@@ -2330,7 +2396,7 @@ impl ChannelDb {
         let (subject_stored, body_stored, snippet_stored, enc) = self.seal_content(subject, body);
         let thread_id = upsert_thread_tx(
             &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), &subject_stored,
-            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1, epix_envelope::DEFAULT_APP,
+            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1, epix_envelope::DEFAULT_APP, false,
         )?;
         tx.execute(
             "INSERT INTO msg
@@ -2390,7 +2456,7 @@ impl ChannelDb {
         let (subject_stored, body_stored, snippet_stored, enc) = self.seal_content(subject, body);
         let thread_id = upsert_thread_tx(
             &tx, identity_id, conv_id, peer_xid, members_json.as_deref(), &subject_stored,
-            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1, epix_envelope::DEFAULT_APP,
+            &snippet_stored, enc, sent_ms, /*unread=*/ 0, /*count=*/ 1, epix_envelope::DEFAULT_APP, false,
         )?;
         let dir = if is_out { "out" } else { "in" };
         tx.execute(
@@ -2746,6 +2812,7 @@ fn upsert_thread_tx(
     incr_unread: i64,
     incr_count: i64,
     app: &str,
+    keep_newer_members: bool,
 ) -> Result<i64> {
     tx.execute(
         "INSERT INTO thread
@@ -2753,7 +2820,9 @@ fn upsert_thread_tx(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
          ON CONFLICT(identity_id, conv_id) DO UPDATE SET
             peer_xid = COALESCE(thread.peer_xid, excluded.peer_xid),
-            members  = COALESCE(excluded.members, thread.members),
+            members  = CASE WHEN ?12 AND thread.last_ms > excluded.last_ms
+                            THEN COALESCE(thread.members, excluded.members)
+                            ELSE COALESCE(excluded.members, thread.members) END,
             subject  = CASE WHEN excluded.last_ms >= thread.last_ms THEN excluded.subject ELSE thread.subject END,
             snippet  = CASE WHEN excluded.last_ms >= thread.last_ms THEN excluded.snippet ELSE thread.snippet END,
             enc      = CASE WHEN excluded.last_ms >= thread.last_ms THEN excluded.enc ELSE thread.enc END,
@@ -2772,6 +2841,7 @@ fn upsert_thread_tx(
             incr_count,
             incr_unread,
             app,
+            keep_newer_members,
         ],
     )
     .map_err(db_err)?;
@@ -2917,6 +2987,7 @@ mod tests {
             })
             .unwrap();
         let inbound = |sign: u8, app: &str, sent_ms: i64| InboundCommit {
+            sent_copy_id: None,
             identity_id: idn,
             session_id: Some(sid),
             new_session: None,
@@ -2937,6 +3008,36 @@ mod tests {
         };
         // A talk DM lands beside a plain mail thread.
         d.commit_inbound(&inbound(1, "talk", 5)).unwrap();
+        let copy = InboundCommit {
+            sent_copy_id: Some("03".repeat(32)),
+            ..inbound(3, "mail", 9)
+        };
+        assert_eq!(d.commit_inbound(&copy).unwrap(), None);
+        assert!(d.is_processed(&copy.sign_h, idn).unwrap());
+        assert_eq!(d.messages(idn, "dm1").unwrap().len(), 1);
+        let conflicting_send = OutboundCommit {
+            sessions: Vec::new(),
+            record: serde_json::json!({"sign": "wrong-app"}),
+            shard_path: "pool/w0/00.json".into(),
+            created_ms: 10,
+            next_attempt_ms: 10,
+            recovery: recovery(),
+            sent: Some(epix_envelope::OutboundMessage {
+                source_id: Some("04".repeat(32)),
+                app: "mail".into(),
+                identity_id: idn,
+                conv_id: "dm1".into(),
+                peer_xid: None,
+                members: Vec::new(),
+                sender_xid: "mud.epix".into(),
+                subject: "Private subject".into(),
+                body: "Private body".into(),
+                sent_ms: 10,
+            }),
+        };
+        assert!(d.commit_outbound(&conflicting_send).is_err());
+        assert!(d.pending_outbound(10).unwrap().is_empty());
+        assert_eq!(d.messages(idn, "dm1").unwrap().len(), 1);
         d.insert_sent(idn, "m1", Some("dice.epix"), &[], "mud.epix", "Dinner", "pizza ZQ7", 7)
             .unwrap();
 
@@ -3003,6 +3104,7 @@ mod tests {
             .unwrap();
 
         let c = InboundCommit {
+            sent_copy_id: None,
             app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
@@ -3073,6 +3175,7 @@ mod tests {
             })
             .unwrap();
         d.commit_inbound(&InboundCommit {
+            sent_copy_id: None,
             app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
@@ -3162,6 +3265,7 @@ mod tests {
             })
             .unwrap();
         d.commit_inbound(&InboundCommit {
+            sent_copy_id: None,
             app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
@@ -3657,10 +3761,12 @@ mod tests {
             .unwrap();
         let sign_h = vec![42u8; 16];
         let commit = InboundCommit {
+            sent_copy_id: None,
             app: "mail".into(),
             identity_id: idn,
             session_id: None,
             new_session: Some(epix_envelope::OutboundSession {
+                sent_copy: false,
                 session_id: None,
                 identity_id: idn,
                 conv_id: "new-conv".into(),
@@ -3716,6 +3822,7 @@ mod tests {
         d.remember_revoked_device("b.epix", Some("epix1b"), "b-ik", 2)
             .unwrap();
         let inbound = InboundCommit {
+            sent_copy_id: None,
             app: "mail".into(),
             identity_id: idn,
             session_id: Some(sid),
@@ -3741,6 +3848,7 @@ mod tests {
             .unwrap();
         let outbound = OutboundCommit {
             sessions: vec![epix_envelope::OutboundSession {
+                sent_copy: false,
                 session_id: Some(sid),
                 identity_id: idn,
                 conv_id: "cv".into(),
@@ -3774,10 +3882,12 @@ mod tests {
             .upsert_identity("mine.epix", "epix1active", 1, None)
             .unwrap();
         let make_commit = |identity_id: i64, suffix: &str| InboundCommit {
+            sent_copy_id: None,
             app: "mail".into(),
             identity_id,
             session_id: None,
             new_session: Some(epix_envelope::OutboundSession {
+                sent_copy: false,
                 session_id: None,
                 identity_id,
                 conv_id: format!("conv-{suffix}"),
@@ -3827,6 +3937,7 @@ mod tests {
         let d = db();
         let idn = d.upsert_identity("a.epix", "epix1a", 0, None).unwrap();
         let session = |ratchet: &[u8]| epix_envelope::OutboundSession {
+            sent_copy: false,
             session_id: None,
             identity_id: idn,
             conv_id: "same-conv".into(),
@@ -3869,6 +3980,7 @@ mod tests {
         let idn = d.upsert_identity("a.epix", "epix1a", 0, None).unwrap();
         let chunk = |peer_ik: &str, own: bool| OutboundCommit {
             sessions: vec![epix_envelope::OutboundSession {
+                sent_copy: false,
                 session_id: None,
                 identity_id: idn,
                 conv_id: "group".into(),
@@ -3887,6 +3999,7 @@ mod tests {
             next_attempt_ms: 1,
             recovery: recovery(),
             sent: own.then(|| epix_envelope::OutboundMessage {
+                source_id: None,
                 app: "mail".into(),
                 identity_id: idn,
                 conv_id: "group".into(),
@@ -3928,6 +4041,7 @@ mod tests {
             .unwrap();
         let commit = |suffix: &str, before: &[u8]| OutboundCommit {
             sessions: vec![epix_envelope::OutboundSession {
+                sent_copy: false,
                 session_id: Some(sid),
                 identity_id: idn,
                 conv_id: "cv".into(),
@@ -3970,6 +4084,7 @@ mod tests {
             next_attempt_ms,
             recovery: recovery(),
             sent: Some(epix_envelope::OutboundMessage {
+                source_id: None,
                 app: "mail".into(),
                 identity_id,
                 conv_id: conv.into(),
@@ -4017,6 +4132,7 @@ mod tests {
             next_attempt_ms,
             recovery: recovery(),
             sent: Some(epix_envelope::OutboundMessage {
+                source_id: None,
                 app: "mail".into(),
                 identity_id,
                 conv_id: conv.clone(),

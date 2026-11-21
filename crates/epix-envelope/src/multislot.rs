@@ -174,17 +174,61 @@ fn keyslot_plain(k_msg: &[u8; 32], body_ct: &[u8]) -> String {
     b64(&p)
 }
 
-/// Recover `(K_msg, body_hash)` from an opened keyslot's payload.
-pub fn parse_keyslot_plain(opened_body: &str) -> Option<([u8; 32], [u8; 32])> {
-    let raw = b64d(opened_body)?;
-    if raw.len() != KEYSLOT_PAYLOAD {
-        return None;
+/// Stable message ID and authoring timestamp, shared by all copies of a sent Mail row.
+#[derive(Clone, Debug)]
+pub struct MailOrigin {
+    pub source_id: String,
+    pub sent_ms: i64,
+}
+
+const SENT_COPY_V1: u8 = 1;
+
+struct Keyslot {
+    key: [u8; 32],
+    body_hash: [u8; 32],
+    sent_copy_id: Option<String>,
+}
+
+fn sent_keyslot_plain(key: &[u8; 32], body_ct: &[u8], source_id: &str) -> Result<String> {
+    let origin: [u8; 32] = hex::decode(source_id)
+        .ok()
+        .and_then(|bytes| bytes.try_into().ok())
+        .ok_or_else(|| Error::Protocol("invalid Mail source ID".into()))?;
+    if hex::encode(origin) != source_id {
+        return Err(Error::Protocol("noncanonical Mail source ID".into()));
     }
-    let mut k = [0u8; 32];
-    let mut h = [0u8; 32];
-    k.copy_from_slice(&raw[..32]);
-    h.copy_from_slice(&raw[32..64]);
-    Some((k, h))
+    let mut bytes = Vec::with_capacity(KEYSLOT_PAYLOAD + 33);
+    bytes.extend_from_slice(key);
+    bytes.extend_from_slice(blake3::hash(body_ct).as_bytes());
+    bytes.push(SENT_COPY_V1);
+    bytes.extend_from_slice(&origin);
+    Ok(b64(&bytes))
+}
+
+fn decode_keyslot(opened_body: &str) -> Option<Keyslot> {
+    let raw = b64d(opened_body)?;
+    let extra = raw.get(KEYSLOT_PAYLOAD..)?;
+    let sent_copy_id = match extra {
+        [] => None,
+        [SENT_COPY_V1, origin @ ..] if origin.len() == 32 => Some(hex::encode(origin)),
+        _ => return None,
+    };
+    Some(Keyslot {
+        key: raw[..32].try_into().ok()?,
+        body_hash: raw[32..64].try_into().ok()?,
+        sent_copy_id,
+    })
+}
+
+pub fn parse_keyslot_plain(opened_body: &str) -> Option<([u8; 32], [u8; 32])> {
+    let slot = decode_keyslot(opened_body)?;
+    slot.sent_copy_id.is_none().then_some((slot.key, slot.body_hash))
+}
+
+pub(crate) fn open_keyslot_body(slot: &str, body_ct: &[u8]) -> Option<(BodyPlain, Option<String>)> {
+    let keys = decode_keyslot(slot)?;
+    let body = open_shared_body(&keys.key, &keys.body_hash, body_ct)?;
+    Some((body, keys.sent_copy_id))
 }
 
 // --- ct framing -------------------------------------------------------------
@@ -276,6 +320,9 @@ pub struct RlnProofMaterial {
     pub reservation: Option<crate::store::RlnReservation>,
 }
 
+/// Produces proof material for a sealed pool record and its current epoch.
+pub type RlnProver<'a> = dyn Fn(&[u8], i64) -> std::result::Result<RlnProofMaterial, String> + 'a;
+
 /// Seal a message to MANY recipient devices as ONE count-hiding pool record.
 ///
 /// `dests` is the flat list of recipient-device bundles (every device of every
@@ -287,7 +334,7 @@ pub struct RlnProofMaterial {
 ///
 /// Fails if `dests.len() > SLOTS` (the caller chunks larger sends).
 #[allow(clippy::too_many_arguments)]
-fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
+pub fn prepare_multi_with_origin<E: Engine + ?Sized, S: EnvelopeStore>(
     store: &S,
     engine: &E,
     identity_id: i64,
@@ -303,7 +350,8 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     next_attempt_ms: i64,
     rule: &PoolRule,
     record_own: bool,
-    rln_prover: Option<&dyn Fn(&[u8], i64) -> std::result::Result<RlnProofMaterial, String>>,
+    mail_origin: Option<&MailOrigin>,
+    rln_prover: Option<&RlnProver<'_>>,
 ) -> Result<PreparedSend> {
     if dests.is_empty() || dests.len() > SLOTS {
         return Err(Error::Protocol(format!(
@@ -334,9 +382,16 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
 
     // ONE shared body under a fresh single-use key.
     let k_msg = rand32();
-    let body_plain = encode_body_plain(my_xid, members, subject, body, now_ms, app);
+    if mail_origin.is_some() && (app != crate::store::DEFAULT_APP || !engine.supports_sent_copies()) {
+        return Err(Error::Protocol("sent copies require authenticated Mail channels".into()));
+    }
+    let sent_ms = mail_origin.map_or(now_ms, |origin| origin.sent_ms);
+    let body_plain = encode_body_plain(my_xid, members, subject, body, sent_ms, app);
     let body_ct = seal_body(&k_msg, &body_plain);
     let ks_plain = keyslot_plain(&k_msg, &body_ct);
+    let sibling_slot = mail_origin
+        .map(|origin| sent_keyslot_plain(&k_msg, &body_ct, &origin.source_id))
+        .transpose()?;
 
     // One real slot per destination device: a normal pairwise seal of the tiny
     // key payload, padded to the fixed keyslot bucket.
@@ -361,7 +416,13 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
         // otherwise device 2 reuses device 1's session, seals a keyslot device 2
         // can't open, and double-advances this sender's ratchet. Read it through
         // the engine (matches the recv side's `ik_a` and stays engine-agnostic).
-        let existing = store.session_id_for_leg(identity_id, &conv_hex, &peer_ik)?;
+        let sent_copy_slot = sibling_slot.as_ref().filter(|_| peer_xid.as_deref() == Some(my_xid));
+        let session_conv = if sent_copy_slot.is_some() {
+            format!("{}{conv_hex}", crate::store::SENT_COPY_OUT)
+        } else {
+            conv_hex.clone()
+        };
+        let existing = store.session_id_for_leg(identity_id, &session_conv, &peer_ik)?;
         let (session_id, session_blob, recv_tags) = match existing {
             Some(sid) => (Some(sid), store.session_ratchet(sid)?, Vec::new()),
             None => {
@@ -374,8 +435,9 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
         // sender_xid / members / subject / sent_ms all travel in the SHARED body;
         // the keyslot carries only the key material, keeping every keyslot small
         // and identical in size.
+        let keyslot = sent_copy_slot.unwrap_or(&ks_plain);
         let sealed = engine
-            .seal(&session_blob, "", &[], "", &ks_plain, 0, &ks_buckets)
+            .seal(&session_blob, "", &[], "", keyslot, 0, &ks_buckets)
             .map_err(crate::indexer::eng_err)?;
         if sealed.ct.len() != KEYSLOT_LEN {
             return Err(Error::Protocol(format!(
@@ -387,9 +449,10 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
         // session mutation land together below, after all remaining fallible
         // work (padding, RLN proof, PoW, and signing) has succeeded.
         sessions.push(crate::store::OutboundSession {
+            sent_copy: sent_copy_slot.is_some(),
             session_id,
             identity_id,
-            conv_id: conv_hex.clone(),
+            conv_id: session_conv,
             peer_xid,
             peer_ik,
             peer_auth,
@@ -453,6 +516,7 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
 
     let shard_path = pool::shard_path(rule, epoch, &route_tag);
     let sent = record_own.then(|| crate::store::OutboundMessage {
+        source_id: mail_origin.map(|origin| origin.source_id.clone()),
         identity_id,
         conv_id: conv_hex,
         peer_xid: None,
@@ -460,7 +524,7 @@ fn prepare_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
         sender_xid: my_xid.to_string(),
         subject: subject.to_string(),
         body: body.to_string(),
-        sent_ms: now_ms,
+        sent_ms,
         app: app.to_string(),
     });
     let commit = crate::store::OutboundCommit {
@@ -495,9 +559,9 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
     next_attempt_ms: i64,
     rule: &PoolRule,
     record_own: bool,
-    rln_prover: Option<&dyn Fn(&[u8], i64) -> std::result::Result<RlnProofMaterial, String>>,
+    rln_prover: Option<&RlnProver<'_>>,
 ) -> Result<SendResult> {
-    let prepared = prepare_multi_inner(
+    let prepared = prepare_multi_with_origin(
         store,
         engine,
         identity_id,
@@ -513,6 +577,7 @@ fn send_multi_inner<E: Engine + ?Sized, S: EnvelopeStore>(
         next_attempt_ms,
         rule,
         record_own,
+        None,
         rln_prover,
     )?;
     let record = prepared.commit.record.clone();
@@ -623,7 +688,7 @@ pub fn prepare_multi_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
     rule: &PoolRule,
     record_own: bool,
 ) -> Result<PreparedSend> {
-    prepare_multi_inner(
+    prepare_multi_with_origin(
         store,
         engine,
         identity_id,
@@ -639,6 +704,7 @@ pub fn prepare_multi_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
         next_attempt_ms,
         rule,
         record_own,
+        None,
         None,
     )
 }
@@ -756,7 +822,7 @@ pub fn prepare_multi_with_rln_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
             reservation: None,
         })
     };
-    prepare_multi_inner(
+    prepare_multi_with_origin(
         store,
         engine,
         identity_id,
@@ -772,6 +838,7 @@ pub fn prepare_multi_with_rln_scheduled<E: Engine + ?Sized, S: EnvelopeStore>(
         next_attempt_ms,
         rule,
         record_own,
+        None,
         Some(&adapted),
     )
 }
@@ -797,7 +864,7 @@ pub fn prepare_multi_with_rln_reserved_scheduled<E: Engine + ?Sized, S: Envelope
     record_own: bool,
     rln_prover: &dyn Fn(&[u8], i64) -> std::result::Result<RlnProofMaterial, String>,
 ) -> Result<PreparedSend> {
-    prepare_multi_inner(
+    prepare_multi_with_origin(
         store,
         engine,
         identity_id,
@@ -813,6 +880,7 @@ pub fn prepare_multi_with_rln_reserved_scheduled<E: Engine + ?Sized, S: Envelope
         next_attempt_ms,
         rule,
         record_own,
+        None,
         Some(rln_prover),
     )
 }

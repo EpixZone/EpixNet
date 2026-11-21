@@ -38,7 +38,7 @@ pub use indexer::{
     ProcessOutcome, SendResult,
 };
 pub use multislot::{
-    prepare_multi_scheduled, prepare_multi_with_rln_reserved_scheduled,
+    MailOrigin, prepare_multi_with_origin, prepare_multi_scheduled, prepare_multi_with_rln_reserved_scheduled,
     prepare_multi_with_rln_scheduled, send_multi, send_multi_scheduled, send_multi_with_rln,
     send_multi_with_rln_scheduled, Dest, PreparedSend, RlnProofMaterial, SLOTS,
 };
