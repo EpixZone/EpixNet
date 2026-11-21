@@ -136,8 +136,13 @@ pub fn verify_record(
         return Err(RecordError::ClockTooFarFuture);
     }
 
-    // The claimed `author` (for a moderation tombstone, the ORIGINAL author
-    // whose item is being deleted) must be an authorized signer of this dir.
+    // The claimed `author` must be an authorized signer of this dir. A record
+    // signed through the node's `recordSign` always names its SIGNER here
+    // (the node overwrites `author` with the signing key's address), so a
+    // moderation tombstone made that way names the moderator, not the
+    // original author; it still hides the item because versions group by
+    // `post_id`. A tombstone built elsewhere may keep the original author,
+    // and the moderation relaxation below accepts either.
     if !valid_signers.iter().any(|s| s == author) {
         return Err(RecordError::UnauthorizedAuthor);
     }

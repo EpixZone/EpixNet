@@ -1902,9 +1902,6 @@ if (window.getComputedStyle(document.body).transform) {
         // A page may only ask; the grant is the user's decision in this
         // chrome. Route a raw permissionAdd through the same prompt instead of
         // forwarding it (the node refuses it from a page id regardless).
-        if (Array.isArray(message.params)) {
-          message.params = message.params[0];
-        }
         return this.actionPermissionAdd(message);
       } else if (cmd === "evxRequest") {
         return this.actionEvxRequest(message);
@@ -2094,44 +2091,68 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     Wrapper.prototype.actionPermissionAdd = function (message) {
-      var permission;
+      var answer, answer_granted, answered, permission;
       permission = message.params;
+      // EpixFrame's requestPermission sends [permission] and awaits the
+      // answer, and a raw permissionAdd was always answered by the node, so
+      // both are answered even when the permission is already granted. Only
+      // the legacy bare-string wrapperPermissionAdd keeps its silence there
+      // (see below).
+      answer_granted = Array.isArray(permission) || message.cmd === "permissionAdd";
+      if (Array.isArray(permission)) {
+        permission = permission[0];
+      }
+      answered = false;
+      answer = (function (_this) {
+        return function (result) {
+          if (answered) {
+            return false;
+          }
+          answered = true;
+          return _this.sendInner({
+            "cmd": "response",
+            "to": message.id,
+            "result": result
+          });
+        };
+      })(this);
       return $.when(this.event_xite_info).done((function (_this) {
         return function () {
-          var grant;
+          var dismissed, grant;
           if (indexOf.call(_this.xite_info.settings.permissions, permission) >= 0) {
-            // Already granted: nothing was refused, so there is nothing for
-            // the page to re-sync. Deliberately no answer - the dashboard
-            // builds already out there run their grant callback as if the
-            // user had just tapped Grant, before their settings have loaded.
+            if (answer_granted) {
+              return answer("ok");
+            }
+            // Already granted, legacy bare-string form: nothing was refused,
+            // so there is nothing for the page to re-sync. Deliberately no
+            // answer - the dashboard builds already out there run their grant
+            // callback as if the user had just tapped Grant, before their
+            // settings have loaded.
             return false;
           }
           if (window.ui_restrict) {
             // A public gateway grants nothing to anyone (the node refuses
             // every grant that is not the operator's), so a dialog here could
             // only dead-end. Tell the page and show nothing.
-            return _this.sendInner({
-              "cmd": "response",
-              "to": message.id,
-              "result": {"error": "Permissions cannot be granted on a public gateway"}
-            });
+            return answer({"error": "Permissions cannot be granted on a public gateway"});
           }
           grant = function () {
             return _this.ws.cmd("permissionAdd", permission, function (res) {
-              return _this.sendInner({
-                "cmd": "response",
-                "to": message.id,
-                "result": res
-              });
+              return answer(res);
             });
+          };
+          // The user closed the prompt without granting: answer, so a page
+          // awaiting the request does not wait forever.
+          dismissed = function () {
+            return answer({"error": "cancelled"});
           };
           if (permission === "ADMIN" && window.is_homepage) {
             // The node's own control panel asking to manage the node: no
             // "trust the developer" warning for that.
-            return _this.displayConfirm("The dashboard needs permission to manage this EpixNet node.", "Allow", grant);
+            return _this.displayConfirm("The dashboard needs permission to manage this EpixNet node.", "Allow", grant, void 0, dismissed);
           }
           return _this.ws.cmd("permissionDetails", permission, function (permission_details) {
-            return _this.displayConfirm("This xite requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", grant);
+            return _this.displayConfirm("This xite requests permission:" + (" <b>" + (_this.toHtmlSafe(permission)) + "</b>") + ("<br><small style='color: #4F4F4F'>" + permission_details + "</small>"), "Grant", grant, void 0, dismissed);
           });
         };
       })(this));
@@ -2550,8 +2571,10 @@ if (window.getComputedStyle(document.body).transform) {
     };
 
     // `id` is optional: the chrome's own confirms are keyed by their caption.
-    Wrapper.prototype.displayConfirm = function (body, captions, cb, id) {
-      var button, buttons, caption, fn, i, j, len;
+    // `dismissed`, when given, runs if the user closes the dialog with its
+    // close cross instead of choosing a button.
+    Wrapper.prototype.displayConfirm = function (body, captions, cb, id, dismissed) {
+      var button, buttons, caption, elem, fn, i, j, len;
       body = $("<span class='message-outer'><span class='message'>" + body + "</span></span>");
       buttons = $("<span class='buttons'></span>");
       if (!(captions instanceof Array)) {
@@ -2578,7 +2601,12 @@ if (window.getComputedStyle(document.body).transform) {
         buttons.append(button);
       }
       body.append(buttons);
-      this.notifications.add(id != null ? id : "notification-" + caption, "ask", body);
+      elem = this.notifications.add(id != null ? id : "notification-" + caption, "ask", body);
+      if (dismissed) {
+        $(".close", elem).on("click", function () {
+          dismissed();
+        });
+      }
       buttons.first().focus();
       return $(".notification").scrollLeft(0);
     };

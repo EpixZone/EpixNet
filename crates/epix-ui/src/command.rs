@@ -2085,9 +2085,13 @@ impl WsCommand for FileWrite {
         // writes into its merged xites, e.g. starring a repo in the index).
         let (target, inner) = s.resolve_target(inner_path).await?;
         s.state.write_file(&target, &inner, &bytes).await?;
-        // Ingest written data files into the xite's database right away (like
-        // EpixNet's storage.onUpdated), so the page's dbQuery sees the change
-        // before the sign/publish round-trip. The writing connection is
+        // Offer written data files to the xite's database ingest (like
+        // EpixNet's storage.onUpdated). Indexing is gated on accepted input:
+        // on a xite with an accepted (signed) db authority a file is indexed
+        // only as its signed manifests declare it, so an unsigned write to a
+        // hash-declared file reaches dbQuery after siteSign / fileWriteSign,
+        // not before. Only an owned xite with no accepted authority yet
+        // indexes its draft paths straight away. The writing connection is
         // excluded from the file_done echo (EpixNet notifies `ws != self`).
         if inner.ends_with(".json") && !inner.ends_with("content.json") {
             s.state.ingest_file_from(&target, &inner, Some(s.id)).await;
@@ -2766,6 +2770,7 @@ impl WsCommand for EcdsaSign {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let data = arg_str(p, "data", 0).ok_or("ecdsaSign: data required")?;
+        // A bare string is the data alone: it must never double as the key.
         let privatekey = match arg_str(p, "privatekey", 1) {
             Some(pk) => pk.to_string(),
             None => {
@@ -2853,7 +2858,10 @@ impl WsCommand for VrfGetBeacon {
         "vrfGetBeacon"
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
-        let height = arg_u64(p, "height", 0).ok_or("vrfGetBeacon: height required")?;
+        // A bare number (or numeric string) is the height.
+        let height = arg_u64(p, "height", 0)
+            .or_else(|| p.as_u64().or_else(|| p.as_str().and_then(|s| s.trim().parse().ok())))
+            .ok_or("vrfGetBeacon: height required")?;
         let vrf = epix_chain::Vrf::new_multi(s.state.chain_rpc_urls().await);
         match vrf.beacon(height).await {
             Ok(b) => Ok(beacon_json(&b)),
@@ -2937,6 +2945,8 @@ impl WsCommand for XidResolveName {
         let raw = arg_str(p, "name", 0)
             .or_else(|| arg_str(p, "xid_name", 0))
             .ok_or("xidResolveName: name required")?;
+        // A bare "name.tld" string is the name alone; its tld comes from the
+        // suffix, never from the same string.
         let (name, tld) = match arg_str(p, "tld", 1) {
             Some(tld) => (raw, tld),
             None => raw.rsplit_once('.').unwrap_or((raw, "epix")),
@@ -3586,7 +3596,7 @@ impl WsCommand for OptionalLimitStats {
 }
 
 /// `optionalLimitSet(limit)` - set the optional-files cap (`"10%"` or a GB
-/// number).
+/// number). Anything else is refused with an error.
 struct OptionalLimitSet;
 #[async_trait]
 impl WsCommand for OptionalLimitSet {
@@ -3595,7 +3605,7 @@ impl WsCommand for OptionalLimitSet {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let limit = arg_str(p, "limit", 0).ok_or("optionalLimitSet: limit required")?;
-        s.state.set_optional_limit(limit).await;
+        s.state.set_optional_limit(limit).await?;
         Ok(Value::from("ok"))
     }
 }
@@ -4342,12 +4352,15 @@ impl WsCommand for SiteblockIgnoreAddXite {
 
 // ---- ContentFilter: mute + siteblock lists ---------------------------------
 
-/// Read a positional-or-named string arg from the command params.
+/// Read a positional-or-named string arg from the command params. A bare
+/// string parameter (`cmd("x", "value")`) stands only for the FIRST
+/// positional argument (`idx == 0`), so it can never also fill a later
+/// parameter such as an optional target address, key, seed or title.
 fn arg_str<'a>(p: &'a Value, key: &str, idx: usize) -> Option<&'a str> {
     p.get(key)
         .or_else(|| p.as_array().and_then(|a| a.get(idx)))
         .and_then(|v| v.as_str())
-        .or_else(|| p.as_str())
+        .or_else(|| if idx == 0 { p.as_str() } else { None })
 }
 
 /// The legacy `certList` row shape over the identity model: every linked
@@ -4394,9 +4407,12 @@ impl WsCommand for IdentitySelect {
     }
     async fn handle(&self, s: &WsSession, p: &Value) -> Result<Value, String> {
         let address = s.address()?.to_string();
+        // A bare string is the auth_address, not "no choice": treating it as
+        // absent would silently reset the xite to the default identity.
         let raw = p
             .get("auth_address")
-            .or_else(|| p.as_array().and_then(|a| a.first()));
+            .or_else(|| p.as_array().and_then(|a| a.first()))
+            .or_else(|| p.is_string().then_some(p));
         let choice = match raw {
             None | Some(Value::Null) => None,
             Some(v) => Some(
@@ -4456,6 +4472,7 @@ impl WsCommand for IdentityLinkComplete {
         let address = s.address()?.to_string();
         let auth_address = arg_str(p, "auth_address", 0)
             .ok_or("identityLinkComplete: auth_address required")?;
+        // A bare string is the auth_address alone, never also the name.
         let name = arg_str(p, "name", 1).filter(|n| !n.is_empty());
         s.state.identity_link_complete(auth_address, name, Some(&address)).await
     }
@@ -6564,3 +6581,7 @@ mod tests {
 #[cfg(test)]
 #[path = "command/tests/sidebar_maintenance.rs"]
 mod sidebar_maintenance_tests;
+
+#[cfg(test)]
+#[path = "command/tests/bare_params.rs"]
+mod bare_params_tests;

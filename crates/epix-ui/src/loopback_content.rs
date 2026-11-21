@@ -6,7 +6,7 @@
 use super::{Ctx, FileQuery};
 use axum::http::request::Parts;
 use axum::{
-    extract::{FromRequest, Path, Query, RawQuery, Request, State},
+    extract::{Path, Query, RawQuery, Request, State},
     http::{header, HeaderMap, Method, StatusCode, Uri},
     middleware::Next,
     response::{IntoResponse, Redirect, Response},
@@ -424,12 +424,9 @@ async fn upload(ctx: &Ctx, request: Request, xite: &str) -> Response {
         return denied();
     }
     let headers = request.headers().clone();
-    // Use the existing endpoint's Bytes extractor and body-size limit. The
+    // The endpoint bounds the body by the size declared for this nonce. The
     // handler checks the xite again while atomically consuming the nonce.
-    let body = match axum::body::Bytes::from_request(request, ctx).await {
-        Ok(body) => body,
-        Err(error) => return error.into_response(),
-    };
+    let body = request.into_body();
     let mut response = super::bigfile_upload(State(ctx.clone()), query, headers, body).await;
     sandbox_resource(&mut response);
     response

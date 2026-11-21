@@ -10,6 +10,7 @@ pub mod populate;
 pub mod schema;
 
 pub use content_db::ContentDb;
+pub use populate::path_is_excluded;
 pub use derived::{DeltaMetrics, DerivedIndex, SourceEntry, SourceVersion};
 pub use schema::{DbSchema, MapSettings, TableSchema, ToTable};
 
@@ -176,8 +177,9 @@ impl Database {
         populate::populate(&conn, schema, db_dir.as_ref())
     }
 
-    /// Populate, skipping data files whose path contains one of `exclude`
-    /// (ContentFilter mute enforcement - muted authors' files are left out).
+    /// Populate, skipping data files under a directory named by `exclude`
+    /// (ContentFilter mute enforcement - muted authors' files are left out;
+    /// see [`path_is_excluded`]).
     pub fn populate_filtered(
         &self,
         schema: &DbSchema,
@@ -703,6 +705,61 @@ mod tests {
         db.populate(&schema, dir.path()).unwrap();
         let again = db.query("SELECT COUNT(*) AS n FROM post", &[]).unwrap();
         assert_eq!(again[0]["n"], 2);
+    }
+
+    #[test]
+    fn exclusion_matches_whole_user_directories_only() {
+        let muted = vec!["bob.epix".to_string()];
+        assert!(path_is_excluded("data/users/bob.epix/data.json", &muted));
+        assert!(path_is_excluded("data/users/bob.epix/sub/data.json", &muted));
+        assert!(path_is_excluded("epix1hub/data/users/bob.epix/data.json", &muted));
+        assert!(!path_is_excluded("data/users/bigbob.epix/data.json", &muted));
+        assert!(!path_is_excluded("data/users/bob.epixx/data.json", &muted));
+        assert!(!path_is_excluded("data/users/bob.epix.json", &muted));
+        assert!(!path_is_excluded("bob.epix", &muted));
+        // A multi-segment entry matches consecutive whole segments.
+        let fragment = vec!["data/blocked/".to_string()];
+        assert!(path_is_excluded("data/blocked/data.json", &fragment));
+        assert!(!path_is_excluded("data/unblocked/data.json", &fragment));
+        // A muted hub address matches its merged prefix.
+        assert!(path_is_excluded("epix1hub/data/u/data.json", &["epix1hub".to_string()]));
+        // An empty entry mutes nothing.
+        assert!(!path_is_excluded("data/users/bob.epix/data.json", &[String::new()]));
+    }
+
+    #[test]
+    fn muting_one_author_leaves_a_longer_lookalike_name_indexed() {
+        let schema = DbSchema::from_json(
+            r#"{
+              "db_name": "Users", "db_file": "db/db.db", "version": 2,
+              "maps": {
+                "data/users/.*/data.json": {
+                  "to_table": [{"node": "posts", "table": "post"}]
+                }
+              },
+              "tables": {
+                "post": { "cols": [["post_id","INTEGER"],["title","TEXT"],["json_id","INTEGER"]] }
+              }
+            }"#,
+        )
+        .unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        for author in ["bob.epix", "bigbob.epix"] {
+            std::fs::create_dir_all(dir.path().join(format!("data/users/{author}"))).unwrap();
+            std::fs::write(
+                dir.path().join(format!("data/users/{author}/data.json")),
+                format!(r#"{{"posts":[{{"post_id":1,"title":"{author}"}}]}}"#),
+            )
+            .unwrap();
+        }
+        let db = Database::open_in_memory().unwrap();
+        db.apply_schema(&schema).unwrap();
+        let ingested = db
+            .populate_filtered(&schema, dir.path(), &["bob.epix".to_string()])
+            .unwrap();
+        assert_eq!(ingested, 1);
+        let rows = db.query("SELECT title FROM post", &[]).unwrap();
+        assert_eq!(rows, vec![serde_json::json!({"title": "bigbob.epix"})]);
     }
 
     #[test]

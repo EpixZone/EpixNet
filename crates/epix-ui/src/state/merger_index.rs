@@ -842,10 +842,7 @@ fn reconcile_hub(
     let mut retained = BTreeSet::new();
     let mut metrics = Vec::new();
     for (path, value) in values {
-        if muted
-            .iter()
-            .any(|entry| format!("{hub}/{path}").contains(entry))
-        {
+        if epix_db::path_is_excluded(&format!("{hub}/{path}"), muted) {
             continue;
         }
         retained.insert(path.clone());
@@ -973,10 +970,7 @@ impl AppState {
             return false;
         }
         let muted = self.muted_authors().await;
-        if muted
-            .iter()
-            .any(|entry| format!("{}/{}", delta.canonical, delta.path).contains(entry))
-        {
+        if epix_db::path_is_excluded(&format!("{}/{}", delta.canonical, delta.path), &muted) {
             // Reconciliation retires the input and advances the receipt without
             // ever inserting a muted hub through the single-file path.
             return false;

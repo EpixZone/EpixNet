@@ -1829,7 +1829,6 @@ pub mod xid_signers {
 /// briefly (transient failures don't cache at all), positives cache long -
 /// this is what stops xites from hammering the chain once per render.
 pub mod xid_identity {
-    use super::DEFAULT_RPC_URL;
     use std::collections::{HashMap, HashSet};
     use std::sync::RwLock;
     use std::time::{Duration, Instant};
@@ -2129,11 +2128,14 @@ pub mod xid_identity {
         if super::chain_egress_ok().is_err() {
             return None;
         }
-        // Step 1: unverified reverse lookup - names the candidate domain.
-        let (_, client) = super::http_client(Duration::from_secs(15)).ok()?;
-        let url = format!("{DEFAULT_RPC_URL}/xid/v1/reverse_identity/{address}");
+        // Step 1: unverified reverse lookup - names the candidate domain. It
+        // goes through the shared resolver so it uses the same configured
+        // endpoints (and failover) as the forward resolve in step 2.
         // Transient fetch errors return without caching so the next call retries.
-        let data: serde_json::Value = client.get(&url).send().await.ok()?.json().await.ok()?;
+        let data = super::shared_resolver()
+            .reverse_identity_record(address)
+            .await
+            .ok()?;
         let record = match data.get("name_record").filter(|r| !r.is_null()) {
             Some(r) => r,
             None => {
