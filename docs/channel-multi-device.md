@@ -47,8 +47,10 @@ receiver discard duplicate copies after a retry. Only locally authored rows
 are eligible for this transfer.
 
 Both devices need a node version supporting sent copies. Historical recovery
-requires an original sending device that still has the message in its private
-index. No manual export is needed.
+requires the original sending device to come online with the message still in
+its private channel index. This includes outgoing channel messages saved before
+the upgrade. For messages from the earlier `messages.json` mail format, the
+existing `channelMigrateLegacy` command can import retained files locally.
 
 ## Bundle storage (cutover-safe)
 
