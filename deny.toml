@@ -23,6 +23,15 @@ ignore = [
     # through the affected operations, so the side channel has nothing to
     # leak. Drop this when emissary moves to p256 0.14.
     "RUSTSEC-2026-0387",
+    # RUSTSEC-2026-0543: chrono unmaintained (no vulnerability). Only
+    # epix-mirror uses it, to read and compare RFC 3339 / RFC 2822 timestamps.
+    # Revisit by moving epix-mirror to the `time` crate.
+    "RUSTSEC-2026-0543",
+    # RUSTSEC-2026-0542: humantime unmaintained (no vulnerability), declared
+    # unmaintained together with chrono. Pulled by arti-client and the tor-*
+    # crates (humantime-serde config parsing) and by env_logger in the vendored
+    # Reticulum stack. Drop when those move off it.
+    "RUSTSEC-2026-0542",
 
     # --- arkworks zk stack (RLN anti-spam, epix-rln -> vendored rln) --------
     # RUSTSEC-2024-0388: derivative unmaintained (build-time proc-macro used by
