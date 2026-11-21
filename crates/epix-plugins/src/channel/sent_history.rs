@@ -18,6 +18,9 @@ const PAGE_SIZE: usize = 4;
 const MAX_QUEUED: i64 = 16;
 
 pub(super) async fn run(state: Arc<AppState>, ms: Arc<ChannelState>) {
+    if !ms.engine.supports_sent_copies() {
+        return;
+    }
     loop {
         reconcile_sent_history(&state, &ms).await;
         tokio::time::sleep(INTERVAL).await;
@@ -73,7 +76,14 @@ async fn sync_identity(
         .remember_revoked_devices(&revoked, now_ms())
         .map_err(|e| e.to_string())?;
     for sibling in published.verified_siblings(&sender) {
-        sync_sibling(state, ms, &sender, &sibling).await?;
+        if let Err(error) = sync_sibling(state, ms, &sender, &sibling).await {
+            state
+                .log(
+                    "WARNING",
+                    format!("channel sent history for a linked device: {error}"),
+                )
+                .await;
+        }
     }
     Ok(())
 }
