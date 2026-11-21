@@ -55,7 +55,8 @@ pub async fn serve(checkpoint: &Path, alice: &[&str], bob: &[&str]) {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_secs() as i64;
-    let validator = SigningKey::from_bytes(&[71; 32]);
+    let validator_seed: [u8; 32] = Sha256::digest(epix_crypt::new_seed().as_bytes()).into();
+    let validator = SigningKey::from_bytes(&validator_seed);
     let validators = HashMap::from([(
         "epixvalcons1test".into(),
         PinnedValidator {

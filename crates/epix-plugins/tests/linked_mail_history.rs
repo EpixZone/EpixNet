@@ -275,8 +275,12 @@ async fn linked_devices_receive_live_and_preupgrade_sent_mail() {
         laptop.relay(&hub, &[&phone, &bob]).await;
         bob.relay(&hub, &[&laptop, &phone]).await;
         let rows = phone.messages().await;
-        if rows.len() >= 3 || Instant::now() >= deadline {
-            break (rows, laptop.messages().await, bob.messages().await);
+        let source = laptop.messages().await;
+        let recipient = bob.messages().await;
+        if (rows.len() >= 3 && source.len() >= 3 && recipient.len() >= 2)
+            || Instant::now() >= deadline
+        {
+            break (rows, source, recipient);
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
     };
