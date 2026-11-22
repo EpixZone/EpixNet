@@ -2456,9 +2456,10 @@ class MainActivity : AppCompatActivity(), WalletHost, AddonHost {
             addView(closeButton)
         }
         // Give the wallet most of the screen, dashboard-dark behind it.
-        val maxPopupHeight = (resources.displayMetrics.heightPixels * heightFraction).toInt()
         val holder = object : LinearLayout(this) {
             override fun onMeasure(widthMeasureSpec: Int, heightMeasureSpec: Int) {
+                // The activity keeps this dialog alive across orientation changes.
+                val maxPopupHeight = (resources.displayMetrics.heightPixels * heightFraction).toInt()
                 val availableHeight =
                     if (View.MeasureSpec.getMode(heightMeasureSpec) == View.MeasureSpec.UNSPECIFIED) {
                         maxPopupHeight
