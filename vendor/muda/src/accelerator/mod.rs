@@ -19,9 +19,8 @@
 //! let accelerator = Accelerator::new(Modifiers::SHIFT, Code::KeyQ);
 //! let accelerator_without_mods = Accelerator::new(Modifiers::empty(), Code::KeyQ);
 //! ```
-//! or from `&str`, note that all modifiers
-//! have to be listed before the non-modifier key, `shift+alt+KeyQ` is legal,
-//! whereas `shift+q+alt` is not.
+//! or parsed from a string. Put the modifiers first, as in `shift+alt+KeyQ`.
+//! The parser rejects `shift+q+alt` because a modifier follows the letter.
 //! ```no_run
 //! # use muda::accelerator::*;
 //! let key_accelerator: KeyAccelerator = "shift+alt+q".parse().unwrap();
