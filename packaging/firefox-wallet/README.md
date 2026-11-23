@@ -11,8 +11,10 @@ changes would invalidate its signature. `epix-browser --export-wallet` uses the
 same packing code as the current installer and exports its final bytes without
 opening a browser or touching a profile. Preparation sets the selected AMO release version. For older wallet builds it
 renames the Firefox manifest key `applications` to `browser_specific_settings`.
-It applies the reviewed data declaration and the desktop Firefox 140 minimum for
-built-in consent. The extension keeps its ID and private-window settings.
+It applies the reviewed data declaration and a Firefox minimum of 142 for this
+XPI. Mozilla validates the shared minimum against both desktop (consent since
+140) and Android (since 142). EpixNet desktop ships a newer ESR. The extension
+keeps its ID and private-window settings.
 
 ## Publisher prerequisites
 

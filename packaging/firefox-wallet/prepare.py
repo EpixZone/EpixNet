@@ -157,7 +157,7 @@ def source_bundle(output, repositories, version, environment, raw_entries, final
         "  target/debug/epix-browser --export-wallet ../rebuilt.xpi\n"
         "  cd ..\n"
         "  python3 rebuild.py verify-final rebuilt.xpi\n"
-        "The final comparison applies the release version, Firefox manifest key migration, desktop consent minimum and reviewed data declaration. All other payload bytes must match.\n"
+        "The final comparison applies the release version, Firefox manifest key migration, minimum version for consent and reviewed data declaration. All other payload bytes must match.\n"
         "See EpixNet/packaging/firefox-wallet/README.md for signing and remaining publisher requirements.\n"
     ).encode()
     write_archive(output, entries)
