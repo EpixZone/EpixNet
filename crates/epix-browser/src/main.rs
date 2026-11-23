@@ -314,12 +314,6 @@ fn main() {
     shutdown::shutdown(rt);
 }
 
-/// The launcher has no console of its own on Windows (GUI subsystem, so no
-/// terminal window pops up behind the browser). Printed output still has to
-/// land somewhere: attach to the parent process's console when there is one
-/// (`cargo run` / a terminal invocation keeps live output), else append both
-/// std streams to `<data_root>/log/epix-browser.log` so field problems stay
-/// diagnosable.
 /// A modal error box, for failures before the startup window exists.
 #[cfg(windows)]
 fn show_error_dialog(message: &str) {
@@ -333,6 +327,12 @@ fn show_error_dialog(message: &str) {
     }
 }
 
+/// The launcher has no console of its own on Windows (GUI subsystem, so no
+/// terminal window pops up behind the browser). Printed output still has to
+/// land somewhere: attach to the parent process's console when there is one
+/// (`cargo run` / a terminal invocation keeps live output), else append both
+/// std streams to `<data_root>/log/epix-browser.log` so field problems stay
+/// diagnosable.
 #[cfg(windows)]
 fn attach_console_or_log(data_root: &Path) {
     use std::os::windows::io::IntoRawHandle;
@@ -1316,23 +1316,24 @@ fn portable_ca_entry(root: &Path, pem: &str) -> Result<String, String> {
         .ok_or_else(|| "the portable folder path must be valid Unicode".to_string())
 }
 
-/// Make `entry` the CA reference in a `Certificates.Install` list. A full
-/// path (portable mode) also replaces our bare filename and any CA path a
-/// copy left from an earlier location, such as another drive letter. Other
-/// certificates stay. Returns whether the list changed.
+/// Keep the active Epix CA reference when switching data folders or moving
+/// the portable copy. Preserve other certificate policies.
 fn update_ca_install_list(install: &mut Vec<serde_json::Value>, entry: &str) -> bool {
-    let before = install.clone();
-    if entry != CA_POLICY_FILE {
-        let suffix = Path::new("browser-ca").join(CA_POLICY_FILE);
-        install.retain(|value| {
-            let Some(text) = value.as_str() else { return true };
-            text == entry || (text != CA_POLICY_FILE && !Path::new(text).ends_with(&suffix))
-        });
+    let before = install.len();
+    let suffix = Path::new(epix_ui::paths::PORTABLE_DATA_DIR)
+        .join("browser-ca")
+        .join(CA_POLICY_FILE);
+    install.retain(|value| {
+        let Some(text) = value.as_str() else { return true };
+        let path = Path::new(text);
+        let portable_ca = path.is_absolute() && path.ends_with(&suffix);
+        text == entry || (text != CA_POLICY_FILE && !portable_ca)
+    });
+    if install.iter().any(|value| value.as_str() == Some(entry)) {
+        return install.len() != before;
     }
-    if !install.iter().any(|value| value.as_str() == Some(entry)) {
-        install.push(serde_json::Value::String(entry.to_string()));
-    }
-    *install != before
+    install.push(serde_json::Value::String(entry.to_string()));
+    true
 }
 
 #[cfg(test)]
@@ -1369,6 +1370,22 @@ mod ca_policy_tests {
             [serde_json::json!("corporate.pem"), serde_json::json!(7), serde_json::json!(new_ca)]
         );
         assert!(!update_ca_install_list(&mut install, &new_ca));
+    }
+
+    #[test]
+    fn bare_filename_replaces_a_previous_portable_ca() {
+        let old = tempfile::tempdir().unwrap();
+        let old_ca = old.path().join("Data/browser-ca").join(CA_POLICY_FILE);
+        let other_ca = old.path().join("corporate/browser-ca").join(CA_POLICY_FILE);
+        let mut install = vec![serde_json::json!(old_ca), serde_json::json!(other_ca)];
+        assert!(update_ca_install_list(&mut install, CA_POLICY_FILE));
+        assert_eq!(install, [serde_json::json!(other_ca), serde_json::json!(CA_POLICY_FILE)]);
+        assert!(!update_ca_install_list(&mut install, CA_POLICY_FILE));
+
+        // Also repair a policy that a previous version already left with both entries.
+        install.push(serde_json::json!(old_ca));
+        assert!(update_ca_install_list(&mut install, CA_POLICY_FILE));
+        assert_eq!(install, [serde_json::json!(other_ca), serde_json::json!(CA_POLICY_FILE)]);
     }
 
     #[test]
