@@ -17,7 +17,7 @@ EpixNet supports **Tor** and **I2P** in builds that include those features. Rout
 
 ## Get started
 
-The quickest way in is a ready-made package from [EpixNet releases](https://github.com/EpixZone/EpixNet/releases/latest). Each release ships a Windows installer (`Epix-Setup-<version>.exe`), a portable Windows zip that needs no install ([EpixNet Portable](#epixnet-portable-for-windows)), a macOS disk image (`Epix-<version>.dmg`), Linux `.deb`, `.rpm`, AppImage and `.tar.gz` packages, and an Android APK, with a `SHA256SUMS` file to check the downloads. There is no iOS release download; iOS is built from source.
+The quickest way in is a ready-made package from [EpixNet releases](https://github.com/EpixZone/EpixNet/releases/latest). Each release ships a Windows installer (`Epix-Setup-<version>.exe`), a portable Windows zip that needs no install ([EpixNet Portable](#epixnet-portable-for-windows)), a macOS disk image (`Epix-<version>.dmg`), Linux `.deb`, `.rpm`, AppImage and `.tar.gz` packages, and an Android APK, with a `SHA256SUMS` file for the Linux downloads. There is no iOS release download; iOS is built from source.
 
 You can also build EpixNet from its source code. Pick your system below. Each guide starts from a brand new machine with nothing installed yet and walks you through every step.
 
@@ -279,7 +279,7 @@ The AppImage uses `EpixNet.AppImage.home` as its home folder. To upgrade, replac
 
 ### EpixNet Portable for Windows
 
-`EpixNet-Portable-<version>-x64.zip` runs without installing. Unzip it anywhere, for example onto a USB drive, then start `epix-browser.exe` in the `EpixNet Portable` folder. Everything stays in the `Data` folder beside it: xites, keys, settings, the browser profile and its certificate.
+`EpixNet-Portable-<version>-x64.zip` runs without installing. Unzip it anywhere, for example onto a USB drive, then start `epix-browser.exe` in the `EpixNet Portable` folder. EpixNet keeps your xites, keys, settings, browser profile and certificate in the adjacent `Data` folder. Firefox saves downloads to your Windows Downloads folder by default. Choose a folder on the portable drive to keep downloaded files there too.
 
 - The `epixnet-portable.txt` file turns this on. Delete it to use the normal per-user folder. `--data-dir` still wins.
 - To upgrade, quit EpixNet and unzip the new version. Move your `Data` folder into the new `EpixNet Portable` folder, then delete the old one.
