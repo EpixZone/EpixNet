@@ -1305,7 +1305,7 @@ mod test {
 
     impl MockablePowManager for MockPowManager {
         fn check_solve(self: &Arc<Self>, solve: &ProofOfWorkV1) -> Result<(), PowSolveError> {
-            // For testing, treat all zeros as the only valid solve. Error is chosen arbitrarily.
+            // Accept only all-zero solution bytes, independently of the request nonce.
             if solve.solution() == &[0; 16] {
                 Ok(())
             } else {
@@ -1325,7 +1325,7 @@ mod test {
             id,
             pow: effort.map(|e| {
                 ProofOfWork::V1(ProofOfWorkV1::new(
-                    Nonce::from([0; 16]),
+                    Nonce::from(rand::random::<[u8; 16]>()),
                     Effort::from(e),
                     SeedHead::from([0; 4]),
                     SolutionByteArray::from([0; 16]),
@@ -1338,7 +1338,7 @@ mod test {
         MockRendRequest {
             id,
             pow: Some(ProofOfWork::V1(ProofOfWorkV1::new(
-                Nonce::from([0; 16]),
+                Nonce::from(rand::random::<[u8; 16]>()),
                 Effort::from(effort),
                 SeedHead::from([0; 4]),
                 SolutionByteArray::from([1; 16]),

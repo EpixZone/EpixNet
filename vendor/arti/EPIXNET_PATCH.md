@@ -13,6 +13,7 @@ The root application and fuzz workspaces provide their dependency locks.
 * Time formatting, parsing and Serde in Arti use the local `tor-time-format` package.
   Config files, guard state and onion-service records retain their wire formats.
 * The HTTP proxy URI fallback encodes credentials without logging the username.
+* Onion-service request queue tests draw a fresh random nonce per request. Their mock verifier checks the solution bytes.
 * Serde derives for public onion-service discovery keys use their existing string
   representation. The Arti consumers select only the `serde_with` macros they use.
 * `tor-key-forge` and `tor-keymgr` are already under `vendor/` with the RSA migration.

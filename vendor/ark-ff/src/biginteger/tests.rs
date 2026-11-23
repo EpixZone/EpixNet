@@ -205,7 +205,7 @@ fn biginteger_bits_test<B: BigInteger>() {
     // 4th bit of BigInteger representing 32 is not 1
     assert!(!thirty_two.get_bit(4));
     // 5th bit of BigInteger representing 32 is 1
-    assert!(thirty_two.get_bit(5), "{:?}", thirty_two);
+    assert!(thirty_two.get_bit(5));
 
     // Generates a random BigInteger and tests bit construction methods.
     let mut rng = ark_std::test_rng();
