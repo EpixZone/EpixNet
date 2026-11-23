@@ -1109,7 +1109,7 @@ fn find_certutil() -> Option<PathBuf> {
 ///    the install dir is user-writable, like the per-user Windows bundle under
 ///    `%LOCALAPPDATA%\Epix`.
 ///
-/// Linux prefers mechanism 2 and macOS uses ONLY mechanism 2. A Mac with
+/// Linux and the Windows bundle prefer mechanism 2. macOS uses only mechanism 2. A Mac with
 /// `certutil` almost always got it from Homebrew, which ships a NEWER NSS than
 /// the one our bundled Firefox is built
 /// against; the trust that newer certutil writes into `cert9.db` is not honored
@@ -1131,9 +1131,11 @@ fn install_ca(profile: &Path, firefox: &Path, ca: &LocalCa) -> Result<(), String
     {
         // The host's NSS may write trust records our bundled Firefox cannot
         // use, despite certutil succeeding and the DER appearing in cert9.db.
-        // Import through Firefox itself before considering that fallback.
-        #[cfg(target_os = "linux")]
-        if install_ca_policies(firefox, &pem).is_ok() {
+        // The Windows bundle also needs its policy updated if the portable
+        // data folder changed. A successful NSS import would skip that step.
+        let prefer_policy = cfg!(target_os = "linux")
+            || (cfg!(windows) && bundled_firefox().as_deref() == Some(firefox));
+        if prefer_policy && install_ca_policies(firefox, &pem).is_ok() {
             return Ok(());
         }
         // Why the mechanism failed: "not found", an io error, or an exit
