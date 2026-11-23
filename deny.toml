@@ -44,8 +44,7 @@ ignore = [
     # menu/event loop - our code never iterates untrusted GVariants, so the
     # unsound path is not reachable. Revisit if the tray moves off GTK3.
     "RUSTSEC-2024-0429", # glib VariantStrIter unsoundness
-    # proc-macro-error + instant: unmaintained, pulled transitively by the same
-    # tao/GTK3 tray stack (a build-time proc-macro helper and a time shim).
+    # proc-macro-error is an unmaintained build-time dependency of gtk3-macros.
     "RUSTSEC-2024-0370", # proc-macro-error
 ]
 
