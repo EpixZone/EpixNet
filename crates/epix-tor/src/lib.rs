@@ -28,6 +28,7 @@ use tor_cell::relaycell::msg::Connected;
 use tor_hsservice::config::OnionServiceConfigBuilder;
 use tor_hsservice::RunningOnionService;
 use tor_proto::stream::IncomingStreamRequest;
+use tor_rtcompat::tokio::TokioRustlsRuntime;
 
 #[cfg(feature = "bridges")]
 pub mod bridges;
@@ -70,7 +71,7 @@ impl TorMode {
 /// A bootstrapped in-process Tor node (Arti). Cheap to clone.
 #[derive(Clone)]
 pub struct Tor {
-    client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
+    client: Arc<TorClient<TokioRustlsRuntime>>,
 }
 
 /// The onion service's ed25519 identity key, for proving onion ownership to
@@ -370,7 +371,10 @@ impl Tor {
         let config = builder
             .build()
             .map_err(|e| Error::Protocol(format!("tor config: {e}")))?;
-        let client = TorClient::create_bootstrapped(config)
+        let runtime = TokioRustlsRuntime::current()?;
+        let client = TorClient::with_runtime(runtime)
+            .config(config)
+            .create_bootstrapped()
             .await
             .map_err(|e| Error::Protocol(format!("tor bootstrap: {e}")))?;
         Ok(Self { client })
@@ -517,7 +521,7 @@ impl Tor {
 
 /// One SOCKS5 CONNECT exchange, then a bidirectional copy over Tor.
 async fn socks5_handle(
-    client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
+    client: Arc<TorClient<TokioRustlsRuntime>>,
     mut sock: TcpStream,
 ) -> std::io::Result<()> {
     use std::io::{Error as IoError, ErrorKind};
@@ -582,7 +586,7 @@ async fn socks5_handle(
 /// [`Transport`] impl that dials peers through Tor.
 #[derive(Clone)]
 pub struct TorTransport {
-    client: Arc<TorClient<tor_rtcompat::PreferredRuntime>>,
+    client: Arc<TorClient<TokioRustlsRuntime>>,
     /// Dial plain IP peers via Tor too (`--tor always`).
     route_all: bool,
 }
@@ -1013,6 +1017,7 @@ mod tests {
             }
         );
         s.write_all(req.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
         // Read whatever the onion service sends first; any bytes prove the
         // circuit carried an application-level response end to end.
         let mut buf = vec![0u8; 64];
@@ -1041,9 +1046,9 @@ mod tests {
             while let Some(mut stream) = inbound.recv().await {
                 tokio::spawn(async move {
                     let mut b = [0u8; 4];
-                    if stream.read_exact(&mut b).await.is_ok() {
-                        let _ = stream.write_all(&b).await;
-                    }
+                    stream.read_exact(&mut b).await?;
+                    stream.write_all(&b).await?;
+                    stream.flush().await
                 });
             }
         });
@@ -1063,6 +1068,7 @@ mod tests {
         }
         let mut s = stream.expect("dial our own onion service");
         s.write_all(b"ping").await.unwrap();
+        s.flush().await.unwrap();
         let mut back = [0u8; 4];
         s.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"ping");

@@ -1,0 +1,56 @@
+//! Prelude used internally for everything in `parse2`.
+//!
+//! This is also exported, but with `#[doc(hidden)]`, for the benefit of our public macros.
+
+pub use std::collections::{BTreeSet, HashSet};
+pub use std::fmt::{self, Debug, Display, Write as _};
+pub use std::hash::Hash;
+pub use std::marker::PhantomData;
+pub use std::mem;
+pub use std::ops::RangeInclusive;
+pub use std::result::Result;
+pub use std::slice;
+pub use std::str::FromStr;
+pub use std::sync::Arc;
+pub use std::time::{Duration, SystemTime};
+
+pub use derive_deftly::{Deftly, define_derive_deftly, define_derive_deftly_module};
+pub use digest::Digest;
+pub use educe::Educe;
+pub use itertools::Itertools;
+pub use pastey::paste;
+pub use thiserror::Error;
+pub use void::Void;
+
+pub use tor_basic_utils::{assert_not_impl, intern::*};
+pub use tor_error::{Bug, into_internal};
+pub use tor_llcrypto::pk;
+
+pub const PEM_HEADER_START: &str = crate::parse::tokenize::object::BEGIN_STR;
+pub const PEM_FOOTER_START: &str = crate::parse::tokenize::object::END_STR;
+pub const PEM_AFTER_LABEL: &str = crate::parse::tokenize::object::TAG_END;
+
+pub use super::{
+    derive::netdoc_parseable_derive_debug,
+    error::{ArgumentError, ErrorProblem, ParseError, UnexpectedArgument, VerifyFailed},
+    keyword::KeywordRef,
+    lex::{ArgumentStream, ItemStream, UnparsedItem, WS},
+    lines::{Lines, StrExt as _},
+    multiplicity::{ArgumentSetMethods, ItemSetMethods, MultiplicitySelector, ObjectSetMethods},
+    signatures::{
+        HasUnverifiedParsedBody, NetdocParseableSignatures, NetdocParseableUnverified,
+        SignatureHashInputs, SignatureHashesAccumulator, SignatureItemParseable, SignaturesData,
+        SignedDocumentBody, sig_hashes,
+    },
+    structural::{StopAt, StopPredicate},
+    traits::{
+        IsStructural, ItemArgumentParseable, ItemObjectParseable, ItemValueParseable,
+        NetdocParseable, NetdocParseableFields,
+    },
+};
+pub use crate::types::Unknown;
+pub use crate::{NormalItemArgument, netdoc_ordering_check, stop_at};
+
+pub use ArgumentError as AE;
+pub use ErrorProblem as EP;
+pub use VerifyFailed as VF;

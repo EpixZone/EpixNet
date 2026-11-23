@@ -34,6 +34,7 @@ mod lab {
         thread,
         time::{Duration, Instant},
     };
+    use time::format_description::well_known::{Rfc2822, Rfc3339};
 
     fn cmd(program: impl AsRef<std::ffi::OsStr>, args: &[&str]) -> Command {
         let mut command = Command::new(program);
@@ -182,7 +183,8 @@ mod lab {
             root.join("upstream.asc"),
             output(gpg(root, &["--armor", "--export"]))?,
         )?;
-        let expires = (chrono::Utc::now() + chrono::Duration::hours(12)).to_rfc3339();
+        let expires =
+            (time::OffsetDateTime::now_utc() + time::Duration::hours(12)).format(&Rfc3339)?;
         for version in ["1.0", "2.0"] {
             apt_repo(root, version)?;
             rpm_repo(root, version)?;
@@ -273,7 +275,7 @@ mod lab {
         let release = repo.join("dists/stable/Release");
         let mut list = cmd("apt-ftparchive", &["release", "."]);
         list.current_dir(release.parent().unwrap());
-        let until = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc2822();
+        let until = (time::OffsetDateTime::now_utc() + time::Duration::days(1)).format(&Rfc2822)?;
         let mut content=format!("Origin: Epix fixture\nLabel: Epix fixture\nSuite: stable\nCodename: stable\nArchitectures: amd64\nComponents: main\nValid-Until: {until}\n").into_bytes();
         content.extend(output(list)?);
         fs::write(&release, content)?;

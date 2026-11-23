@@ -29,6 +29,11 @@ class SigningTests(unittest.TestCase):
             subprocess.run(["git", "init", "-q", str(path)], check=True)
         (self.wallet / "source.js").write_text("// human-readable wallet source\n")
         self.wallet_revision = self.commit(self.wallet)
+        self.review = json.loads((HERE / "data-disclosure.json").read_text())
+        self.review["wallet_revision"] = self.wallet_revision
+        self.review_path = self.repo / "packaging/firefox-wallet/data-disclosure.json"
+        self.review_path.parent.mkdir(parents=True)
+        self.review_path.write_text(json.dumps(self.review))
         (self.repo / "shells").mkdir()
         (self.repo / "shells/wallet-ext.rev").write_text(self.wallet_revision[:12])
         self.archive = self.root / "wallet.zip"
@@ -63,7 +68,8 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(manifest["version"], self.args.version)
         self.assertEqual(manifest["incognito"], "spanning")
         self.assertNotIn("applications", manifest)
-        self.assertEqual(manifest["browser_specific_settings"], json.loads(self.entries["manifest.json"])["applications"])
+        self.assertEqual(manifest["browser_specific_settings"], {"gecko": {
+            "id": prepare.WALLET_ID, **self.review["gecko"]}})
         self.assertEqual(receipt["epixnet_revision"], self.revision)
         self.assertEqual(receipt["wallet_revision"], self.wallet_revision)
         source = prepare.read_archive(self.args.output / "source.zip")
@@ -92,13 +98,23 @@ class SigningTests(unittest.TestCase):
             rebuild.restore(unpacked, metadata)
 
     def test_submission_preserves_all_browser_settings_and_rejects_conflicting_aliases(self):
-        settings = {"gecko": {"id": prepare.WALLET_ID, "strict_min_version": "102.0"}, "gecko_android": {}}
-        expected = {"browser_specific_settings": settings, "version": "2"}
+        settings = {"gecko": {"id": prepare.WALLET_ID, "strict_min_version": "102.0",
+                              "strict_max_version": "160.*"}, "safari": {"strict_min_version": "16"}}
+        expected = {"browser_specific_settings": {"gecko": {**settings["gecko"], **self.review["gecko"]},
+                                                  "safari": settings["safari"]}, "version": "2"}
         for manifest in ({"applications": settings}, {"browser_specific_settings": settings},
                          {"applications": settings, "browser_specific_settings": settings}):
-            self.assertEqual(json.loads(rebuild.submission_manifest(manifest, "2")), expected)
+            self.assertEqual(json.loads(rebuild.submission_manifest(manifest, "2", self.review["gecko"])), expected)
         with self.assertRaisesRegex(ValueError, "conflicting browser settings"):
-            rebuild.submission_manifest({"applications": settings, "browser_specific_settings": {}}, "2")
+            rebuild.submission_manifest({"applications": settings, "browser_specific_settings": {}}, "2", self.review["gecko"])
+
+    def test_unreviewed_wallet_pin_stops_preparation(self):
+        self.review["wallet_revision"] = "0" * 40
+        self.review_path.write_text(json.dumps(self.review))
+        self.commit(self.repo)
+        with self.assertRaisesRegex(ValueError, "Review the data disclosure"):
+            prepare.prepare(self.args, self.repo)
+        self.assertFalse(self.args.output.exists())
 
     def test_lint_warnings_block_submission_and_are_retained(self):
         prepare.prepare(self.args, self.repo)

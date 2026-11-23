@@ -3,50 +3,7 @@
 # Docs: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-# Fail on security advisories from the RustSec database, except the accepted
-# ones below. A green check means no NEW advisory has appeared.
-yanked = "warn"
-ignore = [
-    # RUSTSEC-2023-0071: Marvin timing sidechannel in `rsa`. No fixed upstream
-    # release yet. Tracked; revisit when rsa publishes a patched version.
-    "RUSTSEC-2023-0071",
-    # RUSTSEC-2025-0141: bincode unmaintained. Migration tracked separately.
-    "RUSTSEC-2025-0141",
-    # RUSTSEC-2024-0436: paste unmaintained (proc-macro, low risk).
-    "RUSTSEC-2024-0436",
-    # RUSTSEC-2026-0387: crypto-bigint timing variability, patched in 0.7.6.
-    # Our own k256/elliptic-curve stack is on the patched 0.7 line. The ignore
-    # covers the OTHER copy, crypto-bigint 0.5.5, pulled by the embedded I2P
-    # router (emissary-core -> p256 0.13), for which no patched 0.5 exists.
-    # emissary uses p256 only to VERIFY other routers' ECDSA-P256 RouterInfo
-    # signatures (public keys, public data): no secret integer ever goes
-    # through the affected operations, so the side channel has nothing to
-    # leak. Drop this when emissary moves to p256 0.14.
-    "RUSTSEC-2026-0387",
-    # RUSTSEC-2026-0543: chrono unmaintained (no vulnerability). Only
-    # epix-mirror uses it, to read and compare RFC 3339 / RFC 2822 timestamps.
-    # Revisit by moving epix-mirror to the `time` crate.
-    "RUSTSEC-2026-0543",
-    # RUSTSEC-2026-0542: humantime unmaintained (no vulnerability), declared
-    # unmaintained together with chrono. Pulled by arti-client and the tor-*
-    # crates (humantime-serde config parsing) and by env_logger in the vendored
-    # Reticulum stack. Drop when those move off it.
-    "RUSTSEC-2026-0542",
-
-    # --- arkworks zk stack (RLN anti-spam, epix-rln -> vendored rln) --------
-    # RUSTSEC-2024-0388: derivative unmaintained (build-time proc-macro used by
-    # ark-crypto-primitives). No runtime surface; pinned by arkworks 0.5.
-    "RUSTSEC-2024-0388",
-
-    # glib 0.18 `VariantStrIter` unsoundness (CVSS 6.9). Fixed in glib 0.20,
-    # but the GTK3 bindings pin glib 0.18, so it is unavoidable while the tray
-    # uses GTK3. glib here is used only internally by GTK for the tray's own
-    # menu/event loop - our code never iterates untrusted GVariants, so the
-    # unsound path is not reachable. Revisit if the tray moves off GTK3.
-    "RUSTSEC-2024-0429", # glib VariantStrIter unsoundness
-    # proc-macro-error is an unmaintained build-time dependency of gtk3-macros.
-    "RUSTSEC-2024-0370", # proc-macro-error
-]
+yanked = "deny"
 
 [bans]
 # Warn (do not fail) on duplicate crate versions. The tor/arti stack pulls in

@@ -50,12 +50,23 @@ def restore(root, metadata):
         print(f"Restored {name} at {identity}")
 
 
-def submission_manifest(manifest, version):
+def reviewed_gecko_settings(repository, wallet_revision):
+    path = repository / "packaging/firefox-wallet/data-disclosure.json"
+    review = json.loads(path.read_text())
+    if review["wallet_revision"] != wallet_revision:
+        raise ValueError("Review the data disclosure for the pinned wallet revision")
+    return review["gecko"]
+
+
+def submission_manifest(manifest, version, reviewed_settings):
     if "applications" in manifest:
         legacy = manifest.pop("applications")
         if "browser_specific_settings" in manifest and manifest["browser_specific_settings"] != legacy:
             raise ValueError("Firefox manifest contains conflicting browser settings")
         manifest["browser_specific_settings"] = legacy
+    gecko = manifest["browser_specific_settings"]["gecko"]
+    for key in ("strict_min_version", "data_collection_permissions"):
+        gecko[key] = reviewed_settings[key]
     manifest["version"] = version
     return (json.dumps(manifest, indent=2) + "\n").encode()
 
@@ -89,7 +100,9 @@ def main():
         with zipfile.ZipFile(args.artifact) as archive:
             entries = {name: archive.read(name) for name in archive.namelist() if not name.endswith("/")}
         manifest = json.loads(entries["manifest.json"])
-        entries["manifest.json"] = submission_manifest(manifest, metadata["version"])
+        wallet_revision = metadata["repositories"]["epix-wallet"]["revision"]
+        settings = reviewed_gecko_settings(root / "EpixNet", wallet_revision)
+        entries["manifest.json"] = submission_manifest(manifest, metadata["version"], settings)
         verify(entries, metadata["final_files"])
 
 

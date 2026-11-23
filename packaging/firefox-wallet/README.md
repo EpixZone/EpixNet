@@ -10,8 +10,11 @@ background HTML and JavaScript. Signing the upstream ZIP and then applying these
 changes would invalidate its signature. `epix-browser --export-wallet` uses the
 same packing code as the current installer and exports its final bytes without
 opening a browser or touching a profile. Preparation sets the selected AMO release version. For older wallet builds it
-renames the Firefox manifest key `applications` to `browser_specific_settings`,
-keeping the same extension ID, minimum version and private-window settings.
+renames the Firefox manifest key `applications` to `browser_specific_settings`.
+It applies the reviewed data declaration and a Firefox minimum of 142 for this
+XPI. Mozilla validates the shared minimum against both desktop (consent since
+140) and Android (since 142). EpixNet desktop ships a newer ESR. The extension
+keeps its ID and private-window settings.
 
 ## Publisher prerequisites
 
@@ -27,24 +30,13 @@ keeping the same extension ID, minimum version and private-window settings.
 3. Choose an unused numeric version higher than both the installed wallet and
    the highest version submitted to AMO. The developer can check the former
    in the preparation receipt. Only the publisher can confirm unlisted AMO history.
-4. Confirm which data the signed build transmits, why, to whom, and which
-   transmissions users can decline. Wallet addresses and signed transactions
-   go to network services. The EVM broadcast code also sends the requesting
-   site's origin in a header. Review `financialAndPaymentInfo` and
-   `browsingActivity` against the complete build, including native messaging.
-   Check the [published privacy policy](https://techsonix.com/epixnet/privacy/)
-   against those disclosures. Built-in consent requires Firefox 140 on desktop
-   and 142 on Android. Supporting earlier versions requires a consent path for
-   them or disabling the transmissions on those versions.
-   [Mozilla data consent guidance](https://extensionworkshop.com/documentation/develop/firefox-builtin-data-consent/)
+4. Use the [reviewed wallet disclosure](DATA-DISCLOSURE.md) for this submission.
+   Review it again when the wallet pin or EpixNet's packaging or native bridge
+   changes. Preparation checks the wallet revision against the declaration.
 
 The project requires zero lint errors and warnings before the workflow submits.
-With wallet `88a545a37c95` and `web-ext` 10.8.0, migrating the manifest key
-removes one of the original 66 warnings. The 65 remaining warnings cover the
-missing data declaration (1), dynamic evaluation (32), unsafe assignments or
-imports (9), unsupported APIs (5) and API compatibility on desktop and Android
-(9 each). See the retained `lint.json` for each location. Mozilla performs its
-own validation and can request further changes or information.
+See the retained `lint.json` for each location. Mozilla performs its own
+validation and can request further changes or information.
 
 The source upload includes committed EpixNet and wallet source, lockfiles and
 build instructions. It preserves original commit objects and tracked file modes
@@ -131,6 +123,11 @@ Before updating the application, run the returned XPI in the supported Firefox
 ESR with signature verification enabled. Confirm Firefox reports an ordinary
 Mozilla signature, the wallet works, existing storage and UUID survive an
 in-place update, and private-window consent and disabled state are preserved.
+Offer the signed file through a user-confirmed Firefox install or update. In
+ESR 153.7.0 the current managed profile sideload activates the wallet and grants
+the declared data permissions silently on both first install and upgrade.
+Verify that declining the real offer prevents the new wallet from activating
+and that the launcher's Tor routing works while the user decides.
 Also check restart and the next version update. Run all PR security and Sonar
 checks before merging the adoption change.
 

@@ -17,9 +17,12 @@ use std::{
     },
     thread,
 };
+use time::format_description::well_known::Rfc3339;
 
 fn expiry() -> String {
-    (chrono::Utc::now() + chrono::Duration::hours(12)).to_rfc3339()
+    (time::OffsetDateTime::now_utc() + time::Duration::hours(12))
+        .format(&Rfc3339)
+        .unwrap()
 }
 fn info(bytes: &[u8]) -> FileInfo {
     FileInfo {

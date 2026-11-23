@@ -4,11 +4,17 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
+macro_rules! installer_module {
+    ($name:literal) => {
+        (
+            concat!("distribution/epix-addon-installer/", $name),
+            include_bytes!(concat!("../../../packaging/firefox-addons/", $name)),
+        )
+    };
+}
+
 const MODULES: &[(&str, &[u8])] = &[
-    (
-        "distribution/epix-addon-installer/chrome.manifest",
-        include_bytes!("../../../packaging/firefox-addons/chrome.manifest"),
-    ),
+    installer_module!("chrome.manifest"),
     (
         "epix-addons.cfg",
         include_bytes!("../../../packaging/firefox-addons/epix-addons.cfg"),
@@ -17,34 +23,21 @@ const MODULES: &[(&str, &[u8])] = &[
         "defaults/pref/epix-addons.js",
         include_bytes!("../../../packaging/firefox-addons/epix-addons.js"),
     ),
+    installer_module!("manager.sys.mjs"),
+    installer_module!("policy.sys.mjs"),
+    installer_module!("theme.sys.mjs"),
+    installer_module!("welcome.sys.mjs"),
     (
-        "distribution/epix-addon-installer/manager.sys.mjs",
-        include_bytes!("../../../packaging/firefox-addons/manager.sys.mjs"),
-    ),
-    (
-        "distribution/epix-addon-installer/policy.sys.mjs",
-        include_bytes!("../../../packaging/firefox-addons/policy.sys.mjs"),
-    ),
-    (
-        "distribution/epix-addon-installer/theme.sys.mjs",
-        include_bytes!("../../../packaging/firefox-addons/theme.sys.mjs"),
+        "distribution/epix-addon-installer/welcome.png",
+        include_bytes!("../../../packaging/linux/icons/epix-128.png"),
     ),
     (
         "distribution/epix-addon-installer/theme/manifest.json",
         include_bytes!("../../../shells/epix-theme/manifest.json"),
     ),
-    (
-        "distribution/epix-addon-installer/manager.xhtml",
-        include_bytes!("../../../packaging/firefox-addons/manager.xhtml"),
-    ),
-    (
-        "distribution/epix-addon-installer/manager.css",
-        include_bytes!("../../../packaging/firefox-addons/manager.css"),
-    ),
-    (
-        "distribution/epix-addon-installer/compatibility.json",
-        include_bytes!("../../../packaging/firefox-addons/compatibility.json"),
-    ),
+    installer_module!("manager.xhtml"),
+    installer_module!("manager.css"),
+    installer_module!("compatibility.json"),
 ];
 const ARCHIVE_LIMIT: u64 = 32 * 1024 * 1024;
 
@@ -363,7 +356,7 @@ mod tests {
         let id = "a".repeat(64);
         assert!(preflight(&firefox, &profile, &id).is_ok());
         let root = resources(&firefox).unwrap();
-        std::fs::write(root.join("application.ini"), "Version=153.5.1\n").unwrap();
+        std::fs::write(root.join("application.ini"), "Version=153.7.0\n").unwrap();
         assert!(preflight(&firefox, &profile, &id).is_ok());
         std::fs::write(root.join("application.ini"), "Version=154.0\n").unwrap();
         assert!(preflight(&firefox, &profile, &id).is_err());
@@ -373,8 +366,8 @@ mod tests {
         assert!(preflight(&firefox, &profile, &id).is_err());
     }
     #[test]
-    fn packaged_theme_resources_must_match_the_launcher() {
-        for name in ["theme.sys.mjs", "theme/manifest.json"] {
+    fn packaged_branding_resources_must_match_the_launcher() {
+        for name in ["theme.sys.mjs", "theme/manifest.json", "welcome.sys.mjs", "welcome.png"] {
             let (_temp, firefox, profile) = fixture();
             let id = "a".repeat(64);
             let path = resources(&firefox)

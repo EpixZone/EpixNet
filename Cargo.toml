@@ -1,7 +1,36 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/rln", "vendor/ark-relations", "vendor/rdrand", "vendor/emissary-util", "vendor/askama_derive", "vendor/saturating-time", "vendor/reticulum", "vendor/rusqlite"]
-members = ["crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/epix-ui", "crates/epix-server", "crates/epix-chain", "crates/epix-dht", "crates/epix-dht-net", "crates/epix-reticulum", "crates/epix-propagation", "crates/epix-runtime", "crates/epix-user", "crates/epix-peer", "crates/epix-plugin", "crates/epix-plugins", "crates/epix-tor", "crates/epix-i2p", "crates/epix-node", "crates/iptproxy-sys", "crates/epix-ffi", "crates/epix-browser", "crates/epix-browser-net", "crates/epix-nmh", "crates/epix-build", "crates/epix-bt", "crates/xid-spike", "crates/epix-blob", "crates/epix-fs", "crates/epix-selfenc", "crates/epix-edx", "crates/epix-feed", "crates/epix-search", "crates/epix-envelope", "crates/epix-channel", "crates/epix-pairwise-engine", "crates/epix-group-engine", "crates/epix-rln", "crates/evx-api", "crates/evx-runtime", "crates/evx-worker", "crates/evx-supervisor", "crates/evx-state", "crates/evx-activation", "crates/evx-host", "crates/evx-workspace", "crates/evx-declaration", "crates/epix-evx", "crates/evx-windows", "crates/evx-android", "crates/evx-windows-native"]
+exclude = [
+    "vendor/ark-ff",
+    "vendor/flex-error",
+    "vendor/arti/arti-client",
+    "vendor/arti/pwd-grp",
+    "vendor/arti/retry-error",
+    "vendor/arti/slotmap-careful",
+    "vendor/arti/tor-basic-utils",
+    "vendor/arti/tor-cell",
+    "vendor/arti/tor-chanmgr",
+    "vendor/arti/tor-checkable",
+    "vendor/arti/tor-circmgr",
+    "vendor/arti/tor-config",
+    "vendor/arti/tor-dircommon",
+    "vendor/arti/tor-dirmgr",
+    "vendor/arti/tor-error",
+    "vendor/arti/tor-guardmgr",
+    "vendor/arti/tor-hscrypto",
+    "vendor/arti/tor-hsservice",
+    "vendor/arti/tor-linkspec",
+    "vendor/arti/tor-log-ratelim",
+    "vendor/arti/tor-memquota",
+    "vendor/arti/tor-memquota-cost",
+    "vendor/arti/tor-netdir",
+    "vendor/arti/tor-netdoc",
+    "vendor/arti/tor-persist",
+    "vendor/arti/tor-protover",
+    "vendor/arti/tor-rtcompat",
+    "vendor/arti/tor-rtmock",
+    "vendor/tor-keymgr", "vendor/tor-key-forge", "vendor/tor-llcrypto", "vendor/rln", "vendor/ark-relations", "vendor/ark-crypto-primitives", "vendor/rdrand", "vendor/askama_derive", "vendor/saturating-time", "vendor/reticulum", "vendor/rusqlite", "vendor/muda"]
+members = ["crates/epix-tor-time-format", "crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/epix-ui", "crates/epix-server", "crates/epix-chain", "crates/epix-dht", "crates/epix-dht-net", "crates/epix-reticulum", "crates/epix-propagation", "crates/epix-runtime", "crates/epix-user", "crates/epix-peer", "crates/epix-plugin", "crates/epix-plugins", "crates/epix-tor", "crates/epix-i2p", "crates/epix-node", "crates/iptproxy-sys", "crates/epix-ffi", "crates/epix-browser", "crates/epix-browser-net", "crates/epix-nmh", "crates/epix-build", "crates/epix-bt", "crates/xid-spike", "crates/epix-blob", "crates/epix-fs", "crates/epix-selfenc", "crates/epix-edx", "crates/epix-feed", "crates/epix-search", "crates/epix-envelope", "crates/epix-channel", "crates/epix-pairwise-engine", "crates/epix-group-engine", "crates/epix-rln", "crates/evx-api", "crates/evx-runtime", "crates/evx-worker", "crates/evx-supervisor", "crates/evx-state", "crates/evx-activation", "crates/evx-host", "crates/evx-workspace", "crates/evx-declaration", "crates/epix-evx", "crates/evx-windows", "crates/evx-android", "crates/evx-windows-native"]
 
 # saturating-time 0.5.0 hangs forever on Windows: its platform-limit search
 # assumes 1ns clock granularity, but Windows SystemTime is a 100ns FILETIME, so
@@ -10,6 +39,45 @@ members = ["crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crate
 # required by Arti 0.47. See vendor/saturating-time/EPIXNET_PATCH.md.
 [patch.crates-io]
 saturating-time = { path = "vendor/saturating-time" }
+# Arti package revisions and dependency updates are recorded in vendor/arti/EPIXNET_PATCH.md.
+arti-client = { path = "vendor/arti/arti-client" }
+pwd-grp = { path = "vendor/arti/pwd-grp" }
+retry-error = { path = "vendor/arti/retry-error" }
+slotmap-careful = { path = "vendor/arti/slotmap-careful" }
+tor-basic-utils = { path = "vendor/arti/tor-basic-utils" }
+tor-cell = { path = "vendor/arti/tor-cell" }
+tor-chanmgr = { path = "vendor/arti/tor-chanmgr" }
+tor-checkable = { path = "vendor/arti/tor-checkable" }
+tor-circmgr = { path = "vendor/arti/tor-circmgr" }
+tor-config = { path = "vendor/arti/tor-config" }
+tor-dircommon = { path = "vendor/arti/tor-dircommon" }
+tor-dirmgr = { path = "vendor/arti/tor-dirmgr" }
+tor-error = { path = "vendor/arti/tor-error" }
+tor-guardmgr = { path = "vendor/arti/tor-guardmgr" }
+tor-hscrypto = { path = "vendor/arti/tor-hscrypto" }
+tor-hsservice = { path = "vendor/arti/tor-hsservice" }
+tor-linkspec = { path = "vendor/arti/tor-linkspec" }
+tor-log-ratelim = { path = "vendor/arti/tor-log-ratelim" }
+tor-memquota = { path = "vendor/arti/tor-memquota" }
+tor-memquota-cost = { path = "vendor/arti/tor-memquota-cost" }
+tor-netdir = { path = "vendor/arti/tor-netdir" }
+tor-netdoc = { path = "vendor/arti/tor-netdoc" }
+tor-persist = { path = "vendor/arti/tor-persist" }
+tor-protover = { path = "vendor/arti/tor-protover" }
+tor-rtcompat = { path = "vendor/arti/tor-rtcompat" }
+tor-rtmock = { path = "vendor/arti/tor-rtmock" }
+tor-time-format = { path = "crates/epix-tor-time-format" }
+# Replace the unmaintained paste macro in the proof and Tendermint dependencies.
+# Release hashes and changes are recorded in vendor/PASTE_PATCHES.md.
+ark-ff = { path = "vendor/ark-ff" }
+flex-error = { path = "vendor/flex-error" }
+# Use RustCrypto RSA 0.10 for Arti's Tor verification and SSH keystore adapters.
+tor-key-forge = { path = "vendor/tor-key-forge" }
+tor-keymgr = { path = "vendor/tor-keymgr" }
+tor-llcrypto = { path = "vendor/tor-llcrypto" }
+# Keep tray-icon on its AppIndicator backend with GTK 0.19 throughout.
+libappindicator = { git = "https://github.com/tauri-apps/libappindicator-rs", rev = "1fef6b3b8cb4eb1bb3fd287f897826eb397c3165" }
+muda = { path = "vendor/muda" }
 # Keep Arti and r2d2 on their compatible rusqlite API while using patched SQLite.
 # See vendor/rusqlite/EPIXNET_PATCH.md.
 rusqlite = { path = "vendor/rusqlite" }
@@ -23,6 +91,8 @@ rln = { path = "vendor/rln" }
 # Keep RLN's arkworks 0.5 proof formats while adapting its diagnostic layer to
 # patched tracing-subscriber 0.3. See vendor/ark-relations/EPIXNET_PATCH.md.
 ark-relations = { path = "vendor/ark-relations" }
+# Only the commitment, encryption and signature modules use the derive macro.
+ark-crypto-primitives = { path = "vendor/ark-crypto-primitives" }
 # Query Android's advertised ARM64 RNG capability instead of a privileged
 # register that native translation cannot emulate. Keep the other entropy
 # sources unchanged. See vendor/rdrand/EPIXNET_PATCH.md.
@@ -30,11 +100,6 @@ rdrand = { path = "vendor/rdrand" }
 # Backport Askama's upstream replacement of the unmaintained basic-toml parser.
 # See vendor/askama_derive/EPIXNET_PATCH.md.
 askama_derive = { path = "vendor/askama_derive" }
-
-[patch."https://github.com/eepnet/emissary"]
-# Keep the reviewed router revision while upgrading the reseeder to patched ZIP.
-# See vendor/emissary-util/EPIXNET_PATCH.md.
-emissary-util = { path = "vendor/emissary-util" }
 
 [patch."https://github.com/BeechatNetworkSystemsLtd/Reticulum-rs"]
 # Preserve the pinned wire/crypto implementation with routed-link and Channel
