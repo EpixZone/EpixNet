@@ -91,6 +91,73 @@ pub fn data_root() -> PathBuf {
     read_conf_data_dir(&default.join("epixnet.conf")).unwrap_or(default)
 }
 
+/// The launch option that picks a data folder, like `EPIX_DATA_DIR`.
+pub const DATA_DIR_OPTION: &str = "--data-dir";
+
+/// Remove `--data-dir <folder>` or `--data-dir=<folder>` from launch
+/// arguments and return the folder. With `leading_only`, only options before
+/// the first other argument count, so an action's own arguments keep their
+/// meaning. Giving the option twice, or without a folder, is an error.
+pub fn take_data_dir_option(
+    args: &mut Vec<std::ffi::OsString>,
+    leading_only: bool,
+) -> Result<Option<PathBuf>, String> {
+    let missing = || format!("{DATA_DIR_OPTION} requires a folder path");
+    let mut found = None;
+    let mut index = 0;
+    while index < args.len() {
+        let inline = args[index]
+            .to_str()
+            .and_then(|arg| arg.strip_prefix(DATA_DIR_OPTION))
+            .and_then(|rest| rest.strip_prefix('='))
+            .map(std::ffi::OsString::from);
+        let value = if args[index] == DATA_DIR_OPTION {
+            if index + 1 == args.len() {
+                return Err(missing());
+            }
+            let value = args.remove(index + 1);
+            args.remove(index);
+            value
+        } else if let Some(value) = inline {
+            args.remove(index);
+            value
+        } else if leading_only {
+            break;
+        } else {
+            index += 1;
+            continue;
+        };
+        // A following option is a forgotten folder, not a folder named "--x".
+        if value.is_empty() || value.to_string_lossy().starts_with('-') {
+            return Err(missing());
+        }
+        if found.replace(PathBuf::from(value)).is_some() {
+            return Err(format!("Specify {DATA_DIR_OPTION} only once"));
+        }
+    }
+    Ok(found)
+}
+
+/// Select this launch's data folder: a `--data-dir` folder, else
+/// `EPIX_DATA_DIR`. Returns `None` for the default folder (which a Config page
+/// move may have relocated). The choice is exported as an absolute
+/// `EPIX_DATA_DIR`, so every child process uses the same folder: the browser
+/// handoff, the wallet's native host and a restart. Call it before the process
+/// starts any thread, because it changes the environment.
+pub fn apply_launch_data_dir(option: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
+    let Some(folder) = option.or_else(|| {
+        std::env::var_os("EPIX_DATA_DIR")
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    }) else {
+        return Ok(None);
+    };
+    let absolute = std::path::absolute(&folder)
+        .map_err(|e| format!("Cannot use data folder {}: {e}", folder.display()))?;
+    std::env::set_var("EPIX_DATA_DIR", &absolute);
+    Ok(Some(absolute))
+}
+
 /// The default location's `epixnet.conf` - the same file the Python client
 /// keeps its settings in, so a customized Python install carries over. This is
 /// always in the default data root, even when that file's own `data_dir` key
@@ -312,5 +379,60 @@ mod tests {
         assert!(text.contains("ui_port=42222"));
         // A missing file is a no-op success.
         remove_conf_keys(&dir.path().join("nope.conf"), &["tor"]).unwrap();
+    }
+
+    fn os_args(args: &[&str]) -> Vec<std::ffi::OsString> {
+        args.iter().map(std::ffi::OsString::from).collect()
+    }
+
+    #[test]
+    fn data_dir_option_is_removed_in_both_spellings() {
+        for (input, rest) in [
+            (&["--data-dir", "/n", "dashboard.epix"][..], &["dashboard.epix"][..]),
+            (&["--data-dir=/n", "--background"][..], &["--background"][..]),
+            (&["--background", "--data-dir", "/n"][..], &["--background"][..]),
+        ] {
+            let mut args = os_args(input);
+            assert_eq!(
+                take_data_dir_option(&mut args, false).unwrap(),
+                Some(PathBuf::from("/n")),
+                "{input:?}"
+            );
+            assert_eq!(args, os_args(rest), "{input:?}");
+        }
+        let mut args = os_args(&["dashboard.epix"]);
+        assert_eq!(take_data_dir_option(&mut args, false).unwrap(), None);
+        assert_eq!(args, os_args(&["dashboard.epix"]));
+        // Similar names are not the option.
+        let mut args = os_args(&["--data-directory", "/n"]);
+        assert_eq!(take_data_dir_option(&mut args, false).unwrap(), None);
+        assert_eq!(args.len(), 2);
+    }
+
+    #[test]
+    fn leading_data_dir_option_stops_at_the_first_other_argument() {
+        let mut args = os_args(&["--data-dir", "/n", "siteSign", "--data-dir", "x"]);
+        assert_eq!(
+            take_data_dir_option(&mut args, true).unwrap(),
+            Some(PathBuf::from("/n"))
+        );
+        assert_eq!(args, os_args(&["siteSign", "--data-dir", "x"]));
+        let mut args = os_args(&["siteSign", "--data-dir", "x"]);
+        assert_eq!(take_data_dir_option(&mut args, true).unwrap(), None);
+        assert_eq!(args.len(), 3);
+    }
+
+    #[test]
+    fn data_dir_option_rejects_missing_empty_and_repeated_folders() {
+        for input in [
+            &["--data-dir"][..],
+            &["--data-dir="][..],
+            &["--data-dir", ""][..],
+            &["--data-dir", "--background"][..],
+            &["--data-dir", "/a", "--data-dir=/b"][..],
+        ] {
+            let mut args = os_args(input);
+            assert!(take_data_dir_option(&mut args, false).is_err(), "{input:?}");
+        }
     }
 }

@@ -243,3 +243,51 @@ fn explicit_non_unicode_data_directory_supplies_its_own_preferences() {
     fixture.assert_no_launch(&output);
     assert!(!root.join("lock.pid").exists());
 }
+
+#[test]
+fn data_dir_option_selects_the_browser_folder_over_the_environment() {
+    let fixture = Fixture::new();
+    fixture.managed_browser();
+    let chosen = fixture.root.path().join("chosen node");
+    for args in [
+        vec!["--data-dir", "chosen node", "talk.epix"],
+        vec!["talk.epix", "--data-dir=chosen node"],
+    ] {
+        let output = run(fixture.command().args(&args));
+        assert_eq!(output.status.code(), Some(47), "{args:?}: {output:?}");
+        let record = std::fs::read_to_string(fixture.root.path().join("record")).unwrap();
+        let lines = record.lines().collect::<Vec<_>>();
+        // The folder is exported absolute, so a later working directory or a
+        // restart resolves the same place. The option never reaches the browser.
+        assert_eq!(lines[1..], ["1", "talk.epix", chosen.to_str().unwrap()], "{args:?}");
+        std::fs::remove_file(fixture.root.path().join("record")).unwrap();
+    }
+    assert!(!fixture.root.path().join("node/lock.pid").exists());
+}
+
+#[test]
+fn data_dir_option_before_an_action_selects_the_action_folder() {
+    let fixture = Fixture::new();
+    let chosen = fixture.root.path().join("action node");
+    let output = run(fixture.command().args(["--data-dir", "action node", "cryptVerify"]));
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stderr).contains("cryptVerify:"), "{output:?}");
+    assert!(chosen.is_dir(), "the action did not use the chosen folder");
+    fixture.assert_no_launch(&output);
+}
+
+#[test]
+fn incomplete_data_dir_option_fails_before_node_or_browser_start() {
+    let fixture = Fixture::new();
+    fixture.managed_browser();
+    for args in [
+        vec!["talk.epix", "--data-dir"],
+        vec!["--data-dir", "--browser", "epix"],
+        vec!["--data-dir", "a", "--data-dir", "b"],
+    ] {
+        let output = run(fixture.command().args(&args));
+        assert_eq!(output.status.code(), Some(2), "{args:?}: {output:?}");
+        assert!(String::from_utf8_lossy(&output.stderr).contains("--data-dir"), "{output:?}");
+        fixture.assert_no_launch(&output);
+    }
+}

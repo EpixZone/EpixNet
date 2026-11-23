@@ -6930,7 +6930,7 @@ impl AppState {
             .lock()
             .unwrap()
             .clone()
-            .ok_or("The data directory is fixed for this node (set via EPIX_DATA_DIR or the embedding app)")?;
+            .ok_or("The data directory is fixed for this node (set by --data-dir, EPIX_DATA_DIR or the embedding app)")?;
         let current = self.data_root.as_ref().ok_or("This node keeps no data on disk")?
             .canonicalize().map_err(|e| format!("Could not resolve the current data directory: {e}"))?;
         let mut input = new_dir.trim().to_string();

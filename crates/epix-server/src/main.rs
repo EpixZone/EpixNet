@@ -19,16 +19,79 @@ const GEOIP_CITY_GZ: &[u8] = include_bytes!("../assets/dbip-city-lite.mmdb.gz");
 /// chain name resolution being reachable.
 const DEFAULT_DASHBOARD: &str = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 
-#[tokio::main]
-async fn main() {
+fn main() {
+    let mut args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // The data folder is chosen first, while this is the only thread: it is
+    // exported as EPIX_DATA_DIR for this process and the ones it starts.
+    if let Err(error) =
+        data_dir_option(&mut args).and_then(epix_ui::paths::apply_launch_data_dir)
+    {
+        eprintln!("{error}. Use epix-server --help for usage.");
+        std::process::exit(2);
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .unwrap_or_else(|error| {
+            eprintln!("Cannot start the async runtime: {error}");
+            std::process::exit(1);
+        });
+    runtime.block_on(run(args));
+}
+
+/// `--data-dir` may appear anywhere in a node launch, but only before an
+/// action name, so an action's own arguments keep their meaning.
+fn data_dir_option(
+    args: &mut Vec<std::ffi::OsString>,
+) -> Result<Option<std::path::PathBuf>, String> {
+    let leading = epix_ui::paths::take_data_dir_option(args, true)?;
+    let action = args.first().and_then(|arg| arg.to_str()).is_some_and(actions::is_action);
+    if action {
+        return Ok(leading);
+    }
+    match (leading, epix_ui::paths::take_data_dir_option(args, false)?) {
+        (Some(_), Some(_)) => Err("Specify --data-dir only once".into()),
+        (leading, later) => Ok(leading.or(later)),
+    }
+}
+
+fn print_help() {
+    println!("epix-server {}", env!("EPIX_VERSION"));
+    println!("Usage: epix-server [options] [xite address | name.epix | epix://link]");
+    println!("       epix-server [--data-dir <folder>] <action> [args...]");
+    println!();
+    println!("Options:");
+    println!("  --data-dir <folder>    Keep xites, keys and settings in <folder>.");
+    println!("                         Overrides EPIX_DATA_DIR. Default folder:");
+    println!("                         {}", epix_ui::paths::default_data_root().display());
+    println!("  --browser epix|system  Open the EpixNet Browser or your system browser.");
+    println!("                         Order: --browser, EPIX_BROWSER, saved setting, epix.");
+    println!("  -V, --version          Print the version.");
+    println!();
+    println!("Actions: siteCreate, siteSign, sitePublish, siteVerify, siteList,");
+    println!("         siteDelete, siteDownload, siteSignMessage, dbRebuild, dbQuery,");
+    println!("         importBundle,");
+    println!("         cryptSign, cryptVerify, cryptGetPrivatekey,");
+    println!("         cryptPrivatekeyToAddress, peerPing, siteCmd");
+    println!();
+    println!("Environment:");
+    println!("  EPIX_DATA_DIR   Data folder, the same as --data-dir.");
+    println!("  EPIX_UI_ADDR    Dashboard address. Default 127.0.0.1:42222.");
+    println!("  EPIX_HEADLESS   1 serves the network without opening a browser.");
+    println!("  EPIX_TOR        Node Tor mode: enable, disable or always.");
+    println!("  EPIX_BROWSER    epix or system, like --browser.");
+    println!("A saved open_browser=false setting also stops automatic opening.");
+}
+
+async fn run(args: Vec<std::ffi::OsString>) {
     // CLI actions (siteCreate, siteSign, peerPing, ...) run and exit; the
     // action name is the first argument, Python-CLI style. Anything else is
     // a xite target and starts the node. argv[0] is skipped, never trusted.
     // args_os, not args: args() PANICS on a non-Unicode argument, and this
     // CLI takes file paths (importBundle) that need not be valid UTF-8 -
     // fail those with a clean usage error instead.
-    let cli: Vec<String> = match std::env::args_os()
-        .skip(1)
+    let cli: Vec<String> = match args
+        .into_iter()
         .map(std::ffi::OsString::into_string)
         .collect::<Result<Vec<_>, _>>()
     {
@@ -42,19 +105,7 @@ async fn main() {
     // a xite target and boot a full node against the real data dir.
     match cli.first().map(String::as_str) {
         Some("-h") | Some("--help") | Some("help") => {
-            println!("epix-server {}", env!("EPIX_VERSION"));
-            println!("Usage: epix-server [--browser epix|system] [xite address | name.epix | epix://link]");
-            println!("       epix-server <action> [args...]");
-            println!();
-            println!("Actions: siteCreate, siteSign, sitePublish, siteVerify, siteList,");
-            println!("         siteDelete, siteDownload, siteSignMessage, dbRebuild, dbQuery,");
-            println!("         importBundle,");
-            println!("         cryptSign, cryptVerify, cryptGetPrivatekey,");
-            println!("         cryptPrivatekeyToAddress, peerPing, siteCmd");
-            println!();
-            println!("Env: EPIX_DATA_DIR, EPIX_UI_ADDR, EPIX_HEADLESS, EPIX_TOR, EPIX_BROWSER");
-            println!("Browser: --browser > EPIX_BROWSER > saved browser setting > epix");
-            println!("EPIX_HEADLESS or saved open_browser=false disables automatic opening.");
+            print_help();
             return;
         }
         Some("-V") | Some("--version") => {
