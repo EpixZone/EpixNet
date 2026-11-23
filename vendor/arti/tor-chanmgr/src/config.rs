@@ -275,12 +275,7 @@ impl std::fmt::Display for ProxyProtocol {
                     let (user_encoded, pass_encoded) =
                         encode_userinfo_http(*addr, &auth.username, auth.password.as_deref())
                             .unwrap_or_else(|| {
-                                // Fallback: use url crate to percent-encode directly
-                                debug_assert!(
-                                    false,
-                                    "encode_userinfo_http failed for addr={}, user={}",
-                                    addr, auth.username
-                                );
+                                // Keep credentials out of diagnostics when falling back.
                                 let encoded_user = percent_encode_userinfo(&auth.username);
                                 let encoded_pass =
                                     auth.password.as_ref().map(|p| percent_encode_userinfo(p));
