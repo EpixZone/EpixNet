@@ -121,8 +121,8 @@ features = [
 [dependencies.glob-match]
 version = "0.2.1"
 
-[dependencies.humantime]
-version = "2"
+[dependencies.tor-time-format]
+version = "0.1.0"
 
 [dependencies.inventory]
 version = "0.3.13"
@@ -195,8 +195,8 @@ version = "0.3.0"
 [dependencies.zeroize]
 version = "1"
 
-[dev-dependencies.paste]
-version = "1.0.3"
+[dev-dependencies.pastey]
+version = "0.2.3"
 
 [dev-dependencies.serde_json]
 version = "1.0.104"

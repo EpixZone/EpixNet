@@ -533,7 +533,7 @@ pub mod deps {
     pub use derive_deftly_template_Ed25519Keypair;
     pub use derive_deftly_template_RsaKeypair;
     pub use derive_more;
-    pub use paste::paste;
+    pub use pastey::paste;
     pub use signature;
     pub use tor_llcrypto::pk::{ValidatableSignature, curve25519, ed25519, rsa};
 }

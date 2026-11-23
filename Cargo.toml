@@ -1,7 +1,32 @@
 [workspace]
 resolver = "2"
-exclude = ["vendor/tor-keymgr", "vendor/tor-key-forge", "vendor/tor-llcrypto", "vendor/rln", "vendor/ark-relations", "vendor/ark-crypto-primitives", "vendor/rdrand", "vendor/askama_derive", "vendor/saturating-time", "vendor/reticulum", "vendor/rusqlite", "vendor/muda"]
-members = ["crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/epix-ui", "crates/epix-server", "crates/epix-chain", "crates/epix-dht", "crates/epix-dht-net", "crates/epix-reticulum", "crates/epix-propagation", "crates/epix-runtime", "crates/epix-user", "crates/epix-peer", "crates/epix-plugin", "crates/epix-plugins", "crates/epix-tor", "crates/epix-i2p", "crates/epix-node", "crates/iptproxy-sys", "crates/epix-ffi", "crates/epix-browser", "crates/epix-browser-net", "crates/epix-nmh", "crates/epix-build", "crates/epix-bt", "crates/xid-spike", "crates/epix-blob", "crates/epix-fs", "crates/epix-selfenc", "crates/epix-edx", "crates/epix-feed", "crates/epix-search", "crates/epix-envelope", "crates/epix-channel", "crates/epix-pairwise-engine", "crates/epix-group-engine", "crates/epix-rln", "crates/evx-api", "crates/evx-runtime", "crates/evx-worker", "crates/evx-supervisor", "crates/evx-state", "crates/evx-activation", "crates/evx-host", "crates/evx-workspace", "crates/evx-declaration", "crates/epix-evx", "crates/evx-windows", "crates/evx-android", "crates/evx-windows-native"]
+exclude = [
+    "vendor/arti/arti-client",
+    "vendor/arti/pwd-grp",
+    "vendor/arti/retry-error",
+    "vendor/arti/slotmap-careful",
+    "vendor/arti/tor-basic-utils",
+    "vendor/arti/tor-cell",
+    "vendor/arti/tor-checkable",
+    "vendor/arti/tor-circmgr",
+    "vendor/arti/tor-config",
+    "vendor/arti/tor-dircommon",
+    "vendor/arti/tor-dirmgr",
+    "vendor/arti/tor-error",
+    "vendor/arti/tor-guardmgr",
+    "vendor/arti/tor-hscrypto",
+    "vendor/arti/tor-hsservice",
+    "vendor/arti/tor-log-ratelim",
+    "vendor/arti/tor-memquota",
+    "vendor/arti/tor-memquota-cost",
+    "vendor/arti/tor-netdir",
+    "vendor/arti/tor-netdoc",
+    "vendor/arti/tor-persist",
+    "vendor/arti/tor-protover",
+    "vendor/arti/tor-rtcompat",
+    "vendor/arti/tor-rtmock",
+    "vendor/tor-keymgr", "vendor/tor-key-forge", "vendor/tor-llcrypto", "vendor/rln", "vendor/ark-relations", "vendor/ark-crypto-primitives", "vendor/rdrand", "vendor/askama_derive", "vendor/saturating-time", "vendor/reticulum", "vendor/rusqlite", "vendor/muda"]
+members = ["vendor/arti/tor-time-format", "crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crates/epix-db", "crates/epix-content", "crates/epix-transport", "crates/epix-protocol", "crates/epix-discovery", "crates/epix-xite", "crates/epix-worker", "crates/epix-ui", "crates/epix-server", "crates/epix-chain", "crates/epix-dht", "crates/epix-dht-net", "crates/epix-reticulum", "crates/epix-propagation", "crates/epix-runtime", "crates/epix-user", "crates/epix-peer", "crates/epix-plugin", "crates/epix-plugins", "crates/epix-tor", "crates/epix-i2p", "crates/epix-node", "crates/iptproxy-sys", "crates/epix-ffi", "crates/epix-browser", "crates/epix-browser-net", "crates/epix-nmh", "crates/epix-build", "crates/epix-bt", "crates/xid-spike", "crates/epix-blob", "crates/epix-fs", "crates/epix-selfenc", "crates/epix-edx", "crates/epix-feed", "crates/epix-search", "crates/epix-envelope", "crates/epix-channel", "crates/epix-pairwise-engine", "crates/epix-group-engine", "crates/epix-rln", "crates/evx-api", "crates/evx-runtime", "crates/evx-worker", "crates/evx-supervisor", "crates/evx-state", "crates/evx-activation", "crates/evx-host", "crates/evx-workspace", "crates/evx-declaration", "crates/epix-evx", "crates/evx-windows", "crates/evx-android", "crates/evx-windows-native"]
 
 # saturating-time 0.5.0 hangs forever on Windows: its platform-limit search
 # assumes 1ns clock granularity, but Windows SystemTime is a 100ns FILETIME, so
@@ -9,6 +34,32 @@ members = ["crates/epix-mirror", "crates/epix-core", "crates/epix-crypt", "crate
 # Tor bootstrap on Windows. Port the existing 0.4.1 fork fix to the 0.5 version
 # required by Arti 0.47. See vendor/saturating-time/EPIXNET_PATCH.md.
 [patch.crates-io]
+# Arti package revisions and dependency updates are recorded in vendor/arti/EPIXNET_PATCH.md.
+arti-client = { path = "vendor/arti/arti-client" }
+pwd-grp = { path = "vendor/arti/pwd-grp" }
+retry-error = { path = "vendor/arti/retry-error" }
+slotmap-careful = { path = "vendor/arti/slotmap-careful" }
+tor-basic-utils = { path = "vendor/arti/tor-basic-utils" }
+tor-cell = { path = "vendor/arti/tor-cell" }
+tor-checkable = { path = "vendor/arti/tor-checkable" }
+tor-circmgr = { path = "vendor/arti/tor-circmgr" }
+tor-config = { path = "vendor/arti/tor-config" }
+tor-dircommon = { path = "vendor/arti/tor-dircommon" }
+tor-dirmgr = { path = "vendor/arti/tor-dirmgr" }
+tor-error = { path = "vendor/arti/tor-error" }
+tor-guardmgr = { path = "vendor/arti/tor-guardmgr" }
+tor-hscrypto = { path = "vendor/arti/tor-hscrypto" }
+tor-hsservice = { path = "vendor/arti/tor-hsservice" }
+tor-log-ratelim = { path = "vendor/arti/tor-log-ratelim" }
+tor-memquota = { path = "vendor/arti/tor-memquota" }
+tor-memquota-cost = { path = "vendor/arti/tor-memquota-cost" }
+tor-netdir = { path = "vendor/arti/tor-netdir" }
+tor-netdoc = { path = "vendor/arti/tor-netdoc" }
+tor-persist = { path = "vendor/arti/tor-persist" }
+tor-protover = { path = "vendor/arti/tor-protover" }
+tor-rtcompat = { path = "vendor/arti/tor-rtcompat" }
+tor-rtmock = { path = "vendor/arti/tor-rtmock" }
+tor-time-format = { path = "vendor/arti/tor-time-format" }
 saturating-time = { path = "vendor/saturating-time" }
 # Use RustCrypto RSA 0.10 for Arti's Tor verification and SSH keystore adapters.
 tor-key-forge = { path = "vendor/tor-key-forge" }

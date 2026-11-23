@@ -118,7 +118,7 @@ pub(crate) mod ssh_keys {
             PRIV => { $($(#[ $docs_and_attrs_priv:meta ])* $basename_priv:literal,)* }
         ) => {
             $(
-                paste::paste! {
+                pastey::paste! {
                     define_key_consts!(
                         @ $(#[ $docs_and_attrs ])*
                         [< $basename:upper _PUB >], $basename, ".public"
@@ -127,7 +127,7 @@ pub(crate) mod ssh_keys {
             )*
 
             $(
-                paste::paste! {
+                pastey::paste! {
                     define_key_consts!(
                         @ $(#[ $docs_and_attrs_priv ])*
                         [< $basename_priv:upper >], $basename_priv, ".private"

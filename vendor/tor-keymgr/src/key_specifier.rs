@@ -727,7 +727,7 @@ mod test {
 
     use crate::test_utils::check_key_specifier;
     use derive_deftly::Deftly;
-    use humantime::parse_rfc3339;
+    use tor_time_format::parse_rfc3339;
     use itertools::Itertools;
     use serde::{Deserialize, Serialize};
     use std::fmt::Debug;

@@ -66,8 +66,8 @@ features = ["full"]
 [dependencies.downcast-rs]
 version = "2.0.1"
 
-[dependencies.paste]
-version = "1.0.3"
+[dependencies.pastey]
+version = "0.2.3"
 
 [dependencies.rand]
 version = "0.10.1"
