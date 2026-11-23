@@ -93,6 +93,9 @@ impl fmt::Display for Timestamp {
             .map_err(|_| fmt::Error)?;
         let secs = i64::try_from(duration.as_secs()).map_err(|_| fmt::Error)?;
         let utc = OffsetDateTime::from_unix_timestamp(secs).map_err(|_| fmt::Error)?;
+        if utc.year() > 9999 {
+            return Err(fmt::Error);
+        }
         write!(
             out,
             "{}T{:02}:{:02}:{:02}",

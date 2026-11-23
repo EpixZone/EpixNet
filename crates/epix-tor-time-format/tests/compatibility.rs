@@ -186,3 +186,16 @@ fn maximum_timestamp_respects_the_target_clock() {
         assert!(parse_rfc3339(last_utc_second).is_err());
     }
 }
+
+#[test]
+fn invalid_system_times_return_serialization_errors() {
+    let before_epoch = UNIX_EPOCH - Duration::from_secs(1);
+    assert!(
+        tor_time_format::serde::serialize(&before_epoch, serde_json::value::Serializer).is_err()
+    );
+    assert!(tor_time_format::serde::option::serialize(
+        &Some(before_epoch),
+        serde_json::value::Serializer
+    )
+    .is_err());
+}

@@ -30,8 +30,16 @@ impl TimeText for SystemTime {
     }
 }
 
+fn encode<T: TimeText>(value: T) -> Result<String, fmt::Error> {
+    let mut text = String::new();
+    fmt::write(&mut text, format_args!("{}", value.formatted()))?;
+    Ok(text)
+}
+
 pub fn serialize<S: Serializer, T: TimeText>(value: &T, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.collect_str(&value.formatted())
+    encode(*value)
+        .map_err(::serde::ser::Error::custom)?
+        .serialize(serializer)
 }
 
 pub fn deserialize<'de, D: Deserializer<'de>, T: TimeText>(deserializer: D) -> Result<T, D::Error> {
@@ -47,7 +55,9 @@ pub mod option {
         serializer: S,
     ) -> Result<S::Ok, S::Error> {
         value
-            .map(|time| time.formatted().to_string())
+            .map(encode)
+            .transpose()
+            .map_err(::serde::ser::Error::custom)?
             .serialize(serializer)
     }
 
