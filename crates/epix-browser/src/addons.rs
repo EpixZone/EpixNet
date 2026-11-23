@@ -371,7 +371,7 @@ mod tests {
         let id = "a".repeat(64);
         assert!(preflight(&firefox, &profile, &id).is_ok());
         let root = resources(&firefox).unwrap();
-        std::fs::write(root.join("application.ini"), "Version=153.5.1\n").unwrap();
+        std::fs::write(root.join("application.ini"), "Version=153.7.0\n").unwrap();
         assert!(preflight(&firefox, &profile, &id).is_ok());
         std::fs::write(root.join("application.ini"), "Version=154.0\n").unwrap();
         assert!(preflight(&firefox, &profile, &id).is_err());

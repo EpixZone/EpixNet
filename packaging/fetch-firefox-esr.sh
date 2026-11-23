@@ -12,9 +12,9 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # Pin the release: firefox-esr-latest can still select the previous ESR series
 # during Mozilla's overlap period, leaving new bundles on the retiring branch.
-VERSION="${EPIX_FF_VERSION:-153.4.0esr}"
+VERSION="${EPIX_FF_VERSION:-153.7.0esr}"
 if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?esr$ ]]; then
-  echo "invalid EPIX_FF_VERSION '$VERSION' (expected a release such as 153.4.0esr)" >&2
+  echo "invalid EPIX_FF_VERSION '$VERSION' (expected a release such as 153.7.0esr)" >&2
   exit 1
 fi
 OS="${1:-osx}"

@@ -100,7 +100,7 @@ done
         ):
             with self.subTest(platform=platform, arch=arch):
                 result = self.fetch(platform, EPIX_ARCH=arch)
-                self.assert_download(result, "firefox-153.4.0esr-ssl", mozilla)
+                self.assert_download(result, "firefox-153.7.0esr-ssl", mozilla)
 
     def test_explicit_esr_override_and_language_apply_to_every_platform(self):
         for platform, mozilla in (("osx", "osx"), ("win64", "win64"), ("linux", "linux64")):
@@ -130,11 +130,11 @@ done
 
     def test_cached_linux_runtime_can_be_reused_offline_but_default_still_downloads(self):
         env = {"EPIX_ARCH": "x86_64"}
-        self.assert_download(self.fetch("linux", "--if-needed", **env), "firefox-153.4.0esr-ssl", "linux64")
+        self.assert_download(self.fetch("linux", "--if-needed", **env), "firefox-153.7.0esr-ssl", "linux64")
         offline = self.fetch("linux", "--if-needed", **env, EPIX_TEST_HTTP_FAILURE="1")
         self.assertEqual(offline.returncode, 0, offline.stderr)
         self.assertFalse(self.capture.exists())
-        self.assert_download(self.fetch("linux", **env), "firefox-153.4.0esr-ssl", "linux64")
+        self.assert_download(self.fetch("linux", **env), "firefox-153.7.0esr-ssl", "linux64")
         self.assertEqual({p.name for p in (self.out / "firefox").iterdir()}, {"firefox", "libxul.so"})
 
     def test_changed_linux_version_language_or_architecture_requires_a_fetch(self):
@@ -154,7 +154,7 @@ done
         for name in ("firefox", "libxul.so"):
             with self.subTest(name=name):
                 (self.out / "firefox" / name).unlink()
-                self.assert_download(self.fetch("linux", "--if-needed", **env), "firefox-153.4.0esr-ssl", "linux64")
+                self.assert_download(self.fetch("linux", "--if-needed", **env), "firefox-153.7.0esr-ssl", "linux64")
 
     def test_cached_concurrent_calls_make_one_download(self):
         log = self.root / "curl-calls"
