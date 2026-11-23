@@ -118,7 +118,7 @@ jobs:
       - name: Fetch Firefox ESR to bundle
         shell: bash
         run: packaging/fetch-firefox-esr.sh win64
-      - name: Build installer (unsigned)
+      - name: Build installer and portable zip (unsigned)
         shell: bash
         env:
           EPIX_BUNDLE_FIREFOX: ${{ github.workspace }}/packaging/firefox-esr/firefox
@@ -128,4 +128,6 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: epix-windows-unsigned
-          path: dist/Epix-Setup-*.exe
+          path: |
+            dist/Epix-Setup-*.exe
+            dist/EpixNet-Portable-*-x64.zip
