@@ -36,7 +36,8 @@ zip = { version = "9", default-features = false, features = ["deflate"] }
 # event loop the tray needs; `image` decodes the embedded PNG icon. All
 # best-effort - the launcher falls back to no-tray when the host can't show one.
 tray-icon = "0.26"
-tao = "0.37"
+# The GTK 0.19 migration is upstream of the latest Tao release.
+tao = { git = "https://github.com/tauri-apps/tao", rev = "c89d64c517cb176c07547360bb6b809c2c91d41f" }
 image = { version = "0.25", default-features = false, features = ["png"] }
 
 # Windows: register the native-messaging host via the registry; console
@@ -73,7 +74,7 @@ objc2-app-kit = { version = "0.3", default-features = false, features = [
 objc2-quartz-core = { version = "0.3", default-features = false, features = ["std", "CAAnimation", "CALayer", "CAMediaTiming", "CAMediaTimingFunction", "objc2-core-foundation"] }
 
 [target.'cfg(all(unix, not(target_os = "macos")))'.dependencies]
-gtk = "0.18"
+gtk = "0.19"
 
 # build.rs downloads the prebuilt wallet extension (the epix-wallet repo's
 # wallet-dist release) into shells/wallet-ext when it is not staged locally.
