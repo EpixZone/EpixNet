@@ -201,6 +201,8 @@ version = "1.0.103"
 features = ["derive"]
 
 [dependencies.serde_with]
+default-features = false
+features = ["macros"]
 version = "3.0.0"
 
 [dependencies.signature]

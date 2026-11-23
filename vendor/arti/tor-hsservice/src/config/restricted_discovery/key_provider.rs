@@ -11,7 +11,6 @@ use derive_more::{AsRef, Into};
 use fs_mistrust::{CheckedDir, Mistrust, MistrustBuilder};
 
 use amplify::Getters;
-use serde_with::DisplayFromStr;
 
 use tor_config::define_list_builder_helper;
 use tor_config::derive::prelude::*;
@@ -23,13 +22,9 @@ use tor_hscrypto::pk::HsClientDescEncKeyParseError;
 use tor_persist::slug::BadSlug;
 
 /// A static mapping from [`HsClientNickname`] to client discovery keys.
-#[serde_with::serde_as]
 #[derive(Default, Debug, Clone, Eq, PartialEq)] //
 #[derive(Into, From, AsRef, Serialize, Deserialize)]
-pub struct StaticKeyProvider(
-    #[serde_as(as = "BTreeMap<DisplayFromStr, DisplayFromStr>")]
-    BTreeMap<HsClientNickname, HsClientDescEncKey>,
-);
+pub struct StaticKeyProvider(BTreeMap<HsClientNickname, HsClientDescEncKey>);
 
 define_list_builder_helper! {
     #[derive(Eq, PartialEq)]
@@ -259,4 +254,37 @@ pub(super) enum DirectoryKeyProviderError {
         #[source]
         err: HsClientDescEncKeyParseError,
     },
+}
+
+#[cfg(test)]
+mod test {
+    use super::StaticKeyProvider;
+
+    fn descriptor(fill: char) -> String {
+        format!("descriptor:x25519:{}A", fill.to_string().repeat(51))
+    }
+
+    #[test]
+    fn canonical_authorized_client_map_roundtrips() {
+        let key = descriptor('A');
+        let lower = key.to_ascii_lowercase();
+        let input = format!(r#"{{"z":"{lower}","a":"{key}"}}"#);
+        let parsed: StaticKeyProvider = serde_json::from_str(&input).unwrap();
+        let canonical = format!(r#"{{"a":"{key}","z":"{key}"}}"#);
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), canonical);
+        let empty: StaticKeyProvider = serde_json::from_str("{}").unwrap();
+        assert_eq!(serde_json::to_string(&empty).unwrap(), "{}");
+    }
+
+    #[test]
+    fn invalid_strings_rejected_and_duplicate_nicknames_keep_the_last() {
+        let key = descriptor('A');
+        let other = descriptor('B');
+        let duplicates = format!(r#"{{"a":"{key}","a":"{other}"}}"#);
+        let parsed: StaticKeyProvider = serde_json::from_str(&duplicates).unwrap();
+        assert_eq!(serde_json::to_string(&parsed).unwrap(), format!(r#"{{"a":"{other}"}}"#));
+        for bad in [format!(r#"{{"../bad":"{key}"}}"#), format!(r#"{{"a":"bad","a":"{key}"}}"#)] {
+            assert!(serde_json::from_str::<StaticKeyProvider>(&bad).is_err());
+        }
+    }
 }

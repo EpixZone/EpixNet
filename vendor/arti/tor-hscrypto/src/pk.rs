@@ -568,7 +568,7 @@ define_pk_keypair! {
 /// // The keys are identical
 /// assert_eq!(key1, key2);
 /// ```
-#[derive(Deftly)]
+#[derive(Deftly, serde_with::SerializeDisplay, serde_with::DeserializeFromStr)]
 #[derive_deftly(ConstantTimeEq, PartialEqFromCtEq)]
 pub struct HsClientDescEncKey(curve25519::PublicKey) /
 

@@ -12,6 +12,8 @@ The root application and fuzz workspaces provide their dependency locks.
   macro paths and names are preserved for callers.
 * Time formatting, parsing and Serde in Arti use the local `tor-time-format` package.
   Config files, guard state and onion-service records retain their wire formats.
+* Serde derives for public onion-service discovery keys use their existing string
+  representation. The Arti consumers select only the `serde_with` macros they use.
 * `tor-key-forge` and `tor-keymgr` are already under `vendor/` with the RSA migration.
   The remaining published packages in the table are under `vendor/arti/`.
 
@@ -29,6 +31,7 @@ authority certificate from the simulated relay's keys directory is used.
 | slotmap-careful | 0.9.0 | `7dae6673c710ab011fc8d2ff604b16201df0a59f943976d911d83bbac2a1854f` |
 | tor-basic-utils | 0.47.0 | `e44c7b006f22966d44a2a0a6c1ee71e472c62182c7f0460077df3294d52f23c4` |
 | tor-cell | 0.47.0 | `b2d6398fd085306de5af739899d0390674b8646d4ff6cfb69d65f40a5f9d88da` |
+| tor-chanmgr | 0.47.0 | `431ba53bf020ea8681ef0c2fbf0f0f854997fca9afe1b2c081f41f14ec00cf5d` |
 | tor-checkable | 0.47.0 | `e58a50a2dbf5d21758c9e2dbaaf085403670b8bf52475c815dd1185698b7af9a` |
 | tor-circmgr | 0.47.0 | `8b6b55747c690e0c931c5a081640ffdca6d1003c01b57b8102afcbdbaf3ec3fd` |
 | tor-config | 0.47.0 | `b849c69c695b9534cf945c0422b85eaf5760bb6141a73c47b72fd6f95ea4d719` |
@@ -40,6 +43,7 @@ authority certificate from the simulated relay's keys directory is used.
 | tor-hsservice | 0.47.0 | `55809560d9295dcc2ee77002c5a4275d1f5f5a54203de7cd6acb52215f5344bd` |
 | tor-key-forge | 0.47.0 | `5534581a7f347ffcade7ea32ecccdbc035d36468bc8c03b0dce83363b6d41801` |
 | tor-keymgr | 0.47.0 | `e269210a2ba305bf6524990a3c37aab4529b92a01f3d15ef6af23c067c8eb2c4` |
+| tor-linkspec | 0.47.0 | `d287978bd5e1ffbe7ca2eb8daadb4e06e42d084bdad26bea4d4bbe1ff877e10f` |
 | tor-log-ratelim | 0.47.0 | `2096a87f0691f0781bf564249c524d62b5338c3954ba1c6ef10ec90df1d97733` |
 | tor-memquota | 0.47.0 | `96853fc516264fe2ebefbe40d276b6a3b84e15fc08b74fd7a85e2c5df9f11c37` |
 | tor-memquota-cost | 0.47.0 | `f5e5712bfe2995a60eddcc32d07e2e38a42120318a8f5411d621bf0a8fa77219` |

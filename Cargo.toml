@@ -7,6 +7,7 @@ exclude = [
     "vendor/arti/slotmap-careful",
     "vendor/arti/tor-basic-utils",
     "vendor/arti/tor-cell",
+    "vendor/arti/tor-chanmgr",
     "vendor/arti/tor-checkable",
     "vendor/arti/tor-circmgr",
     "vendor/arti/tor-config",
@@ -16,6 +17,7 @@ exclude = [
     "vendor/arti/tor-guardmgr",
     "vendor/arti/tor-hscrypto",
     "vendor/arti/tor-hsservice",
+    "vendor/arti/tor-linkspec",
     "vendor/arti/tor-log-ratelim",
     "vendor/arti/tor-memquota",
     "vendor/arti/tor-memquota-cost",
@@ -41,6 +43,7 @@ retry-error = { path = "vendor/arti/retry-error" }
 slotmap-careful = { path = "vendor/arti/slotmap-careful" }
 tor-basic-utils = { path = "vendor/arti/tor-basic-utils" }
 tor-cell = { path = "vendor/arti/tor-cell" }
+tor-chanmgr = { path = "vendor/arti/tor-chanmgr" }
 tor-checkable = { path = "vendor/arti/tor-checkable" }
 tor-circmgr = { path = "vendor/arti/tor-circmgr" }
 tor-config = { path = "vendor/arti/tor-config" }
@@ -50,6 +53,7 @@ tor-error = { path = "vendor/arti/tor-error" }
 tor-guardmgr = { path = "vendor/arti/tor-guardmgr" }
 tor-hscrypto = { path = "vendor/arti/tor-hscrypto" }
 tor-hsservice = { path = "vendor/arti/tor-hsservice" }
+tor-linkspec = { path = "vendor/arti/tor-linkspec" }
 tor-log-ratelim = { path = "vendor/arti/tor-log-ratelim" }
 tor-memquota = { path = "vendor/arti/tor-memquota" }
 tor-memquota-cost = { path = "vendor/arti/tor-memquota-cost" }

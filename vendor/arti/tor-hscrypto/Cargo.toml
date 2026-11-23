@@ -130,6 +130,11 @@ version = "0.10.1"
 [dependencies.safelog]
 version = "0.10.0"
 
+[dependencies.serde_with]
+version = "3.0.0"
+default-features = false
+features = ["macros"]
+
 [dependencies.serde]
 version = "1.0.103"
 features = ["derive"]
