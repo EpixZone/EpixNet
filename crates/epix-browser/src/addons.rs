@@ -30,6 +30,14 @@ const MODULES: &[(&str, &[u8])] = &[
         include_bytes!("../../../packaging/firefox-addons/theme.sys.mjs"),
     ),
     (
+        "distribution/epix-addon-installer/welcome.sys.mjs",
+        include_bytes!("../../../packaging/firefox-addons/welcome.sys.mjs"),
+    ),
+    (
+        "distribution/epix-addon-installer/welcome.png",
+        include_bytes!("../../../packaging/linux/icons/epix-128.png"),
+    ),
+    (
         "distribution/epix-addon-installer/theme/manifest.json",
         include_bytes!("../../../shells/epix-theme/manifest.json"),
     ),
@@ -373,8 +381,8 @@ mod tests {
         assert!(preflight(&firefox, &profile, &id).is_err());
     }
     #[test]
-    fn packaged_theme_resources_must_match_the_launcher() {
-        for name in ["theme.sys.mjs", "theme/manifest.json"] {
+    fn packaged_branding_resources_must_match_the_launcher() {
+        for name in ["theme.sys.mjs", "theme/manifest.json", "welcome.sys.mjs", "welcome.png"] {
             let (_temp, firefox, profile) = fixture();
             let id = "a".repeat(64);
             let path = resources(&firefox)
