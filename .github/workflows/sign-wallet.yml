@@ -11,6 +11,10 @@ on:
         description: Submit to Mozilla using configured publisher credentials
         type: boolean
         default: false
+      reviewed_warnings:
+        description: Use the publisher review for the six warnings in wallet 0.13.41.1
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -23,6 +27,7 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_INCREMENTAL: "0"
       CARGO_BUILD_JOBS: "2"
+      WALLET_REVIEW_FLAG: ${{ inputs.reviewed_warnings && '--reviewed-warnings' || '--no-reviewed-warnings' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
@@ -60,13 +65,13 @@ jobs:
           python3 packaging/firefox-wallet/test-signing.py
           python3 packaging/firefox-wallet/prepare.py --browser "$PWD/target/debug/epix-browser" --wallet-source "$PWD/signing-wallet-source" --wallet-archive "$RUNNER_TEMP/wallet-input/epix-wallet-firefox.zip" --version "$WALLET_VERSION" --output "$RUNNER_TEMP/wallet-prepared"
       - name: Check Mozilla submission requirements and retain the lint report
-        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --lint-only
+        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --lint-only "$WALLET_REVIEW_FLAG"
       - name: Submit to Mozilla for self-distribution
         if: ${{ inputs.submit_to_mozilla }}
         env:
           WEB_EXT_API_KEY: ${{ secrets.AMO_JWT_ISSUER }}
           WEB_EXT_API_SECRET: ${{ secrets.AMO_JWT_SECRET }}
-        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --output "$RUNNER_TEMP/wallet-returned"
+        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --output "$RUNNER_TEMP/wallet-returned" "$WALLET_REVIEW_FLAG"
       - name: Retain prepared inputs and any returned XPI for verification
         if: ${{ always() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
