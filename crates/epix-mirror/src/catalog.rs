@@ -11,6 +11,8 @@ use std::{
     fmt,
 };
 
+use time::format_description::well_known::Rfc3339;
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct FileInfo {
@@ -129,11 +131,11 @@ pub(crate) fn valid_digest(value: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 pub fn timestamp(value: &str) -> Result<i64> {
-    Ok(chrono::DateTime::parse_from_rfc3339(value)?.timestamp())
+    Ok(time::OffsetDateTime::parse(value, &Rfc3339)?.unix_timestamp())
 }
 pub fn fresh(catalog: &Catalog) -> Result<()> {
     ensure!(
-        timestamp(&catalog.expires)? > chrono::Utc::now().timestamp(),
+        timestamp(&catalog.expires)? > time::OffsetDateTime::now_utc().unix_timestamp(),
         "Snapshot expired; obtain a fresh signed snapshot"
     );
     Ok(())

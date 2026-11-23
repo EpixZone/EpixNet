@@ -6,7 +6,6 @@ description = "Verified signed-xite package snapshots for standard package manag
 
 [dependencies]
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 epix-crypt = { path = "../epix-crypt" }
 epix-fs = { path = "../epix-fs" }
 flate2 = "1"
@@ -20,6 +19,7 @@ serde_json = "1"
 sha2 = "0.11"
 socket2 = "0.6"
 tempfile = "3"
+time = { version = "0.3", features = ["formatting", "parsing"] }
 zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 
 [target.'cfg(unix)'.dependencies]

@@ -9,7 +9,8 @@ description = "EDX verified blob core: BLAKE3/bao outboard trees, verified range
 # golden vectors in tests/ and a deliberate spec revision.
 [dependencies]
 blake3 = "=1.8.7"
-bao-tree = "=0.17.0"
+# Upstream 0.17.0 plus the manifest-only removal of unused generator macros.
+bao-tree = { version = "=0.17.0", git = "https://github.com/n0-computer/bao-tree", rev = "d50f2b2ce4b2477f9c7bfa3c452914b9bc66b334" }
 positioned-io = "=0.3.5"
 # default-features off: postcard's default heapless support drags the
 # unmaintained atomic-polyfill (RUSTSEC-2023-0089); we only need std.

@@ -4,6 +4,7 @@ use roxmltree::{Document, Node, ParsingOptions};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
 use std::path::Path;
+use time::format_description::well_known::Rfc2822;
 
 use crate::FileInfo;
 const METADATA_LIMIT: u64 = 64 * 1024 * 1024;
@@ -185,11 +186,11 @@ fn expiry(release: &Fields, expires: i64) -> Result<()> {
             .strip_suffix(" UTC")
             .map(|v| format!("{v} +0000"))
             .unwrap_or_else(|| value.clone());
-        let until = chrono::DateTime::parse_from_rfc2822(&date)
+        let until = time::OffsetDateTime::parse(&date, &Rfc2822)
             .context("Invalid APT Valid-Until")?
-            .timestamp();
+            .unix_timestamp();
         ensure!(
-            until > chrono::Utc::now().timestamp(),
+            until > time::OffsetDateTime::now_utc().unix_timestamp(),
             "Upstream APT Release is expired"
         );
         ensure!(
@@ -468,10 +469,13 @@ mod tests {
         let mut f = Fixture::new();
         f.apt("Valid-Until: Fri, 01 Jan 2021 00:00:00 UTC\n");
         assert!(validate("apt", f.dir.path(), &f.files, 1).is_err());
-        let future = chrono::Utc::now() + chrono::Duration::days(1);
-        f.apt(&format!("Valid-Until: {}\n", future.to_rfc2822()));
-        validate("apt", f.dir.path(), &f.files, future.timestamp() - 1).unwrap();
-        assert!(validate("apt", f.dir.path(), &f.files, future.timestamp() + 1).is_err());
+        let future = time::OffsetDateTime::now_utc() + time::Duration::days(1);
+        f.apt(&format!(
+            "Valid-Until: {}\n",
+            future.format(&Rfc2822).unwrap()
+        ));
+        validate("apt", f.dir.path(), &f.files, future.unix_timestamp() - 1).unwrap();
+        assert!(validate("apt", f.dir.path(), &f.files, future.unix_timestamp() + 1).is_err());
     }
     #[test]
     fn apt_detached_signature_presence_is_required() {

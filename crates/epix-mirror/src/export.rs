@@ -50,7 +50,7 @@ fn cookies(path: Option<&Path>, origin: &str) -> Result<Option<String>> {
     let text = std::str::from_utf8(&bytes)?;
     let url = reqwest::Url::parse(origin)?;
     let host = url.host_str().context("Missing node host")?;
-    let now = chrono::Utc::now().timestamp();
+    let now = time::OffsetDateTime::now_utc().unix_timestamp();
     let mut values = Vec::new();
     for line in text.lines() {
         let line = line.strip_prefix("#HttpOnly_").unwrap_or(line);
