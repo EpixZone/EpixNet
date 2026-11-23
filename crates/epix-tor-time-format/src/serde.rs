@@ -48,7 +48,8 @@ pub fn deserialize<'de, D: Deserializer<'de>, T: TimeText>(deserializer: D) -> R
 
 /// A missing optional time is encoded as a null value. Present times use the same text as required fields.
 pub mod option {
-    use super::*;
+    use super::{encode, TimeText};
+    use ::serde::{de::Error, Deserialize, Deserializer, Serialize, Serializer};
 
     pub fn serialize<S: Serializer, T: TimeText>(
         value: &Option<T>,
