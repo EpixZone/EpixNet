@@ -1,0 +1,14 @@
+{
+  "wallet_revision": "7e5c7955111a18645ee00c26d3f1bf22656d7e7f",
+  "gecko": {
+    "strict_min_version": "140.0",
+    "data_collection_permissions": {
+      "required": [
+        "financialAndPaymentInfo",
+        "browsingActivity",
+        "personallyIdentifyingInfo",
+        "authenticationInfo"
+      ]
+    }
+  }
+}

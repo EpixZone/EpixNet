@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import zipfile
 
-from rebuild import submission_manifest
+from rebuild import reviewed_gecko_settings, submission_manifest
 
 ROOT = Path(__file__).resolve().parents[2]
 WALLET_ID = "wallet@epix.zone"
@@ -157,7 +157,7 @@ def source_bundle(output, repositories, version, environment, raw_entries, final
         "  target/debug/epix-browser --export-wallet ../rebuilt.xpi\n"
         "  cd ..\n"
         "  python3 rebuild.py verify-final rebuilt.xpi\n"
-        "The final comparison sets the submitted version and migrates the legacy applications manifest key to browser_specific_settings. All other payload bytes must match.\n"
+        "The final comparison applies the release version, Firefox manifest key migration, desktop consent minimum and reviewed data declaration. All other payload bytes must match.\n"
         "See EpixNet/packaging/firefox-wallet/README.md for signing and remaining publisher requirements.\n"
     ).encode()
     write_archive(output, entries)
@@ -170,6 +170,7 @@ def prepare(args, root=ROOT):
     pin = (root / "shells/wallet-ext.rev").read_text().strip()
     if wallet_revision[:12] != pin:
         raise ValueError("Wallet source does not match the pinned release revision")
+    settings = reviewed_gecko_settings(root, wallet_revision)
     expected = (root / "shells/wallet-ext.sha256").read_text().split()[0]
     original = args.wallet_archive.read_bytes()
     if sha256(original) != expected:
@@ -201,7 +202,7 @@ def prepare(args, root=ROOT):
     submitted = tuple(int(part) for part in version.split("."))
     if submitted + (0,) * (4 - len(submitted)) <= installed + (0,) * (4 - len(installed)):
         raise ValueError("Submitted version must be newer than the installed wallet version")
-    entries["manifest.json"] = submission_manifest(manifest, version)
+    entries["manifest.json"] = submission_manifest(manifest, version, settings)
     extension = args.output / "extension"
     extension.mkdir()
     for name, content in entries.items():
