@@ -34,12 +34,11 @@ keeps its ID and private-window settings.
    Review it again when the wallet pin or EpixNet's packaging or native bridge
    changes. Preparation checks the wallet revision against the declaration.
 
-By default, the workflow requires zero lint errors and warnings. For the
-publisher-reviewed wallet `39d6afd0e243`, version `0.13.41.1`, the publisher
-can select **Use the publisher review**. Strict Mozilla lint still runs. The
-submission must match the exact unsigned XPI, validator versions, bundle bytes
-and all six complete diagnostics recorded in [the review](mozilla-review.json).
-Any difference stops submission. Mozilla makes its own approval decision.
+The default gate requires zero lint errors and warnings. Selecting the
+publisher-reviewed warnings option accepts only the unsigned XPI, wallet
+revision, extension ID, release version, validator versions, bundle digests
+and full diagnostics recorded in [the review](mozilla-review.json).
+A changed candidate or diagnostic needs a fresh review.
 
 The source upload includes committed EpixNet and wallet source, lockfiles and
 build instructions. It preserves original commit objects and tracked file modes
@@ -51,16 +50,12 @@ upstream file and final transformed payload against the submission. A complete
 independent rebuild must pass those comparisons before publishing; source recipe
 validation alone is not proof of reproducibility.
 
-Wallet revision `88a545a37c95` was rebuilt independently from the extracted source
-bundle: all 108 upstream files matched the release byte for byte. That build
-used Node 22.22.1, Yarn 3.4.1 and the complete protoc 3.21.3 distribution. The
-[original release run](https://github.com/EpixZone/epix-wallet/actions/runs/42530606913)
-used Node 22.23.4 and protoc 23.4. Install the compiler together with its standard
-`include/google/protobuf` headers, including `descriptor.proto`, and preserve
-the distribution's `bin`/`include` layout. A system compiler without these headers
-fails before generating the wallet libraries. On Debian/Ubuntu, the headers are
-provided by `libprotobuf-dev`. Keep the original release tool versions in the
-source review record when updating the wallet pin.
+Record the release workflow run and its Node, Yarn and protoc versions in
+[data-disclosure.json](data-disclosure.json) when reviewing a new wallet pin.
+The generated build recipe includes these versions and checks the Yarn version
+against the wallet's committed package manager. Install the compiler together
+with its standard `include/google/protobuf` headers, including
+`descriptor.proto`, and preserve its `bin` and `include` layout.
 
 See Mozilla's
 [signing guide](https://extensionworkshop.com/documentation/develop/getting-started-with-web-ext/)
@@ -89,12 +84,11 @@ python3 packaging/firefox-wallet/prepare.py \
   --browser /absolute/path/to/EpixNet/target/debug/epix-browser \
   --wallet-source /absolute/path/to/pinned-epix-wallet \
   --wallet-archive /absolute/path/to/epix-wallet-firefox.zip \
-  --version 0.13.41.1 \
+  --version "${WALLET_VERSION:?Set the unused AMO version}" \
   --output /absolute/path/to/new-wallet-submission
 ```
 
-Choose the release version for the actual publisher account; the example is not
-a reserved version. The current install has a content-stamped fourth version
+The current install has a content-stamped fourth version
 component, so use a higher earlier component to ensure the signed release can
 upgrade it. Preparation rejects equal or lower versions. A stale launcher, dirty tracked source, mismatched wallet
 revision, modified release archive, or locally overridden wallet build is
@@ -115,11 +109,13 @@ python3 packaging/firefox-wallet/sign.py /absolute/path/to/new-wallet-submission
 ```
 
 The entry point checks that the prepared inputs have not changed and repeats
-strict lint before submitting. For the single reviewed candidate above, add
-`--reviewed-warnings` to both `sign.py` commands. This submits private approval
-notes to AMO and uploads `review-source.zip`. It contains both repositories,
-the build instructions, the complete fresh `mozilla-lint.json` and
-`reviewed-findings.json` with the reason for each reported line and column.
+strict lint before submitting. Every submission sends the reviewer notes to
+AMO, uploads a source archive with both repositories, and includes its
+`BUILD.txt`, `REVIEWER.txt` and complete `mozilla-lint.json`. Reviewers can
+verify the project identity, permissions and data recipients and test the
+requested signing text with a disposable account. Use `--reviewed-warnings` on
+both commands only for an exact publisher-reviewed candidate. This also
+includes `reviewed-findings.json` with the explanation for each diagnostic.
 The workflow retains the exact submission materials for inspection. It also checks
 that the returned XPI's payload matches the submission. It does not treat
 `META-INF` filenames as proof of a valid Mozilla signature. `result.json`

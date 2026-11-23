@@ -125,6 +125,19 @@ def source_bundle(output, repositories, version, environment, raw_entries, final
             files = read_archive(archive)
             snapshots[name] = source_snapshot(repository, files)
             entries.update({f"{name}/{key}": value for key, value in files.items()})
+    wallet_revision = snapshots["epix-wallet"]["revision"]
+    epixnet_revision = snapshots["EpixNet"]["revision"]
+    disclosure = json.loads(entries["EpixNet/packaging/firefox-wallet/data-disclosure.json"])
+    tools = disclosure["build_tools"]
+    if json.loads(entries["epix-wallet/package.json"])["packageManager"] != "yarn@" + tools["yarn"]:
+        raise ValueError("Reviewed Yarn version differs from the wallet source")
+    review_directory = "EpixNet/packaging/firefox-wallet/"
+    entries["REVIEWER.txt"] = (
+        f"Epix Wallet {version} ({WALLET_ID}) for unlisted distribution with EpixNet.\n"
+        f"Wallet source: https://github.com/EpixZone/epix-wallet/tree/{wallet_revision}\n"
+        f"EpixNet packaging: https://github.com/EpixZone/EpixNet/tree/{epixnet_revision}\n"
+        f"Privacy policy: {environment['EPIX_PRIVACY_URL']}\nTerms: {environment['EPIX_TERMS_URL']}\n\n"
+    ).encode() + entries[review_directory + "REVIEWER.txt"]
     metadata = {"repositories": snapshots, "version": version, "environment": environment,
                 "wallet_files": {name: sha256(content) for name, content in raw_entries.items()},
                 "final_files": {name: sha256(content) for name, content in final_entries.items()}}
@@ -135,9 +148,10 @@ def source_bundle(output, repositories, version, environment, raw_entries, final
         + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in environment.items())).encode()
     entries["BUILD.txt"] = (
         f"Submitted release version: {version}\n"
-        "Use Linux, Node 22, the included Yarn 3.4.1, Python 3, Git, Rust and EpixNet desktop build dependencies.\n"
+        f"Wallet release build: https://github.com/EpixZone/epix-wallet/actions/runs/{tools['release_run']}\n"
+        f"Use Linux, Node {tools['node']}, the included Yarn {tools['yarn']} and protoc {tools['protoc']}.\n"
+        "Install Python 3, Git, Rust and EpixNet desktop build dependencies.\n"
         "Install a complete Protobuf compiler distribution, including include/google/protobuf/descriptor.proto; a compiler binary alone is insufficient.\n"
-        "For the reviewed wallet 39d6afd0e243, use Node 22.23.4, Yarn 3.4.1 and protoc 23.4. Verify the release tool versions again for later wallet pins.\n"
         "Keep the compiler distribution's bin and include directories together, and add its bin directory to PATH before building.\n"
         "From this extracted bundle, restore exact detached Git metadata (no synthetic commits):\n"
         "  python3 rebuild.py restore\n"

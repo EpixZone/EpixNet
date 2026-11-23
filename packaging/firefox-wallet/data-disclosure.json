@@ -10,5 +10,11 @@
         "authenticationInfo"
       ]
     }
+  },
+  "build_tools": {
+    "release_run": 45271957817,
+    "node": "22.23.5",
+    "yarn": "3.4.1",
+    "protoc": "23.4"
   }
 }

@@ -12,7 +12,7 @@ on:
         type: boolean
         default: false
       reviewed_warnings:
-        description: Use the publisher review for the six warnings in wallet 0.13.41.1
+        description: Require the exact candidate and lint findings recorded in mozilla-review.json
         type: boolean
         default: false
 
