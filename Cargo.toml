@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
 exclude = [
+    "vendor/ark-ff",
+    "vendor/flex-error",
     "vendor/arti/arti-client",
     "vendor/arti/pwd-grp",
     "vendor/arti/retry-error",
@@ -36,6 +38,7 @@ members = ["crates/epix-tor-time-format", "crates/epix-mirror", "crates/epix-cor
 # Tor bootstrap on Windows. Port the existing 0.4.1 fork fix to the 0.5 version
 # required by Arti 0.47. See vendor/saturating-time/EPIXNET_PATCH.md.
 [patch.crates-io]
+saturating-time = { path = "vendor/saturating-time" }
 # Arti package revisions and dependency updates are recorded in vendor/arti/EPIXNET_PATCH.md.
 arti-client = { path = "vendor/arti/arti-client" }
 pwd-grp = { path = "vendor/arti/pwd-grp" }
@@ -64,7 +67,10 @@ tor-protover = { path = "vendor/arti/tor-protover" }
 tor-rtcompat = { path = "vendor/arti/tor-rtcompat" }
 tor-rtmock = { path = "vendor/arti/tor-rtmock" }
 tor-time-format = { path = "crates/epix-tor-time-format" }
-saturating-time = { path = "vendor/saturating-time" }
+# Replace the unmaintained paste macro in the proof and Tendermint dependencies.
+# Release hashes and changes are recorded in vendor/PASTE_PATCHES.md.
+ark-ff = { path = "vendor/ark-ff" }
+flex-error = { path = "vendor/flex-error" }
 # Use RustCrypto RSA 0.10 for Arti's Tor verification and SSH keystore adapters.
 tor-key-forge = { path = "vendor/tor-key-forge" }
 tor-keymgr = { path = "vendor/tor-keymgr" }
