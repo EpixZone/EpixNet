@@ -1013,6 +1013,7 @@ mod tests {
             }
         );
         s.write_all(req.as_bytes()).await.unwrap();
+        s.flush().await.unwrap();
         // Read whatever the onion service sends first; any bytes prove the
         // circuit carried an application-level response end to end.
         let mut buf = vec![0u8; 64];
@@ -1041,9 +1042,9 @@ mod tests {
             while let Some(mut stream) = inbound.recv().await {
                 tokio::spawn(async move {
                     let mut b = [0u8; 4];
-                    if stream.read_exact(&mut b).await.is_ok() {
-                        let _ = stream.write_all(&b).await;
-                    }
+                    stream.read_exact(&mut b).await?;
+                    stream.write_all(&b).await?;
+                    stream.flush().await
                 });
             }
         });
@@ -1063,6 +1064,7 @@ mod tests {
         }
         let mut s = stream.expect("dial our own onion service");
         s.write_all(b"ping").await.unwrap();
+        s.flush().await.unwrap();
         let mut back = [0u8; 4];
         s.read_exact(&mut back).await.unwrap();
         assert_eq!(&back, b"ping");
