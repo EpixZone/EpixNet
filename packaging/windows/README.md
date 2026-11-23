@@ -115,6 +115,50 @@ The CA itself is written by the launcher to
      `install_native_host()` in `crates/epix-browser/src/ext.rs`; the
      uninstaller removes the key.
 
+## Portable zip
+
+The pack phase also writes `dist/EpixNet-Portable-<version>-x64.zip` from the
+same signed stage (`make-portable.py`; `EPIX_PHASE=portable` builds only the
+zip). It holds one `EpixNet Portable\` folder: the staged tree, plus
+
+- `epixnet-portable.txt`, the marker that turns on portable mode. Its text
+  tells users how to start, upgrade and move the folder.
+- a portable `firefox\distribution\policies.json`: `DisableAppUpdate` is on
+  and there is no bare CA filename. Firefox's updater would download and
+  schedule updates outside the folder, so users upgrade by replacing the
+  folder, like the Linux AppImage.
+
+With the marker beside `epix-browser.exe`, `epix_ui::paths` selects a `Data`
+folder there and exports it as `EPIX_DATA_DIR`, so the node, Firefox, the
+native host and restarts all use it. `--data-dir` and `EPIX_DATA_DIR` still
+win. In portable mode the launcher also
+
+- writes the CA to `Data\browser-ca\epix-ca.pem` and lists that full path in
+  `policies.json` (`Certificates.Install` accepts full paths), replacing an
+  entry left from an earlier location, such as another drive letter;
+- writes the native host manifest to `Data\native-host\`.
+
+What Windows still records outside the folder (measured on Windows 11 with
+ESR 153.7, by diffing files and registry around a run and a moved-folder run):
+
+- `HKCU\Software\Mozilla\NativeMessagingHosts\zone.epix.nmh`, pointing at
+  the portable manifest. Firefox on Windows finds native hosts only through
+  the registry. An installed EpixNet points it back when it starts.
+- Firefox's own small files, even with its updater off: a crash-ping store
+  in `%APPDATA%\Mozilla\Firefox\Crash Reports\glean`, and an update lock,
+  update setting and profile count in `C:\ProgramData\Mozilla-<id>\`, named
+  by a hash of the install path.
+- the `HKCU\...\Run` value, only when the user turns on Open at Login. It
+  names this copy's launcher and no data folder, so it follows the marker.
+- EVX AppContainer profiles (`%LOCALAPPDATA%\Packages\Epix.Evx.*`), only
+  when an EVX xite runs. Their names hash the workspace path, so a moved
+  folder gets new ones.
+- a Windows Firewall rule, if the user allows the prompt for this copy.
+
+Nothing registers `epix://` links for a portable copy. A portable copy and an
+installed EpixNet do not run at the same time: the single-instance channel
+refuses a second launcher with a different data folder.
+
 ## Signing
 
 Sign `epix-browser.exe`, `epix-nmh.exe` and `evx-worker.exe` **before** the

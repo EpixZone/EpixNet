@@ -9,9 +9,11 @@
 #   EPIX_BUNDLE_FIREFOX=/path/to/firefox   dir containing firefox.exe
 #   EPIX_VERSION=x.y.z                     release version (from the tag)
 #   EPIX_SKIP_BUILD=1                      reuse target/ instead of cargo build
-#   EPIX_PHASE=stage|pack|all              stage = build + assemble the tree,
-#                                          pack = makensis on an existing tree
-#                                          (sign the staged exes in between);
+#   EPIX_PHASE=stage|pack|portable|all     stage = build + assemble the tree,
+#                                          pack = makensis + the portable zip
+#                                          on an existing tree (sign the
+#                                          staged exes in between),
+#                                          portable = only the zip;
 #                                          default all (local, unsigned)
 set -euo pipefail
 
@@ -20,9 +22,13 @@ OUT_DIR="${1:-$REPO_ROOT/dist}"
 STAGE="$OUT_DIR/epix-windows"
 VERSION="${EPIX_VERSION:-0.1.0}"
 PHASE="${EPIX_PHASE:-all}"
+case "$PHASE" in
+  stage|pack|portable|all) ;;
+  *) echo "EPIX_PHASE must be stage, pack, portable or all" >&2; exit 2 ;;
+esac
 mkdir -p "$OUT_DIR"
 
-if [ "$PHASE" != "pack" ]; then
+if [ "$PHASE" = "stage" ] || [ "$PHASE" = "all" ]; then
   if [ "${EPIX_SKIP_BUILD:-0}" != "1" ]; then
     ( cd "$REPO_ROOT" && cargo build --release -p epix-browser -p epix-nmh -p evx-worker \
         --target x86_64-pc-windows-msvc )
@@ -74,10 +80,17 @@ POLICIES
   echo "· staged: $STAGE"
 fi
 
-if [ "$PHASE" != "stage" ]; then
+if [ "$PHASE" = "pack" ] || [ "$PHASE" = "all" ]; then
   OUT_FILE="$OUT_DIR/Epix-Setup-$VERSION.exe"
   echo "· building installer -> $OUT_FILE"
   makensis -DSTAGE_DIR="$STAGE" -DOUT_FILE="$OUT_FILE" -DVERSION="$VERSION" \
     "$REPO_ROOT/packaging/windows/installer.nsi"
   echo "· done: $OUT_FILE"
+fi
+
+# The portable zip: the same signed tree, unpacked anywhere, no installer.
+# make-portable.py adds the marker and Firefox policies for portable use.
+if [ "$PHASE" != "stage" ]; then
+  python3 "$REPO_ROOT/packaging/windows/make-portable.py" "$STAGE" \
+    "$OUT_DIR/EpixNet-Portable-$VERSION-x64.zip"
 fi

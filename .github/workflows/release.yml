@@ -209,7 +209,8 @@ jobs:
           files-folder: ${{ github.workspace }}/dist/epix-windows
           files-folder-filter: exe
           files-folder-recurse: false
-      - name: Pack installer
+      # Also zips the signed tree as EpixNet Portable.
+      - name: Pack installer and portable zip
         shell: bash
         env:
           EPIX_VERSION: ${{ steps.v.outputs.version }}
@@ -236,7 +237,9 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: epix-windows
-          path: dist/Epix-Setup-*.exe
+          path: |
+            dist/Epix-Setup-*.exe
+            dist/EpixNet-Portable-*-x64.zip
 
   # Signed Android APK for direct download (sideloading). Without
   # ANDROID_KEYSTORE_BASE64 the job still builds an UNSIGNED APK (not
@@ -407,6 +410,7 @@ jobs:
             artifacts/epix-linux/enable-epixnet-sandbox.sh
             artifacts/epix-linux/SHA256SUMS
             artifacts/epix-windows/*.exe
+            artifacts/epix-windows/*.zip
             artifacts/epix-android/*.apk
             artifacts/epix-android/*.aab
           )

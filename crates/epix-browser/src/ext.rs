@@ -793,6 +793,11 @@ fn serde_json_manifest(nmh: &Path) -> String {
 
 /// Where the native-messaging host manifest is written.
 fn native_host_dir() -> PathBuf {
+    // Firefox finds a Windows host through the registry, so a portable copy
+    // can keep the manifest itself in its own folder.
+    if let Some(root) = crate::portable::root().filter(|_| cfg!(windows)) {
+        return root.join("native-host");
+    }
     if cfg!(windows) {
         // Windows reads the path from the registry, so any stable dir works.
         let appdata = std::env::var("APPDATA").map(PathBuf::from).unwrap_or_else(|_| PathBuf::from("."));

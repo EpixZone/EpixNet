@@ -17,7 +17,7 @@ EpixNet supports **Tor** and **I2P** in builds that include those features. Rout
 
 ## Get started
 
-The quickest way in is a ready-made package from [EpixNet releases](https://github.com/EpixZone/EpixNet/releases/latest). Each release ships a Windows installer (`Epix-Setup-<version>.exe`), a macOS disk image (`Epix-<version>.dmg`), Linux `.deb`, `.rpm`, AppImage and `.tar.gz` packages, and an Android APK, with a `SHA256SUMS` file to check the downloads. There is no iOS release download; iOS is built from source.
+The quickest way in is a ready-made package from [EpixNet releases](https://github.com/EpixZone/EpixNet/releases/latest). Each release ships a Windows installer (`Epix-Setup-<version>.exe`), a portable Windows zip that needs no install ([EpixNet Portable](#epixnet-portable-for-windows)), a macOS disk image (`Epix-<version>.dmg`), Linux `.deb`, `.rpm`, AppImage and `.tar.gz` packages, and an Android APK, with a `SHA256SUMS` file to check the downloads. There is no iOS release download; iOS is built from source.
 
 You can also build EpixNet from its source code. Pick your system below. Each guide starts from a brand new machine with nothing installed yet and walks you through every step.
 
@@ -276,6 +276,20 @@ mv EpixNet-*-x86_64.AppImage EpixNet.AppImage
 ```
 
 The AppImage uses `EpixNet.AppImage.home` as its home folder. To upgrade, replace `EpixNet.AppImage` with the new version under the same name. Browser downloads land in that folder too, and Open at Login does not work in this mode. On Ubuntu 24.04 and newer, the first start may still ask for your password once to add a system sandbox rule for the bundled Firefox.
+
+### EpixNet Portable for Windows
+
+`EpixNet-Portable-<version>-x64.zip` runs without installing. Unzip it anywhere, for example onto a USB drive, then start `epix-browser.exe` in the `EpixNet Portable` folder. Everything stays in the `Data` folder beside it: xites, keys, settings, the browser profile and its certificate.
+
+- The `epixnet-portable.txt` file turns this on. Delete it to use the normal per-user folder. `--data-dir` still wins.
+- To upgrade, quit EpixNet and unzip the new version. Move your `Data` folder into the new `EpixNet Portable` folder, then delete the old one.
+- The bundled Firefox does not update itself. Get its security fixes with the next EpixNet Portable.
+- To move it, quit EpixNet and move the whole folder. A new drive letter is fine.
+- Run one EpixNet at a time. While an installed EpixNet runs, the portable copy refuses to start, and the other way round.
+- `epix://` links from other apps do not open a portable copy.
+- The `Data` folder holds your private keys. Back it up and keep it safe.
+
+Windows still keeps a few small records outside the folder. Firefox finds the wallet's helper through one registry entry, which points into the portable folder. Firefox itself keeps a few small crash-report and update files. Open at Login, if you turn it on, adds a startup entry for this copy. Allowing EpixNet through Windows Firewall adds a firewall rule. Running an EVX xite creates Windows sandbox profiles. [`packaging/windows/README.md`](packaging/windows/README.md#portable-zip) lists them.
 
 ## Checking which version you are running
 

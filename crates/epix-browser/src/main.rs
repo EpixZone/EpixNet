@@ -26,6 +26,7 @@ mod icon;
 mod ipc;
 #[cfg(target_os = "linux")]
 mod linux_sandbox;
+mod portable;
 use epix_browser_net::proxy;
 mod shutdown;
 mod splash_view;
@@ -132,6 +133,14 @@ fn print_help() {
     println!("  --background         Start the node and tray without opening a window.");
     println!("  --quit               Close a running EpixNet and wait for it to exit.");
     println!("  -V, --version        Print the version.");
+    if cfg!(windows) {
+        println!();
+        println!(
+            "Portable mode: with {} beside epix-browser.exe, everything stays in the",
+            epix_ui::paths::PORTABLE_MARKER
+        );
+        println!("{} folder there. --data-dir still wins.", epix_ui::paths::PORTABLE_DATA_DIR);
+    }
 }
 
 fn main() {
@@ -164,8 +173,13 @@ fn main() {
     attach_console_or_log(&epix_node::data_root());
     match data_dir {
         // A login item written by this instance reopens the same folder.
-        Ok(Some(folder)) => autostart::use_data_dir(folder),
-        Ok(None) => {}
+        Ok(epix_ui::paths::LaunchDataDir::Chosen(folder)) => autostart::use_data_dir(folder),
+        // A portable login item finds its folder again from the launcher.
+        Ok(epix_ui::paths::LaunchDataDir::Portable(folder)) => {
+            println!("· portable mode: data in {}", folder.display());
+            portable::enable(folder);
+        }
+        Ok(epix_ui::paths::LaunchDataDir::Default) => {}
         Err(error) => {
             eprintln!("{error}. Use epix-browser --help for usage.");
             std::process::exit(2);
@@ -239,6 +253,12 @@ fn main() {
         Ok(ipc::Role::Primary(rx)) => rx,
         Err(error) => {
             eprintln!("Could not start Epix Browser: {error}");
+            // A double-clicked launcher has no console. Say why nothing
+            // opened, for example while another copy runs from another folder.
+            #[cfg(windows)]
+            if !background {
+                show_error_dialog(&format!("EpixNet could not start.\n\n{error}"));
+            }
             std::process::exit(1);
         }
     };
@@ -300,6 +320,19 @@ fn main() {
 /// (`cargo run` / a terminal invocation keeps live output), else append both
 /// std streams to `<data_root>/log/epix-browser.log` so field problems stay
 /// diagnosable.
+/// A modal error box, for failures before the startup window exists.
+#[cfg(windows)]
+fn show_error_dialog(message: &str) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{MessageBoxW, MB_ICONWARNING, MB_OK};
+    let wide = |text: &str| text.encode_utf16().chain(std::iter::once(0)).collect::<Vec<u16>>();
+    let (text, title) = (wide(message), wide("EpixNet"));
+    // SAFETY: both buffers are NUL-terminated UTF-16 and outlive the call.
+    // nosemgrep: rust.lang.security.unsafe-usage.unsafe-usage
+    unsafe {
+        MessageBoxW(std::ptr::null_mut(), text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+    }
+}
+
 #[cfg(windows)]
 fn attach_console_or_log(data_root: &Path) {
     use std::os::windows::io::IntoRawHandle;
@@ -1210,16 +1243,22 @@ fn firefox_distribution_dir(firefox: &Path) -> Option<PathBuf> {
 /// else writing it (never inside a macOS .app: the bundle is code-signed, and
 /// editing it would break the seal).
 fn install_ca_policies(firefox: &Path, pem: &str) -> Result<(), String> {
-    let wrote = mozilla_cert_dirs()
-        .iter()
-        .filter(|dir| {
-            std::fs::create_dir_all(dir).is_ok()
-                && std::fs::write(dir.join(CA_POLICY_FILE), pem).is_ok()
-        })
-        .count();
-    if wrote == 0 {
-        return Err("could not write the CA into a Mozilla certificates dir".to_string());
-    }
+    let entry = match portable::root() {
+        Some(root) => portable_ca_entry(root, pem)?,
+        None => {
+            let wrote = mozilla_cert_dirs()
+                .iter()
+                .filter(|dir| {
+                    std::fs::create_dir_all(dir).is_ok()
+                        && std::fs::write(dir.join(CA_POLICY_FILE), pem).is_ok()
+                })
+                .count();
+            if wrote == 0 {
+                return Err("could not write the CA into a Mozilla certificates dir".to_string());
+            }
+            CA_POLICY_FILE.to_string()
+        }
+    };
 
     let dist = firefox_distribution_dir(firefox)
         .ok_or_else(|| "cannot locate the Firefox distribution dir".to_string())?;
@@ -1249,10 +1288,9 @@ fn install_ca_policies(firefox: &Path, pem: &str) -> Result<(), String> {
         .or_insert_with(|| serde_json::json!([]))
         .as_array_mut()
         .ok_or("Certificates.Install is not a list")?;
-    if install.iter().any(|v| v.as_str() == Some(CA_POLICY_FILE)) {
+    if !update_ca_install_list(install, &entry) {
         return Ok(()); // already referenced (baked in, or a prior run)
     }
-    install.push(serde_json::Value::String(CA_POLICY_FILE.to_string()));
     if cfg!(target_os = "macos") {
         return Err(
             "the bundled Firefox has no CA policy baked in (won't edit a signed .app; re-package)"
@@ -1262,6 +1300,85 @@ fn install_ca_policies(firefox: &Path, pem: &str) -> Result<(), String> {
     std::fs::create_dir_all(&dist).map_err(|e| format!("create {}: {e}", dist.display()))?;
     let json = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())?;
     std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))
+}
+
+/// Write a portable copy's CA inside its own data folder and return the full
+/// path for `Certificates.Install`, which Firefox accepts in place of a bare
+/// filename. Nothing lands in the user's Mozilla certificate folders.
+fn portable_ca_entry(root: &Path, pem: &str) -> Result<String, String> {
+    let dir = root.join("browser-ca");
+    let file = dir.join(CA_POLICY_FILE);
+    std::fs::create_dir_all(&dir)
+        .and_then(|()| std::fs::write(&file, pem))
+        .map_err(|e| format!("write {}: {e}", file.display()))?;
+    file.to_str()
+        .map(str::to_string)
+        .ok_or_else(|| "the portable folder path must be valid Unicode".to_string())
+}
+
+/// Make `entry` the CA reference in a `Certificates.Install` list. A full
+/// path (portable mode) also replaces our bare filename and any CA path a
+/// copy left from an earlier location, such as another drive letter. Other
+/// certificates stay. Returns whether the list changed.
+fn update_ca_install_list(install: &mut Vec<serde_json::Value>, entry: &str) -> bool {
+    let before = install.clone();
+    if entry != CA_POLICY_FILE {
+        let suffix = Path::new("browser-ca").join(CA_POLICY_FILE);
+        install.retain(|value| {
+            let Some(text) = value.as_str() else { return true };
+            text == entry || (text != CA_POLICY_FILE && !Path::new(text).ends_with(&suffix))
+        });
+    }
+    if !install.iter().any(|value| value.as_str() == Some(entry)) {
+        install.push(serde_json::Value::String(entry.to_string()));
+    }
+    *install != before
+}
+
+#[cfg(test)]
+mod ca_policy_tests {
+    use super::*;
+
+    fn text(path: &Path) -> String {
+        path.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn bare_filename_is_added_once_and_keeps_other_certificates() {
+        let mut install = vec![serde_json::json!("corporate.pem")];
+        assert!(update_ca_install_list(&mut install, CA_POLICY_FILE));
+        assert!(!update_ca_install_list(&mut install, CA_POLICY_FILE));
+        assert_eq!(install, [serde_json::json!("corporate.pem"), serde_json::json!(CA_POLICY_FILE)]);
+    }
+
+    #[test]
+    fn portable_path_replaces_the_bare_name_and_an_old_location() {
+        let old = tempfile::tempdir().unwrap();
+        let new = tempfile::tempdir().unwrap();
+        let old_ca = text(&old.path().join("Data/browser-ca").join(CA_POLICY_FILE));
+        let new_ca = text(&new.path().join("Data/browser-ca").join(CA_POLICY_FILE));
+        let mut install = vec![
+            serde_json::json!(CA_POLICY_FILE),
+            serde_json::json!(old_ca),
+            serde_json::json!("corporate.pem"),
+            serde_json::json!(7),
+        ];
+        assert!(update_ca_install_list(&mut install, &new_ca));
+        assert_eq!(
+            install,
+            [serde_json::json!("corporate.pem"), serde_json::json!(7), serde_json::json!(new_ca)]
+        );
+        assert!(!update_ca_install_list(&mut install, &new_ca));
+    }
+
+    #[test]
+    fn portable_ca_stays_in_the_data_folder() {
+        let root = tempfile::tempdir().unwrap();
+        let entry = portable_ca_entry(root.path(), "PEM").unwrap();
+        let file = root.path().join("browser-ca").join(CA_POLICY_FILE);
+        assert_eq!(entry, text(&file));
+        assert_eq!(std::fs::read_to_string(file).unwrap(), "PEM");
+    }
 }
 
 /// Make DuckDuckGo the managed browser's default search engine (matching the

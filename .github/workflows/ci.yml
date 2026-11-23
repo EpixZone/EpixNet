@@ -125,6 +125,7 @@ jobs:
           python3 packaging/linux/test-packaging.py -v
           python3 packaging/linux/test-autostart.py -v
           python3 packaging/linux/test-evx-package.py -v
+          python3 packaging/windows/test-portable.py -v
 
   build-test:
     name: Build & test
