@@ -10,4 +10,4 @@ Each vendored directory includes the upstream source, license and commit metadat
 
 The ark-ff 0.5.0 source never uses the paste macro. Its manifest drops that dependency, following [arkworks/algebra PR 994](https://github.com/arkworks-rs/algebra/pull/994).
 
-The flex-error release uses this macro to build error type identifiers. Its public macro import now uses [pastey](https://github.com/as1100k/pastey). The flex-error manifest also omits the upstream workspace README path, which points outside the published crate.
+The flex-error release uses this macro to build error type identifiers. Its public macro import now uses [pastey](https://github.com/as1100k/pastey). The flex-error manifest also omits the upstream workspace README path, which points outside the published crate. Its formatter doctest declares the sample type used by the macro expansion.

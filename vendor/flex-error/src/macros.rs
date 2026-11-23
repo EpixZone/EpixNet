@@ -143,6 +143,7 @@ pub use pastey::paste;
   will include the following expansion:
 
   ```
+  # struct MySubErrorSubdetail { code: u32 }
   impl ::core::fmt::Display for MySubErrorSubdetail {
     fn fmt(&self, f: &mut ::core::fmt::Formatter<'_>) -> ::core::fmt::Result {
       let e = self;
