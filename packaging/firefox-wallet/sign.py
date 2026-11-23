@@ -4,11 +4,15 @@ import argparse
 import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
+import zipfile
 
 from prepare import read_archive, sha256
 
 ROOT = Path(__file__).resolve().parent
+REVIEW_FILE = ROOT / "mozilla-review.json"
+TOOL_VERSIONS = {"web-ext": "10.8.0", "addons-linter": "10.14.0"}
 
 
 def checked_preparation(prepared):
@@ -37,37 +41,99 @@ def verify_returned_content(candidate, expected):
 
 
 def pinned_cli():
-    cli = ROOT / "node_modules/web-ext/bin/web-ext.js"
-    package = json.loads((ROOT / "node_modules/web-ext/package.json").read_text())
-    if package.get("version") != "10.8.0":
-        raise ValueError("Install the pinned signing tools with npm ci --ignore-scripts")
-    return cli
+    modules = ROOT / "node_modules"
+    for name, version in TOOL_VERSIONS.items():
+        directory = modules / name
+        nested = modules / "web-ext/node_modules" / name
+        if name == "addons-linter" and nested.exists():
+            directory = nested
+        package = json.loads((directory / "package.json").read_text())
+        if package.get("version") != version:
+            raise ValueError("Install the pinned signing tools with npm ci --ignore-scripts")
+    return modules / "web-ext/bin/web-ext.js"
 
 
-def lint_preparation(prepared):
-    checked_preparation(prepared)
+def verify_review(prepared, entries, report, exit_code):
+    review = json.loads(REVIEW_FILE.read_text())
+    receipt = json.loads((prepared / "provenance.json").read_text())
+    if (review["tools"] != TOOL_VERSIONS or
+            any(receipt.get(key) != review[key] for key in ("extension_id", "wallet_revision", "version", "unsigned_sha256")) or
+            json.loads(entries["epix-mobile-build.json"])["revision"] != review["wallet_revision"]):
+        raise ValueError("The candidate or validation tools differ from the publisher review")
+    findings = review["findings"]
+    count = len(findings)
+    metadata = report.get("metadata", {})
+    if (exit_code != 1 or report.get("errors") != [] or report.get("notices") != [] or
+            report.get("count") != count or metadata.get("id") != review["extension_id"] or
+            metadata.get("version") != review["version"] or
+            report.get("summary") != {"errors": 0, "notices": 0, "warnings": count}):
+        raise ValueError("Mozilla lint status differs from the publisher review")
+    # File processing order can vary between runs. Match every complete diagnostic,
+    # including duplicates, and bind its reported location to the reviewed bytes.
+    reviewed = [finding["diagnostic"] for finding in findings]
+    if sorted(json.dumps(row, sort_keys=True) for row in report["warnings"]) != sorted(
+            json.dumps(row, sort_keys=True) for row in reviewed):
+        raise ValueError("Mozilla lint diagnostics differ from the publisher review")
+    for finding in findings:
+        name = finding["diagnostic"]["file"]
+        if sha256(entries[name]) != finding["bundle_sha256"]:
+            raise ValueError(f"Reviewed bundle changed: {name}")
+
+
+def run_lint(prepared, entries, reviewed_warnings):
     result = subprocess.run(["node", str(pinned_cli()), "lint", "--warnings-as-errors", "--output=json",
                              "--source-dir", str(prepared / "extension")], capture_output=True, text=True, check=False)
+    (prepared / "lint.json").write_text(result.stdout)
     report = json.loads(result.stdout)
-    (prepared / "lint.json").write_text(json.dumps(report, indent=2) + "\n")
     summary = report.get("summary", {})
-    if result.returncode or summary.get("errors", 1) or summary.get("warnings", 1):
+    if reviewed_warnings:
+        verify_review(prepared, entries, report, result.returncode)
+    elif result.returncode or summary.get("errors", 1) or summary.get("warnings", 1):
         raise ValueError("Mozilla lint requires publisher/upstream review; see retained lint.json. Submission was not attempted.")
     return summary
 
 
-def sign(prepared, output):
+def lint_preparation(prepared, reviewed_warnings=False):
+    return run_lint(prepared, checked_preparation(prepared), reviewed_warnings)
+
+
+def reviewed_upload(prepared, output):
+    source = output / "review-source.zip"
+    shutil.copyfile(prepared / "source.zip", source)
+    with zipfile.ZipFile(source, "a") as archive:
+        for name, path in (("mozilla-lint.json", prepared / "lint.json"), ("reviewed-findings.json", REVIEW_FILE)):
+            if name in archive.namelist():
+                raise ValueError(f"Source archive already contains {name}")
+            archive.writestr(zipfile.ZipInfo(name), path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
+    notes = ("Epix Wallet for unlisted distribution with EpixNet. Please review the six Mozilla lint warnings. "
+             "The uploaded source archive contains the full validator output in mozilla-lint.json and an "
+             "explanation, upstream source link, location and bundle digest for each warning in reviewed-findings.json. "
+             "BUILD.txt explains how to restore both source revisions, reproduce the build and verify every file.\n\n"
+             "To test onboarding, install in a fresh Firefox profile and open the Epix Wallet toolbar button. "
+             "Select 'Create a new wallet', then 'Create new recovery phrase'. Use the newly generated phrase, "
+             "a test wallet name and a disposable password of at least eight characters. Complete the prompts, "
+             "open the wallet, then lock and unlock it. The test needs no funds or existing accounts.")
+    metadata = output / "amo-metadata.json"
+    metadata.write_text(json.dumps({"version": {"approval_notes": notes}}, indent=2) + "\n")
+    return source, metadata
+
+
+def sign(prepared, output, reviewed_warnings=False):
     for name in ("WEB_EXT_API_KEY", "WEB_EXT_API_SECRET"):
         if not os.environ.get(name):
             raise ValueError(f"Configure publisher-owned {name} in the signing environment")
     expected = checked_preparation(prepared)
-    lint_preparation(prepared)
-    cli = pinned_cli()
+    run_lint(prepared, expected, reviewed_warnings)
     output.mkdir(parents=True, exist_ok=False)
-    subprocess.run(["node", str(cli), "sign", "--channel=unlisted",
+    source = prepared / "source.zip"
+    metadata_args = []
+    if reviewed_warnings:
+        source, metadata = reviewed_upload(prepared, output)
+        metadata_args = ["--amo-metadata", str(metadata)]
+    subprocess.run(["node", str(pinned_cli()), "sign", "--channel=unlisted",
                     "--source-dir", str(prepared / "extension"),
-                    "--upload-source-code", str(prepared / "source.zip"),
-                    "--artifacts-dir", str(output)], check=True)
+                    "--upload-source-code", str(source),
+                    "--artifacts-dir", str(output), *metadata_args], check=True)
     candidates = list(output.glob("*.xpi"))
     if len(candidates) != 1:
         raise ValueError("Mozilla signing did not produce exactly one XPI")
@@ -85,13 +151,15 @@ def main():
     parser.add_argument("prepared", type=Path)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--lint-only", action="store_true")
+    parser.add_argument("--reviewed-warnings", action=argparse.BooleanOptionalAction, default=False,
+                        help="Require the exact publisher-reviewed candidate, tool versions and diagnostics")
     args = parser.parse_args()
     if args.lint_only:
-        print(json.dumps(lint_preparation(args.prepared.resolve()), indent=2))
+        print(json.dumps(lint_preparation(args.prepared.resolve(), args.reviewed_warnings), indent=2))
     elif args.output is None:
         parser.error("submission requires --output")
     else:
-        print(json.dumps(sign(args.prepared.resolve(), args.output.resolve()), indent=2))
+        print(json.dumps(sign(args.prepared.resolve(), args.output.resolve(), args.reviewed_warnings), indent=2))
 
 
 if __name__ == "__main__":

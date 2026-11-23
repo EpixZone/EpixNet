@@ -34,9 +34,12 @@ keeps its ID and private-window settings.
    Review it again when the wallet pin or EpixNet's packaging or native bridge
    changes. Preparation checks the wallet revision against the declaration.
 
-The project requires zero lint errors and warnings before the workflow submits.
-See the retained `lint.json` for each location. Mozilla performs its own
-validation and can request further changes or information.
+By default, the workflow requires zero lint errors and warnings. For the
+publisher-reviewed wallet `39d6afd0e243`, version `0.13.41.1`, the publisher
+can select **Use the publisher review**. Strict Mozilla lint still runs. The
+submission must match the exact unsigned XPI, validator versions, bundle bytes
+and all six complete diagnostics recorded in [the review](mozilla-review.json).
+Any difference stops submission. Mozilla makes its own approval decision.
 
 The source upload includes committed EpixNet and wallet source, lockfiles and
 build instructions. It preserves original commit objects and tracked file modes
@@ -68,9 +71,9 @@ and [source submission requirements](https://extensionworkshop.com/documentation
 Run **Prepare Firefox wallet signing** from Actions with a unique numeric
 version newer than both the last submitted version and the installed wallet. Its default prepares inputs
 without contacting Mozilla and runs strict lint. A lint failure marks the run
-failed but retains the inputs and report for review. Select **Submit to Mozilla**
-only when lint passes and the publisher credentials, account and source review
-are ready. The pinned `web-ext` 10.8.0 tool submits an
+failed and retains the inputs and full report for review. Select **Submit to Mozilla**
+when the candidate passes the selected gate and the publisher credentials, account
+and sources are ready. The pinned `web-ext` 10.8.0 tool submits an
 unlisted extension for self-distribution and uploads the readable source bundle.
 The workflow keeps the preparation and service response as workflow artifacts;
 it does not publish a release or update the wallet pin.
@@ -112,7 +115,12 @@ python3 packaging/firefox-wallet/sign.py /absolute/path/to/new-wallet-submission
 ```
 
 The entry point checks that the prepared inputs have not changed and repeats
-strict lint before submitting. It also checks
+strict lint before submitting. For the single reviewed candidate above, add
+`--reviewed-warnings` to both `sign.py` commands. This submits private approval
+notes to AMO and uploads `review-source.zip`. It contains both repositories,
+the build instructions, the complete fresh `mozilla-lint.json` and
+`reviewed-findings.json` with the reason for each reported line and column.
+The workflow retains the exact submission materials for inspection. It also checks
 that the returned XPI's payload matches the submission. It does not treat
 `META-INF` filenames as proof of a valid Mozilla signature. `result.json`
 explicitly leaves Firefox signature verification outstanding.

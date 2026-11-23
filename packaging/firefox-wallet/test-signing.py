@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import json
+from copy import deepcopy
 import os
 from pathlib import Path
 import subprocess
@@ -129,6 +130,88 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(json.loads((self.args.output / "lint.json").read_text()), report)
         self.assertFalse((self.root / "returned").exists())
 
+    def reviewed_fixture(self):
+        receipt = prepare.prepare(self.args, self.repo)
+        review = json.loads(sign.REVIEW_FILE.read_text())
+        for finding in review["findings"]:
+            finding["diagnostic"]["file"] = "background.js"
+            finding["bundle_sha256"] = prepare.sha256(self.entries["background.js"])
+        for key in ("wallet_revision", "version", "unsigned_sha256"):
+            review[key] = receipt[key]
+        path = self.root / "fixture-review.json"
+        path.write_text(json.dumps(review))
+        fixture = patch.object(sign, "REVIEW_FILE", path)
+        fixture.start()
+        self.addCleanup(fixture.stop)
+        diagnostics = [row["diagnostic"] for row in reversed(review["findings"])]
+        return {"metadata": {"id": review["extension_id"], "version": receipt["version"]},
+                "summary": {"warnings": len(diagnostics), "errors": 0, "notices": 0},
+                "count": len(diagnostics), "warnings": diagnostics, "errors": [], "notices": []}
+
+    def test_reviewed_submission_sends_original_report_source_instructions_and_notes(self):
+        report = self.reviewed_fixture()
+        raw = json.dumps(report, indent=1) + "\n"
+        output = self.root / "returned"
+        expected = sign.checked_preparation(self.args.output)
+
+        def service(command, check, **kwargs):
+            if "lint" in command:
+                self.assertIn("--warnings-as-errors", command)
+                return SimpleNamespace(stdout=raw, returncode=1)
+            self.assertTrue(check)
+            self.assertIn("--channel=unlisted", command)
+            source = prepare.read_archive(Path(command[command.index("--upload-source-code") + 1]))
+            self.assertEqual(source["mozilla-lint.json"], raw.encode())
+            self.assertEqual(source["reviewed-findings.json"], sign.REVIEW_FILE.read_bytes())
+            self.assertIn("epix-wallet/source.js", source)
+            self.assertIn("EpixNet/shells/wallet-ext.rev", source)
+            self.assertIn(b"rebuild.py verify-final", source["BUILD.txt"])
+            metadata = json.loads(Path(command[command.index("--amo-metadata") + 1]).read_text())
+            self.assertIn("mozilla-lint.json", metadata["version"]["approval_notes"])
+            prepare.write_archive(output / "wallet.xpi", expected)
+
+        with patch.object(sign, "pinned_cli", return_value="web-ext"), \
+                patch.object(sign.subprocess, "run", side_effect=service) as command, \
+                patch.dict(os.environ, {"WEB_EXT_API_KEY": "fixture", "WEB_EXT_API_SECRET": "fixture"}):
+            with self.assertRaisesRegex(ValueError, "not attempted"):
+                sign.sign(self.args.output, output)
+            self.assertFalse(output.exists())
+            receipt = sign.sign(self.args.output, output, reviewed_warnings=True)
+        self.assertEqual(command.call_count, 3)
+        self.assertFalse(receipt["firefox_signature_verified"])
+
+    def test_review_rejects_changes_to_diagnostics_candidate_or_lint_status(self):
+        report = self.reviewed_fixture()
+        candidate = sign.checked_preparation(self.args.output)
+        for field in ("code", "message", "file", "line", "column", "description", "_type"):
+            with self.subTest(field=field):
+                changed = deepcopy(report)
+                changed["warnings"][0][field] = "different"
+                with self.assertRaisesRegex(ValueError, "diagnostics differ"):
+                    sign.verify_review(self.args.output, candidate, changed, 1)
+        for warnings in (report["warnings"][:-1], report["warnings"] + report["warnings"][:1],
+                         [report["warnings"][1], *report["warnings"][1:]]):
+            with self.assertRaisesRegex(ValueError, "diagnostics differ"):
+                sign.verify_review(self.args.output, candidate, {**report, "warnings": warnings}, 1)
+        for change in ({"errors": [{}]}, {"notices": [{}]}, {"count": 0},
+                       {"summary": {"errors": 0, "warnings": 0, "notices": 0}},
+                       {"metadata": {**report["metadata"], "id": "other"}},
+                       {"metadata": {**report["metadata"], "version": "old"}}):
+            with self.assertRaisesRegex(ValueError, "lint status differs"):
+                sign.verify_review(self.args.output, candidate, {**report, **change}, 1)
+        for code in (0, 2, -1):
+            with self.assertRaisesRegex(ValueError, "lint status differs"):
+                sign.verify_review(self.args.output, candidate, report, code)
+        for key in ("extension_id", "wallet_revision", "version", "unsigned_sha256", "tools"):
+            review = json.loads(sign.REVIEW_FILE.read_text())
+            sign.REVIEW_FILE.write_text(json.dumps({**review, key: "different"}))
+            with self.assertRaisesRegex(ValueError, "candidate or validation tools differ"):
+                sign.verify_review(self.args.output, candidate, report, 1)
+            sign.REVIEW_FILE.write_text(json.dumps(review))
+        changed_bundle = {**candidate, report["warnings"][0]["file"]: b"changed"}
+        with self.assertRaisesRegex(ValueError, "Reviewed bundle changed"):
+            sign.verify_review(self.args.output, changed_bundle, report, 1)
+
     def test_submission_version_must_upgrade_the_installed_wallet(self):
         self.args.version = "1.0.0"
         with self.assertRaisesRegex(ValueError, "newer than the installed"):
@@ -170,9 +253,10 @@ class SigningTests(unittest.TestCase):
     def test_submission_returns_an_unverified_receipt_without_exposing_credentials(self):
         prepare.prepare(self.args, self.repo)
         tools = self.root / "tools"
-        package = tools / "node_modules/web-ext/package.json"
-        package.parent.mkdir(parents=True)
-        package.write_text(json.dumps({"version": "10.8.0"}))
+        for name, version in sign.TOOL_VERSIONS.items():
+            package = tools / "node_modules" / name / "package.json"
+            package.parent.mkdir(parents=True)
+            package.write_text(json.dumps({"version": version}))
         output = self.root / "returned"
         expected = sign.checked_preparation(self.args.output)
 
@@ -191,6 +275,17 @@ class SigningTests(unittest.TestCase):
             receipt = sign.sign(self.args.output, output)
         self.assertFalse(receipt["firefox_signature_verified"])
         self.assertEqual(receipt["sha256"], prepare.sha256((output / "wallet.xpi").read_bytes()))
+
+    def test_rejects_a_different_linter_resolved_by_web_ext(self):
+        for name, version in sign.TOOL_VERSIONS.items():
+            directory = self.root / "node_modules" / name
+            directory.mkdir(parents=True)
+            (directory / "package.json").write_text(json.dumps({"version": version}))
+        nested = self.root / "node_modules/web-ext/node_modules/addons-linter"
+        nested.mkdir(parents=True)
+        (nested / "package.json").write_text('{"version":"1.0.0"}')
+        with patch.object(sign, "ROOT", self.root), self.assertRaisesRegex(ValueError, "pinned signing tools"):
+            sign.pinned_cli()
 
     def test_returned_payload_must_match_but_signature_filenames_are_not_trusted(self):
         candidate = self.root / "returned.xpi"
