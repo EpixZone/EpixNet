@@ -36,8 +36,11 @@ fn main() {
             let capture = std::env::var_os("EPIX_TEST_AUTOSTART_CAPTURE").unwrap();
             std::fs::write(capture, format!("native\n{}\n", args.join("\n"))).unwrap();
         }
-        Some("enable") | Some("disable") => {
-            if let Err(error) = autostart::set_enabled(args[0] == "enable") {
+        Some("enable") | Some("disable") | Some("enable-data") => {
+            if args[0] == "enable-data" {
+                autostart::use_data_dir(std::path::PathBuf::from(&args[1]));
+            }
+            if let Err(error) = autostart::set_enabled(args[0] != "disable") {
                 eprintln!("{error}");
                 std::process::exit(1);
             }
@@ -98,16 +101,16 @@ fn main() {
         path.chmod(0o755)
         return path
 
-    def run_browser(self, browser, action, *, check=True):
+    def run_browser(self, browser, action, *extra, check=True):
         result = subprocess.run(
-            [str(browser), action], env=self.env, cwd=self.root,
+            [str(browser), action, *extra], env=self.env, cwd=self.root,
             capture_output=True, text=True, timeout=10,
         )
         if check:
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         return result
 
-    def launch(self, expected):
+    def launch(self, expected, *extra):
         subprocess.run(
             ["desktop-file-validate", str(self.desktop)],
             env=self.env, check=True, capture_output=True, text=True, timeout=10,
@@ -117,16 +120,17 @@ fn main() {
             capture_output=True, text=True, timeout=10,
         )
         self.assertEqual(launched.returncode, 0, launched.stdout + launched.stderr)
+        wanted = [expected, "--background", *extra]
         deadline = time.monotonic() + 3
         arguments = None
         while time.monotonic() < deadline:
             if self.capture.exists():
                 arguments = self.capture.read_text().splitlines()
-                if arguments == [expected, "--background"]:
+                if arguments == wanted:
                     break
             time.sleep(0.025)
         self.assertTrue(self.capture.exists(), "Autostart executable was not launched")
-        self.assertEqual(arguments, [expected, "--background"])
+        self.assertEqual(arguments, wanted)
 
     def enable_appimage(self, outer_name="EpixNet.AppImage", appdir_name=".mount_EpixNe123456"):
         appdir = self.root / appdir_name
@@ -154,6 +158,15 @@ fn main() {
         self.assertEqual(self.run_browser(browser, "status").stdout.strip(), "false")
         self.assertFalse(self.desktop.exists())
         self.run_browser(browser, "disable")
+
+    def test_chosen_data_folder_is_reopened_at_login(self):
+        folder = str(self.root / 'Epix %f "data" $HOME `tick` \\ ;&|*?')
+        browser = self.browser(self.root / "native install/epix-browser")
+        self.run_browser(browser, "enable-data", folder)
+        self.launch("native", "--data-dir", folder)
+        self.capture.unlink()
+        self.enable_appimage()
+        self.launch("appimage")
 
     def test_native_install_ignores_stale_appimage_environment(self):
         browser = self.browser(self.root / "native/epix-browser")
