@@ -8,14 +8,42 @@
 //! Everything here is best-effort and per-user (no admin). The tray reads the
 //! real state back with [`is_enabled`], so a failed write just leaves the
 //! toggle where it was.
+//!
+//! A launch with `--data-dir` (or `EPIX_DATA_DIR`) writes that folder into the
+//! login item too, because a login session has neither. The default folder,
+//! including one moved on the Config page, needs no argument.
 
 #[cfg(not(target_os = "windows"))]
 use std::path::PathBuf;
+use std::path::Path;
+use std::sync::OnceLock;
 
 /// LaunchAgent label (macOS). Windows uses the "EpixNet" Run value name and
 /// Linux the `epixnet.desktop` filename instead.
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "macos", test))]
 const LABEL: &str = "zone.epix.EpixNet";
+
+/// The data folder this instance was started with, when not the default.
+static DATA_DIR: OnceLock<std::path::PathBuf> = OnceLock::new();
+
+/// Remember the data folder chosen at launch, so the login item this instance
+/// writes reopens the same folder.
+pub fn use_data_dir(folder: std::path::PathBuf) {
+    let _ = DATA_DIR.set(folder);
+}
+
+/// What a login item passes after the launcher path.
+fn login_arguments(data_dir: Option<&Path>) -> Result<Vec<String>, String> {
+    let mut arguments = vec!["--background".to_string()];
+    if let Some(folder) = data_dir {
+        let folder = folder.to_str().ok_or("Autostart data folder must be valid UTF-8")?;
+        if folder.chars().any(char::is_control) {
+            return Err("Autostart data folder must not contain control characters".into());
+        }
+        arguments.extend(["--data-dir".to_string(), folder.to_string()]);
+    }
+    Ok(arguments)
+}
 
 /// The launcher executable, so the login item relaunches this same binary.
 /// Only ever written into a per-user autostart entry, never used for a trust or
@@ -48,7 +76,24 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         return Ok(());
     }
     let exe = exe()?;
-    let plist = format!(
+    let exe = exe.to_str().ok_or("Autostart path must be valid UTF-8")?;
+    let plist = launch_agent_plist(exe, &login_arguments(DATA_DIR.get().map(PathBuf::as_path))?);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("create LaunchAgents: {e}"))?;
+    }
+    std::fs::write(&path, plist).map_err(|e| format!("write plist: {e}"))
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_plist(exe: &str, arguments: &[String]) -> String {
+    let xml = |value: &str| {
+        value.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+    };
+    let program: String = std::iter::once(exe)
+        .chain(arguments.iter().map(String::as_str))
+        .map(|value| format!("    <string>{}</string>\n", xml(value)))
+        .collect();
+    format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -56,20 +101,13 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
   <key>Label</key><string>{LABEL}</string>
   <key>ProgramArguments</key>
   <array>
-    <string>{}</string>
-    <string>--background</string>
-  </array>
+{program}  </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><false/>
 </dict>
 </plist>
-"#,
-        exe.display()
-    );
-    if let Some(dir) = path.parent() {
-        std::fs::create_dir_all(dir).map_err(|e| format!("create LaunchAgents: {e}"))?;
-    }
-    std::fs::write(&path, plist).map_err(|e| format!("write plist: {e}"))
+"#
+    )
 }
 
 // -------------------------------------------------------------- Windows -----
@@ -101,9 +139,45 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         }
     } else {
         let exe = exe()?;
-        let cmd = format!("\"{}\" --background", exe.display());
+        let arguments = login_arguments(DATA_DIR.get().map(std::path::PathBuf::as_path))?;
+        let cmd = run_command(&exe.display().to_string(), &arguments);
         key.set_value("EpixNet", &cmd).map_err(|e| format!("set Run value: {e}"))
     }
+}
+
+/// The Run value: the quoted launcher, then each argument, quoted when it
+/// needs it. Backslashes before a quote are doubled, as the C runtime's
+/// command-line parser expects, so `C:\data\` stays one argument.
+#[cfg(any(target_os = "windows", test))]
+fn run_command(exe: &str, arguments: &[String]) -> String {
+    let mut command = format!("\"{exe}\"");
+    for argument in arguments {
+        command.push(' ');
+        if !argument.is_empty() && !argument.contains([' ', '\t', '"']) {
+            command.push_str(argument);
+            continue;
+        }
+        command.push('"');
+        let mut backslashes = 0;
+        for ch in argument.chars() {
+            match ch {
+                '\\' => backslashes += 1,
+                '"' => {
+                    command.push_str(&"\\".repeat(backslashes * 2 + 1));
+                    command.push('"');
+                    backslashes = 0;
+                }
+                _ => {
+                    command.push_str(&"\\".repeat(backslashes));
+                    command.push(ch);
+                    backslashes = 0;
+                }
+            }
+        }
+        command.push_str(&"\\".repeat(backslashes * 2));
+        command.push('"');
+    }
+    command
 }
 
 // ---------------------------------------------------------------- Linux -----
@@ -194,7 +268,7 @@ pub fn refresh_enabled() -> Result<(), String> {
     if !metadata.file_type().is_file() {
         return Ok(());
     }
-    let entry = std::fs::read_to_string(path).map_err(|e| format!("read autostart: {e}"))?;
+    let entry = std::fs::read_to_string(&path).map_err(|e| format!("read autostart: {e}"))?;
     let Some(old) = entry
         .strip_prefix("[Desktop Entry]\nType=Application\nName=EpixNet\nExec=\"")
         .and_then(|s| s.strip_suffix("\" --background\nTerminal=false\nX-GNOME-Autostart-enabled=true\n"))
@@ -208,7 +282,8 @@ pub fn refresh_enabled() -> Result<(), String> {
     if old.is_absolute() && old.ends_with("usr/bin/epix-browser") {
         if let Some(dir) = old.ancestors().nth(3) {
             if appimage_directory(dir).is_some() {
-                set_enabled(true)?;
+                // Old entries never named a data folder; keep it that way.
+                write_desktop_entry(&path, None)?;
             }
         }
     }
@@ -224,6 +299,12 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
         }
         return Ok(());
     }
+    write_desktop_entry(&path, DATA_DIR.get().map(PathBuf::as_path))
+}
+
+#[cfg(all(unix, not(target_os = "macos")))]
+fn write_desktop_entry(path: &Path, data_dir: Option<&Path>) -> Result<(), String> {
+    let arguments = login_arguments(data_dir)?;
     let (launcher, extract) = linux_launcher()?;
     let launcher = launcher.to_str().ok_or("Autostart path must be valid UTF-8")?;
     if launcher.chars().any(char::is_control) {
@@ -237,17 +318,70 @@ pub fn set_enabled(on: bool) -> Result<(), String> {
     } else {
         r#"exec "$0" "$@""#
     };
+    let exec: Vec<String> = [desktop_argument(script), desktop_argument(launcher)]
+        .into_iter()
+        .chain(arguments.iter().map(|argument| desktop_argument(argument)))
+        .collect();
     let desktop = format!(
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=EpixNet\n\
-         Exec=/bin/sh -c {} {} --background\n\
+         Exec=/bin/sh -c {}\n\
          Terminal=false\n\
          X-GNOME-Autostart-enabled=true\n",
-        desktop_argument(script), desktop_argument(launcher)
+        exec.join(" ")
     );
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("create autostart dir: {e}"))?;
     }
-    std::fs::write(&path, desktop).map_err(|e| format!("write autostart: {e}"))
+    std::fs::write(path, desktop).map_err(|e| format!("write autostart: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn login_arguments_add_only_a_chosen_data_folder() {
+        assert_eq!(login_arguments(None).unwrap(), ["--background"]);
+        assert_eq!(
+            login_arguments(Some(Path::new("/srv/epix data"))).unwrap(),
+            ["--background", "--data-dir", "/srv/epix data"]
+        );
+        assert!(login_arguments(Some(Path::new("/bad\nfolder"))).is_err());
+    }
+
+    #[test]
+    fn run_command_keeps_each_folder_one_argument() {
+        let exe = r"C:\Users\me\AppData\Local\Epix\epix-browser.exe";
+        let run = |folder: &str| {
+            run_command(exe, &login_arguments(Some(Path::new(folder))).unwrap())
+        };
+        assert_eq!(
+            run_command(exe, &login_arguments(None).unwrap()),
+            format!("\"{exe}\" --background")
+        );
+        assert_eq!(run(r"D:\EpixData"), format!(r#""{exe}" --background --data-dir D:\EpixData"#));
+        assert_eq!(
+            run(r"D:\Epix Data\"),
+            format!(r#""{exe}" --background --data-dir "D:\Epix Data\\""#)
+        );
+        assert_eq!(
+            run(r"D:\a b\c"),
+            format!(r#""{exe}" --background --data-dir "D:\a b\c""#)
+        );
+    }
+
+    #[test]
+    fn launch_agent_lists_each_argument_and_escapes_xml() {
+        let plist = launch_agent_plist(
+            "/Applications/Epix.app/Contents/MacOS/epix-browser",
+            &login_arguments(Some(Path::new("/Users/me/R&D <data>"))).unwrap(),
+        );
+        assert!(plist.contains(
+            "    <string>/Applications/Epix.app/Contents/MacOS/epix-browser</string>\n    \
+             <string>--background</string>\n    <string>--data-dir</string>\n    \
+             <string>/Users/me/R&amp;D &lt;data&gt;</string>\n  </array>"
+        ), "{plist}");
+    }
 }

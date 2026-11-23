@@ -223,7 +223,7 @@ Set these before you start EpixNet to change how it runs:
 | `EPIX_BROWSER=epix` or `system` | Choose the browser for standalone node startup. The `--browser` flag takes precedence. | saved choice, otherwise `epix` |
 | `EPIX_UI_ADDR` | The address the dashboard listens on. | `127.0.0.1:42222` |
 | `EPIX_TOR` | Node Tor mode: `enable`, `disable`, or `always`. `always` requires Tor for node peer traffic; browser and wallet routing have separate controls. | `enable` |
-| `EPIX_DATA_DIR` | Where EpixNet keeps its data (xites, keys, settings). | see below |
+| `EPIX_DATA_DIR` | Where EpixNet keeps its data (xites, keys, settings). The `--data-dir` option does the same and wins. | see below |
 
 If dashboard port `42222` is already taken, EpixNet tries each next port in order until one is available. The selected dashboard port is saved in `ui_port` inside your data folder. For simultaneous standalone nodes, use `EPIX_HEADLESS=1` or `--browser system` and a separate `EPIX_DATA_DIR` per instance. The managed EpixNet Browser retains its single active profile policy.
 
@@ -238,6 +238,44 @@ Your data folder by default:
 - Windows: `%APPDATA%\EpixNet`
 - macOS: `~/Library/Application Support/EpixNet`
 - Linux: `~/.local/share/EpixNet` (or `$XDG_DATA_HOME/EpixNet`)
+
+### Choosing the data folder
+
+Start EpixNet with `--data-dir` to keep its data in another folder:
+
+```sh
+epix-browser --data-dir /mnt/usb/EpixNet       # desktop app
+epix-server --data-dir ~/epix-node             # standalone node
+epix-server --data-dir ~/epix-node siteList    # put it before an action name
+```
+
+On Windows:
+
+```powershell
+& "$env:LOCALAPPDATA\Epix\epix-browser.exe" --data-dir D:\EpixNet
+```
+
+- `--data-dir` does the same as `EPIX_DATA_DIR` and wins when both are set.
+- A relative folder is resolved against the current directory. A missing folder is created.
+- With **Open at Login** turned on from the tray, the login item starts EpixNet with the same folder.
+- A folder chosen this way cannot be moved from the Config page.
+- Only one EpixNet Browser runs at a time. A second one with a different folder refuses to start.
+
+To move your data for good without any option, use **Data directory** on the Config page. That choice is saved in `epixnet.conf` in the default folder, and every launch follows it, including Open at Login.
+
+### Keeping everything in one folder on Linux
+
+`--data-dir` moves your xites, keys, settings and browser profile. The EpixNet Browser still writes two small files to `~/.mozilla`: its local certificate and the wallet's native host entry. Firefox also keeps caches under `~/.cache` and `~/.config`.
+
+The AppImage can keep all of it next to itself. Give it a fixed name, so upgrades keep finding the folder, then create the folder once:
+
+```sh
+mv EpixNet-*-x86_64.AppImage EpixNet.AppImage
+./EpixNet.AppImage --appimage-portable-home    # creates EpixNet.AppImage.home
+./EpixNet.AppImage
+```
+
+The AppImage uses `EpixNet.AppImage.home` as its home folder. To upgrade, replace `EpixNet.AppImage` with the new version under the same name. Browser downloads land in that folder too, and Open at Login does not work in this mode. On Ubuntu 24.04 and newer, the first start may still ask for your password once to add a system sandbox rule for the bundled Firefox.
 
 ## Checking which version you are running
 

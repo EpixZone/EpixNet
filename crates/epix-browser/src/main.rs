@@ -120,10 +120,29 @@ pub struct Ready {
     pub i2p_on: bool,
 }
 
+fn print_help() {
+    println!("epix-browser {}", env!("EPIX_VERSION"));
+    println!("Usage: epix-browser [options] [xite address | name.epix | epix://link]");
+    println!("       epix-browser --quit");
+    println!();
+    println!("Options:");
+    println!("  --data-dir <folder>  Keep xites, keys, settings and the browser profile");
+    println!("                       in <folder>. Overrides EPIX_DATA_DIR. Default folder:");
+    println!("                       {}", epix_ui::paths::default_data_root().display());
+    println!("  --background         Start the node and tray without opening a window.");
+    println!("  --quit               Close a running EpixNet and wait for it to exit.");
+    println!("  -V, --version        Print the version.");
+}
+
 fn main() {
+    let mut raw_args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    // Choose the data folder while this is the only thread: it is exported as
+    // EPIX_DATA_DIR for this process, Firefox, the native host and restarts.
+    let data_dir = epix_ui::paths::take_data_dir_option(&mut raw_args, false)
+        .and_then(epix_ui::paths::apply_launch_data_dir);
     // Keep export stdout available to packaging tools, including on Windows.
     let args: Vec<String> =
-        std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+        raw_args.iter().map(|a| a.to_string_lossy().into_owned()).collect();
     if args.first().is_some_and(|arg| arg == "--export-wallet") {
         let result = if args.len() == 2 {
             ext::export_wallet(Path::new(&args[1]))
@@ -143,6 +162,26 @@ fn main() {
     // console; adopt the parent's (dev runs from a terminal) or log to a file.
     #[cfg(windows)]
     attach_console_or_log(&epix_node::data_root());
+    match data_dir {
+        // A login item written by this instance reopens the same folder.
+        Ok(Some(folder)) => autostart::use_data_dir(folder),
+        Ok(None) => {}
+        Err(error) => {
+            eprintln!("{error}. Use epix-browser --help for usage.");
+            std::process::exit(2);
+        }
+    }
+    match args.first().map(String::as_str) {
+        Some("-h") | Some("--help") => {
+            print_help();
+            return;
+        }
+        Some("-V") | Some("--version") => {
+            println!("epix-browser {}", env!("EPIX_VERSION"));
+            return;
+        }
+        _ => {}
+    }
     // Start the clock the startup log lines are stamped against.
     startup::since_launch();
 
