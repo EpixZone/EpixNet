@@ -13,8 +13,8 @@ yosemite = "0.7"
 # can drop it and use only an external router. The fork tracks eepnet/emissary
 # at 4495edc with its upstream ZIP upgrade, new RSA and P-256 verification
 # libraries, and updated interface discovery. Keep rustls enabled for mobile cross-builds.
-emissary-core = { git = "https://github.com/EpixZone/emissary", rev = "4fb2ed193a9e9150a68c9cae5c128b486f0d440c", optional = true, features = ["events"] }
-emissary-util = { git = "https://github.com/EpixZone/emissary", rev = "4fb2ed193a9e9150a68c9cae5c128b486f0d440c", optional = true, default-features = false, features = ["tokio", "rustls"] }
+emissary-core = { git = "https://github.com/EpixZone/emissary", rev = "c0a9b69c495a3aacb3c0c54278531b1e61ef9945", optional = true, features = ["events"] }
+emissary-util = { git = "https://github.com/EpixZone/emissary", rev = "c0a9b69c495a3aacb3c0c54278531b1e61ef9945", optional = true, default-features = false, features = ["tokio", "rustls"] }
 tokio = { version = "1", features = ["rt", "sync", "time", "net", "macros", "fs"] }
 async-trait = "0.1"
 tracing = "0.1"
