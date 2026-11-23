@@ -18,7 +18,7 @@ MAX_TOTAL = 32 * 1024 * 1024
 MAX_FILES = 2000
 EXACT = {
     "Cargo.toml", "Cargo.lock", "rust-toolchain.toml", "deny.toml",
-    "osv-scanner.toml", ".gitleaks.toml", ".gitignore",
+    ".gitleaks.toml", ".gitignore",
     ".github/workflows/ci.yml", ".github/workflows/build.yml",
     ".github/workflows/release.yml", ".github/workflows/security.yml",
     ".github/workflows/evx-platforms.yml",

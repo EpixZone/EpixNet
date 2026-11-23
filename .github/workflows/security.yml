@@ -96,12 +96,10 @@ jobs:
           toolchain: stable
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
-      # Existing maintenance notices are documented in deny.toml and osv-scanner.toml.
-      - run: >-
-          cargo audit
-          --ignore RUSTSEC-2024-0436
-          --ignore RUSTSEC-2026-0542
-          --ignore RUSTSEC-2026-0543
+      - name: Audit shipping and fuzz dependencies
+        run: |
+          cargo audit --deny warnings
+          cargo audit --deny warnings --file fuzz/Cargo.lock
 
   cargo-deny:
     name: cargo deny (advisories, bans, licenses, sources)
@@ -124,20 +122,14 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Test temporary OSV range correction
-        run: python3 -m unittest discover -s scripts -p test_osv_ci_config.py
-      - name: Prepare OSV policy for this lockfile
-        run: python3 scripts/osv_ci_config.py
-      - name: Scan Cargo.lock with OSV 2.7.0
-        # The action wrapper converts exit 128 to success, even with the false
-        # flag in scan-args. Call the same scanner directly to preserve errors.
-        # Keep this restricted to the inventory checked by osv_ci_config.py.
+      - name: Scan shipping and fuzz lockfiles with OSV 2.7.0
+        # Run the scanner directly to propagate both findings and scan failures.
         run: |
           docker run --rm \
             --volume "$GITHUB_WORKSPACE:/workspace:ro" --workdir /workspace \
             --entrypoint /root/osv-scanner \
             ghcr.io/google/osv-scanner-action:v2.7.0@sha256:d54770fe0b09493894e76a02aaed9f51a0513fa57c5186452a755d257b0068a6 \
-            scan source --config=.osv-scanner-ci.toml --lockfile=Cargo.lock \
+            scan source --lockfile=Cargo.lock --lockfile=fuzz/Cargo.lock \
             --allow-no-lockfiles=false
 
   semgrep:
@@ -169,7 +161,7 @@ jobs:
           --exclude-rule rust.lang.security.args-os.args-os
           --exclude-rule rust.lang.security.unsafe-usage.unsafe-usage
           --exclude-rule rust.lang.security.current-exe.current-exe
-          --error --sarif --output semgrep.sarif crates || true
+          --error --sarif --output semgrep.sarif crates
       - uses: github/codeql-action/upload-sarif@9b3254085494b55a0f7c4c2b3d2d52cc712ce370 # v4.39.1
         if: always()
         with:

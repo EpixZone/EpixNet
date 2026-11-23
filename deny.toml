@@ -3,15 +3,7 @@
 # Docs: https://embarkstudios.github.io/cargo-deny/
 
 [advisories]
-yanked = "warn"
-ignore = [
-    # The Tor, Tendermint and arkworks dependencies still require paste.
-    "RUSTSEC-2024-0436",
-    # Arti uses humantime for duration parsing and formatting.
-    "RUSTSEC-2026-0542",
-    # Arti's serde_with dependency records optional chrono support in Cargo.lock.
-    "RUSTSEC-2026-0543",
-]
+yanked = "deny"
 
 [bans]
 # Warn (do not fail) on duplicate crate versions. The tor/arti stack pulls in
