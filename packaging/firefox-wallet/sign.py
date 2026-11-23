@@ -13,6 +13,8 @@ from prepare import read_archive, sha256
 ROOT = Path(__file__).resolve().parent
 REVIEW_FILE = ROOT / "mozilla-review.json"
 TOOL_VERSIONS = {"web-ext": "10.8.0", "addons-linter": "10.14.0"}
+# Mozilla's Version.approval_notes model and API share this character limit.
+AMO_NOTES_LIMIT = 3000
 
 
 def checked_preparation(prepared):
@@ -112,6 +114,8 @@ def review_upload(prepared, output, reviewed_warnings):
     notes += "\nThe complete validator report is in mozilla-lint.json."
     if reviewed_warnings:
         notes += " reviewed-findings.json gives the source, location, bundle digest and review for each warning."
+    if len(notes) > AMO_NOTES_LIMIT:
+        raise ValueError("Reviewer notes exceed Mozilla's 3,000-character limit")
     metadata = output / "amo-metadata.json"
     metadata.write_text(json.dumps({"version": {"approval_notes": notes}}, indent=2) + "\n")
     return source, metadata
