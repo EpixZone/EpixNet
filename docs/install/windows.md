@@ -144,6 +144,8 @@ EpixNet keeps your sites, keys, and settings in:
 
 Paste that into the File Explorer address bar to open it.
 
+To use another folder, start EpixNet with `--data-dir <folder>` (see [Choosing the data folder](../../README.md#choosing-the-data-folder)). To keep EpixNet and all its data in one folder without installing, use [EpixNet Portable](../../README.md#epixnet-portable-for-windows).
+
 ## If something goes wrong
 
 - **`link.exe` not found` or a C++ error:** step 1 did not finish. Re-open the Visual Studio Build Tools installer and make sure **Desktop development with C++** is checked.

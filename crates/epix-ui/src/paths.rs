@@ -80,15 +80,57 @@ pub fn default_data_root() -> PathBuf {
 }
 
 /// The effective data root: `EPIX_DATA_DIR` if set (tests, extra nodes), else
-/// the `data_dir` configured in `<default>/epixnet.conf`, else the default.
+/// a portable copy's `Data` folder, else the `data_dir` configured in
+/// `<default>/epixnet.conf`, else the default.
 pub fn data_root() -> PathBuf {
     if let Ok(dir) = std::env::var("EPIX_DATA_DIR") {
         if !dir.is_empty() {
             return PathBuf::from(dir);
         }
     }
+    if let Some(portable) = portable_data_root() {
+        return portable;
+    }
     let default = default_data_root();
     read_conf_data_dir(&default.join("epixnet.conf")).unwrap_or(default)
+}
+
+/// A file that turns on portable mode when it sits beside the executable.
+pub const PORTABLE_MARKER: &str = "epixnet-portable.txt";
+
+/// The folder a portable copy keeps its data in, beside the marker.
+pub const PORTABLE_DATA_DIR: &str = "Data";
+
+/// The `Data` folder of a portable copy: the executable's folder holds
+/// [`PORTABLE_MARKER`]. Windows only, where the portable zip ships. On Linux
+/// the AppImage's own portable home folder covers this.
+pub fn portable_data_root() -> Option<PathBuf> {
+    if !cfg!(windows) {
+        return None;
+    }
+    // Locating our own files, not a trust decision: current_exe comes from
+    // the kernel, and whoever can write beside it already runs as this user.
+    // nosemgrep: rust.lang.security.current-exe.current-exe
+    let exe = std::env::current_exe().ok()?;
+    portable_data_root_in(exe.parent()?)
+}
+
+fn portable_data_root_in(folder: &Path) -> Option<PathBuf> {
+    folder
+        .join(PORTABLE_MARKER)
+        .is_file()
+        .then(|| folder.join(PORTABLE_DATA_DIR))
+}
+
+/// Where a launch keeps its data.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchDataDir {
+    /// The per-user default, or the folder a Config page move saved.
+    Default,
+    /// A folder named with `--data-dir` or `EPIX_DATA_DIR`.
+    Chosen(PathBuf),
+    /// The `Data` folder of a portable copy.
+    Portable(PathBuf),
 }
 
 /// The launch option that picks a data folder, like `EPIX_DATA_DIR`.
@@ -139,23 +181,38 @@ pub fn take_data_dir_option(
 }
 
 /// Select this launch's data folder: a `--data-dir` folder, else
-/// `EPIX_DATA_DIR`. Returns `None` for the default folder (which a Config page
-/// move may have relocated). The choice is exported as an absolute
-/// `EPIX_DATA_DIR`, so every child process uses the same folder: the browser
-/// handoff, the wallet's native host and a restart. Call it before the process
-/// starts any thread, because it changes the environment.
-pub fn apply_launch_data_dir(option: Option<PathBuf>) -> Result<Option<PathBuf>, String> {
-    let Some(folder) = option.or_else(|| {
+/// `EPIX_DATA_DIR`, else a portable copy's `Data` folder, else the default
+/// (which a Config page move may have relocated). A chosen or portable folder
+/// is exported as an absolute `EPIX_DATA_DIR`, so every child process uses
+/// the same folder: the browser handoff, the wallet's native host and a
+/// restart. Call it before the process starts any thread, because it changes
+/// the environment.
+pub fn apply_launch_data_dir(option: Option<PathBuf>) -> Result<LaunchDataDir, String> {
+    let chosen = option.or_else(|| {
         std::env::var_os("EPIX_DATA_DIR")
             .filter(|value| !value.is_empty())
             .map(PathBuf::from)
-    }) else {
-        return Ok(None);
+    });
+    let portable = portable_data_root();
+    let (folder, is_portable) = match chosen {
+        Some(folder) => {
+            let absolute = std::path::absolute(&folder)
+                .map_err(|e| format!("Cannot use data folder {}: {e}", folder.display()))?;
+            // A restart inherits the portable folder as EPIX_DATA_DIR.
+            let is_portable = portable.as_ref() == Some(&absolute);
+            (absolute, is_portable)
+        }
+        None => match portable {
+            Some(portable) => (portable, true),
+            None => return Ok(LaunchDataDir::Default),
+        },
     };
-    let absolute = std::path::absolute(&folder)
-        .map_err(|e| format!("Cannot use data folder {}: {e}", folder.display()))?;
-    std::env::set_var("EPIX_DATA_DIR", &absolute);
-    Ok(Some(absolute))
+    std::env::set_var("EPIX_DATA_DIR", &folder);
+    Ok(if is_portable {
+        LaunchDataDir::Portable(folder)
+    } else {
+        LaunchDataDir::Chosen(folder)
+    })
 }
 
 /// The default location's `epixnet.conf` - the same file the Python client
@@ -379,6 +436,21 @@ mod tests {
         assert!(text.contains("ui_port=42222"));
         // A missing file is a no-op success.
         remove_conf_keys(&dir.path().join("nope.conf"), &["tor"]).unwrap();
+    }
+
+    #[test]
+    fn portable_marker_puts_data_beside_the_executable() {
+        let folder = tempfile::tempdir().unwrap();
+        assert_eq!(portable_data_root_in(folder.path()), None);
+        // A folder of that name is not the marker.
+        std::fs::create_dir(folder.path().join(PORTABLE_MARKER)).unwrap();
+        assert_eq!(portable_data_root_in(folder.path()), None);
+        let other = tempfile::tempdir().unwrap();
+        std::fs::write(other.path().join(PORTABLE_MARKER), b"portable").unwrap();
+        assert_eq!(
+            portable_data_root_in(other.path()),
+            Some(other.path().join("Data"))
+        );
     }
 
     fn os_args(args: &[&str]) -> Vec<std::ffi::OsString> {
