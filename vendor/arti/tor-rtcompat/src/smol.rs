@@ -9,21 +9,20 @@ use crate::{RealCoarseTimeProvider, ToplevelBlockOn, compound::CompoundRuntime};
 use std::io::Result as IoResult;
 
 #[cfg(feature = "native-tls")]
-use crate::impls::native_tls::NativeTlsProvider;
+use crate::tls::NativeTlsProvider;
 #[cfg(feature = "rustls")]
 use crate::impls::rustls::RustlsProvider;
 
 // Bring in our SmolRuntime type.
 use crate::impls::smol::SmolRuntime;
 
-/// An alias for the smol runtime that we prefer to use, based on whatever TLS
-/// implementation has been enabled.
+/// The preferred Smol runtime for Tor links. Both TLS feature names use Rustls.
 #[cfg(feature = "native-tls")]
 pub use SmolNativeTlsRuntime as PreferredRuntime;
 #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
 pub use SmolRustlsRuntime as PreferredRuntime;
 
-/// A [`Runtime`](crate::Runtime) powered by smol and native-tls.
+/// A [`Runtime`](crate::Runtime) powered by smol and the Rustls Tor link provider.
 #[derive(Clone)]
 #[cfg(feature = "native-tls")]
 pub struct SmolNativeTlsRuntime {
@@ -31,7 +30,7 @@ pub struct SmolNativeTlsRuntime {
     inner: NativeTlsInner,
 }
 
-/// Implementation type for SmolRuntime using NativeTls.
+/// Implementation type for SmolRuntime using the legacy TLS feature name.
 #[cfg(feature = "native-tls")]
 type NativeTlsInner = CompoundRuntime<
     SmolRuntime,

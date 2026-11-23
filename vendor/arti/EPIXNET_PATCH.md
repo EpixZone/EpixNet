@@ -19,6 +19,12 @@ The root application and fuzz workspaces provide their dependency locks.
 * `tor-key-forge` and `tor-keymgr` are already under `vendor/` with the RSA migration.
   The remaining published packages in the table are under `vendor/arti/`.
 
+EpixNet selects Tokio with Rustls explicitly for all Tor connections. Arti binds
+the TLS certificate to the relay's directory identity in its channel handshake.
+The upstream `native-tls` feature and runtime names also use this Rustls
+transport in the EpixNet build. The separate native client implementation is
+removed. This change is limited to Tor relay links.
+
 The runtime TLS tests use the upstream expired, password-protected test identity
 in `tor-rtcompat/testdata/expired-server-identity.pfx`. The macOS and Windows
 native TLS backends can import the PKCS#12 fixture. The descriptor tests use

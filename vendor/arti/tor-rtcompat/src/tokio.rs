@@ -5,25 +5,17 @@ use crate::{CompoundRuntime, RealCoarseTimeProvider, ToplevelBlockOn};
 use std::io::{Error as IoError, Result as IoResult};
 
 #[cfg(feature = "native-tls")]
-use crate::impls::native_tls::NativeTlsProvider;
+use crate::tls::NativeTlsProvider;
 #[cfg(feature = "rustls")]
 use crate::impls::rustls::RustlsProvider;
 
-/// An alias for the Tokio runtime that we prefer to use, based on whatever TLS
-/// implementation has been enabled.
-///
-/// If only one of `native_tls` and `rustls` bas been enabled within the
-/// `tor-rtcompat` crate, that will be the TLS backend that this uses.
-///
-/// Currently, `native_tls` is preferred over `rustls` when both are available,
-/// because of its maturity within Arti.  However, this might change in the
-/// future.
+/// The preferred Tokio runtime for Tor links. Both TLS feature names use Rustls.
 #[cfg(feature = "native-tls")]
 pub use TokioNativeTlsRuntime as PreferredRuntime;
 #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
 pub use TokioRustlsRuntime as PreferredRuntime;
 
-/// A [`Runtime`](crate::Runtime) built around a Handle to a tokio runtime, and `native_tls`.
+/// A [`Runtime`](crate::Runtime) built around a Handle to a tokio runtime, and the Rustls Tor link provider.
 ///
 /// # Limitations
 ///

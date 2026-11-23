@@ -14,9 +14,6 @@ pub(crate) mod smol;
 #[cfg(feature = "rustls")]
 pub(crate) mod rustls;
 
-#[cfg(feature = "native-tls")]
-pub(crate) mod native_tls;
-
 pub(crate) mod streamops;
 pub(crate) mod unimpl_tls;
 

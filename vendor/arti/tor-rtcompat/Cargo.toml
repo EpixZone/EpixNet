@@ -63,10 +63,8 @@ full = [
     "tor-cert-x509?/full",
     "web-time-compat/full",
 ]
-native-tls = [
-    "native-tls-crate",
-    "async-native-tls",
-]
+# Retain the upstream feature name for consumers, using the same Tor link verifier.
+native-tls = ["rustls", "futures-rustls/ring"]
 rustls = [
     "futures-rustls",
     "dep:rustls-dont-use",
@@ -81,7 +79,6 @@ smol = [
     "__is_experimental",
 ]
 static = [
-    "native-tls-crate?/vendored",
     "__is_nonadditive",
 ]
 testing = [
@@ -113,10 +110,6 @@ optional = true
 
 [dependencies.async-io]
 version = "2.2.1"
-optional = true
-
-[dependencies.async-native-tls]
-version = "0.6.0"
 optional = true
 
 [dependencies.async-std-crate]
@@ -172,11 +165,6 @@ default-features = false
 
 [dependencies.hex]
 version = "0.4.3"
-
-[dependencies.native-tls-crate]
-version = "0.2"
-optional = true
-package = "native-tls"
 
 [dependencies.pastey]
 version = "0.2.3"

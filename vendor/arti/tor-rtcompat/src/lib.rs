@@ -101,7 +101,8 @@ pub mod tls {
         feature = "native-tls",
         any(feature = "tokio", feature = "async-std", feature = "smol")
     ))]
-    pub use crate::impls::native_tls::NativeTlsProvider;
+    /// Upstream compatibility name for the Rustls provider used for Tor links.
+    pub use crate::impls::rustls::RustlsProvider as NativeTlsProvider;
     #[cfg(all(
         feature = "rustls",
         any(feature = "tokio", feature = "async-std", feature = "smol")
@@ -140,8 +141,7 @@ use tokio as preferred_backend_mod;
 ///
 /// If `tokio` and `async-std` are both available, we prefer `tokio` for its
 /// performance.
-/// If `native_tls` and `rustls` are both available, we prefer `native_tls` since
-/// it has been used in Arti for longer.
+/// Both TLS feature names use the same Rustls Tor link authentication.
 ///
 /// The process [**may not fork**](crate#do-not-fork)
 /// (except, very carefully, before exec)

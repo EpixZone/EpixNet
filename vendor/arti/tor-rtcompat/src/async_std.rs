@@ -4,28 +4,20 @@ use crate::{RealCoarseTimeProvider, ToplevelBlockOn, compound::CompoundRuntime};
 use std::io::Result as IoResult;
 
 #[cfg(feature = "native-tls")]
-use crate::impls::native_tls::NativeTlsProvider;
+use crate::tls::NativeTlsProvider;
 #[cfg(feature = "rustls")]
 use crate::impls::rustls::RustlsProvider;
 
 use async_executors::AsyncStd;
 
-/// An alias for the async_std runtime that we prefer to use, based on whatever TLS
-/// implementation has been enabled.
-///
-/// If only one of `native_tls` and `rustls` bas been enabled within the
-/// `tor-rtcompat` crate, that will be the TLS backend that this uses.
-///
-/// Currently, `native_tls` is preferred over `rustls` when both are available,
-/// because of its maturity within Arti.  However, this might change in the
-/// future.
+/// The preferred AsyncStd runtime for Tor links. Both TLS feature names use Rustls.
 #[cfg(feature = "native-tls")]
 pub use AsyncStdNativeTlsRuntime as PreferredRuntime;
 
 #[cfg(all(feature = "rustls", not(feature = "native-tls")))]
 pub use AsyncStdRustlsRuntime as PreferredRuntime;
 
-/// A [`Runtime`](crate::Runtime) powered by `async_std` and `native_tls`.
+/// A [`Runtime`](crate::Runtime) powered by `async_std` and the Rustls Tor link provider.
 #[derive(Clone)]
 #[cfg(feature = "native-tls")]
 pub struct AsyncStdNativeTlsRuntime {

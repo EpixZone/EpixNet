@@ -142,10 +142,8 @@ Features supported by this crate:
 
 * `tokio` -- build with [Tokio](https://tokio.rs/) support
 * `async-std` -- build with [async-std](https://async.rs/) support.
-* `native-tls` --  build with the [native-tls](https://github.com/sfackler/rust-native-tls)
-  crate for TLS support.
-* `static` -- link the native TLS library statically (enables the `vendored` feature of the
-  `native-tls` crate).
+* `native-tls` is the upstream compatibility name for the Rustls Tor link provider in EpixNet.
+* `static` is retained for Cargo feature compatibility. EpixNet uses the Rustls Tor transport.
 * `rustls` -- build with the [rustls](https://github.com/rustls/rustls) crate for TLS support.
 
 ### Experimental and unstable features
@@ -153,8 +151,7 @@ Features supported by this crate:
 
 
 By default, *this* crate doesn't enable any features. However, you're almost certainly
-using this as part of the `arti-client` crate, which will enable `tokio` and `native-tls` in
-its default configuration.
+using this as part of the `arti-client` crate, whose default TLS feature also resolves to Rustls in EpixNet.
 
 ## Design FAQ
 
