@@ -849,11 +849,12 @@ KeyPathInfo {
 
         let key_spec = TestSpecifier {};
 
-        check_key_specifier(&key_spec, "encabulator/marzlevane");
+        let expected_path = "encabulator/marzlevane";
+        check_key_specifier(&key_spec, expected_path);
 
         assert_eq!(
             TestSpecifierPattern {}.arti_pattern().unwrap(),
-            KeyPathPattern::Arti("encabulator/marzlevane".into())
+            KeyPathPattern::Arti(expected_path.into())
         );
     }
 
@@ -871,7 +872,8 @@ KeyPathInfo {
 
         let key_spec = TestSpecifier { count: 6 };
 
-        check_key_specifier(&key_spec, "encabulator/marzlevane+6");
+        let expected_path = "encabulator/marzlevane+6";
+        check_key_specifier(&key_spec, expected_path);
 
         assert_eq!(
             TestSpecifierPattern { count: None }.arti_pattern().unwrap(),
@@ -897,7 +899,8 @@ KeyPathInfo {
             bearings: "spurving".into(),
         };
 
-        check_key_specifier(&key_spec, "encabulator/logarithmic/spurving/fan");
+        let expected_path = "encabulator/logarithmic/spurving/fan";
+        check_key_specifier(&key_spec, expected_path);
 
         assert_eq!(
             TestSpecifierPattern {
