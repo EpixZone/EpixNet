@@ -79,7 +79,7 @@ test("starts the fallback timer at once on a page that has already loaded", () =
   assert.equal(added.length, 1);
 });
 
-test("rewrites bare addresses and address searches to the dotted alias", () => {
+test("rewrites only bare address hosts and preserves search requests", () => {
   const { added, startup } = page();
   startup[0]();
   const redirect = added[0][0];
@@ -87,9 +87,7 @@ test("rewrites bare addresses and address searches to the dotted alias", () => {
     redirectUrl: `https://${ADDRESS}.epix/topic/1?x=2`,
   });
   for (const key of ["q", "query", "p", "text", "wd", "eq", "kw"]) {
-    assert.deepEqual(plain(redirect({ url: `https://search.example/?${key}=%20${ADDRESS}%20` })), {
-      redirectUrl: `https://${ADDRESS}.epix/`,
-    });
+    assert.deepEqual(plain(redirect({ url: `https://search.example/?${key}=%20${ADDRESS}%20` })), {});
   }
   for (const url of [
     "https://dashboard.epix/",

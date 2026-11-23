@@ -5,7 +5,7 @@ from pathlib import Path
 import shutil
 
 ROOT = Path(__file__).resolve().parent
-MODULE_FILES = ("chrome.manifest", "manager.sys.mjs", "policy.sys.mjs", "theme.sys.mjs", "welcome.sys.mjs", "manager.xhtml", "manager.css", "compatibility.json")
+MODULE_FILES = ("chrome.manifest", "manager.sys.mjs", "policy.sys.mjs", "theme.sys.mjs", "welcome.sys.mjs", "xite-address.sys.mjs", "manager.xhtml", "manager.css", "compatibility.json")
 
 def install(resources: Path):
     if not resources.is_dir() or resources.is_symlink():

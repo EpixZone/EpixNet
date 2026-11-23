@@ -1563,8 +1563,8 @@ user_pref("keyword.enabled", true);
 // explicit https://dashboard.epix/ would load). Whitelist the suffix so any
 // `*.epix` typed without a scheme navigates like a real domain - the PAC then
 // routes it to the node proxy and the bar keeps showing the name, like DNS.
-// (Bare bech32 `epix1…` addresses have no dot, so this can't reach them; the
-// urlbar WebExtension redirect handles those.)
+// The packaged browser classifies a typed bare EPIX address before Firefox creates
+// a search request. Explicit search mode stays with the selected engine.
 user_pref("browser.fixup.domainsuffixwhitelist.epix", true);
 user_pref("browser.urlbar.suggest.searches", false);
 user_pref("browser.urlbar.suggest.quickactions", false);

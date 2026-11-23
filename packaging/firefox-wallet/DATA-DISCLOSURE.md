@@ -50,4 +50,4 @@ wallet repository in the source archive.
 | Connected accounts, viewing keys and private balance queries | `packages/background/src/keyring/handler.ts`, `packages/background/src/token-cw20/handler.ts`, `packages/stores/src/query/secret-wasm/secret20-balance.ts` |
 | Native commands, local transfers and release settings | `apps/extension/src/background/epix-native.ts`, `apps/extension/src/pages/setting/general/link-keplr-mobile/index.tsx`, `.github/workflows/build-dist.yml`, `apps/extension/src/config.ui.ts` |
 
-EpixNet supplies the desktop address redirect in `crates/epix-browser/assets/epix-urlbar.js`.
+EpixNet resolves an exact bare EPIX address in the browser address bar before a search is formed. The wallet’s desktop redirect handles HTTP(S) URLs whose host is a bare EPIX address. Search-engine query parameters are never examined. See `packaging/firefox-addons/xite-address.sys.mjs` and `crates/epix-browser/assets/epix-urlbar.js` in the EpixNet source.

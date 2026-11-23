@@ -27,6 +27,7 @@ const MODULES: &[(&str, &[u8])] = &[
     installer_module!("policy.sys.mjs"),
     installer_module!("theme.sys.mjs"),
     installer_module!("welcome.sys.mjs"),
+    installer_module!("xite-address.sys.mjs"),
     (
         "distribution/epix-addon-installer/welcome.png",
         include_bytes!("../../../packaging/linux/icons/epix-128.png"),
