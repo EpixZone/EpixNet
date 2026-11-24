@@ -33,6 +33,9 @@ use tor_rtcompat::tokio::TokioRustlsRuntime;
 #[cfg(feature = "bridges")]
 pub mod bridges;
 
+#[cfg(target_os = "linux")]
+mod storage;
+
 /// Options for [`Tor::bootstrap`]. A struct so callers that do not use bridges
 /// pass `&BootstrapOpts::default()` without cfg-forking on their side.
 #[derive(Default)]
@@ -356,12 +359,12 @@ impl Tor {
         #[cfg(not(feature = "bridges"))]
         let _ = opts;
         install_crypto_provider();
-        let state = data_dir.join("tor").join("state");
-        let cache = data_dir.join("tor").join("cache");
-        clear_poisoned_guard_state(&state);
+        let tor_dir = data_dir.join("tor");
+        let state = tor_dir.join("state");
+        let cache = tor_dir.join("cache");
         // `mut` is only needed under the `bridges` feature (apply_bridge below).
         #[cfg_attr(not(feature = "bridges"), allow(unused_mut))]
-        let mut builder = TorClientConfigBuilder::from_directories(state, cache);
+        let mut builder = TorClientConfigBuilder::from_directories(&state, cache);
         // Route the guard channel through Snowflake when a bridge is configured
         // (censored networks); otherwise arti dials relays directly as before.
         #[cfg(feature = "bridges")]
@@ -371,6 +374,11 @@ impl Tor {
         let config = builder
             .build()
             .map_err(|e| Error::Protocol(format!("tor config: {e}")))?;
+        #[cfg(target_os = "linux")]
+        for name in ["state", "cache"] {
+            storage::secure_existing_directory(config.fs_mistrust(), &tor_dir, name)?;
+        }
+        clear_poisoned_guard_state(&state);
         let runtime = TokioRustlsRuntime::current()?;
         let client = TorClient::with_runtime(runtime)
             .config(config)
