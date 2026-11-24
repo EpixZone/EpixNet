@@ -8,8 +8,9 @@ const { test } = require("node:test");
 const { pathToFileURL } = require("node:url");
 
 const script = path.join(__dirname, "../assets/epix-urlbar.js");
+const validator = path.join(__dirname, "../assets/epix-address.js");
 const source = fs.readFileSync(script, "utf8");
-const ADDRESS = "epix1" + "q".repeat(38);
+const ADDRESS = "epix1dashanwfts3qcflekhmkvcz66ss4kxz2tr2k6g";
 // The script runs in its own realm, so its objects have another Object
 // prototype. Copy them into this one before a strict comparison.
 const plain = (value) => JSON.parse(JSON.stringify(value));
@@ -33,7 +34,9 @@ function page({ readyState = "loading", onStartup = true } = {}) {
   };
   context.globalThis = context;
   // Named as the real file, so a coverage run attributes the lines to it.
-  vm.runInNewContext(source, context, { filename: pathToFileURL(script).href });
+  vm.createContext(context);
+  vm.runInContext(fs.readFileSync(validator, "utf8"), context, { filename: pathToFileURL(validator).href });
+  vm.runInContext(source, context, { filename: pathToFileURL(script).href });
   return { added, startup, events, timers };
 }
 
@@ -79,20 +82,22 @@ test("starts the fallback timer at once on a page that has already loaded", () =
   assert.equal(added.length, 1);
 });
 
-test("rewrites bare addresses and address searches to the dotted alias", () => {
+test("rewrites only bare address hosts and preserves search requests", () => {
   const { added, startup } = page();
   startup[0]();
   const redirect = added[0][0];
   assert.deepEqual(plain(redirect({ url: `https://${ADDRESS}/topic/1?x=2` })), {
     redirectUrl: `https://${ADDRESS}.epix/topic/1?x=2`,
   });
+  assert.equal(redirect({ url: `https://${ADDRESS.toUpperCase()}/` }).redirectUrl, `https://${ADDRESS}.epix/`);
   for (const key of ["q", "query", "p", "text", "wd", "eq", "kw"]) {
-    assert.deepEqual(plain(redirect({ url: `https://search.example/?${key}=%20${ADDRESS}%20` })), {
-      redirectUrl: `https://${ADDRESS}.epix/`,
-    });
+    assert.deepEqual(plain(redirect({ url: `https://search.example/?${key}=%20${ADDRESS}%20` })), {});
   }
   for (const url of [
     "https://dashboard.epix/",
+    "https://epix1bookclubmembership2026/",
+    `https://${ADDRESS.slice(0, -1)}q/`,
+    `https://${"epix1" + "i".repeat(38)}/`,
     `https://${ADDRESS}.epix/`,
     "https://search.example/?q=epix",
     `https://search.example/?other=${ADDRESS}`,

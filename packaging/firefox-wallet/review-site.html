@@ -1,0 +1,34 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Epix Wallet signing test</title>
+<h1>Epix Wallet signing test</h1>
+<p>Connect a disposable, unfunded wallet. Compare the text below with the wallet prompt, then reject the signature.</p>
+<pre id="message">{"purpose":  "Mozilla text preview", "network": "local"}</pre>
+<button id="request" type="button">Request test signature</button>
+<p id="status" role="status"></p>
+<script>
+  const button = document.getElementById("request");
+  const status = document.getElementById("status");
+  button.addEventListener("click", async () => {
+    const wallet = window.keplr;
+    if (!wallet) {
+      status.textContent = "Epix Wallet is unavailable. Open this page in the test profile.";
+      return;
+    }
+    button.disabled = true;
+    try {
+      const chain = "epix_1916-1";
+      await wallet.enable(chain);
+      const account = await wallet.getKey(chain);
+      const message = document.getElementById("message").textContent;
+      await wallet.signArbitrary(chain, account.bech32Address, message);
+      status.textContent = "The wallet returned a text signature.";
+    } catch (error) {
+      status.textContent = String(error);
+    } finally {
+      button.disabled = false;
+    }
+  });
+</script>
+</html>

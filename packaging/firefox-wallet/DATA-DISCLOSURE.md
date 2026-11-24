@@ -1,9 +1,9 @@
 # Epix Wallet data disclosure
 
-This review covers the desktop Firefox signing candidate for `wallet@epix.zone`,
-version `0.13.41.1`, with wallet source `39d6afd0e243` and the EpixNet packaging
-and native bridge in PR #778. Wallet PR #40 updates local JavaScript dependency helpers for Firefox.
-We reviewed the wallet permissions, data recipients and analytics configuration for this build.
+This review covers the desktop Firefox signing candidate for `wallet@epix.zone`.
+The [machine-readable record](data-disclosure.json) identifies the reviewed wallet
+revision. The submitted source archive identifies the exact wallet and EpixNet
+revisions, Firefox version declaration, release version and public policy URLs.
 The signing manifest requires the four data types below. Individual site connections, signature requests and
 transactions still have their own controls. The wallet offers no separate
 Firefox data permission for these flows. [Machine-readable declaration](data-disclosure.json) ·
@@ -36,9 +36,18 @@ wallet connections, independent providers and public records. The table gives
 the release-specific details for publisher and reviewer use, including the
 phishing URL, Google icon lookup, EVM origin, and viewing credentials.
 
-## Sources for this release
+## Source in the submitted archive
 
-- [Phishing redirect](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/background/background.ts#L202-L234), [content-script URL](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/content-scripts/content-scripts.ts#L120-L132), [Google icon URL](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/utils/favicon.ts), [signature prompt](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/pages/sign/components/arbitrary-message/arbitrary-message-origin.tsx), [account-switch prompt](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/pages/switch-account/index.tsx#L162).
-- [Transaction simulation](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/keyring-cosmos/service.ts#L1317-L1368), [EVM queries](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/keyring-ethereum/service.ts#L1292-L1360), [EVM broadcast](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/tx-ethereum/service.ts#L48-L69), [token scans](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/token-scan/service.ts#L436-L465), [Bitcoin account and lookup data](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/keyring-bitcoin/service.ts).
-- [Connected wallet accounts](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/keyring/handler.ts#L503-L575), [site challenge signatures](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/keyring-ethereum/service.ts#L758-L800), [viewing key access](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/background/src/token-cw20/handler.ts#L131), [private balance query](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/packages/stores/src/query/secret-wasm/secret20-balance.ts#L49).
-- [Native commands](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/background/epix-native.ts#L512-L569), [local wallet transfer](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/pages/setting/general/link-keplr-mobile/index.tsx), [release configuration](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/.github/workflows/build-dist.yml#L57-L63), [analytics configuration](https://github.com/EpixZone/epix-wallet/blob/39d6afd0e243/apps/extension/src/config.ui.ts#L134-L147).
+`REVIEWER.txt` links both exact Git revisions. These paths are relative to the
+wallet repository in the source archive.
+
+| Behavior | Source path |
+| --- | --- |
+| Phishing checks and redirects | `apps/extension/src/background/background.ts`, `apps/extension/src/content-scripts/content-scripts.ts` |
+| Site icon requests | `apps/extension/src/utils/favicon.ts`, `apps/extension/src/pages/sign/components/arbitrary-message/arbitrary-message-origin.tsx`, `apps/extension/src/pages/switch-account/index.tsx` |
+| Transaction simulation, EVM queries and broadcasts | `packages/background/src/keyring-cosmos/service.ts`, `packages/background/src/keyring-ethereum/service.ts`, `packages/background/src/tx-ethereum/service.ts` |
+| Token scans and Bitcoin account lookups | `packages/background/src/token-scan/service.ts`, `packages/background/src/keyring-bitcoin/service.ts` |
+| Connected accounts, viewing keys and private balance queries | `packages/background/src/keyring/handler.ts`, `packages/background/src/token-cw20/handler.ts`, `packages/stores/src/query/secret-wasm/secret20-balance.ts` |
+| Native commands, local transfers and release settings | `apps/extension/src/background/epix-native.ts`, `apps/extension/src/pages/setting/general/link-keplr-mobile/index.tsx`, `.github/workflows/build-dist.yml`, `apps/extension/src/config.ui.ts` |
+
+EpixNet resolves an exact bare EPIX address in the browser address bar before a search is formed. The wallet’s desktop redirect handles HTTP(S) URLs whose host is a bare EPIX address. Search-engine query parameters are never examined. See `packaging/firefox-addons/xite-address.sys.mjs` and `crates/epix-browser/assets/epix-urlbar.js` in the EpixNet source.

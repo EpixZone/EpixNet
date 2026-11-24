@@ -13,6 +13,8 @@ from prepare import read_archive, sha256
 ROOT = Path(__file__).resolve().parent
 REVIEW_FILE = ROOT / "mozilla-review.json"
 TOOL_VERSIONS = {"web-ext": "10.8.0", "addons-linter": "10.14.0"}
+# Mozilla's Version.approval_notes model and API share this character limit.
+AMO_NOTES_LIMIT = 3000
 
 
 def checked_preparation(prepared):
@@ -97,22 +99,23 @@ def lint_preparation(prepared, reviewed_warnings=False):
     return run_lint(prepared, checked_preparation(prepared), reviewed_warnings)
 
 
-def reviewed_upload(prepared, output):
+def review_upload(prepared, output, reviewed_warnings):
     source = output / "review-source.zip"
     shutil.copyfile(prepared / "source.zip", source)
+    files = {"mozilla-lint.json": prepared / "lint.json"}
+    if reviewed_warnings:
+        files["reviewed-findings.json"] = REVIEW_FILE
     with zipfile.ZipFile(source, "a") as archive:
-        for name, path in (("mozilla-lint.json", prepared / "lint.json"), ("reviewed-findings.json", REVIEW_FILE)):
+        notes = archive.read("REVIEWER.txt").decode("utf-8")
+        for name, path in files.items():
             if name in archive.namelist():
                 raise ValueError(f"Source archive already contains {name}")
             archive.writestr(zipfile.ZipInfo(name), path.read_bytes(), compress_type=zipfile.ZIP_DEFLATED)
-    notes = ("Epix Wallet for unlisted distribution with EpixNet. Please review the six Mozilla lint warnings. "
-             "The uploaded source archive contains the full validator output in mozilla-lint.json and an "
-             "explanation, upstream source link, location and bundle digest for each warning in reviewed-findings.json. "
-             "BUILD.txt explains how to restore both source revisions, reproduce the build and verify every file.\n\n"
-             "To test onboarding, install in a fresh Firefox profile and open the Epix Wallet toolbar button. "
-             "Select 'Create a new wallet', then 'Create new recovery phrase'. Use the newly generated phrase, "
-             "a test wallet name and a disposable password of at least eight characters. Complete the prompts, "
-             "open the wallet, then lock and unlock it. The test needs no funds or existing accounts.")
+    notes += "\nThe complete validator report is in mozilla-lint.json."
+    if reviewed_warnings:
+        notes += " reviewed-findings.json gives the source, location, bundle digest and review for each warning."
+    if len(notes) > AMO_NOTES_LIMIT:
+        raise ValueError("Reviewer notes exceed Mozilla's 3,000-character limit")
     metadata = output / "amo-metadata.json"
     metadata.write_text(json.dumps({"version": {"approval_notes": notes}}, indent=2) + "\n")
     return source, metadata
@@ -125,15 +128,11 @@ def sign(prepared, output, reviewed_warnings=False):
     expected = checked_preparation(prepared)
     run_lint(prepared, expected, reviewed_warnings)
     output.mkdir(parents=True, exist_ok=False)
-    source = prepared / "source.zip"
-    metadata_args = []
-    if reviewed_warnings:
-        source, metadata = reviewed_upload(prepared, output)
-        metadata_args = ["--amo-metadata", str(metadata)]
+    source, metadata = review_upload(prepared, output, reviewed_warnings)
     subprocess.run(["node", str(pinned_cli()), "sign", "--channel=unlisted",
                     "--source-dir", str(prepared / "extension"),
                     "--upload-source-code", str(source),
-                    "--artifacts-dir", str(output), *metadata_args], check=True)
+                    "--artifacts-dir", str(output), "--amo-metadata", str(metadata)], check=True)
     candidates = list(output.glob("*.xpi"))
     if len(candidates) != 1:
         raise ValueError("Mozilla signing did not produce exactly one XPI")

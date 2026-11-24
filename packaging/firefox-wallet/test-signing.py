@@ -29,11 +29,14 @@ class SigningTests(unittest.TestCase):
             path.mkdir()
             subprocess.run(["git", "init", "-q", str(path)], check=True)
         (self.wallet / "source.js").write_text("// human-readable wallet source\n")
+        (self.wallet / "package.json").write_text(json.dumps({"packageManager": "yarn@3.4.1"}))
         self.wallet_revision = self.commit(self.wallet)
         self.review = json.loads((HERE / "data-disclosure.json").read_text())
         self.review["wallet_revision"] = self.wallet_revision
         self.review_path = self.repo / "packaging/firefox-wallet/data-disclosure.json"
         self.review_path.parent.mkdir(parents=True)
+        self.review["build_tools"].update(node="22.9.1", protoc="25.4", release_run=12345)
+        (self.review_path.parent / "REVIEWER.txt").write_bytes((HERE / "REVIEWER.txt").read_bytes())
         self.review_path.write_text(json.dumps(self.review))
         (self.repo / "shells").mkdir()
         (self.repo / "shells/wallet-ext.rev").write_text(self.wallet_revision[:12])
@@ -76,6 +79,13 @@ class SigningTests(unittest.TestCase):
         source = prepare.read_archive(self.args.output / "source.zip")
         self.assertIn("epix-wallet/source.js", source)
         self.assertIn(b"1.0.0.1", source["BUILD.txt"])
+        self.assertIn(b"Node 22.9.1, the included Yarn 3.4.1 and protoc 25.4", source["BUILD.txt"])
+        self.assertIn(b"/actions/runs/12345", source["BUILD.txt"])
+        notes = source["REVIEWER.txt"].decode()
+        self.assertIn(f"/epix-wallet/tree/{self.wallet_revision}", notes)
+        self.assertIn(f"/EpixNet/tree/{self.revision}", notes)
+        self.assertIn("https://example.com/privacy/", notes)
+        self.assertIn("https://example.com/terms/", notes)
         with self.assertRaises(FileExistsError):
             prepare.prepare(self.args, self.repo)
 
@@ -108,6 +118,14 @@ class SigningTests(unittest.TestCase):
             self.assertEqual(json.loads(rebuild.submission_manifest(manifest, "2", self.review["gecko"])), expected)
         with self.assertRaisesRegex(ValueError, "conflicting browser settings"):
             rebuild.submission_manifest({"applications": settings, "browser_specific_settings": {}}, "2", self.review["gecko"])
+
+    def test_source_recipe_rejects_unmatched_package_manager(self):
+        self.review["build_tools"]["yarn"] = "3.9.0"
+        self.review_path.write_text(json.dumps(self.review))
+        updated = self.commit(self.repo)
+        self.browser.write_text(self.browser.read_text().replace(self.revision[:12], updated[:12]))
+        with self.assertRaisesRegex(ValueError, "Yarn version differs"):
+            prepare.prepare(self.args, self.repo)
 
     def test_unreviewed_wallet_pin_stops_preparation(self):
         self.review["wallet_revision"] = "0" * 40
@@ -168,6 +186,7 @@ class SigningTests(unittest.TestCase):
             self.assertIn(b"rebuild.py verify-final", source["BUILD.txt"])
             metadata = json.loads(Path(command[command.index("--amo-metadata") + 1]).read_text())
             self.assertIn("mozilla-lint.json", metadata["version"]["approval_notes"])
+            self.assertLessEqual(len(metadata["version"]["approval_notes"]), sign.AMO_NOTES_LIMIT)
             prepare.write_archive(output / "wallet.xpi", expected)
 
         with patch.object(sign, "pinned_cli", return_value="web-ext"), \
@@ -179,6 +198,24 @@ class SigningTests(unittest.TestCase):
             receipt = sign.sign(self.args.output, output, reviewed_warnings=True)
         self.assertEqual(command.call_count, 3)
         self.assertFalse(receipt["firefox_signature_verified"])
+
+    def test_oversized_reviewer_notes_stop_before_upload(self):
+        receipt = prepare.prepare(self.args, self.repo)
+        prepared = self.args.output
+        source = prepared / "source.zip"
+        entries = prepare.read_archive(source)
+        entries["REVIEWER.txt"] = b"A" * sign.AMO_NOTES_LIMIT
+        source.unlink()
+        prepare.write_archive(source, entries)
+        receipt["source_sha256"] = prepare.sha256(source.read_bytes())
+        (prepared / "provenance.json").write_text(json.dumps(receipt))
+        completed = SimpleNamespace(stdout=json.dumps({"summary": {"errors": 0, "warnings": 0}}), returncode=0)
+        with patch.object(sign, "pinned_cli", return_value="web-ext"), \
+                patch.object(sign.subprocess, "run", return_value=completed) as command, \
+                patch.dict(os.environ, {"WEB_EXT_API_KEY": "fixture", "WEB_EXT_API_SECRET": "fixture"}):
+            with self.assertRaisesRegex(ValueError, "3,000-character"):
+                sign.sign(prepared, self.root / "oversize")
+        command.assert_called_once()
 
     def test_review_rejects_changes_to_diagnostics_candidate_or_lint_status(self):
         report = self.reviewed_fixture()
@@ -268,6 +305,15 @@ class SigningTests(unittest.TestCase):
             self.assertIn("--channel=unlisted", command)
             self.assertNotIn("fixture-issuer", command)
             self.assertNotIn("fixture-secret", command)
+            source = prepare.read_archive(Path(command[command.index("--upload-source-code") + 1]))
+            notes = json.loads(Path(command[command.index("--amo-metadata") + 1]).read_text())["version"]["approval_notes"]
+            self.assertIn(source["REVIEWER.txt"].decode(), notes)
+            self.assertIn("Chainapsis", notes)
+            self.assertIn("DATA-DISCLOSURE.md", notes)
+            self.assertIn("review-site.html", notes)
+            self.assertEqual(json.loads(source["mozilla-lint.json"])["summary"]["warnings"], 0)
+            self.assertNotIn("reviewed-findings.json", source)
+            self.assertNotIn("reviewed-findings.json", notes)
             prepare.write_archive(output / "wallet.xpi", expected)
 
         with patch.object(sign, "ROOT", tools), patch.object(sign.subprocess, "run", service), \

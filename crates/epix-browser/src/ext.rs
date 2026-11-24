@@ -420,19 +420,9 @@ fn patch_wallet_js(contents: &[u8]) -> Vec<u8> {
     patch_wallet_boot_spin(base).unwrap_or_else(|| base.to_vec())
 }
 
-/// URL-bar navigation for bare xite addresses. A bech32 `epix1…` address has no
-/// dot, so Firefox's fixup sends it to the default search engine instead of
-/// navigating (a dotted `name.epix` navigates natively via the suffix
-/// whitelist). This background script catches that search - a main-frame
-/// navigation whose search term IS a bech32 address - before it leaves, and
-/// goes to the xite instead, like the mobile shells' address bars.
-///
-/// Matched on the search TERM across all main-frame navigations, not on any one
-/// engine's host, so it keeps working if the user changes their default search
-/// engine (DuckDuckGo, Google, Bing, Brave, Ecosia, Startpage, Yahoo, Baidu,
-/// Yandex, or a custom one). The term rides in a handful of well-known query
-/// keys; `epix1…` never legitimately appears as another xite's query value, so a
-/// term match is unambiguous. Non-matching navigations fall straight through.
+/// The wallet redirects HTTP(S) links to bare EPIX hosts to their dotted .epix alias.
+/// The packaged browser's address bar handles direct address entry separately.
+/// Ordinary search requests pass through to the chosen provider.
 ///
 /// The redirect target is the dotted ALIAS `https://<addr>.epix/`, never the
 /// bare `https://<addr>/`: browsers special-case single-label (dotless) hosts
@@ -446,7 +436,12 @@ fn patch_wallet_js(contents: &[u8]) -> Vec<u8> {
 /// loads. Firefox records a blocking listener added during the load and, at the
 /// next browser start, holds every request it matches until the page has
 /// loaded again. For a main-frame filter that is the first page itself.
-const EPIX_URLBAR_JS: &[u8] = include_bytes!("../assets/epix-urlbar.js");
+const EPIX_URLBAR_JS: &[u8] = concat!(
+    "(() => {\n",
+    include_str!("../assets/epix-address.js"),
+    include_str!("../assets/epix-urlbar.js"),
+    "\n})();\n",
+).as_bytes();
 
 /// Add the URL-bar script to the wallet's background page, right after the
 /// polyfill so it registers before the wallet's own bundles. Accept the quoted
@@ -511,18 +506,9 @@ fn transform_manifest(contents: &[u8], stamp: u32) -> Vec<u8> {
     serde_json::to_vec(&m).unwrap_or_else(|_| stamp_manifest_version(contents, stamp))
 }
 
-/// The injected `epix-urlbar.js` runs on the wallet's background page, so it
-/// inherits the wallet's granted host permissions. Its blocking `webRequest`
-/// redirect watches all main-frame navigations (to catch a `epix1…` search on
-/// WHATEVER engine is default), so it needs host permission for all http/https
-/// origins. In a Manifest V2 add-on those host patterns must live in the
-/// `permissions` array: the wallet lists them under the `host_permissions` key
-/// instead, which Firefox IGNORES for MV2 - so without this the redirect
-/// silently no-ops and a typed `epix1…` address falls through to search. Grant
-/// `*://*/*` in the MV2 `permissions` array (idempotent; a no-op on MV3, where
-/// host_permissions is honoured, or if already present). This matches the broad
-/// host access the wallet already intends (its content scripts run on
-/// `<all_urls>`), so it grants nothing the wallet did not already ask for.
+/// The wallet's background script redirects top-level HTTP(S) URLs whose host
+/// is a bare EPIX address. Firefox MV2 reads host patterns from `permissions`.
+/// Some upstream builds only include them under the MV3 `host_permissions` key.
 fn grant_urlbar_host_permissions(m: &mut serde_json::Value) {
     let is_mv2 = m.get("manifest_version").and_then(|v| v.as_u64()) == Some(2);
     if !is_mv2 {
@@ -1223,12 +1209,11 @@ mod tests {
             assert!(poly < urlbar && urlbar < bundle, "script order polyfill < urlbar < bundles: {s}");
             assert_eq!(s.replace("<script src=\"epix-urlbar.js\"></script>", ""), src);
         }
-        // The injected script only rewrites bech32-address searches and hosts.
+        // The injected script only rewrites bare address hosts.
         let js = std::str::from_utf8(EPIX_URLBAR_JS).unwrap();
-        assert!(js.contains("*://*/*"), "engine-agnostic: watches all main-frame navigations");
+        assert!(js.contains("*://*/*"), "examines HTTP(S) navigations");
         assert!(js.contains("main_frame"), "only top-level navigations");
-        assert!(js.contains("^epix1[a-z0-9]{20,80}$"), "exact bech32 match");
-        assert!(js.contains(".epix/"), "search terms go to the dotted alias, never a dotless host");
+        assert!(js.contains("isEpixXiteAddress(u.hostname)"), "checked EPIX address host");
         assert!(js.contains("u.hostname + \".epix\""), "bare-address hosts rewrite to the alias");
         // Behavior, including when the listener is added, is covered by
         // tests/urlbar.test.cjs.
