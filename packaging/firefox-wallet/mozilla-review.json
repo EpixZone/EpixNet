@@ -2,7 +2,7 @@
   "extension_id": "wallet@epix.zone",
   "wallet_revision": "03aa7b0f56aaefc3eb87f9e5334105018c5bd47e",
   "version": "0.13.41.2",
-  "unsigned_sha256": "facfce400550156cbd585af6794d3883b0765af0bc8d57d0466e551375193b83",
+  "unsigned_sha256": "d92bb0cfde0ed7e63da8fc3f98f767f4605c00d76770ca4bab3823ff0d9beb36",
   "tools": {
     "web-ext": "10.8.0",
     "addons-linter": "10.14.0"

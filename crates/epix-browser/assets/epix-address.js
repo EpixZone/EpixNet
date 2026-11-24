@@ -18,9 +18,9 @@ function isEpixXiteAddress(text) {
 
   // BIP-173 expands the HRP into its high bits, a zero, then its low bits.
   const hrp = "epix";
-  for (const letter of hrp) addWord(letter.charCodeAt(0) >>> 5);
+  for (const letter of hrp) addWord(letter.codePointAt(0) >>> 5);
   addWord(0);
-  for (const letter of hrp) addWord(letter.charCodeAt(0) & 31);
+  for (const letter of hrp) addWord(letter.codePointAt(0) & 31);
   for (const letter of address.slice(hrp.length + 1)) {
     const word = alphabet.indexOf(letter);
     if (word < 0) return false;
