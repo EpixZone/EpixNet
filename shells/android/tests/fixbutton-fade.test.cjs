@@ -35,6 +35,7 @@ test('scroll fades the fixbutton in both directions and respects reduced motion 
     const button = page.locator('.fixbutton');
     const shown = {opacity: 1, visibility: 'visible', pointerEvents: 'auto'};
     const hidden = {opacity: 0, visibility: 'hidden', pointerEvents: 'none'};
+    assert.equal(await button.evaluate(element => getComputedStyle(element).opacity), '1');
 
     for (const hide of [true, false]) {
         const {duration, middle, end} = await sampleChange(button, hide);
