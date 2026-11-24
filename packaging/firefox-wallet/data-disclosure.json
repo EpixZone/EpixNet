@@ -1,5 +1,5 @@
 {
-  "wallet_revision": "39d6afd0e2439e18cc229c609de619a4aad91ac7",
+  "wallet_revision": "03aa7b0f56aaefc3eb87f9e5334105018c5bd47e",
   "gecko": {
     "strict_min_version": "142.0",
     "data_collection_permissions": {
@@ -12,7 +12,7 @@
     }
   },
   "build_tools": {
-    "release_run": 45271957817,
+    "release_run": 45292564952,
     "node": "22.23.5",
     "yarn": "3.4.1",
     "protoc": "23.4"
