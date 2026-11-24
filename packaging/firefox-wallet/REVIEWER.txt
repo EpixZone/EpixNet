@@ -8,7 +8,7 @@ Test in a fresh Firefox profile with a disposable, unfunded account.
 2. From the extracted source directory, run:
    python3 -m http.server 8765 --bind 127.0.0.1 --directory EpixNet/packaging/firefox-wallet
    Open http://127.0.0.1:8765/review-site.html and click “Request test signature”. Connect the test account. Check the text, punctuation and spacing against the wallet prompt. Click the × next to Approve and confirm the page reports rejection.
-3. In Settings, open “Chains and Assets”, then “Noble USDN balance and claims”. An unfunded account cannot claim or withdraw. Earlier dedicated Earn enrollment, deposit and terms screens were removed. Native staking is available separately.
+3. In Settings, under “Chains and Assets”, select “Noble USDN balance and claims”. An unfunded account cannot claim or withdraw. Earlier dedicated Earn enrollment, deposit and terms screens were removed. Native staking is available separately.
 4. Open blocklist.html at the extension’s moz-extension origin. Its tab title is “Epix Wallet”. Real phishing-list matches continue to open https://blocklist.keplr.app with the matched URL.
 
 BUILD.txt describes rebuilding and comparing every file. After building the wallet libraries, run these tests from epix-wallet:
