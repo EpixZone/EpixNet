@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "name": "Epix browser controls",
-  "version": "1.0",
+  "version": "1.1",
   "browser_specific_settings": { "gecko": { "id": "browser-ext@epix.zone" } },
   "permissions": ["geckoViewAddons", "nativeMessaging", "nativeMessagingFromContent"],
   "content_scripts": [{
