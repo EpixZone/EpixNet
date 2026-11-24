@@ -39,6 +39,8 @@ jobs:
         run: node ui/tests/coverage-tools/node_modules/playwright/cli.js install --with-deps chromium
       - name: Test wrapper behavior and coverage mapping
         run: node --test ui/tests/*.test.cjs
+      - name: Test the Android fixbutton fade
+        run: node --test shells/android/tests/fixbutton-fade.test.cjs
       - name: Exercise the shipped globe and measure its editable source
         run: node ui/tests/globe-browser.cjs --coverage coverage
       - name: Run the wallet's packed URL-bar script and measure it
