@@ -136,6 +136,8 @@ class PackagingTests(unittest.TestCase):
         shutil.copy2(HERE.parents[1] / "scripts/run-browser.sh", launcher)
         shutil.copytree(HERE, repo / "packaging/linux")
         shutil.copytree(HERE.parent / "firefox-addons", repo / "packaging/firefox-addons")
+        assets = Path("crates/epix-browser/assets")
+        shutil.copytree(HERE.parents[1] / assets, repo / assets)
         shutil.copytree(HERE.parents[1] / "shells/epix-theme", repo / "shells/epix-theme")
         fetch = repo / "packaging/fetch-firefox-esr.sh"
         fetch.write_text('#!/bin/sh\nprintf "%s\\n" "$@" > fetch-args\n'
@@ -199,6 +201,8 @@ class PackagingTests(unittest.TestCase):
                     self.assertEqual(capture.read_text().splitlines(), ["linux", "--if-needed"])
                     self.assertTrue((runtime / "libepix-sandbox-probe.so").is_file())
                     self.assertTrue((runtime / "distribution/epix-addon-installer/manager.sys.mjs").is_file())
+                    self.assertEqual((runtime / "distribution/epix-addon-installer/epix-address.js").read_bytes(),
+                                     (repo / assets / "epix-address.js").read_bytes())
                     policy = json.loads((runtime / "distribution/policies.json").read_text())
                     self.assertIn("epix-ca.pem", policy["policies"]["Certificates"]["Install"])
                 else:
