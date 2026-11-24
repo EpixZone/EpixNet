@@ -436,7 +436,12 @@ fn patch_wallet_js(contents: &[u8]) -> Vec<u8> {
 /// loads. Firefox records a blocking listener added during the load and, at the
 /// next browser start, holds every request it matches until the page has
 /// loaded again. For a main-frame filter that is the first page itself.
-const EPIX_URLBAR_JS: &[u8] = include_bytes!("../assets/epix-urlbar.js");
+const EPIX_URLBAR_JS: &[u8] = concat!(
+    "(() => {\n",
+    include_str!("../assets/epix-address.js"),
+    include_str!("../assets/epix-urlbar.js"),
+    "\n})();\n",
+).as_bytes();
 
 /// Add the URL-bar script to the wallet's background page, right after the
 /// polyfill so it registers before the wallet's own bundles. Accept the quoted
@@ -1208,7 +1213,7 @@ mod tests {
         let js = std::str::from_utf8(EPIX_URLBAR_JS).unwrap();
         assert!(js.contains("*://*/*"), "examines HTTP(S) navigations");
         assert!(js.contains("main_frame"), "only top-level navigations");
-        assert!(js.contains("^epix1[a-z0-9]{20,80}$"), "exact bech32 match");
+        assert!(js.contains("isEpixXiteAddress(u.hostname)"), "checked EPIX address host");
         assert!(js.contains("u.hostname + \".epix\""), "bare-address hosts rewrite to the alias");
         // Behavior, including when the listener is added, is covered by
         // tests/urlbar.test.cjs.

@@ -11,6 +11,8 @@ export function configureXiteAddresses() {
   const { UrlbarResult } = ChromeUtils.importESModule(
     "chrome://browser/content/urlbar/UrlbarResult.mjs"
   );
+  const validator = {};
+  Services.scriptloader.loadSubScript("resource://epix-addon-installer/epix-address.js", validator);
   const original = UrlbarProviderHeuristicFallback.matchUnknownUrl;
   if (typeof original !== "function") {
     throw new Error("Firefox address bar heuristic is unavailable");
@@ -19,7 +21,7 @@ export function configureXiteAddresses() {
     const address = context.searchString;
     if (context.sapName === "urlbar" && !context.searchMode &&
         context.restrictSource == null && !context.restrictToken &&
-        /^epix1[a-z0-9]{20,80}$/i.test(address)) {
+        validator.isEpixXiteAddress(address)) {
       const url = "https://" + address.toLowerCase() + ".epix/";
       return new UrlbarResult({
         type: UrlbarUtils.RESULT_TYPE.URL,

@@ -2,13 +2,12 @@
 (() => {
   const api = globalThis.browser || globalThis.chrome;
   if (!api?.webRequest) return;
-  const ADDR = /^epix1[a-z0-9]{20,80}$/;
   const redirect = (details) => {
     try {
       const u = new URL(details.url);
       // A bare-address HOST navigates to its dotted alias, keeping
       // path + query (clicked links, typed https://epix1.../ URLs).
-      if (ADDR.test(u.hostname)) {
+      if (isEpixXiteAddress(u.hostname)) {
         return { redirectUrl: "https://" + u.hostname + ".epix" + u.pathname + u.search };
       }
     } catch (_) {

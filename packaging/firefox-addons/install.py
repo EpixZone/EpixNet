@@ -18,6 +18,7 @@ def install(resources: Path):
     destination.mkdir(parents=True, exist_ok=True)
     for name in MODULE_FILES:
         shutil.copyfile(ROOT / name, destination / name)
+    shutil.copyfile(ROOT.parent.parent / "crates" / "epix-browser" / "assets" / "epix-address.js", destination / "epix-address.js")
     shutil.copyfile(ROOT.parent / "linux" / "icons" / "epix-128.png", destination / "welcome.png")
     theme = destination / "theme"
     theme.mkdir(exist_ok=True)
