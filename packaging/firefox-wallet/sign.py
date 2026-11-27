@@ -121,14 +121,19 @@ def review_upload(prepared, output, reviewed_warnings):
     return source, metadata
 
 
-def sign(prepared, output, reviewed_warnings=False):
-    for name in ("WEB_EXT_API_KEY", "WEB_EXT_API_SECRET"):
-        if not os.environ.get(name):
-            raise ValueError(f"Configure publisher-owned {name} in the signing environment")
+def prepare_upload(prepared, output, reviewed_warnings=False):
     expected = checked_preparation(prepared)
     run_lint(prepared, expected, reviewed_warnings)
     output.mkdir(parents=True, exist_ok=False)
     source, metadata = review_upload(prepared, output, reviewed_warnings)
+    return expected, source, metadata
+
+
+def sign(prepared, output, reviewed_warnings=False):
+    for name in ("WEB_EXT_API_KEY", "WEB_EXT_API_SECRET"):
+        if not os.environ.get(name):
+            raise ValueError(f"Configure publisher-owned {name} in the signing environment")
+    expected, source, metadata = prepare_upload(prepared, output, reviewed_warnings)
     subprocess.run(["node", str(pinned_cli()), "sign", "--channel=unlisted",
                     "--source-dir", str(prepared / "extension"),
                     "--upload-source-code", str(source),
@@ -149,14 +154,19 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("prepared", type=Path)
     parser.add_argument("--output", type=Path)
-    parser.add_argument("--lint-only", action="store_true")
+    modes = parser.add_mutually_exclusive_group()
+    modes.add_argument("--lint-only", action="store_true")
+    modes.add_argument("--prepare-only", action="store_true", help="Write the source archive and metadata for review")
     parser.add_argument("--reviewed-warnings", action=argparse.BooleanOptionalAction, default=False,
                         help="Require the exact publisher-reviewed candidate, tool versions and diagnostics")
     args = parser.parse_args()
     if args.lint_only:
         print(json.dumps(lint_preparation(args.prepared.resolve(), args.reviewed_warnings), indent=2))
     elif args.output is None:
-        parser.error("submission requires --output")
+        parser.error("preparing upload files or submitting requires --output")
+    elif args.prepare_only:
+        _, source, metadata = prepare_upload(args.prepared.resolve(), args.output.resolve(), args.reviewed_warnings)
+        print(f"Prepared {source} and {metadata}")
     else:
         print(json.dumps(sign(args.prepared.resolve(), args.output.resolve(), args.reviewed_warnings), indent=2))
 
