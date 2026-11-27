@@ -903,11 +903,11 @@ impl Store {
         let Some(current) = Self::extern_stamp_bytes(meta) else { return false };
         let Ok(txn) = self.db.begin_read() else { return false };
         let Ok(table) = txn.open_table(EXTERN_STAMP) else { return false };
-        let matches = matches!(
-            table.get(id.0.as_slice()),
-            Ok(Some(stored)) if stored.value() == current
-        );
-        matches
+        // Consume redb's guard inside the call, so no borrow of `table`
+        // outlives it.
+        table
+            .get(id.0.as_slice())
+            .is_ok_and(|stored| stored.is_some_and(|stored| stored.value() == current))
     }
 
     /// Record that `id`'s bytes verified against the file described by
