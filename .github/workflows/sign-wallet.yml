@@ -30,7 +30,7 @@ jobs:
       WALLET_REVIEW_FLAG: ${{ inputs.reviewed_warnings && '--reviewed-warnings' || '--no-reviewed-warnings' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
       - uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -64,8 +64,9 @@ jobs:
           cargo build --locked -p epix-browser --no-default-features
           python3 packaging/firefox-wallet/test-signing.py
           python3 packaging/firefox-wallet/prepare.py --browser "$PWD/target/debug/epix-browser" --wallet-source "$PWD/signing-wallet-source" --wallet-archive "$RUNNER_TEMP/wallet-input/epix-wallet-firefox.zip" --version "$WALLET_VERSION" --output "$RUNNER_TEMP/wallet-prepared"
-      - name: Check Mozilla submission requirements and retain the lint report
-        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --lint-only "$WALLET_REVIEW_FLAG"
+      - name: Validate and retain the source archive for the reviewer build
+        if: ${{ !inputs.submit_to_mozilla }}
+        run: python3 packaging/firefox-wallet/sign.py "$RUNNER_TEMP/wallet-prepared" --prepare-only --output "$RUNNER_TEMP/wallet-review" "$WALLET_REVIEW_FLAG"
       - name: Submit to Mozilla for self-distribution
         if: ${{ inputs.submit_to_mozilla }}
         env:
@@ -79,6 +80,7 @@ jobs:
           name: firefox-wallet-signing-${{ github.run_id }}
           path: |
             ${{ runner.temp }}/wallet-prepared/
+            ${{ runner.temp }}/wallet-review/
             ${{ runner.temp }}/wallet-returned/
           if-no-files-found: ignore
           retention-days: 14

@@ -11,7 +11,7 @@ import subprocess
 import tempfile
 import zipfile
 
-from rebuild import reviewed_gecko_settings, submission_manifest
+from rebuild import reviewed_gecko_settings, submission_manifest, write_archive
 
 ROOT = Path(__file__).resolve().parents[2]
 WALLET_ID = "wallet@epix.zone"
@@ -73,14 +73,6 @@ def release_version(value):
     return value
 
 
-def write_archive(path, entries):
-    with zipfile.ZipFile(path, "x", compression=zipfile.ZIP_DEFLATED) as archive:
-        for name, content in sorted(entries.items()):
-            entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
-            entry.compress_type = zipfile.ZIP_DEFLATED
-            archive.writestr(entry, content)
-
-
 def wallet_build_environment(entries, revision):
     metadata = json.loads(entries["epix-mobile-build.json"])
     if (metadata.get("revision") != revision or metadata.get("modifiedSource") is not False
@@ -115,7 +107,7 @@ def source_snapshot(repository, entries):
     return {"revision": revision, "commit": commit, "files": files}
 
 
-def source_bundle(output, repositories, version, environment, raw_entries, final_entries):
+def source_bundle(output, repositories, version, environment, raw_entries, final_entries, unsigned_sha256):
     entries = {}
     snapshots = {}
     with tempfile.TemporaryDirectory(prefix="wallet-source-") as temporary:
@@ -139,40 +131,35 @@ def source_bundle(output, repositories, version, environment, raw_entries, final
         f"Privacy policy: {environment['EPIX_PRIVACY_URL']}\nTerms: {environment['EPIX_TERMS_URL']}\n\n"
     ).encode() + entries[review_directory + "REVIEWER.txt"]
     metadata = {"repositories": snapshots, "version": version, "environment": environment,
+                "unsigned_sha256": unsigned_sha256,
                 "wallet_files": {name: sha256(content) for name, content in raw_entries.items()},
                 "final_files": {name: sha256(content) for name, content in final_entries.items()}}
     entries["SOURCE.json"] = (json.dumps(metadata, indent=2) + "\n").encode()
-    entries["rebuild.py"] = (ROOT / "packaging/firefox-wallet/rebuild.py").read_bytes()
+    for name in ("build.sh", "rebuild.py", "review-tools.sha256"):
+        entries[name] = (ROOT / "packaging/firefox-wallet" / name).read_bytes()
+    build_environment = dict(environment, REVIEW_NODE=tools["node"], REVIEW_PROTOC=tools["protoc"], REVIEW_YARN=tools["yarn"])
     entries["wallet-build-env.sh"] = ("unset KEPLR_EXT_AMPLITUDE_API_KEY KEPLR_EXT_ANALYTICS_API_URL "
         "KEPLR_EXT_ANALYTICS_API_AUTH_TOKEN KEPLR_EXT_GOOGLE_MEASUREMENT_ID KEPLR_EXT_GOOGLE_API_KEY_FOR_MEASUREMENT\n"
-        + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in environment.items())).encode()
+        + "".join(f"export {key}={shlex.quote(value)}\n" for key, value in build_environment.items())).encode()
     entries["BUILD.txt"] = (
-        f"Submitted release version: {version}\n"
+        f"Rebuild Epix Wallet {version} on Ubuntu 24.04 LTS (ARM64 or x86_64).\n"
         f"Wallet release build: https://github.com/EpixZone/epix-wallet/actions/runs/{tools['release_run']}\n"
-        f"Use Linux, Node {tools['node']}, the included Yarn {tools['yarn']} and protoc {tools['protoc']}.\n"
-        "Install Python 3, Git, Rust and EpixNet desktop build dependencies.\n"
-        "Install a complete Protobuf compiler distribution, including include/google/protobuf/descriptor.proto; a compiler binary alone is insufficient.\n"
-        "Keep the compiler distribution's bin and include directories together, and add its bin directory to PATH before building.\n"
-        "From this extracted bundle, restore exact detached Git metadata (no synthetic commits):\n"
-        "  python3 rebuild.py restore\n"
-        "  . ./wallet-build-env.sh\n"
-        "The policy URLs come from the checksum-verified original build metadata. Analytics credentials are unset. "
-        "EPIX_MOBILE_STORE_BUILD=1 enables the upstream policy/analytics validation; it does not change emitted code.\n"
-        "  cd epix-wallet\n"
-        "  corepack enable\n"
-        "  yarn install --immutable\n"
-        "  yarn build:libs\n"
-        "  yarn workspace @keplr-wallet/extension build\n"
-        "  cd ..\n"
-        "  python3 rebuild.py verify-wallet epix-wallet/apps/extension/build/firefox\n"
-        "This must match every file of the pinned upstream archive before continuing.\n"
-        "  cd EpixNet\n"
-        "  EPIX_WALLET_DIST=\"$PWD/../epix-wallet/apps/extension/build/firefox\" cargo build --locked -p epix-browser --no-default-features\n"
-        "  target/debug/epix-browser --export-wallet ../rebuilt.xpi\n"
-        "  cd ..\n"
-        "  python3 rebuild.py verify-final rebuilt.xpi\n"
-        "The final comparison applies the release version, Firefox manifest key migration, minimum version for consent and reviewed data declaration. All other payload bytes must match.\n"
-        "See EpixNet/packaging/firefox-wallet/README.md for signing and remaining publisher requirements.\n"
+        f"The script installs Node {tools['node']}, the included Yarn {tools['yarn']} and protoc {tools['protoc']}. "
+        "It uses the complete compiler distribution with its standard Protobuf headers and Rust 1.100.0.\n"
+        "Use a fresh directory with 4 CPUs, 10 GB RAM and 35 GB free disk. Network access is needed for tools "
+        "and locked dependencies. On a fresh Ubuntu system install these packages first:\n"
+        "  sudo apt-get update\n"
+        "  sudo apt-get install -y ca-certificates curl xz-utils unzip python3 git build-essential cmake "
+        "pkg-config libudev-dev libgtk-3-dev libayatana-appindicator3-dev libxdo-dev\n"
+        "Extract this source ZIP, then run the following from the directory containing BUILD.txt:\n"
+        "  bash build.sh\n"
+        "The script restores both exact Git revisions and builds the Firefox wallet from the submitted sources. "
+        "It verifies every upstream file, exports the rebuilt wallet through the EpixNet launcher, "
+        "and applies the submission manifest and deterministic ZIP settings. "
+        "The result is rebuilt.xpi in this directory. Compare the unsigned archive bytes with:\n"
+        f"  echo '{unsigned_sha256}  rebuilt.xpi' | sha256sum -c -\n"
+        "For the optional tests in REVIEWER.txt, make the same Node and Yarn available in your shell:\n"
+        '  export PATH="$PWD/.review-build/node/bin:$PATH"\n'
     ).encode()
     write_archive(output, entries)
 
@@ -227,13 +214,14 @@ def prepare(args, root=ROOT):
         target.write_bytes(content)
     unsigned = args.output / "unsigned.xpi"
     write_archive(unsigned, entries)
+    unsigned_sha256 = sha256(unsigned.read_bytes())
     source = args.output / "source.zip"
-    source_bundle(source, {"EpixNet": root, "epix-wallet": args.wallet_source}, version, environment, raw_entries, entries)
+    source_bundle(source, {"EpixNet": root, "epix-wallet": args.wallet_source}, version, environment, raw_entries, entries, unsigned_sha256)
     provenance = {"schema": 1, "extension_id": WALLET_ID, "version": version,
                   "runtime_version": runtime_version, "epixnet_revision": revision,
                   "wallet_revision": wallet_revision, "wallet_archive_sha256": expected,
                   "runtime_export_sha256": metadata["archive_sha256"],
-                  "unsigned_sha256": sha256(unsigned.read_bytes()), "source_sha256": sha256(source.read_bytes())}
+                  "unsigned_sha256": unsigned_sha256, "source_sha256": sha256(source.read_bytes())}
     (args.output / "provenance.json").write_text(json.dumps(provenance, indent=2) + "\n")
     return provenance
 

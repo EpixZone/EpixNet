@@ -102,7 +102,17 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(metadata["environment"]["EPIX_TERMS_URL"], "https://example.com/terms/")
         self.assertIn(b"EPIX_MOBILE_STORE_BUILD=1", (unpacked / "wallet-build-env.sh").read_bytes())
         rebuild.verify(self.entries, metadata["wallet_files"])
-        subprocess.run([sys.executable, unpacked / "rebuild.py", "verify-final", self.archive], check=True)
+        rebuilt = self.root / "rebuilt.xpi"
+        command = [sys.executable, unpacked / "rebuild.py", "verify-final", self.archive, "--output", rebuilt]
+        subprocess.run(command, check=True)
+        self.assertEqual(rebuilt.read_bytes(), (self.args.output / "unsigned.xpi").read_bytes())
+        rebuilt.unlink()
+        metadata["unsigned_sha256"] = "0" * 64
+        (unpacked / "SOURCE.json").write_text(json.dumps(metadata))
+        failure = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("archive differs", failure.stderr)
+        self.assertFalse(rebuilt.exists())
         with self.assertRaisesRegex(ValueError, "differs"):
             rebuild.verify({**self.entries, "background.js": b"changed"}, metadata["wallet_files"])
         with self.assertRaisesRegex(ValueError, "newly extracted"):
@@ -183,7 +193,9 @@ class SigningTests(unittest.TestCase):
             self.assertEqual(source["reviewed-findings.json"], sign.REVIEW_FILE.read_bytes())
             self.assertIn("epix-wallet/source.js", source)
             self.assertIn("EpixNet/shells/wallet-ext.rev", source)
-            self.assertIn(b"rebuild.py verify-final", source["BUILD.txt"])
+            self.assertIn(b"bash build.sh", source["BUILD.txt"])
+            self.assertIn(b'rebuild.py" verify-final', source["build.sh"])
+            self.assertIn(b"protoc-23.4-linux-aarch_64.zip", source["review-tools.sha256"])
             metadata = json.loads(Path(command[command.index("--amo-metadata") + 1]).read_text())
             self.assertIn("mozilla-lint.json", metadata["version"]["approval_notes"])
             self.assertLessEqual(len(metadata["version"]["approval_notes"]), sign.AMO_NOTES_LIMIT)
@@ -216,6 +228,20 @@ class SigningTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "3,000-character"):
                 sign.sign(prepared, self.root / "oversize")
         command.assert_called_once()
+
+    def test_prepare_only_writes_the_reviewed_source_without_publisher_credentials(self):
+        report = self.reviewed_fixture()
+        completed = SimpleNamespace(stdout=json.dumps(report), returncode=1)
+        with patch.dict(os.environ, {}, clear=True), patch.object(sign, "pinned_cli", return_value="web-ext"), \
+                patch.object(sign.subprocess, "run", return_value=completed) as command:
+            _, source, metadata = sign.prepare_upload(self.args.output, self.root / "review", reviewed_warnings=True)
+        command.assert_called_once()
+        self.assertIn("lint", command.call_args.args[0])
+        entries = prepare.read_archive(source)
+        self.assertEqual(json.loads(entries["mozilla-lint.json"]), report)
+        self.assertEqual(entries["reviewed-findings.json"], sign.REVIEW_FILE.read_bytes())
+        self.assertIn("BUILD.txt", entries)
+        self.assertIn("reviewed-findings.json", json.loads(metadata.read_text())["version"]["approval_notes"])
 
     def test_review_rejects_changes_to_diagnostics_candidate_or_lint_status(self):
         report = self.reviewed_fixture()
