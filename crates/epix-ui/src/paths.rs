@@ -222,7 +222,7 @@ pub type HelpOption = (String, Vec<String>);
 pub fn help_option(option: &str, lines: &[&str]) -> HelpOption {
     (
         option.to_string(),
-        lines.iter().map(|line| line.to_string()).collect(),
+        lines.iter().map(ToString::to_string).collect(),
     )
 }
 
