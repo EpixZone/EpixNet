@@ -217,6 +217,20 @@ class SigningTests(unittest.TestCase):
                 sign.sign(prepared, self.root / "oversize")
         command.assert_called_once()
 
+    def test_prepare_only_writes_the_reviewed_source_without_publisher_credentials(self):
+        report = self.reviewed_fixture()
+        completed = SimpleNamespace(stdout=json.dumps(report), returncode=1)
+        with patch.dict(os.environ, {}, clear=True), patch.object(sign, "pinned_cli", return_value="web-ext"), \
+                patch.object(sign.subprocess, "run", return_value=completed) as command:
+            _, source, metadata = sign.prepare_upload(self.args.output, self.root / "review", reviewed_warnings=True)
+        command.assert_called_once()
+        self.assertIn("lint", command.call_args.args[0])
+        entries = prepare.read_archive(source)
+        self.assertEqual(json.loads(entries["mozilla-lint.json"]), report)
+        self.assertEqual(entries["reviewed-findings.json"], sign.REVIEW_FILE.read_bytes())
+        self.assertIn("BUILD.txt", entries)
+        self.assertIn("reviewed-findings.json", json.loads(metadata.read_text())["version"]["approval_notes"])
+
     def test_review_rejects_changes_to_diagnostics_candidate_or_lint_status(self):
         report = self.reviewed_fixture()
         candidate = sign.checked_preparation(self.args.output)

@@ -64,8 +64,9 @@ and [source submission requirements](https://extensionworkshop.com/documentation
 ## Manual workflow
 
 Run **Prepare Firefox wallet signing** from Actions with a unique numeric
-version newer than both the last submitted version and the installed wallet. Its default prepares inputs
-without contacting Mozilla and runs strict lint. A lint failure marks the run
+version newer than both the last submitted version and the installed wallet.
+The default run validates the XPI and saves `wallet-review/review-source.zip`
+and `wallet-review/amo-metadata.json` for testing before submission. A lint failure marks the run
 failed and retains the inputs and full report for review. Select **Submit to Mozilla**
 when the candidate passes the selected gate and the publisher credentials, account
 and sources are ready. The pinned `web-ext` 10.8.0 tool submits an
@@ -103,7 +104,8 @@ environment variables:
 ```sh
 npm ci --prefix packaging/firefox-wallet --ignore-scripts --no-fund
 npm audit --prefix packaging/firefox-wallet --audit-level=low
-python3 packaging/firefox-wallet/sign.py /absolute/path/to/new-wallet-submission --lint-only
+python3 packaging/firefox-wallet/sign.py /absolute/path/to/new-wallet-submission \
+  --prepare-only --output /absolute/path/to/review-materials
 python3 packaging/firefox-wallet/sign.py /absolute/path/to/new-wallet-submission \
   --output /absolute/path/to/new-mozilla-response
 ```
