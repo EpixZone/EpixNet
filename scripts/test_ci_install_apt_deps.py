@@ -48,7 +48,11 @@ class AptTests(unittest.TestCase):
         self.command("apt-get", '''import json,os,sys
 from pathlib import Path
 p=Path(os.environ["FAKE_STATE"]);s=json.loads(p.read_text())
-s["calls"].append({"args":sys.argv[1:],"noninteractive":os.environ.get("DEBIAN_FRONTEND"),"mirrors":Path(os.environ["FAKE_MIRRORS"]).read_text() if Path(os.environ["FAKE_MIRRORS"]).exists() else None})
+args=sys.argv[1:];parts=None
+for flag,value in zip(args,args[1:]):
+    if flag=="-o" and value.startswith("Dir::Etc::SourceParts="):
+        parts={f.name:f.read_text() for f in Path(value.split("=",1)[1]).iterdir()}
+s["calls"].append({"args":args,"parts":parts,"noninteractive":os.environ.get("DEBIAN_FRONTEND"),"mirrors":Path(os.environ["FAKE_MIRRORS"]).read_text() if Path(os.environ["FAKE_MIRRORS"]).exists() else None})
 code=s["results"].pop(0);p.write_text(json.dumps(s));raise SystemExit(code)
 ''')
         self.command("timeout", '''import json,os,sys
@@ -78,6 +82,44 @@ os.execvp(sys.argv[3],sys.argv[3:])
         self.assertTrue(all(x["noninteractive"] == "noninteractive" for x in state["calls"]))
         return code, state["calls"], sleep.call_count
 
+    @staticmethod
+    def operation(call):
+        """The apt-get arguments after any leading `-o` options."""
+        args = call["args"]
+        while args[:1] == ["-o"]:
+            args = args[2:]
+        return args
+
+    def test_hosted_runner_reads_only_the_ubuntu_archive(self):
+        code, calls, _ = self.run_install([0, 0])
+        self.assertEqual(code, 0)
+        self.assertEqual([self.operation(c)[0] for c in calls], ["update", "install"])
+        for call in calls:
+            self.assertEqual(call["parts"], {"ubuntu.sources": self.modern.read_text()})
+        self.assertTrue(self.third_party.is_file())
+        parts = Path(calls[0]["args"][1].split("=", 1)[1])
+        self.assertFalse(parts.exists(), "the temporary source list is removed")
+
+    def test_legacy_runner_skips_every_added_repository(self):
+        self.modern.unlink()
+        (self.etc / "apt/sources.list").write_text("deb " + HELPER.MIRROR_URI + " jammy main universe\n")
+        code, calls, _ = self.run_install([0, 0])
+        self.assertEqual(code, 0)
+        self.assertEqual([c["parts"] for c in calls], [{}, {}])
+
+    def test_developer_machines_keep_their_apt_sources(self):
+        for case in ("local", "self-hosted", "debian"):
+            with self.subTest(case=case):
+                self.env.update(GITHUB_ACTIONS="true", RUNNER_ENVIRONMENT="github-hosted")
+                (self.etc / "os-release").write_text("ID=ubuntu\n")
+                if case == "local": self.env["GITHUB_ACTIONS"] = "false"
+                if case == "self-hosted": self.env["RUNNER_ENVIRONMENT"] = "self-hosted"
+                if case == "debian": (self.etc / "os-release").write_text("ID=debian\n")
+                code, calls, _ = self.run_install([0, 0])
+                self.assertEqual(code, 0)
+                self.assertEqual([c["args"][0] for c in calls], ["update", "install"])
+                self.assertEqual([c["parts"] for c in calls], [None, None])
+
     def test_success_does_not_change_sources_or_mirrors(self):
         before = {p: p.read_bytes() for p in self.etc.rglob("*") if p.is_file()}
         code, calls, sleeps = self.run_install([0, 0])
@@ -103,7 +145,7 @@ os.execvp(sys.argv[3],sys.argv[3:])
         packages = ["protobuf-compiler", "libgtk-3-dev", "libayatana-appindicator3-dev"]
         code, calls, _ = self.run_install([100, 0, 0], packages)
         self.assertEqual(code, 0)
-        self.assertEqual(calls[-1]["args"], ["install", "-y", "--no-install-recommends", *packages])
+        self.assertEqual(self.operation(calls[-1]), ["install", "-y", "--no-install-recommends", *packages])
         self.assertEqual(legacy.read_text(), text)
         self.assertEqual(self.mirrors.read_bytes(), FALLBACK)
 
@@ -114,7 +156,7 @@ os.execvp(sys.argv[3],sys.argv[3:])
     def test_final_update_failure_skips_install(self):
         code, calls, sleeps = self.run_install([124, 124])
         self.assertEqual((code, len(calls), sleeps), (124, 2, 1))
-        self.assertEqual([c["args"] for c in calls], [["update"], ["update"]])
+        self.assertEqual([self.operation(c) for c in calls], [["update"], ["update"]])
 
     def test_unsafe_or_unknown_setups_leave_mirrors_unchanged(self):
         cases = ["local", "self-hosted", "debian", "arm64", "missing-os", "missing-source",
