@@ -719,7 +719,9 @@ impl Store {
         // that is "no path", not an error.
         let Ok(table) = txn.open_table(EXTERN) else { return Ok(None);
         };
-        Ok(table.get(id.0.as_slice()).map_err(db_err)?.map(|g| g.value().to_string()))
+        // redb's guard borrows the table, so finish with it before `table` drops.
+        let rel = table.get(id.0.as_slice()).map_err(db_err)?.map(|g| g.value().to_string());
+        Ok(rel)
     }
 
     /// The configured xite data root, or an error naming why extern
@@ -901,10 +903,11 @@ impl Store {
         let Some(current) = Self::extern_stamp_bytes(meta) else { return false };
         let Ok(txn) = self.db.begin_read() else { return false };
         let Ok(table) = txn.open_table(EXTERN_STAMP) else { return false };
-        matches!(
+        let matches = matches!(
             table.get(id.0.as_slice()),
             Ok(Some(stored)) if stored.value() == current
-        )
+        );
+        matches
     }
 
     /// Record that `id`'s bytes verified against the file described by
@@ -947,10 +950,11 @@ impl Store {
     fn get_record(&self, id: ObjId) -> io::Result<Option<ObjRecord>> {
         let txn = self.db.begin_read().map_err(db_err)?;
         let table = txn.open_table(OBJECTS).map_err(db_err)?;
-        match table.get(id.0.as_slice()).map_err(db_err)? {
-            Some(g) => Ok(Some(dec(g.value())?)),
-            None => Ok(None),
-        }
+        let record = match table.get(id.0.as_slice()).map_err(db_err)? {
+            Some(g) => Some(dec(g.value())?),
+            None => None,
+        };
+        Ok(record)
     }
 
     fn object_mutation_lock(&self, id: ObjId) -> Arc<Mutex<()>> {
@@ -3670,7 +3674,8 @@ impl Store {
         // A store that has never had a manifest claim has no table yet; that
         // is "not claimed", not an error.
         let Ok(owners) = txn.open_table(MANIFEST_OWNERS) else { return Ok(false) };
-        Ok(owners.get(id.0.as_slice()).map_err(db_err)?.is_some())
+        let claimed = owners.get(id.0.as_slice()).map_err(db_err)?.is_some();
+        Ok(claimed)
     }
 
     pub fn claim_manifest(&self, id: ObjId) -> io::Result<bool> {
