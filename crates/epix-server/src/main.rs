@@ -61,15 +61,21 @@ fn print_help() {
     println!("       epix-server [--data-dir <folder>] <action> [args...]");
     println!();
     println!("Options:");
-    println!("  --data-dir <folder>    Keep xites, keys and settings in <folder>.");
-    println!("                         Overrides EPIX_DATA_DIR. Default folder:");
-    println!("                         {}", epix_ui::paths::default_data_root().display());
-    if cfg!(windows) {
-        println!("                         The folder must be on an NTFS drive.");
-    }
-    println!("  --browser epix|system  Open the EpixNet Browser or your system browser.");
-    println!("                         Order: --browser, EPIX_BROWSER, saved setting, epix.");
-    println!("  -V, --version          Print the version.");
+    use epix_ui::paths::{data_dir_help, help_option, help_table};
+    print!(
+        "{}",
+        help_table(&[
+            data_dir_help("xites, keys and settings"),
+            help_option(
+                "--browser epix|system",
+                &[
+                    "Open the EpixNet Browser or your system browser.",
+                    "Order: --browser, EPIX_BROWSER, saved setting, epix.",
+                ],
+            ),
+            help_option("-V, --version", &["Print the version."]),
+        ])
+    );
     println!();
     println!("Actions: siteCreate, siteSign, sitePublish, siteVerify, siteList,");
     println!("         siteDelete, siteDownload, siteSignMessage, dbRebuild, dbQuery,");

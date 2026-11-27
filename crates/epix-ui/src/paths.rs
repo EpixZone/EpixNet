@@ -215,6 +215,45 @@ pub fn apply_launch_data_dir(option: Option<PathBuf>) -> Result<LaunchDataDir, S
     })
 }
 
+/// One row of a command-line help table: the option and its description lines.
+pub type HelpOption = (String, Vec<String>);
+
+/// A help row for an option whose description never changes.
+pub fn help_option(option: &str, lines: &[&str]) -> HelpOption {
+    (
+        option.to_string(),
+        lines.iter().map(|line| line.to_string()).collect(),
+    )
+}
+
+/// The `--data-dir` help row that `epix-server` and `epix-browser` share.
+/// `holds` names what the folder keeps.
+pub fn data_dir_help(holds: &str) -> HelpOption {
+    let mut lines = vec![
+        format!("Keep {holds}"),
+        "in <folder>. Overrides EPIX_DATA_DIR. Default folder:".to_string(),
+        default_data_root().display().to_string(),
+    ];
+    if cfg!(windows) {
+        lines.push("The folder must be on an NTFS drive.".to_string());
+    }
+    (format!("{DATA_DIR_OPTION} <folder>"), lines)
+}
+
+/// Lay out help rows so every description line starts in one column, two
+/// spaces after the longest option.
+pub fn help_table(options: &[HelpOption]) -> String {
+    let width = options.iter().map(|(option, _)| option.len()).max().unwrap_or(0);
+    let mut table = String::new();
+    for (option, lines) in options {
+        for (index, line) in lines.iter().enumerate() {
+            let label = if index == 0 { option.as_str() } else { "" };
+            table.push_str(&format!("  {label:<width$}  {line}\n"));
+        }
+    }
+    table
+}
+
 /// The default location's `epixnet.conf` - the same file the Python client
 /// keeps its settings in, so a customized Python install carries over. This is
 /// always in the default data root, even when that file's own `data_dir` key
@@ -319,6 +358,31 @@ fn home() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn help_table_lines_up_descriptions_after_the_longest_option() {
+        let table = help_table(&[
+            help_option("-V", &["Print the version."]),
+            help_option("--long <x>", &["First line.", "Second line."]),
+        ]);
+        assert_eq!(
+            table,
+            "  -V          Print the version.\n\
+             \x20 --long <x>  First line.\n\
+             \x20             Second line.\n"
+        );
+        assert_eq!(help_table(&[]), "");
+    }
+
+    #[test]
+    fn data_dir_help_names_the_default_folder_and_the_windows_drive_rule() {
+        let (option, lines) = data_dir_help("xites");
+        assert_eq!(option, "--data-dir <folder>");
+        assert_eq!(lines[0], "Keep xites");
+        assert_eq!(lines[2], default_data_root().display().to_string());
+        let ntfs = lines.iter().any(|line| line.contains("NTFS"));
+        assert_eq!(ntfs, cfg!(windows));
+    }
 
     #[test]
     fn data_directory_resolves_missing_suffix_and_rejects_unsafe_input() {

@@ -127,15 +127,19 @@ fn print_help() {
     println!("       epix-browser --quit");
     println!();
     println!("Options:");
-    println!("  --data-dir <folder>  Keep xites, keys, settings and the browser profile");
-    println!("                       in <folder>. Overrides EPIX_DATA_DIR. Default folder:");
-    println!("                       {}", epix_ui::paths::default_data_root().display());
-    if cfg!(windows) {
-        println!("                       The folder must be on an NTFS drive.");
-    }
-    println!("  --background         Start the node and tray without opening a window.");
-    println!("  --quit               Close a running EpixNet and wait for it to exit.");
-    println!("  -V, --version        Print the version.");
+    use epix_ui::paths::{data_dir_help, help_option, help_table};
+    print!(
+        "{}",
+        help_table(&[
+            data_dir_help("xites, keys, settings and the browser profile"),
+            help_option(
+                "--background",
+                &["Start the node and tray without opening a window."],
+            ),
+            help_option("--quit", &["Close a running EpixNet and wait for it to exit."]),
+            help_option("-V, --version", &["Print the version."]),
+        ])
+    );
     if cfg!(windows) {
         println!();
         println!(
