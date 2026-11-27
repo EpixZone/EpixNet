@@ -102,7 +102,17 @@ class SigningTests(unittest.TestCase):
         self.assertEqual(metadata["environment"]["EPIX_TERMS_URL"], "https://example.com/terms/")
         self.assertIn(b"EPIX_MOBILE_STORE_BUILD=1", (unpacked / "wallet-build-env.sh").read_bytes())
         rebuild.verify(self.entries, metadata["wallet_files"])
-        subprocess.run([sys.executable, unpacked / "rebuild.py", "verify-final", self.archive], check=True)
+        rebuilt = self.root / "rebuilt.xpi"
+        command = [sys.executable, unpacked / "rebuild.py", "verify-final", self.archive, "--output", rebuilt]
+        subprocess.run(command, check=True)
+        self.assertEqual(rebuilt.read_bytes(), (self.args.output / "unsigned.xpi").read_bytes())
+        rebuilt.unlink()
+        metadata["unsigned_sha256"] = "0" * 64
+        (unpacked / "SOURCE.json").write_text(json.dumps(metadata))
+        failure = subprocess.run(command, capture_output=True, text=True)
+        self.assertNotEqual(failure.returncode, 0)
+        self.assertIn("archive differs", failure.stderr)
+        self.assertFalse(rebuilt.exists())
         with self.assertRaisesRegex(ValueError, "differs"):
             rebuild.verify({**self.entries, "background.js": b"changed"}, metadata["wallet_files"])
         with self.assertRaisesRegex(ValueError, "newly extracted"):
@@ -183,7 +193,9 @@ class SigningTests(unittest.TestCase):
             self.assertEqual(source["reviewed-findings.json"], sign.REVIEW_FILE.read_bytes())
             self.assertIn("epix-wallet/source.js", source)
             self.assertIn("EpixNet/shells/wallet-ext.rev", source)
-            self.assertIn(b"rebuild.py verify-final", source["BUILD.txt"])
+            self.assertIn(b"bash build.sh", source["BUILD.txt"])
+            self.assertIn(b'rebuild.py" verify-final', source["build.sh"])
+            self.assertIn(b"protoc-23.4-linux-aarch_64.zip", source["review-tools.sha256"])
             metadata = json.loads(Path(command[command.index("--amo-metadata") + 1]).read_text())
             self.assertIn("mozilla-lint.json", metadata["version"]["approval_notes"])
             self.assertLessEqual(len(metadata["version"]["approval_notes"]), sign.AMO_NOTES_LIMIT)

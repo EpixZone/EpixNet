@@ -5,6 +5,7 @@ import hashlib
 import json
 from pathlib import Path, PurePosixPath
 import subprocess
+import tempfile
 import zipfile
 
 
@@ -50,6 +51,25 @@ def restore(root, metadata):
         print(f"Restored {name} at {identity}")
 
 
+def write_archive(path, entries):
+    with zipfile.ZipFile(path, "x", compression=zipfile.ZIP_DEFLATED) as archive:
+        for name, content in sorted(entries.items()):
+            entry = zipfile.ZipInfo(name, date_time=(1980, 1, 1, 0, 0, 0))
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(entry, content)
+
+
+def write_verified_archive(path, entries, expected_digest):
+    with tempfile.TemporaryDirectory(dir=path.parent) as scratch:
+        candidate = Path(scratch) / "rebuilt.xpi"
+        write_archive(candidate, entries)
+        digest = hashlib.sha256(candidate.read_bytes()).hexdigest()
+        if digest != expected_digest:
+            raise ValueError("Rebuilt XPI archive differs from the submitted SHA-256")
+        path.hardlink_to(candidate)
+    print(f"Verified {digest}  {path}")
+
+
 def reviewed_gecko_settings(repository, wallet_revision):
     path = repository / "packaging/firefox-wallet/data-disclosure.json"
     review = json.loads(path.read_text())
@@ -83,7 +103,10 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("operation", choices=("restore", "verify-wallet", "verify-final"))
     parser.add_argument("artifact", nargs="?", type=Path)
+    parser.add_argument("--output", type=Path, help="Write the verified final unsigned XPI to a new file")
     args = parser.parse_args()
+    if args.output and args.operation != "verify-final":
+        parser.error("--output requires verify-final")
     root = Path(__file__).resolve().parent
     metadata = json.loads((root / "SOURCE.json").read_text())
     if args.operation == "restore":
@@ -104,6 +127,8 @@ def main():
         settings = reviewed_gecko_settings(root / "EpixNet", wallet_revision)
         entries["manifest.json"] = submission_manifest(manifest, metadata["version"], settings)
         verify(entries, metadata["final_files"])
+        if args.output:
+            write_verified_archive(args.output, entries, metadata["unsigned_sha256"])
 
 
 if __name__ == "__main__":

@@ -45,17 +45,17 @@ build instructions. It preserves original commit objects and tracked file modes
 so `rebuild.py restore` restores exact detached revisions and clean Git status.
 The source bundle records the public terms/privacy URLs from the checksum-verified
 wallet build metadata, unsets analytics credentials, and enables the upstream
-store-build validation. `BUILD.txt` includes commands to verify every rebuilt
-upstream file and final transformed payload against the submission. A complete
-independent rebuild must pass those comparisons before publishing; source recipe
-validation alone is not proof of reproducibility.
+store-build validation. On Ubuntu 24.04 LTS, follow `BUILD.txt` to install the
+system packages and run `bash build.sh` from a fresh extraction. The script
+checks the tool downloads, installs the complete Protobuf compiler and headers,
+builds each wallet library and the Firefox extension, and exports the result
+with the locked EpixNet launcher. It checks every upstream and final file and
+the SHA-256 of the complete `rebuilt.xpi` archive.
 
-Record the release workflow run and its Node, Yarn and protoc versions in
-[data-disclosure.json](data-disclosure.json) when reviewing a new wallet pin.
-The generated build recipe includes these versions and checks the Yarn version
-against the wallet's committed package manager. Install the compiler together
-with its standard `include/google/protobuf` headers, including
-`descriptor.proto`, and preserve its `bin` and `include` layout.
+When reviewing a new wallet pin, record the release workflow run and tool
+versions in [data-disclosure.json](data-disclosure.json). Update
+[review-tools.sha256](review-tools.sha256) with the Node and Protobuf archive
+digests for Linux ARM64 and x86_64 when their versions change.
 
 See Mozilla's
 [signing guide](https://extensionworkshop.com/documentation/develop/getting-started-with-web-ext/)
