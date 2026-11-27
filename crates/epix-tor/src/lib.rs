@@ -350,6 +350,40 @@ pub fn reset_guard_state(data_dir: &Path) -> bool {
     cleared
 }
 
+/// Arti's configuration with its state and cache under `<data>/tor`.
+fn tor_config_builder(data_dir: &Path) -> TorClientConfigBuilder {
+    let tor_dir = data_dir.join("tor");
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut builder =
+        TorClientConfigBuilder::from_directories(tor_dir.join("state"), tor_dir.join("cache"));
+    // On Windows, fs-mistrust checks no owners or permissions. It only stats
+    // every step of the path and requires a directory, starting with the bare
+    // volume (`\\?\E:`). It skips that volume only when the stat fails the way
+    // NTFS, exFAT and FAT32 fail it, so a drive whose driver answers
+    // differently can stop Tor with "problem with filesystem permissions".
+    // Turning the checks off skips that walk and still requires the final
+    // folder to be a directory.
+    #[cfg(windows)]
+    builder.storage().permissions().dangerously_trust_everyone();
+    builder
+}
+
+/// Arti's top-level message hides the path and OS error behind a local
+/// failure, so append each cause it does not already contain.
+fn error_with_causes(error: &dyn std::error::Error) -> String {
+    let mut text = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !text.contains(&cause_text) {
+            text.push_str(": ");
+            text.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    text
+}
+
 impl Tor {
     /// Bootstrap a Tor client, keeping its state + directory cache under
     /// `data_dir` (`<data>/tor/state`, `<data>/tor/cache`) so later starts
@@ -361,10 +395,9 @@ impl Tor {
         install_crypto_provider();
         let tor_dir = data_dir.join("tor");
         let state = tor_dir.join("state");
-        let cache = tor_dir.join("cache");
         // `mut` is only needed under the `bridges` feature (apply_bridge below).
         #[cfg_attr(not(feature = "bridges"), allow(unused_mut))]
-        let mut builder = TorClientConfigBuilder::from_directories(&state, cache);
+        let mut builder = tor_config_builder(data_dir);
         // Route the guard channel through Snowflake when a bridge is configured
         // (censored networks); otherwise arti dials relays directly as before.
         #[cfg(feature = "bridges")]
@@ -384,7 +417,7 @@ impl Tor {
             .config(config)
             .create_bootstrapped()
             .await
-            .map_err(|e| Error::Protocol(format!("tor bootstrap: {e}")))?;
+            .map_err(|e| Error::Protocol(format!("tor bootstrap: {}", error_with_causes(&e))))?;
         Ok(Self { client })
     }
 
@@ -396,9 +429,7 @@ impl Tor {
     /// keep running on the same client.
     #[cfg(feature = "bridges")]
     pub fn reconfigure_bridge(&self, data_dir: &Path, bridge: Option<(String, u16)>) -> Result<()> {
-        let state = data_dir.join("tor").join("state");
-        let cache = data_dir.join("tor").join("cache");
-        let mut builder = TorClientConfigBuilder::from_directories(state, cache);
+        let mut builder = tor_config_builder(data_dir);
         if let Some((line, port)) = &bridge {
             bridges::apply_bridge(&mut builder, line, *port)?;
         }
@@ -721,6 +752,48 @@ impl Transport for MixedTransport {
 mod tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    #[test]
+    fn storage_path_checks_are_off_only_on_windows() {
+        let config = tor_config_builder(Path::new("data")).build().unwrap();
+        let unchecked = fs_mistrust::Mistrust::new_dangerously_trust_everyone();
+        assert_eq!(config.fs_mistrust() == &unchecked, cfg!(windows));
+    }
+
+    /// An error with an optional cause, shaped like Arti's reports.
+    #[derive(Debug)]
+    struct Layer(&'static str, Option<Box<Layer>>);
+
+    impl std::fmt::Display for Layer {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+
+    impl std::error::Error for Layer {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|cause| cause as _)
+        }
+    }
+
+    #[test]
+    fn bootstrap_errors_show_the_causes_arti_hides() {
+        let error = Layer(
+            "tor: problem with filesystem permissions: Error while trying to access persistent state",
+            Some(Box::new(Layer(
+                "Error while trying to access persistent state",
+                Some(Box::new(Layer(
+                    "Problem accessing persistent state",
+                    Some(Box::new(Layer(r#"Wrong type of file at "\\?\E:""#, None))),
+                ))),
+            ))),
+        );
+        assert_eq!(
+            error_with_causes(&error),
+            "tor: problem with filesystem permissions: Error while trying to access persistent \
+             state: Problem accessing persistent state: Wrong type of file at \"\\\\?\\E:\""
+        );
+    }
 
     #[test]
     fn tor_mode_parses_epixnet_values() {

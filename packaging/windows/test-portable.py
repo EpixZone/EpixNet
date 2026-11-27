@@ -53,6 +53,7 @@ class PortableZipTests(unittest.TestCase):
             })
             marker = archive.read("EpixNet Portable/epixnet-portable.txt").decode()
             self.assertIn("epix-browser.exe", marker)
+            self.assertIn("NTFS drive", marker)
             self.assertIn("\r\n", marker)
             self.assertFalse(any("/Data/" in name for name in names))
         # The stage itself stays the installer's: same policies, no marker.

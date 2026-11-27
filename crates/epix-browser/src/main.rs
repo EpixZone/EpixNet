@@ -130,6 +130,9 @@ fn print_help() {
     println!("  --data-dir <folder>  Keep xites, keys, settings and the browser profile");
     println!("                       in <folder>. Overrides EPIX_DATA_DIR. Default folder:");
     println!("                       {}", epix_ui::paths::default_data_root().display());
+    if cfg!(windows) {
+        println!("                       The folder must be on an NTFS drive.");
+    }
     println!("  --background         Start the node and tray without opening a window.");
     println!("  --quit               Close a running EpixNet and wait for it to exit.");
     println!("  -V, --version        Print the version.");

@@ -257,6 +257,7 @@ On Windows:
 
 - `--data-dir` does the same as `EPIX_DATA_DIR` and wins when both are set.
 - A relative folder is resolved against the current directory. A missing folder is created.
+- On Windows the folder must be on an NTFS drive. exFAT and FAT32 drives have no Windows file permissions, so EpixNet cannot keep your keys private there and refuses to start.
 - With **Open at Login** turned on from the tray, the login item starts EpixNet with the same folder.
 - A folder chosen this way cannot be moved from the Config page.
 - Only one EpixNet Browser runs at a time. A second one with a different folder refuses to start.
@@ -279,8 +280,9 @@ The AppImage uses `EpixNet.AppImage.home` as its home folder. To upgrade, replac
 
 ### EpixNet Portable for Windows
 
-`EpixNet-Portable-<version>-x64.zip` runs without installing. Unzip it anywhere, for example onto a USB drive, then start `epix-browser.exe` in the `EpixNet Portable` folder. EpixNet keeps your xites, keys, settings, browser profile and certificate in the adjacent `Data` folder. Firefox saves downloads to your Windows Downloads folder by default. Choose a folder on the portable drive to keep downloaded files there too.
+`EpixNet-Portable-<version>-x64.zip` runs without installing. Unzip it onto any NTFS drive, for example a USB drive, then start `epix-browser.exe` in the `EpixNet Portable` folder. EpixNet keeps your xites, keys, settings, browser profile and certificate in the adjacent `Data` folder. Firefox saves downloads to your Windows Downloads folder by default. Choose a folder on the portable drive to keep downloaded files there too.
 
+- The drive must use NTFS. Many USB sticks come formatted as exFAT or FAT32, which have no Windows file permissions, so EpixNet cannot keep your keys private there and refuses to start. To use such a stick, copy its files elsewhere, then right-click the drive in File Explorer, choose **Format**, and pick **NTFS**. Formatting erases the drive.
 - The `epixnet-portable.txt` file turns this on. Delete it to use the normal per-user folder. `--data-dir` still wins.
 - To upgrade, quit EpixNet and unzip the new version. Move your `Data` folder into the new `EpixNet Portable` folder, then delete the old one.
 - The bundled Firefox does not update itself. Get its security fixes with the next EpixNet Portable.

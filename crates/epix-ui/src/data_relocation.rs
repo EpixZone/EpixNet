@@ -47,6 +47,9 @@ impl DataRootLease {
     pub fn acquire(root: &Path) -> io::Result<Self> {
         let root = resolve_trusted_root(root)?;
         let directory = Directory::open(&root, true)?;
+        // Refuse exFAT or FAT32 before the lock file or any data is written.
+        #[cfg(windows)]
+        windows_permissions::require_private_acls(&directory.file)?;
         let lock = Lease::acquire(&directory, DATA_LOCK)?;
         directory.assert_bound()?;
         Ok(Self {
