@@ -1,0 +1,40 @@
+name: Install protoc on Windows
+description: >-
+  Install a pinned protoc release from GitHub and check its SHA-256.
+  Chocolatey's community feed can return 503, and choco then installs
+  nothing yet still succeeds, so the build failed later without protoc.
+
+runs:
+  using: composite
+  steps:
+    - name: Install protoc
+      shell: pwsh
+      env:
+        PROTOC_VERSION: "36.2"
+        PROTOC_SHA256: f0c128dc0d8492eceece83bb459a4c0e316764b929ffbf1aa416357fd644edd3
+      # Runs on Windows PowerShell 5.1 too, so it can be tested locally.
+      run: |
+        $ErrorActionPreference = 'Stop'
+        $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip"
+        $zip = Join-Path $env:RUNNER_TEMP 'protoc.zip'
+        for ($attempt = 1; ; $attempt++) {
+          try {
+            Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+            break
+          } catch {
+            if ($attempt -ge 5) { throw }
+            Write-Host "protoc download failed (attempt $attempt): $_"
+            Start-Sleep -Seconds (10 * $attempt)
+          }
+        }
+        $hash = (Get-FileHash -Algorithm SHA256 $zip).Hash
+        if ($hash -ne $env:PROTOC_SHA256) {
+          throw "protoc download has SHA-256 $hash, expected $env:PROTOC_SHA256"
+        }
+        $root = Join-Path $env:RUNNER_TEMP 'protoc'
+        Expand-Archive -Path $zip -DestinationPath $root -Force
+        $protoc = Join-Path $root 'bin\protoc.exe'
+        & $protoc --version
+        if ($LASTEXITCODE -ne 0) { throw "protoc did not run" }
+        Add-Content -Path $env:GITHUB_PATH -Value (Join-Path $root 'bin')
+        Add-Content -Path $env:GITHUB_ENV -Value "PROTOC=$protoc"

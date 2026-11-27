@@ -253,36 +253,59 @@ pub(super) fn verify_private_directory(file: &File) -> io::Result<()> {
     verify_private_acl(file, &current_user_sid()?, true)
 }
 
-pub(super) fn create_private_directory(path: &Path, parent: &File) -> io::Result<File> {
+/// Refuse a drive whose file system cannot store the owner-only permissions
+/// that keep keys private. exFAT and FAT32, common on USB sticks, have none.
+pub(super) fn require_private_acls(directory: &File) -> io::Result<()> {
     let mut flags = 0;
-    // SAFETY: parent is a pinned directory handle; optional outputs are null.
+    let mut name = [0u16; 261];
+    // SAFETY: directory is an open handle, the name buffer's length is passed
+    // with it, and the other optional outputs are null.
     if unsafe {
         GetVolumeInformationByHandleW(
-            parent.as_raw_handle(),
+            directory.as_raw_handle(),
             null_mut(),
             0,
             null_mut(),
             null_mut(),
             &mut flags,
-            null_mut(),
-            0,
+            name.as_mut_ptr(),
+            name.len() as u32,
         )
     } == 0
     {
         return Err(io::Error::new(
             io::ErrorKind::Unsupported,
             format!(
-                "Cannot verify destination ACL support: {}",
+                "Cannot check the drive's file system: {}",
                 io::Error::last_os_error()
             ),
         ));
     }
     if flags & FILE_PERSISTENT_ACLS == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "The destination filesystem cannot enforce private Windows permissions",
-        ));
+        let length = name.iter().position(|&unit| unit == 0).unwrap_or(name.len());
+        return Err(no_private_acls(&String::from_utf16_lossy(&name[..length])));
     }
+    Ok(())
+}
+
+fn no_private_acls(file_system: &str) -> io::Error {
+    let file_system = if file_system.is_empty() {
+        "a file system"
+    } else {
+        file_system
+    };
+    io::Error::new(
+        io::ErrorKind::Unsupported,
+        format!(
+            "EpixNet needs an NTFS drive for its data folder. This drive uses {file_system}, \
+             which has no Windows file permissions, so EpixNet cannot keep your keys private. \
+             Use a folder on an NTFS drive, or format this drive as NTFS."
+        ),
+    )
+}
+
+pub(super) fn create_private_directory(path: &Path, parent: &File) -> io::Result<File> {
+    require_private_acls(parent)?;
     let sid = current_user_sid()?;
     create_with_descriptor(path, &format!("O:{sid}D:P(A;OICI;FA;;;{sid})"))?;
     let directory = open_directory(path)?;
@@ -362,6 +385,22 @@ mod ace_bounds_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ntfs_folders_pass_the_private_permission_check() {
+        let temp = tempfile::tempdir().unwrap();
+        require_private_acls(&open_directory(temp.path()).unwrap()).unwrap();
+    }
+
+    #[test]
+    fn drives_without_permissions_are_named_with_the_fix() {
+        let error = no_private_acls("exFAT");
+        assert_eq!(error.kind(), io::ErrorKind::Unsupported);
+        let message = error.to_string();
+        assert!(message.contains("This drive uses exFAT"), "{message}");
+        assert!(message.contains("format this drive as NTFS"), "{message}");
+        assert!(no_private_acls("").to_string().contains("uses a file system,"));
+    }
 
     #[test]
     fn shared_parent_cannot_grant_other_users_access_to_staged_or_promoted_private_files() {

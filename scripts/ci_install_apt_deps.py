@@ -4,7 +4,9 @@ import argparse
 import os
 from pathlib import Path
 import re
+import shutil
 import subprocess
+import tempfile
 import time
 
 ETC = Path("/etc")
@@ -32,13 +34,35 @@ def ubuntu_uses_mirror_list():
     return False
 
 
-def use_official_mirrors():
-    # Only the ephemeral amd64 runner layout is known here. Do not rewrite
-    # developer/Debian/ARM sources or guess a codename, keyring, or ports URL.
+def hosted_ubuntu():
+    """Whether this is an ephemeral GitHub-hosted Ubuntu runner, never a developer machine."""
     if os.environ.get("GITHUB_ACTIONS") != "true" or os.environ.get("RUNNER_ENVIRONMENT") != "github-hosted":
         return False
     os_release = ETC / "os-release"
-    if not os_release.is_file() or not re.search(r'(?m)^ID=(?:ubuntu|"ubuntu")$', os_release.read_text()):
+    return os_release.is_file() and bool(re.search(r'(?m)^ID=(?:ubuntu|"ubuntu")$', os_release.read_text()))
+
+
+def ubuntu_archive_only(parts):
+    """apt options that read only Ubuntu's own archive on a hosted runner.
+
+    Runner images also list other repositories, such as packages.microsoft.com.
+    When one of them fails, `apt-get update` fails the job, although no package
+    installed here comes from it. `parts` replaces /etc/apt/sources.list.d and
+    receives a copy of ubuntu.sources (Ubuntu 24.04 and newer). Ubuntu 22.04
+    keeps its archive in /etc/apt/sources.list, which apt still reads.
+    """
+    if not hosted_ubuntu():
+        return []
+    modern = ETC / "apt/sources.list.d/ubuntu.sources"
+    if modern.is_file():
+        shutil.copyfile(modern, parts / "ubuntu.sources")
+    return ["-o", f"Dir::Etc::SourceParts={parts}"]
+
+
+def use_official_mirrors():
+    # Only the ephemeral amd64 runner layout is known here. Do not rewrite
+    # developer/Debian/ARM sources or guess a codename, keyring, or ports URL.
+    if not hosted_ubuntu():
         return False
     arch = subprocess.run(["dpkg", "--print-architecture"], capture_output=True, text=True, check=False)
     if arch.returncode or arch.stdout.strip() != "amd64" or not ubuntu_uses_mirror_list():
@@ -58,6 +82,11 @@ def use_official_mirrors():
 
 
 def install(packages):
+    with tempfile.TemporaryDirectory(prefix="apt-sources-") as parts:
+        return install_from(packages, ubuntu_archive_only(Path(parts)))
+
+
+def install_from(packages, options):
     env = dict(os.environ, DEBIAN_FRONTEND="noninteractive")
     for attempt in range(1, 3):
         for phase, arguments in (
@@ -65,7 +94,7 @@ def install(packages):
             ("install", ["install", "-y", "--no-install-recommends", *packages]),
         ):
             result = subprocess.run(
-                ["timeout", "--kill-after=15s", "300", "apt-get", *arguments], env=env, check=False
+                ["timeout", "--kill-after=15s", "300", "apt-get", *options, *arguments], env=env, check=False
             )
             if result.returncode:
                 print(f"::warning::apt {phase} attempt {attempt} failed with exit {result.returncode}", flush=True)

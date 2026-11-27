@@ -242,7 +242,7 @@ jobs:
         with:
           key: filesystem-transactions
       - name: Install protoc for the UI mesh dependency
-        run: choco install protoc -y --no-progress
+        uses: ./.github/actions/install-protoc-windows
       # This excluded vendored crate has a standalone dependency graph. Avoid
       # building or caching the full workspace to exercise Windows clock limits.
       - name: Test Windows clock limits and coarse-clock progress

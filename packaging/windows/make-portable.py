@@ -35,6 +35,10 @@ Nothing is installed.
 
 Start EpixNet with epix-browser.exe.
 
+Keep this folder on an NTFS drive. exFAT and FAT32 drives, common on
+USB sticks, have no Windows file permissions, so EpixNet cannot keep
+your keys private there and will not start.
+
 To upgrade, quit EpixNet and unzip the new version. Then move this Data
 folder into the new EpixNet Portable folder, and delete the old one.
 

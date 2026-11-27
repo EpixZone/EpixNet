@@ -155,6 +155,15 @@ ESR 153.7, by diffing files and registry around a run and a moved-folder run):
   folder gets new ones.
 - a Windows Firewall rule, if the user allows the prompt for this copy.
 
+The folder must be on an NTFS drive. exFAT and FAT32, the usual formats of
+USB sticks, cannot store the owner-only permissions EpixNet puts on its
+private folders. On an exFAT drive the node started, then creating the first
+private folder failed, arti could not lock `tor\state\state.lock` (OS error
+87, the same on FAT32), and EVX did not start. `DataRootLease::acquire` now
+refuses such a drive
+before anything is written, with a message that names its file system. The
+same check covers `--data-dir` and `EPIX_DATA_DIR`.
+
 Nothing registers `epix://` links for a portable copy. A portable copy and an
 installed EpixNet do not run at the same time: the single-instance channel
 refuses a second launcher with a different data folder.
